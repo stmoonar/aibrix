@@ -381,19 +381,21 @@ service_manager:
   # write holds the SM writer lock from start to end - a sleep from its hide to
   # its bookkeeping, a wake from its checks to its commit, a transfer for both.
   # A request waits up to writer_lock_wait_s for the lock (first-come
-  # first-served), then gets 409 writer_busy. 30 s queue behind at least one
-  # worst-case sleep (29 s) or several ordinary 2-5 s operations.
+  # first-served), then gets 409 writer_busy. 30 s queue behind several ordinary
+  # 2-5 s operations; behind a worst-case hold (a hung engine) a caller gets 409
+  # writer_busy and retries on its next tick.
   writer_lock_wait_s: 30
   # Deprecated and ignored (2026-10-02: a sleep has no separate commit phase).
   commit_lock_wait_s: null
   # Timeout clients (the controller) use for slow SM calls. Must exceed the
   # worst-case call = writer_lock_wait_s + the longest writer-lock hold (a
-  # transfer: its donors' sleep - ack_timeout_s + probe_timeout_s +
-  # sleep_call_timeout_s + max(physical_confirm_timeout_s + probe_timeout_s,
-  # 4 x probe_timeout_s) + io_margin_s = 29 s - plus its receivers' wake -
-  # probe_timeout_s + wake.call_timeout_s + 2 x probe_timeout_s + a compensating
-  # sleep (29 s) + io_margin_s = 47 s - plus one selection probe) + io_margin_s
-  # = 30 + 78 + 2 = 110 s with these values; validated at SM and controller
+  # transfer, any number of pairs: its donors' sleep - ack_timeout_s +
+  # probe_timeout_s + sleep_call_timeout_s + max(physical_confirm_timeout_s +
+  # probe_timeout_s, 4 x probe_timeout_s) + io_margin_s = 42 s - plus its
+  # receivers' wake - probe_timeout_s + wake.call_timeout_s + 2 x probe_timeout_s
+  # + ONE compensating sleep (42 s) + io_margin_s = 69 s - plus one selection
+  # probe round) + io_margin_s = 30 + 116 + 2 = 148 s with these values; validated
+  # at SM and controller
   # start. The controller uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
   api_call_timeout_s: 360
   # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
@@ -446,7 +448,7 @@ service_manager:
     # -> one load read -> ONE /sleep -> physical confirmation (D1/D2), all under
     # the writer lock (whole-lock, 2026-10-02); no caller can skip a step and
     # nothing drains (draining is the controller's job). The four timeouts below
-    # bound one sleep's lock hold: 5 + 2 + 10 + max(8 + 2, 4 x 2) + 2 = 29 s.
+    # bound one sleep's lock hold: 5 + 5 + 10 + max(8 + 5, 4 x 5) + 2 = 42 s.
     # Max wait for every live gateway plugin instance to report the new route-gen
     # (measured 7-15 ms; a timeout rolls the hide back).
     ack_timeout_s: 5
@@ -471,8 +473,8 @@ service_manager:
     # HTTP timeout of every other vLLM probe (/metrics, /version, /is_sleeping,
     # /is_paused, /resume, the wake gate's resident probes). No answer reads as
     # "unknown", which every caller treats fail-closed. Targets are probed in
-    # parallel.
-    probe_timeout_s: 2
+    # parallel. 5 s (the live value): many probes hit an AWAKE engine under load.
+    probe_timeout_s: 5
     # Allowance for Redis / Kubernetes calls in the worst-case lock hold.
     io_margin_s: 2
     # After /sleep, wait this long for /is_sleeping to report true. Not confirmed
@@ -503,7 +505,8 @@ service_manager:
     # path): the former soft drain budgets per sleep path and the no-drain paths.
     # Still parsed (the controller reads budgets_s.safescale_commit for its own
     # probe window); apa is not spelled out: images before 2026-09-29 reject an
-    # unknown budgets_s path at start.
+    # unknown budgets_s path at start. no_drain_paths lists every path (as live
+    # since 2026-10-06), so an older SM image (a rollback) never drains either.
     budgets_s:
       safescale_commit: null
       urgent: 30
@@ -512,7 +515,7 @@ service_manager:
       repair: 30
       startup: 30
       default: 30
-    no_drain_paths: [safescale_commit, urgent, apa]
+    no_drain_paths: [safescale_commit, urgent, scale_down, apa, defrag, repair, startup, default]
   wake:
     # HTTP timeout of ONE /wake_up call (single attempt, measured 1.5-3 s). No
     # answer in time: the wake stays journaled (with its GPU lease) and the

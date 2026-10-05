@@ -278,16 +278,13 @@ DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
     "default": 30.0,
 }
 
-#: Sleep paths that do NOT drain (v1 / paper semantics, 2026-09-29): hide -> gateway ack
-#: -> /sleep ``mode=abort`` at once. Continuable requests are continued by the reissue
-#: sidecar; non-continuable ones (and requests whose state the SM cannot read) are cut
-#: off, never waited for and never a reason to roll back - the outcome counts them.
-#: The caller's drain_budget_s is ignored on these paths. The SafeScale probe window
-#: (the pod is already hidden while it runs) is the only drain of a TRE scale-down;
-#: the fast-loop donors (urgent) and APA scale-downs release at once. Maintenance
-#: paths (defrag, repair, startup, scale_down = manual binding power) keep draining.
-#: DEPRECATED (2026-10-02): every path is a no-drain path now; ignored.
-DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = ("safescale_commit", "urgent", "apa")
+#: DEPRECATED (2026-10-02): ``service_manager.sleep.no_drain_paths``, the sleep paths
+#: that skipped the drain (hide -> gateway ack -> /sleep ``mode=abort`` at once; the
+#: reissue sidecar continues what it can). Every path is a no-drain path now and the
+#: service-manager ignores the key (still parsed and validated). The default lists
+#: every path, like the live registry, so an older image (a rollback) that still
+#: reads it never drains either.
+DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = SLEEP_PATHS
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
@@ -816,8 +813,11 @@ class SleepPolicy:
     #: HTTP timeout of every other vLLM probe of a sleep (``GET /metrics``,
     #: ``/version``, ``/is_sleeping``, ``/is_paused``, ``/resume``) and of the wake
     #: gate's resident probes. A probe without an answer reads "unknown", which
-    #: every caller treats fail-closed; part of the worst-case lock hold.
-    probe_timeout_s: float = 2.0
+    #: every caller treats fail-closed; part of the worst-case lock hold. 5 s
+    #: (2026-10-06, the live value since 09-28): many of these probes hit an AWAKE
+    #: engine under load (its API server answers /metrics late), and a false
+    #: "unknown" there leaves a pod hidden or refuses a wake for nothing.
+    probe_timeout_s: float = 5.0
     #: Allowance for the Redis / Kubernetes calls of one sleep (patches, journal)
     #: in the worst-case lock hold.
     io_margin_s: float = 2.0
@@ -914,8 +914,9 @@ class ServiceManagerConfig:
     pressure_registry_nodes_only: bool = True
     #: A request that needs the SM writer lock waits up to this long for it, then
     #: gets 409 ``writer_busy``. Every write holds the lock from start to end
-    #: (whole-lock, 2026-10-02): 30 s queue behind at least one worst-case sleep
-    #: (:meth:`worst_case_sleep_lock_s`) or several ordinary 2-5 s operations.
+    #: (whole-lock, 2026-10-02): 30 s queue behind several ordinary 2-5 s
+    #: operations; behind a worst-case hold (:meth:`worst_case_lock_hold_s`, a
+    #: hung engine) a caller gets 409 writer_busy and retries on its next tick.
     #: Waiters are served first-come first-served.
     writer_lock_wait_s: float = 30.0
     #: DEPRECATED, ignored (2026-10-02: a sleep has no separate commit phase).
@@ -985,7 +986,7 @@ class ServiceManagerConfig:
         its last probe round) and the rollback of a failed /sleep
         (``/is_sleeping``, ``/is_paused``, ``/resume``, ``/is_paused``: 4 probes)
         + the Redis / Kubernetes allowance (``io_margin_s``). Defaults:
-        5 + 2 + 10 + max(8 + 2, 8) + 2 = 29 s."""
+        5 + 5 + 10 + max(8 + 5, 4 x 5) + 2 = 42 s."""
         sleep = self.sleep
         after_call = max(
             sleep.physical_confirm_timeout_s + sleep.probe_timeout_s,
@@ -1004,8 +1005,9 @@ class ServiceManagerConfig:
         /wake_up run in parallel): the wake gate's resident probes (one parallel
         round) + /wake_up (``wake_call_timeout_s``) + the /is_sleeping
         convergence probe + a failed wake's settlement probe and compensating
-        sleep (:meth:`worst_case_sleep_lock_s`) + ``io_margin_s``. Defaults:
-        2 + 10 + 2 + 2 + 29 + 2 = 47 s; without a compensating sleep 18 s."""
+        sleep (:meth:`worst_case_sleep_lock_s`; ONE sleep call for every failed
+        wake of the call, in parallel) + ``io_margin_s``. Defaults:
+        5 + 10 + 5 + 5 + 42 + 2 = 69 s; without a compensating sleep 27 s."""
         sleep = self.sleep
         return (
             sleep.probe_timeout_s
@@ -1016,9 +1018,11 @@ class ServiceManagerConfig:
         )
 
     def worst_case_transfer_lock_s(self) -> float:
-        """Longest writer-lock hold of one ``POST /v2/transfers``: the selection's
-        resident probe of the pair taken + the donors' sleep + the receivers'
-        wake. Defaults: 2 + 29 + 47 = 78 s (both failure paths at their bound)."""
+        """Longest writer-lock hold of one ``POST /v2/transfers``, any number of
+        pairs: the selection's resident probe (one parallel round for every
+        candidate) + the donors' sleep (one call) + the receivers' wake (one
+        call). Defaults: 5 + 42 + 69 = 116 s (both failure paths at their
+        bound)."""
         return (
             self.sleep.probe_timeout_s
             + self.worst_case_sleep_lock_s()
@@ -1040,7 +1044,7 @@ class ServiceManagerConfig:
         """Upper bound of one sleeping / waking / transfer SM call as its client
         sees it: the wait for the writer lock (``writer_lock_wait_s``, then 409
         writer_busy) + the longest lock hold + ``io_margin_s``. Defaults:
-        30 + 78 + 2 = 110 s."""
+        30 + 116 + 2 = 148 s."""
         return self.writer_lock_wait_s + self.worst_case_lock_hold_s() + self.sleep.io_margin_s
 
     def shutdown_timeout_s(self) -> float:
