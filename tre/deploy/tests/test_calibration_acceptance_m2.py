@@ -95,7 +95,7 @@ def _args(tmp_path, **over):
         dry_run=False, stop_on_failure=True, controller_namespace="tre-v2",
         model_namespace="default", registry=None, redis_url=None,
         gateway_url="http://gw/v1/completions", guard_mode="warn", min_slo_windows=3,
-        max_model_error_rate=0.05, envoy_stats_url=None, envoy_cluster_filter=None,
+        max_model_error_rate=0.10, envoy_stats_url=None, envoy_cluster_filter=None,
         freeze_file=tmp_path / "freeze.json", composition=ac.COMPOSITION_M2,
         rho_star_run=_m_root(tmp_path), ledger_root=[],
         corpus_lang="en", zh_ratio=0.0, routing_strategy=None, api="completions")

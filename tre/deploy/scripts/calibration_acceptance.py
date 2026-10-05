@@ -1361,6 +1361,7 @@ def build_plan_m2(args, model: str, cells: Sequence[design.DesignCell],
         "spike_check": spike_check,
         "seeds": seeds,
         "id_check": ids,
+        "stream_cut": check_m2_stream_cut(args),
         "retained": {"cells": []},
         "label": {**labels, "attribution": attribution, "window_ms": args.window_ms,
                   "step_ms": args.fit_step_ms},
@@ -1379,6 +1380,7 @@ def build_plan_m2(args, model: str, cells: Sequence[design.DesignCell],
         "rho_star_source": rho_star,
         "spikes": dict(spikes),
         "seeds": seeds,
+        "stream_cut": check_m2_stream_cut(args),
         "id_check": ids,
         "label": labels,
         "label_attribution": attribution,
@@ -1438,6 +1440,20 @@ def print_plan_m2(plan: dict, model: str) -> None:
     print(f"  freeze: {fr['path'] + ' sha256 ' + fr['sha256'] if fr else 'NOT CHECKED (dry run)'}")
 
 
+def check_m2_stream_cut(args) -> dict:
+    """User 2026-10-05: M2 runs under T14's stream-cut rule (:mod:`scripts.stream_cut`): the
+    runtime ``--max-model-error-rate`` must be its 0.10 (refused otherwise, dry run included);
+    the audit half (route-timeout cuts, the 0.05 non-cut limit) is bound in the plan and the
+    manifest and applied by ``dline_refit accept``."""
+    from scripts import stream_cut
+
+    rate = float(getattr(args, "max_model_error_rate", float("nan")))
+    if rate != stream_cut.RUNTIME_MODEL_ERROR_LIMIT:
+        raise ValueError(f"M2 needs --max-model-error-rate {stream_cut.RUNTIME_MODEL_ERROR_LIMIT:g} (the stream-cut "
+                         f"rule's runtime limit, user 2026-10-05); got {rate:g}")
+    return stream_cut.record()
+
+
 def run_acceptance_set_m2(args, *, drive: Optional[Callable] = None,
                           sample_factory: Optional[Callable[[str], Callable]] = None,
                           sleep: Callable[[float], None] = time.sleep,
@@ -1460,6 +1476,7 @@ def run_acceptance_set_m2(args, *, drive: Optional[Callable] = None,
         resolve_attribution(args, model, None, M2_DEFAULT_ATTRIBUTION)
     else:
         freeze = check_freeze(args, model)
+    check_m2_stream_cut(args)
     training.check_primary_label(args, model)
     labels = label_documents(args, model)
     cap = training.resolve_cap(args)
@@ -1520,6 +1537,7 @@ def run_acceptance_set_m2(args, *, drive: Optional[Callable] = None,
                  "label_attribution": label_attribution(labels["label_def"]),
                  "design_seed": seed, "seeds": plan["seeds"], "spikes": plan["spikes"],
                  "rho_star_source": rho_star, "id_check": ids,
+                 "stream_cut": check_m2_stream_cut(args),
                  "how_to_evaluate": ("dline_refit accept --freeze-file <freeze> --dataset "
                                      "M2=<this run's dataset of the frozen label's attribution> "
                                      "--m-manifest <this file> (never --h2-dataset)")}

@@ -189,13 +189,10 @@ from typing import Any, Mapping, Optional, Sequence
 
 PREREG_SEED = 20260922
 PREREG_RESAMPLES = 1000
-#: The route timeout of the stream-cut addendum (``audit_rule.cut``: "e2e_ms >= 150000").
-ROUTE_TIMEOUT_CUT_MS = 150_000.0
-#: The original model-error limit the non-cut errors are judged against (``audit_rule.rule``).
-NON_CUT_ERROR_LIMIT = 0.05
-#: The runtime void limit of the addendum (``runtime_limit.max_model_error_rate``).
-RUNTIME_MODEL_ERROR_LIMIT = 0.10
-OUTCOME_MODEL_ERROR = "model_error"
+#: The stream-cut rule (route-timeout cut, the 0.05 non-cut limit, the 0.10 runtime limit) is
+#: scripts.stream_cut's - one definition, shared with dline_refit accept (M2).
+from scripts.stream_cut import (NON_CUT_ERROR_LIMIT, OUTCOME_MODEL_ERROR,  # noqa: E402
+                                ROUTE_TIMEOUT_CUT_MS, RUNTIME_MODEL_ERROR_LIMIT)
 KINDS = ("interpolation", "extrapolation")
 #: Dry run only: fake kinds for the training shapes (no T14 shape is read).
 DRY_RUN_KINDS = {"S1": "interpolation", "S2": "interpolation", "S3": "interpolation", "S4": "interpolation",
@@ -555,52 +552,13 @@ def manifest_rows(inp: Mapping[str, Any], manifest_path: Path, dataset_dir: Path
 
 
 def censoring_audit(requests_csv: Path, cells: Mapping[tuple, Mapping[str, Any]]) -> dict:
-    """The stream-cut audit per cell: every request of the cell's EVALUATED attempt (the
-    manifest's; voided earlier attempts are other keys and are not read), warm-up included
-    (the whole-cell ``model_errors / sent`` of ``openloop.check_cell``)."""
-    per: dict[tuple, dict] = {k: {"sent": 0, "sent_in_warmup": 0, "model_error": 0, "cut": 0, "non_cut": 0,
-                                  "non_cut_no_e2e": 0} for k in cells}
-    with open(requests_csv, newline="", encoding="utf-8") as fh:
-        for r in csv.DictReader(fh):
-            try:
-                key = (str(r["cell_id"]), int(float(r["attempt"] or 1)))
-            except (KeyError, ValueError):
-                continue
-            c = per.get(key)
-            if c is None:
-                continue
-            c["sent"] += 1
-            c["sent_in_warmup"] += str(r.get("in_warmup") or "").strip().lower() in ("1", "true", "yes")
-            if (r.get("outcome") or "").strip() != OUTCOME_MODEL_ERROR:
-                continue
-            c["model_error"] += 1
-            try:
-                e2e = float(r.get("e2e_ms") or "nan")
-            except ValueError:
-                e2e = math.nan
-            if math.isfinite(e2e) and e2e >= ROUTE_TIMEOUT_CUT_MS:
-                c["cut"] += 1
-            else:
-                c["non_cut"] += 1
-                c["non_cut_no_e2e"] += not math.isfinite(e2e)
-    out = []
-    for (cid, att), c in sorted(per.items()):
-        sent = c["sent"]
-        rate = (c["non_cut"] / sent) if sent else None
-        out.append({"cell_id": cid, "attempt": att, **cells[(cid, att)], **c,
-                    "cut_share_of_sent": (c["cut"] / sent) if sent else None,
-                    "non_cut_rate": rate,
-                    "model_error_rate": (c["model_error"] / sent) if sent else None,
-                    "void_at_audit": bool(sent == 0 or (rate is not None and rate > NON_CUT_ERROR_LIMIT)),
-                    "runtime_limit_exceeded": bool(sent and c["model_error"] / sent > RUNTIME_MODEL_ERROR_LIMIT)})
-    return {"rule": {"cut": f"outcome {OUTCOME_MODEL_ERROR} and e2e_ms >= {ROUTE_TIMEOUT_CUT_MS:.0f}",
-                     "non_cut": "any other model_error, e2e_ms missing included (D4)",
-                     "non_cut_limit": NON_CUT_ERROR_LIMIT, "runtime_limit": RUNTIME_MODEL_ERROR_LIMIT,
-                     "scope": "the evaluated (valid) attempt only; voided earlier attempts excluded",
-                     "denominator": "every request of that attempt in requests.csv, warm-up included"},
-            "requests_csv": str(requests_csv), "cells": out,
-            "void_at_audit": [c["cell_id"] for c in out if c["void_at_audit"]],
-            "totals": {k: sum(c[k] for c in out) for k in ("sent", "model_error", "cut", "non_cut")}}
+    """The stream-cut audit per cell (:func:`scripts.stream_cut.audit`, the one definition):
+    every request of the cell's EVALUATED attempt (the manifest's; voided earlier attempts are
+    other keys and are not read), warm-up included (the whole-cell ``model_errors / sent`` of
+    ``openloop.check_cell``)."""
+    from scripts import stream_cut
+
+    return stream_cut.audit(requests_csv, cells)
 
 
 def void_status(audit: Mapping[str, Any]) -> dict:

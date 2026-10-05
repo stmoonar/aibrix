@@ -2690,8 +2690,62 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
     if not problems:
         m, pr = collect_m_rows(sources, manifests)
         problems += pr
+    cuts: dict[str, dict] = {}
+    if not problems:
+        cuts, pr = m2_stream_cut_audits(manifests, sources, m)
+        problems += pr
     return {"doc": doc, "freeze_sha256": freeze_sha, "manifests": manifests, "manifest_paths": manifest_paths,
-            "sources": sources, "m": m}, problems
+            "sources": sources, "m": m, "stream_cut": cuts}, problems
+
+
+#: The M2 composition whose manifests carry the stream-cut rule (calibration_acceptance).
+M2_COMPOSITION_NAME = "m2-20261005"
+
+
+def m2_stream_cut_audits(manifests: Mapping[str, Mapping[str, Any]], sources: Sequence[DatasetSource],
+                         m: Mapping[str, Any]) -> tuple[dict, list[str]]:
+    """User 2026-10-05: M2 is judged under T14's stream-cut rule (:mod:`scripts.stream_cut`,
+    the T14 scorer's own function). For each M2 manifest (``composition_name``
+    :data:`M2_COMPOSITION_NAME`): the manifest must bind the 0.10 runtime limit; every cell's
+    evaluated attempt is audited over its dataset's ``requests.csv`` (route-timeout cuts are
+    censored, not errors - their windows stay violations through the unserved counts); a cell
+    whose non-cut errors exceed 0.05 of its requests is void at audit, excluded from the
+    evaluation and listed. Other manifests: nothing (M of 2026-10-03 and older)."""
+    from scripts import stream_cut
+
+    out: dict[str, dict] = {}
+    problems: list[str] = []
+    by_name = {s.name: s for s in sources}
+    for model, man in sorted(manifests.items()):
+        if man.get("composition_name") != M2_COMPOSITION_NAME:
+            continue
+        rec = man.get("stream_cut") or {}
+        if not _same(rec.get("max_model_error_rate"), stream_cut.RUNTIME_MODEL_ERROR_LIMIT):
+            problems.append(f"{model}: the M2 manifest binds max_model_error_rate {rec.get('max_model_error_rate')!r}, "
+                            f"not the stream-cut rule's {stream_cut.RUNTIME_MODEL_ERROR_LIMIT:g}")
+            continue
+        per_ds: dict[str, dict] = defaultdict(dict)
+        for c in man["cells"]:
+            key = (model, str(c["cell_id"]), _attempt(c["attempt"]))
+            placed = (m.get("placed") or {}).get(key) or {}
+            per_ds[placed.get("dataset", "")][(str(c["cell_id"]), int(_attempt(c["attempt"])))] = {
+                "shape": c.get("shape"), "primitive": c.get("primitive")}
+        cells, rule = [], None
+        for name, keys in sorted(per_ds.items()):
+            src = by_name.get(name)
+            req = (src.directory / "requests.csv") if src else None
+            if req is None or not req.is_file():
+                problems.append(f"{model}: no requests.csv for the M2 cells of dataset {name!r} (stream-cut audit)")
+                continue
+            a = stream_cut.audit(req, keys)
+            rule = a["rule"]
+            cells += [{**c, "dataset": name} for c in a["cells"]]
+        void = sorted((c["cell_id"], c["attempt"]) for c in cells if c["void_at_audit"])
+        out[model] = {"rule": rule, "manifest_record": rec, "cells": cells,
+                      "audit_void_cells": [{"cell_id": c, "attempt": a} for c, a in void],
+                      "excluded_from_evaluation": [c for c, _a in void],
+                      "totals": {k: sum(c[k] for c in cells) for k in ("sent", "model_error", "cut", "non_cut")}}
+    return out, problems
 
 
 def b_prime_inputs(doc: Mapping[str, Any], thresholds_file: Optional[Path], dwell_windows: int,
@@ -2781,7 +2835,13 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
         entry, man = doc["models"][model], inp["manifests"][model]
         mpath = inp["manifest_paths"][model]
         csv_path = work / f"{model}_validation.csv"
-        _write_validation_csv(csv_path, m["header"][model], m["rows"][model])
+        cut = (inp.get("stream_cut") or {}).get(model)
+        rows = m["rows"][model]
+        if cut:
+            # M2 stream-cut audit: audit-void cells are excluded (and listed in the result)
+            gone = {(d["cell_id"], int(d["attempt"])) for d in cut["audit_void_cells"]}
+            rows = [r for r in rows if (r["cell_id"], int(_attempt(r["attempt"]))) not in gone]
+        _write_validation_csv(csv_path, m["header"][model], rows)
         gcfg = dict(gate)
         if not isinstance(entry.get("a_deadband"), Mapping) and isinstance(entry.get("b_prime"), Mapping):
             # an older freeze: s0 from its own (hash-checked) training CSV, never from M
@@ -2806,10 +2866,12 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                            "sha256sums_sha256": man["sha256sums_sha256"],
                            "label_def_sha256": man["label_def_sha256"]},
             "validation_csv": str(csv_path), "validation_csv_sha256": sha256_file(csv_path),
-            "validation_rows": len(m["rows"][model]),
+            "validation_rows": len(rows),
             "published": entry["published"],
             **ev,
         }
+        if cut:
+            models[model]["stream_cut_audit"] = cut
     if onset_rule:
         failed = failures({k: r for k, r in models.items() if r["verdict"] == VERDICT_FAIL}, ONSET_GATING_CRITERIA)
         limitations = [x for x in failures({k: r for k, r in models.items()

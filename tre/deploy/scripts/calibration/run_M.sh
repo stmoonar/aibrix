@@ -40,7 +40,8 @@ case "$M_COMPOSITION" in
   m2-20261005)
     calib_require_env RHO_STAR_RUN
     calib_require_file "$RHO_STAR_RUN/$MODEL/M_manifest.json" "$RHO_STAR_RUN/$MODEL/M_SHA256SUMS"
-    COMPOSITION_ARGS=(--composition "$M_COMPOSITION" --rho-star-run "$RHO_STAR_RUN")
+    # the stream-cut rule's runtime limit (user 2026-10-05; the campaign refuses any other for M2)
+    COMPOSITION_ARGS=(--composition "$M_COMPOSITION" --rho-star-run "$RHO_STAR_RUN" --max-model-error-rate 0.10)
     for r in ${LEDGER_ROOTS:-}; do COMPOSITION_ARGS+=(--ledger-root "$r"); done
     ;;
   *) calib_die "unknown M_COMPOSITION '$M_COMPOSITION' (m1-20260923 | m2-20261005)" ;;

@@ -289,13 +289,18 @@ def build(args) -> dict:
                 "claim_rule": CROSS_SHAPE_CLAIM_RULE,
                 "ci_method": dict(t14_score.CROSS_SHAPE_CI_METHOD),
                 "yardstick": dict(t14_score.CROSS_SHAPE_YARDSTICK),
-                "ci_notes": ("the 6-window block is conservative relative to dline_refit.WINDOWS_PER_INDEPENDENT = 3 "
-                             "(30 s windows on a 10 s step); the 'windows / 6' wording of the method docs came from "
-                             "the earlier 5 s step. A zero-width per-shape CI at BA = 1 or .5 reflects perfect "
-                             "separation or a one-sided classification in 3 cells, not zero sampling uncertainty, so "
-                             "the median half width is taken over the non-degenerate shapes only (fewer than 2 in a "
-                             "kind: not_evaluable). Decided 2026-10-05 before sealing, on a TRAINING-only check "
-                             "(next-20261005/t14_ci_check/); no T14 claim was computed under this rule."),
+                "ci_notes": ("history (see dev_disclosure): the 2026-10-03 per-shape CI (the accept's cell bootstrap) "
+                             "degenerates with 3 cells per shape (half width 0); the defect was noticed while scoring "
+                             "the 2026-10-03 T14 as DEV under the hybrid label, and the CI method was then changed to "
+                             "the moving-block bootstrap on design grounds (the claim rule is unchanged). The 6-window "
+                             "block is conservative relative to dline_refit.WINDOWS_PER_INDEPENDENT = 3 (30 s windows "
+                             "on a 10 s step); the 'windows / 6' wording of the method docs came from the earlier 5 s "
+                             "step. The yardstick refinement came from a TRAINING-only check (next-20261005/"
+                             "t14_ci_check/: run2 / run2b holds, 3-cell subsets), not from DEV: a zero-width per-shape "
+                             "CI at BA = 1 or .5 reflects perfect separation or a one-sided classification in 3 cells, "
+                             "not zero sampling uncertainty, so the median half width is taken over the non-degenerate "
+                             "shapes only (fewer than 2 in a kind: not_evaluable). No T14 cross-shape claim was "
+                             "computed under the new CI method or yardstick."),
                 "role": "claim rule for the text, sealed under the hybrid label; not an acceptance gate"},
             "scoring": {"decisions": DECISIONS, "disclosure_rules": DISCLOSURE_RULES,
                         "scorer": {"module": "scripts.analysis.t14_score (rule v2)",
@@ -314,9 +319,17 @@ def build(args) -> dict:
                                 "the CRIT / HIGH lines, not on Z = 1); same rule as M2, all three models"),
             },
         },
-        "dev_disclosure": ("the 2026-10-03 T14 (same design, other seed) was opened and scored under the completion "
-                           "label (pass); it is DEV for this round and informed no choice in this document beyond "
-                           "keeping the design unchanged"),
+        "dev_disclosure": ("the 2026-10-03 T14 (same design, other seed) is DEV for this round. (1) It was opened and "
+                           "scored under the completion label in its own round (pass). (2) It was scored again as DEV "
+                           "under the hybrid label with this round's freeze (next-20261005/dev/dev_score.json): rule "
+                           "v2 verdict pass_a_disclosed (A: BA .820, CI95 low .749 < .75; FA 0). (3) That DEV scoring "
+                           "is where the defect of the per-shape CI was noticed: the cell bootstrap degenerates to a "
+                           "half width of 0 with 3 cells per shape; the CI method was then changed to the moving-block "
+                           "bootstrap on design grounds (evaluation.cross_shape.ci_method; claim rule unchanged). "
+                           "(4) The yardstick refinement (median half width over non-degenerate shapes only) came "
+                           "from a TRAINING-only check, not from DEV. (5) The cross-shape result of the 2026-10-03 T14 "
+                           "under the new CI method and yardstick was deliberately NOT computed. Beyond these points "
+                           "and keeping the design unchanged, the old T14 informed no choice in this document."),
         "known_risks": [
             "the capacity prior's leave-one-out of S1 is far off (the short-prompt S1 dominates the intercept); the 8 "
             "T14 predictions are all positive",
