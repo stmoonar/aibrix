@@ -15,6 +15,7 @@ CustomTraceGenerator - 增强版负载测试系统
   --max-retries    OpenAI SDK 重试次数（默认 2，与 v1 硬编码值相同）
   --routing-strategy  routing-strategy 请求头（默认取配置，v1 配置均为 least-gpu-cache；传 "" 不发该头）
   --trace-file     直接重放 v1 记录的逐请求计划 traces.json（跳过阶段1生成）
+  --ignore-eos     opt-in：每个请求加 ignore_eos: true（默认关，与 v1 相同）
 以及 performance_metrics.json 每行追加的审计字段。
 
 [2026-09-30] 发送改由全项目唯一的发送客户端 tre_replayer（profile e1_v1）完成，本包只剩
@@ -73,7 +74,8 @@ class CustomTraceGenerator:
 
     def __init__(self, config_path: str, output_dir: str = None, verbose: bool = False,
                  base_url: str = None, max_retries: int = None,
-                 routing_strategy: str = None, trace_file: str = None):
+                 routing_strategy: str = None, trace_file: str = None,
+                 ignore_eos: bool = False):
         """
         初始化CustomTraceGenerator
 
@@ -110,6 +112,8 @@ class CustomTraceGenerator:
             self.config.client.max_retries = int(max_retries)
         if routing_strategy is not None:
             self.config.client.routing_algorithm = routing_strategy
+        if ignore_eos:  # opt-in only: the flag can turn it on, never off (config key wins otherwise)
+            self.config.client.ignore_eos = True
         self.config.client.validate_process_config()
 
         if self.verbose:
@@ -231,6 +235,7 @@ class CustomTraceGenerator:
                 "gateway_endpoint": self.config.gateway_endpoint,
                 "openai_base_url": f"{self.config.gateway_endpoint}/v1",
                 "max_retries": self.config.client.max_retries,
+                "ignore_eos": bool(getattr(self.config.client, "ignore_eos", False)),
                 "timeout": self.config.client.timeout,
                 "routing_strategy_header": self.config.client.routing_algorithm or None,
                 "enable_streaming": self.config.client.enable_streaming,
@@ -508,6 +513,9 @@ def main(argv=None):
     parser.add_argument('--routing-strategy', default=None,
                        help='routing-strategy 请求头取值（默认取配置 client.routing_algorithm，'
                             'v1 配置均为 least-gpu-cache；传空串则不发送该头）')
+    parser.add_argument('--ignore-eos', action='store_true',
+                       help='每个请求加 ignore_eos: true（OpenAI SDK extra_body），输出长度 = max_tokens；'
+                            '默认关（= v1 请求）。也可用配置 client.ignore_eos: true')
     parser.add_argument('--trace-file', default=None,
                        help='重放 v1 记录的逐请求计划 traces.json（跳过阶段1生成；'
                             '同目录 load_timeline_*.json 一并复制到输出目录）')
@@ -535,6 +543,7 @@ def main(argv=None):
             max_retries=args.max_retries,
             routing_strategy=args.routing_strategy,
             trace_file=args.trace_file,
+            ignore_eos=args.ignore_eos,
         )
 
         success = False

@@ -22,7 +22,7 @@ in their **profile**.
 | | `calib` | `replay` | `e1_v1` |
 |---|---|---|---|
 | endpoint | `/v1/chat/completions` | `/v1/completions` | `/v1/chat/completions` (SDK) |
-| body | `api.request_body`: `model`, `messages`=[user], `max_tokens`, `temperature: 0`, `ignore_eos: true`, `stream`, `stream_options.include_usage`, `seed` if given | same with `prompt` | v1's `create()` kwargs: `model`, `messages`=[user], `temperature` from the model config (unset → `null`), `stream`, `stream_options.include_usage`, `max_tokens` = trace's, else config's, else absent; **no** `ignore_eos` |
+| body | `api.request_body`: `model`, `messages`=[user], `max_tokens`, `temperature: 0`, `ignore_eos: true`, `stream`, `stream_options.include_usage`, `seed` if given | same with `prompt` | v1's `create()` kwargs: `model`, `messages`=[user], `temperature` from the model config (unset → `null`), `stream`, `stream_options.include_usage`, `max_tokens` = trace's, else config's, else absent; **no** `ignore_eos` (opt-in: `tre_loadgen_v1 --ignore-eos` / config `client.ignore_eos: true` adds `ignore_eos: true` via `extra_body`, nothing else changes) |
 | headers | `Content-Type`, `Accept: text/event-stream`, `model`, `routing-strategy` if set | same | SDK headers (`Authorization: Bearer dummy-key-for-local-gateway`, `X-Stainless-*`, UA `AsyncOpenAI/Python`), `routing-strategy` (config, `least-gpu-cache`) |
 | prompt | materialised natural prompt, exact templated length | materialised | the trace's text, verbatim |
 | transport | `httpx.AsyncClient`, keep-alive (idle expiry 4 s, `TRE_SENDER_KEEPALIVE_EXPIRY_S`), sharded pools (64 connections, 16 idle kept per shard; shards up to `max_in_flight`), `Accept-Encoding: identity` | same | `openai.DefaultAsyncHttpxClient` (1000 / 100), as v1 |

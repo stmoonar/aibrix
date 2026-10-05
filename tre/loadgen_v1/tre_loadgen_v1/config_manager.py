@@ -65,6 +65,8 @@ class ClientConfig:
     oracle_trace_upload_url: str = None
     # [v2 port] v1 在 client_dispatcher 里硬编码 max_retries=2；这里做成参数，默认值不变
     max_retries: int = 2
+    # [v2] opt-in: 每个请求加 ignore_eos: true（默认关 = v1 请求不变）
+    ignore_eos: bool = False
 
     def validate_routing_algorithm(self):
         """验证路由算法配置"""
@@ -300,7 +302,8 @@ class ConfigManager:
             task_batch_window=client_dict.get('task_batch_window', 5.0),
             load_monitor_interval=client_dict.get('load_monitor_interval', 1.0),
             oracle_trace_upload_url=client_dict.get('oracle_trace_upload_url', None),
-            max_retries=client_dict.get('max_retries', 2)
+            max_retries=client_dict.get('max_retries', 2),
+            ignore_eos=bool(client_dict.get('ignore_eos', False))
         )
 
     def _parse_models_config(self, models_list: List[Dict[str, Any]]) -> List[ModelConfig]:

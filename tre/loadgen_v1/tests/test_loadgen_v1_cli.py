@@ -88,6 +88,30 @@ def test_replay_recorded_trace_end_to_end(fake_server, tmp_path):
     for r in reqs:
         assert r["path"] == "/v1/chat/completions"
         assert "routing-strategy" not in r["headers"]
+        assert "ignore_eos" not in r["body"]  # default: v1's request, no ignore_eos
+    assert meta["ignore_eos"] is False
+
+
+def test_ignore_eos_flag_adds_field_to_every_request(fake_server, tmp_path):
+    tag = uuid.uuid4().hex[:8]
+    rec = _recorded_dir(tmp_path, tag)
+    cfg = write_config(tmp_path / "config.yaml", tmp_path / "base")
+    out = tmp_path / "out"
+    proc = _run_cli(["--config", str(cfg), "--trace-file", str(rec / "traces.json"),
+                     "--base-url", fake_server.url, "--output", str(out), "--max-retries", "0",
+                     "--ignore-eos"], cwd=tmp_path)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    reqs = fake_server.records_for({f"{tag} a", f"{tag} b", f"{tag} c", f"{tag} d"})
+    assert len(reqs) == 4
+    by_prompt = {r["body"]["messages"][0]["content"]: r["body"] for r in reqs}
+    for body in by_prompt.values():
+        # only ignore_eos is added: temperature stays JSON null, stream + usage as before
+        assert body["ignore_eos"] is True
+        assert "temperature" in body and body["temperature"] is None
+        assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    # max_tokens unchanged: the trace's value, else the model config's
+    assert by_prompt[f"{tag} a"]["max_tokens"] == 3 and by_prompt[f"{tag} b"]["max_tokens"] == 6
+    assert json.loads((out / "loadgen_run_meta.json").read_text())["ignore_eos"] is True
 
 
 def test_dispatch_requires_explicit_base_url(tmp_path):

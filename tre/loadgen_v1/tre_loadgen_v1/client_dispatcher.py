@@ -7,7 +7,8 @@
   的 ``WorkerProcess.create_client`` 相同（api_key 占位、``<gateway>/v1``、max_retries、
   timeout、``routing-strategy`` 头）；请求参数与 v1 的 ``send_request_streaming`` 相同
   （messages=单条 user、temperature 取模型配置（未配置 = JSON null）、stream +
-  include_usage、max_tokens 取 trace 否则取模型配置；不加 ignore_eos）。
+  include_usage、max_tokens 取 trace 否则取模型配置；默认不加 ignore_eos，
+  ``--ignore-eos`` / 配置 ``client.ignore_eos: true`` 时每个请求加 ``ignore_eos: true``）。
 * 并发模型：与 v1 相同 —— ``process_count`` 个进程 × 每进程一个 asyncio 事件循环 × 每进程
   一个 SDK 客户端（httpx 连接池 1000/100）。不同处：schedule 事先按请求轮转分片给各进程，
   各进程按绝对时间自行发送（``tre_replayer.engine.procpool``），不再有 v1 那个在事件循环
@@ -80,6 +81,7 @@ def v1_options_from_config(config: Any) -> V1ChatOptions:
         timeout_s=float(getattr(client, "timeout", 300.0)),
         routing_strategy=getattr(client, "routing_algorithm", None) or None,
         streaming=bool(getattr(client, "enable_streaming", True)),
+        ignore_eos=bool(getattr(client, "ignore_eos", False)),
     )
 
 

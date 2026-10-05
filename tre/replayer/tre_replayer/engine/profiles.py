@@ -20,7 +20,8 @@ record:
     The paper's client (v1 ``CustomTraceGenerator``, ported as ``tre/loadgen_v1``):
     ``chat.completions.create`` through the OpenAI SDK with v1's options - ``messages``
     = one user turn holding the trace's prompt, ``temperature`` from the model's config
-    (unset = JSON ``null``), **no** ``ignore_eos``, ``max_tokens`` = the trace's
+    (unset = JSON ``null``), **no** ``ignore_eos`` (opt-in: ``V1ChatOptions.ignore_eos``,
+    loadgen_v1 ``--ignore-eos``), ``max_tokens`` = the trace's
     ``max_output_tokens`` (else the model's config, else absent), ``stream`` +
     ``include_usage``; ``routing-strategy`` header; SDK retries (default 2, as v1);
     timeout 300 s. Record: v1's ``performance_metrics.json`` line (v1 fields, then v1's
@@ -123,6 +124,10 @@ class V1ChatOptions:
     #: SDK clients per worker process (1 = v1's single client, the default; None = up
     #: to transport.E1_MAX_POOL_SHARDS, opened as load needs them). Not a request parameter.
     pool_shards: Optional[int] = 1
+    #: Opt-in (default off = v1's request): add ``ignore_eos: true`` to every request body
+    #: (SDK ``extra_body``), so each output is exactly ``max_tokens`` long. Nothing else
+    #: changes (temperature, prompts, max_tokens).
+    ignore_eos: bool = False
 
     def kwargs_for(self, model: str, prompt: str, max_output_tokens: Optional[int]) -> dict[str, Any]:
         """``chat.completions.create`` keyword arguments, as v1 built them."""
@@ -143,6 +148,8 @@ class V1ChatOptions:
             kwargs["stream_options"] = {"include_usage": True}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if self.ignore_eos:
+            kwargs["extra_body"] = {"ignore_eos": True}
         return kwargs
 
     def as_dict(self) -> dict:
