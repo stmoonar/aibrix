@@ -144,6 +144,9 @@ class ServiceManagerError(Exception):
             "status": self.status,
             "retriable": self.retriable,
         }
+        code = (self.body or {}).get("error")
+        if isinstance(code, str) and code:
+            result["code"] = code  # the SM's structured error code (writer_busy, ...)
         if self.not_executed:
             result["not_executed"] = True
         if self.floor_violation:

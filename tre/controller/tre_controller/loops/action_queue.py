@@ -14,6 +14,7 @@ from tre_controller.planning.planner import (
     DefragAction,
     HideAction,
     ReceiverTarget,
+    RelayHold,
     SafeScaleCommitAction,
     ScaleAction,
     SourceLoop,
@@ -287,6 +288,9 @@ class ActionQueue:
         self._view_change: dict[str, tuple[int, str]] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
+        #: Review P2-1 (2026-10-06): (donor, receiver) -> the hold of a relay the SM
+        #: answered with nothing done (see :meth:`relay_holds`).
+        self._relay_holds: dict[tuple[str, str], RelayHold] = {}
         #: C1 review P3: id(queued action) -> the record that part belongs to (a part of
         #: a superseded target updates that record, never its successor).
         self._rescue_parts: dict[int, RescueTargetRecord] = {}
@@ -455,6 +459,32 @@ class ActionQueue:
         relay records both sides (donor "down", receiver "up"); a call that changed
         nothing (``taken: 0``, a relay side with no pair) records nothing (2026-10-02)."""
         return dict(self._view_change)
+
+    def relay_holds(self) -> dict[tuple[str, str], RelayHold]:
+        """Review P2-1: (donor, receiver) -> :class:`RelayHold` of its last relay when
+        the SM answered it with nothing done (refused, vetoed, floor-clamped, unfilled,
+        no pair completed) - the planner does not send the same pair again while the
+        fleet view it was planned from is current. A relay with a pair done, or with an
+        unknown outcome (timeout, transport error), leaves no hold."""
+        return dict(self._relay_holds)
+
+    def _note_relay_hold(self, action: TransferIntent, result: DispatchResult) -> None:
+        pair = (action.donor_model, action.receiver_model)
+        summary = result.transfer or {}
+        outcome = summary.get("outcome")
+        if (result.done or 0) > 0 or outcome == "unknown" or result.done is None or action.basis is None:
+            self._relay_holds.pop(pair, None)
+            return
+        if outcome in ("refused", "unsupported"):
+            reason = str(summary.get("code") or outcome)
+        elif summary.get("clamped_by_floor"):
+            reason = "clamped_by_floor"
+        elif summary.get("pairs"):
+            reason = "no_pair_done"
+        else:
+            skipped = summary.get("skipped") or {}
+            reason = "unfilled" + (f"({','.join(sorted(map(str, skipped)))})" if skipped else "")
+        self._relay_holds[pair] = RelayHold(basis=action.basis, reason=reason)
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
         """C1: model -> its last rescue target (copies). The planner tick keeps the
@@ -1411,6 +1441,7 @@ class ActionQueue:
         )
         self._note_rescue_result(action, result)
         self._record_transfer_done(action, result)
+        self._note_relay_hold(action, result)
         if result.ok and self._is_observe_fresh():
             # Observe began while the SM ran the relay: it was sent before (the mode is
             # read right before the call) and the SM completes it - recorded only.
@@ -1644,7 +1675,8 @@ class ActionQueue:
             return DispatchResult(
                 model=receiver, action_kind="transfer", ok=False, error=error, retriable=False,
                 taken=0 if outcome == "refused" else None, done=0 if outcome == "refused" else None,
-                transfer={"outcome": outcome, "status": status}, not_executed=outcome == "refused",
+                transfer={"outcome": outcome, "status": status, "code": response.get("code")},
+                not_executed=outcome == "refused",
             )
         summary = _transfer_summary(body)
         done, taken, unfilled = summary["done"], summary["taken"], summary["unfilled"]

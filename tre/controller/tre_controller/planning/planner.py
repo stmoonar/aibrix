@@ -133,6 +133,10 @@ class ClusterView:
     floor_enforced: bool | None = field(default=None, compare=False)
     #: Why ``routable_ids`` is None (``routable_missing`` / ``routable_unavailable: ...``).
     routable_error: str | None = field(default=None, compare=False)
+    #: ``/v2/state`` ``version``: the SM binding-store version the view was read at
+    #: (every SM write - sleep, wake, hide, transfer - raises it). None = not reported.
+    #: Keys the relay hold (:class:`RelayHold`).
+    sm_version: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -197,6 +201,62 @@ IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
 
 
 @dataclass(frozen=True)
+class RelayBasis:
+    """The fleet-view inputs a relay was planned from (review P2-1, 2026-10-06): the
+    SM state version of the view, the SM floor view (routable, floor, headroom) of
+    both models, and the view's own time (``state_ms`` / ``fetched_ms``)."""
+
+    sm_version: int | None
+    donor_floor: Any
+    receiver_floor: Any
+    view_ms: int | None
+
+
+def relay_basis(view: "ClusterView | None", donor: str, receiver: str) -> RelayBasis | None:
+    """:class:`RelayBasis` of a donor -> receiver relay planned on ``view`` (None
+    without a view: nothing to key a hold on)."""
+    if view is None:
+        return None
+    floors = view.model_floors or {}
+    return RelayBasis(
+        sm_version=view.sm_version,
+        donor_floor=floors.get(donor),
+        receiver_floor=floors.get(receiver),
+        view_ms=view.state_ms if view.state_ms is not None else view.fetched_ms,
+    )
+
+
+#: SM refusals of a relay that say nothing about the fleet (the writer lock was busy,
+#: the routable view could not be read): any newer fleet view releases their hold.
+TRANSIENT_RELAY_REFUSALS = frozenset({"writer_busy", "routable_unknown"})
+
+
+@dataclass(frozen=True)
+class RelayHold:
+    """A relay the SM answered with nothing done (``done == 0``: refused, vetoed,
+    floor-clamped, unfilled - never an unknown outcome) is not planned again for the
+    same donor -> receiver pair while the fleet view it was planned from is still
+    current (review P2-1: no new writer-lock call for the same answer). A state gate,
+    not a timer: a new SM state version or a changed floor view of either model
+    releases it; a transient refusal (:data:`TRANSIENT_RELAY_REFUSALS`), or a view
+    without an SM version, is released by any newer view."""
+
+    basis: RelayBasis
+    reason: str
+
+    def holds(self, current: RelayBasis | None) -> bool:
+        if current is None:
+            return False
+        if (
+            self.reason in TRANSIENT_RELAY_REFUSALS
+            or current.sm_version is None
+            or self.basis.sm_version is None
+        ):
+            return current == self.basis
+        return replace(current, view_ms=None) == replace(self.basis, view_ms=None)
+
+
+@dataclass(frozen=True)
 class TransferIntent:
     """An immediate donor -> receiver relay expressed as a COUNT (2026-10-02, design
     20261002-controller-transfer). The controller decides the quantity - how many
@@ -219,6 +279,8 @@ class TransferIntent:
     pairs: int = 0
     #: C1: the rescue target the receiver side belongs to (bookkeeping only).
     rescue: RescuePlan | None = field(default=None, compare=False)
+    #: The fleet-view inputs it was planned from (:class:`RelayHold`; None = no view).
+    basis: RelayBasis | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.pairs <= 0:
@@ -385,6 +447,7 @@ def build_plan(
     preemptible_models: set[str] | None = None,
     rescue_bases: Mapping[str, RescueBasis] | None = None,
     view_pending: Mapping[str, str] | None = None,
+    relay_holds: Mapping[tuple[str, str], RelayHold] | None = None,
 ) -> PlanResult:
     """One plan. Quantity only for the immediate relays (2026-10-02): a CRITICAL / LOW
     receiver's need is met first from free capacity (its sleeping bindings on free
@@ -392,7 +455,9 @@ def build_plan(
     donors (count only; the SM places them), then by middle-zone SafeScale probes. A
     donor gives at most its ``floor_headroom`` (SM count, ``_donor_headroom``) minus
     what this tick already took from it. Whatever the relays cannot cover is planned
-    again on the next tick from a new view (free capacity first)."""
+    again on the next tick from a new view (free capacity first). ``relay_holds``
+    ((donor, receiver) -> :class:`RelayHold`): pairs the SM answered with nothing
+    done on the fleet view that is still current - not planned again."""
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
     # out a retry backoff. A CRITICAL receiver among them is still planned: the
@@ -798,6 +863,8 @@ def build_plan(
                         reason="critical_donor_immediate",
                         source_loop="rescue",
                         events=events,
+                        view=cluster_view,
+                        relay_holds=relay_holds,
                     )
                     still_needed -= gained
 
@@ -1046,6 +1113,8 @@ def build_plan(
                 reason="low_fairness_donor_immediate",
                 source_loop="fairness",
                 events=events,
+                view=cluster_view,
+                relay_holds=relay_holds,
             )
 
         for middle in middle_zone:
@@ -1117,13 +1186,27 @@ def _plan_transfer_intent(
     reason: str,
     source_loop: SourceLoop,
     events: list[str],
+    view: ClusterView | None = None,
+    relay_holds: Mapping[tuple[str, str], RelayHold] | None = None,
 ) -> int:
     """One immediate relay as a :class:`TransferIntent` (count only). With a cluster
     view its size is bounded by :meth:`_SlotOccupancy.pairable_count` - pairs the SM
     can form (receiver bindings whose every GPU this donor holds awake) - so no intent
     is sent that cannot be filled; without one, by ``need`` / ``donor_limit``.
+    No relay while the SM reported its routable view unreadable (``routable_error``
+    other than ``routable_missing``, a state without the field: the SM refuses the
+    relay with 409 ``routable_unknown`` - ``relay_skipped_routable_unknown``) or while the pair is held (:class:`RelayHold`:
+    ``relay_held:<donor>:<receiver>:<reason>``).
     Returns the receiver replicas it is expected to add."""
     if need <= 0 or donor_limit <= 0:
+        return 0
+    if view is not None and view.routable_error and view.routable_error != "routable_missing":
+        _event_once(events, f"relay_skipped_routable_unknown:{donor}:{receiver}")
+        return 0
+    basis = relay_basis(view, donor, receiver)
+    hold = (relay_holds or {}).get((donor, receiver))
+    if hold is not None and hold.holds(basis):
+        _event_once(events, f"relay_held:{donor}:{receiver}:{hold.reason}")
         return 0
     if occupancy is None:
         pairs = count = min(need, donor_limit)
@@ -1145,9 +1228,15 @@ def _plan_transfer_intent(
             reason=reason,
             source_loop=source_loop,
             sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+            basis=basis,
         )
     )
     return pairs
+
+
+def _event_once(events: list[str], event: str) -> None:
+    if event not in events:
+        events.append(event)
 
 
 def _plan_middle_zone_probe(

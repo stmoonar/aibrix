@@ -254,6 +254,8 @@ def run_planner_tick(
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
         # C1: earlier rescue targets the decision windows do not reflect yet.
         rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
+        # Review P2-1: relays the SM answered with nothing done on a still-current view.
+        relay_holds=_relay_holds(queue),
     )
     _note_saturation_steps(plan.actions, classifications, contexts, snapshot, signal_state, cluster_view)
     if _prof_on:
@@ -576,6 +578,11 @@ def _probe_backoff_models(
             int(metrics.window_end_ms),
         )
     return dict(holds(signals))
+
+
+def _relay_holds(queue: PlannerQueue):
+    reader = getattr(queue, "relay_holds", None)
+    return reader() if callable(reader) else None
 
 
 def _drain_queue_events(queue: PlannerQueue) -> list[str]:

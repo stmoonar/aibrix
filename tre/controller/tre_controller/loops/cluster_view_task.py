@@ -108,7 +108,19 @@ def cluster_view_from_state(state: dict, topology: ClusterTopology) -> ClusterVi
         model_floors=dict(routable.models),
         floor_enforced=routable.floor_enforced,
         routable_error=routable.error,
+        sm_version=_state_version(state),
     )
+
+
+def _state_version(state: dict) -> int | None:
+    """``/v2/state`` ``version`` (the SM binding-store version), None when absent."""
+    raw = state.get("version") if isinstance(state, dict) else None
+    if isinstance(raw, bool):
+        return None
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 #: ``/v2/state`` ``gpus[].reason`` values that make a GPU no wake / create capacity
