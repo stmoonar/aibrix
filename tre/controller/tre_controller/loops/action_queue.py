@@ -158,6 +158,11 @@ class DispatchResult:
     #: ``writer_busy``, ``floor_violation``, a located wake refusal, 400 / 404 / 503):
     #: accounted as not executed - no view-pending / O1 stamp, no last action.
     not_executed: bool = False
+    #: Review P3 (2026-10-06): pods a multi-pod binding-power call changed before a
+    #: later pod failed. Such a failed result still changed the fleet: it is stamped
+    #: (O1 / view-pending), recorded as the model's last action and counted for its
+    #: rescue target.
+    changed: tuple[str, ...] = ()
 
 
 @dataclass
@@ -544,7 +549,7 @@ class ActionQueue:
             record.gained += int(part.delta)
         else:
             record.failures += 1
-            record.gained += min(int(part.delta), len(result.picked or ()))
+            record.gained += min(int(part.delta), max(len(result.picked or ()), len(result.changed)))
 
     def _finish_rescue(self, action) -> None:
         """C1: one rescue scale-up ended (done, failed, dropped): the target is done
@@ -1040,6 +1045,8 @@ class ActionQueue:
         result = await self._timed_dispatch(action, queued.model)
         self._note_rescue_result(action, result)
         if not result.ok:
+            if result.changed:
+                self._record_done(queued.model, action, result)
             return result, queued
         self._record_done(queued.model, action, result)
         results.append(replace(result, attempts=attempts))
@@ -1058,6 +1065,8 @@ class ActionQueue:
             donor = action.donor_sleep()
             result = await self._timed_dispatch(donor, action.donor)
             if not result.ok:
+                if result.changed:
+                    self._record_done(action.donor, donor, result)
                 if result.unconfirmed:
                     action = replace(
                         action,
@@ -1751,18 +1760,25 @@ class ActionQueue:
         # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: the
         # SafeScale commit of the hidden probe pods.
         # Stops at the first failure (a retry re-sends every pod: the SM answers a
-        # binding already in the wanted power state with a no-op).
+        # binding already in the wanted power state with a no-op). A failure after
+        # some pods changed is reported with them (``changed``), never as "nothing
+        # happened" - even when the failing pod's refusal changed nothing itself.
+        changed: list[str] = []
         for pod in action.pods:
             response = await self._client.set_binding_power(
                 pod, awake=action.delta > 0, **_sleep_kwargs(action)
             )
             if not bool(response.get("ok", False)):
-                return _dispatch_result(model=action.model, action_kind="scale", response=response)
+                result = _dispatch_result(model=action.model, action_kind="scale", response=response)
+                if changed:
+                    result = replace(result, changed=tuple(changed), not_executed=False)
+                return result
+            changed.append(pod)
         return DispatchResult(model=action.model, action_kind="scale", ok=True)
 
     def _record_done(self, model: str, action, result: DispatchResult) -> None:
         direction = _action_direction(action)
-        if not result.ok or direction is None:
+        if not (result.ok or result.changed) or direction is None:
             return
         if direction == "down" and result.taken == 0:
             return  # clamped to nothing (2026-10-02): no scale-down happened

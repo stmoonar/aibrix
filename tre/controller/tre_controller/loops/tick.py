@@ -732,11 +732,18 @@ def _apply_safescale(
                 rescue = replace(rescue, covered=rescue.covered + restore_used[model])
                 rescue_of[model] = rescue
             if isinstance(action, TransferIntent):
-                # A relay is never split (its count is the SM's donor count): covered
-                # entirely by restored pods (dropped), or kept whole.
-                if restore_left[model] >= delta:
+                # Covered entirely by restored pods: dropped. Partly covered (review P3,
+                # 2026-10-06): shrunk by the covered receiver pairs when every pair takes
+                # the same number of donors (count = pairs x donors per pair, the SM's
+                # donor count); otherwise kept whole.
+                left = restore_left[model]
+                if left >= delta:
                     restore_left[model] -= delta
                     continue
+                per_pair, uneven = divmod(int(action.count), int(action.pairs))
+                if left > 0 and not uneven:
+                    restore_left[model] = 0
+                    action = replace(action, pairs=delta - left, count=(delta - left) * per_pair)
                 if rescue is not getattr(action, "rescue", None):
                     action = replace(action, rescue=rescue)
                 survived.add(model)
