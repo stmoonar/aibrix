@@ -92,6 +92,7 @@ class FakeEngine:
         fail_sleep: bool = False,
         hold_abort_output: bool = False,
         break_at: int | None = None,
+        break_requests: int | None = None,
     ) -> None:
         self.name = name
         self.token_delay_s = token_delay_s
@@ -110,8 +111,10 @@ class FakeEngine:
         #: an aborted generation emits its abort output only after ``release_abort_output``.
         self.hold_abort_output = hold_abort_output
         self._abort_output_release = asyncio.Event()
-        #: a stream's connection is dropped (no abort, no [DONE]) before token ``break_at``.
+        #: a stream's connection is dropped (no abort, no [DONE]) before token ``break_at``;
+        #: only for the first ``break_requests`` streams (None = all).
         self.break_at = break_at
+        self.break_requests = break_requests
         self.sleeping = False
         self.requests: list[dict[str, Any]] = []
         self.active: dict[str, _Req] = {}
@@ -290,7 +293,9 @@ class FakeEngine:
                 role_sent = False
                 full, sent = "", 0
                 for index in range(max_tokens):
-                    if self.break_at is not None and index == self.break_at:
+                    if self.break_at is not None and index == self.break_at and self.break_requests != 0:
+                        if self.break_requests is not None:
+                            self.break_requests -= 1
                         request.transport.close()  # an engine crash mid-stream
                         break
                     ok = await step(index)
@@ -421,6 +426,21 @@ class FakeGateway:
         out_headers = {k: v for k, v in upstream.headers.items()
                        if k.lower() not in ("content-length", "transfer-encoding", "date", "server", "connection")}
         out_headers["target-pod"] = pod
+        if upstream.status != 200:
+            # Like the TRE gateway plugin (gateway.go responseErrorProcessingWithHeaders /
+            # util.go generateErrorMessage): a non-200 upstream answer is replaced by the
+            # plugin's own OpenAI error whose message is the upstream body as a string; the
+            # upstream headers are dropped.
+            try:
+                body = (await upstream.read()).decode("utf-8", "replace")
+            finally:
+                upstream.release()
+            error = {"message": body, "type": "overloaded_error" if upstream.status == 503 else "api_error",
+                     "code": "service_unavailable" if upstream.status == 503 else None, "param": None}
+            resp = web.json_response({"error": error}, status=upstream.status, headers={"target-pod": pod})
+            if not self.keepalive:
+                resp.force_close()
+            return resp
         try:
             resp = web.StreamResponse(status=upstream.status, headers=out_headers)
             if not self.keepalive:

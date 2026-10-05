@@ -96,22 +96,28 @@ data:
     #: Removed from a completions request continued with a token-id prompt.\nCOMPLETION_CONT_DROP\
     \ = (\"prompt\", \"prompt_embeds\", \"echo\", \"suffix\", \"truncate_prompt_tokens\"\
     , \"add_special_tokens\")\n\n_ABORT_MARK = b'\"abort\"'\n\n#: Start of the message\
-    \ of every error response the sidecar itself produces (``_error``).\n#: A 502\
-    \ / 503 carrying it came from another sidecar and is final for the gateway retry\n\
-    #: loop (``ReissueSidecar._gateway_request``).\nSIDECAR_ERROR_PREFIX = \"tre-reissue\
-    \ sidecar:\"\nSIDECAR_ERROR_MARK = SIDECAR_ERROR_PREFIX.encode()\n\n\n\ndef _request_key(name:\
-    \ str, kind: type) -> Any:\n    \"\"\"A ``web.Request`` item key (aiohttp < 3.12\
-    \ has no ``web.RequestKey``: a string).\"\"\"\n    return web.RequestKey(name,\
-    \ kind) if hasattr(web, \"RequestKey\") else name\n\n\n#: Per-request: the tre_reissue_total\
-    \ kind owed for a request whose retry / continuation\n#: is under way; ``_account``\
-    \ clears it. If the client goes away first, the request is\n#: accounted as ``(kind,\
-    \ \"client_gone\")``.\n_REISSUE_PENDING = _request_key(\"tre_reissue_pending\"\
-    , str)\n#: Per-request: the client has the complete response (the stream's ``[DONE]``\
-    \ is\n#: written); a cancel after that (the engine had not ended its response\
-    \ yet) is not a\n#: client cancel.\n_DELIVERED = _request_key(\"tre_reissue_delivered\"\
-    , bool)\n\nOVERHEAD_BUCKETS_S = (\n    0.00005, 0.0001, 0.00025, 0.0005, 0.001,\
-    \ 0.0025, 0.005, 0.01, 0.05, 0.1, 0.25, 1.0,\n)\nGAP_BUCKETS_S = (0.05, 0.1, 0.25,\
-    \ 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0)\n\n\n# ----------------------------------------------------------------------------\
+    \ of every error response the sidecar itself produces (``_error``).\nSIDECAR_ERROR_PREFIX\
+    \ = \"tre-reissue sidecar:\"\n#: In the message of a sidecar 503 that is FINAL:\
+    \ that sidecar already spent its bounded\n#: gateway retries (retry_exhausted)\
+    \ or the hop limit is reached (depth_limit). A 502 / 503\n#: carrying it is not\
+    \ retried by the sidecar before it (``ReissueSidecar._gateway_request``).\n#:\
+    \ A plain token, no quotes or backslashes: the TRE gateway plugin replaces an\
+    \ upstream\n#: error body with its own OpenAI error whose message is the original\
+    \ body as a JSON\n#: string (escaped) and drops the upstream headers, so only\
+    \ a substring survives.\nFINAL_ERROR_MARK = \"tre_reissue_final\"\n_FINAL_ERROR_MARK_B\
+    \ = FINAL_ERROR_MARK.encode()\n\n\n\ndef _request_key(name: str, kind: type) ->\
+    \ Any:\n    \"\"\"A ``web.Request`` item key (aiohttp < 3.12 has no ``web.RequestKey``:\
+    \ a string).\"\"\"\n    return web.RequestKey(name, kind) if hasattr(web, \"RequestKey\"\
+    ) else name\n\n\n#: Per-request: the tre_reissue_total kind owed for a request\
+    \ whose retry / continuation\n#: is under way; ``_account`` clears it. If the\
+    \ client goes away first, the request is\n#: accounted as ``(kind, \"client_gone\"\
+    )``.\n_REISSUE_PENDING = _request_key(\"tre_reissue_pending\", str)\n#: Per-request:\
+    \ the client has the complete response (the stream's ``[DONE]`` is\n#: written);\
+    \ a cancel after that (the engine had not ended its response yet) is not a\n#:\
+    \ client cancel.\n_DELIVERED = _request_key(\"tre_reissue_delivered\", bool)\n\
+    \nOVERHEAD_BUCKETS_S = (\n    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025,\
+    \ 0.005, 0.01, 0.05, 0.1, 0.25, 1.0,\n)\nGAP_BUCKETS_S = (0.05, 0.1, 0.25, 0.5,\
+    \ 1.0, 2.0, 5.0, 10.0, 30.0, 60.0)\n\n\n# ----------------------------------------------------------------------------\
     \ config\n\n\ndef _truthy(value: str) -> bool:\n    return value.strip().lower()\
     \ in {\"1\", \"true\", \"yes\", \"on\"}\n\n\n@dataclass(frozen=True)\nclass Config:\n\
     \    \"\"\"Every field ``foo`` is read from ``TRE_REISSUE_FOO`` (see ``from_env``).\"\
@@ -598,9 +604,11 @@ data:
     \ monotonic; suppressed since).\n        self._warned: dict[str, tuple[float,\
     \ int]] = {}\n        #: Requests that got an idle pooled connection (diagnostics\
     \ / tests).\n        self.local_reused = 0\n        self._monitor_task: asyncio.Task\
-    \ | None = None\n        self._max_model_len: int | None = cfg.max_model_len or\
-    \ None\n        self._sleep_error_mark = json.dumps(cfg.sleeping_error_type).encode()\n\
-    \        self._gateway_drop = _GATEWAY_DROP_BASE | frozenset(\n            h.lower()\
+    \ | None = None\n        #: Sleep / wake calls running shielded from their handler\
+    \ (``_run_to_end``).\n        self._control_tasks: set[asyncio.Task] = set()\n\
+    \        self._max_model_len: int | None = cfg.max_model_len or None\n       \
+    \ self._sleep_error_mark = json.dumps(cfg.sleeping_error_type).encode()\n    \
+    \    self._gateway_drop = _GATEWAY_DROP_BASE | frozenset(\n            h.lower()\
     \ for h in (cfg.depth_header, cfg.hidden_header, cfg.exclude_header)\n       \
     \ )\n        self._local_drop = HOP_BY_HOP | frozenset({cfg.depth_header.lower()})\n\
     \n    # ---------------------------------------------------------------- lifecycle\n\
@@ -770,6 +778,9 @@ data:
     \ -> web.StreamResponse:\n        \"\"\"``coro`` shielded from the handler's cancellation;\
     \ if the caller went away, an\n        error of the call that carries on is logged\
     \ (WARNING), not left to the GC.\"\"\"\n        task = asyncio.ensure_future(coro)\n\
+    \        # A strong reference until it is done: the event loop keeps only a weak\
+    \ one, and\n        # the caller's handler (the other owner) may be cancelled\
+    \ first.\n        self._control_tasks.add(task)\n        task.add_done_callback(self._control_tasks.discard)\n\
     \        try:\n            return await asyncio.shield(task)\n        except asyncio.CancelledError:\n\
     \            path = request.path\n\n            def report(done: asyncio.Task)\
     \ -> None:\n                if not done.cancelled() and done.exception() is not\
@@ -781,11 +792,11 @@ data:
     \           \"model\": self.cfg.model,\n            \"pod\": self.cfg.pod_name,\n\
     \            \"enabled\": self.cfg.enabled,\n            \"sleeping\": self.state.sleeping,\n\
     \            \"sleep_pending\": self.state.pending,\n            \"waking\": self.state.waking,\n\
-    \            \"epoch\": self.state.epoch,\n            \"last_sleep\": self.state.last_sleep,\n\
-    \            \"gateway_url\": self.cfg.gateway_url,\n            \"max_depth\"\
-    : self.cfg.max_depth,\n            \"max_model_len\": self._max_model_len,\n \
-    \           \"counts\": {kind: self.metrics.total(kind) for kind in Metrics.KINDS},\n\
-    \        }\n\n    # --------------------------------------------------------------\
+    \            \"epoch\": self.state.epoch,\n            \"sleep_calls\": self.state.sleep_calls,\n\
+    \            \"last_sleep\": self.state.last_sleep,\n            \"gateway_url\"\
+    : self.cfg.gateway_url,\n            \"max_depth\": self.cfg.max_depth,\n    \
+    \        \"max_model_len\": self._max_model_len,\n            \"counts\": {kind:\
+    \ self.metrics.total(kind) for kind in Metrics.KINDS},\n        }\n\n    # --------------------------------------------------------------\
     \ plain proxy\n\n    async def _proxy_local(self, request: web.Request, body:\
     \ bytes, *, timeout: float | None):\n        try:\n            resp = await self._local_request(\n\
     \                request.method, self.cfg.upstream_url + request.path_qs, data=body\
@@ -824,7 +835,8 @@ data:
     \          except (aiohttp.ClientError, asyncio.TimeoutError):\n             \
     \   resp.close()\n                if request.transport is not None:\n        \
     \            request.transport.close()\n                return out\n         \
-    \   try:\n                await out.write_eof()\n            except ConnectionResetError:\n\
+    \   request[_DELIVERED] = True  # every byte is written; only the end remains\n\
+    \            try:\n                await out.write_eof()\n            except ConnectionResetError:\n\
     \                pass\n            return out\n        finally:\n            resp.release()\n\
     \n    # ------------------------------------------------------------- sleep /\
     \ wake\n\n    async def _control_call(self, request: web.Request, body: bytes,\
@@ -903,14 +915,16 @@ data:
     \  ) -> tuple[aiohttp.ClientResponse | None, int, str]:\n        \"\"\"Send a\
     \ not-yet-started request to the gateway, retrying 503 / 502 / connect\n     \
     \   errors (bounded, backoff, Retry-After honoured). (response, attempts, last\
-    \ error).\n\n        One retry layer: a 502 / 503 produced by ANOTHER sidecar\
-    \ (its error message starts\n        with ``SIDECAR_ERROR_MARK``: hop limit, its\
-    \ own retries exhausted, its engine\n        unreachable) is final, not retried\
-    \ - that sidecar already spent its own bounded\n        attempts, and retrying\
-    \ it would multiply the sends per hop. Envoy's / the\n        gateway's own 502\
-    \ / 503 (no routable pod, connect failure) are retried.\"\"\"\n        cfg = self.cfg\n\
-    \        error = \"\"\n        delay = 0.0\n        for attempt in range(1, cfg.retry_attempts\
-    \ + 1):\n            if delay > 0:\n                await asyncio.sleep(delay)\n\
+    \ error).\n\n        One retry layer: a 502 / 503 that another sidecar marked\
+    \ final\n        (``FINAL_ERROR_MARK``: its own gateway retries ran out, or the\
+    \ hop limit) is not\n        retried - that sidecar already spent its bounded\
+    \ attempts, and retrying it would\n        multiply the sends per hop. Every other\
+    \ 502 / 503 is retried: Envoy's / the\n        gateway's own (no routable pod,\
+    \ connect failure) and a sidecar's single-attempt\n        errors (its engine\
+    \ unreachable or broken before the first byte), where another\n        attempt\
+    \ can land on a healthy pod.\"\"\"\n        cfg = self.cfg\n        error = \"\
+    \"\n        delay = 0.0\n        for attempt in range(1, cfg.retry_attempts +\
+    \ 1):\n            if delay > 0:\n                await asyncio.sleep(delay)\n\
     \            backoff = min(cfg.retry_backoff_s * (2 ** (attempt - 1)), cfg.retry_max_backoff_s)\n\
     \            try:\n                resp = await self.gateway.request(method, cfg.gateway_url\
     \ + path_qs, data=data, headers=headers)\n            except (aiohttp.ClientError,\
@@ -920,8 +934,8 @@ data:
     \                    payload = await resp.read()\n                except (aiohttp.ClientError,\
     \ asyncio.TimeoutError):\n                    payload = b\"\"\n              \
     \  finally:\n                    resp.release()\n                detail = payload[:300].decode(\"\
-    utf-8\", \"replace\")\n                if SIDECAR_ERROR_MARK in payload:\n   \
-    \                 return None, attempt, f\"sidecar HTTP {resp.status} (final,\
+    utf-8\", \"replace\")\n                if _FINAL_ERROR_MARK_B in payload:\n  \
+    \                  return None, attempt, f\"sidecar HTTP {resp.status} (final,\
     \ not retried): {detail}\"\n                error = f\"gateway HTTP {resp.status}:\
     \ {detail}\"\n                advised = _retry_after(resp.headers.get(\"Retry-After\"\
     ))\n                delay = min(advised if advised is not None else backoff, cfg.retry_max_backoff_s)\n\
@@ -935,31 +949,35 @@ data:
     \ not a locally relayed request\n        request[_REISSUE_PENDING] = \"retry\"\
     \n        cfg = self.cfg\n        if depth + 1 > cfg.max_depth:\n            self._account(\"\
     failed\", \"depth_limit\", request, depth, retry_of=reason)\n            return\
-    \ self._unavailable(\"retry hop limit reached\")\n        model = _body_model(raw)\n\
-    \        headers = self._gateway_headers(request, model=model, depth=depth + 1)\n\
-    \        resp, attempts, error = await self._gateway_request(request.method, request.path_qs,\
-    \ raw, headers)\n        if resp is None:\n            self._account(\"failed\"\
-    , \"retry_exhausted\", request, depth, retry_of=reason, attempts=attempts,\n \
-    \                         error=error)\n            return self._unavailable(f\"\
-    every instance is asleep or unreachable ({error})\")\n        self._account(\"\
+    \ self._unavailable(\"retry hop limit reached\", final=True)\n        model =\
+    \ _body_model(raw)\n        headers = self._gateway_headers(request, model=model,\
+    \ depth=depth + 1)\n        resp, attempts, error = await self._gateway_request(request.method,\
+    \ request.path_qs, raw, headers)\n        if resp is None:\n            self._account(\"\
+    failed\", \"retry_exhausted\", request, depth, retry_of=reason, attempts=attempts,\n\
+    \                          error=error)\n            return self._unavailable(f\"\
+    every instance is asleep or unreachable ({error})\", final=True)\n        self._account(\"\
     retry\", reason, request, depth, attempts=attempts, target=_target(resp))\n  \
     \      return await self._relay(request, resp, extra={cfg.retried_header: str(attempts)})\n\
-    \n    def _unavailable(self, message: str) -> web.Response:\n        return _error(503,\
-    \ message, \"ServiceUnavailable\", headers={\"Retry-After\": \"1\"})\n\n    #\
-    \ --------------------------------------------------------------- generation\n\
-    \n    async def _handle_generation(self, request: web.Request, path: str) -> web.StreamResponse:\n\
-    \        raw = await request.read()\n        added = AddedTime()  # the full client\
-    \ request is read: the sidecar's clock starts\n        try:\n            return\
-    \ await self._generation(request, path, raw, added)\n        except asyncio.CancelledError:\n\
-    \            # The client went away (or the server shuts down): the upstream requests\n\
-    \            # were closed on the way out. A request whose retry / continuation\
-    \ was cut\n            # short still gets its one tre_reissue_total line. Once\
-    \ the client had the\n            # complete response it is a completed request\
-    \ (normal accounting).\n            if not request.get(_DELIVERED):\n        \
-    \        added.discard()\n                self.metrics.event(\"client_cancel\"\
-    )\n                kind = request.pop(_REISSUE_PENDING, None)\n              \
-    \  if kind is not None:\n                    self._account(kind, \"client_gone\"\
-    , request,\n                                  _int_header(request.headers.get(self.cfg.depth_header)))\n\
+    \n    def _unavailable(self, message: str, *, final: bool = False) -> web.Response:\n\
+    \        \"\"\"503 + Retry-After. ``final``: the retries behind it ran out (see\n\
+    \        ``FINAL_ERROR_MARK``); the sidecar before it does not retry it.\"\"\"\
+    \n        if final:\n            message = f\"{message} [{FINAL_ERROR_MARK}]\"\
+    \n        return _error(503, message, \"ServiceUnavailable\", headers={\"Retry-After\"\
+    : \"1\"})\n\n    # ---------------------------------------------------------------\
+    \ generation\n\n    async def _handle_generation(self, request: web.Request, path:\
+    \ str) -> web.StreamResponse:\n        raw = await request.read()\n        added\
+    \ = AddedTime()  # the full client request is read: the sidecar's clock starts\n\
+    \        try:\n            return await self._generation(request, path, raw, added)\n\
+    \        except asyncio.CancelledError:\n            # The client went away (or\
+    \ the server shuts down): the upstream requests\n            # were closed on\
+    \ the way out. A request whose retry / continuation was cut\n            # short\
+    \ still gets its one tre_reissue_total line. Once the client had the\n       \
+    \     # complete response it is a completed request (normal accounting).\n   \
+    \         if not request.get(_DELIVERED):\n                added.discard()\n \
+    \               self.metrics.event(\"client_cancel\")\n                kind =\
+    \ request.pop(_REISSUE_PENDING, None)\n                if kind is not None:\n\
+    \                    self._account(kind, \"client_gone\", request,\n         \
+    \                         _int_header(request.headers.get(self.cfg.depth_header)))\n\
     \            raise\n        finally:\n            self.metrics.observe_added(added)\n\
     \n    async def _generation(\n        self, request: web.Request, path: str, raw:\
     \ bytes, added: AddedTime\n    ) -> web.StreamResponse:\n        cfg = self.cfg\n\
@@ -976,40 +994,41 @@ data:
     \ one inside _local_request.\n            resp = await self._local_request(\n\
     \                \"POST\", cfg.upstream_url + request.path_qs, data=raw, headers=headers,\n\
     \            )\n        except (aiohttp.ClientError, asyncio.TimeoutError, OSError)\
-    \ as exc:\n            if self.state.active:\n                return await self._retry(request,\
-    \ raw, depth, \"local_unavailable_sleeping\", added)\n            if is_connection_refused(exc):\n\
-    \                # The engine is not listening (crashed / restarting): another\
-    \ instance.\n                return await self._retry(request, raw, depth, \"\
-    local_refused\", added)\n            return self._upstream_failed(request, depth,\
-    \ exc, status=503)\n        if resp.status == 503:\n            try:\n       \
-    \         payload = await resp.read()\n            finally:\n                resp.release()\n\
-    \            if self._sleep_error_mark in payload and _is_sleeping_payload(payload,\
-    \ cfg.sleeping_error_type):\n                self._apply_observed(True, epoch,\
-    \ source=\"engine_503\")\n                return await self._retry(request, raw,\
-    \ depth, \"engine_sleeping\")\n            return web.Response(body=payload, status=503,\
-    \ headers=response_headers(resp.headers))\n        if not generation or resp.status\
-    \ != 200 or not isinstance(body, dict):\n            return await self._relay(request,\
-    \ resp, added=added)\n        ctype = resp.headers.get(\"Content-Type\", \"\"\
-    )\n        if \"text/event-stream\" in ctype:\n            return await self._stream(request,\
-    \ path, raw, body, resp, depth, nc_reason, added, sleeps)\n        if \"json\"\
-    \ in ctype:\n            return await self._non_stream(request, path, raw, body,\
-    \ resp, depth, nc_reason, added, sleeps)\n        return await self._relay(request,\
-    \ resp, added=added)\n\n    def _abort_decision(self, request: web.Request, depth:\
-    \ int, nc_reason: str | None,\n                        info: AbortInfo, sent_any:\
-    \ bool, sleeps: int) -> tuple[str, str]:\n        \"\"\"(action, reason); action\
-    \ = retry | continue | passthrough_abort | failed.\n\n        ``sleeps``: ``state.sleep_calls``\
-    \ when the generation started. The abort is\n        sleep-caused iff a /sleep\
-    \ call was forwarded since - whether it is still running,\n        succeeded,\
-    \ or failed and was rolled back (the engine may abort its requests and\n     \
-    \   then fail the sleep; their abort outputs can arrive after the call returned).\
-    \ The\n        current sleeping mark is not needed: the only way to put the engine\
-    \ to sleep is a\n        /sleep through this sidecar, and a generation starts\
-    \ only while the mark is\n        clear. An abort with no sleep call in between\
-    \ is the engine's own: passed through.\"\"\"\n        if self.state.sleep_calls\
-    \ == sleeps:\n            return \"passthrough_abort\", \"not_sleeping\"\n   \
-    \     if _client_gone(request):\n            return \"passthrough_abort\", \"\
-    client_gone\"\n        if not sent_any:\n            # Nothing reached the client:\
-    \ resending the original is exact.\n            return \"retry\", \"abort_before_output\"\
+    \ as exc:\n            if self.state.active or self.state.sleep_calls != sleeps:\n\
+    \                return await self._retry(request, raw, depth, \"local_unavailable_sleeping\"\
+    , added)\n            if is_connection_refused(exc):\n                # The engine\
+    \ is not listening (crashed / restarting): another instance.\n               \
+    \ return await self._retry(request, raw, depth, \"local_refused\", added)\n  \
+    \          return self._upstream_failed(request, depth, exc, status=503)\n   \
+    \     if resp.status == 503:\n            try:\n                payload = await\
+    \ resp.read()\n            finally:\n                resp.release()\n        \
+    \    if self._sleep_error_mark in payload and _is_sleeping_payload(payload, cfg.sleeping_error_type):\n\
+    \                self._apply_observed(True, epoch, source=\"engine_503\")\n  \
+    \              return await self._retry(request, raw, depth, \"engine_sleeping\"\
+    )\n            return web.Response(body=payload, status=503, headers=response_headers(resp.headers))\n\
+    \        if not generation or resp.status != 200 or not isinstance(body, dict):\n\
+    \            return await self._relay(request, resp, added=added)\n        ctype\
+    \ = resp.headers.get(\"Content-Type\", \"\")\n        if \"text/event-stream\"\
+    \ in ctype:\n            return await self._stream(request, path, raw, body, resp,\
+    \ depth, nc_reason, added, sleeps)\n        if \"json\" in ctype:\n          \
+    \  return await self._non_stream(request, path, raw, body, resp, depth, nc_reason,\
+    \ added, sleeps)\n        return await self._relay(request, resp, added=added)\n\
+    \n    def _abort_decision(self, request: web.Request, depth: int, nc_reason: str\
+    \ | None,\n                        info: AbortInfo, sent_any: bool, sleeps: int)\
+    \ -> tuple[str, str]:\n        \"\"\"(action, reason); action = retry | continue\
+    \ | passthrough_abort | failed.\n\n        ``sleeps``: ``state.sleep_calls`` when\
+    \ the generation started. The abort is\n        sleep-caused iff a /sleep call\
+    \ was forwarded since - whether it is still running,\n        succeeded, or failed\
+    \ and was rolled back (the engine may abort its requests and\n        then fail\
+    \ the sleep; their abort outputs can arrive after the call returned). The\n  \
+    \      current sleeping mark is not needed: the only way to put the engine to\
+    \ sleep is a\n        /sleep through this sidecar, and a generation starts only\
+    \ while the mark is\n        clear. An abort with no sleep call in between is\
+    \ the engine's own: passed through.\"\"\"\n        if self.state.sleep_calls ==\
+    \ sleeps:\n            return \"passthrough_abort\", \"not_sleeping\"\n      \
+    \  if _client_gone(request):\n            return \"passthrough_abort\", \"client_gone\"\
+    \n        if not sent_any:\n            # Nothing reached the client: resending\
+    \ the original is exact.\n            return \"retry\", \"abort_before_output\"\
     \n        if nc_reason is not None:\n            return \"passthrough_abort\"\
     , f\"non_continuable_{nc_reason}\"\n        if depth + 1 > self.cfg.max_depth:\n\
     \            return \"failed\", \"depth_limit\"\n        if info.generated_ids\
@@ -1146,11 +1165,11 @@ data:
     \ as exc:\n            plan, plan_error = None, str(exc)\n        if plan is None\
     \ and not plan_error:\n            # Budget spent: the abort hit the very last\
     \ token.\n            text = \"\" if held_sent else held\n            parts.append(sse(with_text(abort.obj,\
-    \ text, \"length\") | {cfg.continued_field: 0}))\n            await self._finish_stream(client,\
-    \ parts, base, merged_usage(prompt_tokens, generated, None),\n               \
-    \                       wants_usage, 0)\n            self._account(\"continue\"\
-    , \"budget_spent\", request, depth, generated=generated)\n            return\n\
-    \        cont_resp = None\n        attempts = 0\n        error = plan_error\n\
+    \ text, \"length\") | {cfg.continued_field: 0}))\n            await self._finish_stream(request,\
+    \ client, parts, base, merged_usage(prompt_tokens, generated, None),\n       \
+    \                               wants_usage, 0)\n            self._account(\"\
+    continue\", \"budget_spent\", request, depth, generated=generated)\n         \
+    \   return\n        cont_resp = None\n        attempts = 0\n        error = plan_error\n\
     \        if plan is not None:\n            headers = self._gateway_headers(request,\
     \ model=body.get(\"model\"), depth=depth + 1)\n            headers[\"Content-Type\"\
     ] = \"application/json\"\n            cont_resp, attempts, error = await self._gateway_request(\n\
@@ -1161,26 +1180,26 @@ data:
     \                error = f\"gateway HTTP {cont_resp.status}: {detail}\"\n    \
     \            cont_resp = None\n        if cont_resp is None:\n            text\
     \ = \"\" if held_sent else held\n            parts.append(sse(with_text(abort.obj,\
-    \ text, \"abort\")))\n            await self._finish_stream(client, parts, base,\
-    \ merged_usage(prompt_tokens, generated, None),\n                            \
-    \          wants_usage, None)\n            self._account(\"failed\", \"continuation_unavailable\"\
-    , request, depth, generated=generated,\n                          attempts=attempts,\
-    \ error=error)\n            return\n        target = _target(cont_resp)\n    \
-    \    cont_usage: dict | None = None\n        cont_finish: str | None = None\n\
-    \        segments = 1\n        gap_s: float | None = None\n        pending_text\
-    \ = \"\"\n        consumed = 0\n        stopped_at_seam = False\n        cont_failed\
-    \ = False\n        error = \"\"\n        buf = b\"\"\n        try:\n         \
-    \   if parts:\n                await client.write(b\"\".join(parts))\n       \
-    \         parts = []\n            try:\n                async for data in cont_resp.content.iter_any():\n\
-    \                    added.start()\n                    buf += data\n        \
-    \            events, buf = split_events(buf)\n                    out: list[bytes]\
-    \ = []\n                    for event in events:\n                        obj\
-    \ = event_obj(event)\n                        if obj is None:\n              \
-    \              continue  # [DONE], comments (a nested sidecar's), junk\n     \
-    \                   if \"error\" in obj and not obj.get(\"choices\"):\n      \
-    \                      cont_failed, error = True, f\"continuation error event:\
-    \ {str(obj.get('error'))[:200]}\"\n                            continue\n    \
-    \                    if plan.as_chat:\n                            obj = completion_chunk_as_chat(obj,\
+    \ text, \"abort\")))\n            await self._finish_stream(request, client, parts,\
+    \ base, merged_usage(prompt_tokens, generated, None),\n                      \
+    \                wants_usage, None)\n            self._account(\"failed\", \"\
+    continuation_unavailable\", request, depth, generated=generated,\n           \
+    \               attempts=attempts, error=error)\n            return\n        target\
+    \ = _target(cont_resp)\n        cont_usage: dict | None = None\n        cont_finish:\
+    \ str | None = None\n        segments = 1\n        gap_s: float | None = None\n\
+    \        pending_text = \"\"\n        consumed = 0\n        stopped_at_seam =\
+    \ False\n        cont_failed = False\n        error = \"\"\n        buf = b\"\"\
+    \n        try:\n            if parts:\n                await client.write(b\"\"\
+    .join(parts))\n                parts = []\n            try:\n                async\
+    \ for data in cont_resp.content.iter_any():\n                    added.start()\n\
+    \                    buf += data\n                    events, buf = split_events(buf)\n\
+    \                    out: list[bytes] = []\n                    for event in events:\n\
+    \                        obj = event_obj(event)\n                        if obj\
+    \ is None:\n                            continue  # [DONE], comments (a nested\
+    \ sidecar's), junk\n                        if \"error\" in obj and not obj.get(\"\
+    choices\"):\n                            cont_failed, error = True, f\"continuation\
+    \ error event: {str(obj.get('error'))[:200]}\"\n                            continue\n\
+    \                        if plan.as_chat:\n                            obj = completion_chunk_as_chat(obj,\
     \ stream=True)\n                        if is_usage_only(obj):\n             \
     \               cont_usage = obj[\"usage\"]\n                            continue\n\
     \                        nested = obj.pop(cfg.continued_field, None)\n       \
@@ -1241,45 +1260,47 @@ data:
     \ No finish chunk reached the client: close the stream as aborted.\n         \
     \       tail_parts.append(sse(with_text(abort.obj, \"\" if held_sent else held,\
     \ \"abort\")))\n        else:\n            outcome, reason = \"continue\", \"\
-    abort_sleep\"\n        await self._finish_stream(client, tail_parts, base, merged_usage(prompt_tokens,\
-    \ generated, cont_usage),\n                                  wants_usage, segments\
-    \ if outcome == \"continue\" else None)\n        self._account(outcome, reason,\
-    \ request, depth, generated=generated, attempts=attempts, target=target,\n   \
-    \                   gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam)\n\
-    \n    async def _finish_stream(self, client: web.StreamResponse, parts: list[bytes],\
-    \ base: dict, usage: dict,\n                             wants_usage: bool, segments:\
-    \ int | None) -> None:\n        if wants_usage:\n            parts.append(sse(dict(base,\
+    abort_sleep\"\n        await self._finish_stream(request, client, tail_parts,\
+    \ base,\n                                  merged_usage(prompt_tokens, generated,\
+    \ cont_usage), wants_usage,\n                                  segments if outcome\
+    \ == \"continue\" else None)\n        self._account(outcome, reason, request,\
+    \ depth, generated=generated, attempts=attempts, target=target,\n            \
+    \          gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam)\n\
+    \n    async def _finish_stream(self, request: web.Request, client: web.StreamResponse,\
+    \ parts: list[bytes],\n                             base: dict, usage: dict, wants_usage:\
+    \ bool, segments: int | None) -> None:\n        if wants_usage:\n            parts.append(sse(dict(base,\
     \ choices=[], usage=usage)))\n        if segments:\n            parts.append(f\"\
     : {self.cfg.continued_header}: {segments}\\n\\n\".encode())\n        parts.append(SSE_DONE)\n\
     \        try:\n            await client.write(b\"\".join(parts))\n           \
-    \ await client.write_eof()\n        except ConnectionResetError:\n           \
-    \ pass\n\n    # -------------------------------------------------------- non-streaming\
-    \ path\n\n    async def _non_stream(\n        self, request: web.Request, path:\
-    \ str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,\n        depth: int,\
-    \ nc_reason: str | None, added: AddedTime, sleeps: int,\n    ) -> web.StreamResponse:\n\
+    \ request[_DELIVERED] = True  # the [DONE] is written\n            await client.write_eof()\n\
+    \        except ConnectionResetError:\n            pass\n\n    # --------------------------------------------------------\
+    \ non-streaming path\n\n    async def _non_stream(\n        self, request: web.Request,\
+    \ path: str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,\n        depth:\
+    \ int, nc_reason: str | None, added: AddedTime, sleeps: int,\n    ) -> web.StreamResponse:\n\
     \        \"\"\"Relay time: the whole body received -> the response handed back\
     \ to aiohttp\n        (which sends it after the handler returns; that socket write\
     \ is not timed),\n        minus the wait for a continuation through the gateway.\"\
     \"\"\n        cfg = self.cfg\n        try:\n            payload = await resp.read()\n\
     \        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:\n        \
-    \    if self.state.active:\n                return await self._retry(request,\
-    \ raw, depth, \"local_broken_sleeping\", added)\n            return _error(502,\
-    \ f\"upstream failed: {exc}\", \"BadGateway\")\n        finally:\n           \
-    \ resp.release()\n        added.start()\n        headers = response_headers(resp.headers)\n\
-    \        obj = None\n        if _ABORT_MARK in payload:\n            try:\n  \
-    \              obj = json.loads(payload)\n            except ValueError:\n   \
-    \             obj = None\n        if not isinstance(obj, dict) or not has_abort(obj):\n\
-    \            return web.Response(body=payload, status=resp.status, headers=headers)\n\
-    \        chat = path == cfg.chat_path\n        info = self._abort_info(obj, chat,\
-    \ stream=False)\n        # Non-streaming: nothing reached the client yet, so resending\
-    \ the original request\n        # is always exact. A continuation only saves the\
-    \ tokens already generated, so it\n        # is used when possible (continuable,\
-    \ token ids present); otherwise pure retry.\n        continuable = nc_reason is\
-    \ None and bool(info.generated_ids) and info.prompt_ids is not None\n        action,\
-    \ reason = self._abort_decision(request, depth, nc_reason, info, sent_any=continuable,\n\
-    \                                              sleeps=sleeps)\n        if action\
-    \ == \"retry\" and nc_reason is not None:\n            reason = f\"abort_non_continuable_{nc_reason}\"\
-    \n        if action == \"retry\":\n            return await self._retry(request,\
+    \    if self.state.active or self.state.sleep_calls != sleeps:\n             \
+    \   return await self._retry(request, raw, depth, \"local_broken_sleeping\", added)\n\
+    \            return _error(502, f\"upstream failed: {exc}\", \"BadGateway\")\n\
+    \        finally:\n            resp.release()\n        added.start()\n       \
+    \ headers = response_headers(resp.headers)\n        obj = None\n        if _ABORT_MARK\
+    \ in payload:\n            try:\n                obj = json.loads(payload)\n \
+    \           except ValueError:\n                obj = None\n        if not isinstance(obj,\
+    \ dict) or not has_abort(obj):\n            return web.Response(body=payload,\
+    \ status=resp.status, headers=headers)\n        chat = path == cfg.chat_path\n\
+    \        info = self._abort_info(obj, chat, stream=False)\n        # Non-streaming:\
+    \ nothing reached the client yet, so resending the original request\n        #\
+    \ is always exact. A continuation only saves the tokens already generated, so\
+    \ it\n        # is used when possible (continuable, token ids present); otherwise\
+    \ pure retry.\n        continuable = nc_reason is None and bool(info.generated_ids)\
+    \ and info.prompt_ids is not None\n        action, reason = self._abort_decision(request,\
+    \ depth, nc_reason, info, sent_any=continuable,\n                            \
+    \                  sleeps=sleeps)\n        if action == \"retry\" and nc_reason\
+    \ is not None:\n            reason = f\"abort_non_continuable_{nc_reason}\"\n\
+    \        if action == \"retry\":\n            return await self._retry(request,\
     \ raw, depth, reason, added)\n        if action != \"continue\":\n           \
     \ self._account(action, reason, request, depth)\n            return web.Response(body=payload,\
     \ status=resp.status, headers=headers)\n        request[_REISSUE_PENDING] = \"\

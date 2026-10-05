@@ -153,10 +153,15 @@ COMPLETION_CONT_DROP = ("prompt", "prompt_embeds", "echo", "suffix", "truncate_p
 _ABORT_MARK = b'"abort"'
 
 #: Start of the message of every error response the sidecar itself produces (``_error``).
-#: A 502 / 503 carrying it came from another sidecar and is final for the gateway retry
-#: loop (``ReissueSidecar._gateway_request``).
 SIDECAR_ERROR_PREFIX = "tre-reissue sidecar:"
-SIDECAR_ERROR_MARK = SIDECAR_ERROR_PREFIX.encode()
+#: In the message of a sidecar 503 that is FINAL: that sidecar already spent its bounded
+#: gateway retries (retry_exhausted) or the hop limit is reached (depth_limit). A 502 / 503
+#: carrying it is not retried by the sidecar before it (``ReissueSidecar._gateway_request``).
+#: A plain token, no quotes or backslashes: the TRE gateway plugin replaces an upstream
+#: error body with its own OpenAI error whose message is the original body as a JSON
+#: string (escaped) and drops the upstream headers, so only a substring survives.
+FINAL_ERROR_MARK = "tre_reissue_final"
+_FINAL_ERROR_MARK_B = FINAL_ERROR_MARK.encode()
 
 
 
@@ -1028,6 +1033,8 @@ class ReissueSidecar:
         #: Requests that got an idle pooled connection (diagnostics / tests).
         self.local_reused = 0
         self._monitor_task: asyncio.Task | None = None
+        #: Sleep / wake calls running shielded from their handler (``_run_to_end``).
+        self._control_tasks: set[asyncio.Task] = set()
         self._max_model_len: int | None = cfg.max_model_len or None
         self._sleep_error_mark = json.dumps(cfg.sleeping_error_type).encode()
         self._gateway_drop = _GATEWAY_DROP_BASE | frozenset(
@@ -1269,6 +1276,10 @@ class ReissueSidecar:
         """``coro`` shielded from the handler's cancellation; if the caller went away, an
         error of the call that carries on is logged (WARNING), not left to the GC."""
         task = asyncio.ensure_future(coro)
+        # A strong reference until it is done: the event loop keeps only a weak one, and
+        # the caller's handler (the other owner) may be cancelled first.
+        self._control_tasks.add(task)
+        task.add_done_callback(self._control_tasks.discard)
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -1292,6 +1303,7 @@ class ReissueSidecar:
             "sleep_pending": self.state.pending,
             "waking": self.state.waking,
             "epoch": self.state.epoch,
+            "sleep_calls": self.state.sleep_calls,
             "last_sleep": self.state.last_sleep,
             "gateway_url": self.cfg.gateway_url,
             "max_depth": self.cfg.max_depth,
@@ -1360,6 +1372,7 @@ class ReissueSidecar:
                 if request.transport is not None:
                     request.transport.close()
                 return out
+            request[_DELIVERED] = True  # every byte is written; only the end remains
             try:
                 await out.write_eof()
             except ConnectionResetError:
@@ -1480,11 +1493,13 @@ class ReissueSidecar:
         """Send a not-yet-started request to the gateway, retrying 503 / 502 / connect
         errors (bounded, backoff, Retry-After honoured). (response, attempts, last error).
 
-        One retry layer: a 502 / 503 produced by ANOTHER sidecar (its error message starts
-        with ``SIDECAR_ERROR_MARK``: hop limit, its own retries exhausted, its engine
-        unreachable) is final, not retried - that sidecar already spent its own bounded
-        attempts, and retrying it would multiply the sends per hop. Envoy's / the
-        gateway's own 502 / 503 (no routable pod, connect failure) are retried."""
+        One retry layer: a 502 / 503 that another sidecar marked final
+        (``FINAL_ERROR_MARK``: its own gateway retries ran out, or the hop limit) is not
+        retried - that sidecar already spent its bounded attempts, and retrying it would
+        multiply the sends per hop. Every other 502 / 503 is retried: Envoy's / the
+        gateway's own (no routable pod, connect failure) and a sidecar's single-attempt
+        errors (its engine unreachable or broken before the first byte), where another
+        attempt can land on a healthy pod."""
         cfg = self.cfg
         error = ""
         delay = 0.0
@@ -1506,7 +1521,7 @@ class ReissueSidecar:
                 finally:
                     resp.release()
                 detail = payload[:300].decode("utf-8", "replace")
-                if SIDECAR_ERROR_MARK in payload:
+                if _FINAL_ERROR_MARK_B in payload:
                     return None, attempt, f"sidecar HTTP {resp.status} (final, not retried): {detail}"
                 error = f"gateway HTTP {resp.status}: {detail}"
                 advised = _retry_after(resp.headers.get("Retry-After"))
@@ -1528,18 +1543,22 @@ class ReissueSidecar:
         cfg = self.cfg
         if depth + 1 > cfg.max_depth:
             self._account("failed", "depth_limit", request, depth, retry_of=reason)
-            return self._unavailable("retry hop limit reached")
+            return self._unavailable("retry hop limit reached", final=True)
         model = _body_model(raw)
         headers = self._gateway_headers(request, model=model, depth=depth + 1)
         resp, attempts, error = await self._gateway_request(request.method, request.path_qs, raw, headers)
         if resp is None:
             self._account("failed", "retry_exhausted", request, depth, retry_of=reason, attempts=attempts,
                           error=error)
-            return self._unavailable(f"every instance is asleep or unreachable ({error})")
+            return self._unavailable(f"every instance is asleep or unreachable ({error})", final=True)
         self._account("retry", reason, request, depth, attempts=attempts, target=_target(resp))
         return await self._relay(request, resp, extra={cfg.retried_header: str(attempts)})
 
-    def _unavailable(self, message: str) -> web.Response:
+    def _unavailable(self, message: str, *, final: bool = False) -> web.Response:
+        """503 + Retry-After. ``final``: the retries behind it ran out (see
+        ``FINAL_ERROR_MARK``); the sidecar before it does not retry it."""
+        if final:
+            message = f"{message} [{FINAL_ERROR_MARK}]"
         return _error(503, message, "ServiceUnavailable", headers={"Retry-After": "1"})
 
     # --------------------------------------------------------------- generation
@@ -1588,7 +1607,7 @@ class ReissueSidecar:
                 "POST", cfg.upstream_url + request.path_qs, data=raw, headers=headers,
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            if self.state.active:
+            if self.state.active or self.state.sleep_calls != sleeps:
                 return await self._retry(request, raw, depth, "local_unavailable_sleeping", added)
             if is_connection_refused(exc):
                 # The engine is not listening (crashed / restarting): another instance.
@@ -1851,7 +1870,7 @@ class ReissueSidecar:
             # Budget spent: the abort hit the very last token.
             text = "" if held_sent else held
             parts.append(sse(with_text(abort.obj, text, "length") | {cfg.continued_field: 0}))
-            await self._finish_stream(client, parts, base, merged_usage(prompt_tokens, generated, None),
+            await self._finish_stream(request, client, parts, base, merged_usage(prompt_tokens, generated, None),
                                       wants_usage, 0)
             self._account("continue", "budget_spent", request, depth, generated=generated)
             return
@@ -1874,7 +1893,7 @@ class ReissueSidecar:
         if cont_resp is None:
             text = "" if held_sent else held
             parts.append(sse(with_text(abort.obj, text, "abort")))
-            await self._finish_stream(client, parts, base, merged_usage(prompt_tokens, generated, None),
+            await self._finish_stream(request, client, parts, base, merged_usage(prompt_tokens, generated, None),
                                       wants_usage, None)
             self._account("failed", "continuation_unavailable", request, depth, generated=generated,
                           attempts=attempts, error=error)
@@ -1994,13 +2013,14 @@ class ReissueSidecar:
                 tail_parts.append(sse(with_text(abort.obj, "" if held_sent else held, "abort")))
         else:
             outcome, reason = "continue", "abort_sleep"
-        await self._finish_stream(client, tail_parts, base, merged_usage(prompt_tokens, generated, cont_usage),
-                                  wants_usage, segments if outcome == "continue" else None)
+        await self._finish_stream(request, client, tail_parts, base,
+                                  merged_usage(prompt_tokens, generated, cont_usage), wants_usage,
+                                  segments if outcome == "continue" else None)
         self._account(outcome, reason, request, depth, generated=generated, attempts=attempts, target=target,
                       gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam)
 
-    async def _finish_stream(self, client: web.StreamResponse, parts: list[bytes], base: dict, usage: dict,
-                             wants_usage: bool, segments: int | None) -> None:
+    async def _finish_stream(self, request: web.Request, client: web.StreamResponse, parts: list[bytes],
+                             base: dict, usage: dict, wants_usage: bool, segments: int | None) -> None:
         if wants_usage:
             parts.append(sse(dict(base, choices=[], usage=usage)))
         if segments:
@@ -2008,6 +2028,7 @@ class ReissueSidecar:
         parts.append(SSE_DONE)
         try:
             await client.write(b"".join(parts))
+            request[_DELIVERED] = True  # the [DONE] is written
             await client.write_eof()
         except ConnectionResetError:
             pass
@@ -2025,7 +2046,7 @@ class ReissueSidecar:
         try:
             payload = await resp.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            if self.state.active:
+            if self.state.active or self.state.sleep_calls != sleeps:
                 return await self._retry(request, raw, depth, "local_broken_sleeping", added)
             return _error(502, f"upstream failed: {exc}", "BadGateway")
         finally:

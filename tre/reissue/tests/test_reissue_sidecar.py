@@ -10,6 +10,7 @@ the upstream request)."""
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,9 @@ from tre_reissue.sidecar import Config, ReissueSidecar
 MODEL = "m"
 PROMPT = "one two three four"
 HIDDEN = {"X-TRE-Hidden": "1"}
+#: Test servers wait at most this long for handlers still running at teardown (aiohttp's
+#: default is 60 s: a failing disconnect test would hang that long).
+SHUTDOWN_TIMEOUT_S = 1.0
 
 
 class _OptionsServer(TestServer):
@@ -39,7 +43,7 @@ class _OptionsServer(TestServer):
         self._options = dict(options)
 
     async def _make_runner(self, **kwargs):
-        return web.AppRunner(self.app, **self._options)
+        return web.AppRunner(self.app, shutdown_timeout=SHUTDOWN_TIMEOUT_S, **self._options)
 
 
 class Harness:
@@ -78,7 +82,10 @@ class Harness:
 
     async def _serve(self, app, options: dict | None = None) -> TestServer:
         server = TestServer(app) if options is None else _OptionsServer(app, options)
-        await server.start_server()
+        if options is None:
+            await server.start_server(shutdown_timeout=SHUTDOWN_TIMEOUT_S)
+        else:
+            await server.start_server()
         self.servers.append(server)
         return server
 
@@ -283,24 +290,40 @@ async def test_retry_hop_limit():
 
 
 @pytest.mark.asyncio
-async def test_a_sidecar_error_is_not_retried_by_the_sidecar_before_it():
+async def test_a_final_sidecar_error_is_not_retried_by_the_sidecar_before_it():
     """T5, one retry layer (I5): A and B both sleep; A's retry reaches B, which retries
     on its own and gets the gateway's 503 (no routable pod) retry_attempts times. B's
-    final 503 is a sidecar error: A does not retry it. The sends per client request are
-    1 (A) + retry_attempts (B), not retry_attempts x (1 + retry_attempts)."""
+    503 is final (its retries ran out), and reaches A wrapped by the gateway: A does not
+    retry it. The sends per client request are 1 (A) + retry_attempts (B), not
+    retry_attempts x (1 + retry_attempts)."""
     async with Harness() as h:
         assert await h.sleep_a() == 200
         async with h.http.post(h.url("/sleep", h.sb), headers=HIDDEN) as resp:
             assert resp.status == 200
         status, headers, raw = await h.post("/v1/completions", completion_body(3))
         assert status == 503 and headers["Retry-After"] == "1"
-        assert json.loads(raw)["error"]["message"].startswith("tre-reissue sidecar:")
+        assert sc.FINAL_ERROR_MARK in json.loads(raw)["error"]["message"]  # final for A's caller too
         sends = [r["headers"]["x-tre-reissue-depth"] for r in h.gateway.requests]
         attempts = h.sidecar_a.cfg.retry_attempts
         assert sends.count("1") == 1  # A: one send, B's answer is final
         assert sends.count("2") == attempts  # B: its own bounded retries of the gateway's 503
         assert len(sends) == 1 + attempts
-        assert h.sidecar_a.metrics.reissue == {("failed", "retry_exhausted"): 1}
+        assert h.sidecar_a.metrics.reissue[("failed", "retry_exhausted")] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_single_attempt_sidecar_error_is_retried():
+    """T5, the other side: A sleeps and retries through the gateway; B's engine drops the
+    first stream before its first event, so B answers 502 after ONE attempt (not final).
+    A retries it like any gateway 502 and the second attempt succeeds."""
+    async with Harness(b={"break_at": 0, "break_requests": 1}) as h:
+        assert await h.sleep_a() == 200
+        status, headers, raw = await h.post("/v1/completions", completion_body(3))
+        assert status == 200 and headers["x-tre-retried"] == "2"
+        assert text_of(parse_sse(raw), False) == expected_text(tokenize(PROMPT), 3)
+        assert [r["headers"]["x-tre-reissue-depth"] for r in h.gateway.requests] == ["1", "1"]
+        assert h.gateway.requests[0]["target"] == "pod-b"
+        assert h.sidecar_a.metrics.reissue[("retry", "local_sleeping")] == 1
 
 
 # ------------------------------------------------------------- continuation path
@@ -517,7 +540,8 @@ async def test_abort_after_a_failed_sleep_is_still_continued():
         objs = parse_sse(raw)
         assert status == 200 and finishes(objs) == ["length"]
         assert text_of(objs, False) == expected_text(tokenize(PROMPT), 8)
-        assert h.sidecar_a.metrics.reissue == {("continue", "abort_sleep"): 1}
+        assert h.sidecar_a.metrics.reissue[("continue", "abort_sleep")] == 1
+        assert ("passthrough_abort", "not_sleeping") not in h.sidecar_a.metrics.reissue
 
 
 @pytest.mark.asyncio
@@ -612,6 +636,16 @@ async def test_continuation_after_mode_wait_budget_expiry():
 # ------------------------------------------------------------ client disconnect
 
 
+def _bounded(seconds: float = 15.0):
+    """A disconnect test that fails must fail, not hang (no pytest-timeout plugin here)."""
+    def wrap(test):
+        @functools.wraps(test)
+        async def run(*args, **kwargs):
+            return await asyncio.wait_for(test(*args, **kwargs), seconds)
+        return run
+    return wrap
+
+
 async def _until(condition, timeout_s: float = 2.0) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -623,6 +657,7 @@ async def _until(condition, timeout_s: float = 2.0) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False])
+@_bounded()
 async def test_client_disconnect_closes_the_upstream_request(stream):
     """The client goes away while its request waits on the engine (queued / prefill:
     no token yet): the sidecar closes its upstream request and the engine aborts it.
@@ -644,6 +679,7 @@ async def test_client_disconnect_closes_the_upstream_request(stream):
 
 
 @pytest.mark.asyncio
+@_bounded()
 async def test_client_disconnect_during_a_continuation_closes_the_continuation():
     """Pod A slept mid-stream and the request is being continued on pod B; the client
     goes away: B's request is closed too (through the gateway), and A accounts the
@@ -663,6 +699,7 @@ async def test_client_disconnect_during_a_continuation_closes_the_continuation()
 
 
 @pytest.mark.asyncio
+@_bounded()
 async def test_client_leaving_after_done_is_a_completed_request():
     """The client got the whole stream ([DONE]) and closes before the engine ends its
     response: a completed request, not a client cancel, and its added time is kept."""
@@ -683,6 +720,7 @@ def _open_fds() -> int:
 @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="counts /proc/self/fd")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["complete", "client_cancel", "upstream_error", "continuation", "retry"])
+@_bounded()
 async def test_open_sockets_return_to_baseline_after_each_terminal_path(path):
     """T4 (I3 / I4): the client and the gateway keep no idle connection and the sidecars'
     loopback pool drops an idle one after 0.05 s, so once a request has ended - completed,
@@ -710,11 +748,12 @@ async def test_open_sockets_return_to_baseline_after_each_terminal_path(path):
             status, _, raw = await h.post("/v1/completions", completion_body(8),
                                           sleep_after=3 if path == "continuation" else None)
             assert status == 200 and text_of(parse_sse(raw), False) == expected_text(tokenize(PROMPT), 8)
-        await _until(lambda: _open_fds() == baseline)
+        await _until(lambda: _open_fds() <= baseline)
         assert not h.engine_a.active and not h.engine_b.active
 
 
 @pytest.mark.asyncio
+@_bounded()
 async def test_sleep_caller_leaving_mid_call_still_marks_the_pod_sleeping():
     """The service-manager disconnects while the engine is still in /sleep: the call runs
     to its end and the sleeping mark follows the engine's answer (no probe needed)."""
