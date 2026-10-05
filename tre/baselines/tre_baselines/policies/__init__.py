@@ -1,5 +1,10 @@
 """Policy registry: ``TRE_BL_POLICY`` names one entry of :data:`POLICIES`.
 
+The keys are the short policy names; each policy's ``label`` is the arm name used in
+decision records and docs, which names the adaptation: ``Chiron-global`` (only the global
+loop scales; B is virtual), ``TokenScale-colocated`` (PD policy on colocated replicas),
+``PreServe-oracle`` (Tier-1 = trace oracle + noise).
+
 Each value is a factory ``factory(config) -> Policy`` taking the shell's
 :class:`tre_baselines.config.Config` (``config.policy_params`` = the policy ConfigMap as a
 dict, ``config.models`` = per-model registry limits, ``config.tick_s``, ``config.seed``).

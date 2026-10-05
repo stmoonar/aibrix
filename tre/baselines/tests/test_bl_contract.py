@@ -119,3 +119,20 @@ def test_missing_idle_ttft_fit_refuses_an_actuating_shell(tmp_path) -> None:
     with pytest.raises(ValueError, match="ttft_idle_c_ms"):
         load_config({**env, "TRE_BL_DRY_RUN": "false"})
     assert load_config(env).dry_run is True  # dry-run: warns, falls back to the fixed arm
+
+
+def test_arms_are_named_as_adaptations(tmp_path) -> None:
+    labels = {name: getattr(factory, "label", None) for name, factory in POLICIES.items()}
+    assert labels == {"static": "static", "chiron": "Chiron-global", "tokenscale": "TokenScale-colocated",
+                      "preserve": "PreServe-oracle"}
+    from bl_fakes import FakeCluster, FakeRedis, FakeSource, limits, make_config
+    from tre_baselines.loop import BaselineShell
+    from tre_baselines.policies.chiron import ChironPolicy
+    from tre_baselines.sm_client import Dispatcher
+
+    config = make_config(tmp_path, {"a": limits("a")}, policy="chiron")
+    cluster = FakeCluster(awake={"a": 1})
+    policy = ChironPolicy(dataclasses.replace(config, policy_params={"theta": 0.5}))
+    shell = BaselineShell(config, FakeSource(config, cluster, FakeRedis()), policy, Dispatcher(cluster.put_target))
+    assert {line["arm"] for line in shell.tick_once()} == {"Chiron-global"}
+    assert shell.health_doc()["arm"] == "Chiron-global"

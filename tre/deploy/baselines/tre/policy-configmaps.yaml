@@ -1,5 +1,8 @@
 # Per-policy parameters, mounted together at /etc/tre-baselines/<policy>.yaml; the shell
-# reads the file named by TRE_BL_POLICY_CONFIG. Filled in by each policy (empty for now).
+# reads the file named by TRE_BL_POLICY_CONFIG. Empty until the parameters are measured
+# (Chiron-global theta_trace, TokenScale-colocated V_b/V_P and bucket edges,
+# PreServe-oracle mu and trace_path): those policies refuse to start on {} (fail closed).
+# Freeze all of them in one config commit before any comparison.
 apiVersion: v1
 kind: ConfigMap
 metadata:

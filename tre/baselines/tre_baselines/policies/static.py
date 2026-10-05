@@ -9,6 +9,7 @@ from tre_baselines.snapshot import ClusterSnapshot
 
 class StaticPolicy:
     name = "static"
+    label = "static"
 
     def __init__(self, config: Any = None) -> None:
         self.config = config

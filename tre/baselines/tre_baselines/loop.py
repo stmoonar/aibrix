@@ -34,7 +34,9 @@
   - for a refusal (an HTTP answer, not a transport error) - any change of the SM state
   version (``/v2/state`` ``version``) resets it: the state that caused the refusal is gone.
   The remaining wait only bounds retries whose cause the state does not show.
-* One JSONL line per model per tick to ``$TRE_BL_LOG_DIR/decisions-<policy>-<YYYYMMDD>.jsonl``
+* One JSONL line per model per tick (``policy`` = the ``TRE_BL_POLICY`` key, ``arm`` = the
+  adapted arm's name, e.g. ``PreServe-oracle``) to
+  ``$TRE_BL_LOG_DIR/decisions-<policy>-<YYYYMMDD>.jsonl``
   (date of the Redis clock, UTC), mirrored to ``tre:v2:bl:decision:<model>`` (TTL 1 h)
   unless ``TRE_BL_WRITE_REDIS=false``, and appended to the stream ``tre:v2:bl:decisions``
   (MAXLEN ~ 100000) unless ``TRE_BL_DECISION_STREAM=false``.
@@ -197,6 +199,9 @@ class BaselineShell:
         self.redis = redis
         self.lock = lock
         self.log = decision_log or DecisionLog(config.log_dir, config.policy)
+        #: Arm name in decision records (adaptations named: Chiron-global,
+        #: TokenScale-colocated, PreServe-oracle).
+        self.arm = str(getattr(policy, "label", None) or config.policy)
         self.stats = ShellStats()
         self.backoff = Backoff(config.tick_s, getattr(config, "backoff_max_s", DEFAULT_BACKOFF_MAX_S))
         #: Models backing off after an SM refusal (cleared when the SM state changes).
@@ -334,6 +339,7 @@ class BaselineShell:
                 "ts_ms": snap.now_ms,
                 "tick": snap.tick,
                 "policy": self.config.policy,
+                "arm": self.arm,
                 **item,
                 "action": action,
                 "dry_run": effective_dry,
@@ -464,6 +470,7 @@ class BaselineShell:
             return {
                 "ok": s.consecutive_failures < int(self.config.max_tick_failures),
                 "policy": self.config.policy,
+                "arm": self.arm,
                 "ticks": s.ticks,
                 "consecutive_failures": s.consecutive_failures,
                 "last_error": s.last_error,

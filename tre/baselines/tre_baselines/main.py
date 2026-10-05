@@ -38,8 +38,9 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    LOG.info("baseline scaler: policy=%s dry_run=%s tick_s=%s models=%s", config.policy, config.dry_run,
-             config.tick_s, sorted(config.models))
+    LOG.info("baseline scaler: arm=%s (policy=%s) dry_run=%s tick_s=%s abort_sleep_path=%s models=%s",
+             shell.arm, config.policy, config.dry_run, config.tick_s, config.abort_sleep_path,
+             sorted(config.models))
     try:
         shell.run()
     finally:
