@@ -299,7 +299,10 @@ def dataset_attribution(directory: Path) -> str:
     except ImportError:            # pragma: no cover - the module is always there in the repo
         helper = None
     if helper is not None:
-        return str(helper(Path(directory)))
+        try:
+            return str(helper(Path(directory)))
+        except ValueError as exc:          # an unknown attribution in the manifest
+            raise Refused([f"dataset {directory}: {exc}"])
     d = Path(directory)
     man = d / "manifest.json" if (d / "manifest.json").exists() else d / "dataset" / "manifest.json"
     try:
