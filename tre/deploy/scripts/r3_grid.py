@@ -56,7 +56,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -683,6 +683,24 @@ def _capture_config(args) -> dict:
     return out
 
 
+def reissue_targets(args, endpoints: Sequence[str], *, run=None) -> tuple[dict, Optional[str]]:
+    """``({pod key: reissue metrics URL}, discovery error)`` for the reissue check: the
+    explicit ``--pod-endpoint`` hosts, else EVERY pod of the model (routable or not - a
+    continuation is counted on the pod that was put to sleep)."""
+    from scripts import calibration_capture as capture
+
+    path = getattr(args, "reissue_metrics_path", capture.REISSUE_METRICS_PATH)
+    if args.pod_endpoint:
+        return {u: capture.reissue_metrics_url(u, path) for u in endpoints}, None
+    try:
+        kw = {} if run is None else {"run": run}
+        pods = capture.discover_pod_targets(args.model, args.namespace, args.pod_metrics_port,
+                                            selector_extra="", **kw)
+    except Exception as exc:  # noqa: BLE001 - recorded: the cell is unmeasured
+        return {}, f"{type(exc).__name__}: {exc}"[:300]
+    return {t["key"]: capture.reissue_metrics_url(t["url"], path) for t in pods}, None
+
+
 def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "openloop.CellGuard"]:
     """Drive one open-loop cell from --schedule and return (window rows, guard)."""
     from tre_replayer.traces.loader import load_trace_segments
@@ -829,6 +847,17 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             print(f"WARNING: cell {cell_id}: {capture.CLOCK_DOMAIN_MISMATCH} at the cell start ({reasons}); "
                   "its gateway docs / controller ticks will be kept but never marked complete")
 
+    # Reissue contamination (scripts.calibration_capture.reissue_check): the sidecar
+    # counters of every model pod right before the load ...
+    reissue_policy = getattr(args, "reissue_check", "off") if layout is not None else None
+    reissue_before = reissue_rtargets = reissue_discovery_error = None
+    if reissue_policy in ("void", "record"):
+        from scripts import calibration_capture as capture
+
+        reissue_rtargets, reissue_discovery_error = reissue_targets(
+            args, endpoints if args.instant_source == "pod" else [])
+        reissue_before = capture.scrape_reissue(reissue_rtargets)
+
     sender_records: list[dict] = []
     sidecar_samples: list[dict] = []
     client_provenance: dict = {}
@@ -858,6 +887,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         request_seed=getattr(args, "request_seed", None),
         sender_processes=getattr(args, "sender_processes", None),
         client_out=client_provenance,
+        arrivals=getattr(args, "arrivals", openloop.ARRIVALS_POISSON),
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
@@ -875,6 +905,22 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
     clock_end = None
     if clock_start is not None:
         clock_end = capture.cell_clock_mark(redis_client, args.model, clock_cfg, start=clock_start)
+
+    # ... and right after it: a continued request (or a pod not read) voids the cell
+    # under --reissue-check void; the dataset excludes it under any policy.
+    reissue = None
+    if reissue_before is not None:
+        reissue = capture.reissue_check(reissue_before, capture.scrape_reissue(reissue_rtargets),
+                                        policy=reissue_policy, discovery_error=reissue_discovery_error)
+        reason = capture.reissue_void_reason(reissue)
+        if reason:
+            print(f"WARNING: cell {cell_id}: reissue check {reissue['status']}: {reason}")
+            if reissue_policy == "void":
+                guard = replace(guard, void_reasons=(*guard.void_reasons, reason))
+    elif reissue_policy == "off":
+        from scripts import calibration_capture as capture
+
+        reissue = capture.reissue_not_checked()
 
     # The cell's windows, labelled by THE labelling path - rewindow_from_raw.label_cell -
     # on the raw records and sidecar samples this very drive produced (the same bytes the
@@ -951,6 +997,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         "ttft_basis": "first_chunk_with_text",
         # What made this cell's arrivals and prompts its own (see openloop).
         "schedule_seed": args.schedule_seed,
+        "arrivals": getattr(args, "arrivals", openloop.ARRIVALS_POISSON),
         "prompt_key": args.prompt_key,
         "prompt_file": (
             None
@@ -962,6 +1009,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         # profile, wire (transport, pool, keep-alive), sender processes, library versions.
         "client": client_provenance,
     })
+    if reissue is not None:
+        artifact["reissue"] = reissue
     if raw_dir is not None:
         (raw_dir / f"{cell_id}.guard.json").write_text(
             json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -986,7 +1035,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             clock_start=clock_start, clock_end=clock_end,
             clock_config=clock_cfg or capture_clock_config(args),
             info={"guard_voided": guard.voided, "void_reasons": list(guard.void_reasons),
-                  "truncated": guard.truncated},
+                  "truncated": guard.truncated, "reissue": reissue},
         )
         gd = meta.get("gateway_redis_dump") or {}
         ct = meta.get("controller_ticks") or {}
@@ -1181,15 +1230,18 @@ def closed_loop_rows(
 
     arms = label if label is not None else slo_labels.slo_targets(
         ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    # the label decides the evidence attribution (label v2 hybrid: TTFT / min-n by first token),
+    # exactly as rewindow_from_raw.label_cell does - never a v1 table under a v2 label
+    attribution = rewindow_from_raw.label_attribution(arms)
     rows: list[dict] = []
     for wm, result in zip(windows, results):
         client = rewindow_from_raw.aggregate_window(
             list(raw_records), [], wm.model, wm.window_start_ms, wm.window_end_ms,
             percentile_mode=percentile_mode, min_latency_samples=min_latency_samples,
-            instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+            instant_sample_interval_ms=SCRAPE_INTERVAL_MS, attribution=attribution,
         )
         evidence = rewindow_from_raw.window_request_evidence(
-            raw_records, wm.window_start_ms, wm.window_end_ms)
+            raw_records, wm.window_start_ms, wm.window_end_ms, attribution=attribution)
         rows.append(window_row(
             cell, wm, result.TRS if result.defined else None, result.Q_ctl,
             client=client, server=wm,
@@ -1344,6 +1396,10 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "default is the same for every cell, so two cells with the same "
                          "segments get the same arrival instants; a campaign whose cells "
                          "must be independent passes one per cell")
+    ap.add_argument("--arrivals", default=openloop.ARRIVALS_POISSON, choices=list(openloop.ARRIVALS),
+                    help="arrival process of the schedule cell: poisson (default) or "
+                         "deterministic (every 1/rps s from each segment's start; one request "
+                         "per one-interval segment - the idle-TTFT capture)")
     ap.add_argument("--prompt-key", default=None,
                     help="namespace for this cell's request ids, and therefore for its "
                          "prompt seeds. Without it request k of every schedule of a model "
@@ -1392,6 +1448,13 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "window ends are not in redis's time domain at the cell start, refuse the "
                          "cell (default) or run it and mark its redis dumps clock_domain_mismatch "
                          "(the campaign passes flag: it checks once before the run)")
+    ap.add_argument("--reissue-check", default=_capture.DEFAULT_REISSUE_POLICY, choices=list(_capture.REISSUE_POLICIES),
+                    help="with --capture-dir: read every model pod's reissue-sidecar tre_reissue_total right "
+                         "before and after the load; a request continued during the cell (kind=continue) "
+                         "or a pod that could not be read voids the cell (void, default), is only "
+                         "recorded (record; the dataset still excludes it) or nothing is read (off)")
+    ap.add_argument("--reissue-metrics-path", default=_capture.REISSUE_METRICS_PATH,
+                    help="the sidecar's metrics path on the pod's serving port")
     ap.add_argument("--capture-margin-ms", type=int, default=None,
                     help="redis dumps cover [redis start - margin, redis end + margin] (default: "
                          "window + one gateway round + the clock check's blind spot, 52 s at 30 s)")

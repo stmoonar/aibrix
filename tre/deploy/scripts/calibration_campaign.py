@@ -604,6 +604,7 @@ def primary_label(args, model: str) -> slo_labels.LabelDefinition:
         min_completed_requests=getattr(
             args, "fit_min_completed_requests", slo_labels.DEFAULT_MIN_COMPLETED_REQUESTS),
         registry=getattr(args, "registry", None),
+        attribution=getattr(args, "fit_label_attribution", None),
     )
 
 
@@ -678,7 +679,10 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         # a cell that fails the check later is run and its redis dumps marked, not refused.
         command += ["--capture-dir", str(Path(output).parent / capture.CELLS_DIRNAME),
                     "--control-namespace", str(getattr(args, "controller_namespace", "tre-v2") or ""),
-                    "--clock-domain-check", "flag"]
+                    "--clock-domain-check", "flag",
+                    # a request continued by the reissue sidecar during the cell (or a pod
+                    # whose counter could not be read) voids it (scripts.calibration_capture)
+                    "--reissue-check", str(getattr(args, "reissue_check", None) or capture.DEFAULT_REISSUE_POLICY)]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
     if getattr(args, "envoy_stats_url", None):
@@ -1278,6 +1282,7 @@ def fit_plan(
         ttft_idle_b_ms_per_token=None,
         min_completed_requests=getattr(args, "fit_min_completed_requests", 20),
         label_registry=getattr(args, "registry", None),
+        label_attribution=getattr(args, "fit_label_attribution", None),
     )
     plan["label_arms_by_model"] = {}
     for model in models:
@@ -2048,7 +2053,8 @@ def preflight_input_lengths(shapes: Optional[Sequence[str]] = None) -> list[int]
 
 def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
                              out_dir: Optional[Path] = None,
-                             shapes: Optional[Sequence[str]] = None) -> Optional[dict]:
+                             shapes: Optional[Sequence[str]] = None,
+                             lengths: Optional[Sequence[int]] = None) -> Optional[dict]:
     """The run-level prompt-length pre-flight: for every model and every length of
     :func:`preflight_input_lengths` (the run's shortest cell input, 512, its longest), one
     request of the run's exact kind (``openloop.preflight_prompt_tokens``: same builder,
@@ -2058,14 +2064,15 @@ def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
     share. Raises SystemExit listing every failure otherwise - fail-closed, like the
     clock-domain pre-flight next to which every entry point calls it. The verdicts go to
     ``<out_dir>/prompt_preflight.json``. ``--prompt-preflight skip`` skips it (recorded
-    in the provenance)."""
+    in the provenance). ``lengths`` replaces the shape-derived lengths (a run whose
+    cells are not calibration shapes, e.g. :mod:`scripts.ttft_idle_capture`)."""
     if getattr(args, "prompt_preflight", "refuse") == "skip":
         print("WARNING: --prompt-preflight skip: the prompt lengths were not checked against the engine")
         return None
     if models is None:
         models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
     corpus = prompt_corpus(args)
-    lengths = preflight_input_lengths(shapes)
+    lengths = sorted({int(n) for n in lengths}) if lengths else preflight_input_lengths(shapes)
     checks: dict[str, list[dict]] = {}
     for model in models:
         for length in lengths:
@@ -2107,6 +2114,73 @@ def prompt_corpus_cli_args(args) -> list[str]:
     return ["--corpus-lang", corpus["corpus_lang"], "--zh-ratio", repr(corpus["zh_ratio"])]
 
 
+#: The gateway-plugins Deployment (in ``--controller-namespace``) whose image a run records.
+DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT = "tre-gateway-plugins"
+#: The runner :func:`image_provenance` calls kubectl with (read-only ``get``); the tests
+#: replace it so they never reach a cluster.
+IMAGE_PROVENANCE_RUN = subprocess.run
+KUBECTL_TIMEOUT_S = 20.0
+
+
+def _pod_images(item: Mapping) -> dict:
+    meta, spec, status = item.get("metadata") or {}, item.get("spec") or {}, item.get("status") or {}
+    ids = {c.get("name"): c.get("imageID") for c in status.get("containerStatuses") or []}
+    return {"pod": f"{meta.get('namespace')}/{meta.get('name')}", "node": spec.get("nodeName"),
+            "containers": [{"name": c.get("name"), "image": c.get("image"), "image_id": ids.get(c.get("name"))}
+                           for c in spec.get("containers") or []]}
+
+
+def image_provenance(models: Sequence[str], *, model_namespace: str, control_namespace: str,
+                     gateway_deployment: str = DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT, run=None) -> dict:
+    """The images the run is measured on, read with ``kubectl get`` (read-only): every
+    routable pod of each model (each container's image tag and image ID - the vLLM image
+    among them) and the gateway-plugins Deployment's image plus its pods' image IDs.
+
+    Never fails a run: whatever cannot be read is recorded as None, the reason goes to
+    ``warnings`` and is printed as a WARNING."""
+    run = run or IMAGE_PROVENANCE_RUN
+    warnings: list[str] = []
+
+    def kubectl_json(*argv: str) -> Optional[dict]:
+        try:
+            out = run(["kubectl", *argv, "-o", "json"], capture_output=True, text=True, check=True,
+                      timeout=KUBECTL_TIMEOUT_S).stdout
+            doc = json.loads(out or "{}")
+            return doc if isinstance(doc, dict) else None
+        except Exception as exc:  # noqa: BLE001 - provenance never fails a run
+            warnings.append(f"kubectl {' '.join(argv)}: {exc!r}")
+            return None
+
+    model_pods: dict[str, Optional[list]] = {}
+    for m in models:
+        doc = kubectl_json("-n", model_namespace, "get", "pods", "-l",
+                           f"model.aibrix.ai/name={m},tre.aibrix.io/routable=true")
+        if doc is None:
+            model_pods[m] = None
+            continue
+        pods = sorted((_pod_images(i) for i in doc.get("items") or []), key=lambda p: p["pod"])
+        if not pods:
+            warnings.append(f"{m}: no routable pod in namespace {model_namespace}")
+        model_pods[m] = pods or None
+    gateway: Optional[dict] = None
+    dep = kubectl_json("-n", control_namespace, "get", "deployment", gateway_deployment)
+    if dep is not None:
+        spec = ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+        labels = ((dep.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+        pods_doc = (kubectl_json("-n", control_namespace, "get", "pods", "-l",
+                                 ",".join(f"{k}={v}" for k, v in sorted(labels.items())))
+                    if labels else None)
+        gateway = {"namespace": control_namespace, "deployment": gateway_deployment,
+                   "containers": [{"name": c.get("name"), "image": c.get("image")}
+                                  for c in spec.get("containers") or []],
+                   "pods": (sorted((_pod_images(i) for i in pods_doc.get("items") or []), key=lambda p: p["pod"])
+                            if pods_doc is not None else None)}
+    for w in warnings:
+        print(f"WARNING: run provenance: {w} (recorded as null)", file=sys.stderr)
+    return {"model_pods": model_pods, "gateway_plugins": gateway, "warnings": warnings,
+            "source": "kubectl get (read-only), when the run was planned"}
+
+
 def run_provenance(args) -> dict:
     """What a run was made with, recorded before it drives anything."""
     registry = registry_path_for(args)
@@ -2122,6 +2196,13 @@ def run_provenance(args) -> dict:
     }
     return {
         "code": git_state(Path(__file__).resolve().parents[2]),
+        # The model pods' (vLLM) and the gateway plugins' images (null + warning when
+        # kubectl cannot say): theta is only valid on the engine it was fitted on.
+        "images": image_provenance(
+            models, model_namespace=str(getattr(args, "model_namespace", None) or "default"),
+            control_namespace=str(getattr(args, "controller_namespace", None) or "tre-v2"),
+            gateway_deployment=str(getattr(args, "gateway_plugins_deployment", None)
+                                   or DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT)),
         "registry_path": str(registry),
         "registry_sha256": file_sha256(registry),
         "window_ms": args.window_ms,
@@ -2149,6 +2230,19 @@ def run_provenance(args) -> dict:
 
 
 CAMPAIGN_STATUS_FILE = "campaign_status.json"
+
+
+def planned_attribution(out_dir: Path) -> str:
+    """The label attribution a collection's ``plan.json`` records (its ``label.label_def``,
+    else ``label_def``); completion (label v1) when it records none."""
+    try:
+        plan = json.loads((Path(out_dir) / "plan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return slo_labels.ATTRIBUTION_COMPLETION
+    label = ((plan.get("label") or {}).get("label_def") if isinstance(plan.get("label"), dict) else None) \
+        or plan.get("label_def") or {}
+    value = str(label.get("attribution") or slo_labels.ATTRIBUTION_COMPLETION)
+    return value if value in slo_labels.ATTRIBUTIONS else slo_labels.ATTRIBUTION_COMPLETION
 
 
 def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optional[str] = None) -> None:
@@ -2192,6 +2286,11 @@ def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optio
 
         built = calibration_dataset.build_dataset(out_dir)
         print(f"standard dataset: {built}")
+        attribution = planned_attribution(out_dir)
+        if attribution != slo_labels.ATTRIBUTION_COMPLETION:
+            # the run was judged on a label v2: its own dataset too, next to the v1 one
+            hybrid = calibration_dataset.build_dataset(out_dir, overrides={"attribution": attribution})
+            print(f"standard dataset ({attribution} attribution): {hybrid}")
         parent = out_dir.parent
         siblings = calibration_dataset.campaign_dirs(parent)
         if len(siblings) > 1 and all((d / CAMPAIGN_STATUS_FILE).exists() for d in siblings):
@@ -2305,6 +2404,7 @@ def run_campaign(args) -> int:
     status, code = "failed", 1
     try:
         code = _drive_campaign(args, index=index, cap=cap, runnable=runnable,
+                               static_cells=static_cells,
                                out_dir=out_dir, raw_dir=raw_dir, schedule_root=schedule_root)
         status = "complete" if code == 0 else "stopped"
     except KeyboardInterrupt:
@@ -2316,7 +2416,8 @@ def run_campaign(args) -> int:
     return code
 
 
-def _drive_campaign(args, *, index, cap, runnable, out_dir, raw_dir, schedule_root) -> int:
+def _drive_campaign(args, *, index, cap, runnable, static_cells, out_dir, raw_dir,
+                    schedule_root) -> int:
     measured_dir = out_dir / "capacity"
     measured_dir.mkdir(parents=True, exist_ok=True)
     boundary_dir = out_dir / "boundary"
@@ -2481,6 +2582,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--fit-ttft-floor-ms", type=float, default=None,
                     help="default: registry slo.ttft_floor_ms (500 ms, D6'); 150 = the D6 ablation arm")
     ap.add_argument("--fit-min-completed-requests", type=int, default=20)
+    ap.add_argument("--fit-label-attribution", choices=list(slo_labels.ATTRIBUTIONS), default=None,
+                    help="request-to-window attribution of the fit / probe label: completion "
+                         "(default, label v1) or hybrid (label v2, TTFT by first token, TPOT by "
+                         "completion). --acceptance-set-m2 / --t14-set take it from the freeze's "
+                         "label when not given")
     ap.add_argument("--min-slo-windows", type=int, default=3)
     ap.add_argument("--max-model-error-rate", type=float,
                     default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE,
@@ -2513,11 +2619,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--redis-url", default=None)
+    ap.add_argument("--reissue-check", default=capture.DEFAULT_REISSUE_POLICY, choices=list(capture.REISSUE_POLICIES),
+                    help="per cell (r3_grid --reissue-check): a request the reissue sidecar continued during "
+                         "the cell, or a model pod whose tre_reissue_total could not be read, voids the "
+                         "cell (void, default; re-driven once) or is only recorded (record); "
+                         "calibration_dataset excludes such cells either way")
     ap.add_argument("--no-capture-extras", action="store_true",
                     help="do not keep the per-cell system-side evidence (per-pod vLLM metrics, "
                          "gateway redis docs, controller ticks; scripts.calibration_capture)")
     ap.add_argument("--model-namespace", default="default")
     ap.add_argument("--controller-namespace", default="tre-v2")
+    ap.add_argument("--gateway-plugins-deployment", default=DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT,
+                    help="Deployment (in --controller-namespace) whose image the run provenance records")
     ap.add_argument("--dry-run", action="store_true",
                     help="write plan.json and fit_plan.json, print the time estimate, "
                          "drive nothing")
@@ -2568,10 +2681,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="step ③ of plan §6.11 (scripts.calibration_training_supplement): the "
                          "constant-load training cells on the D6' boundaries of one model "
                          "(--models MODEL), placed from --base-run and --boundary-supplement-run")
+    ap.add_argument("--training-plan", default=None,
+                    choices=["legacy-20260923", "p1-deep-overload"],
+                    help="--training-supplement: the cell plan (scripts.calibration_training_"
+                         "supplement.TRAINING_PLANS). legacy-20260923 (default): the 2026-09-23 "
+                         "③a/③b/③d cells (needs --boundary-supplement-run). p1-deep-overload: "
+                         "S2/S3/T8/S4/S5 x {1.5, 2.0, 3.0} x rho*_run2, 150 s holds")
     ap.add_argument("--acceptance-set", action="store_true",
                     help="step ④ of plan §6.11 (scripts.calibration_acceptance): the acceptance "
                          "set M of one model - D6' probes of its new shapes, its ten cells, then "
                          "sealed (M_manifest.json). A real run needs --freeze-file")
+    ap.add_argument("--composition", default=None, choices=["m1-20260923", "m2-20261005"],
+                    help="--acceptance-set: which M (scripts.calibration_acceptance). m1-20260923 "
+                         "(default): stage G's 13 cells (probes + 10 collected + 3 retained). "
+                         "m2-20261005: the next round's M2 - 28 collected cells, rho* reused "
+                         "from --rho-star-run, no probes, no retained cells")
+    ap.add_argument("--rho-star-run", type=Path, default=None,
+                    help="--composition m2-20261005: the sealed M root whose measured rho* M2 "
+                         "reuses (checked against the design constants, hashed into the plan)")
+    ap.add_argument("--m2-serial-offset", type=int, default=0,
+                    help="--composition m2-20261005: restart rule - a model's M2 re-run into a NEW "
+                         "root takes a fresh offset (a multiple of 100, recorded in the plan and the "
+                         "manifest) so its cell codes and seeds are new (default 0 = the first run)")
+    ap.add_argument("--ledger-root", type=Path, action="append", default=[],
+                    help="--composition m2-20261005: a root whose ledgers (cells.jsonl / "
+                         "cells.csv) M2's cell codes and seeds must not appear in (repeatable; "
+                         "--rho-star-run's parent is always scanned)")
     ap.add_argument("--base-run", type=Path, default=None,
                     help="--training-supplement / --acceptance-set: the second round's ladder "
                          "run root (rho*_run2 and C_s per shape)")
@@ -2593,6 +2728,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "probes, then sealed (T14_manifest.json). A real run needs "
                          "--freeze-file, --refit-params-file, --preregistration-json and "
                          "--routing-strategy least-gpu-cache")
+    ap.add_argument("--forbidden-root", type=Path, action="append", default=[],
+                    help="--t14-set: a training / M / refit / freeze root T14's --out-dir and "
+                         "--raw-dir must stay out of (repeatable; joined with the "
+                         "preregistration's t14.forbidden_roots and the capacity prior's input "
+                         "runs)")
     ap.add_argument("--capacity-prior-file", type=Path, default=None,
                     help="--t14-set: the pre-registered capacity prior "
                          "(python -m scripts.calibration_t14 capacity-prior)")
@@ -2606,6 +2746,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="--t14-set: an amendment of --preregistration-json (sidecar <file>.sha256, "
                          "amends.sha256 = the preregistration's); its overrides (the v1-lambda "
                          "parameter file binding only) apply before the binding check")
+    ap.add_argument("--t14-cell-serial-base", type=int, default=None,
+                    help="--t14-set: the first cell serial - 1 (default 80500, the 2026-09-24 / "
+                         "2026-10-03 rounds); a new round takes a fresh base, bound by the "
+                         "preregistration's t14.cell_serial_base")
     ap.add_argument("--corpus-lang", default=r3_grid.CORPUS_LANG_DEFAULT,
                     choices=list(r3_grid.CORPUS_LANGS),
                     help="text of every cell's prompts (r3_grid --corpus-lang; recorded in the "
@@ -2667,7 +2811,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error(f"no gateway URL: pass --gateway-url http://<gateway>/v1/chat/completions or set "
                  f"{GATEWAY_URL_ENV} (there is no built-in default: the address is the deployment's)")
     if args.design_seed is None:
-        args.design_seed = 20260924 if args.t14_set else 20260923
+        if args.t14_set:
+            args.design_seed = 20260924
+        elif args.acceptance_set and args.composition == "m2-20261005":
+            args.design_seed = 20261005  # M2: new seeds (calibration_acceptance.M2_DESIGN_SEED)
+        else:
+            args.design_seed = 20260923
+    if args.m2_serial_offset and args.composition != "m2-20261005":
+        ap.error("--m2-serial-offset belongs to --acceptance-set --composition m2-20261005")
+    if (args.composition or args.rho_star_run or args.ledger_root) and not args.acceptance_set:
+        ap.error("--composition / --rho-star-run / --ledger-root belong to --acceptance-set")
     collection = bool(args.training_supplement or args.acceptance_set or args.t14_set)
     if sum(map(bool, (args.training_supplement, args.acceptance_set, args.t14_set))) > 1:
         ap.error("--training-supplement, --acceptance-set and --t14-set are separate runs")
@@ -2687,10 +2840,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                  "--boundary-supplement-run / --boundary-table / --retained-dataset belong to "
                  "--training-supplement / --acceptance-set (and to calibration_t14 "
                  "capacity-prior)")
+    if args.training_plan and not args.training_supplement:
+        ap.error("--training-plan belongs to --training-supplement")
+    if args.forbidden_root and not args.t14_set:
+        ap.error("--forbidden-root belongs to --t14-set")
     if not args.t14_set and (args.capacity_prior_file or args.refit_params_file
-                             or args.preregistration_json or args.preregistration_amendment_json):
-        ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json belong "
-                 "to --t14-set")
+                             or args.preregistration_json or args.preregistration_amendment_json
+                             or args.t14_cell_serial_base is not None):
+        ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json / "
+                 "--t14-cell-serial-base belong to --t14-set")
     if args.t14_set and not args.capacity_prior_file:
         ap.error("--t14-set needs --capacity-prior-file")
     supplement = args.reprobe_base is not None

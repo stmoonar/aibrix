@@ -67,7 +67,13 @@ def now() -> str:
 
 
 def label(model: str, registry: str):
-    return dr.label_for(model, "primary", registry)
+    """The primary label of the frozen parameters this resplit re-reads, with their
+    attribution (the freeze's label record; refused if it is missing)."""
+    entry = (json.loads(FREEZE.read_text()).get("models") or {}).get(model) or {}
+    ld = (entry.get("verdict_for_holdout") or {}).get("label_def")
+    if not ld:
+        raise SystemExit(f"{FREEZE}: {model} has no frozen label record - its attribution is unknown")
+    return dr.label_for(model, "primary", registry, dr.attribution_of_inputs(label_def=ld, what=str(FREEZE)))
 
 
 # ----------------------------------------------------------------------------- pool

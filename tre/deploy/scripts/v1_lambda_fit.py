@@ -198,10 +198,12 @@ def score(w: V1Window, *, w_p: float, lambda_wait: float, qmin: float = SCORE_QM
 
 class RequestIndex:
     """Served requests' (done_ts_ms, tpot_ms) per (model, cell_id, attempt), from the
-    ``requests.csv`` of standard datasets (one per training source)."""
+    ``requests.csv`` of standard datasets (one per training source); plus their first-token
+    instants (``first_token_ts_ms``), the TTFT set of a label v2 (hybrid) window."""
 
     def __init__(self) -> None:
         self._by: dict[tuple, list[tuple[float, float]]] = defaultdict(list)
+        self._first: dict[tuple, list[float]] = defaultdict(list)
         self.sources: dict[str, str] = {}
 
     def add_dataset(self, run: str, directory: Path, model: Optional[str] = None) -> int:
@@ -216,14 +218,18 @@ class RequestIndex:
                 # the dataset's own classification (rewindow_from_raw.is_served on the raw)
                 if r.get("outcome") != OUTCOME_OK:
                     continue
+                key = (run, r["model"], r["cell_id"], str(r.get("attempt") or "1"))
+                if r.get("first_token_ts_ms"):
+                    self._first[key].append(float(r["first_token_ts_ms"]))
                 done, tpot = r.get("done_ts_ms"), r.get("tpot_ms")
                 if not done or not tpot:
                     continue
-                self._by[(run, r["model"], r["cell_id"], str(r.get("attempt") or "1"))].append(
-                    (float(done), float(tpot)))
+                self._by[key].append((float(done), float(tpot)))
                 n += 1
         for v in self._by.values():
             v.sort()
+        for f in self._first.values():
+            f.sort()
         self.sources[run] = str(path)
         return n
 
@@ -239,6 +245,14 @@ class RequestIndex:
 
     def count(self, *a, **kw) -> int:
         return len(self.tpots(*a, **kw))
+
+    def first_token_count(self, run: str, model: str, cell_id: str, attempt: str, start_ms: float,
+                          end_ms: float, *, closed_right: bool) -> int:
+        """Served requests whose first token is in the window (the hybrid TTFT set)."""
+        keys = self._first.get((run, model, cell_id, str(attempt or "1")), [])
+        if closed_right:
+            return bisect.bisect_right(keys, end_ms) - bisect.bisect_right(keys, start_ms)
+        return bisect.bisect_left(keys, end_ms) - bisect.bisect_left(keys, start_ms)
 
 
 def sources_from_trainset(fit_dir: Path) -> dict[str, Path]:
@@ -280,11 +294,17 @@ def load_windows(model: str, fitting_csv: Path, label, *, trim: int,
             args = (r.get("run", ""), model, r["cell_id"], r.get("attempt") or "1", start, end)
             right = requests.tpots(*args, closed_right=True)
             n_done = slo_labels.completed_requests(r)
+            # the average TPOT is over the completions of the window under either attribution
+            # (TPOT by completion); the row's min-n count is the completions (label v1) or the
+            # TTFT set (label v2, hybrid), so the membership self-check counts what the row counts
+            hybrid = getattr(label, "attribution", slo_labels.ATTRIBUTION_COMPLETION) == slo_labels.ATTRIBUTION_HYBRID
+            n_right = requests.first_token_count(*args, closed_right=True) if hybrid else len(right)
+            n_left = (requests.first_token_count(*args, closed_right=False) if hybrid
+                      else requests.count(*args, closed_right=False))
             if n_done is not None:
                 stats["tpot_membership"]["checked"] += 1
-                stats["tpot_membership"]["closed_right_match"] += int(len(right) == n_done)
-                stats["tpot_membership"]["closed_left_match"] += int(
-                    requests.count(*args, closed_right=False) == n_done)
+                stats["tpot_membership"]["closed_right_match"] += int(n_right == n_done)
+                stats["tpot_membership"]["closed_left_match"] += int(n_left == n_done)
             if right:
                 tpot_avg = sum(right) / len(right)
             elif n_done:
@@ -397,90 +417,9 @@ def fit_model(model: str, label, fitting_csv: Path, *, trim: int,
 
 
 # ------------------------------------------------------- B' (severity-aligned CRITICAL)
-
-
-def severity(w) -> float:
-    """Severity of one v2 window, as ``tre_calibration.fit.fit_delta_margins`` grades it:
-    0.8 * p95 ratio + 0.2 * average ratio, the average falling back to the p95 ratio
-    (always so under the slowdown label, whose windows carry no average ratio)."""
-    p95 = w.latency_ratio_p95 if w.latency_ratio_p95 is not None else (1.0 / w.health_score) - 1.0
-    avg = w.latency_ratio_avg if w.latency_ratio_avg is not None else p95
-    return 0.8 * p95 + 0.2 * avg
-
-
-def severity_cut(train_windows: Sequence[Any], q: float = 0.65) -> float:
-    """The training set's severity quantile of the violating windows - the cut
-    ``fit_delta_margins`` labels its critical windows with (same ``_quantile``)."""
-    from tre_calibration.fit import _quantile
-
-    sev = [severity(w) for w in train_windows if math.isfinite(w.signal) and not w.slo_met]
-    cut = _quantile(sev, q)
-    if cut is None:
-        raise ValueError("no violating training window")
-    return float(cut)
-
-
-def b_prime_point(windows: Sequence[Any], *, theta: float, tau_crit: float, cut: float,
-                  crit0: Sequence[bool], crit2: Sequence[bool]) -> dict:
-    """B' on one window list: CRITICAL recall of violations with severity >= ``cut``
-    (no dwell / dwell 2), healthy false alarm, all-violation recall, and where the
-    violations fall (CRITICAL / LOW band tau_crit <= Z < 1 / Z >= 1)."""
-    def rate(sel, flags):
-        return (sum(1 for i in sel if flags[i]) / len(sel)) if sel else None
-
-    idx = [i for i, w in enumerate(windows) if math.isfinite(w.signal)]
-    viol = [i for i in idx if not windows[i].slo_met]
-    ok = [i for i in idx if windows[i].slo_met]
-    sev = [i for i in viol if severity(windows[i]) >= cut]
-    z = {i: windows[i].signal / theta for i in idx}
-    missed = [i for i in viol if not crit0[i]]
-    low = [i for i in viol if tau_crit <= z[i] < 1.0]
-    return {
-        "violating": len(viol), "healthy": len(ok), "severe_windows": len(sev), "severity_cut": cut,
-        "nodwell": {"recall_severe": rate(sev, crit0), "false_alarm": rate(ok, crit0),
-                    "recall_all": rate(viol, crit0)},
-        "dwell2": {"recall_severe": rate(sev, crit2), "false_alarm": rate(ok, crit2),
-                   "recall_all": rate(viol, crit2)},
-        "violations_by_band": {
-            "critical": (sum(1 for i in viol if z[i] < tau_crit) / len(viol)) if viol else None,
-            "low": (len(low) / len(viol)) if viol else None,
-            "healthy_side_z_ge_1": (sum(1 for i in viol if z[i] >= 1.0) / len(viol)) if viol else None,
-        },
-        "missed_caught_by_slow_loop": (sum(1 for i in missed if z[i] < 1.0) / len(missed)) if missed else None,
-    }
-
-
-def b_prime_boot(windows: Sequence[Any], *, theta: float, tau_crit: float, cut: float,
-                 crit: Sequence[bool], n: int = 1000, seed: int = 20260922) -> dict:
-    """Cell bootstrap (scenario ids with replacement) CI95 of the B' recall / false alarm
-    for one flag series."""
-    import random
-
-    by: dict[str, list[int]] = defaultdict(list)
-    for i, w in enumerate(windows):
-        if math.isfinite(w.signal):
-            by[w.scenario_id].append(i)
-    cells = sorted(by)
-    cnt = {}
-    for c in cells:
-        sev = [i for i in by[c] if not windows[i].slo_met and severity(windows[i]) >= cut]
-        ok = [i for i in by[c] if windows[i].slo_met]
-        cnt[c] = (sum(crit[i] for i in sev), len(sev), sum(crit[i] for i in ok), len(ok))
-    rec, fa = [], []
-    rng = random.Random(seed)
-    for _ in range(n if cells else 0):
-        pick = [rng.choice(cells) for _ in cells]
-        a = [sum(cnt[c][k] for c in pick) for k in range(4)]
-        if a[1]:
-            rec.append(a[0] / a[1])
-        if a[3]:
-            fa.append(a[2] / a[3])
-
-    def ci(v):
-        v = sorted(v)
-        return [v[int(0.025 * len(v))], v[int(0.975 * len(v)) - 1]] if v else [None, None]
-
-    return {"recall_severe_ci95": ci(rec), "false_alarm_ci95": ci(fa), "n": n, "seed": seed}
+# Moved to scripts.b_prime (2026-10-03: B' is the accept gate of dline_refit); re-exported
+# here for v1_lambda_compare and older callers.
+from scripts.b_prime import b_prime_boot, b_prime_point, severity, severity_cut  # noqa: E402,F401
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -495,11 +434,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--wp-grid", choices=WP_GRIDS, default="with_zero")
     args = ap.parse_args(argv)
-    label = dr.label_for(args.model, args.arm, args.registry)
     sources = sources_from_trainset(args.fit_dir)
     for t in args.requests_dataset:
         run, _, d = t.partition("=")
         sources[run] = Path(d)
+    attribution = dr.attribution_of_inputs(fit_dir=args.fit_dir, datasets=sources.values(), what="v1_lambda_fit")
+    label = dr.label_for(args.model, args.arm, args.registry, attribution)
     doc = fit_model(args.model, label, dr.paths(args.fit_dir, args.model)["fitting"],
                     trim=dr.TRIM_RAMP_WINDOWS, sources=sources, wp_grid=args.wp_grid)
     args.out.write_text(json.dumps(doc, indent=1, default=str))

@@ -228,8 +228,9 @@ def test_d6_prime_primary_label_is_the_default() -> None:
     label = label_def_from_args(args, "dsqwen-7b")
     assert label.slowdown and label.ttft_slowdown_k == 5.0 and label.ttft_floor_ms == 500.0
     assert label.tpot_p95_ms == 75.0
-    # 7b idle at 2048 tok: 36.4 + 0.0527 * 2048 = 144.3 ms -> 5x = 721.5 ms; short prompts sit on the floor
-    assert abs(label.ttft_slo_ms(2048) - 5 * (36.4 + 0.0527 * 2048)) < 1e-9
+    # 7b idle at 2048 tok, c / b from the registry -> 5x; short prompts sit on the floor
+    slo = load_registry().model("dsqwen-7b").slo
+    assert abs(label.ttft_slo_ms(2048) - 5 * (slo.ttft_idle_c_ms + slo.ttft_idle_b_ms_per_token * 2048)) < 1e-9
     assert label.ttft_slo_ms(256) == 500.0
     # the fixed comparison column stays selectable
     fixed = label_def_from_args(_parser().parse_args(["--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75"]), "dsqwen-7b")

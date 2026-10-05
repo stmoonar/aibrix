@@ -22,6 +22,7 @@ ARM = "fixed"          # the fixed 500 / 75 ms label: the windows' outcome is se
 TAU_CRIT = 0.73
 TRAIN_BA = 0.9
 BOOT = 40
+TRAIN_VIOLATING_TPOT = 90.0
 
 _IDENTITY = ["model", "shape", "primitive", "stage", "rho", "cell_id", "attempt", "split", "cell_status", "role",
              "rho_factor", "replicate", "possibly_contaminated", "in_warmup"]
@@ -83,13 +84,19 @@ _PROBE = 3_000_301
 
 
 def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = False,
-           false_alarm_cells: int = 0, train_manifest: dict | None = None) -> dict:
+           false_alarm_cells: int = 0, train_manifest: dict | None = None, steps_cells: int = 0) -> dict:
     """A trainset fit dir, a refit tree (the four stage outputs of one model) and an M
-    dataset. ``false_alarm_cells`` healthy M cells carry a low signal (CRITICAL false alarms)."""
+    dataset. ``false_alarm_cells`` healthy M cells carry a low signal (CRITICAL false alarms).
+    ``steps_cells`` > 0: the TPOT-violating cells are that many ``steps`` cells (onset
+    episodes for the onset gate) instead of the five hold cells."""
     # training set, cut by the trainset stage from a small dataset
     train = []
     for n, shape in enumerate(("S1", "S3", "S4", "S5", "S3", "S4")):
         train += _cell_rows(1_100_000 + n, shape=shape, split="train", role="ladder", stage="ladder")
+    # two violating training cells (TPOT 90 / 75 ms: severity 1.2) - the B' cut's source
+    for n, shape in enumerate(("S1", "S5")):
+        train += _cell_rows(1_100_010 + n, shape=shape, split="train", role="ladder", stage="ladder", signal="lo",
+                            tpot=TRAIN_VIOLATING_TPOT)
     _write_dataset(tmp_path / "run2" / "dataset", train, train_manifest)
     fit = tmp_path / "fit"
     assert dl.main(["trainset", "--fit-dir", str(fit), "--h2-dataset", str(tmp_path / "run2")]) == 0
@@ -97,11 +104,14 @@ def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = Fa
     # M: the evaluated cells, one sealed probe and one training row in the same dataset
     m_rows, cells = [], []
     specs = [(c, "lo" if k < false_alarm_cells else s, t, p) for k, (c, s, t, p) in enumerate(_HEALTHY)]
-    for code, sig, ttft, tpot in specs + _TPOT + _TTFT_ONLY:
+    tpot_cells = ([(3_000_101 + k, "lo", 200.0, 100.0) for k in range(steps_cells)] if steps_cells else _TPOT)
+    steps = {c for c, *_ in tpot_cells} if steps_cells else set()
+    for code, sig, ttft, tpot in specs + tpot_cells + _TTFT_ONLY:
+        prim = "steps" if code in steps else "hold"
         m_rows += _cell_rows(code, shape="M", split="holdout", role="ladder", stage="ladder", signal=sig,
-                             ttft=ttft, tpot=tpot)
+                             ttft=ttft, tpot=tpot, primitive=prim)
         cells.append({"model": MODEL, "cell_id": f"i0_o0_c{code}", "attempt": 1, "shape": "M",
-                      "primitive": "hold", "role": "ladder",
+                      "primitive": prim, "role": "ladder",
                       "origin": "retained" if code == _HEALTHY[0][0] else "collected",
                       "seen_before": code == _HEALTHY[0][0],
                       "note": "first-round M cell, looked at once by the 09-22 refit" if code == _HEALTHY[0][0] else ""})
@@ -152,9 +162,31 @@ def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = Fa
             "freeze": tmp_path / "freeze" / "params_freeze.json", "mroot": tmp_path / "M"}
 
 
-def _freeze(w: dict) -> int:
-    return dl.main(["freeze", "--model", MODEL, "--arm", ARM, "--fit-dir", str(w["fit"]), "--out-dir", str(w["out"]),
+def _freeze(w: dict, gate: str = "b_prime") -> int:
+    """A new freeze is always revision 4 with the onset gate. ``gate="b_prime"`` (these tests
+    pin the A, B', D path on hold-only M) re-seals it as a revision-3 freeze - the older-freeze
+    path accept keeps - with a valid self hash and sidecar (the onset gate: test_b_prime_gate.py)."""
+    code = dl.main(["freeze", "--model", MODEL, "--arm", ARM, "--fit-dir", str(w["fit"]), "--out-dir", str(w["out"]),
                     "--freeze-file", str(w["freeze"])])
+    if code == 0 and gate == "b_prime":
+        import hashlib
+        import os
+
+        ff = Path(w["freeze"])
+        doc = json.loads(ff.read_text())
+        doc.pop("accept_gate")
+        doc.pop("freeze_sha256")
+        doc["format_revision"] = 3
+        doc["freeze_sha256"] = dl.canonical_sha256(doc)
+        data = dl._json_bytes(doc)
+        side = Path(f"{ff}.sha256")
+        for p in (ff, side):
+            os.chmod(p, 0o644)
+        ff.write_bytes(data)
+        side.write_text(f"{hashlib.sha256(data).hexdigest()}  {ff.name}\n")
+        for p in (ff, side):
+            os.chmod(p, 0o444)
+    return code
 
 
 def _seal(w: dict, *, label_def=None, freeze_sha=None, cells=None, sums_extra: list[Path] = ()) -> Path:
@@ -352,6 +384,13 @@ def test_accept_runs_once_and_scores_a_known_m(tmp_path, capsys) -> None:
     assert c["C"]["independent_windows"] == pytest.approx(11 / 3) and c["C"]["gating"] is False
     assert c["D"]["passed"] and c["D"]["family_gap_within_ci_half_width"] is True
     assert r["holdout_report"]["with_dwell"]["dwell_windows"] == 2
+    assert c["B"]["gating"] is False                                   # old B: disclosed
+    # B' gates, at the controller's dwell (1) by default: every severe violation caught
+    bp = c["B_prime"]
+    assert bp["gating"] and bp["passed"] and bp["dwell_windows"] == dl.ONLINE_DWELL_WINDOWS == 1
+    assert res["thresholds"]["B_prime"]["dwell_windows"] == 1 and "TRE_DWELL_WINDOWS" in bp["dwell_source"]
+    assert bp["criteria"][0]["value"] == 1.0 and bp["criteria"][2]["value"] == 0.0
+    assert bp["by_dwell"]["2"]["recall_severe"] == pytest.approx(60 / 66)  # disclosed
     # once only
     capsys.readouterr()
     assert _accept(w, man) == dl.EXIT_REFUSED
@@ -407,10 +446,11 @@ def test_accept_fails_b_on_false_alarms_and_exits_3(tmp_path, capsys) -> None:
     assert _freeze(w) == 0
     assert _accept(w, _seal(w)) == dl.EXIT_ACCEPT_FAILED
     out = capsys.readouterr().out
-    assert "acceptance FAILED" in out and f"{MODEL}: B failed" in out
+    assert "acceptance FAILED" in out and f"{MODEL}: B_prime failed" in out
     res = json.loads(dl.freeze_paths(w["freeze"])["result"].read_text())
     c = res["models"][MODEL]["criteria"]
-    assert res["passed"] is False and not c["B"]["passed"]
+    assert res["passed"] is False and not c["B"]["passed"] and not c["B_prime"]["passed"]
+    assert c["B_prime"]["criteria"][2]["value"] == pytest.approx(22 / 66)  # dwell 1: every low window
     fa = c["B"]["criteria"][2]
     assert fa["value"] == pytest.approx(20 / 66) and not fa["met"]
     # BA without dwell: 44 of 66 healthy windows on the healthy side, every violating one caught

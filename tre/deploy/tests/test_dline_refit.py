@@ -177,6 +177,11 @@ def test_the_three_stages_run_end_to_end_and_chain_through_their_outputs(tmp_pat
     final = json.loads((out / MODEL / "fixed" / "final.json").read_text())
     assert "error" not in final, final
     assert final["w_p"] == wp["w_p_used"] and final["theta_published"] == final["theta_merged"]  # D5
+    # 2026-10-05: theta stays the BA argmax; the band of candidates within .005 BA is disclosed
+    band = final["theta_selection"]["plateau"]
+    assert band["theta_lo"] <= final["theta_published"] <= band["theta_hi"]
+    ab = final["absolute_thresholds"]
+    assert ab["critical_abs"] == pytest.approx(final["theta_published"] * final["tau_crit"])
     assert (out / MODEL / "fixed" / "holdout_final.json").exists()
     assert final["holdout_evaluated"] is True and "M_ba" in final
     assert dl.main(["summary", "--model", MODEL, "--fit-dir", str(fit), "--out-dir", str(out),
@@ -632,3 +637,52 @@ def test_publish_tau_rule_publishes_the_rule_pick() -> None:
         dl.publish_tau_arg("-1")
     # an alpha.json from before D18 still chains through its rule pick
     assert dl.published_tau({"chosen_tau_s": 15.0}) == 15.0
+
+
+# ------------------------------------- next round (2026-10-05): pooled training set, theta band
+
+
+def test_train_dynamic_pools_the_train_split_dynamic_cells_and_records_it(tmp_path) -> None:
+    _dataset(tmp_path, "run1", _RUN1)
+    _dataset(tmp_path, "run2", _RUN2, seed=8)
+    off, on = _trainset(tmp_path, "off"), _trainset(tmp_path, "on", "--train-dynamic")
+    dyn = {"i256_o448_c60", "i768_o384_c70"}   # run 1's train-split steps / bursts
+    assert dyn <= set(_ids(on / f"{MODEL}_fitting.csv")) and not dyn & set(_ids(off / f"{MODEL}_fitting.csv"))
+    # the sealed split (run-1 M ramp, run-2 ramp and M) stays H2 either way
+    h2 = json.loads((on / dl.H2_MANIFEST).read_text())
+    assert {(c["run"], c["scenario_id"], c["why"]) for c in h2["cells"]} == {
+        ("run1", "i0_o0_c90", "sealed"), ("run2", "i256_o128_c1100005", "sealed"), ("run2", "i0_o0_c1100006", "sealed")}
+    man_on, man_off = (json.loads((d / dl.TRAINSET_MANIFEST).read_text()) for d in (on, off))
+    assert man_on["dynamic_training"]["admitted"] is True and man_off["dynamic_training"]["admitted"] is False
+    assert man_on["dynamic_training"]["weights"] == "equal per window"
+    assert man_on["models"][MODEL]["dynamic"]["cells"] == 2 and man_off["models"][MODEL]["dynamic"]["cells"] == 0
+    assert man_on["attribution"] == "completion"
+    # the fit stages take dynamic rows only from a training set that records the flag
+    assert dl.check_training_inputs(MODEL, dl.paths(on, MODEL))["dynamic_training"] is True
+    hand = tmp_path / "hand"
+    hand.mkdir()
+    (hand / f"{MODEL}_fitting.csv").write_bytes((on / f"{MODEL}_fitting.csv").read_bytes())
+    with pytest.raises(SystemExit, match="constant-load cells only"):
+        dl.check_training_inputs(MODEL, dl.paths(hand, MODEL))
+    # one theta, one label: sources of two label attributions are refused
+    (tmp_path / "run2" / "dataset" / "manifest.json").write_text(
+        json.dumps({"format_revision": 2, "attribution": {"value": "hybrid", "rule": "first token"}}))
+    with pytest.raises(SystemExit, match="different label attributions"):
+        _trainset(tmp_path, "mixed", "--train-dynamic")
+
+
+def test_the_theta_band_is_disclosed_and_never_moves_theta() -> None:
+    from types import SimpleNamespace
+
+    from tre_calibration.fit import ThetaFitConfig
+
+    # 200 healthy windows at signal 1..200, 5 violating at .5: theta = 1 is the BA argmax (1.0);
+    # the next candidate (~2, recall .995, BA .9975) is within .005 -> a two-point band
+    ws = [SimpleNamespace(signal=float(s), slo_met=True, scenario_id=f"c{s % 7}", scenario_family=f"f{s % 3}")
+          for s in range(1, 201)]
+    ws += [SimpleNamespace(signal=0.5, slo_met=False, scenario_id="v", scenario_family="f0") for _ in range(5)]
+    cfg = ThetaFitConfig(direction="higher_is_healthier", healthy_quantile_candidates=(0.0, 0.005, 0.05, 0.5))
+    theta = cfg.fit(ws).theta
+    band = dl.theta_plateau(ws, cfg, fit_theta=theta)
+    assert theta == 1.0 and band["ba_max"] == 1.0 and len(band["inside"]) == 2
+    assert band["theta_lo"] == theta < band["theta_hi"] < 2.1 and band["argmax_unique_within_tolerance"] is False

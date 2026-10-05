@@ -1725,6 +1725,13 @@ class _Sidecar:
         return mark_live_grid(self.samples)
 
 
+#: Arrival processes of :func:`drive_cell_schedule`. Poisson is the calibration default;
+#: deterministic is for captures that need each request at a known, spaced instant.
+ARRIVALS_POISSON = "poisson"
+ARRIVALS_DETERMINISTIC = "deterministic"
+ARRIVALS = (ARRIVALS_POISSON, ARRIVALS_DETERMINISTIC)
+
+
 def drive_cell_schedule(
     gateway_url: str,
     model: str,
@@ -1760,6 +1767,7 @@ def drive_cell_schedule(
     request_seed: Optional[int] = None,
     sender_processes: Optional[int] = None,
     client_out: Optional[dict] = None,
+    arrivals: Optional[str] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -1795,6 +1803,12 @@ def drive_cell_schedule(
     With ``rps_timeline_path`` the cell also writes its nominal-vs-achieved arrival
     series, built from the instants the requests actually reached the wire.
 
+    ``arrivals`` (None = :data:`ARRIVALS_POISSON`) picks the arrival process.
+    :data:`ARRIVALS_DETERMINISTIC` fires every ``1/rps`` s from each segment's start, so a
+    segment one interval long carries exactly one request at a known instant - what the
+    idle-TTFT capture (:mod:`scripts.ttft_idle_capture`) needs to send one prompt length
+    at a time, spaced so no two requests overlap.
+
     ``request_key`` namespaces the request ids, and with them the prompt seeds, so two
     cells never send the same prompts (see :func:`namespace_request_ids`); ``seed``
     decides the arrival instants (and sampled lengths). ``max_backlog`` arms
@@ -1827,12 +1841,16 @@ def drive_cell_schedule(
     from tre_replayer.engine.profiles import DEFAULT_SENDER_PROCESSES
     from tre_replayer.engine.prompt_store import materialize_prompts, prompt_file_path
     from tre_replayer.engine.prompts import DEFAULT_MODE
-    from tre_replayer.engine.schedule import build_poisson_schedule
+    from tre_replayer.engine.schedule import build_deterministic_schedule, build_poisson_schedule
 
-    events = namespace_request_ids(
-        [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model],
-        request_key,
-    )
+    arrivals = arrivals or ARRIVALS_POISSON
+    if arrivals == ARRIVALS_POISSON:
+        built = build_poisson_schedule(segments, seed=seed)
+    elif arrivals == ARRIVALS_DETERMINISTIC:
+        built = build_deterministic_schedule(segments, seed=seed)
+    else:
+        raise ValueError(f"unknown arrival process {arrivals!r} (expected {ARRIVALS})")
+    events = namespace_request_ids([e for e in built if e.model == model], request_key)
     scheduled = len(events)
 
     # Before anything else, and before any thread or sidecar exists: the pool forks, and

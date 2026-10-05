@@ -21,6 +21,12 @@ from tre_calibration.dataset import CalibrationWindow
 MODEL = base.MODEL
 
 
+def dl_b_prime():
+    from scripts import b_prime
+
+    return b_prime
+
+
 # ------------------------------------------------------------- shared helpers
 
 
@@ -55,7 +61,7 @@ def test_accept_discloses_ranking_per_model_and_pooled_never_gating(tmp_path, ca
     w, res = _accepted(tmp_path)
     out = capsys.readouterr().out
     assert "ranking disclosure (pressure = -Z; not gating)" in out and "| pooled |" in out
-    assert res["format_revision"] == dl.ACCEPT_FORMAT_REVISION == 2
+    assert res["format_revision"] == dl.ACCEPT_FORMAT_REVISION == 4
     r = res["models"][MODEL]
     assert r["windowing"] == dl.DEFAULT_WINDOWING and res["thresholds"]["dwell_windows"] == 2
     d = r["ranking_disclosure"]
@@ -94,7 +100,9 @@ def test_recheck_of_a_revision_1_result_ignores_only_the_new_keys(tmp_path, caps
     w, res = _accepted(tmp_path)
     old = dl.as_revision(res, 1)
     assert "ranking_disclosure" not in old and "windowing" not in old["models"][MODEL]
-    assert old["format_revision"] == 1 and old["models"][MODEL]["criteria"] == res["models"][MODEL]["criteria"]
+    assert old["format_revision"] == 1 and "B_prime" not in old["models"][MODEL]["criteria"]
+    assert old["models"][MODEL]["criteria"]["A"] == res["models"][MODEL]["criteria"]["A"]
+    assert "B_prime" not in old["thresholds"] and old["passed"] is True and old["failed"] == []
     _resign_marker(w, old)
     man = base._seal(w)
     capsys.readouterr()
@@ -113,11 +121,13 @@ def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_p
     assert base._freeze(w) == 0
     ff = w["freeze"]
     doc = json.loads(ff.read_text())
-    assert doc["format_revision"] == 2
+    assert doc["format_revision"] == 3  # base._freeze re-seals the revision-4 freeze as revision 3
     assert doc["models"][MODEL]["windowing"] == {**dl.DEFAULT_WINDOWING,
                                                  "source": "defaults: final.json predates the windowing record"}
-    # rewrite it as a revision-1 freeze (no windowing), re-hashed: the D22 shape
+    # rewrite it as a revision-1 freeze (no windowing, no B' cut), re-hashed: the D22 shape
     del doc["models"][MODEL]["windowing"]
+    del doc["models"][MODEL]["b_prime"]
+    del doc["b_prime_gate"]
     doc["format_revision"] = 1
     doc.pop("freeze_sha256")
     doc["freeze_sha256"] = dl.canonical_sha256(doc)
@@ -128,17 +138,19 @@ def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_p
     os.chmod(side, 0o644)
     side.write_text(f"{hashlib.sha256(data).hexdigest()}  {ff.name}\n")
     assert dl.verify_freeze(ff)["format_revision"] == 1
-    assert base._accept(w, base._seal(w)) == 0
+    thresholds = tmp_path / "b_prime_thresholds.json"
+    thresholds.write_text(json.dumps({"severity_cut_train": {MODEL: 1.2}, "gate": dict(dl_b_prime().DEFAULT_GATE)}))
+    assert base._accept(w, base._seal(w), "--b-prime-thresholds", str(thresholds)) == 0
     res = json.loads(dl.freeze_paths(ff)["result"].read_text())
     assert res["models"][MODEL]["windowing"] == dl.DEFAULT_WINDOWING
     assert res["models"][MODEL]["holdout_report"]["with_dwell"]["dwell_windows"] == 2
     # a revision the reader does not know is refused
-    doc["format_revision"] = 3
+    doc["format_revision"] = 5
     doc["freeze_sha256"] = dl.canonical_sha256({k: v for k, v in doc.items() if k != "freeze_sha256"})
     data = dl._json_bytes(doc)
     ff.write_bytes(data)
     side.write_text(f"{hashlib.sha256(data).hexdigest()}  {ff.name}\n")
-    with pytest.raises(dl.FreezeError, match="not a format revision 1 / 2 freeze"):
+    with pytest.raises(dl.FreezeError, match="not a format revision 1 / 2 / 3 / 4 freeze"):
         dl.verify_freeze(ff)
 
 
@@ -151,11 +163,13 @@ def test_accept_uses_the_dwell_the_freeze_recorded(tmp_path) -> None:
     assert base._freeze(w) == 0
     entry = dl.verify_freeze(w["freeze"])["models"][MODEL]
     assert entry["windowing"]["dwell_windows"] == 3 and entry["windowing"]["source"] == "final.json"
-    assert base._accept(w, base._seal(w)) == dl.EXIT_ACCEPT_FAILED  # 45 / 55 < 0.85: B fails
+    # the old B (dwell 3: 45 / 55 < 0.85) fails but is disclosed only; B' gates at dwell 1
+    assert base._accept(w, base._seal(w)) == 0
     res = json.loads(dl.freeze_paths(w["freeze"])["result"].read_text())
     c = res["models"][MODEL]["criteria"]
     # dwell 3: the first two CRITICAL windows of each 11-window violating cell are unconfirmed
     assert c["B"]["criteria"][0]["value"] == pytest.approx(45 / 55) and c["B"]["dwell_windows"] == 3
+    assert not c["B"]["passed"] and c["B_prime"]["passed"] and c["B_prime"]["dwell_windows"] == 1
     assert res["thresholds"]["dwell_windows"] == 3
 
 

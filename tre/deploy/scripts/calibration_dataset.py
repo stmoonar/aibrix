@@ -23,6 +23,10 @@ wrong latency column. This tool does the assembly once, in one place:
 * ``requests.csv`` - every request of every attempt (void included): the raw evidence
   from which any other label definition can be recomputed.
 * ``cells.csv`` - one row per attempt: status, verdicts, outcome counts, files.
+  An attempt whose guard artifact records a reissue check ``contaminated`` (a request
+  the reissue sidecar continued during the cell) or ``unmeasured`` (a pod's counter not
+  read) is void here whatever the driver's policy was: its windows are excluded and the
+  manifest counts it under ``reissue_check``.
 * ``DATASET.md`` - what every column means (a copy of ``tre/docs/DATASET.md``).
 
 A campaign of the preregistered ladder design (``plan.json`` says ``"design":
@@ -57,10 +61,19 @@ from tre_common import slo_labels
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
 from scripts import adaptive_boundary as boundary
+from scripts import calibration_capture as capture
+from scripts import l3_numerator as l3
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop, r3_grid, rewindow_from_raw
 
 DATASET_DIR = "dataset"
+#: Default directory of a dataset built with the L3 numerator (``--numerator
+#: vllm_counter``), so it never replaces the default (gateway-numerator) one.
+DATASET_DIR_L3 = "dataset_l3"
+#: Default directory of a dataset labelled with the hybrid attribution (``--attribution
+#: hybrid``, label v2: TTFT by first token, TPOT by completion), so it never replaces the
+#: default (completion, label v1) one. With the L3 numerator: ``dataset_l3_hybrid``.
+DATASET_DIR_HYBRID = "dataset_hybrid"
 MANIFEST = "manifest.json"
 WINDOW_TABLE = "windows.csv"
 REQUEST_TABLE = "requests.csv"
@@ -91,6 +104,10 @@ IDENTITY_COLUMNS = [
     "cell_status", "role", "rho_factor", "replicate", "possibly_contaminated",
 ]
 WINDOW_COLUMNS = IDENTITY_COLUMNS + ["in_warmup"] + list(r3_grid.CSV_COLUMNS)
+#: Extra window columns of an L3 dataset (``--numerator vllm_counter``): the numerator's
+#: source and the gateway numerator's two totals of the same window, for comparison.
+#: ``prompt_tokens_total`` / ``generation_tokens_total`` (and ``trs``) are L3's there.
+L3_WINDOW_COLUMNS = ["numerator_source", "prompt_tokens_gateway", "generation_tokens_gateway"]
 REQUEST_COLUMNS = IDENTITY_COLUMNS + [
     "in_warmup", "request_id", "scheduled_send_ts_ms", "send_ts_ms", "first_token_ts_ms", "done_ts_ms",
     "on_wire_delay_ms", "ttft_ms", "tpot_ms", "e2e_ms", "input_tokens", "output_tokens",
@@ -114,6 +131,10 @@ CELL_COLUMNS = [
     # i.e. completions) and its served requests whose usage.prompt_tokens differed from
     # the length they were built to (empty when the capture has no expected length).
     "api", "prompt_tokens_mismatched",
+    # The reissue-sidecar check of the cell (scripts.calibration_capture.reissue_check):
+    # clean / contaminated / unmeasured / not_checked, not_recorded before the check; and
+    # tre_reissue_total{kind="continue"} increase over the model's pods (empty = unmeasured).
+    "reissue_status", "reissue_continue_delta",
 ]
 
 #: The ladder design's per-attempt ledger (see ``scripts.calibration_ladder``).
@@ -453,6 +474,28 @@ class Settings:
     online_step_ms: Optional[int] = None
     online_window_align: str = rewindow_from_raw.WINDOW_ALIGN_NONE
     online_label: Optional[dict] = None
+    #: The TSS numerator of ``prompt_tokens_total`` / ``generation_tokens_total`` / ``trs``
+    #: (:mod:`scripts.l3_numerator`): ``gateway`` (default, what the controller reads) or
+    #: ``vllm_counter`` (L3). Labels, queue and cell verdicts do not depend on it.
+    numerator: str = l3.NUMERATOR_GATEWAY
+    l3_max_gap_ms: int = l3.DEFAULT_MAX_GAP_MS
+    #: Request-to-window attribution of the label (``tre_common.slo_labels.ATTRIBUTIONS``):
+    #: ``completion`` (default, label v1) or ``hybrid`` (label v2). Signal columns do not
+    #: depend on it.
+    attribution: str = slo_labels.ATTRIBUTION_COMPLETION
+
+    @property
+    def window_columns(self) -> list[str]:
+        return WINDOW_COLUMNS + (L3_WINDOW_COLUMNS if self.numerator == l3.NUMERATOR_VLLM_COUNTER else [])
+
+    def numerator_record(self) -> dict:
+        if self.numerator == l3.NUMERATOR_VLLM_COUNTER:
+            return {"source": self.numerator, "counters": [l3.PROMPT_COUNTER, l3.GENERATION_COUNTER],
+                    "max_gap_ms": self.l3_max_gap_ms, "rule": l3.RULE,
+                    "implementation": "scripts.l3_numerator.CounterTokenSource"}
+        return {"source": self.numerator,
+                "rule": "tokens of the requests completed in the window (per-request usage; the "
+                        "gateway's count-at-completion numerator)"}
 
     @property
     def latency_slo_ms(self) -> dict:
@@ -465,6 +508,7 @@ class Settings:
         return slo_labels.label_def_for_model(
             model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms,
             min_completed_requests=self.min_completed_requests, registry=registry,
+            attribution=self.attribution,
         )
 
     def membership(self) -> str:
@@ -559,7 +603,16 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
                 tpot = tpot or guard.get("tpot_slo_ms")
     # The dataset's windows are revision 2's whatever the run itself used online; what
     # the run used is kept for the parity check against its online CSVs.
+    numerator = str(overrides.get("numerator") or l3.NUMERATOR_GATEWAY)
+    if numerator not in l3.NUMERATOR_CHOICES:
+        raise SystemExit(f"unknown numerator {numerator!r}; expected one of {l3.NUMERATOR_CHOICES}")
+    attribution = str(overrides.get("attribution") or slo_labels.ATTRIBUTION_COMPLETION)
+    if attribution not in slo_labels.ATTRIBUTIONS:
+        raise SystemExit(f"unknown attribution {attribution!r}; expected one of {slo_labels.ATTRIBUTIONS}")
     settings = Settings(
+        attribution=attribution,
+        numerator=numerator,
+        l3_max_gap_ms=int(overrides.get("l3_max_gap_ms") or l3.DEFAULT_MAX_GAP_MS),
         window_ms=int(overrides.get("window_ms") or DEFAULT_WINDOW_MS),
         step_ms=int(overrides.get("step_ms") or DEFAULT_STEP_MS),
         window_align=str(overrides.get("window_align") or DEFAULT_WINDOW_ALIGN),
@@ -633,6 +686,31 @@ def _cell_metadata(attempt: Attempt, plan_cells: dict) -> dict:
     return out
 
 
+def dataset_attribution(directory: Path) -> str:
+    """The label attribution a standard dataset was built with: its manifest's
+    ``attribution.value``; a manifest from before the record is ``completion`` (label v1),
+    the only attribution there was. ``directory`` is the dataset dir (or its run root)."""
+    d = Path(directory)
+    if not (d / MANIFEST).exists() and (d / DATASET_DIR / MANIFEST).exists():
+        d = d / DATASET_DIR
+    try:
+        doc = json.loads((d / MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return slo_labels.ATTRIBUTION_COMPLETION
+    value = str(((doc.get("attribution") or {}).get("value")) or slo_labels.ATTRIBUTION_COMPLETION)
+    if value not in slo_labels.ATTRIBUTIONS:
+        raise ValueError(f"{d / MANIFEST}: unknown attribution {value!r}")
+    return value
+
+
+def default_dataset_dirname(settings: "Settings") -> str:
+    """``dataset`` / ``dataset_l3`` / ``dataset_hybrid`` / ``dataset_l3_hybrid``."""
+    name = DATASET_DIR_L3 if settings.numerator == l3.NUMERATOR_VLLM_COUNTER else DATASET_DIR
+    if settings.attribution == slo_labels.ATTRIBUTION_HYBRID:
+        name += "_" + slo_labels.ATTRIBUTION_HYBRID
+    return name
+
+
 def build_dataset(
     run_dir: Path,
     *,
@@ -654,9 +732,6 @@ def build_dataset(
     complete one used to be.
     """
     run_dir = Path(run_dir).resolve()
-    out_dir = Path(out_dir) if out_dir else run_dir / DATASET_DIR
-    if out_dir.exists() and not (out_dir / MANIFEST).exists():
-        raise SystemExit(f"{out_dir} exists and is not a dataset this tool wrote; refusing to replace it")
     campaigns = campaign_dirs(run_dir)
     if not campaigns:
         raise SystemExit(f"{run_dir}: no campaign directory (plan.json) found")
@@ -665,6 +740,10 @@ def build_dataset(
 
     discrepancies: list[str] = []
     settings, provenances = _settings_for(campaigns, overrides or {})
+    l3_mode = settings.numerator == l3.NUMERATOR_VLLM_COUNTER
+    out_dir = Path(out_dir) if out_dir else run_dir / default_dataset_dirname(settings)
+    if out_dir.exists() and not (out_dir / MANIFEST).exists():
+        raise SystemExit(f"{out_dir} exists and is not a dataset this tool wrote; refusing to replace it")
     registry = load_registry(str(settings.registry_path))
     label_registry = load_registry(str(settings.label_registry_path))
 
@@ -683,7 +762,7 @@ def build_dataset(
     window_fh = (staging / WINDOW_TABLE).open("w", newline="", encoding="utf-8")
     request_fh = (staging / REQUEST_TABLE).open("w", newline="", encoding="utf-8")
     try:
-        window_writer = csv.DictWriter(window_fh, fieldnames=WINDOW_COLUMNS, extrasaction="ignore")
+        window_writer = csv.DictWriter(window_fh, fieldnames=settings.window_columns, extrasaction="ignore")
         request_writer = csv.DictWriter(request_fh, fieldnames=REQUEST_COLUMNS, extrasaction="ignore")
         window_writer.writeheader()
         request_writer.writeheader()
@@ -754,6 +833,20 @@ def build_dataset(
     if off_length:
         discrepancies.append(f"built with --allow-prompt-token-mismatch: {len(off_length)} cell(s) "
                              f"off their prompt length: {'; '.join(off_length)}")
+    reissue_summary = reissue_check_summary(manifest_cells)
+    numerator_doc = {**settings.numerator_record(), **numerator_summary(manifest_cells, settings)}
+    if l3_mode and numerator_doc["windows_void"]:
+        discrepancies.append(
+            f"L3 numerator: {sum(numerator_doc['windows_void'].values())} window(s) of non-void attempts "
+            f"dropped ({numerator_doc['windows_void']}); see manifest numerator")
+    if reissue_summary["excluded"]:
+        discrepancies.append(
+            f"reissue check: {len(reissue_summary['excluded'])} attempt(s) excluded as void "
+            f"(contaminated {reissue_summary['counts'].get(capture.REISSUE_CONTAMINATED, 0)}, unmeasured "
+            f"{reissue_summary['counts'].get(capture.REISSUE_UNMEASURED, 0)}); see manifest reissue_check")
+    if reissue_summary["counts"].get(capture.REISSUE_NOT_CHECKED):
+        discrepancies.append(f"reissue check: {reissue_summary['counts'][capture.REISSUE_NOT_CHECKED]} attempt(s) "
+                             "driven with --reissue-check off: their contamination is unknown")
     cells_written = _write_csv(staging / CELL_TABLE, CELL_COLUMNS, cell_rows)
     if README_SOURCE.exists():
         shutil.copyfile(README_SOURCE, staging / README)
@@ -789,6 +882,13 @@ def build_dataset(
                 "recomputed with this file; the SLO label does not depend on it"
             ),
         },
+        # The TSS numerator of the signal columns (scripts.l3_numerator); dline_refit
+        # trainset / freeze / accept refuse to mix two.
+        "numerator": numerator_doc,
+        # The label's request-to-window attribution (label v1 = completion, v2 = hybrid);
+        # dline_refit trainset / accept and the T14 scorer refuse to mix two.
+        "attribution": {"value": settings.attribution,
+                        "rule": slo_labels.ATTRIBUTION_RULES[settings.attribution]},
         "label": labels_by_model[models_seen[0]] if models_seen else None,
         "label_by_model": labels_by_model,
         "windowing": {
@@ -819,7 +919,7 @@ def build_dataset(
             "implementation": "scripts.adaptive_boundary.probe_verdict",
         },
         "tables": {
-            WINDOW_TABLE: {"rows": window_count, "columns": WINDOW_COLUMNS,
+            WINDOW_TABLE: {"rows": window_count, "columns": settings.window_columns,
                            "contains": "every window of every non-void attempt"},
             REQUEST_TABLE: {"rows": request_count, "columns": REQUEST_COLUMNS,
                             "contains": "every request of every attempt, void included"},
@@ -827,6 +927,7 @@ def build_dataset(
                          "contains": "one row per attempt, void and missing included"},
         },
         "cells": manifest_cells,
+        "reissue_check": reissue_summary,
         "boundary_searches": boundary_docs,
         "discrepancies": discrepancies,
     }
@@ -857,6 +958,26 @@ def _probe_summary(probe: dict, manifest_cells: Sequence[dict], search: dict) ->
     }
 
 
+def reissue_check_summary(manifest_cells: Sequence[dict]) -> dict:
+    """The manifest's ``reissue_check``: the attempts per reissue status and the ones
+    excluded for it (contaminated / unmeasured)."""
+    counts: dict[str, int] = {}
+    excluded = []
+    for c in manifest_cells:
+        state = c.get("reissue_status")
+        if state is None:
+            continue
+        counts[state] = counts.get(state, 0) + 1
+        if state in (capture.REISSUE_CONTAMINATED, capture.REISSUE_UNMEASURED):
+            excluded.append({k: c.get(k) for k in ("model", "shape", "cell_id", "attempt", "split")}
+                            | {"reissue_status": state})
+    return {"rule": (f"an attempt whose guard records reissue {capture.REISSUE_CONTAMINATED} (a request "
+                     f"continued by the reissue sidecar during the cell) or {capture.REISSUE_UNMEASURED} "
+                     "(a pod's counter not read at both ends) is void: no window of it is in "
+                     f"{WINDOW_TABLE}; {capture.REISSUE_NOT_RECORDED} = captured before the check"),
+            "counts": dict(sorted(counts.items())), "excluded": excluded}
+
+
 def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepancies,
                      fixed_min_n_diffs: Optional[dict] = None, *, label_registry=None) -> dict:
     guard = attempt.guard
@@ -865,6 +986,12 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         void_reasons = void_reasons or ["raw capture quarantined as void"]
     if attempt.raw_path is not None and not guard:
         void_reasons = void_reasons or ["no guard artifact"]
+    # a continued request (or a pod not read) contaminates the cell, whatever the
+    # driver's --reissue-check policy did with it
+    reissue_state = capture.reissue_status(guard)
+    if (reissue_state in (capture.REISSUE_CONTAMINATED, capture.REISSUE_UNMEASURED)
+            and not any(r.startswith(capture.REISSUE_VOID_PREFIX) for r in void_reasons)):
+        void_reasons.append(capture.reissue_void_reason(guard["reissue"]))
     meta = _cell_metadata(attempt, plan_cells)
     ledger = attempt.ledger or {}
     identity = {
@@ -893,6 +1020,8 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
     records: list[dict] = []
     instants: list[dict] = []
     windows: list[dict] = []
+    l3_rows: list[dict] = []
+    numerator_cell: Optional[dict] = None
     if attempt.raw_path is not None:
         records, instants, _guard, unmatched = rewindow_from_raw.load_cell_capture(attempt.raw_path)
         if unmatched:
@@ -913,19 +1042,28 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             discrepancies.append(f"{attempt.stem}: cell id {attempt.cell_id!r} does not parse")
         if cell is not None:
             primary = settings.primary_label(attempt.model, label_registry or registry)
-            windows = rewindow_from_raw.label_cell(
-                records, instants, cell, registry.model(attempt.model),
-                label=primary,
-                window_ms=settings.window_ms, step_ms=settings.step_ms,
-                window_align=settings.window_align,
-                percentile_mode=settings.percentile_mode,
-                min_latency_samples=settings.min_latency_samples,
-                instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
-                instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
-                start_ms=rewindow_from_raw._as_int(guard.get("start_ms")),
-                end_ms=rewindow_from_raw._as_int(guard.get("end_ms")),
-                truncated_at_ts_ms=rewindow_from_raw._as_int(guard.get("truncated_at_ts_ms")),
-            )
+
+            def labelled(token_source=None) -> list[dict]:
+                return rewindow_from_raw.label_cell(
+                    records, instants, cell, registry.model(attempt.model),
+                    label=primary,
+                    window_ms=settings.window_ms, step_ms=settings.step_ms,
+                    window_align=settings.window_align,
+                    percentile_mode=settings.percentile_mode,
+                    min_latency_samples=settings.min_latency_samples,
+                    instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+                    instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
+                    start_ms=rewindow_from_raw._as_int(guard.get("start_ms")),
+                    end_ms=rewindow_from_raw._as_int(guard.get("end_ms")),
+                    truncated_at_ts_ms=rewindow_from_raw._as_int(guard.get("truncated_at_ts_ms")),
+                    token_source=token_source,
+                )
+
+            windows = labelled()
+            if settings.numerator == l3.NUMERATOR_VLLM_COUNTER:
+                # Same windows, labels and queue; only the numerator (and so trs) is L3's.
+                # Verdicts and cell status below stay on `windows`: they do not depend on it.
+                l3_rows, numerator_cell = l3_windows(attempt, windows, labelled, settings)
             if attempt.primitive == gen.HOLD_PRIMITIVE and attempt.ledger is None:
                 verdict = boundary.probe_verdict(windows, label=primary)
             elif attempt.primitive == gen.HOLD_PRIMITIVE:
@@ -996,8 +1134,9 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             "target_pod": record.get("target_pod"),
             "expected_prompt_tokens": record.get("expected_prompt_tokens"),
         })
+    written = l3_rows if settings.numerator == l3.NUMERATOR_VLLM_COUNTER else windows
     window_rows = (
-        [{**identity, "in_warmup": in_warmup(row["window_start_ms"]), **row} for row in windows]
+        [{**identity, "in_warmup": in_warmup(row["window_start_ms"]), **row} for row in written]
         if status != STATUS_VOID else []
     )
 
@@ -1059,6 +1198,8 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "backlog_stopped": ledger.get("backlog_stopped"),
         "api": guard.get("api"),
         "prompt_tokens_mismatched": _prompt_tokens_mismatched(records),
+        "reissue_status": reissue_state if attempt.raw_path is not None else None,
+        "reissue_continue_delta": (guard.get("reissue") or {}).get("continue_delta"),
     }
     manifest_cell = {
         **{k: v for k, v in identity.items() if k != "cell_status"},
@@ -1066,11 +1207,61 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "void_reasons": void_reasons,
         "probe_verdict": current,
         "probe_verdict_recorded": recorded,
+        "reissue_status": reissue_state if attempt.raw_path is not None else None,
         "files": files,
     }
     manifest_cell["online_csv_parity"] = online_parity
+    if settings.numerator == l3.NUMERATOR_VLLM_COUNTER:
+        manifest_cell["numerator"] = numerator_cell
     return {"cell": cell_row, "manifest": manifest_cell,
             "windows": window_rows, "requests": request_rows}
+
+
+def l3_windows(attempt: Attempt, windows: Sequence[dict], labelled, settings: Settings
+               ) -> tuple[list[dict], dict]:
+    """The attempt's windows with the L3 numerator (``labelled(token_source)`` is the
+    attempt's own :func:`scripts.rewindow_from_raw.label_cell` call), each carrying the
+    gateway numerator's totals of the same window; plus the attempt's L3 record (pods,
+    windows kept, windows void per reason - counted over the labelled windows only)."""
+    source = l3.token_source_for_cell(attempt.campaign, attempt.stem, max_gap_ms=settings.l3_max_gap_ms)
+    rows = labelled(source)
+    gateway = {(int(w["window_start_ms"]), int(w["window_end_ms"])): w for w in windows}
+    for row in rows:
+        g = gateway.get((int(row["window_start_ms"]), int(row["window_end_ms"]))) or {}
+        row["numerator_source"] = l3.NUMERATOR_VLLM_COUNTER
+        row["prompt_tokens_gateway"] = g.get("prompt_tokens_total")
+        row["generation_tokens_gateway"] = g.get("generation_tokens_total")
+    void: dict[str, int] = {}
+    for key in gateway:
+        status = source.status.get(key) or "not_asked"
+        if status != l3.STATUS_OK:
+            void[status] = void.get(status, 0) + 1
+    summary = source.summary()
+    return rows, {"pods": summary["pods"], "missing_pods": summary["missing_pods"],
+                  "windows_labelled": len(gateway), "windows_kept": len(rows),
+                  "windows_void": dict(sorted(void.items()))}
+
+
+def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dict:
+    """The manifest's numerator counts over the attempts that wrote windows."""
+    if settings.numerator != l3.NUMERATOR_VLLM_COUNTER:
+        return {}
+    kept = labelled = 0
+    void: dict[str, int] = {}
+    no_metrics = []
+    for c in manifest_cells:
+        rec = c.get("numerator")
+        if not rec or c.get("status") == STATUS_VOID:
+            continue
+        kept += rec["windows_kept"]
+        labelled += rec["windows_labelled"]
+        for k, v in rec["windows_void"].items():
+            void[k] = void.get(k, 0) + v
+        if not rec["pods"] or rec["missing_pods"]:
+            no_metrics.append({k: c.get(k) for k in ("model", "cell_id", "attempt")}
+                              | {"missing_pods": rec["missing_pods"]})
+    return {"windows_labelled": labelled, "windows_kept": kept, "windows_void": dict(sorted(void.items())),
+            "attempts_without_metrics": no_metrics}
 
 
 #: ``online_csv_parity`` values in the manifest.
@@ -1181,7 +1372,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir", type=Path, help="a campaign --out-dir, or a directory of them")
     ap.add_argument("--out-dir", type=Path, default=None,
-                    help=f"where to write (default: <run_dir>/{DATASET_DIR})")
+                    help=f"where to write (default: <run_dir>/{DATASET_DIR}, or {DATASET_DIR_L3} with "
+                         "--numerator vllm_counter)")
     ap.add_argument("--label-registry", default=None,
                     help="registry the D6' labels' idle TTFT fits come from (default: the "
                          "repository's)")
@@ -1196,6 +1388,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--window-align", choices=list(rewindow_from_raw.WINDOW_ALIGN_CHOICES), default=None,
                     help=f"default {DEFAULT_WINDOW_ALIGN} (format revision {FORMAT_REVISION})")
     ap.add_argument("--min-completed-requests", type=int, default=None)
+    ap.add_argument("--numerator", choices=list(l3.NUMERATOR_CHOICES), default=l3.NUMERATOR_GATEWAY,
+                    help="TSS numerator of the signal columns: gateway (default; tokens of the requests "
+                         "completed in the window, what the controller reads) or vllm_counter (L3: the "
+                         "increase of the pods' vLLM token counters, from cells/<stem>/vllm_metrics_1hz; "
+                         f"default out dir <run_dir>/{DATASET_DIR_L3})")
+    ap.add_argument("--l3-max-gap-ms", type=int, default=None,
+                    help=f"L3: a 1 Hz sample spacing above this voids the window (default "
+                         f"{l3.DEFAULT_MAX_GAP_MS})")
+    ap.add_argument("--attribution", choices=list(slo_labels.ATTRIBUTIONS),
+                    default=slo_labels.ATTRIBUTION_COMPLETION,
+                    help="request-to-window attribution of the label: completion (default, label v1: "
+                         "TTFT / TPOT / min-n by completion) or hybrid (label v2: TTFT and min-n by first "
+                         f"token, TPOT by completion; default out dir <run_dir>/{DATASET_DIR_HYBRID})")
     ap.add_argument("--allow-prompt-token-mismatch", action="store_true",
                     help="build even when a cell's served requests were off their prompt length "
                          "(recorded; dline_refit trainset still refuses those cells)")
@@ -1207,6 +1412,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,
         "min_latency_samples": args.min_latency_samples,
         "window_align": args.window_align, "min_completed_requests": args.min_completed_requests,
+        "numerator": args.numerator, "l3_max_gap_ms": args.l3_max_gap_ms,
+        "attribution": args.attribution,
     })
     manifest = json.loads((out / MANIFEST).read_text(encoding="utf-8"))
     for name, table in manifest["tables"].items():

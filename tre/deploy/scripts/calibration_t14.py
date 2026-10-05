@@ -7,6 +7,15 @@ freeze> --preregistration-json <prereg> --routing-strategy least-gpu-cache ...``
 evaluation: every T14 cell is split holdout (``gen.is_held_out``), nothing that fits may
 read it.
 
+Next round (2026-10-05, T14 re-collected under label v2 / hybrid attribution): the same
+design (8 shapes x 3 factors, 240 s, the same capacity prior) with a new design seed and a
+fresh ``--t14-cell-serial-base``; the run's label attribution (``--fit-label-attribution``)
+must equal the freeze's (:func:`check_param_file`) and the preregistration's
+``t14.conditions.label_attribution`` / ``label_def_sha256``; the stream-cut limit
+``t14.stream_cut.runtime_limit.max_model_error_rate`` (0.10) must equal the run's
+``--max-model-error-rate`` - ``calibration/run_T14.sh`` passes all three from the
+preregistration. The preregistration is written by :mod:`scripts.t14_prereg`.
+
 Composition (:data:`SHAPES` x :data:`FACTORS`, 24 cells)
 --------------------------------------------------------
 Eight new fixed-length shapes (``gen.T14_SHAPES``, weight 1.0, static-grid naming):
@@ -59,8 +68,10 @@ Checks before anything is driven (a dry run runs them too)
 * ``--routing-strategy least-gpu-cache`` (the tre-v2 ext_proc gateway path, NodePort 31094,
   headers ``model`` + ``routing-strategy``). Required for a real run;
 * independent output: ``--out-dir`` absent or empty and, like ``--raw-dir``, outside every
-  training / M / resplit / freeze root (:data:`FORBIDDEN_ROOTS`); no raw directory of a T14
-  cell may pre-exist under ``--raw-dir``;
+  training / M / resplit / freeze root (:func:`forbidden_roots`: the preregistration's
+  ``t14.forbidden_roots``, every ``--forbidden-root`` and the capacity prior's input runs;
+  a real run needs at least one root from the first two); no raw directory of a T14 cell
+  may pre-exist under ``--raw-dir``;
 * (real run) the controller is in ``observe``.
 
 What is written, and the seal
@@ -113,6 +124,7 @@ from scripts import calibration_design as design
 from scripts import calibration_ladder as ladder
 from scripts import calibration_training_supplement as training
 from scripts import gen_calibration_schedules as gen
+from scripts import prompt_corpus as corpus_record
 
 MODE = "t14_set"
 MODEL = "dsqwen-14b"
@@ -134,23 +146,49 @@ T14_MANIFEST = "T14_manifest.json"
 T14_SHA256SUMS = "T14_SHA256SUMS"
 MANIFEST_FORMAT_REVISION = 1   # the M manifest format (dline_refit.M_MANIFEST_FORMAT_REVISION)
 
-#: Roots this collection must stay out of: the training rounds, their supplements, M, the
-#: refits, the resplit and the freeze.
-_DATA = Path("/data/nfs_shared_data/xxy")
-FORBIDDEN_ROOTS: tuple[Path, ...] = tuple(_DATA / name for name in (
-    "calibration_20260921", "calibration_run2_20260923", "calibration_rev2_20260923",
-    "calibration_run2_main_20260923", "calibration_supp_20260923", "calibration_supp3_20260923",
-    "calibration_M_20260923", "calibration_accept_20260923", "calibration_refit_prelim_20260923",
-    "calibration_refit_final_20260923", "calibration_resplit_20260924",
-    "calibration_freeze_20260923",
-))
+#: The roots this collection must stay out of (the training rounds, their supplements, M,
+#: the refits, the resplit and the freeze of the round under test) are the deployment's, so
+#: none is built in: the preregistration lists them under this key (and ``--forbidden-root``
+#: adds more) - see :func:`forbidden_roots`.
+PREREG_FORBIDDEN_ROOTS_KEY = "t14.forbidden_roots"
 
 #: The preregistration keys :func:`check_preregistration` checks (dotted paths).
 PREREG_KEYS_REQUIRED = ("t14.capacity_prior.sha256", "t14.design_seed", "t14.cell_serial_base",
                         "t14.factors", "t14.hold_s", "t14.shapes")
 PREREG_KEYS_OPTIONAL = ("t14.model", "parameter_sets.freeze.sha256",
-                        "parameter_sets.v1lambda.sha256")
+                        "parameter_sets.v1lambda.sha256", "t14.api", "t14.gateway.url",
+                        PREREG_FORBIDDEN_ROOTS_KEY)
 PREREG_KEYS = (*PREREG_KEYS_REQUIRED, *PREREG_KEYS_OPTIONAL)
+#: Optional keys of a next-round (2026-10-05, ``schema`` t14-prereg-v2) preregistration,
+#: checked when present: the stream-cut runtime limit (= the run's
+#: ``--max-model-error-rate``; ``run_T14.sh`` passes the preregistered value), and the label
+#: the run labels its probes / manifest with (canonical sha256 and attribution).
+PREREG_KEY_MODEL_ERROR_RATE = "t14.stream_cut.runtime_limit.max_model_error_rate"
+PREREG_KEY_LABEL_SHA = "t14.conditions.label_def_sha256"
+PREREG_KEY_LABEL_ATTRIBUTION = "t14.conditions.label_attribution"
+PREREG_KEYS_NEXT_ROUND = (PREREG_KEY_MODEL_ERROR_RATE, PREREG_KEY_LABEL_SHA, PREREG_KEY_LABEL_ATTRIBUTION)
+#: Label attribution of label v1 (``tre_common.slo_labels.ATTRIBUTION_COMPLETION``).
+ATTRIBUTION_COMPLETION = "completion"
+
+
+def cell_serial_base(args) -> int:
+    """``--t14-cell-serial-base`` (default :data:`CELL_SERIAL_BASE`). A new round takes a
+    fresh base at or above :data:`CELL_SERIAL_BASE` (below are M 70_000 / 70_500 and the
+    supplements 50_000 / 60_000 / 62_000), so its 24 cell ids - and with them the arrival
+    seeds and prompt keys - are new; the preregistration binds it."""
+    value = getattr(args, "t14_cell_serial_base", None)
+    base = CELL_SERIAL_BASE if value is None else int(value)
+    if base < CELL_SERIAL_BASE or base + len(SHAPES) * len(FACTORS) >= design.MODEL_CODE_BLOCK:
+        raise ValueError(f"--t14-cell-serial-base {base}: needs {CELL_SERIAL_BASE} <= base and base + "
+                         f"{len(SHAPES) * len(FACTORS)} < {design.MODEL_CODE_BLOCK}")
+    return base
+
+
+def label_attribution(args) -> str:
+    """The run's label attribution (``--fit-label-attribution`` of label v2; absent =
+    completion). The frozen parameters must have been fitted under the same one
+    (:func:`check_param_file`), never silently defaulted."""
+    return str(getattr(args, "fit_label_attribution", None) or ATTRIBUTION_COMPLETION)
 
 
 def shape_kind(shape: str) -> str:
@@ -335,11 +373,11 @@ def load_capacity_prior(path: Path, model: str) -> dict:
 # ------------------------------------------------------------------------ the cells
 
 
-def new_cells(model: str, design_seed: int) -> list[design.DesignCell]:
+def new_cells(model: str, design_seed: int, serial_base: int = CELL_SERIAL_BASE) -> list[design.DesignCell]:
     """The 24 cells, shape-major then factor; rho = factor (rho of C^_s)."""
     if model != MODEL:
         raise ValueError(f"T14 is a {MODEL} set; got {model!r}")
-    factory = design.CellFactory(model, design_seed, serial_base=CELL_SERIAL_BASE)
+    factory = design.CellFactory(model, design_seed, serial_base=serial_base)
     cells = []
     for shape in SHAPES:
         for factor in FACTORS:
@@ -426,9 +464,11 @@ def check_max_model_len(model: str, shapes: Sequence[str], registry: Optional[st
 
 
 def check_param_file(path, model: str, registry: Optional[str], what: str, *,
-                     load_path: Optional[dict] = None, allow_corpus_mismatch: bool = False) -> dict:
+                     load_path: Optional[dict] = None, allow_corpus_mismatch: bool = False,
+                     attribution: str = ATTRIBUTION_COMPLETION) -> dict:
     """A ``dline_refit freeze`` file: verifies, and froze ``model`` under the primary label
-    (the check ``calibration_acceptance.check_freeze`` makes)."""
+    of ``attribution`` (the check ``calibration_acceptance.check_freeze`` makes; a hybrid
+    freeze is refused by a completion run and vice versa)."""
     from scripts import dline_refit
 
     if not path or not Path(path).is_file():
@@ -437,7 +477,7 @@ def check_param_file(path, model: str, registry: Optional[str], what: str, *,
         doc = dline_refit.verify_freeze(Path(path))
     except dline_refit.FreezeError as exc:
         raise ValueError(f"{what}: {path} does not verify ({exc})")
-    ours = dline_refit.label_for(model, "primary", registry).as_dict()
+    ours = dline_refit.label_for(model, "primary", registry, attribution).as_dict()
     theirs = acceptance.frozen_label_def(doc, model)
     if dline_refit.canonical_sha256(ours) != dline_refit.canonical_sha256(theirs):
         raise ValueError(f"{what}: {path}: {model} was frozen under another label definition "
@@ -558,19 +598,30 @@ def _set(doc: dict, dotted: str, value) -> None:
 
 def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
                           freeze: Optional[Mapping], refit: Optional[Mapping],
-                          model: str = MODEL, amendment=None) -> dict:
+                          model: str = MODEL, amendment=None, api: Optional[str] = None,
+                          cell_serial_base: int = CELL_SERIAL_BASE,
+                          max_model_error_rate: Optional[float] = None,
+                          labels: Optional[Mapping] = None, attribution: Optional[str] = None) -> dict:
     """The preregistration JSON, bound to this run (ValueError on any mismatch).
 
     Its sidecar ``<path>.sha256`` (sha256sum format, naming the file) must match. Then the
     required keys (:data:`PREREG_KEYS_REQUIRED`) must equal this run's values:
     ``t14.capacity_prior.sha256`` = sha256 of ``--capacity-prior-file``; ``t14.design_seed``
-    = ``--design-seed``; ``t14.cell_serial_base`` = :data:`CELL_SERIAL_BASE`; ``t14.factors``
+    = ``--design-seed``; ``t14.cell_serial_base`` = ``cell_serial_base`` (the run's
+    ``--t14-cell-serial-base``, default :data:`CELL_SERIAL_BASE`); ``t14.factors``
     = :data:`FACTORS` (a list); ``t14.hold_s`` = :data:`HOLD_S`; ``t14.shapes`` = the eight
     names, either the list in :data:`SHAPES` order or ``{"interpolation": [...],
     "extrapolation": [...]}``. The optional keys, when present: ``t14.model`` = the model;
     ``parameter_sets.freeze.sha256`` / ``parameter_sets.v1lambda.sha256`` = the sha256 of
     ``--freeze-file`` / ``--refit-params-file`` (present but its file not given - only
-    possible in a dry run - is reported as unchecked)."""
+    possible in a dry run - is reported as unchecked); ``t14.api`` = ``api`` (the run's
+    ``--api``); ``t14.gateway.url`` must be the endpoint of that API
+    (``prompt_corpus.check_gateway_url``: ``/v1/chat/completions`` for chat);
+    ``t14.forbidden_roots`` a list of paths, returned as ``forbidden_roots``. The next-round
+    keys (:data:`PREREG_KEYS_NEXT_ROUND`), when present: the stream-cut runtime limit =
+    ``max_model_error_rate`` (the run's ``--max-model-error-rate``); the label sha256 =
+    ``labels["label_def_sha256"]`` and the label attribution = ``attribution`` (the label
+    this run seals into its manifest). Present but the run's value not given = unchecked."""
     path = Path(path)
     side = Path(f"{path}.sha256")
     if not path.is_file():
@@ -603,7 +654,7 @@ def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
         "t14.capacity_prior.sha256": (lambda v: isinstance(v, str) and v.lower() == capacity_sha256,
                                       capacity_sha256),
         "t14.design_seed": (lambda v: _is_int(v, int(design_seed)), int(design_seed)),
-        "t14.cell_serial_base": (lambda v: _is_int(v, CELL_SERIAL_BASE), CELL_SERIAL_BASE),
+        "t14.cell_serial_base": (lambda v: _is_int(v, int(cell_serial_base)), int(cell_serial_base)),
         "t14.factors": (lambda v: _floats_equal(v, FACTORS), list(FACTORS)),
         "t14.hold_s": (lambda v: _is_int(v, HOLD_S), HOLD_S),
         "t14.shapes": (_shapes_match, list(SHAPES)),
@@ -632,21 +683,74 @@ def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
         checked.append(key)
         if not isinstance(value, str) or value.lower() != given["sha256"]:
             problems.append(f"{key} = {value!r}, {flag} has sha256 {given['sha256']}")
+    want_api = api if api is not None else (_dig(doc, "t14.api") if _has(doc, "t14.api") else None)
+    if _has(doc, "t14.api"):
+        checked.append("t14.api")
+        if api is not None and _dig(doc, "t14.api") != api:
+            problems.append(f"t14.api = {_dig(doc, 't14.api')!r}, this run sends --api {api}")
+    if _has(doc, "t14.gateway.url"):
+        if want_api is None:
+            unchecked.append("t14.gateway.url (no API to check it against)")
+        else:
+            checked.append("t14.gateway.url")
+            try:
+                corpus_record.check_gateway_url(str(_dig(doc, "t14.gateway.url")), want_api)
+            except ValueError as exc:
+                problems.append(f"t14.gateway.url: {exc}")
+    run_label = (labels or {}).get("label_def_sha256")
+    for key, given, ok in (
+            (PREREG_KEY_MODEL_ERROR_RATE, max_model_error_rate,
+             lambda v, g: not isinstance(v, bool) and isinstance(v, (int, float))
+             and math.isclose(float(v), float(g), rel_tol=0.0, abs_tol=1e-12)),
+            (PREREG_KEY_LABEL_SHA, run_label, lambda v, g: isinstance(v, str) and v.lower() == str(g).lower()),
+            (PREREG_KEY_LABEL_ATTRIBUTION, attribution, lambda v, g: v == g)):
+        if not _has(doc, key):
+            continue
+        if given is None:
+            unchecked.append(f"{key} (not given to the check)")
+            continue
+        checked.append(key)
+        if not ok(_dig(doc, key), given):
+            problems.append(f"{key} = {_dig(doc, key)!r}, this run has {given!r}")
+    roots: list[str] = []
+    if _has(doc, PREREG_FORBIDDEN_ROOTS_KEY):
+        checked.append(PREREG_FORBIDDEN_ROOTS_KEY)
+        value = _dig(doc, PREREG_FORBIDDEN_ROOTS_KEY)
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            problems.append(f"{PREREG_FORBIDDEN_ROOTS_KEY} = {value!r}, not a list of paths")
+        else:
+            roots = list(value)
     if problems:
         raise ValueError(f"{path}: the preregistration does not bind this run: " + "; ".join(problems))
     return {"path": str(path.resolve()), "sha256": got, "checked_keys": checked,
-            "unchecked": unchecked, "amendment": amended}
+            "unchecked": unchecked, "amendment": amended, "forbidden_roots": roots}
 
 
 def _overlaps(path: Path, root: Path) -> bool:
     return path == root or root in path.parents or path in root.parents
 
 
-def check_output_roots(out_dir: Path, raw_dir: Path,
-                       roots: Optional[Sequence[Path]] = None) -> None:
+def forbidden_roots(args, prior: Optional[Mapping], prereg: Optional[Mapping]
+                    ) -> tuple[list[Path], list[Path]]:
+    """(every root T14 must stay out of, the explicitly named ones). Explicit: every
+    ``--forbidden-root`` and the preregistration's ``t14.forbidden_roots``; implied: the
+    capacity prior's input runs (the second round and the boundary supplement)."""
+    explicit = [Path(p) for p in (getattr(args, "forbidden_root", None) or [])]
+    explicit += [Path(p) for p in ((prereg or {}).get("forbidden_roots") or [])]
+    inputs = (prior or {}).get("inputs") or {}
+    implied = [Path(inputs[k]) for k in ("base_run", "boundary_supplement_run") if inputs.get(k)]
+    out, seen = [], set()
+    for root in (*explicit, *implied):
+        key = str(Path(root).resolve())
+        if key not in seen:
+            seen.add(key)
+            out.append(Path(root))
+    return out, explicit
+
+
+def check_output_roots(out_dir: Path, raw_dir: Path, roots: Sequence[Path]) -> None:
     """``--out-dir`` absent or empty; neither it nor ``--raw-dir`` inside (or around) a
-    training / M / resplit / freeze root (:data:`FORBIDDEN_ROOTS`)."""
-    roots = FORBIDDEN_ROOTS if roots is None else roots
+    training / M / resplit / freeze root (:func:`forbidden_roots`)."""
     out, raw = Path(out_dir).resolve(), Path(raw_dir).resolve()
     for root in roots:
         root = Path(root).resolve()
@@ -706,7 +810,7 @@ def _prior_summary(prior: Mapping) -> dict:
 def build_plan(args, model: str, cells: Sequence[design.DesignCell],
                order: Sequence[design.DesignCell], prior: Mapping, labels: Mapping,
                freeze: Optional[Mapping], refit: Optional[Mapping], prereg: Optional[Mapping],
-               mml: Mapping, cap) -> tuple[dict, dict]:
+               mml: Mapping, cap, roots: Sequence[Path] = ()) -> tuple[dict, dict]:
     """(plan.json, run manifest)."""
     composition = {
         "cells": len(cells),
@@ -721,7 +825,8 @@ def build_plan(args, model: str, cells: Sequence[design.DesignCell],
         "mode": MODE,
         "models": [model],
         "design_seed": int(args.design_seed),
-        "cell_serial_base": CELL_SERIAL_BASE,
+        "cell_serial_base": cell_serial_base(args),
+        "max_model_error_rate": getattr(args, "max_model_error_rate", None),
         "composition": composition,
         "capacity_prior": _prior_summary(prior),
         "capacity_source": CAPACITY_SOURCE,
@@ -730,6 +835,8 @@ def build_plan(args, model: str, cells: Sequence[design.DesignCell],
         "preregistration": prereg,
         "routing_strategy": campaign.routing_strategy_for(args),
         "gateway_url": getattr(args, "gateway_url", None),
+        "api": getattr(args, "api", corpus_record.CALIBRATION_API),
+        "forbidden_roots": [str(Path(r).resolve()) for r in roots],
         "label": {**labels, "window_ms": args.window_ms, "step_ms": args.fit_step_ms},
         "order": [c.cell_id for c in order],
         "provenance": campaign.run_provenance(args),
@@ -798,7 +905,10 @@ def print_plan(plan: Mapping, model: str) -> None:
                   f"{sorted(am['overrides'])}")
     else:
         print("  preregistration: NOT CHECKED (no --preregistration-json; dry run)")
-    print(f"  routing strategy: {plan['routing_strategy']} via {plan['gateway_url']}")
+    print(f"  routing strategy: {plan['routing_strategy']} via {plan['gateway_url']} "
+          f"(--api {plan['api']})")
+    print(f"  output kept out of {len(plan['forbidden_roots'])} roots: "
+          + ", ".join(plan["forbidden_roots"]))
 
 
 # --------------------------------------------------------------------------- sealing
@@ -879,7 +989,8 @@ def seal(out_dir: Path, raw_dir: Path, model: str, run: "T14Run", labels: Mappin
         "label_def_sha256": labels["label_def_sha256"],
         "composition": plan["composition"],
         "design_seed": plan["design_seed"],
-        "cell_serial_base": CELL_SERIAL_BASE,
+        "cell_serial_base": plan["cell_serial_base"],
+        "max_model_error_rate": plan.get("max_model_error_rate"),
         "routing_strategy": plan["routing_strategy"],
         "gateway_url": plan["gateway_url"],
         "max_model_len_check": plan["max_model_len_check"],
@@ -892,8 +1003,10 @@ def seal(out_dir: Path, raw_dir: Path, model: str, run: "T14Run", labels: Mappin
         "sha256sums_sha256": sums_sha,
         "how_to_evaluate": (
             "Verify T14_SHA256SUMS first (dline_refit.check_m_manifest accepts this file against "
-            "the D22 freeze). Read this run's standard dataset (<out-dir>/dataset, built right "
-            "after this seal; rebuild: python -m scripts.calibration_dataset <out-dir>): every "
+            "the D22 freeze). Read this run's standard dataset of label_def's attribution "
+            "(<out-dir>/dataset for completion, <out-dir>/dataset_hybrid for hybrid; built right "
+            "after this seal; rebuild: python -m scripts.calibration_dataset <out-dir> "
+            "[--attribution hybrid]): every "
             "row is split holdout; keep the cells listed here (their final attempts) and the "
             "windows after warmup_s, labelled with label_def. Evaluate both frozen parameter "
             "sets (parameter_sets.freeze = the D22 freeze, parameter_sets.v1lambda = the "
@@ -953,13 +1066,16 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     if getattr(args, "design_seed", None) is None:
         args.design_seed = DEFAULT_DESIGN_SEED
     seed = int(args.design_seed)
+    serial_base = cell_serial_base(args)
+    attribution = label_attribution(args)
     dry = bool(args.dry_run)
     out_dir, raw_dir = Path(args.out_dir), Path(args.raw_dir)
-    check_output_roots(out_dir, raw_dir)
+    # emptiness and the command line's roots first; the full set once the prereg is read
+    check_output_roots(out_dir, raw_dir, forbidden_roots(args, None, None)[0])
     if not getattr(args, "capacity_prior_file", None):
         raise ValueError("--t14-set needs --capacity-prior-file")
     prior = load_capacity_prior(Path(args.capacity_prior_file), model)
-    cells = new_cells(model, seed)
+    cells = new_cells(model, seed, serial_base)
     order = interleaved_order(cells, model, seed)
     check_held_out(cells)
     check_fresh_raw(raw_dir, cells)
@@ -975,20 +1091,38 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     if _required(getattr(args, "freeze_file", None), "--freeze-file", "the D22 freeze", dry):
         freeze = check_param_file(args.freeze_file, model, registry, "--freeze-file",
                                   load_path=campaign.load_path(args),
-                                  allow_corpus_mismatch=allow_corpus)
+                                  allow_corpus_mismatch=allow_corpus, attribution=attribution)
     if _required(getattr(args, "refit_params_file", None), "--refit-params-file",
                  "the v1-lambda parameter set", dry):
         refit = check_param_file(args.refit_params_file, model, registry, "--refit-params-file",
                                  load_path=campaign.load_path(args),
-                                 allow_corpus_mismatch=allow_corpus)
+                                 allow_corpus_mismatch=allow_corpus, attribution=attribution)
+    labels = acceptance.label_documents(args, model)
+    sealed_attribution = str(labels["label_def"].get("attribution") or ATTRIBUTION_COMPLETION)
+    if sealed_attribution != attribution:
+        raise ValueError(f"the label T14 seals has attribution {sealed_attribution!r}, the run asked for "
+                         f"{attribution!r} - one attribution for the probes, the manifest and the freeze")
     if _required(getattr(args, "preregistration_json", None), "--preregistration-json",
                  "the preregistration", dry):
         prereg = check_preregistration(Path(args.preregistration_json),
                                        capacity_sha256=prior["sha256"], design_seed=seed,
                                        freeze=freeze, refit=refit, model=model,
-                                       amendment=getattr(args, "preregistration_amendment_json", None))
+                                       amendment=getattr(args, "preregistration_amendment_json", None),
+                                       api=getattr(args, "api", corpus_record.CALIBRATION_API),
+                                       cell_serial_base=serial_base,
+                                       max_model_error_rate=getattr(args, "max_model_error_rate", None),
+                                       labels=labels, attribution=attribution)
     elif getattr(args, "preregistration_amendment_json", None):
         raise ValueError("--preregistration-amendment-json needs --preregistration-json")
+    roots, explicit = forbidden_roots(args, prior, prereg)
+    if not explicit:
+        if not dry:
+            raise ValueError(f"no forbidden roots: list the round's training / M / refit / freeze "
+                             f"roots under {PREREG_FORBIDDEN_ROOTS_KEY} in the preregistration "
+                             "(or pass --forbidden-root)")
+        print(f"WARNING: no {PREREG_FORBIDDEN_ROOTS_KEY} / --forbidden-root; the real run "
+              "requires them")
+    check_output_roots(out_dir, raw_dir, roots)
     routing = campaign.routing_strategy_for(args)
     if routing != ROUTING_STRATEGY:
         if not dry:
@@ -996,10 +1130,9 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
                              f"ext_proc gateway path); got {routing!r}")
         print(f"WARNING: --routing-strategy is {routing!r}; the real run requires "
               f"{ROUTING_STRATEGY!r}")
-    labels = acceptance.label_documents(args, model)
     cap = training.resolve_cap(args)
     plan, manifest = build_plan(args, model, cells, order, prior, labels, freeze, refit, prereg,
-                                mml, cap)
+                                mml, cap, roots)
     out_dir.mkdir(parents=True, exist_ok=True)
     print_plan(plan, model)
     if dry:
@@ -1024,7 +1157,7 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     sample_factory = sample_factory or (lambda m: ladder.make_engine_sampler(m, args.model_namespace))
     run = T14Run(
         args, model, {s: float(prior["predicted_rps"][s]) for s in SHAPES},
-        factory=design.CellFactory(model, seed, serial_base=CELL_SERIAL_BASE), cap=cap,
+        factory=design.CellFactory(model, seed, serial_base=serial_base), cap=cap,
         out_dir=out_dir, raw_dir=raw_dir, drive=drive, sample=sample_factory(model),
         capacity_source=CAPACITY_SOURCE, sleep=sleep, clock=clock, cells=cells)
     status, code = "failed", 1
