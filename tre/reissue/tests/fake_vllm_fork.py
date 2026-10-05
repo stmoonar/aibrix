@@ -89,6 +89,8 @@ class FakeEngine:
         reject_in_stream: bool = False,
         hold_eof: bool = False,
         hold_sleep: bool = False,
+        fail_sleep: bool = False,
+        hold_abort_output: bool = False,
     ) -> None:
         self.name = name
         self.token_delay_s = token_delay_s
@@ -102,6 +104,11 @@ class FakeEngine:
         #: /sleep waits after the engine went to sleep until ``release_sleep``.
         self.hold_sleep = hold_sleep
         self._sleep_release = asyncio.Event()
+        #: /sleep aborts the running requests, then fails (500) and rolls back (awake).
+        self.fail_sleep = fail_sleep
+        #: an aborted generation emits its abort output only after ``release_abort_output``.
+        self.hold_abort_output = hold_abort_output
+        self._abort_output_release = asyncio.Event()
         self.sleeping = False
         self.requests: list[dict[str, Any]] = []
         self.active: dict[str, _Req] = {}
@@ -238,6 +245,8 @@ class FakeEngine:
             if self.hold_at is not None and index == self.hold_at:
                 await req.aborted.wait()
             await asyncio.sleep(self.token_delay_s)
+            if req.abort and self.hold_abort_output:
+                await self._abort_output_release.wait()
             return not req.abort
 
         try:
@@ -328,10 +337,18 @@ class FakeEngine:
         await asyncio.sleep(0.02)  # the weight offload
         if self.hold_sleep:
             await self._sleep_release.wait()
+        if self.fail_sleep:
+            self.sleeping = False
+            self._wake.set()
+            return web.json_response({"error": {"message": "sleep failed", "type": "InternalServerError"}},
+                                     status=500)
         return web.Response(status=200)
 
     def release_sleep(self) -> None:
         self._sleep_release.set()
+
+    def release_abort_output(self) -> None:
+        self._abort_output_release.set()
 
     async def _wake_up(self, request: web.Request) -> web.Response:
         self.requests.append({"path": "/wake_up", "headers": dict(request.headers)})

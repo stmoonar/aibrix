@@ -492,7 +492,28 @@ async def test_non_continuable_non_stream_abort_is_retried_from_scratch():
 
 
 @pytest.mark.asyncio
+async def test_abort_after_a_failed_sleep_is_still_continued():
+    """T6: the engine aborts its requests inside /sleep, then fails the sleep and rolls
+    back. The abort output reaches the sidecar only after the failed call returned (the
+    sleeping mark is already rolled back): a /sleep call happened since the generation
+    started, so it is sleep-caused and continued, the client gets the complete answer."""
+    async with Harness(a={"hold_at": 3, "fail_sleep": True, "hold_abort_output": True}) as h:
+        task = asyncio.ensure_future(h.post("/v1/completions", completion_body(8)))
+        await h.engine_a.wait_generated(3)
+        assert await h.sleep_a() == 500
+        assert not h.sidecar_a.state.active and h.sidecar_a.metrics.events["sleep_failed"] == 1
+        h.engine_a.release_abort_output()
+        status, _, raw = await task
+        objs = parse_sse(raw)
+        assert status == 200 and finishes(objs) == ["length"]
+        assert text_of(objs, False) == expected_text(tokenize(PROMPT), 8)
+        assert h.sidecar_a.metrics.reissue == {("continue", "abort_sleep"): 1}
+
+
+@pytest.mark.asyncio
 async def test_abort_while_awake_is_passed_through():
+    """T6, the other side: no /sleep call since the generation started - the engine's
+    own abort is passed through, not continued."""
     async with Harness(a={"hold_at": 2}) as h:
         async def engine_side_abort():
             await h.engine_a.wait_generated(2)

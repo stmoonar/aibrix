@@ -109,7 +109,13 @@ Envoy 耗时 7–112 ms（很快失败、不是超时），发生时 waiting=0�
 
 ## 4. 已开始的请求：token-id 续发（D6）
 
-触发：本地上游 chunk 出现 `finish_reason == "abort"`，且本地处于 sleeping/pending，客户端仍连着，请求可续发，深度未超限，abort 输出带 token id。
+触发：本地上游 chunk 出现 `finish_reason == "abort"`，且该请求开始之后有 `/sleep` 调用经过本 sidecar，客户端仍连着，请求可续发，深度未超限，abort 输出带 token id。
+
+**abort 是否由睡眠引起：按状态判断，不按时间（2026-10-05）**：sidecar 有计数器 `sleep_calls`，`/sleep`（`/pause`）在**转发给引擎之前**加 1，
+从不回滚；请求开始时（检查本地未睡之后，同一步内）记下当时的值。abort 到达时计数变了 → 由睡眠引起（续发 / 重试）；没变 → 引擎自己的 abort，透传
+（`passthrough_abort{not_sleeping}`）。此前看的是 abort 到达那一刻的 sleeping/pending 标记：引擎在 `/sleep` 里先 abort 再失败回滚时，
+晚到的 abort 输出看到的是已回滚的标记，被当成普通 abort 透传，客户端看到截断。新规则不需要当前标记：引擎只能经本 sidecar 的 `/sleep` 入睡，
+而请求只在标记为空时开始。不加宽限时间窗。
 
 **续发请求**（`build_continuation`）：
 - `POST /v1/completions`，`prompt = prompt_token_ids + generated_token_ids`（两者都来自 fork 的 abort 输出，不重新分词，接缝为 0）；

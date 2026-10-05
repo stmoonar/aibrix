@@ -12,8 +12,8 @@ Every path is proxied transparently (streaming kept). On top of that:
   the first event of an SSE stream), when the local engine is known to be asleep, or when
   a generation is aborted before a single byte reached the client. Bounded attempts; if
   all fail the client gets ``503`` + ``Retry-After``.
-* Started requests aborted by a sleep (``finish_reason == "abort"`` while this pod is
-  sleeping) are CONTINUED on another instance through the gateway with a token-id prompt:
+* Started requests aborted by a sleep (``finish_reason == "abort"`` after a ``/sleep`` call
+  reached this sidecar since the request started) are CONTINUED on another instance through the gateway with a token-id prompt:
   ``prompt = prompt_token_ids + generated_token_ids`` (both from the abort output of the
   fork flag ``--abort-return-token-ids``), ``max_tokens`` reduced by the generated count,
   the same sampling parameters. Chat requests are continued as ``/v1/completions`` over the
@@ -537,6 +537,12 @@ class SleepState:
         self.waking = 0
         #: Bumped on every transition; an observed state is applied only if unchanged.
         self.epoch = 0
+        #: /sleep (/pause) calls forwarded to the engine so far, counted BEFORE forwarding
+        #: and never rolled back. A generation snapshots it at its start; an abort is
+        #: sleep-caused iff the count moved since (``ReissueSidecar._abort_decision``):
+        #: evidence by state, not by a time window, and it holds for an abort output that
+        #: arrives after a /sleep the engine failed and rolled back.
+        self.sleep_calls = 0
         self.last_sleep: dict[str, Any] | None = None
 
     def observe(self, is_sleeping: bool, epoch: int) -> str | None:
@@ -1390,6 +1396,7 @@ class ReissueSidecar:
         # their abort outputs reach us before the call returns. Idempotent.
         transition = not state.active
         state.pending += 1
+        state.sleep_calls += 1
         if transition:
             state.epoch += 1
         started = time.time()
@@ -1571,6 +1578,7 @@ class ReissueSidecar:
             body = parse_body(raw)
         nc_reason = non_continuable_reason(path, body, cfg) if generation else "endpoint"
         epoch = self.state.epoch
+        sleeps = self.state.sleep_calls  # an abort after a /sleep call since now is sleep-caused
         headers = forward_headers(request.headers, self._local_drop)
         added.forwarded()
         try:
@@ -1599,15 +1607,23 @@ class ReissueSidecar:
             return await self._relay(request, resp, added=added)
         ctype = resp.headers.get("Content-Type", "")
         if "text/event-stream" in ctype:
-            return await self._stream(request, path, raw, body, resp, depth, nc_reason, added)
+            return await self._stream(request, path, raw, body, resp, depth, nc_reason, added, sleeps)
         if "json" in ctype:
-            return await self._non_stream(request, path, raw, body, resp, depth, nc_reason, added)
+            return await self._non_stream(request, path, raw, body, resp, depth, nc_reason, added, sleeps)
         return await self._relay(request, resp, added=added)
 
     def _abort_decision(self, request: web.Request, depth: int, nc_reason: str | None,
-                        info: AbortInfo, sent_any: bool) -> tuple[str, str]:
-        """(action, reason); action = retry | continue | passthrough_abort | failed."""
-        if not self.state.active:
+                        info: AbortInfo, sent_any: bool, sleeps: int) -> tuple[str, str]:
+        """(action, reason); action = retry | continue | passthrough_abort | failed.
+
+        ``sleeps``: ``state.sleep_calls`` when the generation started. The abort is
+        sleep-caused iff a /sleep call was forwarded since - whether it is still running,
+        succeeded, or failed and was rolled back (the engine may abort its requests and
+        then fail the sleep; their abort outputs can arrive after the call returned). The
+        current sleeping mark is not needed: the only way to put the engine to sleep is a
+        /sleep through this sidecar, and a generation starts only while the mark is
+        clear. An abort with no sleep call in between is the engine's own: passed through."""
+        if self.state.sleep_calls == sleeps:
             return "passthrough_abort", "not_sleeping"
         if _client_gone(request):
             return "passthrough_abort", "client_gone"
@@ -1642,7 +1658,7 @@ class ReissueSidecar:
 
     async def _stream(
         self, request: web.Request, path: str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,
-        depth: int, nc_reason: str | None, added: AddedTime,
+        depth: int, nc_reason: str | None, added: AddedTime, sleeps: int,
     ) -> web.StreamResponse:
         cfg = self.cfg
         chat = path == cfg.chat_path
@@ -1702,7 +1718,8 @@ class ReissueSidecar:
                         if obj is not None and has_abort(obj):
                             info = self._abort_info(obj, chat, stream=True)
                             action, reason = self._abort_decision(
-                                request, depth, nc_reason, info, sent_any=client is not None or bool(out)
+                                request, depth, nc_reason, info, sent_any=client is not None or bool(out),
+                                sleeps=sleeps,
                             )
                             if action == "retry":
                                 resp.close()
@@ -1999,7 +2016,7 @@ class ReissueSidecar:
 
     async def _non_stream(
         self, request: web.Request, path: str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,
-        depth: int, nc_reason: str | None, added: AddedTime,
+        depth: int, nc_reason: str | None, added: AddedTime, sleeps: int,
     ) -> web.StreamResponse:
         """Relay time: the whole body received -> the response handed back to aiohttp
         (which sends it after the handler returns; that socket write is not timed),
@@ -2029,7 +2046,8 @@ class ReissueSidecar:
         # is always exact. A continuation only saves the tokens already generated, so it
         # is used when possible (continuable, token ids present); otherwise pure retry.
         continuable = nc_reason is None and bool(info.generated_ids) and info.prompt_ids is not None
-        action, reason = self._abort_decision(request, depth, nc_reason, info, sent_any=continuable)
+        action, reason = self._abort_decision(request, depth, nc_reason, info, sent_any=continuable,
+                                              sleeps=sleeps)
         if action == "retry" and nc_reason is not None:
             reason = f"abort_non_continuable_{nc_reason}"
         if action == "retry":
