@@ -129,22 +129,25 @@ def test_sleep_mode_param_accepts_auto_and_booleans():
 def test_worst_case_lock_holds_and_the_call_bound_fit_the_api_call_timeout():
     """Whole-lock (2026-10-02): one sleep holds the writer lock for at most ack 5 +
     one probe round 5 + /sleep 10 + max(confirmation 8 + its last probe 5, the
-    failed-call rollback's 4 probes) + io 2 = 42 s, whatever the target count
-    (probe timeout 5 s since 2026-10-06)."""
+    failed-call rollback's 4 probes) + 8 sequential Kubernetes calls x (connect 2
+    + read 5) + io 2 = 98 s, whatever the target count (probe timeout 5 s and the
+    Kubernetes term since 2026-10-06)."""
     config = ServiceManagerConfig()
-    assert config.worst_case_sleep_lock_s() == 5 + 5 + 10 + max(8 + 5, 4 * 5) + 2 == 42
+    assert config.k8s_call_s() == 2 + 5
+    assert config.worst_case_sleep_lock_s() == 5 + 5 + 10 + max(8 + 5, 4 * 5) + 8 * 7 + 2 == 98
     # A wake: resident probes 5 + /wake_up 10 + convergence and settlement probes
-    # 2 x 5 + ONE compensating sleep 42 (whatever the number of failed wakes) + io 2.
-    assert config.worst_case_wake_lock_s() == 5 + 10 + 2 * 5 + 42 + 2 == 69
-    assert config.worst_case_transfer_lock_s() == 5 + 42 + 69 == 116
-    assert config.worst_case_lock_hold_s() == 116
-    assert config.worst_case_sleep_call_s() == 30 + 116 + 2 == 148
+    # 2 x 5 + ONE compensating sleep 98 (whatever the number of failed wakes) +
+    # 4 Kubernetes calls x 7 + io 2.
+    assert config.worst_case_wake_lock_s() == 5 + 10 + 2 * 5 + 98 + 4 * 7 + 2 == 153
+    assert config.worst_case_transfer_lock_s() == 5 + 2 * 7 + 98 + 153 == 270
+    assert config.worst_case_lock_hold_s() == 270
+    assert config.worst_case_sleep_call_s() == 30 + 270 + 2 == 302
     assert config.worst_case_sleep_call_s() < config.api_call_timeout_s
-    assert config.shutdown_timeout_s() == 116 + 2
+    assert config.shutdown_timeout_s() == 270 + 2
 
     slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 200}})
     errors = Registry(ClusterTopology(nodes=()), [], service_manager=slow).validate()
-    assert any("worst-case service-manager call is 528s" in e for e in errors)
+    assert any("worst-case service-manager call is 682s" in e for e in errors)
 
     from tre_common.registry import sleep_call_timeout_errors
 

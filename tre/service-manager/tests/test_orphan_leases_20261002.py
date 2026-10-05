@@ -115,6 +115,8 @@ def test_a_managed_pod_with_an_unreadable_binding_releases_nothing():
 
     assert world.service.reap_orphan_leases() == []
     assert {lease.binding_id for lease in world.leases.load()} == {"d/node-a/0", "d/node-a/1"}
+    # Blocking every reap fleet-wide is visible, not just a warning.
+    assert world.client.get("/v2/wake").json()["stats"]["orphan_reap_blocked_total"] == 1
 
 
 def test_one_supervisor_pass_in_observe_releases_a_gone_pods_lease_and_keeps_a_terminating_one():
@@ -128,4 +130,29 @@ def test_one_supervisor_pass_in_observe_releases_a_gone_pods_lease_and_keeps_a_t
 
     FleetSupervisor(world.service, drift_observations_required=1).run_once()
 
+    assert {lease.binding_id for lease in world.leases.load()} == {"d/node-a/1"}
+
+
+def test_a_restart_gives_no_awake_lease_to_a_record_whose_pod_was_replaced():
+    # The store records d-0 awake, but its Pod was deleted and a NEW Pod of the
+    # binding exists (asleep). The bootstrap neither rebuilds nor carries d-0's
+    # awake lease (the Pod that held it is gone); the binding is a suspect
+    # instead, which the suspect convergence settles from the new Pod's state.
+    from tre_sm.server import rebuild_gpu_leases
+    from sm_test_fakes import fence, pod
+
+    world = World()
+    old = world.runtime.snapshots.pop("d-0")
+    world.runtime.snapshots["d-0-new"] = pod("d-0-new", "d", (0,), ip=old.pod_ip, state="sleeping")
+    world.vllm.sleeping[old.pod_ip] = True
+    world.runtime.list_live_model_pod_names = lambda: set(world.runtime.snapshots)
+    world.runtime.list_live_model_pod_binding_ids = lambda: {
+        binding_of(s).binding_id for s in world.runtime.snapshots.values()
+    }
+    with fence(world.redis):
+        suspects = rebuild_gpu_leases(
+            world.leases, world.runtime, world.store.load().bindings, starting_bindings=[], waking_bindings=[]
+        )
+
+    assert [item[0] for item in suspects] == ["d/node-a/0"]
     assert {lease.binding_id for lease in world.leases.load()} == {"d/node-a/1"}

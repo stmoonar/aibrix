@@ -88,26 +88,29 @@ SM 已经改成"不排空、一律 abort"，sleep 留在锁外的只是十几毫
 | `sleep.io_margin_s` | 2 s（原 5） | Redis / Kubernetes 调用余量 |
 | `writer_lock_wait_s` | 30 s（原 10） | 能排在若干个 2–5 s 的普通操作之后；排在最坏持锁（引擎 hang）之后时回 409 `writer_busy`，调用方下个 tick 重试 |
 
-最坏持锁（`ServiceManagerConfig.worst_case_*`，与 target / pair / journal 条目的数量无关）：
+最坏持锁（`ServiceManagerConfig.worst_case_*`，与 target / pair / journal 条目的数量无关；每个超时都
+取上限，**包括 Kubernetes API 慢或 hang**，10-06 评审 P2-1）：
 
+- Kubernetes 调用：每次调用带 `(connect 2 s, read k8s_request_timeout_s)` 超时（registry
+  `service_manager.k8s_request_timeout_s`，默认 5 s），urllib3 不重试，所以一次调用最多 7 s。
+  注意 kubernetes 客户端只认 int 或二元组，float 会被静默丢掉（等于没有超时；10-06 评审 P1-1）。
+  每个阶段串行的调用数（每个 target 的调用都并行）：sleep 8（targets 的 Pod LIST、floor 的 Pod LIST
+  ×2、隐藏 2、回执等待时插件 pod LIST 超出的一次、确认或回滚的 annotation 2），wake 4（Pod LIST、
+  唤醒门的居民 LIST、提交 annotation 2），接力选对 2（floor 与居民的 Pod LIST）。409 冲突立刻返回，
+  不计。测试 `test_k8s_call_budget_20261006.py` 检查多 target 时串行调用数不超过这些常数。
 - 一次 sleep：回执 5 + 一轮探测 5 + `/sleep` 10 + max(确认 8 + 最后一轮探测 5，失败回滚的 4 次探测 20)
-  + 余量 2 = **42 s**。典型 1–3 s。
-- 一次 wake：居民探测 5 + `/wake_up` 10 + 收敛与结算探测 2 × 5 + 补偿睡眠 42 + 余量 2 = **69 s**；
-  不需要补偿睡眠时 27 s。典型 1.5–3 s。一次调用里所有失败的 wake 一起结算：一轮并行
-  `/is_sleeping`，醒着的合成**一次** sleep 调用（10-06；之前逐个串行，持锁随数量增长）。
-- 一次接力：选对时的一轮探测 5 + donor 的 sleep 42 + receiver 的 wake 69 = **116 s**（两条失败路径
-  同时到上限）；典型 3–6 s。选对前对所有 donor 卡上的 pod 做**一轮**并行探测，每个候选对的否决
-  读这一轮的结果（10-06；之前每个候选对各探测一次）；receiver 的唤醒门不再重复探测（同一次持锁里
-  第三居民已确认睡着、donor 已由 sleep 原语确认睡着，别的写操作插不进来）。
+  + Kubernetes 8 × 7 + 余量 2 = **98 s**。典型 1–3 s。隐藏（每个 pod 一次 annotation 写）并行。
+- 一次 wake：居民探测 5 + `/wake_up` 10 + 收敛与结算探测 2 × 5 + 补偿睡眠 98 + Kubernetes 4 × 7 + 余量 2
+  = **153 s**；不需要补偿睡眠时 55 s。典型 1.5–3 s。一次调用里所有失败的 wake 一起结算：一轮并行
+  `/is_sleeping`，醒着的合成**一次** sleep 调用（10-06）。一次 `/target` 醒多个副本时，Pod LIST 和
+  居民探测各只做一轮（10-06），提交的 annotation 并行写。
+- 一次接力：选对时的一轮探测 5 + Kubernetes 2 × 7 + donor 的 sleep 98 + receiver 的 wake 153 = **270 s**；
+  典型 3–6 s。选对前对所有 donor 卡上的 pod 做**一轮**并行探测，每个候选对的否决读这一轮的结果；
+  receiver 的唤醒门不再重复探测（同一次持锁里第三居民已确认睡着、donor 已由 sleep 原语确认睡着）。
 - journal 恢复（supervisor）：所有条目的引擎一轮并行探测；wake journal 结算的条目一起提交（10-06）。
-- 还没合并的一处：`/target` 一次醒多个副本、且这些卡的 gpu-truth 不可信（刚有过本地 power 变化）时，
-  每个 binding 的唤醒门各做一轮居民探测（最多 `max_awake_replicas` 轮，每轮一个 `probe_timeout_s`）。
-  gpu-truth 可信时没有这一项；上面的公式没有算它。
-- 所有 Kubernetes API 调用带 `_request_timeout`（默认 10 s，环境变量
-  `TRE_SM_K8S_REQUEST_TIMEOUT_S`；10-06）：API server hang 时不会无限持锁。
-- 调用方看到的最坏时长：`writer_lock_wait_s` 30 + 最长持锁 116 + 余量 2 = 148 s，registry 校验它小于
+- 调用方看到的最坏时长：`writer_lock_wait_s` 30 + 最长持锁 270 + 余量 2 = 302 s，registry 校验它小于
   `api_call_timeout_s`（360 s，controller 的慢调用超时）。
-- SIGTERM 等待：最长持锁 + 余量 = 118 s，小于 Deployment 的 `terminationGracePeriodSeconds`（300 s）。
+- SIGTERM 等待：最长持锁 + 余量 = 272 s，小于 Deployment 的 `terminationGracePeriodSeconds`（300 s）。
 - cold start、defrag、fleet repair 的持锁按设计以分钟计（等 pod 起来），不在 controller 的规划循环里。
 
 **vLLM hang 时的行为**：所有 vLLM 调用都有 HTTP 超时，持锁时长因此有界。
@@ -245,3 +248,9 @@ AIBrix 的 APA 臂（`pkg/controller/podautoscaler/workload_scale.go`）先 `POS
   supervisor（5 s）在 observe 下释放这些孤儿租约；up 的 `reconcile drop_missing` 也会释放它删掉的
   binding 的租约。不再需要手工 `HDEL`。terminating 的 pod 不算消失，它的租约等 pod 对象没了再放。
 - `no_drain_paths`：registry 列出全部 8 条路径（与线上一致）；SM 忽略它，回滚到旧镜像时也不排空。
+- 10-06 评审第二轮：kubernetes 调用超时改成二元组并关掉 urllib3 重试（P1-1）；Kubernetes 调用计入最坏
+  持锁（P2-1）；孤儿回收被不可读的 Pod 挡住时报审计项 `orphan_reaper_blocked` 和计数
+  `orphan_reap_blocked_total`（`GET /v2/wake` 的 stats，P3-1）；唤醒门 / 接力的居民探测遇到同节点上
+  binding 读不出来的 Pod 按"未知居民"处理（fail closed，P3-2）；SM 重启时，store 记为醒着、但记录里
+  的 Pod（按名字）已不存在的 binding 不再从这条记录重建 awake 租约，旧的 awake 租约也不沿用；如果
+  这个 binding 有新的 Pod，就作为 suspect 由探测结算（P3-4）。store 本身的陈旧记录仍由 reconcile 修正。

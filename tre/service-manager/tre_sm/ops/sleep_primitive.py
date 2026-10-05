@@ -670,29 +670,35 @@ class SleepPrimitive:
 
     # ------------------------------------------------------------------- steps
     def _hide(self, batch: SleepBatch) -> None:
-        for pod in batch.pods:
-            binding = pod.target.binding
-            record = {
-                "binding_id": binding.binding_id,
-                "serve_id": binding.serve_id,
-                "model": binding.model,
-                "node": binding.slot.node,
-                "gpu_ids": list(binding.slot.gpu_ids),
-                "pod_ip": pod.target.pod_ip,
-                "path": batch.path,
-                "drain_policy": "no_drain",
-                "phase": "hiding",
-                "previous_state": pod.previous_state,
-                "owner": self._owner,
-                "operation_id": batch.operation_id,
-                "started_at_ms": int(time.time() * 1000),
-            }
-            record.update(batch.journal_extra)
-            self._journal.begin(pod.pod, record)
-            gen = self._runtime.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
-            pod.hidden = True
-            pod.gen = gen if isinstance(gen, int) and not isinstance(gen, bool) else None
-            self._journal.update(pod.pod, phase="awaiting_ack", target_gen=pod.gen)
+        """Journal + hide every target, in parallel (a k8s read + patch each:
+        the hold does not grow with the number of targets, review 2026-10-06).
+        Every target is attempted; the first error is raised afterwards and the
+        caller rolls back what was hidden."""
+        _parallel(lambda pod: self._hide_pod(batch, pod), list(batch.pods))
+
+    def _hide_pod(self, batch: SleepBatch, pod: "_PodSleep") -> None:
+        binding = pod.target.binding
+        record = {
+            "binding_id": binding.binding_id,
+            "serve_id": binding.serve_id,
+            "model": binding.model,
+            "node": binding.slot.node,
+            "gpu_ids": list(binding.slot.gpu_ids),
+            "pod_ip": pod.target.pod_ip,
+            "path": batch.path,
+            "drain_policy": "no_drain",
+            "phase": "hiding",
+            "previous_state": pod.previous_state,
+            "owner": self._owner,
+            "operation_id": batch.operation_id,
+            "started_at_ms": int(time.time() * 1000),
+        }
+        record.update(batch.journal_extra)
+        self._journal.begin(pod.pod, record)
+        gen = self._runtime.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
+        pod.hidden = True
+        pod.gen = gen if isinstance(gen, int) and not isinstance(gen, bool) else None
+        self._journal.update(pod.pod, phase="awaiting_ack", target_gen=pod.gen)
 
     def _check_alive(self) -> None:
         """Every ack poll and right before /sleep: shutdown, the writer fence."""

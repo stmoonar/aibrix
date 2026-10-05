@@ -286,6 +286,23 @@ DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
 #: reads it never drains either.
 DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = SLEEP_PATHS
 
+#: Connect timeout (s) of one Kubernetes API call of the service-manager; the
+#: read timeout is ``service_manager.k8s_request_timeout_s``. Calls are not
+#: retried (urllib3 retries 0): one call takes at most connect + read.
+K8S_CONNECT_TIMEOUT_S = 2.0
+
+#: Kubernetes API calls one writer-lock phase may make one after the other
+#: (2026-10-06, review P2-1; everything per target runs in parallel). A pod
+#: annotation write is 2 calls (read + patch; a 409 conflict answers at once and
+#: is not counted). Sleep: the targets' Pod LIST, the floor's Pod LIST (twice
+#: when a model-level shrink is clamped first), the hide (2), one plugin-pod
+#: LIST overrunning the ack wait, the confirmation or rollback annotation (2) =
+#: 8. Wake: the Pod LIST, the wake gate's resident LIST, the commit annotation
+#: (2) = 4. Transfer selection: the floor's and the residents' Pod LIST = 2.
+K8S_CALLS_SLEEP = 8
+K8S_CALLS_WAKE = 4
+K8S_CALLS_TRANSFER_SELECT = 2
+
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
 #: the default of the deprecated (ignored) ``service_manager.sleep.hard_cap_s``.
@@ -972,6 +989,10 @@ class ServiceManagerConfig:
     #: ``tre:v2:sm:fault:<refuse_wake|fail_wake>:<node>/<gpu>`` (acceptance tests
     #: only). Off by default: the keys are then never read.
     test_hooks: bool = False
+    #: ``service_manager.k8s_request_timeout_s``: read timeout of every Kubernetes
+    #: API call of the service-manager (connect: :data:`K8S_CONNECT_TIMEOUT_S`, no
+    #: retry). Most calls run under the writer lock; part of the worst case.
+    k8s_request_timeout_s: float = 5.0
     #: ``service_manager.operations.max_records``: the operation journal
     #: (``tre:v2:sm:operations``) keeps at most this many finished records (oldest
     #: dropped first; running ones are never dropped).
@@ -985,8 +1006,10 @@ class ServiceManagerConfig:
         longer of the physical confirmation (``physical_confirm_timeout_s`` plus
         its last probe round) and the rollback of a failed /sleep
         (``/is_sleeping``, ``/is_paused``, ``/resume``, ``/is_paused``: 4 probes)
-        + the Redis / Kubernetes allowance (``io_margin_s``). Defaults:
-        5 + 5 + 10 + max(8 + 5, 4 x 5) + 2 = 42 s."""
+        + its sequential Kubernetes calls (:data:`K8S_CALLS_SLEEP` x
+        :meth:`k8s_call_s`, review 2026-10-06: a slow API server is part of the
+        bound) + the Redis allowance (``io_margin_s``). Defaults:
+        5 + 5 + 10 + max(8 + 5, 4 x 5) + 8 x 7 + 2 = 98 s."""
         sleep = self.sleep
         after_call = max(
             sleep.physical_confirm_timeout_s + sleep.probe_timeout_s,
@@ -997,8 +1020,13 @@ class ServiceManagerConfig:
             + sleep.probe_timeout_s
             + sleep.sleep_call_timeout_s
             + after_call
+            + K8S_CALLS_SLEEP * self.k8s_call_s()
             + sleep.io_margin_s
         )
+
+    def k8s_call_s(self) -> float:
+        """Longest Kubernetes API call (connect + read, no retry). Default 2 + 5 = 7 s."""
+        return K8S_CONNECT_TIMEOUT_S + self.k8s_request_timeout_s
 
     def worst_case_wake_lock_s(self) -> float:
         """Longest writer-lock hold of ONE wake call, any number of bindings (their
@@ -1006,25 +1034,29 @@ class ServiceManagerConfig:
         round) + /wake_up (``wake_call_timeout_s``) + the /is_sleeping
         convergence probe + a failed wake's settlement probe and compensating
         sleep (:meth:`worst_case_sleep_lock_s`; ONE sleep call for every failed
-        wake of the call, in parallel) + ``io_margin_s``. Defaults:
-        5 + 10 + 5 + 5 + 42 + 2 = 69 s; without a compensating sleep 27 s."""
+        wake of the call, in parallel) + its sequential Kubernetes calls
+        (:data:`K8S_CALLS_WAKE` x :meth:`k8s_call_s`) + ``io_margin_s``. Defaults:
+        5 + 10 + 5 + 5 + 98 + 4 x 7 + 2 = 153 s; without a compensating sleep 55 s."""
         sleep = self.sleep
         return (
             sleep.probe_timeout_s
             + self.wake_call_timeout_s
             + 2 * sleep.probe_timeout_s
             + self.worst_case_sleep_lock_s()
+            + K8S_CALLS_WAKE * self.k8s_call_s()
             + sleep.io_margin_s
         )
 
     def worst_case_transfer_lock_s(self) -> float:
         """Longest writer-lock hold of one ``POST /v2/transfers``, any number of
         pairs: the selection's resident probe (one parallel round for every
-        candidate) + the donors' sleep (one call) + the receivers' wake (one
-        call). Defaults: 5 + 42 + 69 = 116 s (both failure paths at their
-        bound)."""
+        candidate) and its Kubernetes calls (:data:`K8S_CALLS_TRANSFER_SELECT`)
+        + the donors' sleep (one call) + the receivers' wake (one call).
+        Defaults: 5 + 2 x 7 + 98 + 153 = 270 s (every failure path and every
+        Kubernetes call at its bound)."""
         return (
             self.sleep.probe_timeout_s
+            + K8S_CALLS_TRANSFER_SELECT * self.k8s_call_s()
             + self.worst_case_sleep_lock_s()
             + self.worst_case_wake_lock_s()
         )
@@ -1044,7 +1076,7 @@ class ServiceManagerConfig:
         """Upper bound of one sleeping / waking / transfer SM call as its client
         sees it: the wait for the writer lock (``writer_lock_wait_s``, then 409
         writer_busy) + the longest lock hold + ``io_margin_s``. Defaults:
-        30 + 116 + 2 = 148 s."""
+        30 + 270 + 2 = 302 s."""
         return self.writer_lock_wait_s + self.worst_case_lock_hold_s() + self.sleep.io_margin_s
 
     def shutdown_timeout_s(self) -> float:
@@ -1659,6 +1691,7 @@ def parse_service_manager_config(
         operations_max_records=int(
             _num(operations_raw, "max_records", base.operations_max_records)
         ),
+        k8s_request_timeout_s=_num(raw, "k8s_request_timeout_s", base.k8s_request_timeout_s),
     )
 
 
@@ -1732,6 +1765,8 @@ def _validate_service_manager(
         errors.append("service_manager.sleep.sleep_mode_when_idle must be abort or wait")
     if not math.isfinite(config.wake_call_timeout_s) or config.wake_call_timeout_s <= 0:
         errors.append("service_manager.wake.call_timeout_s must be positive")
+    if not math.isfinite(config.k8s_request_timeout_s) or config.k8s_request_timeout_s <= 0:
+        errors.append("service_manager.k8s_request_timeout_s must be positive")
     for path, value in sleep.budgets_s.items():
         if path not in SLEEP_PATHS:
             errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")

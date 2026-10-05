@@ -6,14 +6,14 @@ from typing import Protocol
 
 from fastapi import FastAPI
 
-from tre_common.registry import ClusterTopology
+from tre_common.registry import K8S_CONNECT_TIMEOUT_S, ClusterTopology, ServiceManagerConfig
 from tre_common.registry import load_registry
 from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.app import create_service_app
 from tre_sm.clock_check import check_clock_skew
 from tre_sm.gpu_truth import RedisGpuTruth
-from tre_sm.ops.k8s_ops import DEFAULT_K8S_REQUEST_TIMEOUT_S, K8sOps, RequestTimeoutApi
+from tre_sm.ops.k8s_ops import K8sOps, RequestTimeoutApi
 from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal, log_ignored_drain_settings
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
@@ -260,18 +260,44 @@ def rebuild_gpu_leases(
     object of the binding exists (terminating included); the suspect
     convergence or the orphan lease reaper then settles it on evidence. A lease
     without a Pod is dropped (the Pod being gone is the evidence). The Pod list
-    unreadable: every such lease is carried (fail closed)."""
+    unreadable: every such lease is carried (fail closed).
+
+    Stale awake records (review 2026-10-06 P3-4): a binding the store records
+    awake whose Pod (by name) no longer exists gets no ``awake`` lease from that
+    record, and its old ``awake`` lease is not carried - the Pod that held it is
+    gone, which is the evidence. When a NEW Pod of the binding exists (and no
+    admission or journaled wake covers it) its state is unknown: the binding
+    becomes a suspect (its GPUs never trusted from gpu-truth; the suspect
+    convergence probes /is_sleeping and takes the lease if it reads awake).
+    The Pod names unreadable: every record is trusted as before (fail closed)."""
+    stale: list[Binding] = []
+    names_lister = getattr(runtime_ops, "list_live_model_pod_names", None)
+    if callable(names_lister) and any(binding.awake for binding in bindings):
+        try:
+            names = set(names_lister())
+        except Exception:  # noqa: BLE001 - fail closed: trust the records
+            LOG.warning("listing the model Pods failed at bootstrap; every awake record is trusted", exc_info=True)
+            names = None
+        if names is not None:
+            stale = [binding for binding in bindings if binding.awake and binding.serve_id not in names]
+    stale_ids = {binding.binding_id for binding in stale}
+    bindings = [binding for binding in bindings if binding.binding_id not in stale_ids]
     covered = {binding.binding_id for binding in bindings if binding.awake}
     covered |= {binding.binding_id for binding in starting_bindings}
     covered |= {binding.binding_id for binding in waking_bindings}
-    candidates = [lease for lease in gpu_leases.load() if lease.binding_id not in covered]
-    if candidates:
+    # An awake lease of a stale record belonged to its gone Pod: not carried.
+    candidates = [
+        lease for lease in gpu_leases.load()
+        if lease.binding_id not in covered and not (lease.binding_id in stale_ids and lease.phase == "awake")
+    ]
+    live = None
+    if candidates or stale:
         try:
             live = set(runtime_ops.list_live_model_pod_binding_ids())
         except Exception:  # noqa: BLE001 - fail closed: keep them all
             LOG.warning("listing the model Pods failed at bootstrap; every uncovered GPU lease is kept", exc_info=True)
             live = None
-        candidates = [lease for lease in candidates if live is None or lease.binding_id in live]
+    candidates = [lease for lease in candidates if live is None or lease.binding_id in live]
     carried = gpu_leases.rebuild_awake(
         bindings,
         starting_bindings=starting_bindings,
@@ -286,7 +312,18 @@ def rebuild_gpu_leases(
             lease.binding_id, lease.phase, lease.node, list(lease.gpu_ids),
             "carried over" if lease.binding_id in carried_ids else "clashes with a rebuilt lease, not carried",
         )
-    return [(lease.binding_id, lease.node, tuple(lease.gpu_ids), "") for lease in candidates]
+    suspects = [(lease.binding_id, lease.node, tuple(lease.gpu_ids), "") for lease in candidates]
+    suspect_ids = {item[0] for item in suspects} | covered
+    for binding in stale:
+        has_pod = live is None or binding.binding_id in live
+        LOG.warning(
+            "bootstrap: %s is recorded awake but its Pod %s is gone; no awake lease from that record%s",
+            binding.binding_id, binding.serve_id,
+            "; a new Pod of it exists: restored as a suspect" if has_pod else "",
+        )
+        if has_pod and binding.binding_id not in suspect_ids:
+            suspects.append((binding.binding_id, binding.slot.node, tuple(binding.slot.gpu_ids), ""))
+    return suspects
 
 
 def check_service_manager_config(registry) -> None:
@@ -324,11 +361,21 @@ def _create_k8s_ops(registry=None) -> K8sOps:
         config.load_kube_config()
 
     namespace = os.environ.get("TRE_MODEL_NAMESPACE", os.environ.get("TARGET_NAMESPACE", "default"))
-    timeout_s = float(os.environ.get("TRE_SM_K8S_REQUEST_TIMEOUT_S", DEFAULT_K8S_REQUEST_TIMEOUT_S))
+    # Bounded calls (review 2026-10-06 P1-1): (connect, read) timeout on every
+    # call and no urllib3 retry, so one call takes at most connect + read - the
+    # term ServiceManagerConfig.worst_case_* counts per Kubernetes call.
+    read_s = (registry.service_manager() if registry is not None else ServiceManagerConfig()).k8s_request_timeout_s
+    configuration = client.Configuration.get_default_copy()
+    configuration.retries = 0
+    api_client = client.ApiClient(configuration)
+
+    def bounded(api):
+        return RequestTimeoutApi(api, connect_s=K8S_CONNECT_TIMEOUT_S, read_s=read_s)
+
     return K8sOps(
-        api=RequestTimeoutApi(client.CoreV1Api(), timeout_s),
-        apps_api=RequestTimeoutApi(client.AppsV1Api(), timeout_s),
-        route_api=RequestTimeoutApi(client.CustomObjectsApi(), timeout_s),
+        api=bounded(client.CoreV1Api(api_client)),
+        apps_api=bounded(client.AppsV1Api(api_client)),
+        route_api=bounded(client.CustomObjectsApi(api_client)),
         namespace=namespace,
         route_namespace=os.environ.get("TRE_ROUTE_NAMESPACE", "aibrix-system"),
         gateway_name=os.environ.get("TRE_GATEWAY_NAME", "aibrix-eg"),

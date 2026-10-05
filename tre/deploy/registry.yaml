@@ -387,16 +387,22 @@ service_manager:
   writer_lock_wait_s: 30
   # Deprecated and ignored (2026-10-02: a sleep has no separate commit phase).
   commit_lock_wait_s: null
+  # Read timeout (s) of every Kubernetes API call of the SM (connect timeout 2 s,
+  # no retry: one call takes at most 2 + this). Most calls run under the writer
+  # lock; the worst case below counts the calls a phase makes one after the other
+  # (sleep 8, wake 4, transfer selection 2; per-target calls run in parallel).
+  k8s_request_timeout_s: 5
   # Timeout clients (the controller) use for slow SM calls. Must exceed the
   # worst-case call = writer_lock_wait_s + the longest writer-lock hold (a
   # transfer, any number of pairs: its donors' sleep - ack_timeout_s +
   # probe_timeout_s + sleep_call_timeout_s + max(physical_confirm_timeout_s +
-  # probe_timeout_s, 4 x probe_timeout_s) + io_margin_s = 42 s - plus its
-  # receivers' wake - probe_timeout_s + wake.call_timeout_s + 2 x probe_timeout_s
-  # + ONE compensating sleep (42 s) + io_margin_s = 69 s - plus one selection
-  # probe round) + io_margin_s = 30 + 116 + 2 = 148 s with these values; validated
-  # at SM and controller
-  # start. The controller uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
+  # probe_timeout_s, 4 x probe_timeout_s) + 8 Kubernetes calls x 7 + io_margin_s
+  # = 98 s - plus its receivers' wake - probe_timeout_s + wake.call_timeout_s +
+  # 2 x probe_timeout_s + ONE compensating sleep (98 s) + 4 Kubernetes calls x 7
+  # + io_margin_s = 153 s - plus one selection probe round and 2 Kubernetes
+  # calls) + io_margin_s = 30 + 270 + 2 = 302 s with these values (every
+  # timeout at its bound); validated at SM and controller start. The controller
+  # uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
   api_call_timeout_s: 360
   # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
   # ERROR, WARNING, INFO or DEBUG; the TRE_SM_LOG_LEVEL env var overrides it.
@@ -448,7 +454,8 @@ service_manager:
     # -> one load read -> ONE /sleep -> physical confirmation (D1/D2), all under
     # the writer lock (whole-lock, 2026-10-02); no caller can skip a step and
     # nothing drains (draining is the controller's job). The four timeouts below
-    # bound one sleep's lock hold: 5 + 5 + 10 + max(8 + 5, 4 x 5) + 2 = 42 s.
+    # bound one sleep's lock hold with its 8 Kubernetes calls (x 7 s):
+    # 5 + 5 + 10 + max(8 + 5, 4 x 5) + 56 + 2 = 98 s.
     # Max wait for every live gateway plugin instance to report the new route-gen
     # (measured 7-15 ms; a timeout rolls the hide back).
     ack_timeout_s: 5

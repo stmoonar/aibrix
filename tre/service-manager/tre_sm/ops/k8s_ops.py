@@ -36,10 +36,6 @@ _VALID_STATES = {POD_STATE_AWAKE, POD_STATE_SLEEPING, POD_STATE_HIDDEN}
 _ROUTE_GEN_PATCH_ATTEMPTS = 5
 
 
-#: Default HTTP timeout (s) of every Kubernetes API call of the service-manager
-#: (env ``TRE_SM_K8S_REQUEST_TIMEOUT_S``): most calls run under the writer lock,
-#: and the kubernetes client has no timeout of its own.
-DEFAULT_K8S_REQUEST_TIMEOUT_S = 10.0
 
 
 class UnreadablePodBinding(RuntimeError):
@@ -49,13 +45,15 @@ class UnreadablePodBinding(RuntimeError):
 
 class RequestTimeoutApi:
     """Wraps a kubernetes API object (``CoreV1Api``, ``AppsV1Api``,
-    ``CustomObjectsApi``): every call gets ``_request_timeout`` unless the caller
-    passes one, so a hung API server cannot hold the writer lock forever (it
-    raises like any other API error)."""
+    ``CustomObjectsApi``): every call gets ``_request_timeout = (connect_s,
+    read_s)`` unless the caller passes one, so a hung API server cannot hold the
+    writer lock forever (it raises like any other API error). A 2-tuple, never a
+    float: the kubernetes client honours only an int or a 2-tuple and silently
+    drops a float (no timeout at all; review 2026-10-06 P1-1)."""
 
-    def __init__(self, api, timeout_s: float = DEFAULT_K8S_REQUEST_TIMEOUT_S) -> None:
+    def __init__(self, api, *, connect_s: float, read_s: float) -> None:
         self._api = api
-        self._timeout_s = float(timeout_s)
+        self._timeout = (float(connect_s), float(read_s))
 
     def __getattr__(self, name):
         attr = getattr(self._api, name)
@@ -63,7 +61,7 @@ class RequestTimeoutApi:
             return attr
 
         def call(*args, **kwargs):
-            kwargs.setdefault("_request_timeout", self._timeout_s)
+            kwargs.setdefault("_request_timeout", self._timeout)
             return attr(*args, **kwargs)
 
         return call
@@ -381,6 +379,12 @@ class K8sOps:
                     f"managed Pod {_metadata(pod).get('name')} has no readable binding: {exc}"
                 ) from exc
         return binding_ids
+
+    def list_live_model_pod_names(self) -> set[str]:
+        """Names of the same Pod objects as :meth:`list_live_model_pod_binding_ids`
+        (terminating ones included): a binding the store records awake under a
+        Pod name not here has lost the Pod that held its lease."""
+        return {str(_metadata(pod).get("name")) for pod in self._live_model_pods() if _metadata(pod).get("name")}
 
     def list_live_model_pod_uids(self) -> set[str]:
         """UIDs of the same Pod objects as :meth:`list_live_model_pod_binding_ids`

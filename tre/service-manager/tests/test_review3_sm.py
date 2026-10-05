@@ -311,7 +311,8 @@ def test_one_sleep_stays_within_the_documented_worst_case_lock_hold(outcome):
         physical_confirm_timeout_s=8.0, poll_interval_s=0.5, io_margin_s=2.0,
     )
     config = ServiceManagerConfig(sleep=sleep_policy)
-    assert config.worst_case_sleep_lock_s() == 29.0
+    # 29 s of vLLM / gateway waits + 8 Kubernetes calls x (connect 2 + read 5).
+    assert config.worst_case_sleep_lock_s() == 29.0 + 8 * 7
     redis = FakeRedis()
     snapshot = pod("pod-a", "m1", (0,), ip="10.0.0.1")
     runtime = FakeRuntime([snapshot])

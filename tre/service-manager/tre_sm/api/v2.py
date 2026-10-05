@@ -46,7 +46,7 @@ from tre_sm.allocator.slots import (
 )
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
-from tre_sm.ops.k8s_ops import StartupPodRecord
+from tre_sm.ops.k8s_ops import StartupPodRecord, UnreadablePodBinding
 from tre_sm.ops.transfer import (
     SKIP_FLOOR,
     TRANSFER_DONE,
@@ -300,6 +300,10 @@ class ServiceManagerV2:
         #: Their GPUs are never trusted from gpu-truth (the probe path decides) until
         #: the pod reads asleep, is gone, or is converged.
         self._suspects: dict[str, tuple[str, tuple[int, ...], str]] = {}
+        #: The last orphan-lease pass found a managed Pod whose binding cannot be
+        #: read (fail closed: no lease reaped fleet-wide); None once a pass reads
+        #: every Pod. Reported by the audit (``orphan_reaper_blocked``).
+        self._orphan_reaper_blocked: str | None = None
         #: Placeholders already alerted for exceeding placeholder_max_s.
         self._placeholder_alerted: set[str] = set()
         #: A placeholder is never released before this SM has seen it this long
@@ -784,6 +788,12 @@ class ServiceManagerV2:
         refusals: list[BaseException] = []
         tried: set[str] = set()
         avoid = {str(item) for item in avoid_gpus}
+        # ONE Pod LIST and at most ONE resident probe round for every wake of
+        # this request (review 2026-10-06 P2-1: the hold must not grow with N).
+        pods = self._pod_snapshots_by_name([b for b in bindings if b.model == model])
+        residents_of = self._shared_resident_probe(
+            {(b.slot.node, int(g)) for b in bindings if b.model == model for g in b.slot.gpu_ids}
+        )
         try:
             while len(tickets) < need:
                 sleeping = [
@@ -814,6 +824,7 @@ class ServiceManagerV2:
                     ticket = self._prepare_wake(
                         binding, planning, leases=leases, journal=journal,
                         previous_desired=before.get(binding.binding_id), placement=placement,
+                        pods=pods, residents_of=residents_of,
                     )
                 except (WakeConflict, GpuLeaseConflict, ValueError) as exc:
                     refusals.append(exc)
@@ -1489,6 +1500,8 @@ class ServiceManagerV2:
             issues.extend(self._fleet_mismatches())
             issues.extend(self._desired_coverage_issues())
         issues.extend(self._sleep_journal_issues())
+        if self._orphan_reaper_blocked:
+            issues.append({"code": "orphan_reaper_blocked", "detail": self._orphan_reaper_blocked})
         return {
             "healthy": not issues,
             "version": result.version,
@@ -2469,9 +2482,20 @@ class ServiceManagerV2:
             return []
         try:
             live = set(lister())
+        except UnreadablePodBinding as exc:
+            # Fail closed fleet-wide (one Pod blocks every reap): made visible -
+            # audit issue, counter, ERROR event - not just a warning.
+            self._orphan_reaper_blocked = str(exc)
+            self._wake_journal.incr("orphan_reap_blocked_total")
+            _log_event(
+                "orphan_reaper_blocked", level=logging.ERROR, detail=str(exc),
+                leases=[lease.binding_id for lease in leases],
+            )
+            return []
         except Exception:  # noqa: BLE001 - unreadable: keep every lease
             LOG.warning("listing the model Pods failed; no orphan GPU lease released", exc_info=True)
             return []
+        self._orphan_reaper_blocked = None
         return [lease for lease in leases if lease.binding_id not in live]
 
     def _release_orphan_leases(self, binding_ids=None) -> list[str]:
@@ -3382,12 +3406,17 @@ class ServiceManagerV2:
         previous_desired: tuple[str, bool] | None = None,
         placement: dict | None = None,
         gate: dict | None = None,
+        pods: dict[str, K8sPodSnapshot] | None = None,
+        residents_of=None,
     ) -> "_WakeTicket":
         """The prepare (writer lock held): every check that can refuse the wake,
         then the journal entry and the binding's ``awake`` GPU lease. Raises
         without side effects. ``gate``: the wake gate's answer when the caller
         already has it in this lock hold (a transfer), else
-        :meth:`_ensure_wake_headroom` decides."""
+        :meth:`_ensure_wake_headroom` decides. ``pods`` (Pod snapshots by name)
+        and ``residents_of`` (a shared resident probe round,
+        :meth:`_shared_resident_probe`): a caller preparing several wakes in one
+        hold reads the Pods and probes the residents once, not per binding."""
         started = time.monotonic()
         if self._wake_journal.get(binding.binding_id) is not None:
             raise WakeConflict(
@@ -3398,11 +3427,16 @@ class ServiceManagerV2:
         if check_account:
             self._ensure_feasible_wake(binding, bindings or [], leases, journal)
         self._check_fault_hooks(binding)
-        snapshot = self._snapshot_for_binding(binding)
+        if pods is None:
+            snapshot = self._snapshot_for_binding(binding)
+        elif binding.serve_id in pods:
+            snapshot = pods[binding.serve_id]
+        else:
+            raise ValueError(f"pod {binding.serve_id} not found for runtime operation")
         if not snapshot.pod_ip:
             raise ValueError(f"pod {binding.serve_id} has no pod IP for wake")
         if gate is None:
-            gate = self._ensure_wake_headroom(binding) or {}
+            gate = self._ensure_wake_headroom(binding, residents_of=residents_of) or {}
         ticket = _WakeTicket(
             binding=binding,
             pod_ip=str(snapshot.pod_ip),
@@ -3962,9 +3996,12 @@ class ServiceManagerV2:
         the wake. One ticket's error never stops the others (P1-1): it stays
         journaled for the recovery."""
         started = time.monotonic()
+        # The awake annotations of every woken ticket in parallel (a k8s read +
+        # patch each): the hold does not grow with the number of tickets.
+        annotated = _parallel(self._annotate_woken, [ticket for ticket in tickets if ticket.woke])
         for ticket in tickets:
             try:
-                self._record_wake(ticket, update_store=update_store)
+                self._record_wake(ticket, update_store=update_store, annotation_error=annotated.get(id(ticket)))
             except Exception as exc:  # noqa: BLE001 - left journaled for the recovery
                 LOG.exception("committing the wake of %s failed", ticket.binding.binding_id)
                 ticket.commit_error = exc
@@ -3995,14 +4032,26 @@ class ServiceManagerV2:
                 ticket.phases_ms["commit"] = _elapsed_ms(started)
                 self._log_wake_outcome(ticket)
 
-    def _record_wake(self, ticket: "_WakeTicket", *, update_store: bool) -> None:
-        """First step of the commit: a woken ticket is recorded (annotation,
-        ``awake`` lease, store); one that cannot be recorded becomes a failed
-        wake (``not_recorded``). An unanswered /wake_up is left to the recovery."""
+    def _annotate_woken(self, ticket: "_WakeTicket") -> BaseException | None:
+        """The awake annotation of a woken ticket; returns the error (never raises)."""
+        try:
+            self._runtime_ops.write_binding_annotations(ticket.binding, state=POD_STATE_AWAKE)
+        except Exception as exc:  # noqa: BLE001 - the ticket becomes not_recorded
+            return exc
+        return None
+
+    def _record_wake(
+        self, ticket: "_WakeTicket", *, update_store: bool, annotation_error: BaseException | None = None
+    ) -> None:
+        """First step of the commit: a woken ticket (annotated by
+        :meth:`_annotate_woken`) is recorded (``awake`` lease, store); one that
+        cannot be recorded becomes a failed wake (``not_recorded``). An
+        unanswered /wake_up is left to the recovery."""
         binding = ticket.binding
         if ticket.woke:
             try:
-                self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+                if annotation_error is not None:
+                    raise annotation_error
                 if self._gpu_leases is not None:
                     self._gpu_leases.acquire(binding, phase="awake")
             except Exception as exc:  # noqa: BLE001 - settled below
@@ -4721,11 +4770,11 @@ class ServiceManagerV2:
         compensating sleep), fails its pair (``receiver_wake_failed``); its donors
         stay asleep."""
         tickets: list[_WakeTicket] = []
-        for state in op.pairs:
-            if state.status != TRANSFER_PENDING:
-                continue
+        pending = [state for state in op.pairs if state.status == TRANSFER_PENDING]
+        pods = self._pod_snapshots_by_name([state.pair.receiver for state in pending])
+        for state in pending:
             try:
-                state.ticket = self._prepare_transfer_wake(op, state.pair)
+                state.ticket = self._prepare_transfer_wake(op, state.pair, pods)
             except Exception as exc:  # noqa: BLE001 - this pair fails, the others go on
                 state.status = TRANSFER_RECEIVER_FAILED
                 state.error = exc
@@ -4749,7 +4798,7 @@ class ServiceManagerV2:
                     gpus=ticket.binding.slot.gpu_ids, binding_id=ticket.binding.binding_id,
                 )
 
-    def _prepare_transfer_wake(self, op: "_Transfer", pair: TransferPair) -> "_WakeTicket":
+    def _prepare_transfer_wake(self, op: "_Transfer", pair: TransferPair, pods=None) -> "_WakeTicket":
         """The wake prepare of one receiver (writer lock held): the books must
         still show it asleep and not hidden; the cap, the account and the wake
         gate decide as for any wake; then its desired power is awake."""
@@ -4780,7 +4829,7 @@ class ServiceManagerV2:
         ticket = self._prepare_wake(
             receiver, snapshot.bindings,
             previous_desired=self._desired_power_of(receiver.binding_id), placement=placement,
-            gate={"truth_source": "transfer_probe", "truth_age_s": None},
+            gate={"truth_source": "transfer_probe", "truth_age_s": None}, pods=pods,
         )
         try:
             self._update_desired(
@@ -4931,9 +4980,14 @@ class ServiceManagerV2:
         )
 
     def _sleep_targets_for(self, bindings: list[Binding]) -> list[SleepTarget]:
+        """The sleep targets of ``bindings`` from ONE Pod LIST (a k8s call per
+        binding would make the lock hold grow with their number)."""
+        pods = self._pod_snapshots_by_name(bindings)
         targets: list[SleepTarget] = []
         for binding in bindings:
-            snapshot = self._snapshot_for_binding(binding)
+            snapshot = pods.get(binding.serve_id)
+            if snapshot is None:
+                raise ValueError(f"pod {binding.serve_id} not found for runtime operation")
             if not snapshot.pod_ip:
                 raise ValueError(f"pod {binding.serve_id} has no pod IP for sleep")
             targets.append(SleepTarget(binding, snapshot.pod_ip, snapshot.pod_uid))
@@ -5060,7 +5114,7 @@ class ServiceManagerV2:
         under the repair's writer lock like every sleep."""
         self._sleep_targets([SleepTarget(binding, pod_ip)], sleep_path="repair")
 
-    def _ensure_wake_headroom(self, binding: Binding) -> dict:
+    def _ensure_wake_headroom(self, binding: Binding, *, residents_of=None) -> dict:
         """The physical side of a wake's feasibility (S1, 2026-09-30).
 
         The account (store, GPU leases, journaled wakes; :meth:`_ensure_feasible_wake`)
@@ -5109,7 +5163,7 @@ class ServiceManagerV2:
             )
         if truth is None and not self._require_gpu_truth:
             return {"truth_source": "none", "truth_age_s": None}
-        residents = self._probe_gpu_residents(binding)
+        residents = residents_of(binding) if residents_of is not None else self._probe_gpu_residents(binding)
         awake = sorted(binding_id for binding_id, sleeping in residents if sleeping is False)
         unknown = sorted(binding_id for binding_id, sleeping in residents if sleeping is None)
         conflict = None
@@ -5266,25 +5320,65 @@ class ServiceManagerV2:
         if not callable(getattr(self._runtime_ops, "list_pod_snapshots", None)) or self._vllm_ops is None:
             return [("<no runtime to probe residents>", None)]
         gpus = {(binding.slot.node, int(gpu)) for gpu in binding.slot.gpu_ids}
+        return self._residents_from(binding, gpus, self._probe_round(gpus))
+
+    def _probe_round(self, gpus: set[tuple[str, int]]):
+        """:meth:`_probe_pods_on_gpus`, or the :class:`UnreadablePodBinding` that
+        made it incomplete (a LIST error still raises)."""
+        try:
+            return self._probe_pods_on_gpus(gpus)
+        except UnreadablePodBinding as exc:
+            return exc
+
+    @staticmethod
+    def _residents_from(binding: Binding, gpus: set[tuple[str, int]], probed) -> list[tuple[str, bool | None]]:
+        """(binding id, /is_sleeping) of the other Pods on ``binding``'s GPUs from
+        a probe round; an incomplete round (a Pod whose binding cannot be read)
+        is one unknown resident (fail closed: it may sit on these GPUs)."""
+        if isinstance(probed, BaseException):
+            return [(f"<unreadable pod: {probed}>", None)]
+        mine = {(binding.slot.node, int(gpu)) for gpu in binding.slot.gpu_ids}
         return [
             (other.binding_id, sleeping)
-            for other, sleeping, _ip in self._probe_pods_on_gpus(gpus)
+            for other, sleeping, _ip in probed
             if other.serve_id != binding.serve_id
+            and any((other.slot.node, int(gpu)) in mine for gpu in other.slot.gpu_ids)
         ]
+
+    def _shared_resident_probe(self, gpus: set[tuple[str, int]]):
+        """A resident probe for several wakes prepared in one hold: the Pods on
+        ``gpus`` are listed and probed at most ONCE (on first use; nothing
+        changes physically before the wakes run), each binding reads its own
+        GPUs from that round."""
+        cache: list = []
+
+        def residents_of(binding: Binding) -> list[tuple[str, bool | None]]:
+            if not callable(getattr(self._runtime_ops, "list_pod_snapshots", None)) or self._vllm_ops is None:
+                return [("<no runtime to probe residents>", None)]
+            if not cache:
+                cache.append(self._probe_round(gpus))
+            return self._residents_from(binding, gpus, cache[0])
+
+        return residents_of
 
     def _probe_pods_on_gpus(self, gpus: set[tuple[str, int]]) -> list[tuple[Binding, bool | None, str | None]]:
         """(binding, /is_sleeping, pod IP) of every Pod on any of ``gpus``
         (``(node, gpu)``): ONE Pod LIST and ONE parallel probe round. A Pod
         without an IP or not Ready is unknown (None). Raises when the Pods
-        cannot be listed."""
+        cannot be listed, and :class:`UnreadablePodBinding` when a Pod on one of
+        the nodes has no readable binding (it may sit on these GPUs: fail
+        closed, like the orphan lease reaper)."""
         lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
         if not callable(lister) or self._vllm_ops is None:
             raise ValueError("no runtime to probe residents")
+        nodes = {node for node, _gpu in gpus}
         found: list[tuple[Binding, object]] = []
         for snapshot in lister():
             try:
                 other = _binding_from_snapshot(snapshot)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError) as exc:
+                if snapshot.node in nodes:
+                    raise UnreadablePodBinding(f"Pod {snapshot.name} on {snapshot.node}: {exc}") from exc
                 continue
             if any((other.slot.node, int(gpu)) in gpus for gpu in other.slot.gpu_ids):
                 found.append((other, snapshot))
@@ -6260,6 +6354,18 @@ class ServiceManagerV2:
                     f"{slot.node}/{gpu_uuid} used_mib={used_mib} max_used_mib={limit} ({source})"
                 )
         return None
+
+    def _pod_snapshots_by_name(self, bindings) -> dict[str, K8sPodSnapshot]:
+        """Pod snapshots by name for ``bindings``, from ONE Pod LIST (of their
+        model when they share one)."""
+        if not bindings or self._runtime_ops is None:
+            return {}
+        models = {binding.model for binding in bindings}
+        snapshots = (
+            self._runtime_ops.list_pod_snapshots(model=next(iter(models)))
+            if len(models) == 1 else self._runtime_ops.list_pod_snapshots()
+        )
+        return {snapshot.name: snapshot for snapshot in snapshots}
 
     def _snapshot_for_binding(self, binding: Binding) -> K8sPodSnapshot:
         snapshots = self._runtime_ops.list_pod_snapshots(model=binding.model) if self._runtime_ops else []

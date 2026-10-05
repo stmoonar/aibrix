@@ -662,3 +662,33 @@ def test_node_pressure_only_considers_registry_nodes():
     ops = K8sOps(api=api, namespace="tre-v2", registry=registry)
 
     assert ops.node_pressure_reasons() == {"node-a": ["DiskPressure"]}
+
+
+# ------------------------------------------- bounded Kubernetes calls (2026-10-06)
+
+
+def test_every_kubernetes_call_gets_a_connect_read_tuple_and_no_retry(monkeypatch):
+    """The kubernetes client honours an int or a 2-tuple ``_request_timeout`` and
+    silently drops a float (no timeout at all): the SM's calls carry a tuple, and
+    urllib3 retries are off so one call takes at most connect + read."""
+    import pytest
+
+    kubernetes = pytest.importorskip("kubernetes")
+    from tre_common.registry import K8S_CONNECT_TIMEOUT_S
+    from tre_sm import server
+
+    monkeypatch.setattr(kubernetes.config, "load_incluster_config", lambda: None)
+    ops = server._create_k8s_ops(None)
+    seen = {}
+
+    def list_namespaced_pod(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(ops._api._api, "list_namespaced_pod", list_namespaced_pod)
+    ops.list_pod_snapshots()
+
+    timeout = seen["_request_timeout"]
+    assert isinstance(timeout, tuple) and len(timeout) == 2
+    assert timeout == (K8S_CONNECT_TIMEOUT_S, 5.0)
+    assert ops._api._api.api_client.configuration.retries == 0
