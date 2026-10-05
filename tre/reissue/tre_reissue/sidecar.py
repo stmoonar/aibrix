@@ -902,7 +902,7 @@ def _retry_after(value: str | None) -> float | None:
 
 #: The sidecar's pool keep-alive must stay at least this far below vLLM's: the pool
 #: timestamps a connection when the sidecar releases it, which lags the server's own
-#: idle clock under CPU throttling (the sidecar runs with a 0.5-core limit).
+#: idle clock under CPU throttling (the sidecar runs with a CPU limit).
 KEEPALIVE_MARGIN_S = 1.0
 
 

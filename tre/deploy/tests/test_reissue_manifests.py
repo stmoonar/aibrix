@@ -257,6 +257,8 @@ def test_repo_registry_and_committed_manifests_carry_the_sidecar():
         if doc.get("kind") != "Deployment":
             continue
         assert REISSUE_CONTAINER in _containers(doc), path.name
+        # I4: room for the in-flight bound (Envoy max_requests 4096 per pod)
+        assert _containers(doc)[REISSUE_CONTAINER]["resources"]["limits"] == {"cpu": "2", "memory": "1Gi"}, path.name
         checked += 1
     assert checked == len(build_deployments(registry))
     # the tre-v2-registry ConfigMap (read by the service-manager for runtime creates)

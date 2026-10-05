@@ -17,7 +17,7 @@
 - **回环连接 keep-alive（2026-09-30）**：sidecar 到本地 vLLM 的连接池空闲保留 `upstream_keepalive_s`（默认 2 s），必须小于 vLLM 的
   `VLLM_HTTP_TIMEOUT_KEEP_ALIVE`（vLLM 默认 5 s，registry `vllm.env` 设为 75 s）。此前池用 aiohttp 默认的 15 s：vLLM 5 s 关掉空闲连接的同时
   sidecar 正好复用它，请求在首字节前失败（`Server disconnected` / `Connection reset by peer` / `Can not write request body`），客户端收到 502
-  （09-30 smoke 的 17 个 502，与过载无关）。registry 校验两者关系（至少低 1 s：sidecar 限 0.5 核，被限流时池记录的释放时间会滞后于 vLLM 的空闲计时），
+  （09-30 smoke 的 17 个 502，与过载无关）。registry 校验两者关系（至少低 1 s：sidecar 有 CPU 上限，被限流时池记录的释放时间会滞后于 vLLM 的空闲计时），
   sidecar 启动时按同一规则再查一次（不满足只打 WARNING）。见 §3a。
 
 ## 2. sidecar 如何知道本 pod 在睡 / 已隐藏（决定）
@@ -210,9 +210,9 @@ reissue:
   configmap: tre-reissue-sidecar
   namespace: default
   cpu_request: 50m
-  cpu_limit: 500m
+  cpu_limit: '2'           # 2026-10-05：0.5 核 / 256Mi 放不下在途上限（Envoy max_requests 4096/pod）
   memory_request: 64Mi
-  memory_limit: 256Mi
+  memory_limit: 1Gi
   extra_env: {}            # 额外 TRE_* 环境变量（字段名 / 头名覆盖）
   # 2026-09-30（旧版 controller/SM/UI 拒绝这些键：三个镜像都升级之后才可写进 live registry，仓库里保持注释）：
   # upstream_keepalive_s: 2       # 须小于每个模型的 VLLM_HTTP_TIMEOUT_KEEP_ALIVE（registry 校验）
@@ -253,7 +253,7 @@ gateway:
 - 生成 ConfigMap `<reissue.namespace>/<reissue.configmap>`，内容是 `sidecar.py`（守卫测试保证与源码一致，过期时提示 `make manifests`）。
 - 每个模型 Deployment：vLLM `--host 127.0.0.1 --port <vllm_port>`，去掉其 ports / readinessProbe；新增容器 `tre-reissue-sidecar`：镜像 = `reissue.image` 或模型镜像，
   `python3 /opt/tre-reissue/sidecar.py`，端口 8000，readiness `/health:8000`（经代理即 vLLM 的 /health），`NVIDIA_VISIBLE_DEVICES=void`，
-  `TRE_REISSUE_REQUIRE_HIDDEN_HEADER=true`，CPU 50m/500m、内存 64/256Mi；`TRE_REISSUE_UPSTREAM_KEEPALIVE_S` / `TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS`
+  `TRE_REISSUE_REQUIRE_HIDDEN_HEADER=true`，CPU 50m/2、内存 64Mi/1Gi（2026-10-05 前为 500m / 256Mi）；`TRE_REISSUE_UPSTREAM_KEEPALIVE_S` / `TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS`
   来自 registry `reissue:`，`TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S` 取该 pod vLLM 容器的 `VLLM_HTTP_TIMEOUT_KEEP_ALIVE`（未设为 5）。
 - `model.aibrix.ai/port` 仍为 8000；Service targetPort 8000；SM 的 `build_model_deployment` 与渲染结果逐字段相同（有测试）。
 - `deploy/scripts/staggered_model_fleet.py` 的离线拉起 `/sleep` 带 `X-TRE-Hidden: 1`（拉起中的 pod 本就 routable=false）。
@@ -270,10 +270,15 @@ gateway:
 | 32 路同时发起的 TTFT | 7.5 ms | 11.6 ms | 4.1 ms | 6.2 ms |
 | 32 路 token 间隔 | 5.71 ms | 5.77 ms | 0.05 ms | 0.31 ms |
 
-- sidecar CPU ≈ 60–80 µs / chunk（0.5 核上限约 6–8k chunk/s）。
+- sidecar CPU ≈ 60–80 µs / chunk（单线程，上限约 12–16k chunk/s；CPU limit 2026-10-05 起为 2，之前 0.5 核时约 6–8k chunk/s）。
 - 纯 aiohttp 代理（`TRE_REISSUE_ENABLED=false`）TTFT +0.62 ms、非流式 +0.57 ms：续发逻辑本身在快路径上几乎不加开销（快路径只做 `b'"abort"' in chunk` 与切分完整事件）。
 - 32 路“同一时刻”发起的 TTFT 增加是单线程 sidecar 串行处理一批请求头的排队（~0.13 ms/请求），真实负载不会这样同步到达。
 - 主机 python 3.10（无 uvloop、aiohttp 3.11）：非流式 +0.70 ms、TTFT +0.96 ms、token 间隔 +0.005 ms。
+- **回环不复用（`force_close`）评估过，未采用（2026-10-05）**：想用“每请求新连接”取代 §3a 的连接池 + 新连接重发 + 重发窗口。
+  同一基准、pool 与 force_close 交替运行，镜像内（py3.12 + uvloop + aiohttp 3.14）3 轮中位数：非流式往返增加 0.67 → 1.07 ms（+0.40），
+  TTFT 0.90 → 1.31 ms（+0.41），32 路同时发起的 TTFT 7.7 → 15.2 ms（p50 +7.5，p99 11.2 → 15.8），每 chunk CPU 68 → 78 µs；
+  主机 py3.10 5 轮：非流式 +0.56 ms、TTFT +0.64 ms、32 路 TTFT p50 +10.4 ms。门槛（p50 +0.5 ms / p99 +2 ms）不满足：
+  单线程 sidecar 每次建连约 0.25 ms，32 路同时到达时串行排队。保留连接池；补丁存档未合入。
 - 验收（计划 P3：p50 < 1 ms）在镜像环境满足。TTFT 比非流式多约 0.35 ms，是因为 sidecar 等第一个事件到达才向客户端发响应头（为了能对“流内 EngineSleeping 错误 / 首事件即 abort”做纯重试并给客户端真实的 503）。
 
 ## 11. 已知限制 / GPU 验证前的缺口

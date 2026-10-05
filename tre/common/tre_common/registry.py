@@ -410,9 +410,12 @@ class ReissueConfig:
     #: Namespace of the model Deployments (and of the script ConfigMap).
     namespace: str = "default"
     cpu_request: str = "50m"
-    cpu_limit: str = "500m"
+    #: Limits sized for the in-flight bound (Envoy circuit breaker max_requests 4096 per
+    #: pod): two or three sockets and their buffers per request, and the JSON / SSE work
+    #: of a burst of continuations, must not be OOM-killed or CPU-throttled into timeouts.
+    cpu_limit: str = "2"
     memory_request: str = "64Mi"
-    memory_limit: str = "256Mi"
+    memory_limit: str = "1Gi"
     #: Extra TRE_REISSUE_* environment for the sidecar (field / header / path names).
     extra_env: dict[str, str] = field(default_factory=dict)
 

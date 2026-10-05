@@ -522,7 +522,7 @@ data:
     \ not None else None\n    except ValueError:\n        return None\n\n\n#: The\
     \ sidecar's pool keep-alive must stay at least this far below vLLM's: the pool\n\
     #: timestamps a connection when the sidecar releases it, which lags the server's\
-    \ own\n#: idle clock under CPU throttling (the sidecar runs with a 0.5-core limit).\n\
+    \ own\n#: idle clock under CPU throttling (the sidecar runs with a CPU limit).\n\
     KEEPALIVE_MARGIN_S = 1.0\n\n\ndef keepalive_is_safe(pool_keepalive_s: float, server_keepalive_s:\
     \ float) -> bool:\n    \"\"\"The connection is closed by the side that SENDS requests\
     \ first: the client's idle\n    limit must be at least ``KEEPALIVE_MARGIN_S``\

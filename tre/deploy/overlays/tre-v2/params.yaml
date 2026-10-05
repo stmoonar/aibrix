@@ -350,9 +350,10 @@ data:
       # null = the model's vllm_image (python3 + aiohttp; the script comes from a ConfigMap).
       image: null
       cpu_request: 50m
-      cpu_limit: 500m
+      # Limits for the in-flight bound (Envoy max_requests 4096 per pod; 2026-10-05).
+      cpu_limit: '2'
       memory_request: 64Mi
-      memory_limit: 256Mi
+      memory_limit: 1Gi
     # Service-manager behaviour (plan 2026-09-27). Every key is optional; the values
     # below are the built-in defaults. Changes to the LIVE registry (ConfigMap
     # tre-v2-registry) go through the console (PUT /api/params), never a kubectl apply

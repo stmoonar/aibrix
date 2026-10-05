@@ -173,8 +173,8 @@ spec:
             cpu: 50m
             memory: 64Mi
           limits:
-            cpu: 500m
-            memory: 256Mi
+            cpu: '2'
+            memory: 1Gi
         volumeMounts:
         - name: tre-reissue-sidecar
           mountPath: /opt/tre-reissue
