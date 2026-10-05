@@ -298,7 +298,7 @@ def build(args) -> dict:
             "outcome_statements": {
                 "pass": "A and FA gates all met (onset not applicable)",
                 "fail": "reported as is",
-                "a_only_fail": ("if only A fails and FA passes, theta may still go online and A is disclosed as a "
+                "pass_a_disclosed": ("if only A fails and FA passes, theta may still go online and A is disclosed as a "
                                 "limitation (user decision 2026-10-05 item 2: urgent scale-up and GPU release act on "
                                 "the CRIT / HIGH lines, not on Z = 1); same rule as M2, all three models"),
             },

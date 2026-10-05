@@ -477,13 +477,7 @@ def check_param_file(path, model: str, registry: Optional[str], what: str, *,
         doc = dline_refit.verify_freeze(Path(path))
     except dline_refit.FreezeError as exc:
         raise ValueError(f"{what}: {path} does not verify ({exc})")
-    primary = dline_refit.label_for(model, "primary", registry)
-    if attribution != ATTRIBUTION_COMPLETION:
-        import dataclasses
-
-        # label v2: LabelDefinition.attribution (interface 2026-10-05 section 2)
-        primary = dataclasses.replace(primary, attribution=attribution)
-    ours = primary.as_dict()
+    ours = dline_refit.label_for(model, "primary", registry, attribution).as_dict()
     theirs = acceptance.frozen_label_def(doc, model)
     if dline_refit.canonical_sha256(ours) != dline_refit.canonical_sha256(theirs):
         raise ValueError(f"{what}: {path}: {model} was frozen under another label definition "

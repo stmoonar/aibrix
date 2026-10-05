@@ -236,10 +236,12 @@ ONSET_NOT_APPLICABLE = {
             "overload onset to catch. The onset-episode gate of the new acceptance is judged on M2's "
             "dynamic cells only."),
 }
-V2_VERDICT_RULE = ("only with status 'evaluated': pass iff A (BA >= .80, CI95 low >= .75, drop from training "
-                   "<= .08) and FA (CRITICAL false alarm on healthy windows at dwell 1 <= .05, CI95 high <= .08) "
-                   "are all met; onset episodes not applicable (steady holds); window B' and D disclosed; "
-                   "fail = reported as is, with the pre-declared consequence of an A-only failure")
+V2_VERDICT_RULE = ("only with status 'evaluated', the accept vocabulary (dline_refit.VERDICT_*): pass iff A "
+                   "(BA >= .80, CI95 low >= .75, drop from training <= .08) and FA (CRITICAL false alarm on "
+                   "healthy windows at dwell 1 <= .05, CI95 high <= .08) are all met; pass_a_disclosed iff only "
+                   "A fails and FA passes (the pre-declared consequence: go-live allowed, A disclosed as a "
+                   "limitation); fail = anything else, reported as is; onset episodes not applicable (steady "
+                   "holds); window B' and D disclosed")
 
 
 class Refused(RuntimeError):
@@ -336,7 +338,8 @@ def _v2_rule_checks(prereg: Mapping[str, Any]) -> list[str]:
     t14 = prereg.get("t14") or {}
     ev = prereg.get("evaluation") or {}
     fa = ev.get("FA") or {}
-    want_fa = {"false_alarm_max": dl.B_FALSE_ALARM_MAX, "false_alarm_ci95_high_max": dl.B_FALSE_ALARM_CI_HIGH_MAX}
+    from scripts import b_prime as _bp
+    want_fa = dict(_bp.WINDOW_FA_GATE)  # the accept window_fa gate (one definition)
     gate = fa.get("gate") or {}
     if any(not _close(gate.get(k), v) for k, v in want_fa.items()):
         problems.append(f"prereg evaluation.FA.gate {gate} != {want_fa}")
@@ -350,8 +353,8 @@ def _v2_rule_checks(prereg: Mapping[str, Any]) -> list[str]:
         problems.append(f"prereg evaluation.scoring.decisions misses {missing}")
     if t14.get("void_rule") != VOID_RULE_TEXT:
         problems.append(f"prereg t14.void_rule {t14.get('void_rule')!r} is not the implemented rule")
-    if "a_only_fail" not in (ev.get("outcome_statements") or {}):
-        problems.append("prereg evaluation.outcome_statements has no pre-declared 'a_only_fail' consequence")
+    if "pass_a_disclosed" not in (ev.get("outcome_statements") or {}):
+        problems.append("prereg evaluation.outcome_statements has no pre-declared 'pass_a_disclosed' consequence")
     if (t14.get("conditions") or {}).get("label_attribution") not in ATTRIBUTIONS:
         problems.append(f"prereg t14.conditions.label_attribution "
                         f"{(t14.get('conditions') or {}).get('label_attribution')!r} not in {list(ATTRIBUTIONS)}")
@@ -763,6 +766,16 @@ def dry_run_rows(dataset_dir: Path, model: str) -> tuple[list[str], list[dict], 
     return header, rows, cells
 
 
+def v2_verdict(a_passed: bool, fa_passed: bool) -> str:
+    """The v2 T14 verdict in the accept's three-way vocabulary (``dline_refit.verdict_of``):
+    A and FA pass -> pass; only A fails -> pass_a_disclosed; otherwise fail."""
+    from scripts import dline_refit as dl
+
+    if not fa_passed:
+        return dl.VERDICT_FAIL
+    return dl.VERDICT_PASS if a_passed else dl.VERDICT_PASS_A_DISCLOSED
+
+
 def fa_gate(entry: Mapping[str, Any], windows: Sequence[Any], *, gate: Mapping[str, float], n_resamples: int,
             seed: int, b_prime_block: Optional[Mapping[str, Any]] = None) -> dict:
     """v2 gate FA: the CRITICAL false alarm on healthy windows at the controller's dwell
@@ -837,7 +850,8 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
     elif vs["void_status_primary"]["status"] != STATUS_EVALUATED:
         status, verdict = vs["void_status_primary"]["status"], None
     else:
-        status, verdict = STATUS_EVALUATED, ("pass" if gate_ok else "fail")
+        status, verdict = STATUS_EVALUATED, (v2_verdict(a_ok, fa["passed"]) if v2 else (
+            dl.VERDICT_PASS if gate_ok else dl.VERDICT_FAIL))
     dropped = hd.audit_csv(csv_path, entry, model=model, sealed_to_h2=False, read_holdout=True)
     bp_unit = ("recall_severe = severe violating WINDOWS CRITICAL at dwell 1 / severe violating windows "
                "(b_prime.series_point; per window, not per episode); CI resamples cells")
@@ -846,8 +860,7 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
                 "B_prime_disclosure": {**crit["B_prime"], "gating": False,
                                        "note": "window B' is disclosed, not gating (v2 rule)"},
                 "B_prime_unit": bp_unit,
-                "a_only_failure": {"value": (not a_ok) and bool(fa["passed"]),
-                                   "consequence": inp["prereg"]["evaluation"]["outcome_statements"]["a_only_fail"]}}
+                "pass_a_disclosed_consequence": inp["prereg"]["evaluation"]["outcome_statements"]["pass_a_disclosed"]}
     else:
         head = {"A": crit["A"], "B_prime": crit["B_prime"], "B_prime_unit": bp_unit}
     metrics = {
@@ -1031,7 +1044,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if v2:
         bd = body["B_prime_disclosure"]
         print(f"  window B' (disclosed): {[(c['name'], c['value']) for c in bd.get('criteria', [])]}; "
-              f"A-only failure {body['a_only_failure']['value']}; onset episodes {body['onset_episodes']['status']}")
+              f"onset episodes {body['onset_episodes']['status']}")
     for kind, block in body["cross_shape"].items():
         cl = block["claim"]
         print(f"  {kind}: per-shape BA " + ", ".join(f"{s} {t['ba']}" for s, t in block["per_shape"].items())

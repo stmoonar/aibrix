@@ -75,3 +75,13 @@ def test_the_cross_shape_claim_per_kind_on_a_per_shape_table() -> None:
     assert rest["shapes"] == 3 and rest["sd_sample"] is not None and "sd_sample" not in cs
     # the other kind is judged on its own table, unaffected
     assert t14.claim(extrapolation)["one_theta_transfers"] is False
+
+
+def test_t14_v2_verdict_uses_the_accept_vocabulary() -> None:
+    from scripts import dline_refit as dl
+    from scripts.analysis import t14_score
+
+    assert t14_score.v2_verdict(True, True) == dl.VERDICT_PASS
+    assert t14_score.v2_verdict(False, True) == dl.VERDICT_PASS_A_DISCLOSED
+    assert t14_score.v2_verdict(True, False) == dl.VERDICT_FAIL
+    assert t14_score.v2_verdict(False, False) == dl.VERDICT_FAIL

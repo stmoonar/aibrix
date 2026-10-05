@@ -94,7 +94,6 @@ rho* source.
 from __future__ import annotations
 
 import csv
-import dataclasses
 import hashlib
 import json
 import math
@@ -682,15 +681,8 @@ def fit_label(args, model: str):
     """The fit's primary label of ``model`` with the attribution M is judged by."""
     from scripts import dline_refit
 
-    label = dline_refit.label_for(model, "primary", getattr(args, "registry", None))
     attribution = getattr(args, "fit_label_attribution", None) or ATTRIBUTION_COMPLETION
-    if getattr(label, "attribution", ATTRIBUTION_COMPLETION) != attribution:
-        try:
-            label = dataclasses.replace(label, attribution=attribution)
-        except TypeError as exc:
-            raise ValueError(f"this tree's label definition has no {attribution!r} attribution "
-                             "(label v2, tre_common.slo_labels)") from exc
-    return label
+    return dline_refit.label_for(model, "primary", getattr(args, "registry", None), attribution)
 
 
 def check_freeze(args, model: str) -> dict:
