@@ -287,3 +287,35 @@ def test_trimmed_stream_restarts_the_event_history(tmp_path) -> None:
     redis.streams[key] = redis.streams[key][-1:]          # MAXLEN trimmed past our cursor
     reader.read(redis.now_ms)
     assert reader.history_since_ms("m") == redis.now_ms and reader.gaps["m"] == 1
+
+
+def test_a_gap_forgets_pre_gap_tracked_requests(tmp_path) -> None:
+    """Review P2-4: a request tracked before the gap whose done was trimmed away must not
+    cover an unknown request after the gap."""
+    from tre_baselines.snapshot import evidence_gaps
+
+    config = make_config(tmp_path, {"m": limits("m")})
+    redis = FakeRedis(now_ms=100_000)
+    engine = {"q": 0}
+    source = LiveSource(config, redis, lambda: ONE_POD,
+                        lambda: [PodEndpoint("m-a", "m", "10.0.0.1", 8000, True)],
+                        fetch_text=lambda u, t: _metrics(engine["q"]))
+    key = req_stream_key("m")
+
+    def gaps():
+        snap = source.gather()
+        redis.advance(2000)
+        return evidence_gaps(snap.models["m"], snap.now_ms, 2.0, events=True)
+
+    assert "event_gap" not in gaps()                      # idle engine: verified
+    redis.xadd(key, {"kind": "arr", "req_id": "old", "pod": "m-a"})
+    engine["q"] = 1
+    assert gaps() == ()                                   # "old" is tracked and running
+    for i in range(3):                                    # old's done and a new arr get trimmed
+        redis.advance(1)
+        redis.xadd(key, {"kind": "done" if i == 0 else "arr", "req_id": "old" if i == 0 else f"n{i}",
+                         "pod": "m-a"})
+    redis.streams[key] = redis.streams[key][-1:]          # only n2's arr survives
+    engine["q"] = 2                                       # n1 (lost) and n2 run; "old" is gone
+    assert "event_gap" in gaps()                          # stale "old" no longer covers n1
+    source.close()

@@ -342,6 +342,9 @@ class EventReader:
     def _gap(self, model: str, now_ms: int) -> None:
         self.since_ms[model] = int(now_ms)
         self.verified[model].clear()
+        # Pre-gap entries may have lost their done in the gap: counting them would let a
+        # pod look covered while the new cohort still runs. Only post-gap arrivals count.
+        self.inflight[model] = InflightTracker()
         self.gaps[model] += 1
 
     def start(self, now_ms: int) -> None:
