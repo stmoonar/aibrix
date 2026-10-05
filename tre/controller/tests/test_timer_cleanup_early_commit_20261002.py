@@ -233,31 +233,44 @@ def test_the_state_machine_logs_a_json_event(caplog):
     assert events and events[0]["model"] == MODEL and events[0]["elapsed_ms"] == 30_000
 
 
+NOW_MS = 1_000_000
+
+
 class _FakeRedis:
-    def __init__(self, instances=1, hashes=None, fail=False):
-        self.instances = instances
+    """``instances``: plugin instance id -> heartbeat score (Redis TIME ms)."""
+
+    def __init__(self, instances=None, hashes=None, fail=False):
+        self.instances = {"gw-a": NOW_MS, "gw-b": NOW_MS} if instances is None else instances
         self.hashes = hashes or {}
         self.fail = fail
 
-    def zcard(self, key):
+    def time(self):
         if self.fail:
             raise ConnectionError("down")
-        assert key == "tre:v2:gw:instances"
-        return self.instances
+        return NOW_MS // 1000, (NOW_MS % 1000) * 1000
+
+    def zrange(self, key, start, end, withscores=False):
+        assert key == "tre:v2:gw:instances" and withscores
+        return [(name.encode(), float(score)) for name, score in self.instances.items()]
 
     def hgetall(self, key):
         return self.hashes.get(key, {})
 
 
-def test_gateway_inflight_reader_is_conservative():
+def test_gateway_inflight_reader_counts_live_instances_only():
+    """Early commit reads the hidden pods' gateway in-flight count over the live plugin
+    instances only: a field a dead instance left behind never blocks the commit, a
+    live instance's nonzero count does; no live instance (or a read error) is unknown."""
     key = "tre:v2:gw:inflight:m-1"
-    reader = GatewayInflightReader(_FakeRedis(hashes={key: {b"gw-a": b'{"total":0,"non_continuable":0,"ts":1}',
-                                                             "gw-b": '{"total":2,"non_continuable":0,"ts":1}'}}))
-    assert reader(("m-1",)) == 2.0
+    fields = {b"gw-a": b'{"total":0,"non_continuable":0,"ts":1}', "gw-b": '{"total":2,"non_continuable":0,"ts":1}'}
+    live = {"gw-a": NOW_MS, "gw-b": NOW_MS - 2_000}
+    assert GatewayInflightReader(_FakeRedis(live, {key: fields}))(("m-1",)) == 2.0
+    dead_b = {"gw-a": NOW_MS, "gw-b": NOW_MS - 60_000}  # gw-b stopped heartbeating
+    assert GatewayInflightReader(_FakeRedis(dead_b, {key: fields}), max_age_ms=10_000)(("m-1",)) == 0.0
     assert GatewayInflightReader(_FakeRedis())(("m-1",)) == 0.0  # no field: nothing routed there
-    assert GatewayInflightReader(_FakeRedis(instances=0))(("m-1",)) is None  # nobody counts
+    assert GatewayInflightReader(_FakeRedis({}))(("m-1",)) is None  # nobody counts
+    assert GatewayInflightReader(_FakeRedis({"gw-a": NOW_MS - 60_000}))(("m-1",)) is None
     assert GatewayInflightReader(_FakeRedis(fail=True))(("m-1",)) is None
-    assert GatewayInflightReader(_FakeRedis(hashes={key: {"gw": "not json"}}))(("m-1",)) is None
 
 
 def test_registry_and_config_keys():

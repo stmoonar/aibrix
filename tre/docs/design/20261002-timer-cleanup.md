@@ -186,7 +186,7 @@ poll:
 |---|---|
 | (a) | at least `min_commit_samples` requests of the remaining pods judged, p95 available |
 | (b) | the formal commit gates pass on the evidence covered so far (`_judge` in early mode: latency SLO, complete evidence of every remaining pod in this poll, fresh cluster view, KV-cache ceiling, Z tail >= tau_low); the evidence must cover up to the poll's read time instead of the deadline |
-| (c) | the hidden pods have nothing in flight: vLLM `num_requests_running + num_requests_waiting` of each hidden pod (scraped in the same poll, never part of the evidence) known and 0, and the gateway in-flight count (`tre:v2:gw:inflight:<pod>` totals, any instance, with at least one registered gateway instance) known and 0 |
+| (c) | the hidden pods have nothing in flight: vLLM `num_requests_running + num_requests_waiting` of each hidden pod (scraped in the same poll, never part of the evidence) known and 0, and the gateway in-flight count (`tre:v2:gw:inflight:<pod>` totals of the **live** plugin instances only - heartbeat in `tre:v2:gw:instances` at most `service_manager.sleep.instance_staleness_s` old, Redis TIME - read with the shared `tre_common.gateway_inflight` reader (2026-10-06: a field a dead instance left behind no longer blocks until its TTL); unknown without a live instance) known and 0 |
 | (d) | see "Review fixes" (P2-3): `early_commit_min_grids` complete post-hide grids in the newest snapshot window (default 2) and max(those grids, p95 e2e, W / 2) since the hide confirmation |
 
 In early mode nothing but a commit is acted on: an outcome that would extend,

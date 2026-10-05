@@ -354,7 +354,15 @@ def create_controller_dependencies(
             # Timer cleanup (early commit): the hidden pods' running + waiting and their
             # gateway in-flight count (TRE Redis, transparent-sleep coordination keys).
             hidden_scrape=bool(cfg.safescale.early_commit),
-            gateway_inflight=GatewayInflightReader(redis_client) if cfg.safescale.early_commit else None,
+            # Live plugin instances only: the SM's gateway liveness bound (heartbeat age).
+            gateway_inflight=(
+                GatewayInflightReader(
+                    redis_client,
+                    max_age_ms=int(1000 * registry.service_manager().sleep.instance_staleness_s),
+                )
+                if cfg.safescale.early_commit
+                else None
+            ),
         )
     # The effective evidence settings (unknown registry keys are only warned about).
     logging.getLogger("tre_controller.safescale").info(json.dumps({

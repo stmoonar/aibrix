@@ -50,7 +50,6 @@ the gateway's TPOT is the same per-token histogram), ``vllm:request_prompt_token
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import re
@@ -1253,32 +1252,26 @@ class DirectEvidenceCollector:
 
 
 class GatewayInflightReader:
-    """Gateway in-flight requests on a set of pods (timer cleanup, early commit): the
-    sum of the ``total`` fields of ``tre:v2:gw:inflight:<pod>`` (one field per gateway
-    plugin instance, written by the transparent-sleep coordination). Conservative: a
-    field of any instance counts (also a stale one), and the answer is unknown (None)
-    when no plugin instance is registered (``tre:v2:gw:instances`` empty: nothing
-    writes the counts), on a read error or an unparsable field."""
+    """Gateway in-flight requests on a set of pods (timer cleanup, early commit), read
+    with the shared live-instance reader :mod:`tre_common.gateway_inflight`: the
+    ``total`` fields of ``tre:v2:gw:inflight:<pod>`` of the plugin instances whose
+    heartbeat in ``tre:v2:gw:instances`` is at most ``max_age_ms`` old (Redis TIME). A
+    field left by a dead instance does not count (it would block the early commit until
+    its key expires). Unknown (None) when no instance is live (nothing writes the
+    counts) or on a read error."""
 
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(self, redis_client: Any, *, max_age_ms: int = 10_000) -> None:
         self._redis = redis_client
+        self._max_age_ms = max(1, int(max_age_ms))
 
     def __call__(self, pods: tuple[str, ...]) -> float | None:
-        from tre_common import rediskeys
+        from tre_common.gateway_inflight import live_gateway_instances, pod_inflight
 
         try:
-            if int(self._redis.zcard(rediskeys.GW_INSTANCES_KEY) or 0) <= 0:
+            live = live_gateway_instances(self._redis, max_age_ms=self._max_age_ms)
+            if not live:
                 return None
-            total = 0.0
-            for pod in pods:
-                for raw in (self._redis.hgetall(rediskeys.gw_inflight_key(pod)) or {}).values():
-                    text = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
-                    payload = json.loads(text)
-                    value = float(payload["total"])
-                    if not math.isfinite(value) or value < 0:
-                        return None
-                    total += value
-            return total
+            return float(sum(pod_inflight(self._redis, pod, live) for pod in pods))
         except Exception:  # noqa: BLE001 - unknown: no early commit
             LOG.warning("gateway in-flight read failed", exc_info=True)
             return None
