@@ -147,9 +147,9 @@ donor is additionally held until a whole window follows it (O1 donor rule).
 ### Configuration
 
 * `safescale.rollback_retry_z_margin: 0.25` (registry and its params mirror).
-* `TRE_SAFESCALE_ROLLBACK_BACKOFF_MS` still parses (invalid values still refuse the
-  start) and is logged as deprecated; the overlay keeps `60000` for image rollback
-  (older images read it).
+* `TRE_SAFESCALE_ROLLBACK_BACKOFF_MS` is ignored (a set value is logged, not
+  validated) and no longer in the overlay (2026-10-06; an image rollback restores
+  the backed-up Deployment with its env).
 
 ### Risks
 
@@ -232,17 +232,17 @@ registry had it off, because the C1 rescue-target bookkeeping (`rescue_bases`)
 already keeps an unreflected scale-up from being repeated. The switch and its
 `PlanConfig` field are removed. The F4 / O1 view-pending hold of a CRITICAL
 scale-up remains only for the legacy one-step rescue (`rescue_max_step_ratio: 0`,
-C1 off), which has no target bookkeeping. The registry key still parses (a set
-key is logged as deprecated and ignored) and is no longer in the shipped
-registry / params mirror.
+C1 off), which has no target bookkeeping. The registry key is no longer parsed
+(2026-10-06): an old registry that still has it loads with the usual "unknown
+key" warning; it is not in the shipped registry / params mirror.
 
 ### Band dwell (`TRE_DWELL_WINDOWS`, `TRE_DWELL_STATES`)
 
 The D8 dwell (a band acts only after N consecutive new windows) had been off
 (`1`) since the v1/paper alignment A5. `SignalState.apply_dwell`, its counters,
 the `dwell_confirmed` receiver suppression in the planner and the model-state box
-are removed. The environment variables still parse with the old validation and
-are logged as deprecated; the overlay no longer sets `TRE_DWELL_WINDOWS` (images
+are removed. The environment variables are ignored (a set one is logged, not
+validated, 2026-10-06); the overlay no longer sets `TRE_DWELL_WINDOWS` (images
 before the cleanup default to `1` without it). `tre_common.dwell` stays: the
 offline calibration and hold-out tools use it.
 

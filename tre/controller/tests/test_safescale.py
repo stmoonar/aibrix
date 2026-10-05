@@ -425,9 +425,9 @@ def test_commit_gate_records_donor_health_alongside_gate_failures() -> None:
 
 
 def test_rollback_hold_follows_evidence_not_time() -> None:
-    # Timer cleanup (2026-10-02): no fixed backoff - the configured rollback_backoff_ms is
-    # ignored; a capacity rollback holds until the signal beats the probe's start.
-    machine = SafeScaleStateMachine(config=SafeScaleConfig(rollback_backoff_ms=60_000.0))
+    # Timer cleanup (2026-10-02): no fixed backoff - a capacity rollback holds until the
+    # signal beats the probe's start.
+    machine = SafeScaleStateMachine(config=SafeScaleConfig())
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0,
                         window_inputs=ProbeWindowInputs(z_m=1.5, routable_pods=3))
     machine.observe("donor", _gw(1_000, 0, 0, ttft_p95_ms=5_000.0), now_ms=1_000)

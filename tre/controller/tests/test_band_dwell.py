@@ -113,12 +113,9 @@ def _ups(result) -> list:
 
 def test_the_controller_has_no_band_dwell_any_more() -> None:
     # Timer cleanup (2026-10-02): CRITICAL / HIGH act on the first window that shows them,
-    # whatever TRE_DWELL_WINDOWS says (it is only parsed and logged).
+    # whatever TRE_DWELL_WINDOWS says (it is ignored).
     state = SignalState(warmup_ms=0)
-    assert not hasattr(state, "apply_dwell")
     r = _tick(state, _snap(E, 0.3))
     assert r.classifications["m"].state == ModelState.CRITICAL and _ups(r)
     assert not any(e.startswith(("dwell_hold", "receiver_suppressed_dwell")) for e in r.events)
     assert _tick(SignalState(warmup_ms=0), _snap(E, 2.0)).classifications["m"].state == ModelState.HIGH
-    with pytest.raises(TypeError):
-        SignalState(dwell_windows=2)

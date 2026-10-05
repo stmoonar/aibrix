@@ -21,10 +21,11 @@ OVERLAY = Path(__file__).resolve().parents[1] / "overlays" / "tre-v2" / "control
 
 
 def test_the_default_gate_dwell_is_the_controllers_deployed_dwell() -> None:
+    # The controller has no band dwell since the timer cleanup (2026-10-02): every band
+    # acts on its first window, i.e. dwell 1. An overlay that still pins it must say 1.
     text = OVERLAY.read_text(encoding="utf-8")
     m = re.search(r"name:\s*TRE_DWELL_WINDOWS\s*\n\s*value:\s*\"?(\d+)\"?", text)
-    assert m, "TRE_DWELL_WINDOWS not found in the controller overlay"
-    assert int(m.group(1)) == dl.ONLINE_DWELL_WINDOWS
+    assert (int(m.group(1)) if m else 1) == dl.ONLINE_DWELL_WINDOWS == 1
 
 
 def test_the_cut_is_sealed_from_training_windows_and_m_does_not_move_it(tmp_path) -> None:

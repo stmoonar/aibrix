@@ -84,9 +84,8 @@ spec:
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
               value: "10"
-            # TRE_DWELL_WINDOWS is not set: the D8 band dwell was removed in the timer
-            # cleanup (2026-10-02; off since the v1/paper alignment A5). Images before it
-            # default to 1 (= off) without the variable; newer ones ignore it (logged).
+            # TRE_DWELL_WINDOWS is not set: the D8 band dwell (off since the v1/paper
+            # alignment A5) was removed in the timer cleanup (2026-10-02).
             # S1.1: sliding window (no 60-120s tumbling staleness). free_running only;
             # phase_aligned always reads the half-open window ending on the boundary.
             - name: TRE_METRICS_WINDOW_MODE
@@ -146,12 +145,10 @@ spec:
               value: "0.01"
             - name: TRE_SAFESCALE_DONOR_MIN_REQUESTS
               value: "20"
-            # ROLLBACK COMPAT - keep at 60000. The fixed A13 rollback backoff is read ONLY
-            # by controller images before the timer cleanup (2026-10-02); newer images log
-            # it as deprecated and ignore it: a rolled-back model is re-probed on new
-            # evidence instead (registry safescale.rollback_retry_z_margin).
-            - name: TRE_SAFESCALE_ROLLBACK_BACKOFF_MS
-              value: "60000"
+            # TRE_SAFESCALE_ROLLBACK_BACKOFF_MS is not set: the fixed A13 rollback backoff
+            # was removed in the timer cleanup (2026-10-02); a rolled-back model is
+            # re-probed on new evidence (registry safescale.rollback_retry_z_margin).
+            # A rollback to an older image restores its backed-up Deployment (env included).
             # --- Ablation switches (D4); production defaults ---
             - name: ENABLE_TRE_SCALING
               value: "true"

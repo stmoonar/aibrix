@@ -9,7 +9,6 @@ window only. ``TRE_SAFESCALE_ROLLBACK_BACKOFF_MS`` still parses and is ignored."
 
 from __future__ import annotations
 
-import logging
 from dataclasses import replace
 
 import pytest
@@ -145,19 +144,10 @@ def test_rescue_tick_re_probes_once_the_replica_count_changed():
     assert not any(event.startswith("safescale_rollback_hold") for event in freed.events)
 
 
-def test_backoff_env_still_parses_but_is_ignored(caplog):
+def test_a_rollback_is_held_by_evidence_whatever_the_elapsed_time():
     assert ControllerConfig.from_env({}).safescale.rollback_retry_z_margin == 0.25
-    with caplog.at_level(logging.WARNING):
-        cfg = ControllerConfig.from_env({"TRE_SAFESCALE_ROLLBACK_BACKOFF_MS": "60000"})
-    assert cfg.safescale.rollback_backoff_ms == 60_000.0
-    assert any("TRE_SAFESCALE_ROLLBACK_BACKOFF_MS" in record.getMessage() and "deprecated" in record.getMessage()
-               for record in caplog.records)
-    with pytest.raises(ValueError):
-        ControllerConfig.from_env({"TRE_SAFESCALE_ROLLBACK_BACKOFF_MS": "-1"})
-    # The state machine never reads it: a rollback is held after any amount of time.
-    machine = _rolled_back(_machine(rollback_backoff_ms=1.0))
+    machine = _rolled_back(_machine())
     assert machine.rollback_retry_holds({"donor": (1.5, 3, 10_000_000)}) == {"donor": "same_evidence"}
-
 
 def test_registry_margin_key():
     assert SafeScaleRegistryConfig().rollback_retry_z_margin == 0.25

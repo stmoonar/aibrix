@@ -10,8 +10,9 @@ from typing import Mapping
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
-#: TRE_DWELL_STATES values (deprecated, ignored: the band dwell was removed).
-DWELL_STATES = ("critical", "low", "high")
+#: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
+#: logged once and otherwise ignored (no validation): an old overlay still starts.
+REMOVED_TIMER_ENV = ("TRE_DWELL_WINDOWS", "TRE_DWELL_STATES", "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS")
 
 LOG = logging.getLogger(__name__)
 
@@ -89,11 +90,6 @@ class SafeScaleConfig:
     # donor_min_requests requests were seen. Needs TRE_GATEWAY_STATS_URL (else fail-open).
     donor_error_rate_max: float = 0.01
     donor_min_requests: float = 20.0
-    # A13 rollback backoff - DEPRECATED, ignored since the timer cleanup (2026-10-02):
-    # TRE_SAFESCALE_ROLLBACK_BACKOFF_MS still parses (an old overlay keeps starting) and
-    # a set value is logged as ignored. The next receiver-less HIGH probe of a model
-    # whose probe rolled back now waits for evidence instead (rollback_retry_z_margin).
-    rollback_backoff_ms: float = 60_000.0
     # Timer cleanup (registry safescale.rollback_retry_z_margin): after a capacity
     # rollback (SLO violation, formal commit gate, donor health) the next receiver-less
     # HIGH probe of the model needs a metrics window ending after the rollback AND either
@@ -173,7 +169,7 @@ class ControllerConfig:
     profile_proc_sample_interval_s: float
     profile_flush_interval_s: float
     safescale: SafeScaleConfig
-    # --- D8 (plan §6.9i): phase-aligned sampler, band dwell, gateway cadence check ---
+    # --- D8 (plan §6.9i): phase-aligned sampler, gateway cadence check ---
     # Defaults keep direct constructions (tests) working; from_env sets them all.
     # TRE_METRICS_REFRESH_MODE: phase_aligned (default) | free_running (old loop).
     metrics_refresh_mode: str = "phase_aligned"
@@ -187,16 +183,11 @@ class ControllerConfig:
     # TRE_METRICS_STALE_HOLD_WINDOWS: stale windows during which the previous snapshot
     # keeps being served before it is marked stale (decision loops then hold).
     metrics_stale_hold_windows: int = 2
-    # TRE_DWELL_WINDOWS / TRE_DWELL_STATES - DEPRECATED, ignored since the timer cleanup
-    # (2026-10-02): the D8 band dwell (off since the v1/paper alignment A5) was removed.
-    # Still parsed with the old validation (an old overlay keeps starting) and logged.
-    dwell_windows: int = 1
     # Timer cleanup review P3-6 (TRE_VIEW_STALE_PERIODS): a fleet view older than this
     # many refresh periods (TRE_FAIRNESS_INTERVAL_SECONDS) raises the cluster_view_stale
     # alert (cluster_view_recovered once fresh again). Alert only: the planner keeps its
     # holds on missing data. 0 = no alert.
     view_stale_periods: int = 3
-    dwell_states: tuple[str, ...] = ("critical", "low", "high")
     # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
     gateway_interval_check: str = "fail"
     # A13 donor-health guard source: Envoy /stats/prometheus URL(s) of the tre-v2 gateway
@@ -276,14 +267,9 @@ class ControllerConfig:
             raise ValueError(
                 f"TRE_GATEWAY_INTERVAL_CHECK must be one of {sorted(GATEWAY_INTERVAL_CHECKS)}"
             )
-        dwell_states = tuple(
-            state.strip().lower()
-            for state in _get_str(values, "TRE_DWELL_STATES", "critical,low,high").split(",")
-            if state.strip()
-        )
-        unknown_states = set(dwell_states) - set(DWELL_STATES)
-        if unknown_states:
-            raise ValueError(f"TRE_DWELL_STATES must be a subset of {list(DWELL_STATES)}")
+        for key in REMOVED_TIMER_ENV:
+            if key in values:
+                LOG.warning("%s=%s is ignored: the timer was removed (timer cleanup 2026-10-02)", key, values.get(key))
         instant_sample_interval_ms = _get_positive_int(
             values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", SCRAPE_INTERVAL_MS
         )
@@ -316,7 +302,6 @@ class ControllerConfig:
             kv_cache_max=_get_positive_float(values, "SAFE_SCALE_KV_CACHE_MAX", 0.8),
             donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
-            rollback_backoff_ms=_deprecated_rollback_backoff_ms(values),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             early_commit=bool(safescale_registry.early_commit),
             early_commit_min_observe_ms=float(early_grids) * float(instant_sample_interval_ms),
@@ -427,9 +412,7 @@ class ControllerConfig:
             metrics_phase_adapt=_get_bool(values, "TRE_METRICS_PHASE_ADAPT", True),
             metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
             metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
-            dwell_windows=_deprecated_dwell_windows(values),
             view_stale_periods=_get_nonneg_int(values, "TRE_VIEW_STALE_PERIODS", 3),
-            dwell_states=dwell_states,
             gateway_interval_check=gateway_interval_check,
             gateway_stats_urls=tuple(
                 url.strip() for url in str(values.get("TRE_GATEWAY_STATS_URL", "")).split(",") if url.strip()
@@ -509,30 +492,6 @@ def _o1_min_evidence_grids(registry_path: str) -> int:
         return int(getattr(scaling, "min_evidence_grids", 2) or 1)
     except Exception:  # noqa: BLE001 - the registry load fails loudly elsewhere
         return 2
-
-
-def _deprecated_dwell_windows(values) -> int:
-    """TRE_DWELL_WINDOWS / TRE_DWELL_STATES: parsed (old values still start) but ignored
-    since the timer cleanup (2026-10-02) removed the band dwell."""
-    windows = _get_positive_int(values, "TRE_DWELL_WINDOWS", 1)
-    for key in ("TRE_DWELL_WINDOWS", "TRE_DWELL_STATES"):
-        if key in values:
-            LOG.warning("%s=%s is deprecated and ignored: the band dwell was removed", key, values.get(key))
-    return windows
-
-
-def _deprecated_rollback_backoff_ms(values) -> float:
-    """TRE_SAFESCALE_ROLLBACK_BACKOFF_MS: still parsed (an invalid value still refuses
-    the start, as before) but ignored since the timer cleanup (2026-10-02) - the
-    rollback retry is gated by evidence (registry safescale.rollback_retry_z_margin)."""
-    value = _get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0)
-    if "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS" in values:
-        LOG.warning(
-            "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS=%s is deprecated and ignored: a rolled-back probe is "
-            "retried on new evidence (registry safescale.rollback_retry_z_margin)",
-            values.get("TRE_SAFESCALE_ROLLBACK_BACKOFF_MS"),
-        )
-    return value
 
 
 def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:

@@ -484,11 +484,6 @@ class ScalingRegistryConfig:
     #: ``ratio`` above: the rescue target is at most ``ratio x n`` (never below n + 1).
     #: 0 = the legacy one-step rescue (``ceil(0.1 * n)`` per decision window).
     rescue_max_step_ratio: float = 2.0
-    #: DEPRECATED, ignored since the timer cleanup (2026-10-02): the opt-in F4 hold of a
-    #: CRITICAL receiver's scale-up under C1 (off in every shipped registry; the rescue
-    #: target bookkeeping keeps an unreflected scale-up from repeating). Still parsed so
-    #: an older registry loads; a set key is logged.
-    scale_up_cooldown_enabled: bool = False
     #: The rescue target may also reach ``n + rescue_max_step_pods`` (HPA's default
     #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
     #: floor(ratio * n), n + pods). 0 = the ratio alone.
@@ -553,7 +548,7 @@ class ScalingRegistryConfig:
 
 
 SCALING_KEYS = frozenset({
-    "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
+    "rescue_max_step_ratio", "rescue_max_step_pods",
     "donor_surplus_release", "rescue_settle_ema_k",
     "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
     "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
@@ -640,12 +635,8 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}") from exc
     if not math.isfinite(settle_k) or settle_k < 0:
         raise ValueError(f"scaling.rescue_settle_ema_k must be a non-negative number, got {k_raw!r}")
-    if "scale_up_cooldown_enabled" in raw:
-        LOG.warning("registry scaling.scale_up_cooldown_enabled is deprecated and ignored (timer cleanup "
-                    "2026-10-02: the C1 rescue target bookkeeping holds an unreflected scale-up)")
     return ScalingRegistryConfig(
         rescue_max_step_ratio=ratio,
-        scale_up_cooldown_enabled=_scaling_bool(raw, "scale_up_cooldown_enabled", defaults.scale_up_cooldown_enabled),
         rescue_max_step_pods=int(float(pods)),
         donor_surplus_release=_scaling_bool(raw, "donor_surplus_release", defaults.donor_surplus_release),
         rescue_settle_ema_k=settle_k,

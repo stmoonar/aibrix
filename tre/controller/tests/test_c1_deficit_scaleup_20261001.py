@@ -379,31 +379,23 @@ def test_queue_counts_every_part_of_one_target():
 
 def test_scale_up_cooldown_key_is_ignored(caplog):
     # Timer cleanup (2026-10-02): the opt-in F4 hold of a C1 rescue was dead code (off in
-    # every shipped registry) and was removed; the key still parses, logged as deprecated.
-    def queue():
-        q = ActionQueue(_Client(), now_ms=_Clock(65_000))
-        q._last_done["critical"] = (65_000, "up")
-        return q
-
-    on = run_rescue_tick(_snapshot(5_000), queue=queue(), registry=_registry(scale_up_cooldown_enabled=True),
-                         action_cooldown=True)
-    off = run_rescue_tick(_snapshot(5_000), queue=queue(), registry=_registry(), action_cooldown=True)
-    assert on.submitted == off.submitted == 1
-    assert "cooldown_hold:critical" not in on.events
+    # every shipped registry) and was removed; an old registry with the key still loads.
+    queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
+    queue._last_done["critical"] = (65_000, "up")
+    result = run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry(), action_cooldown=True)
+    assert result.submitted == 1 and "cooldown_hold:critical" not in result.events
     with caplog.at_level(logging.WARNING):
-        parse_scaling_config({"scale_up_cooldown_enabled": True})
-    assert "scale_up_cooldown_enabled is deprecated" in caplog.text
-
+        assert parse_scaling_config({"scale_up_cooldown_enabled": True}) == ScalingRegistryConfig()
+    assert "scale_up_cooldown_enabled" in caplog.text
 
 # ---------------------------------------------------------------- registry
 def test_scaling_registry_defaults_and_validation(caplog):
-    assert parse_scaling_config(None) == ScalingRegistryConfig(2.0, False)
+    assert parse_scaling_config(None) == ScalingRegistryConfig()
     assert parse_scaling_config({"rescue_max_step_ratio": 0}).rescue_max_step_ratio == 0.0
     assert parse_scaling_config({"rescue_max_step_ratio": 1}).rescue_max_step_ratio == 1.0
-    assert parse_scaling_config({"scale_up_cooldown_enabled": True}).scale_up_cooldown_enabled is True
     for bad in ({"rescue_max_step_ratio": 0.5}, {"rescue_max_step_ratio": -1},
                 {"rescue_max_step_ratio": "x"}, {"rescue_max_step_ratio": True},
-                {"scale_up_cooldown_enabled": "yes"}, ["not", "a", "mapping"]):
+                ["not", "a", "mapping"]):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
     with caplog.at_level(logging.WARNING):

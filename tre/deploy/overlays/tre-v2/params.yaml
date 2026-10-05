@@ -582,8 +582,7 @@ data:
       # metrics window ending after the rollback AND either a routable count different
       # from the one the failed probe started from or a Z at least this much (absolute)
       # above the Z that started it. Other rollbacks (evidence gaps, maintenance, hide
-      # failures) need the new window only. Controller images before 2026-10-02 log this
-      # key as unknown (they use TRE_SAFESCALE_ROLLBACK_BACKOFF_MS).
+      # failures) need the new window only.
       rollback_retry_z_margin: 0.25
       # Direct path: commit before the deadline (timer cleanup) once, on the same poll,
       # min_commit_samples requests are judged, every commit gate passes (SLO, KV cache,
