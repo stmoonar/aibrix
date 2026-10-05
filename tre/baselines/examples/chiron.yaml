@@ -4,7 +4,9 @@
 alpha: 0.5          # paper: Alg.1 smoothing factor
 # b_init: 256       # ours: initial virtual B; default = model max_num_seqs, else 256
 # b_max: 256        # ours: cap on B; default = model max_num_seqs, else 256
-busy_def: nonidle   # main runs: paper IBP (running > 0). Sensitivity only: at_cap (running+waiting >= B)
+busy_def: effective # main runs: busy = ceil(sum(running+waiting) / mean B) - the packed busy count
+                    # (our gateway spreads requests; disclosed adaptation). Sensitivity only:
+                    # nonidle (running > 0, ratchets to the cap under spreading) | at_cap
 # Global loop: desired = max(1, ceil(busy / theta)), i.e. keep IBP = busy/N at theta.
 # theta is REQUIRED (no default; the policy refuses to start without a value for every
 # managed model).
@@ -13,8 +15,8 @@ busy_def: nonidle   # main runs: paper IBP (running > 0). Sensitivity only: at_c
 #   sensitivity: the paper's 3x example, "*": 0.3333333333 (write 1/3 with enough digits:
 #                busy / 0.3333 = 3.0003 * busy rounds UP to one extra pod; the policy
 #                tolerates only 1e-6 relative float noise)
-theta:
-  dsqwen-7b: null    # PLACEHOLDER: fill with theta_trace (null is refused at start)
+theta:               # theta_trace (peak_mean, 5 s; baseline-params-20261006): 7b .460 8b .534 14b .460
+  dsqwen-7b: null    # PLACEHOLDER: fill with theta_trace in the frozen config commit (null is refused)
   dsllama-8b: null
   dsqwen-14b: null
   # "*": 0.3333333333   # sensitivity row (the 3x example) instead of the per-model values

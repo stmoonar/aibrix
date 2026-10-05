@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -177,7 +178,7 @@ def test_theta_and_busy_def_defaults_come_from_config():
         ChironPolicy(SimpleNamespace(policy_params={}))
     with pytest.raises(ValueError):  # a managed model without theta (and no "*")
         ChironPolicy(SimpleNamespace(policy_params={"theta": {"a": 0.5}}, models={"a": 1, "b": 1}))
-    assert policy().busy_def == "nonidle"  # paper IBP; at_cap only as a sensitivity run
+    assert policy().busy_def == "effective"  # packed busy count; nonidle / at_cap for sensitivity
 
 
 def test_unknown_is_not_idle_no_scale_down():
@@ -255,3 +256,26 @@ def test_deterministic_and_json_able():
 def test_registered():
     assert POLICIES["chiron"] is ChironPolicy
     assert build_policy("chiron", SimpleNamespace(policy_params={"theta": 0.5})).name == "chiron"
+
+
+def test_effective_busy_spread_load_gives_a_constant_target_no_ratchet():
+    """Review P1-1: the gateway spreads 0.5x of one pod's B over every awake pod. nonidle
+    counts every pod busy and ratchets to the cap; the packed count stays at
+    ceil(1 / theta) instances whatever N is."""
+    theta, B, cap = 0.45, 100.0, 8
+
+    def run(busy_def, awake):
+        pol = policy(busy_def=busy_def, theta={"*": theta}, b_init=B, b_max=B)
+        seen = []
+        for t in range(12):
+            per_pod = 0.5 * B / awake  # total load 0.5 B, spread evenly
+            d = one(pol, snap([pod(f"p{i}", t * 2000, 0, 0, 0, running=per_pod) for i in range(awake)],
+                              awake=awake, t_ms=t * 2000, max_num_seqs=None))
+            seen.append(d.desired)
+            awake = max(1, min(cap, d.desired))
+        return seen
+
+    want = math.ceil(1 / theta)  # busy_eff = ceil(0.5 B / B) = 1
+    for awake0 in (1, 3, 8):
+        assert set(run("effective", awake0)) == {want}, awake0
+    assert min(cap, run("nonidle", 1)[-1]) == cap  # the old definition ratchets up to the cap

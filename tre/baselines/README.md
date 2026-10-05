@@ -106,8 +106,9 @@ each policy's docstring lists every key, marking what is from the paper and what
 choice (`# not in paper`). TokenScale velocities, Chiron theta and PreServe mu have no
 usable default and must be measured (`tools/`); the policies refuse to start without them:
 
-- Chiron-global: `busy_def: nonidle` (paper IBP) for the main runs, `at_cap` only as a
-  sensitivity run; theta = theta_trace from `tools/chiron_theta --method peak_mean
+- Chiron-global: `busy_def: effective` (busy = ceil(sum(running+waiting) / mean virtual B),
+  the packed busy count; the paper's IBP assumes packing routing, ours spreads) for the main
+  runs, `nonidle` / `at_cap` only as sensitivity runs; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
 - TokenScale-colocated: `tools/tokenscale_buckets` on the trace (edges, centers,
   `median_in`), then `tools/tokenscale_profile --sender http --gateway-url

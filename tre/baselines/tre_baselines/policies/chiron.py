@@ -8,12 +8,20 @@ Local loop (per pod, every tick), from deltas of the pod's cumulative counters:
   TBP = thr_prev/thr only when the cap was binding on the previous tick, else
   neutral (dropped from the max; a literal 1 would forbid growth);
   LocalBP = max(LBP, TBP); LocalBP < 1: B <- a*B/LocalBP + (1-a)*B, else B <- max(1, B/2).
-Global loop (Chiron-global): IBP = busy pods / N; desired = max(1, ceil(busy / theta)) (reason
+Global loop (Chiron-global): IBP = busy / N; desired = max(1, ceil(busy / theta)) (reason
   ``ibp_target``): the instance count at which IBP would sit at theta, i.e. the paper's
   over-provisioning level (section 5.2: keep enough idle instances that a burst of
   1/theta x fits). It depends only on ``busy``, so a constant load gives a constant target;
   a +-1 step on ``IBP > theta`` / ``IBP < theta`` instead flip-flops whenever theta is not
   exactly 1/k (e.g. theta 0.37, busy 1: N=2 -> .5 > .37 up, N=3 -> .33 < .37 down).
+
+``busy`` (ours, 4th disclosed adaptation, decision 2026-10-06): the paper counts the
+instances running interactive requests under *packing* routing. Our gateway spreads
+requests over every awake pod, so "pods with running > 0" grows with N itself and the
+target ratchets to the cap. The default ``busy_def: effective`` counts the instances the
+load would fill if packed: ``busy = ceil(sum_pods(running + waiting) / mean B)``, with B
+the pods' virtual batch caps from the local loop. ``at_cap`` / ``nonidle`` remain for
+sensitivity runs.
 
 Params (``config.policy_params``; see ``examples/chiron.yaml``):
 
@@ -23,9 +31,9 @@ key             default      origin
 alpha           0.5          paper (Alg.1 smoothing factor)
 b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256
 b_max           None         ours: cap on B = b_max, else max_num_seqs, else 256
-busy_def        nonidle      paper IBP (instances running interactive requests): nonidle
-                             (running > 0); at_cap (running+waiting >= B) only as a
-                             sensitivity run (D11)
+busy_def        effective    ours (see above): effective (packed busy count) | at_cap
+                             (running+waiting >= B) | nonidle (running > 0); the last two
+                             only as sensitivity runs
 theta           (required)   ``{model | "*": theta}`` or one number; no silent default: the
                              main runs use theta_trace (``tools/chiron_theta``), the 3x
                              example (1/3) is a sensitivity row; the policy refuses to start
@@ -49,7 +57,7 @@ DEFAULT_ALPHA = 0.5
 DEFAULT_B = 256  # not in paper; chosen: order of the engine default max-num-seqs
 #: busy / theta within this of an integer is that integer (theta written as 0.3333333333).
 _CEIL_TOL = 1e-6
-BUSY_DEFS = ("at_cap", "nonidle")
+BUSY_DEFS = ("effective", "at_cap", "nonidle")
 _NEEDED = ("gen_tokens", "itl_sum", "itl_count")
 
 
@@ -79,7 +87,7 @@ class ChironPolicy:
             raise ValueError("chiron: alpha must be in (0, 1]")
         self.b_init = params.get("b_init")
         self.b_max = params.get("b_max")
-        self.busy_def = str(params.get("busy_def", "nonidle"))
+        self.busy_def = str(params.get("busy_def", "effective"))
         if self.busy_def not in BUSY_DEFS:
             raise ValueError(f"chiron: busy_def must be one of {BUSY_DEFS}")
         theta = params.get("theta")
@@ -167,6 +175,8 @@ class ChironPolicy:
                 continue
             per_pod: dict[str, Any] = {}
             busy = 0
+            queued = 0.0
+            caps: list[float] = []
             for pod in ms.pods:
                 st = states.get(pod.pod)
                 if st is None:
@@ -174,17 +184,24 @@ class ChironPolicy:
                 info = self._local(st, pod, ms, b_max)
                 # Unknown gauges are not busy here (scale-up uses the evidence there is);
                 # they are an evidence gap, which blocks the scale-down below.
+                caps.append(st.B)
+                queued += pod.queued or 0.0
                 if self.busy_def == "at_cap":
                     is_busy = pod.queued is not None and pod.queued >= st.B
                 else:
                     is_busy = pod.running is not None and pod.running > 0
                 busy += int(is_busy)
-                info.update(B=_num(st.B, 2), busy=bool(is_busy))
+                info.update(B=_num(st.B, 2), busy=bool(is_busy), q=_num(pod.queued, 2))
                 per_pod[pod.pod] = info
+            extra: dict[str, Any] = {}
+            if self.busy_def == "effective":
+                b_mean = sum(caps) / len(caps)
+                busy = int(math.ceil(queued / b_mean - _CEIL_TOL)) if queued > 0 else 0
+                extra = {"queued": _num(queued, 2), "B_mean": _num(b_mean, 2)}
             ibp = busy / n
             desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
             decision = Decision(desired, "ibp_target", {
-                "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy,
+                "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy, **extra,
                 "target": desired, "busy_def": self.busy_def, "pods": per_pod,
             })
             gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
