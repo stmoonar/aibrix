@@ -69,10 +69,12 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
-        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
-        # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
-        ttft_idle_c_ms: 36.4
-        ttft_idle_b_ms_per_token: 0.0527
+        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). LIVE: safescale.slo_mode labels uses the same TTFT threshold; provenance
+        # 2026-10-03 idle capture on vllm-openai-tre:0.30.0-ts-8dc0f2a7 (scripts.ttft_idle_capture, chat api,
+        # one request in flight, L 128-4096 x 30), fit scripts.ttft_idle_fit --min-gap-ms 500 over the full
+        # L range (n 210 per model; an L <= 2048 fit differs < 7 % on L 256-2200). Old engine: 09-22 fit.
+        ttft_idle_c_ms: 41.1
+        ttft_idle_b_ms_per_token: 0.0694
         ttft_slo_mode: slowdown
         ttft_slowdown_k: 5.0
         ttft_floor_ms: 500.0
@@ -86,17 +88,21 @@ data:
         prefill_tps:
           theta: 6081.666666666667
           direction: lower_is_healthier
-      # theta_m/w_p/lambda_wait/tau_crit/tau_high: v1-lambda round 2 (2026-09-24), /data/nfs_shared_data/xxy/calibration_v1lambda_20260924/round2_wp0_d13_20/params_v1lambda_r2.json sha256 83d30b12...; identical to the live tre-v2-registry ConfigMap.
+      # theta_m/w_p/lambda_wait/tau_crit/tau_high/ema_alpha: next-round calibration on the 0.30 engine, accepted
+      # 2026-10-05 (onset gate, T14 pass); freeze calib_20261003/next-20261005/freeze/params_freeze.v2.json
+      # sha256 708d1e64... (published theta, lambda_wait, w_p, tau_crit, tau_high; delta_crit/high = tau_low 1.0 -
+      # tau_crit / tau_high - tau_low; tau_s 10 s = ema_tau_ms; ema_alpha is the freeze registry field, inert while
+      # ema_tau_ms is set). Goes live atomically with slo.ttft_idle_c_ms/b_ms_per_token.
       trs:
-        w_p: 0.0
+        w_p: 0.02
         w_d: 1.0
-        lambda_wait: 3.375
+        lambda_wait: 2.375
         qmin: 1.0
-        ema_alpha: 0.2485
-        theta_m: 538.8220633910997
-        tau_crit: 0.56
+        ema_alpha: 0.632121
+        theta_m: 771.0746050443564
+        tau_crit: 0.63
         tau_low: 1.0
-        tau_high: 2.11
+        tau_high: 1.86
         qsat: 4.0
         epsat: 0.05
         hsat: 3
@@ -136,10 +142,12 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
-        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
-        # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
-        ttft_idle_c_ms: 39.3
-        ttft_idle_b_ms_per_token: 0.0555
+        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). LIVE: safescale.slo_mode labels uses the same TTFT threshold; provenance
+        # 2026-10-03 idle capture on vllm-openai-tre:0.30.0-ts-8dc0f2a7 (scripts.ttft_idle_capture, chat api,
+        # one request in flight, L 128-4096 x 30), fit scripts.ttft_idle_fit --min-gap-ms 500 over the full
+        # L range (n 210 per model; an L <= 2048 fit differs < 7 % on L 256-2200). Old engine: 09-22 fit.
+        ttft_idle_c_ms: 48.1
+        ttft_idle_b_ms_per_token: 0.0717
         ttft_slo_mode: slowdown
         ttft_slowdown_k: 5.0
         ttft_floor_ms: 500.0
@@ -153,17 +161,21 @@ data:
         prefill_tps:
           theta: 2186.6666666666665
           direction: lower_is_healthier
-      # theta_m/w_p/lambda_wait/tau_crit/tau_high: v1-lambda round 2 (2026-09-24), /data/nfs_shared_data/xxy/calibration_v1lambda_20260924/round2_wp0_d13_20/params_v1lambda_r2.json sha256 83d30b12...; identical to the live tre-v2-registry ConfigMap.
+      # theta_m/w_p/lambda_wait/tau_crit/tau_high/ema_alpha: next-round calibration on the 0.30 engine, accepted
+      # 2026-10-05 (onset gate, T14 pass); freeze calib_20261003/next-20261005/freeze/params_freeze.v2.json
+      # sha256 708d1e64... (published theta, lambda_wait, w_p, tau_crit, tau_high; delta_crit/high = tau_low 1.0 -
+      # tau_crit / tau_high - tau_low; tau_s 10 s = ema_tau_ms; ema_alpha is the freeze registry field, inert while
+      # ema_tau_ms is set). Goes live atomically with slo.ttft_idle_c_ms/b_ms_per_token.
       trs:
-        w_p: 0.0
+        w_p: 0.01
         w_d: 1.0
-        lambda_wait: 3.125
+        lambda_wait: 2.5
         qmin: 1.0
-        ema_alpha: 0.2485
-        theta_m: 522.6663650900297
-        tau_crit: 0.62
+        ema_alpha: 0.632121
+        theta_m: 674.210074236801
+        tau_crit: 0.54
         tau_low: 1.0
-        tau_high: 1.89
+        tau_high: 1.9
         qsat: 4.0
         epsat: 0.05
         hsat: 3
@@ -210,10 +222,12 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 15000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
-        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
-        # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
-        ttft_idle_c_ms: 43.4
-        ttft_idle_b_ms_per_token: 0.0683
+        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). LIVE: safescale.slo_mode labels uses the same TTFT threshold; provenance
+        # 2026-10-03 idle capture on vllm-openai-tre:0.30.0-ts-8dc0f2a7 (scripts.ttft_idle_capture, chat api,
+        # one request in flight, L 128-4096 x 30), fit scripts.ttft_idle_fit --min-gap-ms 500 over the full
+        # L range (n 210 per model; an L <= 2048 fit differs < 7 % on L 256-2200). Old engine: 09-22 fit.
+        ttft_idle_c_ms: 45.3
+        ttft_idle_b_ms_per_token: 0.0879
         ttft_slo_mode: slowdown
         ttft_slowdown_k: 5.0
         ttft_floor_ms: 500.0
@@ -227,17 +241,21 @@ data:
         prefill_tps:
           theta: 10670.4
           direction: lower_is_healthier
-      # theta_m/w_p/lambda_wait/tau_crit/tau_high: v1-lambda round 2 (2026-09-24), /data/nfs_shared_data/xxy/calibration_v1lambda_20260924/round2_wp0_d13_20/params_v1lambda_r2.json sha256 83d30b12...; identical to the live tre-v2-registry ConfigMap.
+      # theta_m/w_p/lambda_wait/tau_crit/tau_high/ema_alpha: next-round calibration on the 0.30 engine, accepted
+      # 2026-10-05 (onset gate, T14 pass); freeze calib_20261003/next-20261005/freeze/params_freeze.v2.json
+      # sha256 708d1e64... (published theta, lambda_wait, w_p, tau_crit, tau_high; delta_crit/high = tau_low 1.0 -
+      # tau_crit / tau_high - tau_low; tau_s 10 s = ema_tau_ms; ema_alpha is the freeze registry field, inert while
+      # ema_tau_ms is set). Goes live atomically with slo.ttft_idle_c_ms/b_ms_per_token.
       trs:
-        w_p: 0.0
+        w_p: 0.0025
         w_d: 1.0
-        lambda_wait: 2.75
+        lambda_wait: 2.25
         qmin: 1.0
-        ema_alpha: 0.3935
-        theta_m: 553.2067698691039
-        tau_crit: 0.59
+        ema_alpha: 0.632121
+        theta_m: 642.6049429483861
+        tau_crit: 0.64
         tau_low: 1.0
-        tau_high: 1.9
+        tau_high: 2.02
         qsat: 4.0
         epsat: 0.05
         hsat: 3
