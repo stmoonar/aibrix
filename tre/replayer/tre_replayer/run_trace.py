@@ -18,7 +18,9 @@ from typing import Any
 from tre_replayer.engine import rps_timeline
 from tre_replayer.engine.corpus import effective_zh_ratio
 from tre_replayer.engine.dispatcher import dispatch_open_loop
+from tre_replayer.engine.api import API_CHAT, API_COMPLETIONS
 from tre_replayer.engine.http_sender import DEFAULT_ROUTING_STRATEGY, StreamResult, StreamingHttpSender
+from tre_replayer.engine.in_tokens import precount_in_tokens
 from tre_replayer.engine.profiles import PROFILE_E1_V1, PROFILE_REPLAY, V1ChatOptions
 from tre_replayer.engine.stream import TTFT_BASIS
 from tre_replayer.engine.prompt_store import materialize_prompts
@@ -72,11 +74,13 @@ def run_trace(
     client_profile: str = PROFILE_REPLAY,
     sender_processes: int | None = None,
     max_retries: int = E1_DEFAULT_MAX_RETRIES,
+    send_in_tokens: bool = False,
 ) -> dict[str, Any]:
-    from tre_common.registry import load_registry
-
     segments = load_trace_segments(trace_path)
     schedule = build_poisson_schedule(segments, seed=seed)
+    # Opt-in x-tre-bl-in-tokens (tre_replayer.engine.in_tokens): tokenizers from the
+    # registry's weights_path (what the pods load), counted before anything is sent.
+    tokenizer_paths = _registry_tokenizer_paths(registry_path) if send_in_tokens else None
     if client_profile == PROFILE_E1_V1:
         if dry_run:
             raise ValueError("--dry-run has no e1_v1 form (the SDK transport has no synchronous seam)")
@@ -84,21 +88,27 @@ def run_trace(
             schedule, gateway_url=gateway_url, prompt_path=prompt_path, prompt_workers=prompt_workers,
             routing_strategy=routing_strategy, corpus_lang=corpus_lang, zh_ratio=zh_ratio,
             processes=E1_DEFAULT_PROCESSES if sender_processes is None else sender_processes,
-            max_retries=max_retries,
+            max_retries=max_retries, send_in_tokens=send_in_tokens, tokenizer_paths=tokenizer_paths,
         )
+        in_tokens = client.pop("in_tokens_header", None)
         if out_path:
             _write_jsonl(out_path, records)
         return _summarise(
             trace_path, schedule, records, report, registry_path=registry_path, window_ms=window_ms,
             step_ms=step_ms, trim_ramp_windows=trim_ramp_windows, rps_timeline_path=rps_timeline_path,
             routing_strategy=routing_strategy, corpus_lang=corpus_lang, zh_ratio=zh_ratio,
-            prompt_store_misses=0, client=client,
+            prompt_store_misses=0, client=client, send_in_tokens=send_in_tokens, in_tokens=in_tokens,
         )
     if client_profile != PROFILE_REPLAY:
         raise ValueError(f"run_trace sends the replay or the e1_v1 profile, not {client_profile!r}")
     # Prompts are built here, before the loop, not inside each send: see
     # tre_replayer.engine.prompt_store. Without a path there is nowhere to put them and
-    # the sender falls back to fitting inline.
+    # the sender falls back to fitting inline - except with --send-in-tokens, which counts
+    # the prompts before the run and so materialises them into a temporary file.
+    if prompt_path is None and send_in_tokens:
+        import tempfile
+
+        prompt_path = str(Path(tempfile.mkdtemp(prefix="tre-replay-prompts-")) / "prompts.jsonl")
     prompt_store = (
         None
         if prompt_path is None
@@ -107,6 +117,15 @@ def run_trace(
             corpus_lang=corpus_lang, zh_ratio=zh_ratio,
         )
     )
+    in_tokens = None
+    if send_in_tokens:
+        def _prompt_of(event):
+            if event.prompt:
+                return event.prompt
+            return prompt_store.get(event.request_id) if event.request_id in prompt_store else None
+
+        schedule, in_tokens = precount_in_tokens(schedule, api=API_COMPLETIONS, prompt_of=_prompt_of,
+                                                 tokenizer_paths=tokenizer_paths)
     sender = StreamingHttpSender(
         gateway_url,
         stream_call=_dry_stream_call if dry_run else None,
@@ -115,6 +134,7 @@ def run_trace(
         routing_strategy=routing_strategy or None,
         corpus_lang=corpus_lang,
         zh_ratio=zh_ratio,
+        send_in_tokens=send_in_tokens,
     )
     dispatch_kwargs = {"sleep": sleep} if sleep is not None else {}
 
@@ -137,6 +157,7 @@ def run_trace(
         step_ms=step_ms, trim_ramp_windows=trim_ramp_windows, rps_timeline_path=rps_timeline_path,
         routing_strategy=routing_strategy, corpus_lang=corpus_lang, zh_ratio=zh_ratio,
         prompt_store_misses=sender.prompt_store_misses, client=sender.provenance(processes=1),
+        send_in_tokens=send_in_tokens, in_tokens=in_tokens,
     )
 
 
@@ -149,8 +170,16 @@ def e1_base_url(gateway_url: str) -> str:
     return url
 
 
+def _registry_tokenizer_paths(registry_path: str | None) -> dict[str, str]:
+    """``{model: weights_path}`` from the registry (the directory each model's pods load
+    its weights and tokenizer from)."""
+    from tre_common.registry import load_registry
+
+    return {m.name: m.weights_path for m in load_registry(registry_path).models() if m.weights_path}
+
+
 def _run_e1(schedule, *, gateway_url, prompt_path, prompt_workers, routing_strategy, corpus_lang, zh_ratio,
-            processes, max_retries):
+            processes, max_retries, send_in_tokens=False, tokenizer_paths=None):
     """Send ``schedule`` with the e1_v1 profile from ``processes`` workers; rows are the
     e1 record plus the replay row's keys (strict basis) the scoring reads."""
     import tempfile
@@ -165,10 +194,15 @@ def _run_e1(schedule, *, gateway_url, prompt_path, prompt_workers, routing_strat
     store = materialize_prompts(schedule, path=path, processes=prompt_workers, corpus_lang=corpus_lang,
                                 zh_ratio=zh_ratio, api="completions")
     events = [replace(event, prompt=store.get(event.request_id)) for event in schedule]
+    in_tokens = None
+    if send_in_tokens:
+        # v1's request is chat: the header is the templated length of the text sent.
+        events, in_tokens = precount_in_tokens(events, api=API_CHAT, tokenizer_paths=tokenizer_paths)
     options = V1ChatOptions(
         # every model: max_tokens from the trace, temperature unset (JSON null) - v1's config
         model_params={event.model: {"max_tokens": None, "temperature": None} for event in events},
         max_retries=max_retries, timeout_s=E1_TIMEOUT_S, routing_strategy=routing_strategy or None,
+        send_in_tokens=send_in_tokens,
     )
     base = e1_base_url(gateway_url)
 
@@ -177,6 +211,8 @@ def _run_e1(schedule, *, gateway_url, prompt_path, prompt_workers, routing_strat
                                    on_record=on_record, process_id=index)
 
     client = make(0, None, None).provenance(processes=processes)
+    if in_tokens is not None:
+        client["in_tokens_header"] = in_tokens  # moved to the summary by run_trace
     by_id = {event.request_id: event for event in events}
 
     def validate(event) -> None:
@@ -235,7 +271,8 @@ def _write_jsonl(path: str, records: list[dict]) -> None:
 
 
 def _summarise(trace_path, schedule, records, report, *, registry_path, window_ms, step_ms, trim_ramp_windows,
-               rps_timeline_path, routing_strategy, corpus_lang, zh_ratio, prompt_store_misses, client):
+               rps_timeline_path, routing_strategy, corpus_lang, zh_ratio, prompt_store_misses, client,
+               send_in_tokens=False, in_tokens=None):
     from tre_common.registry import load_registry
 
     registry = load_registry(registry_path)
@@ -322,6 +359,10 @@ def _summarise(trace_path, schedule, records, report, *, registry_path, window_m
         # The client that sent it: profile (replay = completions + ignore_eos; e1_v1 =
         # v1's request), wire, processes, code.
         "client": client,
+        # Opt-in x-tre-bl-in-tokens header: on/off, and (on) how many requests carried it,
+        # how many went without (no exact count) and the tokenizers counted with.
+        "send_in_tokens": bool(send_in_tokens),
+        "in_tokens_header": in_tokens,
         "trim_ramp_windows": trim_ramp_windows,
         # Reissue sidecar outcomes (plan 2026-09-27 P5): a run with continue > 0 had
         # requests stitched across pods and is flagged as contaminated.
@@ -400,6 +441,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="worker processes (e1_v1 only; default %d, v1's process_count)" % E1_DEFAULT_PROCESSES)
     ap.add_argument("--max-retries", type=int, default=E1_DEFAULT_MAX_RETRIES,
                     help="OpenAI SDK retries (e1_v1 only; default %(default)s, as run_arm.sh)")
+    ap.add_argument("--send-in-tokens", action="store_true",
+                    help="opt-in: send x-tre-bl-in-tokens = each request's exact prompt length "
+                         "(usage.prompt_tokens; chat-templated for e1_v1), counted before the run with "
+                         "the registry's tokenizers; omitted for a request that cannot be counted")
     args = ap.parse_args(argv)
     routing_strategy = None if args.routing_strategy.strip().lower() in ("", "none") else args.routing_strategy.strip()
     summary = run_trace(
@@ -411,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         routing_strategy=routing_strategy,
         corpus_lang=args.corpus_lang, zh_ratio=args.zh_ratio,
         client_profile=args.client_profile, sender_processes=args.sender_processes,
-        max_retries=args.max_retries,
+        max_retries=args.max_retries, send_in_tokens=args.send_in_tokens,
     )
     print(json.dumps(summary, indent=2))
     return 0

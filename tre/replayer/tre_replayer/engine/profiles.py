@@ -21,7 +21,8 @@ record:
     ``chat.completions.create`` through the OpenAI SDK with v1's options - ``messages``
     = one user turn holding the trace's prompt, ``temperature`` from the model's config
     (unset = JSON ``null``), **no** ``ignore_eos`` (opt-in: ``V1ChatOptions.ignore_eos``,
-    loadgen_v1 ``--ignore-eos``), ``max_tokens`` = the trace's
+    loadgen_v1 ``--ignore-eos``), no ``x-tre-bl-in-tokens`` header (opt-in:
+    ``V1ChatOptions.send_in_tokens``, ``--send-in-tokens``), ``max_tokens`` = the trace's
     ``max_output_tokens`` (else the model's config, else absent), ``stream`` +
     ``include_usage``; ``routing-strategy`` header; SDK retries (default 2, as v1);
     timeout 300 s. Record: v1's ``performance_metrics.json`` line (v1 fields, then v1's
@@ -38,6 +39,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from tre_replayer.engine.api import API_CHAT, API_COMPLETIONS
+from tre_replayer.engine.in_tokens import header_for
 from tre_replayer.engine.transport import TRANSPORT_HTTPX, TRANSPORT_OPENAI_SDK
 
 PROFILE_CALIB = "calib"
@@ -128,8 +130,13 @@ class V1ChatOptions:
     #: (SDK ``extra_body``), so each output is exactly ``max_tokens`` long. Nothing else
     #: changes (temperature, prompts, max_tokens).
     ignore_eos: bool = False
+    #: Opt-in (default off = v1's request): send ``x-tre-bl-in-tokens`` = the request's
+    #: exact templated prompt length (SDK ``extra_headers``), counted before the run
+    #: (:mod:`tre_replayer.engine.in_tokens`); omitted for a request without a count.
+    send_in_tokens: bool = False
 
-    def kwargs_for(self, model: str, prompt: str, max_output_tokens: Optional[int]) -> dict[str, Any]:
+    def kwargs_for(self, model: str, prompt: str, max_output_tokens: Optional[int],
+                   in_tokens: Optional[int] = None) -> dict[str, Any]:
         """``chat.completions.create`` keyword arguments, as v1 built them."""
         params = self.model_params.get(model)
         if params is None:
@@ -150,6 +157,10 @@ class V1ChatOptions:
             kwargs["max_tokens"] = max_tokens
         if self.ignore_eos:
             kwargs["extra_body"] = {"ignore_eos": True}
+        if self.send_in_tokens:
+            headers = header_for(in_tokens)
+            if headers:
+                kwargs["extra_headers"] = headers
         return kwargs
 
     def as_dict(self) -> dict:

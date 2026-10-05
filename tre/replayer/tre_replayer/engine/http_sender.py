@@ -78,6 +78,8 @@ from tre_replayer.engine.api import (  # noqa: F401
     check_api_url,
     request_body,
 )
+from tre_replayer.engine.in_tokens import RECORD_FIELD as IN_TOKENS_FIELD
+from tre_replayer.engine.in_tokens import header_for
 from tre_replayer.engine.metrics import dual_fields_ms, strict_view_ms, v1_view_s
 from tre_replayer.engine.profiles import (
     PROFILE_E1_V1,
@@ -212,6 +214,7 @@ class StreamingHttpSender:
         in_flight: Any = None,
         on_record: Callable[[dict], None] | None = None,
         process_id: int = 0,
+        send_in_tokens: bool = False,
     ) -> None:
         self._profile = get_profile(profile or profile_for_api(api))
         self._e1 = self._profile.name == PROFILE_E1_V1
@@ -275,6 +278,9 @@ class StreamingHttpSender:
         self._in_flight = in_flight if in_flight is not None else InFlightCounter()
         self._on_record = on_record
         self.process_id = int(process_id)
+        # Opt-in: the x-tre-bl-in-tokens header (tre_replayer.engine.in_tokens), from the
+        # count each request carries. e1_v1 takes it from its v1 options.
+        self._send_in_tokens = bool(v1_options.send_in_tokens) if self._e1 else bool(send_in_tokens)
         self.records: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ lifecycle
@@ -286,6 +292,8 @@ class StreamingHttpSender:
     def provenance(self, *, processes: int = 1) -> dict:
         """The client part of a run manifest."""
         extra: dict[str, Any] = {"max_in_flight": self._max_in_flight, "dual_metrics": self._dual}
+        if self._send_in_tokens:
+            extra["send_in_tokens"] = True
         if self._v1 is not None:
             extra["v1_options"] = self._v1.as_dict()
         if self._sync_call is not None:
@@ -388,6 +396,8 @@ class StreamingHttpSender:
                 "in_flight_at_send": 0, "api": self._api,
             }
         record["client_error"] = text
+        if self._send_in_tokens:
+            record[IN_TOKENS_FIELD] = request.in_tokens_header
         return record
 
     def _lateness(self, scheduled_ts: float, actual_ts: float, pickup_ts: float, wire_ts: float,
@@ -427,6 +437,8 @@ class StreamingHttpSender:
             request_body(request.model, prompt, out_tokens, api=self._api, seed=self._request_seed)
         ).encode("utf-8")
         headers = build_request_headers(request.model, self._routing_strategy)
+        if self._send_in_tokens:
+            headers.update(header_for(request.in_tokens_header))
         timeout_s = fixed_length_timeout_s(out_tokens)
         # Last instant before the transport call: everything the driver does between the
         # scheduled instant and here is inside on_wire_delay_ms, prompt work included.
@@ -472,13 +484,16 @@ class StreamingHttpSender:
         }
         if self._dual:
             record.update(dual_fields_ms(res))
+        if self._send_in_tokens:
+            record[IN_TOKENS_FIELD] = request.in_tokens_header
         return record
 
     async def _send_e1(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
         pickup_ts = self._mono()
         if not request.prompt:
             raise ValueError(f"{request.request_id}: the e1_v1 profile sends the trace's own prompt; it has none")
-        kwargs = self._v1.kwargs_for(request.model, request.prompt, request.max_output_tokens)
+        kwargs = self._v1.kwargs_for(request.model, request.prompt, request.max_output_tokens,
+                                     request.in_tokens_header)
         wire_ts = self._mono()
         in_flight_at_send = self._in_flight.inc()
         try:
@@ -486,8 +501,11 @@ class StreamingHttpSender:
         finally:
             self._in_flight.dec()
         lateness = self._lateness(scheduled_ts, actual_ts, pickup_ts, wire_ts)
-        return e1_record(request, res, process_id=self.process_id, lateness=lateness,
-                         in_flight_at_send=in_flight_at_send)
+        record = e1_record(request, res, process_id=self.process_id, lateness=lateness,
+                           in_flight_at_send=in_flight_at_send)
+        if self._send_in_tokens:
+            record[IN_TOKENS_FIELD] = request.in_tokens_header
+        return record
 
     def write_jsonl(self, path: str) -> int:
         with open(path, "w", encoding="utf-8") as fh:

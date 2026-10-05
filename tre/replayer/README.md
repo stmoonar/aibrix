@@ -23,7 +23,7 @@ in their **profile**.
 |---|---|---|---|
 | endpoint | `/v1/chat/completions` | `/v1/completions` | `/v1/chat/completions` (SDK) |
 | body | `api.request_body`: `model`, `messages`=[user], `max_tokens`, `temperature: 0`, `ignore_eos: true`, `stream`, `stream_options.include_usage`, `seed` if given | same with `prompt` | v1's `create()` kwargs: `model`, `messages`=[user], `temperature` from the model config (unset → `null`), `stream`, `stream_options.include_usage`, `max_tokens` = trace's, else config's, else absent; **no** `ignore_eos` (opt-in: `tre_loadgen_v1 --ignore-eos` / config `client.ignore_eos: true` adds `ignore_eos: true` via `extra_body`, nothing else changes) |
-| headers | `Content-Type`, `Accept: text/event-stream`, `model`, `routing-strategy` if set | same | SDK headers (`Authorization: Bearer dummy-key-for-local-gateway`, `X-Stainless-*`, UA `AsyncOpenAI/Python`), `routing-strategy` (config, `least-gpu-cache`) |
+| headers | `Content-Type`, `Accept: text/event-stream`, `model`, `routing-strategy` if set | same (opt-in `run_trace --send-in-tokens`: `x-tre-bl-in-tokens`, see below) | SDK headers (`Authorization: Bearer dummy-key-for-local-gateway`, `X-Stainless-*`, UA `AsyncOpenAI/Python`), `routing-strategy` (config, `least-gpu-cache`); opt-in `x-tre-bl-in-tokens` (`tre_loadgen_v1 --send-in-tokens` / config `client.send_in_tokens: true`, `run_trace --send-in-tokens`) via `extra_headers` |
 | prompt | materialised natural prompt, exact templated length | materialised | the trace's text, verbatim |
 | transport | `httpx.AsyncClient`, keep-alive (idle expiry 4 s, `TRE_SENDER_KEEPALIVE_EXPIRY_S`), sharded pools (64 connections, 16 idle kept per shard; shards up to `max_in_flight`), `Accept-Encoding: identity` | same | `openai.DefaultAsyncHttpxClient` (1000 / 100), as v1 |
 | retries | none - except one repeat of an attempt whose request headers never started to go out (httpcore trace `http11.send_request_headers.started` not reached: a refused / failed connect, or a pooled connection found closed before the write; `transport_retries`). A dead kept-alive connection usually takes the write and fails on the read: that attempt counts as sent and is **not** repeated | same | SDK `max_retries` (default 2; `run_arm.sh` and the campaign pass 0) |
@@ -31,6 +31,15 @@ in their **profile**.
 | record | calibration row (unchanged; `dual_metrics=True` adds both bases) | same | v1's `performance_metrics.json` line + audit + strict + lateness |
 | processes | `--sender-processes` (default `DEFAULT_SENDER_PROCESSES` = 4) | 1 (in-process) | config `process_count` (v14 configs: 8); `run_trace` 8 |
 | used by | `r3_grid` / `calibration_campaign` (openloop cells) | `run_trace --client-profile replay`, a campaign manifest with `"client_profile": "replay"` | `python3 -m tre_loadgen_v1` (run_arm.sh), and the campaign's E1 / TRE / APA arms by default (`campaign_queue` -> `run_trace --client-profile e1_v1`, recorded in `command.json` and `run_trace_summary.json`) |
+
+**`x-tre-bl-in-tokens`** (opt-in, default off; `tre_replayer.engine.in_tokens`): the request's exact
+`usage.prompt_tokens` for the baseline policies' gateway hook (which otherwise estimates from characters).
+Counted once per request before the run (before any worker forks) with the model's own tokenizer
+(`model_tokenizer`: `client.tokenizer_paths` / `TRE_TOKENIZER_PATHS` / the registry's `weights_path`):
+chat = the content inside the chat template (`for_api(tok, "chat").count`), completions = the plain count.
+A request that cannot be counted is sent without the header and counted (`in_tokens_header.omitted` in the
+run meta / summary). Rows of such a run carry `in_tokens_header` (the value sent, or null);
+`scripts/check_in_tokens_header.py <records.jsonl>` compares it with `usage.prompt_tokens`.
 
 All three recognise the reissue sidecar: `x-tre-retried` (header), `x-tre-continued`
 (header, `tre_continued` on the final chunk, `: x-tre-continued: N` SSE comment).

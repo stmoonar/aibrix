@@ -102,6 +102,10 @@ class ScheduledRequest:
     prompt: str = ""
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
+    #: The exact ``usage.prompt_tokens`` of the prompt that will be sent, counted before
+    #: the run (tre_replayer.engine.in_tokens); sent as ``x-tre-bl-in-tokens`` when the
+    #: client has that opt-in on. None = not counted, the header is omitted.
+    in_tokens_header: int | None = None
 
 
 def build_deterministic_schedule(
