@@ -1,4 +1,5 @@
-# PreServe baseline parameters (TRE_BL_POLICY=preserve, TRE_BL_POLICY_CONFIG=<this file>).
+# PreServe-oracle baseline parameters (TRE_BL_POLICY=preserve, TRE_BL_POLICY_CONFIG=<this file>).
+# Tier-1 uses the replayed trace plus noise (an oracle), not the paper's mLSTM: disclose.
 # See tre_baselines/policies/preserve.py for the full table (paper vs ours).
 
 # --- Tier-1 (window-level provisioning, paper §4.1 / Alg.2) ---
@@ -11,10 +12,11 @@ trace_path: /etc/tre-baselines-traces/case/trace.json   # replace with the run's
 trace_seed: 0            # = the replay's --seed (segment traces are re-scheduled from it)
 trace_schedule: poisson  # what tre_replayer.run_trace sends
 trace_match_parts: 2
-window_s: 600            # paper: 10 min; our traces span only a few windows
+window_s: 600            # paper: 10 min (main runs; a 720 s trace fires Tier-1 twice: disclose).
+                         # sensitivity: 60
 lead_s: 0
 tier1: oracle_noisy      # oracle_noisy | oracle | last_window
-# noise_sigma: 0.0772    # default: lognormal sigma with mean APE 6.17 % (paper Table 1)
+# noise_sigma: 0.0772    # default: lognormal sigma with mean APE 6.17 % (paper Table 1); sensitivity: 0.30
 # Per-replica serving capability, tok/s (tools/preserve_mu.py over a calibration capture).
 # Required for every managed model: the policy refuses to start without it.
 mu:
@@ -30,9 +32,8 @@ kv_high: 0.95            # paper
 overload_frac: 0.10      # paper
 t_f: 0.30                # paper T_f
 out_len_is_upper_bound: true  # ours: max_tokens is a hard cap in vLLM -> no virtual extension
-phantom_margin: 0.25     # ours: drop a request not done after D_pred * (1 + margin) iterations
 ext_frac: 0.2            # paper virtual extension (only used when out_len_is_upper_bound: false)
 # kv_capacity_tokens: {dsqwen-7b: 100000}   # only if a pod lacks vllm:cache_config_info
+kv_agree_tol: 0.15       # ours: Tier-2 scale-down needs |U[0] - engine KV usage| <= this per pod
 hold_mode: target        # target | awake
-down_grace_s: 60
-req_ttl_s: 1800
+req_ttl_s: 1800          # ours: GC of arr/done bookkeeping only (a request leaves the map on done)

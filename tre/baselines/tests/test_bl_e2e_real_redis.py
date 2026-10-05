@@ -105,8 +105,12 @@ class World:
     TOK_PER_S = 30.0   # decode tokens/s of one running request
     ITL_S = 0.02
 
-    def __init__(self, models, max_pods: int) -> None:
+    #: KV tokens one in-flight request holds on average (prompt 100 + half of 100 out).
+    KV_TOKENS_PER_REQ = 150.0
+
+    def __init__(self, models, max_pods: int, kv_capacity_tokens: float = 20381 * 16) -> None:
         self.lock = threading.RLock()
+        self.kv_capacity_tokens = float(kv_capacity_tokens)
         self.models = list(models)
         self.max_pods = max_pods
         self.awake = {m: MIN_R for m in models}
@@ -172,7 +176,9 @@ class World:
             return {
                 "vllm:num_requests_running": running,
                 "vllm:num_requests_waiting": waiting,
-                "vllm:kv_cache_usage_perc": min(1.0, running / self.CAP * 0.5),
+                # what the requests in the engine hold, as PreServe's map predicts it
+                "vllm:kv_cache_usage_perc": min(1.0, (running + waiting) * self.KV_TOKENS_PER_REQ
+                                                / self.kv_capacity_tokens),
                 "vllm:prompt_tokens_total": c.prompt,
                 "vllm:generation_tokens_total": c.gen,
                 "vllm:inter_token_latency_seconds_sum": c.itl_sum,
@@ -329,7 +335,7 @@ class Harness:
         self.redis = redis
         self.redis_url = redis_url
         self.policy_name = policy
-        self.world = World([A, B], MAX_R)
+        self.world = World([A, B], MAX_R, (num_gpu_blocks or 20381) * 16)
         self.puts: list[tuple[str, dict, int]] = []  # (model, body, http status)
         self._hook = hook
         self._put_seq = 0
@@ -503,10 +509,14 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     mine = [ln for ln in lines if ln["model"] == A]
     other = [ln for ln in lines if ln["model"] == B]
     high, low2 = h.marks["high"], h.marks["low2"]
-    # up during the high phase, down after the load dropped
+    # up during the high phase, down after the load dropped. PreServe (no grace timer):
+    # Tier-1 provisions at the window start, before the burst fills the look-ahead maps,
+    # so Tier-2 may isolate instances inside the high window already (paper semantics,
+    # once per window).
+    down_from = high if policy == "preserve" else low2 - 500
     assert any(ln["action"] == "up" and high <= ln["ts_ms"] < low2 for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
-    assert any(ln["action"] == "down" and ln["ts_ms"] >= low2 - 500 for ln in mine), [
+    assert any(ln["action"] == "down" and ln["ts_ms"] >= down_from for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
     assert max(ln["awake"] for ln in mine) >= 2
     assert not any(ln["action"] == "up" for ln in other)          # the quiet model is left alone
@@ -608,7 +618,6 @@ def test_preserve_tier2_overload_scales_up(tmp_path, redis_url, redis) -> None:
     """No replay marker (Tier-1 inactive); a tiny KV capacity makes the look-ahead maps
     overload under the high phase, which must add instances."""
     params = _policy_params("preserve", tmp_path)
-    params["down_grace_s"] = 3600
     with Harness(tmp_path, redis_url, redis, "preserve", params, dry_run=False, num_gpu_blocks=12) as h:
         h.phase("high", 6.0, {A: HIGH, B: LOW})
         assert h.shell.healthy()

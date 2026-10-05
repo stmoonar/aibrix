@@ -1,4 +1,4 @@
-"""PreServe baseline, scaling part only (§4.1 Alg.2, §4.3.1, §4.3.2).
+"""PreServe-oracle baseline, scaling part only (§4.1 Alg.2, §4.3.1, §4.3.2).
 
 Not reproduced: the mLSTM workload forecaster (Tier-1 uses the replayed trace, see
 :mod:`preserve_tier1`), the DistilBERT response-length predictor (Tier-2 uses the request's
@@ -18,14 +18,22 @@ fed by the gateway request events. Of it the scaler reads ``U[0:l]`` only:
   additional instance"). A pod is credited once per overload episode (it is credited again
   only after it left overload), so a persisting overload does not add an instance every
   tick; ours, the paper does not say how often the rule is evaluated.
-* scale-down, at most once per Tier-1 window, when every pod's ``max U[0:l] < T_f``: the
-  paper isolates ``N_c - sum_p max(U'_p) / T_f`` instances, i.e. keeps
-  ``sum_p max(U'_p) / T_f`` of them: the load packed onto instances each at ``T_f``. We keep
-  ``ceil`` of that (isolate the floor), at least 1, and only act when it is below
-  ``N_c = awake``.
+* scale-down, at most once per Tier-1 window (paper), when every pod's
+  ``max U[0:l] < T_f``: the paper isolates ``N_c - sum_p max(U'_p) / T_f`` instances, i.e.
+  keeps ``sum_p max(U'_p) / T_f`` of them: the load packed onto instances each at ``T_f``.
+  We keep ``ceil`` of that (isolate the floor), at least 1, and only act when it is below
+  ``N_c = awake``. The map must be complete and agree with the engines (ours; no timer):
+  no evidence gap (:func:`~tre_baselines.snapshot.evidence_gaps` with events: every pod
+  scraped, gauges present, every request in flight known from the stream since the last
+  gap) and, per pod, ``|U[0] - vllm:kv_cache_usage_perc| <= kv_agree_tol``; otherwise the
+  scale-down waits (``down: incomplete``) without using up the window's one scale-down.
+  The isolated instances are put to sleep through the shared transparent-sleep path
+  (abort + sidecar continuation), not drained: that cost is reported, not hidden.
 
 Composition: on a window start Tier-1 sets the target and Tier-2 may only add to it in the
-same tick; inside a window only Tier-2 changes it; otherwise the target is held.
+same tick; inside a window only Tier-2 changes it; otherwise the target is held. Any target
+below ``awake`` is held at ``awake`` while the evidence is incomplete (reason
+``incomplete``; the target itself is kept and applies once the evidence is complete).
 
 Iterations vs wall clock (ours; the paper is iteration-based): a pod's head advances
 ``dt / TPOT_pod`` iterations, fractional part carried, with ``TPOT_pod`` the mean
@@ -36,11 +44,14 @@ then walks each head to ``max(scrape time, last event time)`` (an event written 
 scrape and the stream read is not "out of order").
 
 Output length (ours): the predicted output is the request's ``max_tokens``, which vLLM
-enforces, so by default (``out_len_is_upper_bound: true``) there is no virtual extension
-and a request still active ``D_pred * (1 + phantom_margin)`` iterations after its prefill
-is dropped as a phantom (lost ``done``; anomaly ``phantom_dropped``). The paper's 0.2 * D
-extension (``ext_frac``) exists because its length predictor can under-estimate; it is
-used only with ``out_len_is_upper_bound: false``.
+enforces, so by default (``out_len_is_upper_bound: true``) there is no virtual extension.
+A request leaves the map only on its ``done`` (or when its pod is gone, or when the engine
+reports nothing in flight at all, which is a ``done`` for everything there): when the
+estimated head passes ``D`` first, the request keeps its full size ``(P + D) / M`` until
+then (anomaly ``overdue``). The paper's 0.2 * D extension (``ext_frac``) exists because its
+length predictor can under-estimate; it is used only with ``out_len_is_upper_bound: false``.
+Non-streaming requests have no ``ft`` before their output is complete, so they are not in
+the map (the experiments stream).
 
 Params (``config.policy_params``, example in ``examples/preserve.yaml``):
 
@@ -68,12 +79,11 @@ t_f                   0.30                  paper (T_f)
 ext_frac              0.2                   paper (virtual extension); only with
                                             ``out_len_is_upper_bound: false``
 out_len_is_upper_bound true                 ours: max_tokens is a hard cap -> no extension
-phantom_margin        0.25                  ours: drop a request after D_pred * (1 + this)
 kv_capacity_tokens    {}                    ours: M per model when the pod lacks cache_config
+kv_agree_tol          0.15                  ours: scale-down needs |U[0] - engine KV| <= this
 hold_mode             target                ours: target (keep the last target) | awake
-down_grace_s          60                    ours: no scale-down this soon after a window start
-                                            or the policy's first tick (empty maps)
-req_ttl_s             1800                  ours: forget requests/events older than this
+req_ttl_s             1800                  ours: forget arr/done bookkeeping older than this
+                                            (never a request in the map)
 ====================  ====================  ===================================================
 """
 from __future__ import annotations
@@ -86,9 +96,9 @@ from typing import Any, Hashable, Mapping, Optional
 
 from tre_baselines import trace_oracle
 from tre_baselines.policies import preserve_tier1 as tier1
-from tre_baselines.policies.base import Decision
+from tre_baselines.policies.base import Decision, hold_if_incomplete
 from tre_baselines.policies.preserve_anticipator import LookaheadMap
-from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, RequestEvent
+from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, RequestEvent, evidence_gaps
 
 LOG = logging.getLogger(__name__)
 
@@ -126,8 +136,6 @@ class _ModelState:
     target: Optional[int] = None
     #: (replay t0_ms, window index) of the last Tier-1 firing.
     t1_window: Optional[tuple[int, int]] = None
-    t1_fired_ms: Optional[int] = None
-    first_ms: Optional[int] = None
     credited: set[str] = field(default_factory=set)
     last_down_key: Optional[Hashable] = None
 
@@ -146,6 +154,9 @@ def _per_model(raw: Any, cast=float) -> dict[str, Any]:
 
 class PreServePolicy:
     name = "preserve"
+    #: Arm name in decision records and docs (Tier-1 = trace oracle + noise, not mLSTM).
+    label = "PreServe-oracle"
+    needs_events = True
 
     def __init__(self, config: Any = None, *, oracle: Optional[trace_oracle.TraceOracle] = None) -> None:
         params = dict(getattr(config, "policy_params", None) or {})
@@ -184,16 +195,15 @@ class PreServePolicy:
         self.t_f = float(params.get("t_f", 0.30))
         self.ext_frac = float(params.get("ext_frac", 0.2))
         self.out_len_is_upper_bound = bool(params.get("out_len_is_upper_bound", True))
-        self.phantom_margin = float(params.get("phantom_margin", 0.25))
-        if self.phantom_margin < 0:
-            raise ValueError("preserve: phantom_margin must be >= 0")
+        self.kv_agree_tol = float(params.get("kv_agree_tol", 0.15))
+        if not 0.0 < self.kv_agree_tol <= 1.0:
+            raise ValueError("preserve: kv_agree_tol must be in (0, 1]")
         if self.l < 1 or self.map_factor < 1.0 or not 0 < self.t_f <= 1 or self.ext_frac <= 0:
             raise ValueError("preserve: need lookahead_iters >= 1, map_factor >= 1, 0 < t_f <= 1, ext_frac > 0")
         self.kv_capacity = _per_model(params.get("kv_capacity_tokens"), float)
         self.hold_mode = str(params.get("hold_mode", "target"))
         if self.hold_mode not in HOLD_MODES:
             raise ValueError(f"preserve: hold_mode must be one of {HOLD_MODES}")
-        self.down_grace_ms = int(float(params.get("down_grace_s", 60.0)) * 1000)
         self.req_ttl_ms = int(float(params.get("req_ttl_s", 1800.0)) * 1000)
         self._models: dict[str, _ModelState] = {}
         #: Cumulative anomaly counters (per model), for tests and the run summary.
@@ -229,11 +239,9 @@ class PreServePolicy:
         k = int(math.floor(k_float))
         ps.carry = k_float - k
         ps.last_ms = int(t_ms)
-        dropped = ps.amap.advance(k)
-        for key in dropped:
-            st.active.pop(key, None)
-        if dropped:
-            anom["phantom_dropped"] += len(dropped)
+        overdue = ps.amap.advance(k)
+        if overdue:  # the estimate ran ahead of the request: it stays (floor) until done
+            anom["overdue"] += len(overdue)
 
     # ------------------------------------------------------------- Tier-2 feed
 
@@ -255,8 +263,7 @@ class PreServePolicy:
                     skipped[name] = "no_kv_capacity"
                     continue
                 amap = LookaheadMap(self.map_length(ms.model), ext_frac=self.ext_frac,
-                                    out_len_is_upper_bound=self.out_len_is_upper_bound,
-                                    phantom_margin=self.phantom_margin)
+                                    out_len_is_upper_bound=self.out_len_is_upper_bound)
                 ps = _PodState(amap=amap, M=M)
                 st.pods[name] = ps
             s, c = pod.counters.get("itl_sum"), pod.counters.get("itl_count")
@@ -338,20 +345,26 @@ class PreServePolicy:
         anom["bad_event"] += 1
 
     def _expire(self, st: _ModelState, now_ms: int, anom: Counter) -> None:
+        """Bookkeeping only: arr records whose ft never came and tombstones. A request in
+        the map is never expired by age (it leaves on done)."""
         horizon = now_ms - self.req_ttl_ms
         for key in [k for k, v in st.arr.items() if v.ts_ms < horizon]:
             del st.arr[key]
             anom["expired_arr"] += 1
         for key in [k for k, ts in st.tombstones.items() if ts < horizon]:
             del st.tombstones[key]
-        for key, pod in list(st.active.items()):
-            ps = st.pods.get(pod)
-            req = ps.amap.requests.get(key) if ps else None
-            if req is None or req.ts_ms < horizon:
-                if ps is not None:
-                    ps.amap.remove(key)
-                del st.active[key]
-                anom["expired_req"] += 1
+
+    @staticmethod
+    def _engine_idle(st: _ModelState, ps: _PodState, pod: PodSnapshot, anom: Counter) -> None:
+        """The engine reports nothing running or waiting: every request in this pod's map
+        that started before the scrape is done (its done event was lost)."""
+        if pod.queued != 0:
+            return
+        for key, req in list(ps.amap.requests.items()):
+            if req.ts_ms <= pod.scraped_at_ms:
+                ps.amap.remove(key)
+                st.active.pop(key, None)
+                anom["engine_idle_done"] += 1
 
     # ---------------------------------------------------------------- Tier-1
 
@@ -411,8 +424,6 @@ class PreServePolicy:
         awake = int(ms.awake)
         if ms.model not in self.mu:
             return Decision(desired=awake, reason="no_mu", inputs={"awake": awake})
-        if st.first_ms is None:
-            st.first_ms = int(snap.now_ms)
 
         # Tier-2 feed: pods, events, then walk every head to its scrape instant.
         skipped: dict[str, str] = {}
@@ -425,6 +436,7 @@ class PreServePolicy:
                 # An event may carry a Redis time a little after the scrape (written between
                 # the scrape and the stream read): the head is already there, not out of order.
                 self._advance_to(st, ps, max(int(pod.scraped_at_ms), ps.last_ms or 0), anom)
+                self._engine_idle(st, ps, pod, anom)
         for name in ms.unscraped:
             ps = st.pods.get(name)
             if ps is not None:
@@ -435,6 +447,7 @@ class PreServePolicy:
         t2: dict[str, dict] = {}
         overloaded: list[str] = []
         max_us: list[float] = []
+        kv_disagree: dict[str, Any] = {}
         for pod in ms.pods:
             ps = st.pods.get(pod.pod)
             if ps is None:
@@ -446,7 +459,14 @@ class PreServePolicy:
             if ps.overloaded:
                 overloaded.append(pod.pod)
             max_us.append(max_u)
-            t2[pod.pod] = {"overload_frac": _r(frac, 3), "maxU": _r(max_u), "tpot": ps.tpot_src}
+            u0 = ps.amap.at(0)
+            t2[pod.pod] = {"overload_frac": _r(frac, 3), "maxU": _r(max_u), "U0": _r(u0),
+                           "kv": _r(pod.kv_usage), "tpot": ps.tpot_src}
+            # The map must agree with what the engine holds before it may justify a
+            # scale-down (a map missing requests reads low).
+            if pod.kv_usage is None or abs(u0 - pod.kv_usage) > self.kv_agree_tol:
+                kv_disagree[pod.pod] = [_r(u0), _r(pod.kv_usage)]
+        gaps = evidence_gaps(ms, int(snap.now_ms), snap.tick_s, events=True)
         for name in list(st.credited):
             ps = st.pods.get(name)
             if ps is None or not ps.overloaded:
@@ -466,7 +486,6 @@ class PreServePolicy:
         t1_key = None if idx is None else (int(snap.replay.t0_ms), idx)
         if t1_key is not None and t1_key != st.t1_window:
             st.t1_window = t1_key
-            st.t1_fired_ms = int(snap.now_ms)
             N, t1_info = self._tier1_n(ms.model, idx)
             st.credited = set(overloaded)
             if N is None:
@@ -487,17 +506,14 @@ class PreServePolicy:
             else:
                 down_key: Hashable = (t1_key if t1_key is not None
                                       else ("wall", int(snap.now_ms) // int(self.window_s * 1000)))
-                since = max(st.t1_fired_ms or 0, st.first_ms or 0)
                 if not max_us:
                     down_info = "no_pods"
-                elif skipped or ms.unscraped:
+                elif skipped or gaps or kv_disagree:
                     down_info = "incomplete"
                 elif any(u >= self.t_f for u in max_us):
                     down_info = "above_t_f"
                 elif down_key == st.last_down_key:
                     down_info = "done_this_window"
-                elif int(snap.now_ms) - since < self.down_grace_ms:
-                    down_info = "grace"
                 else:
                     keep = max(1, int(math.ceil(sum(max_us) / self.t_f - 1e-9)))
                     if keep < awake:
@@ -521,6 +537,10 @@ class PreServePolicy:
             inputs["down"] = down_info
         if skipped:
             inputs["skipped"] = skipped
+        if kv_disagree:
+            inputs["kv_disagree"] = kv_disagree
         if anom:
             inputs["anom"] = dict(sorted(anom.items()))
-        return Decision(desired=int(st.target), reason=reason, inputs=inputs)
+        # Any target below awake (Tier-1 or Tier-2) waits for complete evidence; the
+        # target itself is kept.
+        return hold_if_incomplete(Decision(desired=int(st.target), reason=reason, inputs=inputs), awake, gaps)

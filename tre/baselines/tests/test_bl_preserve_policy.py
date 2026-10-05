@@ -33,16 +33,18 @@ def cfg(params: dict, models=("m",), seed: int = 0) -> Config:
 
 
 def make(**params) -> PreServePolicy:
-    p = {"mu": {"m": dict(MU)}, "down_grace_s": 0, "max_output_len": 4096}
+    p = {"mu": {"m": dict(MU)}, "max_output_len": 4096}
     p.update(params)
     return PreServePolicy(cfg(p), oracle=ORACLE)
 
 
-def pod(name: str, t: int, itl=(0.0, 0.0), M: Optional[int] = 10_000) -> PodSnapshot:
+def pod(name: str, t: int, itl=(0.0, 0.0), M: Optional[int] = 10_000, *, running=1.0,
+        kv: Optional[float] = None, cover: bool = True) -> PodSnapshot:
+    """Default: a busy engine (running 1, so it never reads as idle), events cover it."""
     blocks, bs = (None, None) if M is None else (M // 8, 8)
-    return PodSnapshot(pod=name, model="m", node="n0", gpu_ids=(0,), running=0.0, waiting=0.0,
-                       kv_usage=None, counters={"itl_sum": itl[0], "itl_count": itl[1]},
-                       num_gpu_blocks=blocks, block_size=bs, scraped_at_ms=t)
+    return PodSnapshot(pod=name, model="m", node="n0", gpu_ids=(0,), running=running, waiting=0.0,
+                       kv_usage=kv, counters={"itl_sum": itl[0], "itl_count": itl[1]},
+                       num_gpu_blocks=blocks, block_size=bs, scraped_at_ms=t, events_cover=cover)
 
 
 def ev(kind: str, req: str, p: Optional[str], ts: int, inn=None, mx=None, reissue="none") -> RequestEvent:
@@ -50,10 +52,11 @@ def ev(kind: str, req: str, p: Optional[str], ts: int, inn=None, mx=None, reissu
                         in_src="header", max_tokens=mx, out_tokens=None, status=None, reissue=reissue)
 
 
-def snap(now: int, pods, events=(), awake=None, unscraped=(), replay=None) -> ClusterSnapshot:
+def snap(now: int, pods, events=(), awake=None, unscraped=(), replay=None, since=0) -> ClusterSnapshot:
     ms = ModelSnapshot(model="m", awake=len(pods) if awake is None else awake, min_replicas=1,
                        max_replicas=8, gpus_per_replica=1, ttft_slo_ms=500.0, tpot_slo_ms=75.0,
-                       max_num_seqs=256, pods=tuple(pods), events=tuple(events), unscraped=tuple(unscraped))
+                       max_num_seqs=256, pods=tuple(pods), events=tuple(events), unscraped=tuple(unscraped),
+                       events_since_ms=since)
     return ClusterSnapshot(now_ms=now, tick_s=2.0, models={"m": ms}, replay=replay)
 
 
@@ -188,12 +191,12 @@ def test_pod_without_kv_capacity_is_skipped_unless_configured() -> None:
     assert amap(q).at(0) == pytest.approx(0.5)
 
 
-def test_stale_requests_expire() -> None:
+def test_bookkeeping_expires_but_a_request_in_the_map_does_not() -> None:
     p = make(req_ttl_s=10)
     p.decide(snap(1000, [pod("p0", 1000)], load("r", "p0", 1000, 100, 10) + [ev("arr", "s", "p0", 1000, 5, 5)]))
-    p.decide(snap(20_000, [pod("p0", 1000)]))
-    assert p._models["m"].active == {} and p._models["m"].arr == {}
-    assert p.anomalies["m"]["expired_req"] == 1 and p.anomalies["m"]["expired_arr"] == 1
+    p.decide(snap(20_000, [pod("p0", 20_000)]))
+    assert p._models["m"].arr == {} and p.anomalies["m"]["expired_arr"] == 1
+    assert list(p._models["m"].active) == [("r", "p0")]  # leaves the map only on done
 
 
 # ------------------------------------------------------------------- Tier-2
@@ -231,51 +234,71 @@ def test_hold_mode_awake_releases_the_target() -> None:
 
 def test_scale_down_formula_once_per_window_and_guards() -> None:
     p = make()
-    pods = [pod(f"p{i}", 1000, M=1000) for i in range(4)]
+    def pods_at(t):
+        return [pod(f"p{i}", t, M=1000, kv=kv) for i, kv in enumerate((0.25, 0.2, 0.2, 0.0))]
+
+    pods = pods_at(1000)
     events = load("a", "p0", 1000, 250) + load("b", "p1", 1000, 200) + load("c", "p2", 1000, 200)
     # all max U < 0.3; keep ceil((0.25 + 0.2 + 0.2 + 0) / 0.3) = ceil(2.17) = 3 of 4
     d = p.decide(snap(1000, pods, events))
     assert d["m"].reason == "tier2_underload" and d["m"].desired == 3
     # same window: no second scale-down
-    d = p.decide(snap(3000, pods))
+    d = p.decide(snap(3000, pods_at(3000)))
     assert d["m"].reason == "hold" and d["m"].desired == 3 and d["m"].inputs["down"] == "done_this_window"
     # next window (wall-clock window of window_s while Tier-1 is inactive): allowed again
-    d = p.decide(snap(600_000, pods))
+    d = p.decide(snap(600_000, pods_at(600_000)))
     assert d["m"].reason == "tier2_underload" and d["m"].desired == 3
 
 
 def test_scale_down_blockers() -> None:
-    pods3 = [pod(f"p{i}", 1000, M=1000) for i in range(3)]
+    def pods3(*kv, cover=True):
+        return [pod(f"p{i}", 1000, M=1000, kv=k, cover=cover) for i, k in enumerate(kv)]
+
     ev3 = load("a", "p0", 1000, 250) + load("b", "p1", 1000, 200) + load("c", "p2", 1000, 200)
-    d = make().decide(snap(1000, pods3, ev3))  # keep 3 of 3
+    d = make().decide(snap(1000, pods3(0.25, 0.2, 0.2), ev3))  # keep 3 of 3
     assert d["m"].reason == "hold" and d["m"].inputs["down"] == "no_gain"
-    d = make().decide(snap(1000, pods3, load("a", "p0", 1000, 300)))  # 0.30 is not below T_f
+    d = make().decide(snap(1000, pods3(0.3, 0, 0), load("a", "p0", 1000, 300)))  # 0.30 is not below T_f
     assert d["m"].inputs["down"] == "above_t_f"
-    d = make().decide(snap(1000, pods3, unscraped=("p9",), awake=4))
-    assert d["m"].inputs["down"] == "incomplete"
+    d = make().decide(snap(1000, pods3(0, 0, 0), unscraped=("p9",), awake=4))
+    assert d["m"].inputs["down"] == "incomplete" and d["m"].desired == 4
     d = make().decide(snap(1000, [], awake=2))
     assert d["m"].inputs["down"] == "no_pods" and d["m"].desired == 2
     # never below one instance
-    d = make().decide(snap(1000, pods3))
+    d = make().decide(snap(1000, pods3(0, 0, 0)))
     assert d["m"].reason == "tier2_underload" and d["m"].desired == 1
-    # grace after the policy's first tick / a Tier-1 window start
-    g = make(down_grace_s=60)
-    assert g.decide(snap(1000, pods3))["m"].inputs["down"] == "grace"
-    assert g.decide(snap(61_000, pods3))["m"].reason == "tier2_underload"
+
+
+def test_unknown_is_not_idle_no_scale_down() -> None:
+    """Review repro: running 20, KV 0.9, empty event history -> was tier2_underload after
+    the 60 s grace. Now the map must be complete and agree with the engine's KV."""
+    p = make()
+    for t in (1000, 63_000, 600_000):
+        busy = [pod("p0", t, M=1000, running=20.0, kv=0.9, cover=False), pod("p1", t, M=1000, kv=0.0)]
+        d = p.decide(snap(t, busy, since=None))["m"]
+        assert (d.desired, d.inputs["down"]) == (2, "incomplete")
+    # complete events but the map (empty) disagrees with the engine's KV by > 0.15
+    d = make().decide(snap(1000, [pod("p0", 1000, M=1000, kv=0.9), pod("p1", 1000, M=1000, kv=0.0)]))["m"]
+    assert (d.desired, d.inputs["down"]) == (2, "incomplete") and d.inputs["kv_disagree"] == {"p0": [0.0, 0.9]}
+    # a KV gauge that is missing is unknown, not agreement
+    d = make().decide(snap(1000, [pod("p0", 1000, M=1000, kv=None), pod("p1", 1000, M=1000, kv=0.0)]))["m"]
+    assert d.inputs["down"] == "incomplete"
+    # the window's one scale-down was not used up: it happens once the evidence is complete
+    d = p.decide(snap(600_002, [pod("p0", 600_002, M=1000, kv=0.0), pod("p1", 600_002, M=1000, kv=0.0)]))["m"]
+    assert (d.desired, d.reason) == (1, "tier2_underload")
 
 
 # ------------------------------------------------------------ Tier-1 + composition
 
 
 def test_tier1_oracle_windows_and_hold() -> None:
-    p = make(tier1="oracle", down_grace_s=60)
+    p = make(tier1="oracle")
     pods = [pod("p0", 1000)]
     d = p.decide(snap(1000, pods, replay=REPLAY))
     assert d["m"].reason == "tier1_window" and d["m"].desired == 2
     assert d["m"].inputs["tier1"] == {"window": 0, "mode": "oracle", "P_hat": 120000.0,
                                       "D_hat": 60000.0, "W": 600.0, "N": 2}
     d = p.decide(snap(3000, pods, replay=REPLAY))  # same window; awake still 1
-    assert d["m"].reason == "hold" and d["m"].desired == 2 and d["m"].inputs["down"] == "grace"
+    assert d["m"].reason == "hold" and d["m"].desired == 2
     d = p.decide(snap(600_000, pods, replay=REPLAY))
     assert d["m"].reason == "tier1_window" and d["m"].desired == 1
     d = p.decide(snap(1_200_000, pods, awake=1, replay=REPLAY))  # partial last window (300 s)
@@ -371,26 +394,27 @@ def test_injected_oracle_is_never_replaced_by_the_marker_seed() -> None:
 # ------------------------------------------------------------ review fixes (P1 / P2)
 
 
-def test_lost_done_events_are_dropped_as_phantoms() -> None:
+def test_map_clears_only_on_done() -> None:
     events = [e for i in range(10) for e in load(f"r{i}", "p0", 1000, 100, 20)]
     p = make()
     p.decide(snap(1000, [pod("p0", 1000)], events))
-    assert amap(p).total() > 0 and len(p._models["m"].active) == 10
-    # 2 s at the 75 ms SLO TPOT = 26 iterations > 20 * 1.25: every done was lost
-    d = p.decide(snap(3000, [pod("p0", 3000)]))
-    assert p.anomalies["m"]["phantom_dropped"] == 10 and d["m"].inputs["anom"]["phantom_dropped"] == 10
-    assert p._models["m"].active == {} and amap(p).requests == {} and amap(p).total() == 0.0
-    # a late done is then just unknown, never negative load
+    full = amap(p).total()
+    # 2 s at the 75 ms SLO TPOT = 26 iterations > D=20: the estimate ran ahead of the
+    # requests, which are still in flight (no done): each keeps its full size (P + D) / M
+    d = p.decide(snap(3000, [pod("p0", 3000)]))["m"]
+    assert d.inputs["anom"]["overdue"] == 10 and len(p._models["m"].active) == 10
+    assert amap(p).at(0) == pytest.approx(10 * (100 + 20) / 10_000) and amap(p).total() >= full
     p.decide(snap(3000, [pod("p0", 3000)], [ev("done", "r0", "p0", 3000)]))
-    assert p.anomalies["m"]["unknown_req"] == 1 and amap(p).total() == 0.0
+    assert len(p._models["m"].active) == 9 and amap(p).at(0) == pytest.approx(9 * 120 / 10_000)
+    # an engine reporting nothing in flight is a done for everything that started before
+    d = p.decide(snap(5000, [pod("p0", 5000, running=0.0)]))["m"]
+    assert p._models["m"].active == {} and amap(p).total() == 0.0
+    assert d.inputs["anom"]["engine_idle_done"] == 9
     # the paper's mode keeps extending them instead
     q = make(out_len_is_upper_bound=False)
     q.decide(snap(1000, [pod("p0", 1000)], events))
     q.decide(snap(3000, [pod("p0", 3000)]))
-    assert len(amap(q).requests) == 10 and amap(q).total() > 0
-    assert amap(q).requests[("r0", "p0")].extensions >= 1
-    with pytest.raises(ValueError):
-        make(phantom_margin=-1)
+    assert len(amap(q).requests) == 10 and amap(q).requests[("r0", "p0")].extensions >= 1
 
 
 def test_event_after_the_scrape_is_not_out_of_order() -> None:
