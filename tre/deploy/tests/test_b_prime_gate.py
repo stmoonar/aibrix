@@ -247,3 +247,18 @@ def test_the_onset_gate_has_three_verdicts_one_rule_for_every_model(tmp_path, mo
     assert c3["A"]["passed"] and c3["window_fa"]["passed"] and c3["D"]["passed"] and c3["B_prime"]["passed"]
     assert c3["onset"]["evaluable"] is False and res3["failed"] == [f"{MODEL}: onset failed - "
                                                                     "no severe-violation episode in a dynamic cell"]
+
+
+def test_a_critical_of_an_earlier_episode_is_never_credited_to_the_next() -> None:
+    # two episodes 20 s apart in one bursts cell; CRITICAL only during the first. The 30 s
+    # look-back of episode 2 (from 40 s) reaches back to 10 s, but it is clipped at the end of
+    # episode 1 (20 s, exclusive): episode 2 is missed
+    pts = [(0, .5), (10, 6), (20, 6), (30, .5), (40, 6), (50, 6), (60, .5)]
+    windows = [_ew("b", t, r) for t, r in pts]
+    for hits, lag2 in (({10, 20}, None),        # CRITICAL ends with episode 1
+                       ({10, 20, 30}, -10.0)):  # the run is still active after episode 1: it counts
+        crit = [t in hits for t, _ in pts]
+        got = b_prime.onset_detection(windows, crit, cut=5.0, primitive_of={"b": "bursts"}, gate=b_prime.ONSET_GATE,
+                                      n_resamples=50)
+        assert [e["lag_s"] for e in got["episodes"]] == [0.0, lag2]
+        assert [e["t_end_prev"] for e in got["episodes"]] == [None, 20_000.0]

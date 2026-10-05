@@ -195,8 +195,12 @@ def criteria(point: Mapping[str, Any], ci: Mapping[str, Any], gate: Mapping[str,
 #
 # * episode = a maximal run of consecutive (<= one re-window step apart) violating windows
 #   of one cell holding >= 1 severe window (severity >= the sealed training cut);
-# * detected = a dwell-confirmed CRITICAL window inside [t_first_severe - lookback, t_end];
-#   lag = t_first_crit - t_first_severe (negative = CRITICAL led the label);
+# * detected = a dwell-confirmed CRITICAL window inside the episode's detection window
+#   (t_lo, t_end], t_lo = max(t_first_severe - lookback, t_end_prev) with t_end_prev the last
+#   window of the previous episode of the same cell, EXCLUDED (coordinator 2026-10-05: a
+#   CRITICAL of an earlier episode is never credited to the next; a CRITICAL run that simply
+#   continues counts only if it is still active after t_end_prev); lag = t_first_crit -
+#   t_first_severe (negative = CRITICAL led the label);
 # * success = detected with lag <= the lag budget (2 ticks = 20 s, derived from the EMA
 #   alpha .632, tau_crit and window filling - not read off M);
 # * gated on the onset episodes of the DYNAMIC cells (steps / ramp / bursts), whose
@@ -224,9 +228,15 @@ ONSET_GATE_KEYS = tuple(ONSET_GATE)
 WINDOW_FA_GATE = {"false_alarm_max": 0.05, "false_alarm_ci95_high_max": 0.08}
 ICC_UNDEFINED_VALUE = 1.0
 ONSET_RULE = ("episode = maximal run of consecutive violating windows (<= episode_step_ms apart) of one cell "
-              "with >= 1 window of severity >= the sealed training cut; success = a dwell-confirmed CRITICAL "
-              "in [t_first_severe - lookback_s, t_end] with t_first_crit - t_first_severe <= lag_budget_s; "
-              "gated on the episodes of cells whose primitive is in ONSET_DYNAMIC_PRIMITIVES")
+              "with >= 1 window of severity >= the sealed training cut; detection window = window starts t with "
+              "t_first_severe - lookback_s <= t <= t_end and t > t_end_prev, t_end_prev = the last window of the "
+              "previous episode of the same cell (none: no such bound) - a CRITICAL of an earlier episode is "
+              "never credited to the next one, a CRITICAL run that continues counts only if still active after "
+              "t_end_prev; success = a dwell-confirmed CRITICAL in the detection window with t_first_crit - "
+              "t_first_severe <= lag_budget_s; gated on the episodes of cells whose primitive is in "
+              "ONSET_DYNAMIC_PRIMITIVES")
+#: Sealed with the onset parameters: how the look-back is clipped (coordinator 2026-10-05).
+ONSET_LOOKBACK_CLIP = "previous_episode_end_exclusive"
 ONSET_CI_RULE = ("both one-sided (ci_alpha_one_sided) lower bounds of the success rate must reach "
                  "detection_ci_low_min: (a) cell-cluster bootstrap percentile over the cells holding an onset "
                  "episode; (b) Clopper-Pearson on n_eff = n / (1 + (m - 1) ICC), m = episodes per cell, ICC = "
@@ -271,7 +281,8 @@ def episodes(windows: Sequence[Any], cut: float, *, step_ms: float = ONSET_GATE[
             k += 1
             sev = [i for i in run if severity(windows[i]) >= cut]
             if sev:
-                out.append({"cell": sid, "t_first_viol": windows[run[0]].window_start_ms,
+                prev = next((e["t_end"] for e in reversed(out) if e["cell"] == sid), None)
+                out.append({"cell": sid, "t_end_prev": prev, "t_first_viol": windows[run[0]].window_start_ms,
                             "t_first_severe": windows[sev[0]].window_start_ms,
                             "t_end": windows[run[-1]].window_start_ms, "n_violating": len(run), "n_severe": len(sev)})
     return out
@@ -280,10 +291,12 @@ def episodes(windows: Sequence[Any], cut: float, *, step_ms: float = ONSET_GATE[
 def episode_lag_s(windows: Sequence[Any], crit: Sequence[bool], ep: Mapping[str, Any], *,
                   lookback_s: float = ONSET_GATE["lookback_s"]) -> Optional[float]:
     """Seconds from the episode's first severe window to the first dwell-confirmed CRITICAL
-    window of its cell in [t_first_severe - lookback, t_end]; None = missed."""
-    lo, hi = ep["t_first_severe"] - lookback_s * 1000.0, ep["t_end"]
+    window of its cell in the detection window of :data:`ONSET_RULE` (``ep["t_end_prev"]``:
+    the previous episode's last window, None = none); None = missed."""
+    lo, hi, prev = ep["t_first_severe"] - lookback_s * 1000.0, ep["t_end"], ep.get("t_end_prev")
     ts = [w.window_start_ms for i, w in enumerate(windows)
-          if crit[i] and w.scenario_id == ep["cell"] and lo <= w.window_start_ms <= hi]
+          if crit[i] and w.scenario_id == ep["cell"] and lo <= w.window_start_ms <= hi
+          and (prev is None or w.window_start_ms > prev)]
     return (min(ts) - ep["t_first_severe"]) / 1000.0 if ts else None
 
 
@@ -387,7 +400,9 @@ def onset_detection(windows: Sequence[Any], crit: Sequence[bool], *, cut: float,
     out: dict[str, Any] = {"rule": ONSET_RULE, "ci_rule": ONSET_CI_RULE, "gate": g, "severity_cut": cut,
                            "dynamic_primitives": list(ONSET_DYNAMIC_PRIMITIVES),
                            "onset": summary(onset), "hold_disclosed": summary(hold),
-                           "episodes": [{k: ep[k] for k in ("cell", "primitive", "t_first_viol", "t_first_severe",
+                           "lookback_clip": ONSET_LOOKBACK_CLIP,
+                           "episodes": [{k: ep[k] for k in ("cell", "primitive", "t_end_prev", "t_first_viol",
+                                                            "t_first_severe",
                                                             "t_end", "n_violating", "n_severe", "lag_s", "success")}
                                         for ep in eps]}
     n = len(onset)
