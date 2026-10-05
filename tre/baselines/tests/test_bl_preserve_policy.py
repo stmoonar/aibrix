@@ -441,3 +441,25 @@ def test_second_replay_restarts_tier1_at_window_0() -> None:
     assert d["m"].desired == 2
     d = p.decide(snap(5_003_000, pods, replay=second))
     assert d["m"].reason == "hold"
+
+
+def test_tier2_never_isolates_below_the_windows_tier1_n() -> None:
+    """Review P1-3: at a window start Tier-1 provisions N=2 before the burst fills the
+    look-ahead maps; Tier-2 used to isolate back to 1 on the next tick (empty maps)."""
+    p = make(tier1="oracle")
+    two = lambda t, kv=(0.0, 0.0): [pod(f"p{i}", t, M=1000, kv=k) for i, k in enumerate(kv)]  # noqa: E731
+    d = p.decide(snap(1000, two(1000), replay=REPLAY))["m"]
+    assert (d.reason, d.desired, d.inputs["tier1_n"]) == ("tier1_window", 2, 2)
+    d = p.decide(snap(3000, two(3000), replay=REPLAY))["m"]  # empty maps: Tier-2 wants 1
+    assert d.desired == 2 and d.reason == "hold" and d.inputs["tier2_below_t1"] == 1
+    # Tier-2 may add above N ...
+    d = p.decide(snap(5000, two(5000, (0.99, 0.0)), load("a", "p0", 5000, 990, 200), replay=REPLAY))["m"]
+    assert (d.reason, d.desired) == ("tier2_overload", 3)
+    # ... and isolate back down to N, not below
+    p.decide(snap(7000, two(7000, (0.99, 0.0)), [ev("done", "a", "p0", 7000)], replay=REPLAY))
+    three = [pod(f"p{i}", 9000, M=1000, kv=0.0) for i in range(3)]
+    d = p.decide(snap(9000, three, replay=REPLAY))["m"]
+    assert (d.reason, d.desired) == ("tier2_underload", 2) and d.inputs["tier2_below_t1"] == 2
+    # next window N=1: the floor follows the window
+    d = p.decide(snap(600_000, two(600_000), awake=2, replay=REPLAY))["m"]
+    assert d.desired == 1 and d.inputs["tier1_n"] == 1

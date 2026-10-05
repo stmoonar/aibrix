@@ -18,6 +18,9 @@ fed by the gateway request events. Of it the scaler reads ``U[0:l]`` only:
   additional instance"). A pod is credited once per overload episode (it is credited again
   only after it left overload), so a persisting overload does not add an instance every
   tick; ours, the paper does not say how often the rule is evaluated.
+* Tier-2 never isolates below the current window's Tier-1 ``N`` (decision 2026-10-06; a
+  state gate: the window's forecast is evidence too). It may add above ``N`` and isolate
+  back down to ``N``; each clamped attempt counts ``tier2_below_t1`` (reported).
 * scale-down, at most once per Tier-1 window (paper), when every pod's
   ``max U[0:l] < T_f``: the paper isolates ``N_c - sum_p max(U'_p) / T_f`` instances, i.e.
   keeps ``sum_p max(U'_p) / T_f`` of them: the load packed onto instances each at ``T_f``.
@@ -136,6 +139,9 @@ class _ModelState:
     target: Optional[int] = None
     #: (replay t0_ms, window index) of the last Tier-1 firing.
     t1_window: Optional[tuple[int, int]] = None
+    #: Tier-1 N of the current window (None: Tier-1 inactive or no estimate). Tier-2 may add
+    #: above it and isolate back down to it, never below (decision 2026-10-06).
+    t1_n: Optional[int] = None
     credited: set[str] = field(default_factory=set)
     last_down_key: Optional[Hashable] = None
 
@@ -484,9 +490,12 @@ class PreServePolicy:
         down_info: Optional[str] = None
 
         t1_key = None if idx is None else (int(snap.replay.t0_ms), idx)
+        if t1_key is None:
+            st.t1_n = None  # no Tier-1 window in force (no replay, before t0, after the trace)
         if t1_key is not None and t1_key != st.t1_window:
             st.t1_window = t1_key
             N, t1_info = self._tier1_n(ms.model, idx)
+            st.t1_n = None if N is None else clamp(N)
             st.credited = set(overloaded)
             if N is None:
                 reason = "tier1_no_history"
@@ -516,6 +525,12 @@ class PreServePolicy:
                     down_info = "done_this_window"
                 else:
                     keep = max(1, int(math.ceil(sum(max_us) / self.t_f - 1e-9)))
+                    if st.t1_n is not None and keep < st.t1_n:
+                        # The window's forecast is evidence too: Tier-2 does not isolate
+                        # below the Tier-1 N (e.g. at a window start, before the burst
+                        # fills the look-ahead maps).
+                        anom["tier2_below_t1"] += 1
+                        keep = st.t1_n
                     if keep < awake:
                         st.last_down_key = down_key
                         st.target = clamp(keep)
@@ -531,7 +546,9 @@ class PreServePolicy:
             "awake": awake,
             "target": st.target,
             "tier1": t1_info,
+            "tier1_n": st.t1_n,
             "tier2": t2,
+            "tier2_below_t1": cum["tier2_below_t1"],
         }
         if down_info:
             inputs["down"] = down_info

@@ -509,14 +509,13 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     mine = [ln for ln in lines if ln["model"] == A]
     other = [ln for ln in lines if ln["model"] == B]
     high, low2 = h.marks["high"], h.marks["low2"]
-    # up during the high phase, down after the load dropped. PreServe (no grace timer):
-    # Tier-1 provisions at the window start, before the burst fills the look-ahead maps,
-    # so Tier-2 may isolate instances inside the high window already (paper semantics,
-    # once per window).
-    down_from = high if policy == "preserve" else low2 - 500
+    # up during the high phase, down after the load dropped (PreServe: Tier-2 never
+    # isolates below the high window's Tier-1 N)
     assert any(ln["action"] == "up" and high <= ln["ts_ms"] < low2 for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
-    assert any(ln["action"] == "down" and ln["ts_ms"] >= down_from for ln in mine), [
+    assert not any(ln["action"] == "down" and high <= ln["ts_ms"] < low2 - 500 for ln in mine), [
+        (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
+    assert any(ln["action"] == "down" and ln["ts_ms"] >= low2 - 500 for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
     assert max(ln["awake"] for ln in mine) >= 2
     assert not any(ln["action"] == "up" for ln in other)          # the quiet model is left alone
