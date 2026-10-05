@@ -4,9 +4,10 @@ Usage::
 
     python -m tre_baselines.tools.tokenscale_buckets --trace t1.json [--trace t2.json ...] [--model m]
 
-Prints YAML: ``bucket_edges`` (paste into the policy params) and ``bucket_centers`` (per
+Prints YAML: ``bucket_edges`` (paste into the policy params), ``bucket_centers`` (per
 bucket the weighted median (in, out) of its requests; the profiling points for
-``tokenscale_profile``). Edges are inclusive upper bounds (x <= e1 -> bucket 0).
+``tokenscale_profile``) and ``median_in`` (the weighted median input length; the V_P
+profiling point). Edges are inclusive upper bounds (x <= e1 -> bucket 0).
 
 Accepted trace formats (JSON or JSONL):
 
@@ -148,6 +149,7 @@ def compute(samples: list[Sample]) -> dict[str, Any]:
     return {
         "edges": {"in": [_num(e_in[0]), _num(e_in[1])], "out": [_num(e_out[0]), _num(e_out[1])]},
         "centers": centers,
+        "median_in": _num(weighted_quantile([(s[0], s[2]) for s in samples], 0.5)),
     }
 
 
@@ -171,12 +173,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"error: model(s) {missing} not in traces (have {sorted(pooled)})", file=sys.stderr)
             return 2
         pooled = {m: pooled[m] for m in args.model}
-    edges, centers = {}, {}
+    edges, centers, medians = {}, {}, {}
     for model in sorted(pooled):
         res = compute(pooled[model])
         edges[model] = res["edges"]
         centers[model] = res["centers"]
-    sys.stdout.write(yaml.safe_dump({"bucket_edges": edges, "bucket_centers": centers}, sort_keys=False, default_flow_style=None))
+        medians[model] = res["median_in"]
+    sys.stdout.write(yaml.safe_dump({"bucket_edges": edges, "bucket_centers": centers, "median_in": medians},
+                                    sort_keys=False, default_flow_style=None))
     return 0
 
 

@@ -45,7 +45,7 @@ def test_buckets_bad_format(tmp_path, capsys):
 
 
 def _flat_sender(rates):
-    """Sender whose tok/s at concurrency 1,2,4,.. follows ``rates``; records the calls."""
+    """Sender whose tok/s at the n-th ladder step follows ``rates``; records the calls."""
     calls = []
 
     def send(model, tin, tout, c, step_s, warmup_s):
@@ -57,24 +57,15 @@ def _flat_sender(rates):
     return send
 
 
-def test_step_sequence_and_stop_rule():
-    # 100, 200, 300, +2 %, +1 % -> stops after the second consecutive <3 % step
-    s = _flat_sender([1000, 2000, 3000, 3060, 3090, 9990, 9990])
+def test_full_ladder_and_peak():
+    # no early stop: every concurrency of the decided ladder runs; V_b is the peak
+    s = _flat_sender([1000, 2000, 3000, 3060, 2500, 2400])
     v, steps = tp.profile_point(s, "m", 10, 10, 60, 15)
-    assert s.calls == [1, 2, 4, 8, 16] and v == pytest.approx(3090, rel=0.01)
-    assert len(steps) == 5
-
-
-def test_stop_rule_resets_on_improvement():
-    s = _flat_sender([1000, 1010, 2000, 2010, 2010, 5000])
-    v, _ = tp.profile_point(s, "m", 10, 10, 60, 15)
-    assert s.calls == [1, 2, 4, 8, 16] and v == pytest.approx(2010, rel=0.01)
-
-
-def test_max_concurrency_caps():
-    s = _flat_sender([1000 * 2 ** k for k in range(20)])
-    tp.profile_point(s, "m", 10, 10, 60, 15, max_concurrency=8)
-    assert s.calls == [1, 2, 4, 8]
+    assert s.calls == [1, 2, 4, 8, 16, 32] and len(steps) == 6
+    assert v == pytest.approx(3060, rel=0.01)
+    s = _flat_sender([1000] * 3)
+    tp.profile_point(s, "m", 10, 10, 60, 15, ladder=(1, 3, 9))
+    assert s.calls == [1, 3, 9]
 
 
 def _centers_file(tmp_path):
@@ -111,3 +102,86 @@ def test_load_sender_spec():
     assert callable(tp.load_sender("stub"))
     with pytest.raises(ValueError):
         tp.load_sender("nocolon")
+    with pytest.raises(ValueError, match="gateway-url"):
+        tp.load_sender("http")
+
+
+class _FakeVllm:
+    """A chat endpoint that streams like vLLM 0.30 (role chunk, content chunks, usage chunk)
+    and checks each body is the fixed-length generation request."""
+
+    def __init__(self, delay_s=0.02):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.bodies, fake = [], self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                fake.bodies.append(body)
+                import time as _t
+                _t.sleep(delay_s)
+                n = int(body["max_tokens"])
+                chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}]
+                chunks += [{"choices": [{"index": 0, "delta": {"content": "x"}}]} for _ in range(n)]
+                chunks.append({"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": n,
+                                                        "total_tokens": 120 + n}})
+                raw = b"".join(b"data: " + json.dumps(o).encode() + b"\n\n" for o in chunks) + b"data: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1/chat/completions"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_http_sender_drives_closed_loop_chat_against_a_fake_server(tmp_path, monkeypatch):
+    from scripts import r3_grid
+
+    # the prompt text is not under test (natural prompts need the model tokenizer)
+    monkeypatch.setattr(r3_grid, "_make_prompt", lambda n, key, *a, **k: f"prompt {key}")
+    fake = _FakeVllm()
+    try:
+        send = tp.make_http_sender(fake.url, raw_dir=tmp_path / "raw")
+        completed, window, tin, tout = send("dsqwen-7b", 128, 4, 2, 0.6, 0.1)
+    finally:
+        fake.close()
+    assert fake.bodies, "nothing was sent"
+    for body in fake.bodies:  # the calibration chat sender's fixed-length request
+        assert body["model"] == "dsqwen-7b" and body["messages"][0]["role"] == "user"
+        assert body["ignore_eos"] is True and body["temperature"] == 0 and body["max_tokens"] == 4
+        assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    assert 0.4 <= window <= 0.7 and 0 < completed <= len(fake.bodies)
+    assert (tin, tout) == (120 * completed, 4 * completed)  # usage counts, not nominal lengths
+    assert list((tmp_path / "raw").glob("dsqwen-7b_i128_o4_c2.jsonl"))
+
+
+def test_measure_window_counts_only_ok_requests_done_after_warmup():
+    recs = [
+        {"http_status": 200, "done_ts_ms": 1_500, "input_tokens": 10, "output_tokens": 5},   # warm-up
+        {"http_status": 200, "done_ts_ms": 3_000, "input_tokens": 10, "output_tokens": 5},
+        {"http_status": 200, "done_ts_ms": 4_000, "input_tokens": None, "output_tokens": None},
+        {"http_status": 500, "done_ts_ms": 4_000, "input_tokens": 10, "output_tokens": 5},
+        {"http_status": 200, "done_ts_ms": 4_100, "stream_error": "cut", "input_tokens": 1, "output_tokens": 1},
+        {"http_status": 200, "done_ts_ms": 9_000, "input_tokens": 10, "output_tokens": 5},   # after the step
+    ]
+    assert tp.measure_window(recs, 1_000, 5_000, 1.0, 12, 6) == (2, 3.0, 22, 11)
+
+
+def test_buckets_report_the_median_input(tmp_path, capsys):
+    f = tmp_path / "t.json"
+    f.write_text(json.dumps([{"in_tokens": x, "max_tokens": 10} for x in (100, 200, 300, 400, 500)]), encoding="utf-8")
+    assert tb.main(["--trace", str(f), "--default-model", "m"]) == 0
+    assert yaml.safe_load(capsys.readouterr().out)["median_in"] == {"m": 300}
