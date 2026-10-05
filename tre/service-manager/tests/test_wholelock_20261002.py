@@ -422,6 +422,34 @@ def test_transfer_receiver_wake_failure_sleeps_it_back_and_keeps_the_donor_aslee
     assert not world.awake("d-0") and not world.stored_awake("d-0")  # the donor is not rolled back
 
 
+def test_transfer_receiver_pod_list_failure_after_the_donor_slept_still_answers():
+    """Review 2026-10-06 P3-3: the receivers' Pod LIST fails after the donor
+    slept. The caller still gets the transfer answer (409 partial with pairs and
+    taken), the receiver is untouched and the donor stays asleep."""
+    world = World(pods=(("d-0", "d", (0,), "awake"), ("r-0", "r", (0,), "sleeping")))
+    real_list = world.runtime.list_pod_snapshots
+
+    def flaky(*, model=None):
+        if model == "r" and world.vllm.sleeping.get(world.ip_of["d-0"]):
+            raise RuntimeError("api server timeout")
+        return real_list(model=model)
+
+    world.runtime.list_pod_snapshots = flaky
+
+    response = world.client.post("/v2/transfers", json={"donor_model": "d", "receiver_model": "r"})
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "partial" and body["taken"] == 1 and body["done"] == 0
+    [pair] = body["pairs"]
+    assert pair["status"] == "receiver_wake_failed"
+    assert "api server timeout" in pair["error"]["detail"]
+    assert not any(call == ("wake_up", world.ip_of["r-0"]) for call in world.vllm.calls)
+    assert not world.awake("r-0") and world.lease("r-0") is None
+    assert not world.awake("d-0") and not world.stored_awake("d-0") and world.lease("d-0") is None
+    assert world.violations == [] and world.journals() == ({}, {})
+
+
 def test_transfer_crash_after_the_donor_slept_is_settled_by_the_journals():
     world = World(pods=(("d-0", "d", (0,), "awake"), ("r-0", "r", (0,), "sleeping")))
 

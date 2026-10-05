@@ -4768,10 +4768,24 @@ class ServiceManagerV2:
         the commit (writer lock held). A receiver the account / the wake gate
         refuses now, or whose wake fails (S4: an engine that woke anyway gets a
         compensating sleep), fails its pair (``receiver_wake_failed``); its donors
-        stay asleep."""
+        stay asleep. A failed Pod LIST of the receivers (review 2026-10-06 P3-3)
+        fails every pending pair the same way, before any receiver is touched:
+        the donors already slept, so the response (``pairs``, ``taken``) must
+        still reach the caller."""
         tickets: list[_WakeTicket] = []
         pending = [state for state in op.pairs if state.status == TRANSFER_PENDING]
-        pods = self._pod_snapshots_by_name([state.pair.receiver for state in pending])
+        try:
+            pods = self._pod_snapshots_by_name([state.pair.receiver for state in pending])
+        except Exception as exc:  # noqa: BLE001 - no receiver was touched yet
+            _log_event(
+                "transfer_receiver_pods_unreadable", level=logging.WARNING,
+                transfer_id=op.transfer_id, receiver_model=op.receiver_model,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            for state in pending:
+                state.status = TRANSFER_RECEIVER_FAILED
+                state.error = exc
+            return
         for state in pending:
             try:
                 state.ticket = self._prepare_transfer_wake(op, state.pair, pods)
