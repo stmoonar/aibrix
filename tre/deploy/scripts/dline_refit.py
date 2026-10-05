@@ -64,8 +64,9 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     ``--lambda-method v1`` (user 2026-09-24) replaces both rules: lambda_wait AND w_p are
     v1's selection (:mod:`scripts.v1_lambda_fit` - v1's rank-correlation objective, lambda
     1..4 / 0.25, w_p 0.01..0.08 / 0.005, the joint refinement), ported onto the same
-    training windows; the D17 w_p rule is not applied (when the two disagree, v1's joint
-    refinement wins and wp.json says so). tau, theta, delta and the labels stay v2.
+    training windows; the D17 w_p rule is neither applied nor computed (wp.json records
+    ``d3_rule.statement`` "not applied"; no D17 w_p is reported next to v1's). tau, theta,
+    delta and the labels stay v2.
 ``final`` (D5 + hold-out)
     the verdict at (tau, w_p*, lambda*) with 1000 / 200 resamples; D5: the merged theta is
     published whatever the family rule says (the family theta is kept as diagnostic);
@@ -1276,8 +1277,9 @@ def stage_wp_v1(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str,
     """``wp --lambda-method v1``: lambda_wait and w_p from v1's selection (stages A-C of
     ``fit_tre_parameters_from_runs.py``, :mod:`scripts.v1_lambda_fit`) on the D16 fitting
     windows; ``sources`` (run -> standard dataset dir) are where the average TPOT of v1's
-    average-health term is rebuilt from. The D17 w_p rule is NOT applied: user 2026-09-24,
-    v1's joint refinement is taken as is and a disagreement with D17 is reported."""
+    average-health term is rebuilt from. The D17 w_p rule is NOT applied and NOT computed:
+    user 2026-09-24, v1's joint lambda x w_p refinement is taken as is (no D17 comparison is
+    made or reported)."""
     from scripts import v1_lambda_fit
 
     tau = published_tau(alpha_doc)
