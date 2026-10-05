@@ -422,7 +422,8 @@ class Harness:
 
 def _policy_params(policy: str, tmp_path) -> dict:
     if policy == "chiron":
-        return {"b_init": 4, "b_max": 4, "theta": {"*": 0.5}}
+        # at_cap: the scenario saturates the 4-request cap (a sensitivity setting in real runs)
+        return {"b_init": 4, "b_max": 4, "theta": {"*": 0.5}, "busy_def": "at_cap"}
     if policy == "tokenscale":
         vel = {"buckets": [[200.0] * 3] * 3, "v_prefill": 1000.0}
         return {"models": [A, B], "bucket_edges": {"*": {"in": [50, 150], "out": [50, 150]}},

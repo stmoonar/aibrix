@@ -29,6 +29,7 @@ def snap(pods, awake=None, t_ms=0, unscraped=(), max_num_seqs=100, tick=0):
 
 
 def policy(**params):
+    params.setdefault("theta", {"*": 1 / 3})
     return ChironPolicy(SimpleNamespace(policy_params=params))
 
 
@@ -167,9 +168,16 @@ def test_theta_per_model_and_default():
     pol = policy(busy_def="nonidle", theta={M: 0.5, "*": 0.9})
     d = one(pol, _busy_snap([(1, 0), (0, 0)], awake=2))  # busy 1 / .5 = 2
     assert d.desired == 2 and d.inputs["theta"] == 0.5
-    d = one(policy(busy_def="nonidle", theta={"other": 0.1}), _busy_snap([(1, 0)] * 2, awake=2))
-    assert d.inputs["theta"] == pytest.approx(0.3333)  # default 1/3
-    assert d.desired == 6
+    with pytest.raises(ValueError):  # no silent 1/3 default for a model without theta
+        one(policy(busy_def="nonidle", theta={"other": 0.1}), _busy_snap([(1, 0)] * 2, awake=2))
+
+
+def test_theta_and_busy_def_defaults_come_from_config():
+    with pytest.raises(ValueError):
+        ChironPolicy(SimpleNamespace(policy_params={}))
+    with pytest.raises(ValueError):  # a managed model without theta (and no "*")
+        ChironPolicy(SimpleNamespace(policy_params={"theta": {"a": 0.5}}, models={"a": 1, "b": 1}))
+    assert policy().busy_def == "nonidle"  # paper IBP; at_cap only as a sensitivity run
 
 
 def test_unknown_is_not_idle_no_scale_down():
@@ -246,4 +254,4 @@ def test_deterministic_and_json_able():
 
 def test_registered():
     assert POLICIES["chiron"] is ChironPolicy
-    assert build_policy("chiron", SimpleNamespace(policy_params={})).name == "chiron"
+    assert build_policy("chiron", SimpleNamespace(policy_params={"theta": 0.5})).name == "chiron"

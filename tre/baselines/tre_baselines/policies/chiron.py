@@ -8,7 +8,7 @@ Local loop (per pod, every tick), from deltas of the pod's cumulative counters:
   TBP = thr_prev/thr only when the cap was binding on the previous tick, else
   neutral (dropped from the max; a literal 1 would forbid growth);
   LocalBP = max(LBP, TBP); LocalBP < 1: B <- a*B/LocalBP + (1-a)*B, else B <- max(1, B/2).
-Global loop: IBP = busy pods / N; desired = max(1, ceil(busy / theta)) (reason
+Global loop (Chiron-global): IBP = busy pods / N; desired = max(1, ceil(busy / theta)) (reason
   ``ibp_target``): the instance count at which IBP would sit at theta, i.e. the paper's
   over-provisioning level (section 5.2: keep enough idle instances that a burst of
   1/theta x fits). It depends only on ``busy``, so a constant load gives a constant target;
@@ -23,8 +23,13 @@ key             default      origin
 alpha           0.5          paper (Alg.1 smoothing factor)
 b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256
 b_max           None         ours: cap on B = b_max, else max_num_seqs, else 256
-busy_def        at_cap       ours (D11): at_cap (running+waiting >= B) | nonidle (running > 0)
-theta           {"*": 1/3}   paper's 3x example as the default; per model via chiron_theta
+busy_def        nonidle      paper IBP (instances running interactive requests): nonidle
+                             (running > 0); at_cap (running+waiting >= B) only as a
+                             sensitivity run (D11)
+theta           (required)   ``{model | "*": theta}`` or one number; no silent default: the
+                             main runs use theta_trace (``tools/chiron_theta``), the 3x
+                             example (1/3) is a sensitivity row; the policy refuses to start
+                             without it for a managed model
 ==============  ===========  ==============================================================
 
 Unknown is not idle: a pod with a missing gauge is never counted busy (scale-up uses the
@@ -41,7 +46,6 @@ from tre_baselines.policies.base import Decision, hold_if_incomplete
 from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, evidence_gaps
 
 DEFAULT_ALPHA = 0.5
-DEFAULT_THETA = 1.0 / 3.0  # the paper's 3x-burst example
 DEFAULT_B = 256  # not in paper; chosen: order of the engine default max-num-seqs
 #: busy / theta within this of an integer is that integer (theta written as 0.3333333333).
 _CEIL_TOL = 1e-6
@@ -64,6 +68,8 @@ def _num(x: Any, nd: int = 4) -> Optional[float]:
 
 class ChironPolicy:
     name = "chiron"
+    #: Arm name in decision records and docs (B is virtual; only the global loop scales).
+    label = "Chiron-global"
     needs_events = False
 
     def __init__(self, config: Any = None) -> None:
@@ -73,19 +79,31 @@ class ChironPolicy:
             raise ValueError("chiron: alpha must be in (0, 1]")
         self.b_init = params.get("b_init")
         self.b_max = params.get("b_max")
-        self.busy_def = str(params.get("busy_def", "at_cap"))
+        self.busy_def = str(params.get("busy_def", "nonidle"))
         if self.busy_def not in BUSY_DEFS:
             raise ValueError(f"chiron: busy_def must be one of {BUSY_DEFS}")
-        theta = params.get("theta", {})
+        theta = params.get("theta")
+        if theta is None:
+            raise ValueError("chiron: params.theta is required (theta_trace from tools/chiron_theta; "
+                             "1/3 only as a sensitivity run)")
         if not isinstance(theta, Mapping):
             theta = {"*": theta}
+        unset = sorted(str(k) for k, v in theta.items() if v is None)
+        if unset:
+            raise ValueError(f"chiron: theta is null for {unset} (fill theta_trace from tools/chiron_theta)")
         self.theta = {str(k): float(v) for k, v in theta.items()}
         if any(not 0.0 < v <= 1.0 for v in self.theta.values()):
             raise ValueError("chiron: theta must be in (0, 1]")
+        missing = [m for m in (getattr(config, "models", None) or {}) if m not in self.theta and "*" not in self.theta]
+        if missing:
+            raise ValueError(f"chiron: no theta for {sorted(missing)} (and no '*')")
         self._state: dict[str, dict[str, _PodState]] = {}
 
     def _theta_for(self, model: str) -> float:
-        return self.theta.get(model, self.theta.get("*", DEFAULT_THETA))
+        try:
+            return self.theta[model] if model in self.theta else self.theta["*"]
+        except KeyError:
+            raise ValueError(f"chiron: no theta for {model!r}") from None
 
     def _b_bounds(self, ms: ModelSnapshot) -> tuple[float, float]:
         b_init = self.b_init if self.b_init is not None else (ms.max_num_seqs or DEFAULT_B)

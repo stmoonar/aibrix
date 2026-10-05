@@ -1,11 +1,20 @@
-# Chiron baseline params (TRE_BL_POLICY=chiron, TRE_BL_POLICY_CONFIG=<this file>).
+# Chiron-global baseline params (TRE_BL_POLICY=chiron, TRE_BL_POLICY_CONFIG=<this file>).
+# Only the global (instance) loop scales; B is virtual (busy test only, never pushed to
+# the engine) - disclose as an adaptation.
 alpha: 0.5          # paper: Alg.1 smoothing factor
 # b_init: 256       # ours: initial virtual B; default = model max_num_seqs, else 256
 # b_max: 256        # ours: cap on B; default = model max_num_seqs, else 256
-busy_def: at_cap    # ours: at_cap (running+waiting >= B) | nonidle (running > 0)
+busy_def: nonidle   # main runs: paper IBP (running > 0). Sensitivity only: at_cap (running+waiting >= B)
 # Global loop: desired = max(1, ceil(busy / theta)), i.e. keep IBP = busy/N at theta.
-# Write 1/3 with enough digits: busy / 0.3333 = 3.0003 * busy rounds UP to one extra pod
-# (the policy tolerates only 1e-6 relative float noise).
-theta:              # IBP threshold per model; "*" = default (paper's 3x example)
-  "*": 0.3333333333
-  # <model>: 0.25   # produce with: python3 -m tre_baselines.tools.chiron_theta --trace ...
+# theta is REQUIRED (no default; the policy refuses to start without a value for every
+# managed model).
+#   main runs:   theta_trace per model, from the replayed trace (CPU only):
+#                python3 -m tre_baselines.tools.chiron_theta --trace <trace> --method peak_mean --interval-s 5
+#   sensitivity: the paper's 3x example, "*": 0.3333333333 (write 1/3 with enough digits:
+#                busy / 0.3333 = 3.0003 * busy rounds UP to one extra pod; the policy
+#                tolerates only 1e-6 relative float noise)
+theta:
+  dsqwen-7b: null    # PLACEHOLDER: fill with theta_trace (null is refused at start)
+  dsllama-8b: null
+  dsqwen-14b: null
+  # "*": 0.3333333333   # sensitivity row (the 3x example) instead of the per-model values
