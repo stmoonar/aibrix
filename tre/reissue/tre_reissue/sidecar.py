@@ -1570,8 +1570,10 @@ class ReissueSidecar:
                 return await self._retry(request, raw, depth, "local_refused", added)
             return self._upstream_failed(request, depth, exc, status=503)
         if resp.status == 503:
-            payload = await resp.read()
-            resp.release()
+            try:
+                payload = await resp.read()
+            finally:
+                resp.release()
             if self._sleep_error_mark in payload and _is_sleeping_payload(payload, cfg.sleeping_error_type):
                 self._apply_observed(True, epoch, source="engine_503")
                 return await self._retry(request, raw, depth, "engine_sleeping")

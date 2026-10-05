@@ -962,24 +962,24 @@ data:
     \                # The engine is not listening (crashed / restarting): another\
     \ instance.\n                return await self._retry(request, raw, depth, \"\
     local_refused\", added)\n            return self._upstream_failed(request, depth,\
-    \ exc, status=503)\n        if resp.status == 503:\n            payload = await\
-    \ resp.read()\n            resp.release()\n            if self._sleep_error_mark\
-    \ in payload and _is_sleeping_payload(payload, cfg.sleeping_error_type):\n   \
-    \             self._apply_observed(True, epoch, source=\"engine_503\")\n     \
-    \           return await self._retry(request, raw, depth, \"engine_sleeping\"\
-    )\n            return web.Response(body=payload, status=503, headers=response_headers(resp.headers))\n\
-    \        if not generation or resp.status != 200 or not isinstance(body, dict):\n\
-    \            return await self._relay(request, resp, added=added)\n        ctype\
-    \ = resp.headers.get(\"Content-Type\", \"\")\n        if \"text/event-stream\"\
-    \ in ctype:\n            return await self._stream(request, path, raw, body, resp,\
-    \ depth, nc_reason, added)\n        if \"json\" in ctype:\n            return\
-    \ await self._non_stream(request, path, raw, body, resp, depth, nc_reason, added)\n\
-    \        return await self._relay(request, resp, added=added)\n\n    def _abort_decision(self,\
-    \ request: web.Request, depth: int, nc_reason: str | None,\n                 \
-    \       info: AbortInfo, sent_any: bool) -> tuple[str, str]:\n        \"\"\"(action,\
-    \ reason); action = retry | continue | passthrough_abort | failed.\"\"\"\n   \
-    \     if not self.state.active:\n            return \"passthrough_abort\", \"\
-    not_sleeping\"\n        if _client_gone(request):\n            return \"passthrough_abort\"\
+    \ exc, status=503)\n        if resp.status == 503:\n            try:\n       \
+    \         payload = await resp.read()\n            finally:\n                resp.release()\n\
+    \            if self._sleep_error_mark in payload and _is_sleeping_payload(payload,\
+    \ cfg.sleeping_error_type):\n                self._apply_observed(True, epoch,\
+    \ source=\"engine_503\")\n                return await self._retry(request, raw,\
+    \ depth, \"engine_sleeping\")\n            return web.Response(body=payload, status=503,\
+    \ headers=response_headers(resp.headers))\n        if not generation or resp.status\
+    \ != 200 or not isinstance(body, dict):\n            return await self._relay(request,\
+    \ resp, added=added)\n        ctype = resp.headers.get(\"Content-Type\", \"\"\
+    )\n        if \"text/event-stream\" in ctype:\n            return await self._stream(request,\
+    \ path, raw, body, resp, depth, nc_reason, added)\n        if \"json\" in ctype:\n\
+    \            return await self._non_stream(request, path, raw, body, resp, depth,\
+    \ nc_reason, added)\n        return await self._relay(request, resp, added=added)\n\
+    \n    def _abort_decision(self, request: web.Request, depth: int, nc_reason: str\
+    \ | None,\n                        info: AbortInfo, sent_any: bool) -> tuple[str,\
+    \ str]:\n        \"\"\"(action, reason); action = retry | continue | passthrough_abort\
+    \ | failed.\"\"\"\n        if not self.state.active:\n            return \"passthrough_abort\"\
+    , \"not_sleeping\"\n        if _client_gone(request):\n            return \"passthrough_abort\"\
     , \"client_gone\"\n        if not sent_any:\n            # Nothing reached the\
     \ client: resending the original is exact.\n            return \"retry\", \"abort_before_output\"\
     \n        if nc_reason is not None:\n            return \"passthrough_abort\"\
