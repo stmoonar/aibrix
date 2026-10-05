@@ -166,6 +166,9 @@ class ShellStats:
     nonstream_arrivals: dict[str, int] = field(default_factory=dict)
     #: arr events per model.
     arrivals: dict[str, int] = field(default_factory=dict)
+    #: arr events per model whose in_tokens did not come from the client header
+    #: (``in_src != "header"``): must be 0 when the clients send x-tre-bl-in-tokens.
+    nonheader_in_tokens: dict[str, int] = field(default_factory=dict)
 
 
 class DecisionLog:
@@ -303,6 +306,8 @@ class BaselineShell:
                         self.stats.arrivals[model] = self.stats.arrivals.get(model, 0) + 1
                         if ev.stream is False:
                             self.stats.nonstream_arrivals[model] = self.stats.nonstream_arrivals.get(model, 0) + 1
+                        if ev.in_src != "header":
+                            self.stats.nonheader_in_tokens[model] = self.stats.nonheader_in_tokens.get(model, 0) + 1
         decisions: Mapping[str, Decision] = self.policy.decide(snap) or {}
 
         needs_events = bool(getattr(self.policy, "needs_events", False))
@@ -561,6 +566,9 @@ class BaselineShell:
             lines.append("# TYPE tre_bl_nonstream_arrivals_total counter")
             for model, count in sorted(s.nonstream_arrivals.items()):
                 lines.append(f'tre_bl_nonstream_arrivals_total{{policy="{policy}",model="{model}"}} {count}')
+            lines.append("# TYPE tre_bl_nonheader_in_tokens_total counter")
+            for model, count in sorted(s.nonheader_in_tokens.items()):
+                lines.append(f'tre_bl_nonheader_in_tokens_total{{policy="{policy}",model="{model}"}} {count}')
             lines.append("# TYPE tre_bl_policy_events_total counter")
             for model, counts in sorted(self.policy_counters().items()):
                 for name, count in sorted(counts.items()):

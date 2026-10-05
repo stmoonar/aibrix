@@ -459,7 +459,7 @@ def test_tier2_never_isolates_below_the_windows_tier1_n() -> None:
     p.decide(snap(7000, two(7000, (0.99, 0.0)), [ev("done", "a", "p0", 7000)], replay=REPLAY))
     three = [pod(f"p{i}", 9000, M=1000, kv=0.0) for i in range(3)]
     d = p.decide(snap(9000, three, replay=REPLAY))["m"]
-    assert (d.reason, d.desired) == ("tier2_underload", 2) and d.inputs["tier2_below_t1"] == 2
+    assert (d.reason, d.desired) == ("tier2_underload", 2) and d.inputs["tier2_below_t1"] == 1  # once per window
     # next window N=1: the floor follows the window
     d = p.decide(snap(600_000, two(600_000), awake=2, replay=REPLAY))["m"]
     assert d.desired == 1 and d.inputs["tier1_n"] == 1

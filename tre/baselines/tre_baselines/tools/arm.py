@@ -345,15 +345,19 @@ def gateway_bl_dropped(env: Env, a: argparse.Namespace) -> Optional[float]:
     return total
 
 
-def run_validity(shell_metrics: dict[str, str], marker: Optional[dict], gw_now: Optional[float]) -> dict:
-    """The per-run validity record from the scaler pods' ``/metrics`` and the gateway."""
+def run_validity(shell_metrics: dict[str, str], marker: Optional[dict], gw_now: Optional[float],
+                 client_sent_in_tokens: bool = False) -> dict:
+    """The per-run validity record from the scaler pods' ``/metrics`` and the gateway.
+    ``events_valid``: events were seen, the gateway dropped none, and - when the clients
+    sent ``x-tre-bl-in-tokens`` - every arrival's input count came from that header."""
     by_model: dict[str, dict[str, float]] = {}
     policy_events: dict[str, dict[str, float]] = {}
     totals: dict[str, float] = {}
     for text in shell_metrics.values():
         for smp in _samples(text):
             model = smp.labels.get("model")
-            if smp.name in ("tre_bl_arrivals_total", "tre_bl_nonstream_arrivals_total") and model:
+            if smp.name in ("tre_bl_arrivals_total", "tre_bl_nonstream_arrivals_total",
+                            "tre_bl_nonheader_in_tokens_total") and model:
                 key = smp.name[len("tre_bl_"):-len("_total")]
                 by_model.setdefault(model, {})[key] = by_model.get(model, {}).get(key, 0) + smp.value
             elif smp.name == "tre_bl_policy_events_total" and model:
@@ -363,12 +367,23 @@ def run_validity(shell_metrics: dict[str, str], marker: Optional[dict], gw_now: 
                 totals[smp.name] = totals.get(smp.name, 0) + smp.value
     gw0 = (marker or {}).get("gw_bl_dropped0")
     delta = None if gw0 is None or gw_now is None else gw_now - float(gw0)
+    arrivals = sum(v.get("arrivals", 0) for v in by_model.values())
+    nonheader = sum(v.get("nonheader_in_tokens", 0) for v in by_model.values())
+    problems = []
+    if delta != 0:
+        problems.append(f"gateway dropped events: {delta}")
+    if arrivals <= 0:
+        problems.append("no arrivals seen")
+    if client_sent_in_tokens and nonheader > 0:
+        problems.append(f"{nonheader:g} arrivals without the x-tre-bl-in-tokens header")
     return {
         "replay_marker": marker,
         "gw_bl_dropped_t0": gw0,
         "gw_bl_dropped_end": gw_now,
         "gw_bl_dropped_delta": delta,
-        "events_valid": delta == 0,
+        "events_valid": not problems,
+        "invalid_because": problems,
+        "client_sent_in_tokens": client_sent_in_tokens,
         "arrivals": by_model,
         "policy_events": policy_events,
         "sm": totals,
@@ -393,7 +408,7 @@ def collect_validity(env: Env, a: argparse.Namespace) -> str:
         marker = json.loads(raw) if raw else None
     except ValueError:
         marker = None
-    doc = run_validity(metrics, marker, gateway_bl_dropped(env, a))
+    doc = run_validity(metrics, marker, gateway_bl_dropped(env, a), bool(a.client_sent_in_tokens))
     path = os.path.join(a.collect_dir, "run_validity.json")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
@@ -451,6 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="scale down without copying the decision logs (they remain in the Redis stream)")
     dis.add_argument("--log-dir", default="/var/log/tre-baselines", help="TRE_BL_LOG_DIR inside the pod")
     dis.add_argument("--http-port", type=int, default=8080, help="the scaler's /metrics port")
+    dis.add_argument("--client-sent-in-tokens", action="store_true",
+                     help="the clients sent x-tre-bl-in-tokens: any arrival without it invalidates the run")
     dis.add_argument("--selector", default=None,
                      help="label selector of the scaler pods (default app.kubernetes.io/name=<deployment>)")
     mk = sub.add_parser("mark-replay", parents=[common], help=f"write {REPLAY_T0_KEY}")

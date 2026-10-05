@@ -20,7 +20,8 @@ fed by the gateway request events. Of it the scaler reads ``U[0:l]`` only:
   tick; ours, the paper does not say how often the rule is evaluated.
 * Tier-2 never isolates below the current window's Tier-1 ``N`` (decision 2026-10-06; a
   state gate: the window's forecast is evidence too). It may add above ``N`` and isolate
-  back down to ``N``; each clamped attempt counts ``tier2_below_t1`` (reported).
+  back down to ``N``; ``tier2_below_t1`` counts the windows in which Tier-2 wanted to go
+  below ``N`` (once per window, reported).
 * scale-down, at most once per Tier-1 window (paper), when every pod's
   ``max U[0:l] < T_f``: the paper isolates ``N_c - sum_p max(U'_p) / T_f`` instances, i.e.
   keeps ``sum_p max(U'_p) / T_f`` of them: the load packed onto instances each at ``T_f``.
@@ -145,6 +146,8 @@ class _ModelState:
     #: Tier-1 N of the current window (None: Tier-1 inactive or no estimate). Tier-2 may add
     #: above it and isolate back down to it, never below (decision 2026-10-06).
     t1_n: Optional[int] = None
+    #: Down key of the last window whose clamp at t1_n was counted (once per window).
+    below_t1_key: Optional[Hashable] = None
     credited: set[str] = field(default_factory=set)
     last_down_key: Optional[Hashable] = None
 
@@ -563,8 +566,10 @@ class PreServePolicy:
                     if st.t1_n is not None and keep < st.t1_n:
                         # The window's forecast is evidence too: Tier-2 does not isolate
                         # below the Tier-1 N (e.g. at a window start, before the burst
-                        # fills the look-ahead maps).
-                        anom["tier2_below_t1"] += 1
+                        # fills the look-ahead maps). Counted once per window.
+                        if st.below_t1_key != down_key:
+                            st.below_t1_key = down_key
+                            anom["tier2_below_t1"] += 1
                         keep = st.t1_n
                     if keep < awake:
                         st.last_down_key = down_key

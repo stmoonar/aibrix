@@ -558,7 +558,8 @@ def test_metrics_report_policy_counters_and_non_streaming_arrivals(tmp_path) -> 
     def with_events(tick=0):
         snap = gather(tick)
         evs = tuple(RequestEvent(kind="arr", model="a", pod="p", req_id=f"r{i}", ts_ms=snap.now_ms, in_tokens=5,
-                                 in_src="header", max_tokens=5, out_tokens=None, status=None, stream=i == 0)
+                                 in_src="estimate" if i == 2 else "header", max_tokens=5, out_tokens=None,
+                                 status=None, stream=i == 0)
                     for i in range(3))
         return replace(snap, models={**snap.models, "a": replace(snap.models["a"], events=evs)})
 
@@ -567,4 +568,5 @@ def test_metrics_report_policy_counters_and_non_streaming_arrivals(tmp_path) -> 
     text = shell.metrics_text()
     assert 'tre_bl_arrivals_total{policy="scripted",model="a"} 3' in text
     assert 'tre_bl_nonstream_arrivals_total{policy="scripted",model="a"} 2' in text
+    assert 'tre_bl_nonheader_in_tokens_total{policy="scripted",model="a"} 1' in text   # P2-D
     assert 'tre_bl_policy_events_total{policy="scripted",model="a",name="ft_without_arr"} 2' in text

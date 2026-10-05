@@ -244,6 +244,7 @@ class MetricsRunner(FakeRunner):
                 return RunResult(0, f'tre_gateway_bl_req_events_dropped_total{{reason="buffer_full"}} {self.dropped}\n')
             return RunResult(0, 'tre_bl_arrivals_total{policy="preserve",model="m"} 40\n'
                                 'tre_bl_nonstream_arrivals_total{policy="preserve",model="m"} 0\n'
+                                'tre_bl_nonheader_in_tokens_total{policy="preserve",model="m"} 2\n'
                                 'tre_bl_policy_events_total{policy="preserve",model="m",name="ft_without_arr"} 3\n'
                                 'tre_bl_sm_dropped_total{policy="preserve"} 1\n')
         if argv[3:5] == ["get", "pods"] and "app=tre-gateway-plugins" in argv:
@@ -263,6 +264,19 @@ def test_run_validity_reports_gateway_drops_since_the_marker_and_policy_counters
     assert code == 0, out
     doc = json.loads((dest / "run_validity.json").read_text())
     assert doc["gw_bl_dropped_delta"] == 2.0 and doc["events_valid"] is False
-    assert doc["arrivals"] == {"m": {"arrivals": 40.0, "nonstream_arrivals": 0.0}}
+    assert doc["arrivals"] == {"m": {"arrivals": 40.0, "nonstream_arrivals": 0.0, "nonheader_in_tokens": 2.0}}
     assert doc["policy_events"] == {"m": {"ft_without_arr": 3.0}} and doc["sm"]["tre_bl_sm_dropped_total"] == 1.0
     assert (dest / "tre-v2-baseline-scaler-abc12.metrics.txt").is_file()
+
+
+def test_events_valid_needs_arrivals_no_drops_and_headers_when_sent() -> None:
+    def metrics(arr, nonheader):
+        return {"p": f'tre_bl_arrivals_total{{model="m"}} {arr}\ntre_bl_nonheader_in_tokens_total{{model="m"}} {nonheader}\n'}
+
+    marker = {"gw_bl_dropped0": 5.0}
+    assert arm.run_validity(metrics(10, 0), marker, 5.0, True)["events_valid"] is True
+    assert arm.run_validity(metrics(0, 0), marker, 5.0)["invalid_because"] == ["no arrivals seen"]
+    doc = arm.run_validity(metrics(10, 3), marker, 5.0, client_sent_in_tokens=True)
+    assert doc["events_valid"] is False and "header" in doc["invalid_because"][0]
+    assert arm.run_validity(metrics(10, 3), marker, 5.0)["events_valid"] is True   # flag off: estimates expected
+    assert arm.run_validity(metrics(10, 0), marker, None)["events_valid"] is False  # drops unknown
