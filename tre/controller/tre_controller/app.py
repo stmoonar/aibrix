@@ -376,7 +376,7 @@ def create_controller_dependencies(
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
         "slo_mode": cfg.safescale.slo_mode,
         "early_commit": cfg.safescale.early_commit,
-        "early_commit_min_observe_ms": cfg.safescale.early_commit_min_observe_ms,
+        "early_commit_min_grids": cfg.safescale.early_commit_min_grids,
         "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
     }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)

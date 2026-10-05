@@ -187,7 +187,7 @@ poll:
 | (a) | at least `min_commit_samples` requests of the remaining pods judged, p95 available |
 | (b) | the formal commit gates pass on the evidence covered so far (`_judge` in early mode: latency SLO, complete evidence of every remaining pod in this poll, fresh cluster view, KV-cache ceiling, Z tail >= tau_low); the evidence must cover up to the poll's read time instead of the deadline |
 | (c) | the hidden pods have nothing in flight: vLLM `num_requests_running + num_requests_waiting` of each hidden pod (scraped in the same poll, never part of the evidence) known and 0, and the gateway in-flight count (`tre:v2:gw:inflight:<pod>` totals of the **live** plugin instances only - heartbeat in `tre:v2:gw:instances` at most `service_manager.sleep.instance_staleness_s` old, Redis TIME - read with the shared `tre_common.gateway_inflight` reader (2026-10-06: a field a dead instance left behind no longer blocks until its TTL); unknown without a live instance) known and 0 |
-| (d) | see "Review fixes" (P2-3): `early_commit_min_grids` complete post-hide grids in the newest snapshot window (default 2) and max(those grids, p95 e2e, W / 2) since the hide confirmation |
+| (d) | one evidence floor (Q4, 2026-10-06; was "Review fixes" P2-3): `scaling.min_evidence_grids` (O1's warm rule, default 2) complete post-hide grids in the newest snapshot window, AND at least the donor's p95 e2e since the hide confirmation |
 
 In early mode nothing but a commit is acted on: an outcome that would extend,
 wait, roll back or fail a gate leaves the probe probing, and the deadline decides
@@ -199,9 +199,11 @@ follow-up upscales; its decision carries `early_commit` {`elapsed_ms`, `samples`
 
 ### Configuration
 
-Registry `safescale.early_commit: true`, `safescale.early_commit_min_grids: 2`
-(and the params mirror). `false` = deadline only. The controller wires the hidden
-pod scrape and the gateway reader only when enabled.
+Registry `safescale.early_commit: true` (and the params mirror). `false` = deadline
+only. The controller wires the hidden pod scrape and the gateway reader only when
+enabled. The post-hide grids are `scaling.min_evidence_grids` (Q4, 2026-10-06: the
+separate `safescale.early_commit_min_grids` key was removed; a registry that still
+carries it loads with an unknown-key warning).
 
 ### Why rollback is not weakened
 
@@ -213,12 +215,14 @@ commit needs at least the evidence volume the deadline commit needs
 ### Risks
 
 * Less elapsed time means fewer samples of slow phases (for example long decodes
-  that complete later); (a) and (d) bound this, and min grids can be raised.
+  that complete later); (a) and (d) bound this (`min_commit_samples` judged requests,
+  the O1 post-hide grids, one p95 e2e), and `scaling.min_evidence_grids` can be raised.
 * The Z gate reads the snapshot tail, whose 30 s windows still include pre-hide
   grids early in the probe (as at a 20 s deadline); (d) requires one whole
   post-hide grid in the newest window.
-* The gateway count includes fields of instances that stopped without clearing
-  them; that only blocks an early commit (the deadline still decides).
+* The gateway count includes only live plugin instances (2026-10-06); a live
+  instance that stopped counting would only block an early commit (the deadline
+  still decides).
 * Each poll reads the hidden pods too (a few more scrapes per probe).
 
 Tests: `controller/tests/test_timer_cleanup_early_commit_20261002.py`.
@@ -291,6 +295,12 @@ dwell"), `controller/tests/test_c1_deficit_scaleup_20261001.py`
   the hide confirmation is at least max(those grids, the donor's p95 end-to-end
   latency, W / 2). The remaining pods' concurrency needs about one end-to-end
   latency to reach its new level; an early commit at most halves W.
+  **Superseded by Q4 (2026-10-06):** the W / 2 term and the separate minimum
+  observation time are gone (a slow-down-only bound: the evidence gates already
+  decide). The single evidence floor is `scaling.min_evidence_grids` complete
+  post-hide grids AND one p95 e2e since the hide confirmation, together with
+  `min_commit_samples` (20) judged requests, drained hidden pods (live-instance
+  gateway count) and every commit gate passing.
 * **Stalled probe (P2-4).** `insufficient_evidence:stalled` (traffic in flight, not
   one request completed within W) is a capacity rollback for the item-2 gate.
 * **Permanent hold under unchanged evidence (P3-5).** After a capacity rollback, a

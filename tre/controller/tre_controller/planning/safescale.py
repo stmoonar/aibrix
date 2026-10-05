@@ -1363,13 +1363,17 @@ class SafeScaleStateMachine:
         wall_now_ms: int,
         poll: DirectPoll | None,
     ) -> SafeScaleDecision | None:
-        """Timer cleanup (2026-10-02): commit a direct-evidence probe before its deadline
-        when (a) ``min_commit_samples`` requests of the remaining pods are judged, (b) the
-        formal commit gates pass on the evidence so far (:meth:`_judge` early mode: SLO,
-        KV-cache, Z tail, evidence completeness), (c) the hidden pods have nothing in
-        flight - the gateway's in-flight count and vLLM running + waiting both known and
-        0 - and (d) ``early_commit_min_observe_ms`` passed since the hide confirmation
-        and the snapshot tail holds a window ending a whole gateway grid after the hide.
+        """Timer cleanup (2026-10-02, simplified 2026-10-06 Q4): commit a direct-evidence
+        probe before its deadline when (a) ``min_commit_samples`` requests of the
+        remaining pods are judged, (b) the formal commit gates pass on the evidence so far
+        (:meth:`_judge` early mode: SLO, KV-cache, Z tail, evidence completeness), (c) the
+        hidden pods have nothing in flight - the gateway's in-flight count of the live
+        plugin instances and vLLM running + waiting both known and 0 - and (d) one
+        evidence floor: the newest snapshot window holds ``early_commit_min_grids``
+        (= ``scaling.min_evidence_grids``, the O1 warm rule) complete post-hide gateway
+        grids AND at least the donor's p95 end-to-end latency passed since the hide
+        confirmation (the remaining pods' concurrency needs about one e2e to settle).
+        No fixed share of W and no separate minimum observation time.
         None = keep probing (the deadline decides as before)."""
         cfg = self._config
         if not bool(getattr(cfg, "early_commit", False)) or poll is None:
@@ -1381,17 +1385,13 @@ class SafeScaleStateMachine:
         if window is None or window.coverage_end_ms is None or int(window.end_ms) != int(wall_now_ms):
             return None
         elapsed = int(wall_now_ms) - int(probe.window_base_ms)
-        # Review P2-3: never before half of W, one p95 end-to-end latency (the remaining
-        # pods' concurrency needs about one e2e to reach its new steady state) and the
-        # configured post-hide grids.
+        # Review P2-3 / Q4: at least one p95 end-to-end latency since the hide
+        # confirmation (the remaining pods' concurrency needs about one e2e to reach its
+        # new steady state); the post-hide grids below are the other half of the floor.
         inputs = (probe.window_terms or {}).get("inputs") or {}
         p95_e2e = _optional_float(inputs.get("p95_e2e_ms")) if isinstance(inputs, dict) else None
         grids = max(1, int(getattr(cfg, "early_commit_min_grids", 2) or 1))
-        min_elapsed = max(
-            float(getattr(cfg, "early_commit_min_observe_ms", 0.0) or 0.0),
-            0.5 * float(probe.window_ms or 0.0),
-            float(p95_e2e or 0.0),
-        )
+        min_elapsed = float(p95_e2e or 0.0)
         if elapsed < min_elapsed:
             return None
         min_samples = int(getattr(cfg, "min_commit_samples", 20))

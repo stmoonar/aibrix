@@ -725,20 +725,21 @@ class SafeScaleRegistryConfig:
     #: failed probe started from, or its Z is at least this much (absolute, Z units)
     #: above the Z that started it. Replaces the fixed 60 s rollback backoff.
     rollback_retry_z_margin: float = 0.25
-    #: Timer cleanup (2026-10-02): commit a direct-evidence probe before its deadline
-    #: once min_commit_samples requests are judged, every commit gate passes, the hidden
-    #: pods have nothing in flight (gateway count and vLLM running + waiting), the newest
-    #: snapshot window holds ``early_commit_min_grids`` complete post-hide gateway grids
-    #: (at least scaling.min_evidence_grids, the O1 warm rule) and at least max(those
-    #: grids, p95 e2e, W / 2) passed since the hide confirmation.
+    #: Timer cleanup (2026-10-02, simplified 2026-10-06 Q4): commit a direct-evidence
+    #: probe before its deadline once min_commit_samples requests are judged, every
+    #: commit gate passes, the hidden pods have nothing in flight (gateway count of the
+    #: live plugin instances and vLLM running + waiting), the newest snapshot window
+    #: holds scaling.min_evidence_grids complete post-hide gateway grids (the O1 warm
+    #: rule) and at least the donor's p95 e2e passed since the hide confirmation. The
+    #: former ``early_commit_min_grids`` key is gone (an old registry carrying it still
+    #: loads: unknown keys are only warned about).
     early_commit: bool = True
-    early_commit_min_grids: int = 2
 
 
 SAFESCALE_KEYS = frozenset({
     "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
     "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port", "baseline_delay_ms",
-    "rollback_retry_z_margin", "early_commit", "early_commit_min_grids",
+    "rollback_retry_z_margin", "early_commit",
 })
 SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
 
@@ -816,14 +817,6 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
     early = raw.get("early_commit", defaults.early_commit)
     if not isinstance(early, bool):
         raise ValueError(f"safescale.early_commit must be true or false, got {early!r}")
-    grids_raw = raw.get("early_commit_min_grids")
-    grids = defaults.early_commit_min_grids if grids_raw is None else grids_raw
-    try:
-        valid_grids = not isinstance(grids, bool) and float(grids) == int(float(grids)) and int(float(grids)) >= 1
-    except (TypeError, ValueError, OverflowError):
-        valid_grids = False
-    if not valid_grids:
-        raise ValueError(f"safescale.early_commit_min_grids must be an integer >= 1, got {grids!r}")
     return SafeScaleRegistryConfig(
         slo_mode=mode,
         window_ceiling_s=float(ceiling),
@@ -836,7 +829,6 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         baseline_delay_ms=float(baseline_delay),
         rollback_retry_z_margin=float(z_margin),
         early_commit=early,
-        early_commit_min_grids=int(float(grids)),
     )
 
 

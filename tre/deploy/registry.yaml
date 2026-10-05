@@ -631,14 +631,14 @@ safescale:
   # Direct path: commit before the deadline (timer cleanup) once, on the same poll,
   # min_commit_samples requests are judged, every commit gate passes (SLO, KV cache,
   # Z tail, complete evidence of every remaining pod), the hidden pods have nothing in
-  # flight (gateway in-flight count and vLLM running + waiting, both known and 0),
-  # the newest snapshot window holds early_commit_min_grids complete post-hide
-  # gateway grids (10 s each; at least scaling.min_evidence_grids, the O1 warm rule)
-  # and max(those grids, p95 e2e, W / 2) passed since the hide confirmation (an early
-  # commit at most halves W). Rollback checks are unchanged and run first on every
-  # tick. false = commit at the deadline only.
+  # flight (gateway in-flight count of the live plugin instances and vLLM running +
+  # waiting, both known and 0), the newest snapshot window holds
+  # scaling.min_evidence_grids complete post-hide gateway grids (10 s each, the O1
+  # warm rule) and at least the donor's p95 e2e passed since the hide confirmation
+  # (2026-10-06: no W / 2 term, no separate early_commit_min_grids key). Rollback
+  # checks are unchanged and run first on every tick. false = commit at the deadline
+  # only.
   early_commit: true
-  early_commit_min_grids: 2
 
 # Fast-loop scale-up (controller only; read at start, restart-to-apply; every key
 # optional, the values below are the built-in defaults). C1, design

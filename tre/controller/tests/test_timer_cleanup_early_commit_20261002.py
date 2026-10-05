@@ -4,9 +4,11 @@ early commit on the direct evidence path.
 Before the deadline (hide confirmation + W) a probe commits once, on the same poll,
 (a) min_commit_samples requests of the remaining pods are judged, (b) every formal
 commit gate passes on the evidence so far, (c) the hidden pods have nothing in flight
-(gateway count and vLLM running + waiting, both known and 0) and (d) at least
-early_commit_min_observe_ms passed since the confirmation and the snapshot tail holds a
-window ending a whole gateway grid after the hide. Rollback checks are unchanged."""
+(gateway count of the live plugin instances and vLLM running + waiting, both known and
+0) and (d) one evidence floor (Q4, 2026-10-06): the newest snapshot window holds
+scaling.min_evidence_grids complete post-hide grids and at least the donor's p95 e2e
+passed since the confirmation (no W / 2 term, no minimum observation time). Rollback
+checks are unchanged."""
 
 from __future__ import annotations
 
@@ -53,7 +55,6 @@ class EarlyHarness(Harness):
     def __init__(self, pods=("m-0", "m-2"), **cfg) -> None:
         cfg.setdefault("min_window_ms", float(LONG_W))
         cfg.setdefault("early_commit", True)
-        cfg.setdefault("early_commit_min_observe_ms", 10_000.0)
         self.gateway: float | None = 0.0
         self.gateway_reads: list[tuple[str, ...]] = []
         super().__init__(pods=pods, **cfg)
@@ -86,11 +87,11 @@ def test_commits_at_the_first_poll_that_meets_every_condition():
     h.start()
     at, decision = _first_terminal(h, HIDE + LONG_W)
     # Polls every 2 s from 105 s: 20 samples are there early; the newest snapshot window
-    # holds two post-hide grids (110-130 s) from the 131 s poll; W / 2 = 30 s since the
-    # confirmation (review P2-3: an early commit at most halves W) -> the 133 s poll.
-    assert (at, decision.status, decision.reason) == (133_000, "commit", "formal_commit_gate_passed")
+    # holds two post-hide grids (110-130 s) from the 131 s poll, and one p95 e2e has long
+    # passed (Q4: no W / 2 term) -> the 131 s poll.
+    assert (at, decision.status, decision.reason) == (131_000, "commit", "formal_commit_gate_passed")
     early = decision.details["early_commit"]
-    assert early["elapsed_ms"] == 30_000 and early["min_elapsed_ms"] == 30_000 and early["samples"] >= 20
+    assert early["elapsed_ms"] == 28_000 and early["min_elapsed_ms"] < 28_000 and early["samples"] >= 20
     assert early["post_hide_grids"] == 2
     assert early["planned_deadline_ms"] == HIDE + LONG_W
     assert (early["hidden_in_flight"], early["gateway_in_flight"]) == (0.0, 0.0)
@@ -138,14 +139,6 @@ def test_fewer_than_min_commit_samples_never_commit_early():
     assert h.tick(143_000, serve=10).status == "probing"  # 10 judged < 20
     decision = h.tick(145_000, serve=10)
     assert decision.status == "commit" and decision.details["early_commit"]["samples"] == 20
-
-
-def test_the_minimum_observation_time_is_configurable():
-    h = EarlyHarness(early_commit_min_observe_ms=40_000.0)
-    h.start()
-    at, decision = _first_terminal(h, HIDE + LONG_W)
-    assert decision.status == "commit" and at == 143_000
-    assert decision.details["early_commit"]["elapsed_ms"] == 40_000
 
 
 def test_a_long_e2e_model_never_commits_before_one_p95_e2e():
@@ -230,7 +223,7 @@ def test_the_state_machine_logs_a_json_event(caplog):
     with caplog.at_level(logging.INFO, logger="tre_controller.safescale"):
         _first_terminal(h, HIDE + LONG_W)
     events = [json.loads(r.getMessage()) for r in caplog.records if "safescale_early_commit" in r.getMessage()]
-    assert events and events[0]["model"] == MODEL and events[0]["elapsed_ms"] == 30_000
+    assert events and events[0]["model"] == MODEL and events[0]["elapsed_ms"] == 28_000
 
 
 NOW_MS = 1_000_000
@@ -273,16 +266,20 @@ def test_gateway_inflight_reader_counts_live_instances_only():
     assert GatewayInflightReader(_FakeRedis(fail=True))(("m-1",)) is None
 
 
-def test_registry_and_config_keys():
-    assert (SafeScaleRegistryConfig().early_commit, SafeScaleRegistryConfig().early_commit_min_grids) == (True, 2)
-    shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale()
-    assert (shipped.early_commit, shipped.early_commit_min_grids) == (True, 2)
+def test_registry_and_config_keys(tmp_path):
+    assert SafeScaleRegistryConfig().early_commit is True
+    shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))
+    assert shipped.safescale().early_commit is True and shipped.scaling().min_evidence_grids == 2
     assert parse_safescale_config({"early_commit": False}).early_commit is False
-    assert parse_safescale_config({"early_commit_min_grids": 3}).early_commit_min_grids == 3
-    for bad in ({"early_commit": "yes"}, {"early_commit_min_grids": 0}, {"early_commit_min_grids": 1.5},
-                {"early_commit_min_grids": True}):
-        with pytest.raises(ValueError):
-            parse_safescale_config(bad)
-    cfg = ControllerConfig.from_env({}).safescale
-    assert cfg.early_commit is True and cfg.early_commit_min_observe_ms == 20_000.0
-    assert cfg.early_commit_min_grids == 2
+    with pytest.raises(ValueError):
+        parse_safescale_config({"early_commit": "yes"})
+    # Q4: the post-hide grids are O1's scaling.min_evidence_grids; a registry that still
+    # carries the removed safescale.early_commit_min_grids loads (unknown key: a warning).
+    text = (TRE_DIR / "deploy" / "registry.yaml").read_text()
+    assert "\n  min_evidence_grids: 2\n" in text and "\n  early_commit: true\n" in text
+    text = text.replace("\n  min_evidence_grids: 2\n", "\n  min_evidence_grids: 3\n")
+    text = text.replace("\n  early_commit: true\n", "\n  early_commit: true\n  early_commit_min_grids: 5\n")
+    path = tmp_path / "registry.yaml"
+    path.write_text(text)
+    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)}).safescale
+    assert cfg.early_commit is True and cfg.early_commit_min_grids == 3

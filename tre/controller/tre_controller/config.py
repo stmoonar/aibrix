@@ -103,16 +103,16 @@ class SafeScaleConfig:
     # least this much above the Z that started it. Other rollbacks (evidence gaps,
     # maintenance, observe mode, hide failures) need the new window only.
     rollback_retry_z_margin: float = 0.25
-    # Timer cleanup (registry safescale.early_commit / early_commit_min_grids): a
-    # direct-evidence probe commits before its deadline once min_commit_samples requests
-    # are judged, every commit gate passes, the hidden pods have nothing in flight
-    # (gateway count and vLLM running + waiting) and early_commit_min_observe_ms passed
-    # since the hide confirmation (min grids x the gateway period). Rollbacks unchanged.
+    # Timer cleanup (registry safescale.early_commit): a direct-evidence probe commits
+    # before its deadline once min_commit_samples requests are judged, every commit gate
+    # passes, the hidden pods have nothing in flight (gateway count of the live plugin
+    # instances and vLLM running + waiting) and the evidence floor holds. Rollbacks
+    # unchanged.
     early_commit: bool = True
-    early_commit_min_observe_ms: float = 20_000.0
-    # Review P2-3: complete post-hide gateway grids the newest snapshot window must hold
-    # (max of safescale.early_commit_min_grids and scaling.min_evidence_grids); the
-    # early commit also waits for max(p95 e2e, W / 2) since the hide confirmation.
+    # Q4 (2026-10-06), the single evidence floor: complete post-hide gateway grids the
+    # newest snapshot window must hold = registry scaling.min_evidence_grids (O1's warm
+    # rule; no separate safescale key), and at least the donor's p95 e2e since the hide
+    # confirmation. No W / 2 term, no separate minimum observation time.
     early_commit_min_grids: int = 2
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
@@ -278,7 +278,7 @@ class ControllerConfig:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below the gateway period")
 
         safescale_registry = _safescale_registry(registry_path)
-        early_grids = max(int(safescale_registry.early_commit_min_grids), _o1_min_evidence_grids(registry_path))
+        early_grids = _o1_min_evidence_grids(registry_path)
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
             tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
@@ -304,7 +304,6 @@ class ControllerConfig:
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             early_commit=bool(safescale_registry.early_commit),
-            early_commit_min_observe_ms=float(early_grids) * float(instant_sample_interval_ms),
             early_commit_min_grids=early_grids,
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
@@ -485,7 +484,8 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
 
 
 def _o1_min_evidence_grids(registry_path: str) -> int:
-    """Registry scaling.min_evidence_grids (O1 warm rule; 2 without a readable registry)."""
+    """Registry scaling.min_evidence_grids (O1 warm rule; 2 without a readable registry):
+    also the SafeScale early commit's post-hide grids (Q4)."""
     try:
         scaling = load_registry(registry_path).scaling()
         return int(getattr(scaling, "min_evidence_grids", 2) or 1)
