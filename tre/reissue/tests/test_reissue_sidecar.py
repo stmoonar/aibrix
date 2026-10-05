@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from dataclasses import replace
 
@@ -43,12 +44,17 @@ class _OptionsServer(TestServer):
 
 class Harness:
     def __init__(self, *, a: dict | None = None, b: dict | None = None, cfg: dict | None = None,
-                 routable: tuple[str, ...] = ("pod-b",)) -> None:
+                 routable: tuple[str, ...] = ("pod-b",), keepalive: bool = True, monitor: bool = True) -> None:
+        """``keepalive=False``: the client and the gateway keep no idle connection (every
+        socket still open after a request ends is one a sidecar holds); ``monitor=False``:
+        no background /is_sleeping probe or /v1/models fetch."""
         self.engine_a = FakeEngine("a", **(a or {}))
         self.engine_b = FakeEngine("b", **({"token_delay_s": 0.001} | (b or {})))
-        self.gateway = FakeGateway()
+        self.gateway = FakeGateway(keepalive=keepalive)
         self.gateway.routable = list(routable)
         self.cfg_overrides = cfg or {}
+        self.keepalive = keepalive
+        self.monitor = monitor
 
     async def __aenter__(self) -> "Harness":
         self.servers = []
@@ -60,10 +66,14 @@ class Harness:
         base = replace(base, **self.cfg_overrides)
         self.sidecar_a = ReissueSidecar(replace(base, upstream_url=_url(self.ea), pod_name="pod-a"))
         self.sidecar_b = ReissueSidecar(replace(base, upstream_url=_url(self.eb), pod_name="pod-b"))
+        if not self.monitor:
+            async def no_monitor() -> None:
+                return None
+            self.sidecar_a._monitor = self.sidecar_b._monitor = no_monitor
         self.sa = await self._serve(self.sidecar_a.build_app(), sc.server_options(base))
         self.sb = await self._serve(self.sidecar_b.build_app(), sc.server_options(base))
         self.gateway.pods = {"pod-a": _url(self.sa), "pod-b": _url(self.sb)}
-        self.http = aiohttp.ClientSession()
+        self.http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=not self.keepalive))
         return self
 
     async def _serve(self, app, options: dict | None = None) -> TestServer:
@@ -664,6 +674,44 @@ async def test_client_leaving_after_done_is_a_completed_request():
         await _until(lambda: h.engine_a.disconnected == 1)
         assert "client_cancel" not in h.sidecar_a.metrics.events
         assert _hist(h).count == 1
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="counts /proc/self/fd")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["complete", "client_cancel", "upstream_error", "continuation", "retry"])
+async def test_open_sockets_return_to_baseline_after_each_terminal_path(path):
+    """T4 (I3 / I4): the client and the gateway keep no idle connection and the sidecars'
+    loopback pool drops an idle one after 0.05 s, so once a request has ended - completed,
+    cancelled by its client, broken upstream, continued on pod B, retried through the
+    gateway - every socket it used is closed again: the process is back to its open-fd
+    baseline. A socket still open is one a sidecar holds (orphaned upstream work, a
+    response never released)."""
+    engine_a = {"complete": {}, "client_cancel": {"hold_at": 0}, "upstream_error": {"break_at": 2},
+                "continuation": {"hold_at": 3}, "retry": {}}[path]
+    cfg = {"max_model_len": 4096, "upstream_keepalive_s": 0.05}
+    async with Harness(a=engine_a, cfg=cfg, keepalive=False, monitor=False) as h:
+        baseline = _open_fds()
+        if path == "client_cancel":
+            task = asyncio.ensure_future(h.post("/v1/completions", completion_body(8)))
+            await _until(lambda: h.engine_a.active)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif path == "upstream_error":
+            with pytest.raises(aiohttp.ClientError):  # the sidecar closes the client's stream too
+                await h.post("/v1/completions", completion_body(8))
+        else:
+            if path == "retry":
+                h.engine_a.put_to_sleep()
+            status, _, raw = await h.post("/v1/completions", completion_body(8),
+                                          sleep_after=3 if path == "continuation" else None)
+            assert status == 200 and text_of(parse_sse(raw), False) == expected_text(tokenize(PROMPT), 8)
+        await _until(lambda: _open_fds() == baseline)
+        assert not h.engine_a.active and not h.engine_b.active
 
 
 @pytest.mark.asyncio

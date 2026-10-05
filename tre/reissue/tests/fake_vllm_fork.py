@@ -91,6 +91,7 @@ class FakeEngine:
         hold_sleep: bool = False,
         fail_sleep: bool = False,
         hold_abort_output: bool = False,
+        break_at: int | None = None,
     ) -> None:
         self.name = name
         self.token_delay_s = token_delay_s
@@ -109,6 +110,8 @@ class FakeEngine:
         #: an aborted generation emits its abort output only after ``release_abort_output``.
         self.hold_abort_output = hold_abort_output
         self._abort_output_release = asyncio.Event()
+        #: a stream's connection is dropped (no abort, no [DONE]) before token ``break_at``.
+        self.break_at = break_at
         self.sleeping = False
         self.requests: list[dict[str, Any]] = []
         self.active: dict[str, _Req] = {}
@@ -287,6 +290,9 @@ class FakeEngine:
                 role_sent = False
                 full, sent = "", 0
                 for index in range(max_tokens):
+                    if self.break_at is not None and index == self.break_at:
+                        request.transport.close()  # an engine crash mid-stream
+                        break
                     ok = await step(index)
                     if chat and not role_sent:
                         await resp.write(_sse(chunk("", None, role=True)))
@@ -371,9 +377,11 @@ class FakeEngine:
 
 class FakeGateway:
     """Routes to the first routable pod not named in x-tre-exclude-pod; 503 +
-    Retry-After when there is none. Streams the pod's answer back."""
+    Retry-After when there is none. Streams the pod's answer back. ``keepalive=False``:
+    no idle connection on either side (each response closes its connection)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, keepalive: bool = True) -> None:
+        self.keepalive = keepalive
         self.pods: dict[str, str] = {}
         self.routable: list[str] = []
         self.requests: list[dict[str, Any]] = []
@@ -398,12 +406,15 @@ class FakeGateway:
         candidates = [p for p in self.routable if p not in exclude]
         if not candidates:
             record["status"] = 503
-            return web.json_response({"error": {"message": "no routable pod", "type": "ServiceUnavailable"}},
+            resp = web.json_response({"error": {"message": "no routable pod", "type": "ServiceUnavailable"}},
                                      status=503, headers={"Retry-After": "0"})
+            if not self.keepalive:
+                resp.force_close()
+            return resp
         pod = candidates[0]
         record["target"] = pod
         if self.session is None:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=not self.keepalive))
         headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
         upstream = await self.session.request(request.method, self.pods[pod] + request.path_qs, data=raw,
                                               headers=headers)
@@ -412,6 +423,8 @@ class FakeGateway:
         out_headers["target-pod"] = pod
         try:
             resp = web.StreamResponse(status=upstream.status, headers=out_headers)
+            if not self.keepalive:
+                resp.force_close()
             await resp.prepare(request)
             async for data in upstream.content.iter_any():
                 await resp.write(data)
