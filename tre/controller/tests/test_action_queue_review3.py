@@ -95,7 +95,7 @@ def transfer_body(count, *, done=None, taken=None, unfilled=0, clamped=False, st
     return {
         "transfer_id": transfer_id, "donor_model": "7b", "receiver_model": "8b", "count": count,
         "pairs": pairs, "done": done, "taken": taken, "clamped_by_floor": clamped,
-        "donors_slept": taken, "receivers_woken": done, "unfilled": unfilled,
+        "unfilled": unfilled,
         "refusals": list(refusals), "skipped": dict(skipped or {}),
         "picked": [{"serve_id": pair["receiver"]} for pair in pairs if pair["status"] == "done"],
         "phases_ms": {"L1": 1, "U1": 2, "L2": 1, "U2": 2, "L3": 1},

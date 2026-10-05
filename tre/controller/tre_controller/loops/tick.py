@@ -1103,7 +1103,7 @@ def _model_contexts(
     routable_error = getattr(cluster_view, "routable_error", None)
     if cluster_view is not None and routable_error:
         # The SM did not report its routable view (older SM, or it could not read the
-        # Pods / reservations / leases): the controller's own count is used this tick.
+        # Pods / GPU leases): the controller's own count is used this tick.
         events.append(f"sm_routable_fallback:{routable_error}")
     cluster_counts = _cluster_view_counts(cluster_view)
     awake_counts = _awake_including_hidden(cluster_view)

@@ -1585,10 +1585,9 @@ class SafeScaleStateMachine:
                 pods=probe.pods,
                 delta=-len(probe.pods),
                 reason=reason,
-                # Plan D1: drain_budget_s = W is still sent to the SM, but it is ignored
-                # while safescale_commit is in service_manager.sleep.no_drain_paths (the
-                # default): SleepPolicy.soft_budget_s (tre_common/registry.py) returns 0
-                # for no-drain paths whatever budget the caller passes. The probe window,
+                # Plan D1: drain_budget_s = W is still sent to the SM, which ignores it:
+                # the SM never drains on any sleep path (2026-10-02; the registry key
+                # service_manager.sleep.no_drain_paths is deprecated). The probe window,
                 # with the pods already hidden, was the drain (v1 / paper, 2026-09-29).
                 drain_budget_s=(
                     float(probe.window_ms) / 1000.0 if probe.window_ms else None

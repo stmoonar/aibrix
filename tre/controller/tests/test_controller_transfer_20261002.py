@@ -268,8 +268,8 @@ def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
         "HTTP 409", status=409, body={"error": "writer_busy", "detail": "writer lock wait timed out"}
     ).result()
     assert routable_unknown["not_executed"] and writer_busy["not_executed"] and writer_busy["retriable"]
-    # A plain RetryLater 409 (other endpoints) is still classified as not executed.
-    assert ServiceManagerError("HTTP 409", status=409, body={"detail": "a wake of it is in progress; retry"}).not_executed
+    # A 409 without an error code is not known to have changed nothing (outcome unknown).
+    assert not ServiceManagerError("HTTP 409", status=409, body={"detail": "a wake of it is in progress; retry"}).not_executed
     sm = ScriptedSM(results={
         "transfer:7b->8b": [dict(routable_unknown, retriable=False), dict(writer_busy, retriable=False)],
         "scale:8b": [writer_busy],

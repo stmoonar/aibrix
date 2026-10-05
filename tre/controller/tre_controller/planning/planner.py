@@ -183,7 +183,8 @@ class ScaleAction:
     # Sleep path for a negative delta (SM registry service_manager.sleep.budgets_s key):
     # None = derived at dispatch ("urgent" for *_immediate reasons, else "scale_down").
     sleep_path: str | None = None
-    # Soft drain budget (s) for the SM's hide -> ack -> drain -> /sleep; None = SM default.
+    # Drain budget (s) passed to the SM sleep; ignored there since 2026-10-02 (the SM never
+    # drains on any path: hide -> ack -> /sleep mode=abort). None = none passed.
     drain_budget_s: float | None = None
     # S5 (2026-09-30): ``pods`` of a pure-capacity wake are placement HINTS - the SM
     # picks the GPUs itself (registry placement policy) and substitutes a hint it
@@ -195,8 +196,8 @@ class ScaleAction:
 
 
 #: SM sleep path of the fast-loop "*_immediate" donors (CRIT donor, idle proactive,
-#: low-fairness donor). With the default SM registry it does not drain: hide -> ack
-#: -> /sleep mode=abort, the reissue sidecar continues the cut-off requests (v1).
+#: low-fairness donor). The SM never drains (no sleep path does since 2026-10-02):
+#: hide -> ack -> /sleep mode=abort, the reissue sidecar continues the cut-off requests.
 IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
 
 
@@ -1423,7 +1424,8 @@ class _SlotOccupancy:
         """Up to ``need`` sleeping bindings to wake, in placement-policy order.
 
         Each pick is scored against the GPUs the earlier picks take (buddy fit,
-        pair reservation, node balance; tre_common.gpu_placement), so waking three
+        TP-pair reservation ``placement.reserve_tp_pairs``, node balance;
+        tre_common.gpu_placement), so waking three
         single-GPU replicas fills a half-used pair before it breaks a free one.
         """
         need = max(0, need)
@@ -1944,8 +1946,8 @@ def _add_scale_action(
     hint: bool = False,
 ) -> None:
     """``sleep_path`` / ``drain_budget_s`` go to the SM sleep of a negative delta
-    (None = the dispatcher / SM default). The SM registry decides whether the path
-    drains at all (service_manager.sleep.no_drain_paths)."""
+    (None = the dispatcher / SM default). The SM never drains on any path (since
+    2026-10-02): ``drain_budget_s`` is passed through and ignored there."""
     if delta == 0:
         return
     deltas[model] = deltas.get(model, 0) + delta

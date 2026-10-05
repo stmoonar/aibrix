@@ -155,7 +155,7 @@ class DispatchResult:
     #: done, taken, unfilled, clamped_by_floor, pairs with pod names, refusals).
     transfer: dict | None = None
     #: 2026-10-02: the SM refused the call before changing anything (``routable_unknown``,
-    #: ``writer_busy``, ``floor_violation``, a located wake refusal, a plain RetryLater, 400):
+    #: ``writer_busy``, ``floor_violation``, a located wake refusal, 400 / 404 / 503):
     #: accounted as not executed - no view-pending / O1 stamp, no last action.
     not_executed: bool = False
 
@@ -1430,9 +1430,9 @@ class ActionQueue:
     async def _execute_transfer(self, action: TransferIntent) -> list[DispatchResult]:
         """One relay = one ``POST /v2/transfers`` (2026-10-02). Accounting follows the
         response, never ``count``: the donor side by ``taken`` (donor replicas slept),
-        the receiver side by ``done`` (receivers woken); a 200 may be partial. Pairs the
-        SM left to its recovery keep both models held here until ``GET /v2/transfers``
-        no longer lists the transfer."""
+        the receiver side by ``done`` (receivers woken); a 200 may be partial. The SM
+        completes or fails every pair under its writer lock before it answers: both
+        models are free again when the call returns (nothing is tracked afterwards)."""
         result = await self._timed_dispatch(action, action.receiver_model)
         summary = result.transfer or {}
         donor_result = DispatchResult(
@@ -1835,7 +1835,7 @@ class ActionQueue:
 
     def _resources(self, models: Iterable[str], pods: Iterable[str]) -> set[str]:
         """Models and pods. GPU keys were removed on 2026-10-02: the service-manager
-        serializes GPU use (sleep reservations, GPU leases, writer lock)."""
+        serializes GPU use (its global writer lock and GPU leases)."""
         keys = {f"model:{model}" for model in models}
         keys.update(f"pod:{pod}" for pod in pods)
         return keys
@@ -1900,7 +1900,7 @@ def _transfer_summary(body: dict) -> dict:
             pair["error"] = str(error.get("error"))
         pairs.append(pair)
     done = num("done") if "done" in body else sum(1 for pair in pairs if pair["status"] == "done")
-    taken = num("taken") if "taken" in body else num("donors_slept")
+    taken = num("taken")
     skipped = body.get("skipped") if isinstance(body.get("skipped"), dict) else {}
     return {
         "transfer_id": body.get("transfer_id"),

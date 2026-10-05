@@ -10,8 +10,9 @@ from typing import Any, Iterator, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-#: HTTP statuses of the SM that mean "try again later" (review 2 P2-5): 409 = writer
-#: lock busy / sleep reservation / drain rolled back, 503 = shutting down.
+#: HTTP statuses of the SM that mean "try again later" (review 2 P2-5): 409 = the
+#: writer-lock wait timed out (``writer_busy``) or another conflict (an unhide of a pod
+#: not confirmed awake, a located wake refusal), 503 = shutting down.
 RETRIABLE_STATUSES = frozenset({409, 503})
 
 #: ``error`` codes of a structured 409 wake refusal / failure (S3, 2026-09-30): the
@@ -123,19 +124,17 @@ class ServiceManagerError(Exception):
         """The SM refused the call BEFORE changing anything (2026-10-02): a 400 / 404, a
         503 while shutting down, or a 409 whose code says it was refused up front
         (``routable_unknown``, ``floor_violation``, ``writer_busy``, a located wake
-        refusal other than ``wake_failed``) or a plain ``RetryLater`` 409 (``...; retry``;
-        ``/target`` and ``/v2/transfers`` no longer send it - concurrent requests queue on
-        the SM writer lock). The controller then records no change (no view-pending / O1
-        stamp, no last action) and re-plans on the next tick."""
+        refusal other than ``wake_failed``). The controller then records no change (no
+        view-pending / O1 stamp, no last action) and re-plans on the next tick. A 409
+        without an ``error`` code (the SM's plain RetryLater, sent only by the unhide of
+        a pod not confirmed awake and the Pod startup admission) is not recognised:
+        its outcome counts as unknown."""
         if self.status in (400, 404, 503):
             return True
         if self.status != 409:
             return False
         body = self.body or {}
-        code = body.get("error")
-        if code is None:
-            return str(body.get("detail") or "").rstrip().endswith("retry")
-        return code in NOT_EXECUTED_CODES
+        return body.get("error") in NOT_EXECUTED_CODES
 
     def result(self) -> dict:
         result = {
