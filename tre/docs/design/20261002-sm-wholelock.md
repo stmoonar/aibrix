@@ -81,7 +81,7 @@ SM 已经改成"不排空、一律 abort"，sleep 留在锁外的只是十几毫
 | 参数 | 默认值 | 理由 |
 |---|---|---|
 | `sleep.ack_timeout_s` | 5 s（原 10） | 实测回执 7–15 ms；超时回滚隐藏 |
-| `sleep.sleep_call_timeout_s` | 10 s（原 45） | 实测 sleep 1–3 s；只有一次 `/sleep` |
+| `sleep.sleep_call_timeout_s` | 20 s（原 45；10-02 版曾为 10） | 实测运行中引擎的 sleep 1–3 s；刚启动的引擎做启动收敛 sleep 要久得多（10-06 线上 p50 8.3 s、p90 12.2 s、最大 14.5 s），10 s 会把它们误判为 `sleep_unconfirmed`；只有一次 `/sleep` |
 | `sleep.physical_confirm_timeout_s` | 8 s（原 15） | 实测确认在 1 s 内 |
 | `wake.call_timeout_s` | 10 s（新增，单次尝试） | 实测 wake 1.5–3 s；原来是探测超时 × 3 次重试 |
 | `sleep.probe_timeout_s` | 5 s（10-06 恢复线上值；10-02 版曾改为 2） | `/metrics`、`/version`、`/is_sleeping` 等探测；读不到按"未知"保守处理。很多探测打到负载下的醒着引擎（API server 回 `/metrics` 慢），2 s 会误判"未知"，让 pod 白白保持隐藏或拒绝唤醒 |
@@ -98,24 +98,24 @@ SM 已经改成"不排空、一律 abort"，sleep 留在锁外的只是十几毫
   ×2、隐藏 2、回执等待时插件 pod LIST 超出的一次、确认或回滚的 annotation 2），wake 4（Pod LIST、
   唤醒门的居民 LIST、提交 annotation 2），接力选对 2（floor 与居民的 Pod LIST）。409 冲突立刻返回，
   不计。测试 `test_k8s_call_budget_20261006.py` 检查多 target 时串行调用数不超过这些常数。
-- 一次 sleep：回执 5 + 一轮探测 5 + `/sleep` 10 + max(确认 8 + 最后一轮探测 5，失败回滚的 4 次探测 20)
-  + Kubernetes 8 × 7 + 余量 2 = **98 s**。典型 1–3 s。隐藏（每个 pod 一次 annotation 写）并行。
-- 一次 wake：居民探测 5 + `/wake_up` 10 + 收敛与结算探测 2 × 5 + 补偿睡眠 98 + Kubernetes 4 × 7 + 余量 2
-  = **153 s**；不需要补偿睡眠时 55 s。典型 1.5–3 s。一次调用里所有失败的 wake 一起结算：一轮并行
+- 一次 sleep：回执 5 + 一轮探测 5 + `/sleep` 20 + max(确认 8 + 最后一轮探测 5，失败回滚的 4 次探测 20)
+  + Kubernetes 8 × 7 + 余量 2 = **108 s**。典型 1–3 s。隐藏（每个 pod 一次 annotation 写）并行。
+- 一次 wake：居民探测 5 + `/wake_up` 10 + 收敛与结算探测 2 × 5 + 补偿睡眠 108 + Kubernetes 4 × 7 + 余量 2
+  = **163 s**；不需要补偿睡眠时 55 s。典型 1.5–3 s。一次调用里所有失败的 wake 一起结算：一轮并行
   `/is_sleeping`，醒着的合成**一次** sleep 调用（10-06）。一次 `/target` 醒多个副本时，Pod LIST 和
   居民探测各只做一轮（10-06），提交的 annotation 并行写。
-- 一次接力：选对时的一轮探测 5 + Kubernetes 2 × 7 + donor 的 sleep 98 + receiver 的 wake 153 = **270 s**；
+- 一次接力：选对时的一轮探测 5 + Kubernetes 2 × 7 + donor 的 sleep 108 + receiver 的 wake 163 = **290 s**；
   典型 3–6 s。选对前对所有 donor 卡上的 pod 做**一轮**并行探测，每个候选对的否决读这一轮的结果；
   receiver 的唤醒门不再重复探测（同一次持锁里第三居民已确认睡着、donor 已由 sleep 原语确认睡着）。
 - journal 恢复（supervisor）：所有条目的引擎一轮并行探测；wake journal 结算的条目一起提交（10-06）。
-- 调用方看到的最坏时长：`writer_lock_wait_s` 30 + 最长持锁 270 + 余量 2 = 302 s，registry 校验它小于
+- 调用方看到的最坏时长：`writer_lock_wait_s` 30 + 最长持锁 290 + 余量 2 = 322 s，registry 校验它小于
   `api_call_timeout_s`（360 s，controller 的慢调用超时）。
-- SIGTERM 等待：最长持锁 + 余量 = 272 s，小于 Deployment 的 `terminationGracePeriodSeconds`（300 s）。
+- SIGTERM 等待：最长持锁 + 余量 = 292 s，小于 Deployment 的 `terminationGracePeriodSeconds`（300 s）。
 - cold start、defrag、fleet repair 的持锁按设计以分钟计（等 pod 起来），不在 controller 的规划循环里。
 
 **vLLM hang 时的行为**：所有 vLLM 调用都有 HTTP 超时，持锁时长因此有界。
 
-- sleep：`/sleep` 10 s 内没有应答 → pod 保持隐藏，journal 标 `sleep_unconfirmed`，GPU 租约保留，
+- sleep：`/sleep` 20 s 内没有应答 → pod 保持隐藏，journal 标 `sleep_unconfirmed`，GPU 租约保留，
   立即返回并释放锁；之后每轮 supervisor 由 `recover_sleep_journal` 按物理状态结算（读到睡着记为
   已睡；仍读不到就继续隐藏并计数，审计报 `sleep_unconfirmed`）。
 - wake：`/wake_up` 10 s 内没有应答（超时、连接错误；`VllmOps` 把它记为 `status_code` None，且
@@ -254,3 +254,28 @@ AIBrix 的 APA 臂（`pkg/controller/podautoscaler/workload_scale.go`）先 `POS
   binding 读不出来的 Pod 按"未知居民"处理（fail closed，P3-2）；SM 重启时，store 记为醒着、但记录里
   的 Pod（按名字）已不存在的 binding 不再从这条记录重建 awake 租约，旧的 awake 租约也不沿用；如果
   这个 binding 有新的 Pod，就作为 suspect 由探测结算（P3-4）。store 本身的陈旧记录仍由 reconcile 修正。
+
+## 10. 上线与回滚顺序（10-06 评审 P1-1）
+
+registry 和镜像必须**成对**切换，因为两边的 SM 校验互不兼容：
+
+- **新 SM / controller + 线上旧 ConfigMap 起不来**：旧值（`writer_lock_wait_s` 10、`sleep_call_timeout_s` 45、
+  `physical_confirm_timeout_s` 15、`ack_timeout_s` 10、`io_margin_s` 5）按新公式算出最坏调用
+  10 + 359 + 5 = 374 s，不小于 `api_call_timeout_s` 360 s，新 SM 和新 controller 启动时都拒绝。
+- **旧 SM（20261001，代码 ba5b558f）+ 新 registry**：旧镜像要求 `sleep.reservation_ttl_s` 大于
+  `writer_lock_wait_s + poll_interval_s + probe_timeout_s + io_margin_s` = 30 + 0.5 + 5 + 2 = 37.5 s。
+  所以新 registry 写 `reservation_ttl_s: 40`（新 SM 忽略它）。用 ba5b558f 的 loader 和
+  `validate()` 实测新 registry 没有错误；旧公式的最坏调用 305.5 s < 360 s。守卫测试
+  `deploy/tests/test_registry_compat_20261006.py` 按 ba5b558f 的规则检查这些约束。
+
+上线顺序：
+
+1. 先换 registry ConfigMap（`merge_live_registry.py` 合并 live 后 `kubectl replace`）。旧镜像在重启前不重读
+   registry；即使旧 SM 这时重启，新 registry 也能通过它的校验。
+2. gateway-plugins。
+3. SM（Recreate）。
+4. controller。
+
+回滚：镜像和 ConfigMap 作为**一对**恢复（备份里同时存镜像 tag 和 ConfigMap）。只回滚镜像、保留新 ConfigMap
+也能启动（见上），但旧 SM 会按新 registry 的值运行；只回滚 ConfigMap、保留新镜像会让新 SM / controller
+在下一次重启时拒绝启动。

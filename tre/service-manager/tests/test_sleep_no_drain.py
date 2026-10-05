@@ -63,7 +63,7 @@ def test_the_deprecation_line_names_every_ignored_setting(caplog):
 def test_repo_registry_parses_with_the_whole_lock_timeouts():
     config = load_registry(REPO_REGISTRY).service_manager()
     assert config.sleep.ack_timeout_s == 5.0
-    assert config.sleep.sleep_call_timeout_s == 10.0
+    assert config.sleep.sleep_call_timeout_s == 20.0
     assert config.sleep.physical_confirm_timeout_s == 8.0
     assert config.wake_call_timeout_s == 10.0
     assert config.sleep.sleep_mode_when_idle == "abort"

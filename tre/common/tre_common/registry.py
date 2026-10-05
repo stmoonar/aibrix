@@ -885,10 +885,13 @@ class SleepPolicy:
     no_plugin_grace_s: float = 5.0
     poll_interval_s: float = 0.5
     #: HTTP timeout of the ONE /sleep call of a sleep (weight offload; measured
-    #: 1-3 s, 2026-10-02). There is no second call: a call without an answer in
-    #: this time leaves the pod hidden and its journal entry ``sleep_unconfirmed``
-    #: (the lock is released at once; the journal recovery settles it).
-    sleep_call_timeout_s: float = 10.0
+    #: 1-3 s on a running engine, 2026-10-02; the startup-converge sleeps of
+    #: freshly started engines took p50 8.3 s, p90 12.2 s, max 14.5 s live,
+    #: 2026-10-06, hence 20 s). There is no second call: a call without an
+    #: answer in this time leaves the pod hidden and its journal entry
+    #: ``sleep_unconfirmed`` (the lock is released at once; the journal
+    #: recovery settles it).
+    sleep_call_timeout_s: float = 20.0
     #: HTTP timeout of every other vLLM probe of a sleep (``GET /metrics``,
     #: ``/version``, ``/is_sleeping``, ``/is_paused``, ``/resume``) and of the wake
     #: gate's resident probes. A probe without an answer reads "unknown", which
@@ -920,7 +923,10 @@ class SleepPolicy:
     hard_cap_s: float = DEFAULT_ROUTE_TIMEOUT_S
     #: DEPRECATED, ignored (2026-10-02: no sleep reservation - every sleep holds
     #: the writer lock from the hide to the bookkeeping). Parsed for compatibility.
-    reservation_ttl_s: float = 30.0
+    #: 40 (2026-10-06): the registry ships this value for the previous image
+    #: (ba5b558f), which requires it above writer_lock_wait_s + poll_interval_s +
+    #: probe_timeout_s + io_margin_s (37.5 s with the defaults).
+    reservation_ttl_s: float = 40.0
     #: Gateway plugin pods that must ack, besides advancing heartbeats: a plugin
     #: with Redis trouble may still route while its heartbeat stalls, so Ready pods
     #: matching this selector count as live too. None = heartbeats only.
@@ -1071,7 +1077,7 @@ class ServiceManagerConfig:
         + its sequential Kubernetes calls (:data:`K8S_CALLS_SLEEP` x
         :meth:`k8s_call_s`, review 2026-10-06: a slow API server is part of the
         bound) + the Redis allowance (``io_margin_s``). Defaults:
-        5 + 5 + 10 + max(8 + 5, 4 x 5) + 8 x 7 + 2 = 98 s."""
+        5 + 5 + 20 + max(8 + 5, 4 x 5) + 8 x 7 + 2 = 108 s."""
         sleep = self.sleep
         after_call = max(
             sleep.physical_confirm_timeout_s + sleep.probe_timeout_s,
@@ -1098,7 +1104,7 @@ class ServiceManagerConfig:
         sleep (:meth:`worst_case_sleep_lock_s`; ONE sleep call for every failed
         wake of the call, in parallel) + its sequential Kubernetes calls
         (:data:`K8S_CALLS_WAKE` x :meth:`k8s_call_s`) + ``io_margin_s``. Defaults:
-        5 + 10 + 5 + 5 + 98 + 4 x 7 + 2 = 153 s; without a compensating sleep 55 s."""
+        5 + 10 + 5 + 5 + 108 + 4 x 7 + 2 = 163 s; without a compensating sleep 55 s."""
         sleep = self.sleep
         return (
             sleep.probe_timeout_s
@@ -1114,7 +1120,7 @@ class ServiceManagerConfig:
         pairs: the selection's resident probe (one parallel round for every
         candidate) and its Kubernetes calls (:data:`K8S_CALLS_TRANSFER_SELECT`)
         + the donors' sleep (one call) + the receivers' wake (one call).
-        Defaults: 5 + 2 x 7 + 98 + 153 = 270 s (every failure path and every
+        Defaults: 5 + 2 x 7 + 108 + 163 = 290 s (every failure path and every
         Kubernetes call at its bound)."""
         return (
             self.sleep.probe_timeout_s
@@ -1138,7 +1144,7 @@ class ServiceManagerConfig:
         """Upper bound of one sleeping / waking / transfer SM call as its client
         sees it: the wait for the writer lock (``writer_lock_wait_s``, then 409
         writer_busy) + the longest lock hold + ``io_margin_s``. Defaults:
-        30 + 270 + 2 = 302 s."""
+        30 + 290 + 2 = 322 s."""
         return self.writer_lock_wait_s + self.worst_case_lock_hold_s() + self.sleep.io_margin_s
 
     def shutdown_timeout_s(self) -> float:

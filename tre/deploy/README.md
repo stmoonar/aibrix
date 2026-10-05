@@ -32,16 +32,14 @@ by the controller and the service-manager).
 ### Checked at start
 
 - The service-manager refuses to start when `service_manager:` / `gateway:` is
-  invalid. One check is the worst-case duration of one sleeping call, for any
-  number of targets (they drain and commit in parallel):
-  `writer_lock_wait_s + sleep.ack_timeout_s + sleep.hard_cap_s +
-  commit-lock wait + 2 x sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s +
-  sleep.physical_confirm_timeout_s + sleep.poll_interval_s + sleep.io_margin_s`
-  (330.5 s with the shipped values; it counts the rollback re-probe of a failed
-  commit and the last confirmation round's overshoot) must be below
-  `service_manager.api_call_timeout_s`. Another: `sleep.reservation_ttl_s` must
-  exceed `commit-lock wait + sleep.poll_interval_s + sleep.probe_timeout_s +
-  sleep.io_margin_s` (the longest gap between two reservation renewals).
+  invalid. One check is the worst-case duration of one SM call as its client
+  sees it (whole-lock, `ServiceManagerConfig.worst_case_sleep_call_s`):
+  `writer_lock_wait_s` + the longest writer-lock hold (a transfer: its donors'
+  sleep 108 s + its receivers' wake with one compensating sleep 163 s + the
+  selection 19 s) + `sleep.io_margin_s` = 30 + 290 + 2 = 322 s with the shipped
+  values; it must be below `service_manager.api_call_timeout_s` (360 s). The
+  formula is in `tre_common/registry.py`, the numbers in
+  `docs/design/20261002-sm-wholelock.md` section 5.
 - The controller uses `service_manager.api_call_timeout_s` as its timeout for
   slow service-manager calls, unless `TRE_SM_SLOW_TIMEOUT_SECONDS` overrides it.
   It refuses to start when that timeout does not exceed the same worst case.
@@ -79,6 +77,23 @@ On start (and on every supervisor pass) it resolves any sleep journal entries
 that a dead instance left behind. A pod whose `/sleep` may still be running is
 re-opened for routing only after it read awake twice, more than
 `sleep.sleep_call_timeout_s` apart.
+
+### Release order: registry first, images as a pair (2026-10-06)
+
+The whole-lock service-manager and the service-manager before it (image
+20261001, code ba5b558f) validate `service_manager:` with different rules:
+
+- the new SM / controller refuse the old live values (`writer_lock_wait_s` 10,
+  `sleep.sleep_call_timeout_s` 45, `physical_confirm_timeout_s` 15,
+  `ack_timeout_s` 10, `io_margin_s` 5): worst-case call 374 s >= 360 s;
+- the old SM accepts the new registry only because it keeps
+  `sleep.reservation_ttl_s: 40` (> 30 + 0.5 + 5 + 2 = 37.5 s, its renewal-gap
+  rule; the new SM ignores the key). Guard:
+  `deploy/tests/test_registry_compat_20261006.py`.
+
+Order: registry ConfigMap (`merge_live_registry.py`, then `kubectl replace`)
+-> gateway-plugins -> service-manager -> controller. Rollback restores the
+images and the ConfigMap as a pair.
 
 ### Run mode: controller mode and SM actuation
 

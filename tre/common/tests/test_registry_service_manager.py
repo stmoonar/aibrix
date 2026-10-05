@@ -128,22 +128,22 @@ def test_sleep_mode_param_accepts_auto_and_booleans():
 
 def test_worst_case_lock_holds_and_the_call_bound_fit_the_api_call_timeout():
     """Whole-lock (2026-10-02): one sleep holds the writer lock for at most ack 5 +
-    one probe round 5 + /sleep 10 + max(confirmation 8 + its last probe 5, the
+    one probe round 5 + /sleep 20 + max(confirmation 8 + its last probe 5, the
     failed-call rollback's 4 probes) + 8 sequential Kubernetes calls x (connect 2
-    + read 5) + io 2 = 98 s, whatever the target count (probe timeout 5 s and the
+    + read 5) + io 2 = 108 s, whatever the target count (probe timeout 5 s and the
     Kubernetes term since 2026-10-06)."""
     config = ServiceManagerConfig()
     assert config.k8s_call_s() == 2 + 5
-    assert config.worst_case_sleep_lock_s() == 5 + 5 + 10 + max(8 + 5, 4 * 5) + 8 * 7 + 2 == 98
+    assert config.worst_case_sleep_lock_s() == 5 + 5 + 20 + max(8 + 5, 4 * 5) + 8 * 7 + 2 == 108
     # A wake: resident probes 5 + /wake_up 10 + convergence and settlement probes
-    # 2 x 5 + ONE compensating sleep 98 (whatever the number of failed wakes) +
+    # 2 x 5 + ONE compensating sleep 108 (whatever the number of failed wakes) +
     # 4 Kubernetes calls x 7 + io 2.
-    assert config.worst_case_wake_lock_s() == 5 + 10 + 2 * 5 + 98 + 4 * 7 + 2 == 153
-    assert config.worst_case_transfer_lock_s() == 5 + 2 * 7 + 98 + 153 == 270
-    assert config.worst_case_lock_hold_s() == 270
-    assert config.worst_case_sleep_call_s() == 30 + 270 + 2 == 302
+    assert config.worst_case_wake_lock_s() == 5 + 10 + 2 * 5 + 108 + 4 * 7 + 2 == 163
+    assert config.worst_case_transfer_lock_s() == 5 + 2 * 7 + 108 + 163 == 290
+    assert config.worst_case_lock_hold_s() == 290
+    assert config.worst_case_sleep_call_s() == 30 + 290 + 2 == 322
     assert config.worst_case_sleep_call_s() < config.api_call_timeout_s
-    assert config.shutdown_timeout_s() == 270 + 2
+    assert config.shutdown_timeout_s() == 290 + 2
 
     slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 200}})
     errors = Registry(ClusterTopology(nodes=()), [], service_manager=slow).validate()

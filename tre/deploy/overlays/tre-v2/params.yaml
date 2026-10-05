@@ -381,10 +381,10 @@ data:
       # transfer, any number of pairs: its donors' sleep - ack_timeout_s +
       # probe_timeout_s + sleep_call_timeout_s + max(physical_confirm_timeout_s +
       # probe_timeout_s, 4 x probe_timeout_s) + 8 Kubernetes calls x 7 + io_margin_s
-      # = 98 s - plus its receivers' wake - probe_timeout_s + wake.call_timeout_s +
-      # 2 x probe_timeout_s + ONE compensating sleep (98 s) + 4 Kubernetes calls x 7
-      # + io_margin_s = 153 s - plus one selection probe round and 2 Kubernetes
-      # calls) + io_margin_s = 30 + 270 + 2 = 302 s with these values (every
+      # = 108 s - plus its receivers' wake - probe_timeout_s + wake.call_timeout_s +
+      # 2 x probe_timeout_s + ONE compensating sleep (108 s) + 4 Kubernetes calls x 7
+      # + io_margin_s = 163 s - plus one selection probe round and 2 Kubernetes
+      # calls) + io_margin_s = 30 + 290 + 2 = 322 s with these values (every
       # timeout at its bound); validated at SM and controller start. The controller
       # uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
       api_call_timeout_s: 360
@@ -423,7 +423,7 @@ data:
         # the writer lock (whole-lock, 2026-10-02); no caller can skip a step and
         # nothing drains (draining is the controller's job). The four timeouts below
         # bound one sleep's lock hold with its 8 Kubernetes calls (x 7 s):
-        # 5 + 5 + 10 + max(8 + 5, 4 x 5) + 56 + 2 = 98 s.
+        # 5 + 5 + 20 + max(8 + 5, 4 x 5) + 56 + 2 = 108 s.
         # Max wait for every live gateway plugin instance to report the new route-gen
         # (measured 7-15 ms; a timeout rolls the hide back).
         ack_timeout_s: 5
@@ -440,11 +440,13 @@ data:
         fallback_no_plugin: false
         no_plugin_grace_s: 5
         poll_interval_s: 0.5
-        # HTTP timeout of the ONE /sleep call (weight offload, measured 1-3 s). No
+        # HTTP timeout of the ONE /sleep call (weight offload: 1-3 s on a running
+        # engine; the startup-converge sleeps of freshly started engines took p50
+        # 8.3 s, p90 12.2 s, max 14.5 s live, 2026-10-06 - hence 20, not 10). No
         # answer in time: the pod stays hidden, its journal entry is marked
         # sleep_unconfirmed, the lock is released at once and the journal recovery
         # settles it from the physical state (no second call).
-        sleep_call_timeout_s: 10
+        sleep_call_timeout_s: 20
         # HTTP timeout of every other vLLM probe (/metrics, /version, /is_sleeping,
         # /is_paused, /resume, the wake gate's resident probes). No answer reads as
         # "unknown", which every caller treats fail-closed. Targets are probed in
@@ -467,7 +469,12 @@ data:
         # Deprecated and ignored (2026-10-02: no drain, no sleep reservation); still
         # parsed so older registries keep loading.
         hard_cap_s: null
-        reservation_ttl_s: 30
+        # Ignored here too, but the previous service-manager image (20261001, code
+        # ba5b558f: the rollback target while the images are switched) checks it at
+        # start and refuses to start unless it exceeds writer_lock_wait_s +
+        # poll_interval_s + probe_timeout_s + io_margin_s (30 + 0.5 + 5 + 2 = 37.5 s
+        # with these values). Guard: deploy/tests/test_registry_compat_20261006.py.
+        reservation_ttl_s: 40
         # Plugin instances that must ack = advancing heartbeats UNION Ready pods
         # matching this selector: a plugin with Redis trouble may still route while
         # its heartbeat stalls. label_selector: null = heartbeats only. Contract keys
