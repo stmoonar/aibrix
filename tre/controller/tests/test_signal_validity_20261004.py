@@ -74,3 +74,31 @@ def test_held_context_is_never_donor_evidence(fresh):
     assert not _gives(plan, "d")
     assert "donor_suppressed_breakpoint_window:d" in plan.events
 
+
+
+def test_held_receiver_rescue_is_capped_like_thin_evidence():
+    """I4: the held context does not carry the old window's evidence count, so the rescue
+    of a held CRITICAL receiver takes one capped step (control: the same level from a
+    whole window asks for more)."""
+    fresh = dict(_ctx(0.1, 500.0, 50.0), signal_evidence_requests=50.0)
+    donor = _ctx(1.1, 600.0, 5.0)
+
+    def plan(receiver):
+        contexts = {"r": receiver, "d": donor}
+        return build_plan(
+            model_contexts=contexts,
+            classifications=classify_all_models(contexts),
+            model_replicas={"r": 3, "d": 3},
+            idle_gpus=4,
+            cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8,
+                           partial_window_max_step=1, partial_window_lowevidence_requests=10),
+        )
+
+    def added(result):
+        return sum(a.delta for a in result.actions if isinstance(a, ScaleAction) and a.model == "r" and a.delta > 0)
+
+    assert added(plan(dict(fresh))) > 1
+    cache = PaperStateCache(max_stale_windows=3)
+    cache.apply("r", dict(fresh), tokens_available=True)
+    held, _ = cache.apply("r", _missing_ctx(), tokens_available=False)
+    assert added(plan(held)) == 1

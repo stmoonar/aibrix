@@ -123,6 +123,9 @@ class PaperStateCache:
                 # donor gate), and the UI shows the model UNCONFIRMED.
                 "signal_full_window": False,
                 "signal_hold_reason": "tokens_missing",
+                # ... and no evidence count either: a held receiver's rescue is capped
+                # like a thin partial window (planner partial_window_max_step).
+                "signal_evidence_requests": None,
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
