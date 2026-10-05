@@ -110,13 +110,18 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   the packed busy count; the paper's IBP assumes packing routing, ours spreads) for the main
   runs, `nonidle` / `at_cap` only as sensitivity runs; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
-- TokenScale-colocated: `tools/tokenscale_buckets` on the trace (edges, centers,
-  `median_in`), then `tools/tokenscale_profile --sender http --gateway-url
-  <chat endpoint URL> --sm-url <SM> --i-have-user-approval` per model with exactly one
-  awake replica (closed loop 1..32, 60 s steps, 15 s warm-up; ~1 h per model).
-- PreServe-oracle: mu from `tools/preserve_mu` over the calibration capture (needs the
-  registry with the fitted c/b); `window_s` 600 (sensitivity 60), `noise_sigma` 0.0772
-  (sensitivity 0.30).
+- TokenScale-colocated and PreServe-oracle, one run (`tools/tokenscale_profile`): the hot alt
+  trace has one shape (in ~492, out 400), so the buckets degenerate to one cell (disclose).
+  `python3 -m tre_baselines.tools.tokenscale_profile --models dsqwen-7b,dsllama-8b,dsqwen-14b
+  --gateway-url <chat endpoint URL> --sm-url <SM> --out-dir <dir> --i-have-user-approval`
+  with exactly one awake replica per model (checked), models in parallel: closed loop
+  1/2/4/8/12/16/24/32/48/64 (extended while still gaining > 5 %), 60 s steps, 15 s warm-up;
+  prefill/decode tok/s from the replica's vLLM token counters, p95 TTFT/TPOT per step.
+  V_b = peak (in+out) tok/s, V_P = peak prefill tok/s with out=1; PreServe mu = the highest
+  step meeting p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the registry).
+  ~20 min, needs an exclusive window. Disclose: closed loop -> mu slightly optimistic.
+- PreServe-oracle: `window_s` 600 (sensitivity 60), `noise_sigma` 0.0772 (sensitivity 0.30).
+  (`tools/preserve_mu` over a calibration capture is a cross-check only.)
 
 ## Trace volume (PreServe Tier-1)
 
