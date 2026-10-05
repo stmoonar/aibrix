@@ -70,6 +70,10 @@ DATASET_DIR = "dataset"
 #: Default directory of a dataset built with the L3 numerator (``--numerator
 #: vllm_counter``), so it never replaces the default (gateway-numerator) one.
 DATASET_DIR_L3 = "dataset_l3"
+#: Default directory of a dataset labelled with the hybrid attribution (``--attribution
+#: hybrid``, label v2: TTFT by first token, TPOT by completion), so it never replaces the
+#: default (completion, label v1) one. With the L3 numerator: ``dataset_l3_hybrid``.
+DATASET_DIR_HYBRID = "dataset_hybrid"
 MANIFEST = "manifest.json"
 WINDOW_TABLE = "windows.csv"
 REQUEST_TABLE = "requests.csv"
@@ -475,6 +479,10 @@ class Settings:
     #: ``vllm_counter`` (L3). Labels, queue and cell verdicts do not depend on it.
     numerator: str = l3.NUMERATOR_GATEWAY
     l3_max_gap_ms: int = l3.DEFAULT_MAX_GAP_MS
+    #: Request-to-window attribution of the label (``tre_common.slo_labels.ATTRIBUTIONS``):
+    #: ``completion`` (default, label v1) or ``hybrid`` (label v2). Signal columns do not
+    #: depend on it.
+    attribution: str = slo_labels.ATTRIBUTION_COMPLETION
 
     @property
     def window_columns(self) -> list[str]:
@@ -500,6 +508,7 @@ class Settings:
         return slo_labels.label_def_for_model(
             model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms,
             min_completed_requests=self.min_completed_requests, registry=registry,
+            attribution=self.attribution,
         )
 
     def membership(self) -> str:
@@ -597,7 +606,11 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
     numerator = str(overrides.get("numerator") or l3.NUMERATOR_GATEWAY)
     if numerator not in l3.NUMERATOR_CHOICES:
         raise SystemExit(f"unknown numerator {numerator!r}; expected one of {l3.NUMERATOR_CHOICES}")
+    attribution = str(overrides.get("attribution") or slo_labels.ATTRIBUTION_COMPLETION)
+    if attribution not in slo_labels.ATTRIBUTIONS:
+        raise SystemExit(f"unknown attribution {attribution!r}; expected one of {slo_labels.ATTRIBUTIONS}")
     settings = Settings(
+        attribution=attribution,
         numerator=numerator,
         l3_max_gap_ms=int(overrides.get("l3_max_gap_ms") or l3.DEFAULT_MAX_GAP_MS),
         window_ms=int(overrides.get("window_ms") or DEFAULT_WINDOW_MS),
@@ -673,6 +686,31 @@ def _cell_metadata(attempt: Attempt, plan_cells: dict) -> dict:
     return out
 
 
+def dataset_attribution(directory: Path) -> str:
+    """The label attribution a standard dataset was built with: its manifest's
+    ``attribution.value``; a manifest from before the record is ``completion`` (label v1),
+    the only attribution there was. ``directory`` is the dataset dir (or its run root)."""
+    d = Path(directory)
+    if not (d / MANIFEST).exists() and (d / DATASET_DIR / MANIFEST).exists():
+        d = d / DATASET_DIR
+    try:
+        doc = json.loads((d / MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return slo_labels.ATTRIBUTION_COMPLETION
+    value = str(((doc.get("attribution") or {}).get("value")) or slo_labels.ATTRIBUTION_COMPLETION)
+    if value not in slo_labels.ATTRIBUTIONS:
+        raise ValueError(f"{d / MANIFEST}: unknown attribution {value!r}")
+    return value
+
+
+def default_dataset_dirname(settings: "Settings") -> str:
+    """``dataset`` / ``dataset_l3`` / ``dataset_hybrid`` / ``dataset_l3_hybrid``."""
+    name = DATASET_DIR_L3 if settings.numerator == l3.NUMERATOR_VLLM_COUNTER else DATASET_DIR
+    if settings.attribution == slo_labels.ATTRIBUTION_HYBRID:
+        name += "_" + slo_labels.ATTRIBUTION_HYBRID
+    return name
+
+
 def build_dataset(
     run_dir: Path,
     *,
@@ -703,7 +741,7 @@ def build_dataset(
     discrepancies: list[str] = []
     settings, provenances = _settings_for(campaigns, overrides or {})
     l3_mode = settings.numerator == l3.NUMERATOR_VLLM_COUNTER
-    out_dir = Path(out_dir) if out_dir else run_dir / (DATASET_DIR_L3 if l3_mode else DATASET_DIR)
+    out_dir = Path(out_dir) if out_dir else run_dir / default_dataset_dirname(settings)
     if out_dir.exists() and not (out_dir / MANIFEST).exists():
         raise SystemExit(f"{out_dir} exists and is not a dataset this tool wrote; refusing to replace it")
     registry = load_registry(str(settings.registry_path))
@@ -847,6 +885,10 @@ def build_dataset(
         # The TSS numerator of the signal columns (scripts.l3_numerator); dline_refit
         # trainset / freeze / accept refuse to mix two.
         "numerator": numerator_doc,
+        # The label's request-to-window attribution (label v1 = completion, v2 = hybrid);
+        # dline_refit trainset / accept and the T14 scorer refuse to mix two.
+        "attribution": {"value": settings.attribution,
+                        "rule": slo_labels.ATTRIBUTION_RULES[settings.attribution]},
         "label": labels_by_model[models_seen[0]] if models_seen else None,
         "label_by_model": labels_by_model,
         "windowing": {
@@ -1354,6 +1396,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--l3-max-gap-ms", type=int, default=None,
                     help=f"L3: a 1 Hz sample spacing above this voids the window (default "
                          f"{l3.DEFAULT_MAX_GAP_MS})")
+    ap.add_argument("--attribution", choices=list(slo_labels.ATTRIBUTIONS),
+                    default=slo_labels.ATTRIBUTION_COMPLETION,
+                    help="request-to-window attribution of the label: completion (default, label v1: "
+                         "TTFT / TPOT / min-n by completion) or hybrid (label v2: TTFT and min-n by first "
+                         f"token, TPOT by completion; default out dir <run_dir>/{DATASET_DIR_HYBRID})")
     ap.add_argument("--allow-prompt-token-mismatch", action="store_true",
                     help="build even when a cell's served requests were off their prompt length "
                          "(recorded; dline_refit trainset still refuses those cells)")
@@ -1366,6 +1413,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "min_latency_samples": args.min_latency_samples,
         "window_align": args.window_align, "min_completed_requests": args.min_completed_requests,
         "numerator": args.numerator, "l3_max_gap_ms": args.l3_max_gap_ms,
+        "attribution": args.attribution,
     })
     manifest = json.loads((out / MANIFEST).read_text(encoding="utf-8"))
     for name, table in manifest["tables"].items():

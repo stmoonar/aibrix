@@ -604,6 +604,7 @@ def primary_label(args, model: str) -> slo_labels.LabelDefinition:
         min_completed_requests=getattr(
             args, "fit_min_completed_requests", slo_labels.DEFAULT_MIN_COMPLETED_REQUESTS),
         registry=getattr(args, "registry", None),
+        attribution=getattr(args, "fit_label_attribution", None),
     )
 
 
@@ -1281,6 +1282,7 @@ def fit_plan(
         ttft_idle_b_ms_per_token=None,
         min_completed_requests=getattr(args, "fit_min_completed_requests", 20),
         label_registry=getattr(args, "registry", None),
+        label_attribution=getattr(args, "fit_label_attribution", None),
     )
     plan["label_arms_by_model"] = {}
     for model in models:
@@ -2230,6 +2232,19 @@ def run_provenance(args) -> dict:
 CAMPAIGN_STATUS_FILE = "campaign_status.json"
 
 
+def planned_attribution(out_dir: Path) -> str:
+    """The label attribution a collection's ``plan.json`` records (its ``label.label_def``,
+    else ``label_def``); completion (label v1) when it records none."""
+    try:
+        plan = json.loads((Path(out_dir) / "plan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return slo_labels.ATTRIBUTION_COMPLETION
+    label = ((plan.get("label") or {}).get("label_def") if isinstance(plan.get("label"), dict) else None) \
+        or plan.get("label_def") or {}
+    value = str(label.get("attribution") or slo_labels.ATTRIBUTION_COMPLETION)
+    return value if value in slo_labels.ATTRIBUTIONS else slo_labels.ATTRIBUTION_COMPLETION
+
+
 def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optional[str] = None) -> None:
     """Record how the campaign ended, then build the standard dataset.
 
@@ -2271,6 +2286,11 @@ def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optio
 
         built = calibration_dataset.build_dataset(out_dir)
         print(f"standard dataset: {built}")
+        attribution = planned_attribution(out_dir)
+        if attribution != slo_labels.ATTRIBUTION_COMPLETION:
+            # the run was judged on a label v2: its own dataset too, next to the v1 one
+            hybrid = calibration_dataset.build_dataset(out_dir, overrides={"attribution": attribution})
+            print(f"standard dataset ({attribution} attribution): {hybrid}")
         parent = out_dir.parent
         siblings = calibration_dataset.campaign_dirs(parent)
         if len(siblings) > 1 and all((d / CAMPAIGN_STATUS_FILE).exists() for d in siblings):
@@ -2562,6 +2582,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--fit-ttft-floor-ms", type=float, default=None,
                     help="default: registry slo.ttft_floor_ms (500 ms, D6'); 150 = the D6 ablation arm")
     ap.add_argument("--fit-min-completed-requests", type=int, default=20)
+    ap.add_argument("--fit-label-attribution", choices=list(slo_labels.ATTRIBUTIONS), default=None,
+                    help="request-to-window attribution of the fit / probe label: completion "
+                         "(default, label v1) or hybrid (label v2, TTFT by first token, TPOT by "
+                         "completion). --acceptance-set-m2 / --t14-set take it from the freeze's "
+                         "label when not given")
     ap.add_argument("--min-slo-windows", type=int, default=3)
     ap.add_argument("--max-model-error-rate", type=float,
                     default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE,

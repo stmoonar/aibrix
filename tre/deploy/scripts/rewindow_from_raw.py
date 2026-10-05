@@ -53,6 +53,16 @@ follow, and both are enforced here rather than left to the operator:
     kept for the aliasing figure and for the observability-gap metric below: the fraction
     of 1 Hz threshold crossings that the live grid never saw.
 
+Attribution (label v1 / v2, ``tre_common.slo_labels.ATTRIBUTIONS``): the token totals (the
+gateway's count-at-completion TSS numerator) are always the requests completed in the
+window. The latency evidence follows the label's ``attribution``: ``completion`` (v1) puts
+every served request's TTFT / TPOT / e2e sample and its min-n count in its completion
+window; ``hybrid`` (v2, 2026-10-05) puts the TTFT sample and the min-n count
+(``completed_requests``, ``ttft_len_samples``) in the window of its FIRST TOKEN
+(``recv_first_token_ts_ms``) and keeps TPOT / e2e in the completion window. Unserved
+requests count by send instant under both. :func:`label_cell` reads the attribution from the
+label it is given, so a window table and its label definition cannot disagree.
+
 Assumptions (documented, doc15 §4 leaves them to "most conservative choice"):
   * Requests are bucketed into a window by done_ts_ms (completion time), half-open
     [window_start, window_end), matching when a vLLM completion increments the histograms;
@@ -511,6 +521,7 @@ def aggregate_window(
     assigned_replicas: int = 1,
     half_open_start: bool = False,
     instant_tick_ms: Optional[int] = None,
+    attribution: str = slo_labels.ATTRIBUTION_COMPLETION,
 ) -> ModelWindowMetrics:
     """Aggregate raw per-request + instant records into one ModelWindowMetrics, using the
     same 口径 as MetricsStore._aggregate_model (see module docstring).
@@ -521,7 +532,11 @@ def aggregate_window(
     grid) stamps each live-grid sidecar sample with the gateway tick it stands for,
     ``floor(ts / tick) * tick`` (``openloop.mark_live_grid`` keeps the first 1 Hz sample of
     each tick bucket, taken 0-1 s after the boundary the gateway stamps it with).
+    ``attribution`` (module docstring) picks which served requests the TTFT p95 is taken
+    over; tokens, TPOT and e2e are always the completions'.
     """
+    if attribution not in slo_labels.ATTRIBUTIONS:
+        raise ValueError(f"unknown attribution {attribution!r}; expected one of {slo_labels.ATTRIBUTIONS}")
     if half_open_start:
         in_window = [
             r for r in records
@@ -539,7 +554,9 @@ def aggregate_window(
     # took to fail (a 503 in 3 ms, a client timeout at 30 s), not a latency of the engine;
     # it enters the label through the unserved counts instead.
     served = [r for r in in_window if is_served(r)]
-    ttft_samples = [r["ttft_ms"] for r in served if r.get("ttft_ms") is not None]
+    ttft_set = served if attribution == slo_labels.ATTRIBUTION_COMPLETION else ttft_requests(
+        records, window_start_ms, window_end_ms, closed_right=half_open_start)
+    ttft_samples = [r["ttft_ms"] for r in ttft_set if r.get("ttft_ms") is not None]
     tpot_samples = [r["tpot_ms"] for r in served if r.get("tpot_ms") is not None]
     e2e_samples = [r["e2e_ms"] for r in served if r.get("e2e_ms") is not None]
 
@@ -596,8 +613,22 @@ def in_window(ts_ms, window_start_ms: int, window_end_ms: int, *, closed_right: 
     return window_start_ms <= ts < window_end_ms
 
 
+#: The raw record's first-token instant (``r3_grid.RAW_COLUMNS``).
+FIRST_TOKEN_TS = "recv_first_token_ts_ms"
+
+
+def ttft_requests(records: Sequence[dict], window_start_ms: int, window_end_ms: int, *,
+                  closed_right: bool = False) -> list[dict]:
+    """The served requests whose FIRST TOKEN is inside the window - the TTFT set of the
+    hybrid attribution (a served request without a first-token instant is in no TTFT set)."""
+    return [r for r in records
+            if in_window(r.get(FIRST_TOKEN_TS), window_start_ms, window_end_ms, closed_right=closed_right)
+            and is_served(r)]
+
+
 def window_request_evidence(
     records: Sequence[dict], window_start_ms: int, window_end_ms: int, *, closed_right: bool = False,
+    attribution: str = slo_labels.ATTRIBUTION_COMPLETION,
 ) -> dict:
     """The per-request columns of one window: ``completed_requests`` (the min-n guard) and
     ``ttft_len_samples`` (what the slowdown TTFT label reads, ``tre_common.slo_labels``).
@@ -606,12 +637,19 @@ def window_request_evidence(
     :func:`aggregate_window`: requests that were *served* and completed inside the window
     (``closed_right`` as there). ``ttft_len_samples`` pairs each served request's TTFT
     with its vLLM-reported prompt length (raw ``input_tokens`` = ``usage.prompt_tokens``).
+    Under the ``hybrid`` attribution both columns are over the TTFT set instead
+    (:func:`ttft_requests`): the min-n guard counts the requests whose TTFT the window holds.
     """
-    done = [
-        r for r in records
-        if in_window(r.get("done_ts_ms"), window_start_ms, window_end_ms, closed_right=closed_right)
-        and is_served(r)
-    ]
+    if attribution == slo_labels.ATTRIBUTION_HYBRID:
+        done = ttft_requests(records, window_start_ms, window_end_ms, closed_right=closed_right)
+    elif attribution == slo_labels.ATTRIBUTION_COMPLETION:
+        done = [
+            r for r in records
+            if in_window(r.get("done_ts_ms"), window_start_ms, window_end_ms, closed_right=closed_right)
+            and is_served(r)
+        ]
+    else:
+        raise ValueError(f"unknown attribution {attribution!r}; expected one of {slo_labels.ATTRIBUTIONS}")
     return {
         slo_labels.COMPLETED_REQUESTS_COLUMN: len(done),
         slo_labels.TTFT_LEN_SAMPLES_COLUMN: slo_labels.format_ttft_len_samples(
@@ -648,6 +686,7 @@ def rewindow_cell(
     assigned_replicas: int = 1,
     window_align: str = WINDOW_ALIGN_NONE,
     token_source: Optional[Callable[[int, int], Optional[tuple[float, float]]]] = None,
+    attribution: str = slo_labels.ATTRIBUTION_COMPLETION,
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
     compute_window_results for the trs column). Latency columns are client-side; the
@@ -694,6 +733,7 @@ def rewindow_cell(
             routable_pods=routable_pods, assigned_replicas=assigned_replicas,
             half_open_start=aligned,
             instant_tick_ms=SCRAPE_INTERVAL_MS if aligned and instant_grid == INSTANT_GRID_LIVE else None,
+            attribution=attribution,
         )
         for ws, we in windows_ms
     ]
@@ -709,7 +749,8 @@ def rewindow_cell(
     rows = []
     for wm, result in zip(metrics, results):
         evidence = window_request_evidence(
-            records, wm.window_start_ms, wm.window_end_ms, closed_right=aligned
+            records, wm.window_start_ms, wm.window_end_ms, closed_right=aligned,
+            attribution=attribution,
         )
         rows.append(r3_grid.window_row(
             # An undefined TSS (idle rule: nothing in flight, tre_common.tss) is written
@@ -771,6 +812,7 @@ def label_cell(
     arms = label if label is not None else latency_slo_ms
     if arms is None:
         raise ValueError("label_cell needs label (or latency_slo_ms)")
+    attribution = label_attribution(arms)
     rows = rewindow_cell(
         list(records), list(instant_samples), cell, spec,
         window_ms=window_ms, step_ms=step_ms,
@@ -781,6 +823,7 @@ def label_cell(
         start_ms=start_ms, end_ms=end_ms,
         routable_pods=routable_pods, assigned_replicas=assigned_replicas,
         window_align=window_align, token_source=token_source,
+        attribution=attribution,
     )
     rows = openloop.mark_unserved_request_windows(
         rows, records, closed_right=window_align == WINDOW_ALIGN_GRID
@@ -789,6 +832,20 @@ def label_cell(
     for row in rows:
         slo_labels.apply_label_arms(row, arms)
     return rows
+
+
+def label_attribution(arms) -> str:
+    """The attribution of a label (or of the primary of label arms): what the window
+    evidence must be built with. A plain threshold mapping (09-23 interface) is v1."""
+    primary = slo_labels.resolve_arms(arms)[slo_labels.ARM_PRIMARY]
+    if isinstance(primary, slo_labels.LabelDefinition):
+        attributions = {a.attribution for a in slo_labels.resolve_arms(arms).values()
+                        if isinstance(a, slo_labels.LabelDefinition)}
+        if len(attributions) > 1:
+            raise ValueError(f"label arms with different attributions {sorted(attributions)}: one "
+                             "window table carries one attribution")
+        return primary.attribution
+    return slo_labels.ATTRIBUTION_COMPLETION
 
 
 def read_guard(raw_path: Path) -> dict:
@@ -1048,7 +1105,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.label_registry = args.registry
     primary = slo_labels.label_def_from_args(args, args.model)
     arms = slo_labels.resolve_arms(primary)
-    print(f"labels: primary {primary.ttft_slo_mode} ({', '.join(sorted(arms))})")
+    print(f"labels: primary {primary.ttft_slo_mode}, attribution {primary.attribution} "
+          f"({', '.join(sorted(arms))})")
     ledger = load_ledgers(args.ledger) if args.ledger else {}
     if (args.only_split or args.only_role) and not ledger:
         ap.error("--only-split / --only-role select from the ledger: pass --ledger")

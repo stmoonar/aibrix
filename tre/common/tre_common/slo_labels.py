@@ -146,6 +146,29 @@ LABEL_COLUMNS = (LABEL_COLUMN, VIOLATED_COLUMN, LABEL_COLUMN_FIXED, LABEL_COLUMN
 
 LABEL_DEF_NAME = "p95_ttft_tpot_plus_unserved_v1"
 LABEL_DEF_NAME_SLOWDOWN = "p95_ttft_slowdown_tpot_plus_unserved_v1"
+#: Label definition v2 (2026-10-05, next calibration round): the same verdict rule, with
+#: the request-to-window attribution an explicit field (:data:`ATTRIBUTION_HYBRID`). A v1
+#: definition (completion attribution) keeps its v1 name and its byte-identical record.
+LABEL_DEF_NAME_V2 = "p95_ttft_tpot_plus_unserved_v2"
+LABEL_DEF_NAME_SLOWDOWN_V2 = "p95_ttft_slowdown_tpot_plus_unserved_v2"
+
+#: Which window a served request's latency samples count in.
+#: ``completion`` (v1, every label before 2026-10-05): TTFT, TPOT and the min-n count all go
+#: to the window holding the request's completion (``done_ts_ms``).
+#: ``hybrid`` (v2): the TTFT sample (and the min-n count, ``completed_requests``) goes to the
+#: window holding the request's FIRST TOKEN (``recv_first_token_ts_ms``); TPOT / e2e stay in
+#: the completion window. An unserved request counts by its send instant under both. Why:
+#: by completion, the requests queued during a burst complete in the ~30 s drain tail after
+#: it and keep labelling recovered windows as severe violations; by send time, the label
+#: leads every window signal by 10-20 s (docs calib-next-round-design-20261005).
+ATTRIBUTION_COMPLETION = "completion"
+ATTRIBUTION_HYBRID = "hybrid"
+ATTRIBUTIONS = (ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID)
+ATTRIBUTION_RULES = {
+    ATTRIBUTION_COMPLETION: "TTFT, TPOT and the min-n count by completion (done_ts_ms)",
+    ATTRIBUTION_HYBRID: ("TTFT samples and the min-n count (completed_requests) by first token "
+                         "(recv_first_token_ts_ms); TPOT / e2e samples by completion (done_ts_ms)"),
+}
 
 TTFT_SLO_MODE_FIXED = "fixed"
 TTFT_SLO_MODE_SLOWDOWN = "slowdown"
@@ -338,8 +361,15 @@ class LabelDefinition:
     ttft_idle_b_ms_per_token: Optional[float] = None
     min_completed_requests: int = DEFAULT_MIN_COMPLETED_REQUESTS
     percentile_mode: str = DEFAULT_PERCENTILE_MODE
+    #: Request-to-window attribution of the window's latency evidence (:data:`ATTRIBUTIONS`).
+    #: The verdict rule reads the window row as it is; this field says how the row's
+    #: ``ttft_len_samples`` / ``completed_requests`` / p95 columns were attributed
+    #: (``scripts.rewindow_from_raw``), and it is part of the definition's hash.
+    attribution: str = ATTRIBUTION_COMPLETION
 
     def __post_init__(self) -> None:
+        if self.attribution not in ATTRIBUTIONS:
+            raise ValueError(f"attribution must be one of {ATTRIBUTIONS}, got {self.attribution!r}")
         for name in ("ttft_p95_ms", "tpot_p95_ms"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
@@ -400,6 +430,7 @@ class LabelDefinition:
             "tpot_p95_ms": tpot,
             "ttft_slo_mode": mode,
             "min_completed_requests": int(raw.get("min_n", 0)),
+            "attribution": str(raw.get("attribution") or ATTRIBUTION_COMPLETION),
         }
         if mode == TTFT_SLO_MODE_SLOWDOWN:
             kwargs.update(
@@ -438,9 +469,21 @@ class LabelDefinition:
         cols["ttft_p95"] = TTFT_LEN_SAMPLES_COLUMN if self.slowdown else SLO_COLUMNS["ttft_p95"]
         return cols
 
+    @property
+    def hybrid(self) -> bool:
+        return self.attribution == ATTRIBUTION_HYBRID
+
     def as_dict(self) -> dict[str, Any]:
+        """The definition's record (its canonical sha256 is the label's identity). A
+        completion (v1) definition's record is byte-identical to the one written before the
+        ``attribution`` field existed; a hybrid one is v2: own name, ``attribution`` and its
+        rule."""
+        if self.hybrid:
+            name = LABEL_DEF_NAME_SLOWDOWN_V2 if self.slowdown else LABEL_DEF_NAME_V2
+        else:
+            name = LABEL_DEF_NAME_SLOWDOWN if self.slowdown else LABEL_DEF_NAME
         base: dict[str, Any] = {
-            "name": LABEL_DEF_NAME_SLOWDOWN if self.slowdown else LABEL_DEF_NAME,
+            "name": name,
             "mode": self.ttft_slo_mode,
             "ttft_p95_ms": float(self.ttft_p95_ms),
             "tpot_p95_ms": float(self.tpot_p95_ms),
@@ -473,6 +516,10 @@ class LabelDefinition:
             base["violated_if"] = (
                 "p95_ttft_client_ms > ttft_p95_ms or p95_tpot_client_ms > tpot_p95_ms or unserved"
             )
+        if self.hybrid:
+            base["attribution"] = self.attribution
+            base["attribution_rule"] = ATTRIBUTION_RULES[self.attribution]
+            base["min_n_counts"] = "the TTFT set (served requests whose first token is in the window)"
         return base
 
     # -- labelling ---------------------------------------------------------------------
@@ -701,14 +748,20 @@ def label_definition(
         out["slo_ms"] = {SLO_COLUMNS[k]: float(v) for k, v in primary.items()}
     else:
         out["slo_ms"] = {SLO_COLUMNS[k]: v for k, v in primary.latency_slo_ms().items()}
+    membership = {
+        "latency": f"served requests whose completion (done_ts_ms) is in {window_membership}",
+        "unserved": f"requests whose send instant (send_ts_ms) is in {window_membership}",
+    }
+    if isinstance(primary, LabelDefinition) and primary.hybrid:
+        membership["latency"] = (
+            f"TTFT and the min-n count: served requests whose first token (recv_first_token_ts_ms) "
+            f"is in {window_membership}; TPOT / e2e: served requests whose completion (done_ts_ms) "
+            f"is in {window_membership}")
     out.update({
         "latency_source": LATENCY_SOURCE,
         "ttft": "first streamed token minus the instant the request went on the wire",
         "tpot": "(e2e_ms - ttft_ms) / (completion_tokens - 1), per request",
-        "window_membership": {
-            "latency": f"served requests whose completion (done_ts_ms) is in {window_membership}",
-            "unserved": f"requests whose send instant (send_ts_ms) is in {window_membership}",
-        },
+        "window_membership": membership,
         "p95": "tre_common.percentile.histogram_percentile over exact samples, bucket_upper",
         "min_latency_samples": int(min_latency_samples),
         "unserved_classes": list(UNSERVED_COLUMNS),
@@ -754,6 +807,10 @@ def add_label_arguments(
                         help="windows with fewer completed requests carry no latency evidence")
     parser.add_argument("--label-registry", default=None,
                         help="registry the idle TTFT fit is read from (default: the shared one)")
+    parser.add_argument("--label-attribution", choices=ATTRIBUTIONS, default=None,
+                        help="request-to-window attribution of the latency evidence (default "
+                             f"{ATTRIBUTION_COMPLETION}, label v1; {ATTRIBUTION_HYBRID} = label v2: "
+                             "TTFT by first token, TPOT by completion)")
 
 
 def label_def_for_model(
@@ -768,6 +825,7 @@ def label_def_for_model(
     b: Optional[float] = None,
     min_completed_requests: int = DEFAULT_MIN_COMPLETED_REQUESTS,
     registry: Any = None,
+    attribution: Optional[str] = None,
 ) -> LabelDefinition:
     """Build the label for one model. Precedence per field: explicit value > the model's
     registry ``slo`` block > the module default (the D6' primary label: slowdown, k = 5,
@@ -810,6 +868,7 @@ def label_def_for_model(
         ttft_idle_c_ms=c if mode == TTFT_SLO_MODE_SLOWDOWN else None,
         ttft_idle_b_ms_per_token=b if mode == TTFT_SLO_MODE_SLOWDOWN else None,
         min_completed_requests=int(min_completed_requests),
+        attribution=attribution or ATTRIBUTION_COMPLETION,
     )
 
 
@@ -836,6 +895,7 @@ def label_def_from_args(args: argparse.Namespace, model: Optional[str]) -> Label
         min_completed_requests=first("min_completed_requests")
         if first("min_completed_requests") is not None else DEFAULT_MIN_COMPLETED_REQUESTS,
         registry=first("label_registry", "registry"),
+        attribution=getattr(args, "label_attribution", None),
     )
 
 
@@ -853,6 +913,9 @@ def label_cli_args(label: LabelDefinition) -> list[str]:
             "--ttft-idle-c-ms", str(label.ttft_idle_c_ms),
             "--ttft-idle-b-ms-per-token", str(label.ttft_idle_b_ms_per_token),
         ]
+    if label.hybrid:
+        # only when not the default, so a v1 label's command line is unchanged
+        out += ["--label-attribution", label.attribution]
     return out
 
 
