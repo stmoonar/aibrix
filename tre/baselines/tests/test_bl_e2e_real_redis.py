@@ -600,6 +600,8 @@ def test_slow_sm_call_is_not_duplicated(tmp_path, redis_url, redis) -> None:
     params = _policy_params("chiron", tmp_path)
     with Harness(tmp_path, redis_url, redis, "chiron", params, dry_run=False, sm_delay_s=delay) as h:
         h.phase("high", 5.0, {A: HIGH, B: LOW})
+        # then low: the scale-down is a second call, which must wait for the slow first one
+        h.phase("low", 6.0, {A: LOW, B: LOW})
         time.sleep(delay + 0.5)
         wait_until(lambda: h.dispatcher.inflight_count() == 0, 5)
     lines = h.lines()
