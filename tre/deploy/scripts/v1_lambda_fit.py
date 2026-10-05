@@ -198,10 +198,12 @@ def score(w: V1Window, *, w_p: float, lambda_wait: float, qmin: float = SCORE_QM
 
 class RequestIndex:
     """Served requests' (done_ts_ms, tpot_ms) per (model, cell_id, attempt), from the
-    ``requests.csv`` of standard datasets (one per training source)."""
+    ``requests.csv`` of standard datasets (one per training source); plus their first-token
+    instants (``first_token_ts_ms``), the TTFT set of a label v2 (hybrid) window."""
 
     def __init__(self) -> None:
         self._by: dict[tuple, list[tuple[float, float]]] = defaultdict(list)
+        self._first: dict[tuple, list[float]] = defaultdict(list)
         self.sources: dict[str, str] = {}
 
     def add_dataset(self, run: str, directory: Path, model: Optional[str] = None) -> int:
@@ -216,14 +218,18 @@ class RequestIndex:
                 # the dataset's own classification (rewindow_from_raw.is_served on the raw)
                 if r.get("outcome") != OUTCOME_OK:
                     continue
+                key = (run, r["model"], r["cell_id"], str(r.get("attempt") or "1"))
+                if r.get("first_token_ts_ms"):
+                    self._first[key].append(float(r["first_token_ts_ms"]))
                 done, tpot = r.get("done_ts_ms"), r.get("tpot_ms")
                 if not done or not tpot:
                     continue
-                self._by[(run, r["model"], r["cell_id"], str(r.get("attempt") or "1"))].append(
-                    (float(done), float(tpot)))
+                self._by[key].append((float(done), float(tpot)))
                 n += 1
         for v in self._by.values():
             v.sort()
+        for f in self._first.values():
+            f.sort()
         self.sources[run] = str(path)
         return n
 
@@ -239,6 +245,14 @@ class RequestIndex:
 
     def count(self, *a, **kw) -> int:
         return len(self.tpots(*a, **kw))
+
+    def first_token_count(self, run: str, model: str, cell_id: str, attempt: str, start_ms: float,
+                          end_ms: float, *, closed_right: bool) -> int:
+        """Served requests whose first token is in the window (the hybrid TTFT set)."""
+        keys = self._first.get((run, model, cell_id, str(attempt or "1")), [])
+        if closed_right:
+            return bisect.bisect_right(keys, end_ms) - bisect.bisect_right(keys, start_ms)
+        return bisect.bisect_left(keys, end_ms) - bisect.bisect_left(keys, start_ms)
 
 
 def sources_from_trainset(fit_dir: Path) -> dict[str, Path]:
@@ -280,11 +294,17 @@ def load_windows(model: str, fitting_csv: Path, label, *, trim: int,
             args = (r.get("run", ""), model, r["cell_id"], r.get("attempt") or "1", start, end)
             right = requests.tpots(*args, closed_right=True)
             n_done = slo_labels.completed_requests(r)
+            # the average TPOT is over the completions of the window under either attribution
+            # (TPOT by completion); the row's min-n count is the completions (label v1) or the
+            # TTFT set (label v2, hybrid), so the membership self-check counts what the row counts
+            hybrid = getattr(label, "attribution", slo_labels.ATTRIBUTION_COMPLETION) == slo_labels.ATTRIBUTION_HYBRID
+            n_right = requests.first_token_count(*args, closed_right=True) if hybrid else len(right)
+            n_left = (requests.first_token_count(*args, closed_right=False) if hybrid
+                      else requests.count(*args, closed_right=False))
             if n_done is not None:
                 stats["tpot_membership"]["checked"] += 1
-                stats["tpot_membership"]["closed_right_match"] += int(len(right) == n_done)
-                stats["tpot_membership"]["closed_left_match"] += int(
-                    requests.count(*args, closed_right=False) == n_done)
+                stats["tpot_membership"]["closed_right_match"] += int(n_right == n_done)
+                stats["tpot_membership"]["closed_left_match"] += int(n_left == n_done)
             if right:
                 tpot_avg = sum(right) / len(right)
             elif n_done:

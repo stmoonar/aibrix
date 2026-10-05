@@ -105,3 +105,41 @@ def test_v1_label_reproduces_the_frozen_sha_and_v2_differs() -> None:
     assert {a.attribution for a in slo_labels.label_arms(v2).values()} == {"hybrid"}
     assert "--label-attribution" not in slo_labels.label_cli_args(v1)
     assert slo_labels.label_cli_args(v2)[-2:] == ["--label-attribution", "hybrid"]
+
+
+def test_v1_lambda_membership_check_counts_what_a_hybrid_row_counts(tmp_path) -> None:
+    """Integration bug 2026-10-05: v1-lambda's self-check compared the completions of a window
+    with ``completed_requests``, which under hybrid is the TTFT set - every hybrid fit refused."""
+    import csv
+
+    from scripts import v1_lambda_fit
+
+    spec = load_registry(str(REGISTRY)).model(MODEL)
+    label = _label("hybrid")
+    instants = [{"ts_ms": t, "running": 10.0, "waiting": 5.0} for t in range(0, 60_001, 1000)]
+    reqs = _burst_then_tail() + [_req(31.0 + 0.3 * k, 0.3, 1.0) for k in range(25)]
+    rows = rewindow_from_raw.label_cell(
+        reqs, instants, r3_grid.GridCell.from_scenario_id("i512_o100_c9"), spec, label=label,
+        window_ms=30_000, step_ms=30_000, percentile_mode="bucket_upper", min_latency_samples=10,
+        instant_sample_interval_ms=1_000, instant_grid="raw", start_ms=0, end_ms=60_000)
+    # the tail window holds 30 TTFTs (25 fresh + 5) but 60 completions (30 of the burst)
+    assert [r[slo_labels.COMPLETED_REQUESTS_COLUMN] for r in rows] == [30, 30]
+    fit = tmp_path / "fitting.csv"
+    with open(fit, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["run", "cell_id", "attempt", *rows[0]])
+        w.writeheader()
+        w.writerows({"run": "r", "cell_id": "i512_o100_c9", "attempt": "1", **r} for r in rows)
+    ds = tmp_path / "ds"
+    ds.mkdir()
+    with open(ds / "requests.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["model", "cell_id", "attempt", "outcome", "first_token_ts_ms",
+                                           "done_ts_ms", "tpot_ms"])
+        w.writeheader()
+        w.writerows({"model": MODEL, "cell_id": "i512_o100_c9", "attempt": "1", "outcome": "ok",
+                     "first_token_ts_ms": q["recv_first_token_ts_ms"], "done_ts_ms": q["done_ts_ms"],
+                     "tpot_ms": q["tpot_ms"]} for q in reqs)
+    idx = v1_lambda_fit.RequestIndex()
+    idx.add_dataset("r", ds, MODEL)
+    _windows, stats = v1_lambda_fit.load_windows(MODEL, fit, label, trim=0, requests=idx)
+    mem = stats["tpot_membership"]
+    assert mem["checked"] >= 1 and mem["closed_right_match"] == mem["checked"]
