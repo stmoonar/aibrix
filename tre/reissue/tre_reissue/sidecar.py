@@ -152,11 +152,21 @@ COMPLETION_CONT_DROP = ("prompt", "prompt_embeds", "echo", "suffix", "truncate_p
 
 _ABORT_MARK = b'"abort"'
 
-#: Per-request key (``web.Request`` item): the tre_reissue_total kind owed for a request
-#: whose retry / continuation is under way; ``_account`` clears it. If the client goes
-#: away first, the request is accounted as ``(kind, "client_gone")``.
-_REISSUE_PENDING: Any = (web.RequestKey("tre_reissue_pending", str) if hasattr(web, "RequestKey")
-                         else "tre_reissue_pending")  # aiohttp < 3.12: plain string keys
+
+
+def _request_key(name: str, kind: type) -> Any:
+    """A ``web.Request`` item key (aiohttp < 3.12 has no ``web.RequestKey``: a string)."""
+    return web.RequestKey(name, kind) if hasattr(web, "RequestKey") else name
+
+
+#: Per-request: the tre_reissue_total kind owed for a request whose retry / continuation
+#: is under way; ``_account`` clears it. If the client goes away first, the request is
+#: accounted as ``(kind, "client_gone")``.
+_REISSUE_PENDING = _request_key("tre_reissue_pending", str)
+#: Per-request: the client has the complete response (the stream's ``[DONE]`` is
+#: written); a cancel after that (the engine had not ended its response yet) is not a
+#: client cancel.
+_DELIVERED = _request_key("tre_reissue_delivered", bool)
 
 OVERHEAD_BUCKETS_S = (
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.1, 0.25, 1.0,
@@ -473,7 +483,8 @@ class Metrics:
             lines += hist.render("tre_reissue_gap_seconds", f'model="{model}",mode="{mode}"')
         lines += [
             "# HELP tre_reissue_events_total Sidecar events (sleep rejections, state corrections, "
-            "client_cancel: the client went away and the request's upstream calls were closed, ...).",
+            "client_cancel: the request was cancelled before the client had the complete response - "
+            "the client went away, or the server shut down - and its upstream calls were closed, ...).",
             "# TYPE tre_reissue_events_total counter",
         ]
         for name, value in sorted(self.events.items()):
@@ -1226,9 +1237,9 @@ class ReissueSidecar:
             # cancels handlers on a lost connection, ``server_options``): the engine
             # finishes the call anyway, and the sleeping mark must follow its answer.
             if path in cfg.sleep_paths:
-                return await asyncio.shield(self._handle_sleep(request))
+                return await self._run_to_end(self._handle_sleep(request), request)
             if path in cfg.wake_paths:
-                return await asyncio.shield(self._handle_wake(request))
+                return await self._run_to_end(self._handle_wake(request), request)
             if cfg.enabled and path.startswith(cfg.retry_path_prefix):
                 return await self._handle_generation(request, path)
         elif method == "GET":
@@ -1241,6 +1252,24 @@ class ReissueSidecar:
         body = await request.read()
         timeout = None if path.startswith(cfg.retry_path_prefix) else cfg.proxy_timeout_s
         return await self._proxy_local(request, body, timeout=timeout)
+
+    async def _run_to_end(self, coro, request: web.Request) -> web.StreamResponse:
+        """``coro`` shielded from the handler's cancellation; if the caller went away, an
+        error of the call that carries on is logged (WARNING), not left to the GC."""
+        task = asyncio.ensure_future(coro)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            path = request.path
+
+            def report(done: asyncio.Task) -> None:
+                if not done.cancelled() and done.exception() is not None:
+                    self._warn("detached_control_call", {
+                        "event": "tre_control_call_failed_after_disconnect", "path": path,
+                        "error": f"{type(done.exception()).__name__}: {done.exception()}"[:300]})
+
+            task.add_done_callback(report)
+            raise
 
     def _state_view(self) -> dict:
         return {
@@ -1499,12 +1528,15 @@ class ReissueSidecar:
         except asyncio.CancelledError:
             # The client went away (or the server shuts down): the upstream requests
             # were closed on the way out. A request whose retry / continuation was cut
-            # short still gets its one tre_reissue_total line.
-            added.discard()
-            self.metrics.event("client_cancel")
-            kind = request.pop(_REISSUE_PENDING, None)
-            if kind is not None:
-                self._account(kind, "client_gone", request, _int_header(request.headers.get(self.cfg.depth_header)))
+            # short still gets its one tre_reissue_total line. Once the client had the
+            # complete response it is a completed request (normal accounting).
+            if not request.get(_DELIVERED):
+                added.discard()
+                self.metrics.event("client_cancel")
+                kind = request.pop(_REISSUE_PENDING, None)
+                if kind is not None:
+                    self._account(kind, "client_gone", request,
+                                  _int_header(request.headers.get(self.cfg.depth_header)))
             raise
         finally:
             self.metrics.observe_added(added)
@@ -1634,6 +1666,8 @@ class ReissueSidecar:
                         if recent is not None:
                             recent.append(complete)
                         await client.write(complete)
+                        if complete.endswith(SSE_DONE):
+                            request[_DELIVERED] = True
                         added.stop()
                         continue
                     out: list[bytes] = []
@@ -1668,6 +1702,8 @@ class ReissueSidecar:
                         if recent is not None:
                             recent.append(block)
                         await client.write(block)
+                        if block.endswith(SSE_DONE):
+                            request[_DELIVERED] = True
                     added.stop()
             except ConnectionResetError:
                 raise

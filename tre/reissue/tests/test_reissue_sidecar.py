@@ -30,16 +30,15 @@ HIDDEN = {"X-TRE-Hidden": "1"}
 
 class _OptionsServer(TestServer):
     """A TestServer whose runner gets exactly ``options`` (the sidecar's production server
-    options): TestServer itself always turns handler_cancellation on and drops the
-    keyword arguments of its constructor."""
+    options) and nothing else: TestServer itself always passes handler_cancellation=True
+    to its runner and drops the keyword arguments of its constructor."""
 
     def __init__(self, app, options: dict) -> None:
         super().__init__(app)
         self._options = dict(options)
 
     async def _make_runner(self, **kwargs):
-        kwargs.update(self._options)
-        return web.AppRunner(self.app, **kwargs)
+        return web.AppRunner(self.app, **self._options)
 
 
 class Harness:
@@ -522,7 +521,7 @@ async def test_nested_continuation_counts_segments():
         engine_c = FakeEngine("c", token_delay_s=0.001)
         ec = await h._serve(engine_c.app())
         sidecar_c = ReissueSidecar(replace(h.sidecar_a.cfg, upstream_url=_url(ec), pod_name="pod-c"))
-        h.gateway.pods["pod-c"] = _url(await h._serve(sidecar_c.build_app()))
+        h.gateway.pods["pod-c"] = _url(await h._serve(sidecar_c.build_app(), sc.server_options(sidecar_c.cfg)))
 
         async def sleep_b():
             await h.engine_b.wait_generated(3)
@@ -609,6 +608,36 @@ async def test_client_disconnect_during_a_continuation_closes_the_continuation()
         assert not h.engine_b.active
         assert h.sidecar_a.metrics.reissue == {("passthrough_abort", "client_gone"): 1}
         assert counts(h, h.sidecar_b) == {"retry": 0, "continue": 0, "failed": 0, "passthrough_abort": 0}
+
+
+@pytest.mark.asyncio
+async def test_client_leaving_after_done_is_a_completed_request():
+    """The client got the whole stream ([DONE]) and closes before the engine ends its
+    response: a completed request, not a client cancel, and its added time is kept."""
+    async with Harness(a={"hold_eof": True}) as h:
+        async with h.http.post(h.url("/v1/completions"), json=completion_body(4)) as resp:
+            async for line in resp.content:
+                if line.startswith(b"data: [DONE]"):
+                    break  # leaving the block closes the connection before EOF
+        await _until(lambda: h.engine_a.disconnected == 1)
+        assert "client_cancel" not in h.sidecar_a.metrics.events
+        assert _hist(h).count == 1
+
+
+@pytest.mark.asyncio
+async def test_sleep_caller_leaving_mid_call_still_marks_the_pod_sleeping():
+    """The service-manager disconnects while the engine is still in /sleep: the call runs
+    to its end and the sleeping mark follows the engine's answer (no probe needed)."""
+    async with Harness(a={"hold_sleep": True}, cfg={"probe_interval_s": 60.0}) as h:
+        task = asyncio.ensure_future(h.sleep_a())
+        await _until(lambda: h.sidecar_a.state.pending == 1 and h.engine_a.sleeping)
+        task.cancel()  # the caller closes its connection
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _until(lambda: not h.sa.runner.server.connections)  # the sidecar saw it go
+        h.engine_a.release_sleep()
+        await _until(lambda: h.sidecar_a.state.pending == 0)
+        assert h.sidecar_a.state.sleeping is True
 
 
 @pytest.mark.asyncio

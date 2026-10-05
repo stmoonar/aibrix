@@ -87,6 +87,8 @@ class FakeEngine:
         abort_ids: bool = True,
         reject_new: bool = True,
         reject_in_stream: bool = False,
+        hold_eof: bool = False,
+        hold_sleep: bool = False,
     ) -> None:
         self.name = name
         self.token_delay_s = token_delay_s
@@ -95,6 +97,11 @@ class FakeEngine:
         self.abort_ids = abort_ids
         self.reject_new = reject_new
         self.reject_in_stream = reject_in_stream
+        #: a stream waits after [DONE], before ending the response, until cancelled.
+        self.hold_eof = hold_eof
+        #: /sleep waits after the engine went to sleep until ``release_sleep``.
+        self.hold_sleep = hold_sleep
+        self._sleep_release = asyncio.Event()
         self.sleeping = False
         self.requests: list[dict[str, Any]] = []
         self.active: dict[str, _Req] = {}
@@ -296,6 +303,8 @@ class FakeEngine:
                 if include_usage:
                     await resp.write(_sse(dict(base, choices=[], usage=usage())))
                 await resp.write(b"data: [DONE]\n\n")
+                if self.hold_eof:
+                    await asyncio.Event().wait()
                 await resp.write_eof()
             except (ConnectionResetError, ConnectionError):
                 req.do_abort()
@@ -317,7 +326,12 @@ class FakeEngine:
         for req in list(self.active.values()):
             req.do_abort()
         await asyncio.sleep(0.02)  # the weight offload
+        if self.hold_sleep:
+            await self._sleep_release.wait()
         return web.Response(status=200)
+
+    def release_sleep(self) -> None:
+        self._sleep_release.set()
 
     async def _wake_up(self, request: web.Request) -> web.Response:
         self.requests.append({"path": "/wake_up", "headers": dict(request.headers)})

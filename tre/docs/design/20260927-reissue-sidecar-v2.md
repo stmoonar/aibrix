@@ -151,7 +151,7 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 
 - `POST /sleep`、`/pause`：必须 `X-TRE-Hidden: 1`，否则 409（`tre_reissue_events_total{event="sleep_rejected_not_hidden"}`）；该头不转发给 vLLM。
 - `/wake_up`、`/resume`、`/is_sleeping`、`/health`、`/metrics`、`/version`、`/v1/models` 等：透传（控制类超时 300 s，其它非 `/v1/` 路径 60 s，生成路径不设上限）。
-- 客户端断开（2026-10-05）：sidecar 的 HTTP 服务开 `handler_cancellation`，客户端连接断开时取消 handler，handler 持有的上游请求（本地引擎、经网关的重试或续发）随之关闭，vLLM 见连接关闭即 abort（排队中的请求不再 prefill）。sleep 造成的上游中断（客户端仍在）照常续发。`/sleep`、`/wake_up` 用 `asyncio.shield`，调用方断开也执行到底，sleeping 标记跟随引擎结果。已进入重试 / 续发的请求被取消时补记一次 `tre_reissue_total{reason="client_gone"}`（重试为 `kind=retry`，续发为 `kind=passthrough_abort`）。
+- 客户端断开（2026-10-05）：sidecar 的 HTTP 服务开 `handler_cancellation`，客户端连接断开时取消 handler，handler 持有的上游请求（本地引擎、经网关的重试或续发）随之关闭，vLLM 见连接关闭即 abort（排队中的请求不再 prefill）。sleep 造成的上游中断（客户端仍在）照常续发。`/sleep`、`/wake_up` 用 `asyncio.shield`，调用方断开也执行到底，sleeping 标记跟随引擎结果；调用方走后该调用若出错，记一条 WARNING（`tre_control_call_failed_after_disconnect`）。已进入重试 / 续发的请求被取消时补记一次 `tre_reissue_total{reason="client_gone"}`（重试为 `kind=retry`，续发为 `kind=passthrough_abort`）。
 - 打开文件上限（2026-10-05）：启动时把软 `RLIMIT_NOFILE` 提到 min(`TRE_REISSUE_NOFILE_TARGET`（默认 65535）, 硬上限)，只升不降，失败只记 WARNING；启动日志一行 `event=tre_reissue_nofile`（before / after / hard）。原因：Docker ≥ 25 / containerd ≥ 2.0 的容器默认软 1024，pod spec 不能设 ulimit。
 - 自身：`GET /tre-reissue/metrics`、`GET /tre-reissue/state`；每次重试 / 续发 / 透传 abort 在 stdout 打一行 JSON（`event=tre_reissue`）。
 
@@ -162,7 +162,7 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 | `tre_reissue_total{model,kind,reason}` | kind = `retry` / `continue` / `failed` / `passthrough_abort`；reason 细分（`engine_sleeping`、`local_sleeping`、`local_refused`、`local_unavailable_sleeping`、`upstream_unavailable`、`abort_before_output`、`abort_sleep`、`budget_spent`、`depth_limit`、`retry_exhausted`、`continuation_unavailable`、`continuation_aborted`、`continuation_broken`、`no_token_ids`、`not_sleeping`、`client_gone`、`non_continuable_*`、`abort_non_continuable_*`） |
 | `tre_reissue_proxy_added_seconds` | sidecar 自身给一个本地应答请求增加的时间（直方图）：forward（读完客户端请求 → 交给上游 HTTP 客户端）+ relay（每个上游响应头 / 数据块从收到到写给客户端，按请求累加）；不含等待上游的时间（响应头，即非流式请求的整个生成过程、块间间隔、经网关的续写请求）；块写入在发送缓冲超过高水位时会包含客户端背压；被转发重试的请求不计入。两部分另见 `tre_reissue_proxy_forward_seconds` / `tre_reissue_proxy_relay_seconds` |
 | `tre_reissue_gap_seconds{mode}` | abort 到续发（直方图）：`mode="stream"` = 到首个续发 token，`mode="nonstream"` = 到完整续发响应（含续发生成时间），两者不可比 |
-| `tre_reissue_events_total{event}` | sleep 拒绝 / 失败、状态纠偏、`stop_at_seam`、`client_cancel`（客户端断开，上游已关闭）等 |
+| `tre_reissue_events_total{event}` | sleep 拒绝 / 失败、状态纠偏、`stop_at_seam`、`client_cancel`（客户端拿到完整响应前请求被取消：客户端断开，或服务关闭；上游已关闭。流式 `[DONE]` 已写出后的断开不算）等 |
 | `tre_reissue_sleeping` | 本地 sleeping 标记 |
 | `tre_reissue_local_reconnect_total{model,result}` | 首字节前连接级失败后的新连接重发次数，`result=ok/fail`（§3a） |
 | `tre_reissue_local_reconnect_skipped_total{model,reason}` | 首字节前连接级失败但**没有**重发的次数；`reason=outside_window`：复用连接在交出后超过 `local_reconnect_window_s` 才失败（不是 keep-alive 竞态，避免重复执行）（§3a） |
