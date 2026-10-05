@@ -120,11 +120,14 @@ class _FakeVllm:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         self.bodies, self.prompt, self.gen, self.lock, fake = [], 0, 0, threading.Lock(), self
+        self.running, self.stuck = 0, 0  # stuck: extra requests the engine reports forever
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 body = (f"vllm:prompt_tokens_total {fake.prompt}\n"
-                        f"vllm:generation_tokens_total {fake.gen}\n").encode()
+                        f"vllm:generation_tokens_total {fake.gen}\n"
+                        f"vllm:num_requests_running {fake.running + fake.stuck}\n"
+                        f"vllm:num_requests_waiting 0\n").encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -134,11 +137,14 @@ class _FakeVllm:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
                 fake.bodies.append(body)
                 import time as _t
+                with fake.lock:
+                    fake.running += 1
                 _t.sleep(delay_s)
                 n = int(body["max_tokens"])
                 with fake.lock:
                     fake.prompt += 120
                     fake.gen += n
+                    fake.running -= 1
                 chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}]
                 chunks += [{"choices": [{"index": 0, "delta": {"content": "x"}}]} for _ in range(n)]
                 chunks.append({"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": n,
@@ -171,7 +177,7 @@ def test_http_measure_drives_closed_loop_chat_and_reads_engine_counters(tmp_path
     monkeypatch.setattr(r3_grid, "_make_prompt", lambda n, key, *a, **k: f"prompt {key}")
     fake = _FakeVllm()
     try:
-        measure = tp.make_http_measure(fake.url, lambda m: [fake.metrics], raw_dir=tmp_path / "raw")
+        measure = tp.make_http_measure(fake.url, lambda m: [fake.metrics], raw_dir=tmp_path / "raw", drain_poll_s=0.05)
         step = measure("dsqwen-7b", 128, 4, 2, 0.8, 0.2)
     finally:
         fake.close()
@@ -192,3 +198,67 @@ def test_buckets_report_the_median_input(tmp_path, capsys):
     f.write_text(json.dumps([{"in_tokens": x, "max_tokens": 10} for x in (100, 200, 300, 400, 500)]), encoding="utf-8")
     assert tb.main(["--trace", str(f), "--default-model", "m"]) == 0
     assert yaml.safe_load(capsys.readouterr().out)["median_in"] == {"m": 300}
+
+
+def _http_measure(monkeypatch, tmp_path, fake, **kw):
+    from scripts import r3_grid
+
+    monkeypatch.setattr(r3_grid, "_make_prompt", lambda n, key, *a, **k: f"prompt {key}")
+    return tp.make_http_measure(fake.url, lambda m: [fake.metrics], raw_dir=tmp_path / "raw", **kw)
+
+
+def test_a_fleet_change_during_a_step_invalidates_it_and_aborts(tmp_path, monkeypatch):
+    """Review P1-A: a wake/sleep/restart during a step must not yield a velocity or mu."""
+    fake = _FakeVllm()
+    views = iter([("b0",), ("b0", "b1")])                    # mark a, mark b: another replica woke
+    try:
+        measure = _http_measure(monkeypatch, tmp_path, fake, fleet_view=lambda m: next(views),
+                                expected={"m": ("b0",)}, drain_poll_s=0.05)
+        step = measure("m", 64, 4, 1, 0.6, 0.2)
+    finally:
+        fake.close()
+    assert step.valid is False and step.prefill_tok_s is None and "fleet changed" in step.note
+    stub = _scripted(lambda c: 1000 * c)
+    calls = []
+
+    def flaky(model, tin, tout, c, step_s, warmup_s):
+        calls.append(c)
+        st = stub(model, tin, tout, c, step_s, warmup_s)
+        return st if c < 4 else tp.StepMeasure(c, 1, 0, None, None, None, None, valid=False, note="fleet changed")
+
+    res, rows = tp.profile_model(flaky, "m", 492, 400, SLO, step_s=60, warmup_s=15, ladder=(1, 2, 4, 8))
+    assert calls == [1, 2, 4] and res["aborted"] == "fleet changed"     # no out=1 ladder, nothing more sent
+    assert res["velocity"] is None and res["mu"] is None
+
+
+def test_each_step_waits_for_an_idle_replica_before_returning(tmp_path, monkeypatch):
+    """Review P2-B: a state gate on running + waiting == 0 (bounded far above any request)."""
+    fake = _FakeVllm(delay_s=0.3)
+    try:
+        _http_measure(monkeypatch, tmp_path, fake, drain_poll_s=0.05)("m", 64, 4, 3, 0.5, 0.1)
+        assert fake.running == 0                              # stragglers finished before the return
+        fake.stuck = 1
+        with pytest.raises(tp.ProfileAbort, match="in flight"):
+            _http_measure(monkeypatch, tmp_path, fake, drain_poll_s=0.05, drain_cap_s=0.3)("m", 64, 4, 1, 0.3, 0.1)
+    finally:
+        fake.close()
+
+
+def test_preconditions_need_observe_modes_and_no_apa():
+    assert tp.check_preconditions(["a"], lambda k: None, lambda: []) == []
+    modes = {"tre:v2:controller:mode": "active", "tre:v2:sm:actuation": "active"}
+    apa = [{"metadata": {"namespace": "default", "name": "a-apa"}, "spec": {"scaleTargetRef": {"name": "a"}}}]
+    problems = tp.check_preconditions(["a"], modes.get, lambda: apa)
+    assert len(problems) == 3 and any("APA" in p for p in problems)
+
+
+def test_profile_records_the_registry_and_c_b_used(tmp_path):
+    slo = __import__("types").SimpleNamespace(ttft_slo_ms=lambda L: 500.0, tpot_p95_ms=75.0, ttft_idle_c_ms=41.1,
+                                              ttft_idle_b_ms_per_token=0.0694, ttft_slowdown_k=5.0,
+                                              ttft_floor_ms=500.0)
+    out = tmp_path / "o"
+    assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--registry", "r.yaml"],
+                   slo_for=lambda m: slo) == 0
+    doc = yaml.safe_load((out / "profile.yaml").read_text(encoding="utf-8"))
+    assert doc["registry"] == "file:r.yaml"
+    assert doc["slo"]["a"]["ttft_idle_c_ms"] == 41.1 and doc["slo"]["a"]["ttft_idle_b_ms_per_token"] == 0.0694

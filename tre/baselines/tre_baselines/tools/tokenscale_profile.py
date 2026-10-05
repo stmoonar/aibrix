@@ -32,6 +32,23 @@ Outputs (``--out-dir``): ``profile.yaml`` and ``profile_raw.csv``:
   closed loop keeps shorter queues than an open one, so mu is slightly optimistic
   (disclose; cross-check with the calibration rho* x token mix).
 
+Validity gates (state, not timers):
+
+* before sending: the TRE controller and the SM actuation are both ``observe``
+  (``tre:v2:controller:mode`` / ``tre:v2:sm:actuation``, missing = observe), no AIBrix APA
+  ``PodAutoscaler`` targets a profiled model, each model has exactly one awake replica and
+  one routable pod (all read only);
+* at both marks of every step the model's awake bindings and routable pods are read
+  again; a change (a wake, a sleep, a restart) makes the step invalid (rates None) and
+  aborts the model's run (exit 5);
+* after every step, before the next one (also between the two ladders), the tool waits
+  until the replica reports nothing running or waiting, so a step never inherits the
+  previous step's queue (bounded by ``--drain-cap-s``, beyond any request's lifetime).
+
+The SLO and c/b come from ``--registry`` or, by default, the live ConfigMap
+``tre-v2/tre-v2-registry`` (read with ``kubectl get``); the source and the c/b used are
+written into ``profile.yaml``. Each model's ladders run in their own process.
+
 Cost: (len(ladder) x 2) x step_s per model, models in parallel (default ~20 min).
 Sending needs ``--i-have-user-approval``; ``--dry-run`` uses a synthetic stub.
 """
@@ -41,11 +58,12 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing
+import subprocess
 import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -59,6 +77,16 @@ DEFAULT_EXTEND_GAIN = 0.05
 DEFAULT_MAX_CONCURRENCY = 256
 PROMPT_COUNTER = "vllm:prompt_tokens_total"
 GEN_COUNTER = "vllm:generation_tokens_total"
+#: Upper bound of the wait for an idle replica after a step: no request outlives the
+#: gateway route timeout (150 s); twice that means something is wrong -> abort.
+DEFAULT_DRAIN_CAP_S = 300.0
+CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
+SM_ACTUATION_KEY = "tre:v2:sm:actuation"
+EXIT_ABORTED = 5
+
+
+class ProfileAbort(RuntimeError):
+    """The measurement cannot go on validly (fleet changed, replica never idle)."""
 
 
 @dataclass(frozen=True)
@@ -72,6 +100,9 @@ class StepMeasure:
     #: Client-side p95 of the requests that finished inside the window (ms).
     ttft_p95_ms: Optional[float]
     tpot_p95_ms: Optional[float]
+    #: False when the fleet changed during the step (its rates are then None).
+    valid: bool = True
+    note: Optional[str] = None
 
     @property
     def tok_s(self) -> Optional[float]:
@@ -99,6 +130,23 @@ def counter_sum(text: str, name: str) -> Optional[float]:
 
     vals = [s.value for s in parse_prometheus_text(text) if s.name == name and math.isfinite(s.value)]
     return sum(vals) if vals else None
+
+
+def queued(text: str) -> Optional[float]:
+    """running + waiting of a replica's ``/metrics`` (None when a gauge is missing)."""
+    from tre_common.vllm_metrics import VLLM_METRICS
+
+    from tre_baselines.sources import parse_prometheus_text
+
+    samples = parse_prometheus_text(text)
+    total = 0.0
+    for key in ("num_requests_running", "num_requests_waiting"):
+        names = set(VLLM_METRICS[key])
+        vals = [x.value for x in samples if x.name in names and math.isfinite(x.value)]
+        if not vals:
+            return None
+        total += sum(vals)
+    return total
 
 
 def engine_rates(before: str, after: str, dt_s: float) -> tuple[Optional[float], Optional[float]]:
@@ -129,19 +177,40 @@ def make_http_measure(gateway_url: str, metrics_urls: Callable[[str], Sequence[s
                       prompt_mode: str = "natural", routing_strategy: Optional[str] = None,
                       run_key: str = "bl-profile", stream_call: Optional[Callable] = None,
                       fetch: Callable[[str], str] = http_get_text, raw_dir: Optional[Path] = None,
-                      now_ms: Callable[[], int] = lambda: int(time.time() * 1000)) -> Measure:
+                      now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+                      fleet_view: Optional[Callable[[str], Any]] = None,
+                      expected: Optional[dict[str, Any]] = None,
+                      drain_poll_s: float = 0.5, drain_cap_s: float = DEFAULT_DRAIN_CAP_S,
+                      sleep: Callable[[float], None] = time.sleep) -> Measure:
     """One step = ``r3_grid.drive_cell`` (the calibration chat sender) for ``step_s`` with
     ``concurrency`` closed-loop workers, the replica's ``/metrics`` (``metrics_urls(model)``)
-    scraped when the warm-up ends and when the step ends."""
+    scraped when the warm-up ends and when the step ends. ``fleet_view(model)`` (awake
+    bindings + routable pods) is read at both marks and must equal ``expected[model]``;
+    after the step the replica must drain to nothing in flight before the call returns."""
     from scripts import r3_grid  # lazy: tre/deploy on PYTHONPATH (as for the calibration tools)
 
     def scrape(model: str) -> str:
         return "\n".join(fetch(url) for url in metrics_urls(model))
 
+    def drain(model: str) -> None:
+        deadline = time.monotonic() + drain_cap_s
+        while True:
+            try:
+                q = queued(scrape(model))
+            except Exception:  # noqa: BLE001 - unreadable: not idle
+                q = None
+            if q == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise ProfileAbort(f"{model}: replica still has {q} requests in flight {drain_cap_s:g}s after the step")
+            sleep(drain_poll_s)
+
     def measure(model: str, in_tokens: int, out_tokens: int, concurrency: int, step_s: float,
                 warmup_s: float) -> StepMeasure:
         cell = r3_grid.GridCell(int(in_tokens), int(out_tokens), int(concurrency))
         marks: dict[str, tuple[float, int, Optional[str]]] = {}
+
+        views: dict[str, Any] = {}
 
         def mark(name: str) -> None:
             try:
@@ -149,6 +218,11 @@ def make_http_measure(gateway_url: str, metrics_urls: Callable[[str], Sequence[s
             except Exception:  # noqa: BLE001 - an unreadable scrape is unknown, not 0
                 text = None
             marks[name] = (time.monotonic(), now_ms(), text)
+            if fleet_view is not None:
+                try:
+                    views[name] = fleet_view(model)
+                except Exception as exc:  # noqa: BLE001 - unknown fleet: not valid
+                    views[name] = f"<unreadable: {exc!r}>"
 
         timers = [threading.Timer(warmup_s, mark, ("a",)), threading.Timer(step_s, mark, ("b",))]
         with tempfile.TemporaryDirectory(prefix="bl-profile-") as tmp:
@@ -168,6 +242,13 @@ def make_http_measure(gateway_url: str, metrics_urls: Callable[[str], Sequence[s
         (ta, wa, sa), (tb, wb, sb) = marks["a"], marks["b"]
         prefill, decode = engine_rates(sa, sb, tb - ta) if sa is not None and sb is not None else (None, None)
         completed, ttft, tpot = window_latencies(records, wa, wb)
+        drain(model)  # the next step must not inherit this step's queue
+        if fleet_view is not None:
+            want = (expected or {}).get(model)
+            if not views.get("a") == views.get("b") == want:
+                return StepMeasure(int(concurrency), round(tb - ta, 3), completed, None, None, ttft, tpot,
+                                   valid=False, note=f"fleet changed: expected {want}, a={views.get('a')}, "
+                                                     f"b={views.get('b')}")
         return StepMeasure(int(concurrency), round(tb - ta, 3), completed, prefill, decode, ttft, tpot)
 
     return measure
@@ -198,7 +279,12 @@ def run_ladder(measure: Measure, model: str, in_tokens: int, out_tokens: int, st
                warn: Callable[[str], None] = lambda msg: print(msg, file=sys.stderr)) -> list[StepMeasure]:
     """Every step of the ladder; then, while the last step still gained more than
     ``extend_gain`` over the one before, further steps at x1.5 up to ``max_concurrency``."""
-    steps = [measure(model, in_tokens, out_tokens, int(c), step_s, warmup_s) for c in ladder]
+    steps: list[StepMeasure] = []
+    for c in ladder:
+        steps.append(measure(model, in_tokens, out_tokens, int(c), step_s, warmup_s))
+        if not steps[-1].valid:
+            return steps  # aborted: the caller reports it
+
 
     def gain() -> float:
         if len(steps) < 2:
@@ -213,6 +299,8 @@ def run_ladder(measure: Measure, model: str, in_tokens: int, out_tokens: int, st
                  f"{steps[-1].concurrency} (max {max_concurrency}); the peak may be higher")
             break
         steps.append(measure(model, in_tokens, out_tokens, nxt, step_s, warmup_s))
+        if not steps[-1].valid:
+            break
     return steps
 
 
@@ -238,15 +326,23 @@ def profile_model(measure: Measure, model: str, in_tokens: int, out_tokens: int,
     """Both ladders of one model -> ({velocity, mu, slo}, raw rows)."""
     kw = dict(extend_gain=extend_gain, max_concurrency=max_concurrency)
     mixed = run_ladder(measure, model, in_tokens, out_tokens, step_s, warmup_s, ladder, rate="tok_s", **kw)
-    prefill = run_ladder(measure, model, in_tokens, 1, step_s, warmup_s, ladder, rate="prefill_tok_s", **kw)
+    aborted = next((s.note for s in mixed if not s.valid), None)
+    prefill = [] if aborted else run_ladder(measure, model, in_tokens, 1, step_s, warmup_s, ladder,
+                                            rate="prefill_tok_s", **kw)
+    aborted = aborted or next((s.note for s in prefill if not s.valid), None)
     ttft_slo = float(slo.ttft_slo_ms(in_tokens))
     tpot_slo = float(slo.tpot_p95_ms)
     v_b, v_p = _best([s.tok_s for s in mixed]), _best([s.prefill_tok_s for s in prefill])
     result = {
-        "velocity": None if v_b is None or v_p is None else
+        "velocity": None if aborted or v_b is None or v_p is None else
         {"buckets": [[round(v_b, 1)] * 3 for _ in range(3)], "v_prefill": round(v_p, 1)},
-        "mu": preserve_mu(mixed, ttft_slo, tpot_slo),
-        "slo": {"ttft_p95_ms": round(ttft_slo, 1), "tpot_p95_ms": tpot_slo, "in_tokens": in_tokens},
+        "mu": None if aborted else preserve_mu(mixed, ttft_slo, tpot_slo),
+        "slo": {"ttft_p95_ms": round(ttft_slo, 1), "tpot_p95_ms": tpot_slo, "in_tokens": in_tokens,
+                "ttft_idle_c_ms": getattr(slo, "ttft_idle_c_ms", None),
+                "ttft_idle_b_ms_per_token": getattr(slo, "ttft_idle_b_ms_per_token", None),
+                "ttft_slowdown_k": getattr(slo, "ttft_slowdown_k", None),
+                "ttft_floor_ms": getattr(slo, "ttft_floor_ms", None)},
+        "aborted": aborted,
     }
     rows = [dict(model=model, kind=kind, in_tokens=in_tokens, out_tokens=out, **asdict(s), tok_s=s.tok_s)
             for kind, out, steps in (("mixed", out_tokens, mixed), ("prefill", 1, prefill)) for s in steps]
@@ -256,12 +352,53 @@ def profile_model(measure: Measure, model: str, in_tokens: int, out_tokens: int,
 # ------------------------------------------------------------------ cluster checks (read only)
 
 
-def check_one_awake(sm_url: str, model: str, timeout_s: float = 5.0) -> int:
-    """Awake replicas of ``model`` per the SM's ``GET /v2/state`` (read only)."""
+def get_state(sm_url: str, timeout_s: float = 5.0) -> dict:
     with urlopen(Request(sm_url.rstrip("/") + "/v2/state", headers={"accept": "application/json"}),
                  timeout=timeout_s) as resp:
-        state = json.loads(resp.read().decode("utf-8"))
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def check_one_awake(sm_url: str, model: str, timeout_s: float = 5.0) -> int:
+    """Awake replicas of ``model`` per the SM's ``GET /v2/state`` (read only)."""
+    state = get_state(sm_url, timeout_s)
     return int(((state.get("models") or {}).get(model) or {}).get("awake", 0))
+
+
+def awake_bindings(state: dict, model: str) -> frozenset:
+    return frozenset(str(b.get("serve_id")) for b in state.get("bindings") or ()
+                     if b.get("model") == model and b.get("awake") and not b.get("hidden"))
+
+
+def check_preconditions(models: Sequence[str], redis_get: Callable[[str], Optional[str]],
+                        list_apa: Callable[[], list]) -> list[str]:
+    """Why profiling must not start (empty = ok): both run modes observe, no APA CR on a
+    profiled model. ``redis_get`` / ``list_apa`` are read-only."""
+    problems = []
+    for key in (CONTROLLER_MODE_KEY, SM_ACTUATION_KEY):
+        value = redis_get(key)
+        if value not in (None, "", "observe"):
+            problems.append(f"{key} is {value!r}, must be observe (deploy/scripts/set_run_mode.sh observe observe)")
+    for item in list_apa():
+        target = ((item.get("spec") or {}).get("scaleTargetRef") or {}).get("name")
+        if target in set(models):
+            meta = item.get("metadata") or {}
+            problems.append(f"APA PodAutoscaler {meta.get('namespace')}/{meta.get('name')} targets {target}")
+    return problems
+
+
+def _kubectl(argv: Sequence[str]) -> str:
+    return subprocess.run(list(argv), capture_output=True, text=True, check=True).stdout
+
+
+def live_registry(namespace: str = "tre-v2", name: str = "tre-v2-registry", kubectl: str = "kubectl") -> str:
+    """The live registry ConfigMap (``kubectl get``, read only) written to a temp file."""
+    text = _kubectl([kubectl, "-n", namespace, "get", "configmap", name, "-o", "jsonpath={.data.registry\\.yaml}"])
+    if not text.strip():
+        raise ValueError(f"ConfigMap {namespace}/{name} has no registry.yaml")
+    fh = tempfile.NamedTemporaryFile("w", suffix="-registry.yaml", delete=False, encoding="utf-8")
+    with fh:
+        fh.write(text)
+    return fh.name
 
 
 def model_slo(model: str, registry_path: Optional[str]) -> Any:
@@ -273,6 +410,29 @@ def model_slo(model: str, registry_path: Optional[str]) -> Any:
 
     registry = load_registry(registry_path)
     return _slo_definition(model, registry.model(model), registry, strict=True)
+
+
+def run_isolated(models: Sequence[str], one: Callable[[str], tuple]) -> dict[str, tuple]:
+    """Each model's ladders in their own (forked) process; results come back by a queue."""
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+
+    def child(model: str) -> None:
+        try:
+            queue.put((model, "ok", one(model)))
+        except BaseException as exc:  # noqa: BLE001 - reported by the parent
+            queue.put((model, "error", repr(exc)))
+
+    procs = [ctx.Process(target=child, args=(m,), name=f"bl-profile-{m}") for m in models]
+    for p in procs:
+        p.start()
+    out: dict[str, tuple] = {}
+    for _ in procs:
+        model, status, payload = queue.get()
+        out[model] = (status, payload)
+    for p in procs:
+        p.join()
+    return out
 
 
 def _ladder(text: str) -> tuple[int, ...]:
@@ -294,15 +454,21 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--gateway-url", default=None, help="the chat endpoint URL (.../v1/chat/completions)")
     ap.add_argument("--sm-url", default=None, help="required for a real run: checks exactly one awake replica")
+    ap.add_argument("--redis-url", default=None, help="read the run modes here (default: kubectl exec redis-cli)")
+    ap.add_argument("--namespace", default="tre-v2", help="namespace of Redis and the registry ConfigMap")
+    ap.add_argument("--redis-deploy", default="tre-v2-redis")
+    ap.add_argument("--kubectl", default="kubectl")
     ap.add_argument("--model-namespace", default="default", help="namespace of the model pods")
     ap.add_argument("--metrics-port", type=int, default=8000, help="pod port serving vLLM /metrics")
-    ap.add_argument("--registry", default=None, help="registry with the fitted c/b (default: the shared one)")
+    ap.add_argument("--registry", default=None,
+                    help="registry with the fitted c/b (default: the live ConfigMap; dry-run: the shared file)")
     ap.add_argument("--routing-strategy", default=None)
     ap.add_argument("--raw-dir", default=None, help="keep the per-request raw JSONL here")
     ap.add_argument("--dry-run", action="store_true", help="synthetic stub; nothing is sent")
     ap.add_argument("--i-have-user-approval", action="store_true", help="required to send real requests")
     ap.add_argument("--step-s", type=float, default=60.0)
     ap.add_argument("--warmup-s", type=float, default=15.0)
+    ap.add_argument("--drain-cap-s", type=float, default=DEFAULT_DRAIN_CAP_S)
     ap.add_argument("--concurrency", type=_ladder, default=DEFAULT_LADDER)
     ap.add_argument("--extend-gain", type=float, default=DEFAULT_EXTEND_GAIN)
     ap.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
@@ -311,9 +477,26 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     if args.warmup_s >= args.step_s:
         print("error: --warmup-s must be < --step-s", file=sys.stderr)
         return 2
+    real = measure is None and not args.dry_run
+    if real and not args.i_have_user_approval:
+        print("refusing to send requests without --i-have-user-approval (use --dry-run)", file=sys.stderr)
+        return 3
+    if real and (not args.gateway_url or not args.sm_url):
+        print("error: a real run needs --gateway-url and --sm-url", file=sys.stderr)
+        return 2
     minutes = 2 * len(args.concurrency) * args.step_s / 60
     print(f"estimated time: ~{minutes:.0f} min per model (models in parallel), ladder {list(args.concurrency)}")
-    slo_for = slo_for or (lambda m: model_slo(m, args.registry))
+    registry_source = f"file:{args.registry}" if args.registry else "shared registry file (dry-run)"
+    registry_path = args.registry
+    if slo_for is None:
+        if registry_path is None and real:
+            try:
+                registry_path = live_registry(args.namespace, kubectl=args.kubectl)
+            except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+                print(f"error: cannot read the live registry ConfigMap: {exc}", file=sys.stderr)
+                return 2
+            registry_source = f"configmap {args.namespace}/tre-v2-registry (live, read with kubectl get)"
+        slo_for = lambda m: model_slo(m, registry_path)  # noqa: E731
     try:
         slos = {m: slo_for(m) for m in models}
     except (ValueError, KeyError, SystemExit) as exc:
@@ -323,52 +506,73 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
         if args.dry_run:
             measure = make_stub_measure()
         else:
-            if not args.i_have_user_approval:
-                print("refusing to send requests without --i-have-user-approval (use --dry-run)", file=sys.stderr)
-                return 3
-            if not args.gateway_url or not args.sm_url:
-                print("error: a real run needs --gateway-url and --sm-url", file=sys.stderr)
-                return 2
+            from tre_baselines.tools import arm
+
+            redis = (arm.DirectRedis(args.redis_url) if args.redis_url else
+                     arm.KubectlRedis(arm.subprocess_runner, args.kubectl, args.namespace, args.redis_deploy))
+
+            def list_apa() -> list:
+                doc = json.loads(_kubectl([args.kubectl, "get", arm.APA_RESOURCE, "-A", "-o", "json"]) or "{}")
+                return doc.get("items") or []
+
+            problems = check_preconditions(models, redis.get, list_apa)
             wrong = {m: n for m in models if (n := check_one_awake(args.sm_url, m)) != 1}
             if wrong:
-                print(f"error: profile with exactly one awake replica per model, got {wrong}", file=sys.stderr)
-                return 4
+                problems.append(f"profile with exactly one awake replica per model, got {wrong}")
             from scripts.r3_grid import discover_pod_metrics_endpoints
 
-            urls = {m: discover_pod_metrics_endpoints(m, args.model_namespace, args.metrics_port) for m in models}
+            def routable(m: str) -> tuple:
+                return tuple(sorted(discover_pod_metrics_endpoints(m, args.model_namespace, args.metrics_port)))
+
+            urls = {m: routable(m) for m in models}
             if any(len(u) != 1 for u in urls.values()):
-                print(f"error: expected one routable pod per model, got {urls}", file=sys.stderr)
+                problems.append(f"expected one routable pod per model, got {urls}")
+            if problems:
+                print("refusing to profile:\n  " + "\n  ".join(problems), file=sys.stderr)
                 return 4
+
+            def fleet_view(m: str) -> tuple:
+                return (tuple(sorted(awake_bindings(get_state(args.sm_url), m))), routable(m))
+
+            expected = {m: fleet_view(m) for m in models}
             measure = make_http_measure(args.gateway_url, lambda m: urls[m], routing_strategy=args.routing_strategy,
-                                        raw_dir=Path(args.raw_dir) if args.raw_dir else None)
+                                        raw_dir=Path(args.raw_dir) if args.raw_dir else None,
+                                        fleet_view=fleet_view, expected=expected, drain_cap_s=args.drain_cap_s)
 
     def one(model: str) -> tuple[dict, list[dict]]:
         return profile_model(measure, model, args.in_tokens, args.out_tokens, slos[model], step_s=args.step_s,
                              warmup_s=args.warmup_s, ladder=args.concurrency, extend_gain=args.extend_gain,
                              max_concurrency=args.max_concurrency)
 
-    with ThreadPoolExecutor(max_workers=max(1, len(models))) as pool:
-        results = dict(zip(models, pool.map(one, models)))
+    outcomes = run_isolated(models, one)
+    errors = {m: p for m, (st, p) in outcomes.items() if st != "ok"}
+    results = {m: p for m, (st, p) in outcomes.items() if st == "ok"}
     doc = {
         "shape": {"in_tokens": args.in_tokens, "out_tokens": args.out_tokens,
                   "note": "TokenScale buckets degenerate to one cell (all nine = V_b); disclose"},
+        "registry": registry_source,
         "velocity": {m: r["velocity"] for m, (r, _) in results.items()},
         "mu": {m: r["mu"] for m, (r, _) in results.items()},
         "slo": {m: r["slo"] for m, (r, _) in results.items()},
+        "aborted": {**{m: r["aborted"] for m, (r, _) in results.items() if r["aborted"]}, **errors},
     }
-    missing = [m for m, (r, _) in results.items() if r["mu"] is None or r["velocity"] is None]
-    if missing:
-        print(f"warning: no SLO-meeting step / unreadable counters for {missing}: see profile_raw.csv", file=sys.stderr)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(doc, sort_keys=False, default_flow_style=None)
     (out / "profile.yaml").write_text(text, encoding="utf-8")
     rows = [row for _, (_, rs) in results.items() for row in rs]
-    with (out / "profile_raw.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
+    if rows:
+        with (out / "profile_raw.csv").open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
     sys.stdout.write(text)
+    if doc["aborted"]:
+        print(f"error: aborted / failed: {doc['aborted']}", file=sys.stderr)
+        return EXIT_ABORTED
+    missing = [m for m, (r, _) in results.items() if r["mu"] is None or r["velocity"] is None]
+    if missing:
+        print(f"warning: no SLO-meeting step / unreadable counters for {missing}: see profile_raw.csv", file=sys.stderr)
     return 0
 
 
