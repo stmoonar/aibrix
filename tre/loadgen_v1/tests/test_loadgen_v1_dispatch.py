@@ -313,3 +313,42 @@ def test_non_streaming_path_records_audit_fields(fake_server, tmp_path):
     assert r1["success"] and r1["attempts"] == 2 and [a["status"] for a in r1["attempt_log"]] == [503, 200]
     (req,) = [r for r in fake_server.records_for({f"{tag} ns ok"})]
     assert "stream" not in req["body"] and req["body"]["max_tokens"] == 3
+
+
+class _WordTokenizer:
+    """One token per whitespace-separated word; chat template ``<U> {content} <A>`` (+2)."""
+
+    filler = " the"
+    chat_prefix = "<U> "
+    chat_suffix = " <A>"
+    chat_error = None
+    path = "/fixture/tokenizer"
+
+    def encode_plain(self, text):
+        return text.split()
+
+
+def test_send_in_tokens_sends_the_templated_count_counted_before_the_fork(fake_server, tmp_path, monkeypatch):
+    from tre_replayer.engine import model_tokenizer
+
+    def load(model, tokenizer_path=None):
+        if model == "ok-stop":
+            raise model_tokenizer.TokenizerUnavailable("no tokenizer for this model")
+        return _WordTokenizer()
+
+    monkeypatch.setattr(model_tokenizer, "load_tokenizer", load)
+    tag = uuid.uuid4().hex[:8]
+    cfg = write_config(tmp_path / "c.yaml", tmp_path / "out", timeout=TIMEOUT_S, send_in_tokens=True)
+    cm = ConfigManager(str(cfg))
+    cm.load_config()
+    cm.config.gateway_endpoint = fake_server.url
+    traces = [_trace("h-ok", 0.2, "ok", f"{tag} four words here", max_out=2),
+              _trace("h-none", 0.2, "ok-stop", f"{tag} no tokenizer", max_out=2)]
+    dispatcher = ClientDispatcher(cm)
+    by_id = {r["request_id"]: r for r in dispatcher.dispatch_traces(traces)}
+    (sent,) = fake_server.records_for({f"{tag} four words here"})
+    (omitted,) = fake_server.records_for({f"{tag} no tokenizer"})
+    assert sent["headers"]["x-tre-bl-in-tokens"] == "6"  # 4 words + the template's 2
+    assert "x-tre-bl-in-tokens" not in omitted["headers"]  # no count -> no header, never a guess
+    assert by_id["h-ok"]["in_tokens_header"] == 6 and by_id["h-none"]["in_tokens_header"] is None
+    assert dispatcher.in_tokens_summary["counted"] == 1 and dispatcher.in_tokens_summary["omitted"] == 1

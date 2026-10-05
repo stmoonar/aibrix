@@ -16,6 +16,7 @@ CustomTraceGenerator - 增强版负载测试系统
   --routing-strategy  routing-strategy 请求头（默认取配置，v1 配置均为 least-gpu-cache；传 "" 不发该头）
   --trace-file     直接重放 v1 记录的逐请求计划 traces.json（跳过阶段1生成）
   --ignore-eos     opt-in：每个请求加 ignore_eos: true（默认关，与 v1 相同）
+  --send-in-tokens opt-in：每个请求加 x-tre-bl-in-tokens 头（套 chat 模板后的 prompt token 数；默认关）
 以及 performance_metrics.json 每行追加的审计字段。
 
 [2026-09-30] 发送改由全项目唯一的发送客户端 tre_replayer（profile e1_v1）完成，本包只剩
@@ -75,7 +76,7 @@ class CustomTraceGenerator:
     def __init__(self, config_path: str, output_dir: str = None, verbose: bool = False,
                  base_url: str = None, max_retries: int = None,
                  routing_strategy: str = None, trace_file: str = None,
-                 ignore_eos: bool = False):
+                 ignore_eos: bool = False, send_in_tokens: bool = False):
         """
         初始化CustomTraceGenerator
 
@@ -114,6 +115,8 @@ class CustomTraceGenerator:
             self.config.client.routing_algorithm = routing_strategy
         if ignore_eos:  # opt-in only: the flag can turn it on, never off (config key wins otherwise)
             self.config.client.ignore_eos = True
+        if send_in_tokens:  # 同上：只能打开
+            self.config.client.send_in_tokens = True
         self.config.client.validate_process_config()
 
         if self.verbose:
@@ -236,6 +239,7 @@ class CustomTraceGenerator:
                 "openai_base_url": f"{self.config.gateway_endpoint}/v1",
                 "max_retries": self.config.client.max_retries,
                 "ignore_eos": bool(getattr(self.config.client, "ignore_eos", False)),
+                "send_in_tokens": bool(getattr(self.config.client, "send_in_tokens", False)),
                 "timeout": self.config.client.timeout,
                 "routing_strategy_header": self.config.client.routing_algorithm or None,
                 "enable_streaming": self.config.client.enable_streaming,
@@ -360,6 +364,8 @@ class CustomTraceGenerator:
                 "metrics": summarize_v1_records(response_records),
                 "client": dispatcher.provenance,
                 "workers": dispatcher.workers,
+                # --send-in-tokens 时：带头 / 未带头（算不出）的请求数、所用 tokenizer
+                "in_tokens_header": dispatcher.in_tokens_summary,
             })
 
             return True
@@ -516,6 +522,10 @@ def main(argv=None):
     parser.add_argument('--ignore-eos', action='store_true',
                        help='每个请求加 ignore_eos: true（OpenAI SDK extra_body），输出长度 = max_tokens；'
                             '默认关（= v1 请求）。也可用配置 client.ignore_eos: true')
+    parser.add_argument('--send-in-tokens', action='store_true',
+                       help='每个请求加 x-tre-bl-in-tokens 头（OpenAI SDK extra_headers）= 套 chat 模板后的 '
+                            'prompt token 数（= usage.prompt_tokens），发送前用各模型自己的 tokenizer 预先算好；'
+                            '算不出的请求不发该头并计数。默认关。也可用配置 client.send_in_tokens: true')
     parser.add_argument('--trace-file', default=None,
                        help='重放 v1 记录的逐请求计划 traces.json（跳过阶段1生成；'
                             '同目录 load_timeline_*.json 一并复制到输出目录）')
@@ -544,6 +554,7 @@ def main(argv=None):
             routing_strategy=args.routing_strategy,
             trace_file=args.trace_file,
             ignore_eos=args.ignore_eos,
+            send_in_tokens=args.send_in_tokens,
         )
 
         success = False

@@ -23,8 +23,8 @@ V14_TRACES = [
 ]
 
 
-def _run_cli(args, cwd):
-    env = dict(os.environ)
+def _run_cli(args, cwd, **env_extra):
+    env = dict(os.environ, **env_extra)
     env["PYTHONPATH"] = str(LOADGEN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run([sys.executable, "-m", "tre_loadgen_v1", *args], cwd=cwd, env=env,
                           capture_output=True, text=True, timeout=240)
@@ -89,7 +89,10 @@ def test_replay_recorded_trace_end_to_end(fake_server, tmp_path):
         assert r["path"] == "/v1/chat/completions"
         assert "routing-strategy" not in r["headers"]
         assert "ignore_eos" not in r["body"]  # default: v1's request, no ignore_eos
+        assert "x-tre-bl-in-tokens" not in r["headers"]
     assert meta["ignore_eos"] is False
+    assert meta["send_in_tokens"] is False and meta["in_tokens_header"] is None
+    assert all("in_tokens_header" not in line for line in lines)
 
 
 def test_ignore_eos_flag_adds_field_to_every_request(fake_server, tmp_path):
@@ -112,6 +115,28 @@ def test_ignore_eos_flag_adds_field_to_every_request(fake_server, tmp_path):
     # max_tokens unchanged: the trace's value, else the model config's
     assert by_prompt[f"{tag} a"]["max_tokens"] == 3 and by_prompt[f"{tag} b"]["max_tokens"] == 6
     assert json.loads((out / "loadgen_run_meta.json").read_text())["ignore_eos"] is True
+
+
+def test_send_in_tokens_without_a_tokenizer_omits_the_header_and_says_so(fake_server, tmp_path):
+    tag = uuid.uuid4().hex[:8]
+    rec = _recorded_dir(tmp_path, tag)
+    cfg = write_config(tmp_path / "config.yaml", tmp_path / "base")
+    out = tmp_path / "out"
+    # the fake models have no tokenizer anywhere: every count fails -> no header, never a guess
+    proc = _run_cli(["--config", str(cfg), "--trace-file", str(rec / "traces.json"),
+                     "--base-url", fake_server.url, "--output", str(out), "--max-retries", "0",
+                     "--send-in-tokens"], cwd=tmp_path,
+                    TRE_TOKENIZER_PATHS=json.dumps({"ok": str(tmp_path / "missing")}),
+                    TRE_REGISTRY_PATH=str(tmp_path / "missing.yaml"))
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    reqs = fake_server.records_for({f"{tag} a", f"{tag} b", f"{tag} c", f"{tag} d"})
+    assert len(reqs) == 4 and all("x-tre-bl-in-tokens" not in r["headers"] for r in reqs)
+    meta = json.loads((out / "loadgen_run_meta.json").read_text())
+    assert meta["send_in_tokens"] is True
+    assert meta["client"]["v1_options"]["send_in_tokens"] is True
+    assert meta["in_tokens_header"]["counted"] == 0 and meta["in_tokens_header"]["omitted"] == 4
+    lines = [json.loads(line) for line in (out / "performance_metrics.json").read_text().splitlines() if line]
+    assert [line["in_tokens_header"] for line in lines] == [None] * 4
 
 
 def test_dispatch_requires_explicit_base_url(tmp_path):

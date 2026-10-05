@@ -67,6 +67,11 @@ class ClientConfig:
     max_retries: int = 2
     # [v2] opt-in: 每个请求加 ignore_eos: true（默认关 = v1 请求不变）
     ignore_eos: bool = False
+    # [v2] opt-in: 每个请求加 x-tre-bl-in-tokens 头 = 套 chat 模板后的 prompt token 数（默认关）
+    send_in_tokens: bool = False
+    # [v2] 可选 {模型名: tokenizer 目录}；未给的模型按 tre_replayer.engine.model_tokenizer 的顺序解析
+    # （TRE_TOKENIZER_PATHS、TRE_REGISTRY_PATH / /etc/tre/registry.yaml 的 weights_path）
+    tokenizer_paths: Optional[Dict[str, str]] = None
 
     def validate_routing_algorithm(self):
         """验证路由算法配置"""
@@ -303,7 +308,9 @@ class ConfigManager:
             load_monitor_interval=client_dict.get('load_monitor_interval', 1.0),
             oracle_trace_upload_url=client_dict.get('oracle_trace_upload_url', None),
             max_retries=client_dict.get('max_retries', 2),
-            ignore_eos=bool(client_dict.get('ignore_eos', False))
+            ignore_eos=bool(client_dict.get('ignore_eos', False)),
+            send_in_tokens=bool(client_dict.get('send_in_tokens', False)),
+            tokenizer_paths=client_dict.get('tokenizer_paths') or None
         )
 
     def _parse_models_config(self, models_list: List[Dict[str, Any]]) -> List[ModelConfig]:

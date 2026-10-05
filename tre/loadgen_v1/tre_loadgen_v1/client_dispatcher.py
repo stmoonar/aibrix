@@ -8,7 +8,10 @@
   timeout、``routing-strategy`` 头）；请求参数与 v1 的 ``send_request_streaming`` 相同
   （messages=单条 user、temperature 取模型配置（未配置 = JSON null）、stream +
   include_usage、max_tokens 取 trace 否则取模型配置；默认不加 ignore_eos，
-  ``--ignore-eos`` / 配置 ``client.ignore_eos: true`` 时每个请求加 ``ignore_eos: true``）。
+  ``--ignore-eos`` / 配置 ``client.ignore_eos: true`` 时每个请求加 ``ignore_eos: true``；
+  ``--send-in-tokens`` / 配置 ``client.send_in_tokens: true`` 时每个请求加
+  ``x-tre-bl-in-tokens`` 头 = 套 chat 模板后的 prompt token 数，fork 之前在父进程逐请求
+  预先算好（``tre_replayer.engine.in_tokens``），算不出的请求不发该头并计数）。
 * 并发模型：与 v1 相同 —— ``process_count`` 个进程 × 每进程一个 asyncio 事件循环 × 每进程
   一个 SDK 客户端（httpx 连接池 1000/100）。不同处：schedule 事先按请求轮转分片给各进程，
   各进程按绝对时间自行发送（``tre_replayer.engine.procpool``），不再有 v1 那个在事件循环
@@ -53,6 +56,9 @@ def _ensure_replayer_importable() -> None:
 
 _ensure_replayer_importable()
 
+from tre_replayer.engine.api import API_CHAT  # noqa: E402
+from tre_replayer.engine.in_tokens import RECORD_FIELD as IN_TOKENS_FIELD  # noqa: E402
+from tre_replayer.engine.in_tokens import precount_in_tokens  # noqa: E402
 from tre_replayer.engine.http_sender import (  # noqa: E402
     E1_EXTRA_FIELDS,
     V1_AUDIT_FIELDS,
@@ -82,6 +88,7 @@ def v1_options_from_config(config: Any) -> V1ChatOptions:
         routing_strategy=getattr(client, "routing_algorithm", None) or None,
         streaming=bool(getattr(client, "enable_streaming", True)),
         ignore_eos=bool(getattr(client, "ignore_eos", False)),
+        send_in_tokens=bool(getattr(client, "send_in_tokens", False)),
     )
 
 
@@ -101,11 +108,12 @@ def validate_request(request: ScheduledRequest) -> None:
         raise ValueError(f"trace request {request.request_id} has no prompt; e1_v1 sends the trace's own text")
 
 
-def ordered_record(record: Dict[str, Any], phase_type: Optional[str]) -> Dict[str, Any]:
-    """按 RECORD_FIELDS 排好字段，并填上 trace 的 phase_type。"""
+def ordered_record(record: Dict[str, Any], phase_type: Optional[str],
+                   extra_fields: tuple = ()) -> Dict[str, Any]:
+    """按 RECORD_FIELDS 排好字段（opt-in 字段 ``extra_fields`` 接在最后），并填上 trace 的 phase_type。"""
     record = dict(record)
     record["phase_type"] = phase_type if phase_type is not None else "unknown"
-    return {key: record.get(key) for key in RECORD_FIELDS}
+    return {key: record.get(key) for key in RECORD_FIELDS + tuple(extra_fields)}
 
 
 class ClientDispatcher:
@@ -119,6 +127,8 @@ class ClientDispatcher:
         self.options = v1_options_from_config(self.config)
         self.provenance: Dict[str, Any] = {}
         self.workers: List[Dict[str, Any]] = []
+        #: --send-in-tokens 的预计数汇总（关时为 None）
+        self.in_tokens_summary: Optional[Dict[str, Any]] = None
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("ClientDispatcher")
@@ -147,6 +157,15 @@ class ClientDispatcher:
             return []
         phase = {t.request_id: t.phase_type for t in traces}
         requests = scheduled_requests(traces)
+        extra_fields: tuple = ()
+        if self.options.send_in_tokens:
+            # e1_v1 发 chat：头的值 = trace 原文套 chat 模板后的 token 数；fork 前一次算完
+            requests, self.in_tokens_summary = precount_in_tokens(
+                requests, api=API_CHAT, tokenizer_paths=getattr(self.config.client, "tokenizer_paths", None))
+            extra_fields = (IN_TOKENS_FIELD,)
+            self.logger.info("x-tre-bl-in-tokens 预计数: " + json.dumps(self.in_tokens_summary, ensure_ascii=False))
+            if self.in_tokens_summary["omitted"]:
+                self.logger.warning(f"{self.in_tokens_summary['omitted']} 个请求算不出 prompt token 数，不发该头")
         self.logger.info(f"开始调度 {len(requests)} 个请求；进程数 {self.process_count}；"
                          f"网关 {self.config.gateway_endpoint}")
         self.provenance = self.make_sender(0, None, None).provenance(processes=self.process_count)
@@ -163,7 +182,7 @@ class ClientDispatcher:
                 failure = exc
                 self.workers = exc.workers
                 received = exc.records
-        records = [ordered_record(r, phase.get(r["request_id"])) for r in received]
+        records = [ordered_record(r, phase.get(r["request_id"]), extra_fields) for r in received]
         missing = len(requests) - len(records)
         if missing:
             self.logger.warning(f"{missing} 个请求没有结果记录")
