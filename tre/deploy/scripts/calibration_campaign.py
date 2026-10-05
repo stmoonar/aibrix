@@ -2691,6 +2691,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="step ④ of plan §6.11 (scripts.calibration_acceptance): the acceptance "
                          "set M of one model - D6' probes of its new shapes, its ten cells, then "
                          "sealed (M_manifest.json). A real run needs --freeze-file")
+    ap.add_argument("--composition", default=None, choices=["m1-20260923", "m2-20261005"],
+                    help="--acceptance-set: which M (scripts.calibration_acceptance). m1-20260923 "
+                         "(default): stage G's 13 cells (probes + 10 collected + 3 retained). "
+                         "m2-20261005: the next round's M2 - 24 collected cells, rho* reused "
+                         "from --rho-star-run, no probes, no retained cells")
+    ap.add_argument("--rho-star-run", type=Path, default=None,
+                    help="--composition m2-20261005: the sealed M root whose measured rho* M2 "
+                         "reuses (checked against the design constants, hashed into the plan)")
+    ap.add_argument("--ledger-root", type=Path, action="append", default=[],
+                    help="--composition m2-20261005: a root whose ledgers (cells.jsonl / "
+                         "cells.csv) M2's cell codes and seeds must not appear in (repeatable; "
+                         "--rho-star-run's parent is always scanned)")
     ap.add_argument("--base-run", type=Path, default=None,
                     help="--training-supplement / --acceptance-set: the second round's ladder "
                          "run root (rho*_run2 and C_s per shape)")
@@ -2795,7 +2807,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error(f"no gateway URL: pass --gateway-url http://<gateway>/v1/chat/completions or set "
                  f"{GATEWAY_URL_ENV} (there is no built-in default: the address is the deployment's)")
     if args.design_seed is None:
-        args.design_seed = 20260924 if args.t14_set else 20260923
+        if args.t14_set:
+            args.design_seed = 20260924
+        elif args.acceptance_set and args.composition == "m2-20261005":
+            args.design_seed = 20261005  # M2: new seeds (calibration_acceptance.M2_DESIGN_SEED)
+        else:
+            args.design_seed = 20260923
+    if (args.composition or args.rho_star_run or args.ledger_root) and not args.acceptance_set:
+        ap.error("--composition / --rho-star-run / --ledger-root belong to --acceptance-set")
     collection = bool(args.training_supplement or args.acceptance_set or args.t14_set)
     if sum(map(bool, (args.training_supplement, args.acceptance_set, args.t14_set))) > 1:
         ap.error("--training-supplement, --acceptance-set and --t14-set are separate runs")
