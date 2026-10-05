@@ -1,0 +1,581 @@
+{
+ "what": "T14 degraded collection (dsqwen-14b, 24 hold cells), round 2026-10-03 (vLLM 0.30) - preregistration: design, capacity prior, B-prime criterion, evaluation rule. Written before any T14 or M data of this round exists; the collection refuses to start unless this file matches its sha256 sidecar and the bound keys (calibration_t14.check_preregistration).",
+ "written_at_utc": "2026-10-04T11:20:39.371551+00:00",
+ "written_by": "main session (Claude) on the owner instruction to launch stage G (2026-10-04); schema and rules of the 2026-09-24 T14 preregistration; owner review pending",
+ "code": {
+  "branch": "calib/theta-20261003",
+  "commit": "da0ff2cc5daecc08d5730d465ecbe2f98f1754b3",
+  "dirty": false,
+  "modules": [
+   "deploy/scripts/calibration_t14.py",
+   "deploy/scripts/dline_refit.py (accept, B-prime)",
+   "deploy/scripts/b_prime.py"
+  ]
+ },
+ "t14": {
+  "model": "dsqwen-14b",
+  "api": "chat",
+  "shapes": {
+   "interpolation": [
+    "G512x256",
+    "G1200x240",
+    "G640x400",
+    "G1800x160"
+   ],
+   "extrapolation": [
+    "G3072x96",
+    "G4096x64",
+    "G256x768",
+    "G512x1024"
+   ]
+  },
+  "factors": [
+   0.9,
+   1.0,
+   1.1
+  ],
+  "hold_s": 240.0,
+  "warmup_dropped_s": 60.0,
+  "cells_total": 24,
+  "design_seed": 20261004,
+  "cell_serial_base": 80500,
+  "prompt_key_prefix": "p20261004.",
+  "arrival_seed_rule": "calibration_design.derived_seed(20261004, 'dsqwen-14b', cell_id, 'arrivals')",
+  "order_rule": "shapes interleaved, derived_seed(20261004, 'dsqwen-14b', 't14-order')",
+  "cells": [
+   {
+    "order": 1,
+    "cell_id": "i1800_o160_c1280511",
+    "shape": "G1800x160",
+    "kind": "interpolation",
+    "factor": 1.0,
+    "rps": 4.2635,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1873736266,
+    "prompt_key": "p20261004.i1800_o160_c1280511",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 2,
+    "cell_id": "i512_o256_c1280501",
+    "shape": "G512x256",
+    "kind": "interpolation",
+    "factor": 0.9,
+    "rps": 9.4651,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 973731499,
+    "prompt_key": "p20261004.i512_o256_c1280501",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 3,
+    "cell_id": "i512_o1024_c1280523",
+    "shape": "G512x1024",
+    "kind": "extrapolation",
+    "factor": 1.0,
+    "rps": 3.4076,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1347739813,
+    "prompt_key": "p20261004.i512_o1024_c1280523",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 4,
+    "cell_id": "i256_o768_c1280520",
+    "shape": "G256x768",
+    "kind": "extrapolation",
+    "factor": 1.0,
+    "rps": 5.1364,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 537213794,
+    "prompt_key": "p20261004.i256_o768_c1280520",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 5,
+    "cell_id": "i512_o1024_c1280522",
+    "shape": "G512x1024",
+    "kind": "extrapolation",
+    "factor": 0.9,
+    "rps": 3.0669,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1522542399,
+    "prompt_key": "p20261004.i512_o1024_c1280522",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 6,
+    "cell_id": "i256_o768_c1280521",
+    "shape": "G256x768",
+    "kind": "extrapolation",
+    "factor": 1.1,
+    "rps": 5.6501,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 869057980,
+    "prompt_key": "p20261004.i256_o768_c1280521",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 7,
+    "cell_id": "i512_o1024_c1280524",
+    "shape": "G512x1024",
+    "kind": "extrapolation",
+    "factor": 1.1,
+    "rps": 3.7484,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 610962424,
+    "prompt_key": "p20261004.i512_o1024_c1280524",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 8,
+    "cell_id": "i640_o400_c1280509",
+    "shape": "G640x400",
+    "kind": "interpolation",
+    "factor": 1.1,
+    "rps": 7.4022,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 133183371,
+    "prompt_key": "p20261004.i640_o400_c1280509",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 9,
+    "cell_id": "i1800_o160_c1280510",
+    "shape": "G1800x160",
+    "kind": "interpolation",
+    "factor": 0.9,
+    "rps": 3.8371,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1282832587,
+    "prompt_key": "p20261004.i1800_o160_c1280510",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 10,
+    "cell_id": "i3072_o96_c1280514",
+    "shape": "G3072x96",
+    "kind": "extrapolation",
+    "factor": 1.0,
+    "rps": 2.6299,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1099935923,
+    "prompt_key": "p20261004.i3072_o96_c1280514",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 11,
+    "cell_id": "i512_o256_c1280502",
+    "shape": "G512x256",
+    "kind": "interpolation",
+    "factor": 1.0,
+    "rps": 10.5168,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 442230919,
+    "prompt_key": "p20261004.i512_o256_c1280502",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 12,
+    "cell_id": "i4096_o64_c1280516",
+    "shape": "G4096x64",
+    "kind": "extrapolation",
+    "factor": 0.9,
+    "rps": 1.7908,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1529976126,
+    "prompt_key": "p20261004.i4096_o64_c1280516",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 13,
+    "cell_id": "i640_o400_c1280508",
+    "shape": "G640x400",
+    "kind": "interpolation",
+    "factor": 1.0,
+    "rps": 6.7292,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 285684771,
+    "prompt_key": "p20261004.i640_o400_c1280508",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 14,
+    "cell_id": "i1200_o240_c1280505",
+    "shape": "G1200x240",
+    "kind": "interpolation",
+    "factor": 1.0,
+    "rps": 5.5961,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1652301125,
+    "prompt_key": "p20261004.i1200_o240_c1280505",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 15,
+    "cell_id": "i1800_o160_c1280512",
+    "shape": "G1800x160",
+    "kind": "interpolation",
+    "factor": 1.1,
+    "rps": 4.6898,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 143892582,
+    "prompt_key": "p20261004.i1800_o160_c1280512",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 16,
+    "cell_id": "i1200_o240_c1280504",
+    "shape": "G1200x240",
+    "kind": "interpolation",
+    "factor": 0.9,
+    "rps": 5.0365,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 113647999,
+    "prompt_key": "p20261004.i1200_o240_c1280504",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 17,
+    "cell_id": "i4096_o64_c1280517",
+    "shape": "G4096x64",
+    "kind": "extrapolation",
+    "factor": 1.0,
+    "rps": 1.9898,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1195790444,
+    "prompt_key": "p20261004.i4096_o64_c1280517",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 18,
+    "cell_id": "i1200_o240_c1280506",
+    "shape": "G1200x240",
+    "kind": "interpolation",
+    "factor": 1.1,
+    "rps": 6.1558,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1593177903,
+    "prompt_key": "p20261004.i1200_o240_c1280506",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 19,
+    "cell_id": "i4096_o64_c1280518",
+    "shape": "G4096x64",
+    "kind": "extrapolation",
+    "factor": 1.1,
+    "rps": 2.1888,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1206768836,
+    "prompt_key": "p20261004.i4096_o64_c1280518",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 20,
+    "cell_id": "i512_o256_c1280503",
+    "shape": "G512x256",
+    "kind": "interpolation",
+    "factor": 1.1,
+    "rps": 11.5684,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 763919432,
+    "prompt_key": "p20261004.i512_o256_c1280503",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 21,
+    "cell_id": "i3072_o96_c1280515",
+    "shape": "G3072x96",
+    "kind": "extrapolation",
+    "factor": 1.1,
+    "rps": 2.8929,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 1503623333,
+    "prompt_key": "p20261004.i3072_o96_c1280515",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 22,
+    "cell_id": "i256_o768_c1280519",
+    "shape": "G256x768",
+    "kind": "extrapolation",
+    "factor": 0.9,
+    "rps": 4.6228,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 781391171,
+    "prompt_key": "p20261004.i256_o768_c1280519",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 23,
+    "cell_id": "i3072_o96_c1280513",
+    "shape": "G3072x96",
+    "kind": "extrapolation",
+    "factor": 0.9,
+    "rps": 2.3669,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 146082030,
+    "prompt_key": "p20261004.i3072_o96_c1280513",
+    "split": "holdout",
+    "role": "acceptance"
+   },
+   {
+    "order": 24,
+    "cell_id": "i640_o400_c1280507",
+    "shape": "G640x400",
+    "kind": "interpolation",
+    "factor": 0.9,
+    "rps": 6.0563,
+    "hold_s": 240.0,
+    "warmup_s": 60.0,
+    "arrival_seed": 760208918,
+    "prompt_key": "p20261004.i640_o400_c1280507",
+    "split": "holdout",
+    "role": "acceptance"
+   }
+  ],
+  "seed_disjointness": {
+   "checked_against": "every cells.jsonl under /data/nfs_shared_data/xxy/calib_20261003 and /data/nfs_shared_data/xxy/calibration_*/",
+   "ledgers": 24,
+   "existing_arrival_seeds": 1156,
+   "t14_arrival_seed_overlap": 0,
+   "t14_cell_id_overlap_this_round": 0,
+   "t14_cell_id_overlap_earlier_roots": 0,
+   "note": "cell ids are the fixed T14 serials (base 80500), shared with the 2026-09-24 design by construction; arrival seeds and prompt keys follow the design seed"
+  },
+  "capacity_prior": {
+   "path": "/data/nfs_shared_data/xxy/calib_20261003/t14/capacity_prior_dsqwen-14b.json",
+   "sha256": "f8448c7589693a226440a6c3d64db0d9898ceddbd7f0ed9118d5d9612e495df3",
+   "form": "1/R = c0 + c_in*input_mean + c_out*output_mean (least squares, intercept)",
+   "coefficients": {
+    "c0_s": -0.036333551319777765,
+    "c_in_s_per_token": 0.0001275305450269611,
+    "c_out_s_per_token": 0.0002582978679558643
+   },
+   "fit_points": "the 7 training shapes only (D6' boundary rates: b50 x rho*_run2 x C_s, run2 roots per model with run2b for 14b; S3 from the boundary supplement) - no M, no H2, no T14",
+   "boundary_table": {
+    "path": "/data/nfs_shared_data/xxy/calib_20261003/b50.csv",
+    "sha256": "e3348095b9d2131cf67a5a1134b1b18e509ddfdd213b9fb05dc9ed1acbe24092"
+   },
+   "leave_one_out": [
+    {
+     "shape": "S1",
+     "rate_rps": 22.809692,
+     "loo_rps": -37.6921,
+     "loo_error": -2.6525
+    },
+    {
+     "shape": "S2",
+     "rate_rps": 13.1451,
+     "loo_rps": 8.3043,
+     "loo_error": -0.3683
+    },
+    {
+     "shape": "S3",
+     "rate_rps": 4.041737,
+     "loo_rps": 3.9535,
+     "loo_error": -0.0218
+    },
+    {
+     "shape": "S4",
+     "rate_rps": 9.425466,
+     "loo_rps": 8.3975,
+     "loo_error": -0.1091
+    },
+    {
+     "shape": "S5",
+     "rate_rps": 6.011066,
+     "loo_rps": 6.3479,
+     "loo_error": 0.056
+    },
+    {
+     "shape": "T8",
+     "rate_rps": 4.971906,
+     "loo_rps": 5.1417,
+     "loo_error": 0.0341
+    },
+    {
+     "shape": "T9",
+     "rate_rps": 5.727692,
+     "loo_rps": 6.5733,
+     "loo_error": 0.1476
+    }
+   ],
+   "predicted_rps": {
+    "G512x256": 10.516757503706696,
+    "G1200x240": 5.596140287631762,
+    "G640x400": 6.7292421278856,
+    "G1800x160": 4.26349983264353,
+    "G3072x96": 2.629939537691318,
+    "G4096x64": 1.9898017698329047,
+    "G256x768": 5.136448976108366,
+    "G512x1024": 3.407629835280897
+   }
+  },
+  "held_out_assertion": "calibration_t14 refuses unless gen.is_held_out(shape) and split == holdout for every cell (dry run included)",
+  "max_model_len_check": {
+   "max_model_len": 131072,
+   "source": "model config.json",
+   "longest_request_tokens": 4160,
+   "longest_shape": "G4096x64",
+   "margin": 64,
+   "needed": 4224,
+   "ok": true
+  },
+  "gateway": {
+   "url": "http://192.168.223.76:31094/v1/chat/completions",
+   "headers": {
+    "model": "dsqwen-14b",
+    "routing-strategy": "least-gpu-cache"
+   },
+   "known_difference": "training / M use the per-model HTTPRoute path; single replica, so pod choice is identical and only the ext_proc per-request overhead differs"
+  },
+  "engine_image": "vllm-openai-tre:0.30.0-ts-8dc0f2a7",
+  "conditions": {
+   "controller_mode": "observe",
+   "sm_mode": "observe",
+   "routable_replicas": 1,
+   "routable_pod_node": "nscc-ds-4a100-node9 gpu 2-3",
+   "other_load": "M of dsqwen-7b / dsllama-8b may still run (other GPUs); no other 14b load",
+   "label": "D6' primary (slowdown TTFT k=5 floor 500 ms over the 2026-10-03 idle c/b, TPOT 75 ms, min 20 completions, unserved = violated)",
+   "label_def_sha256": "b108dc24b56567f035b50e61f04ed4ebe319a8be84f2c08b0569e14e176183f9",
+   "prompt_corpus": {
+    "corpus_lang": "mix",
+    "zh_ratio": 0.5
+   },
+   "windows": "30 s windows on the 10 s grid, first 60 s of each cell dropped, ramp trim 1 (as the training fit)"
+  },
+  "no_adaptive_points": true,
+  "void_rule": "a void cell is re-driven once; a second void stops the run; a stopped run is never evaluated - re-run all 24 cells into a new root",
+  "forbidden_roots": [
+   "/data/nfs_shared_data/xxy/calib_20261003/run1",
+   "/data/nfs_shared_data/xxy/calib_20261003/run2",
+   "/data/nfs_shared_data/xxy/calib_20261003/run2b",
+   "/data/nfs_shared_data/xxy/calib_20261003/supp",
+   "/data/nfs_shared_data/xxy/calib_20261003/p1",
+   "/data/nfs_shared_data/xxy/calib_20261003/p1r2",
+   "/data/nfs_shared_data/xxy/calib_20261003/fit",
+   "/data/nfs_shared_data/xxy/calib_20261003/freeze",
+   "/data/nfs_shared_data/xxy/calib_20261003/M",
+   "/data/nfs_shared_data/xxy/calib_20261003/cb_idle",
+   "/data/nfs_shared_data/xxy/calib_20261003/prereg"
+  ],
+  "expected_wall_clock_h": {
+   "expected": 2.15,
+   "upper": 2.88
+  }
+ },
+ "parameter_sets": {
+  "freeze": {
+   "path": "/data/nfs_shared_data/xxy/calib_20261003/freeze/params_freeze.json",
+   "sha256": "eb2d59e10a84bb3563e7872cb5252b1142855f662b0549c9172efeafe322e531",
+   "freeze_sha256": "ca7fe45235da713c4faf8d8b8d766343dd96405439eeb3fa185cc80bac5a1f60",
+   "dsqwen-14b": {
+    "alpha": 0.6321205588285577,
+    "delta_crit": 0.47,
+    "delta_high": 0.8,
+    "direction": "higher_is_healthier",
+    "lambda_wait": 2.625,
+    "signal": "tss",
+    "tau_crit": 0.53,
+    "tau_high": 1.8,
+    "tau_s": 10.0,
+    "theta": 616.4033917344415,
+    "w_p": 0.0
+   },
+   "how": "gateway numerator; lambda and w_p from the v1 selection (dline_refit wp --lambda-method v1); tau 10 s (D18); final --no-holdout; owner choice 2026-10-04"
+  },
+  "v1lambda": {
+   "path": "/data/nfs_shared_data/xxy/calib_20261003/freeze/params_freeze.json",
+   "sha256": "eb2d59e10a84bb3563e7872cb5252b1142855f662b0549c9172efeafe322e531",
+   "freeze_sha256": "ca7fe45235da713c4faf8d8b8d766343dd96405439eeb3fa185cc80bac5a1f60",
+   "note": "ONE frozen set this round: the campaign needs two parameter files, so the freeze is named twice (RUN plan G2). There is no second set and no replacement rule."
+  }
+ },
+ "evaluation": {
+  "times": "once on T14, with the freeze parameters; nothing is tuned on T14",
+  "data": "the sealed T14 dataset (T14_manifest.json cells only, the valid attempt), dsqwen-14b, gateway-numerator dataset/",
+  "A": {
+   "metric": "window balanced accuracy at the published theta (no dwell)",
+   "ci": "cell bootstrap, 1000 resamples, seed 20260922, 95 % percentile",
+   "gates_reported": {
+    "ba_min": 0.8,
+    "ba_ci95_low_min": 0.75,
+    "max_drop_from_training_ba": 0.08
+   }
+  },
+  "B_prime": {
+   "cut": "the freeze's sealed b_prime.severity_cut (training .65 quantile)",
+   "dsqwen-14b_cut": 8.80764,
+   "gate": {
+    "decided": "user 2026-10-03: B' replaces B as the accept gate (b_prime_thresholds.json of 2026-09-24); judged at the controller's dwell, dwell 2 disclosed",
+    "false_alarm_ci95_high_max": 0.08,
+    "false_alarm_max": 0.05,
+    "online_dwell_windows": 1,
+    "recall_severe_ci95_low_min": 0.7,
+    "recall_severe_min": 0.8,
+    "severity_quantile": 0.65
+   },
+   "dwell": "judged at dwell 1 (the controller's TRE_DWELL_WINDOWS); dwell 2 disclosed"
+  },
+  "also_reported": [
+   "AUROC of Z vs SLO label",
+   "Kendall tau-b ranking disclosure",
+   "C: TTFT-only recall (disclosure)",
+   "per-shape BA, interpolation and extrapolation separately"
+  ],
+  "outcome_statements": {
+   "pass": "A and B-prime gates all met",
+   "fail": "reported as is"
+  }
+ },
+ "known_risks": [
+  "the capacity prior's leave-one-out of S1 is far off (the short-prompt S1 dominates the intercept); the 8 T14 predictions are all positive"
+ ]
+}

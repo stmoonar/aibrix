@@ -1,0 +1,224 @@
+{
+  "what": "T14 capacity prior (C^_s per held-out 14b shape): pre-registered before T14 is collected, fitted on the training shapes' D6' boundary rates only; T14 drives each shape at {0.9, 1.0, 1.1} x C^_s without probing",
+  "model": "dsqwen-14b",
+  "form": "1/R = c0 + c_in*input_mean + c_out*output_mean (least squares, intercept)",
+  "coefficients": {
+    "c0_s": -0.036333551319777765,
+    "c_in_s_per_token": 0.0001275305450269611,
+    "c_out_s_per_token": 0.0002582978679558643
+  },
+  "fit_points": [
+    {
+      "shape": "S1",
+      "input_mean": 256.0,
+      "output_mean": 128.0,
+      "rho": 3.644769,
+      "capacity_rps": 6.2582,
+      "rate_rps": 22.809692,
+      "source": "D6' b50 1.018 x rho*_run2"
+    },
+    {
+      "shape": "S2",
+      "input_mean": 768.0,
+      "output_mean": 192.0,
+      "rho": 4.325611,
+      "capacity_rps": 3.0389,
+      "rate_rps": 13.1451,
+      "source": "D6' b50 2.065 x rho*_run2"
+    },
+    {
+      "shape": "S3",
+      "input_mean": 2048.0,
+      "output_mean": 96.0,
+      "rho": 2.331816,
+      "capacity_rps": 1.7333,
+      "rate_rps": 4.041737,
+      "source": "boundary supplement anchor (D19)"
+    },
+    {
+      "shape": "S4",
+      "input_mean": 256.0,
+      "output_mean": 448.0,
+      "rho": 4.286251,
+      "capacity_rps": 2.199,
+      "rate_rps": 9.425466,
+      "source": "D6' b50 0.955 x rho*_run2"
+    },
+    {
+      "shape": "S5",
+      "input_mean": 768.0,
+      "output_mean": 384.0,
+      "rho": 2.881485,
+      "capacity_rps": 2.0861,
+      "rate_rps": 6.011066,
+      "source": "D6' b50 0.953 x rho*_run2"
+    },
+    {
+      "shape": "T8",
+      "input_mean": 1600.0,
+      "output_mean": 112.0,
+      "rho": 1.812381,
+      "capacity_rps": 2.7433,
+      "rate_rps": 4.971906,
+      "source": "D6' b50 0.996 x rho*_run2"
+    },
+    {
+      "shape": "T9",
+      "input_mean": 953.6093327995877,
+      "output_mean": 273.0596114777854,
+      "rho": 2.333547,
+      "capacity_rps": 2.4545,
+      "rate_rps": 5.727692,
+      "source": "D6' b50 0.991 x rho*_run2"
+    }
+  ],
+  "fitted": [
+    {
+      "shape": "S1",
+      "fitted_rps": 34.0409
+    },
+    {
+      "shape": "S2",
+      "fitted_rps": 8.9926
+    },
+    {
+      "shape": "S3",
+      "fitted_rps": 4.0057
+    },
+    {
+      "shape": "S4",
+      "fitted_rps": 8.926
+    },
+    {
+      "shape": "S5",
+      "fitted_rps": 6.219
+    },
+    {
+      "shape": "T8",
+      "fitted_rps": 5.0853
+    },
+    {
+      "shape": "T9",
+      "fitted_rps": 6.418
+    }
+  ],
+  "leave_one_out": [
+    {
+      "shape": "S1",
+      "rate_rps": 22.809692,
+      "loo_rps": -37.6921,
+      "loo_error": -2.6525
+    },
+    {
+      "shape": "S2",
+      "rate_rps": 13.1451,
+      "loo_rps": 8.3043,
+      "loo_error": -0.3683
+    },
+    {
+      "shape": "S3",
+      "rate_rps": 4.041737,
+      "loo_rps": 3.9535,
+      "loo_error": -0.0218
+    },
+    {
+      "shape": "S4",
+      "rate_rps": 9.425466,
+      "loo_rps": 8.3975,
+      "loo_error": -0.1091
+    },
+    {
+      "shape": "S5",
+      "rate_rps": 6.011066,
+      "loo_rps": 6.3479,
+      "loo_error": 0.056
+    },
+    {
+      "shape": "T8",
+      "rate_rps": 4.971906,
+      "loo_rps": 5.1417,
+      "loo_error": 0.0341
+    },
+    {
+      "shape": "T9",
+      "rate_rps": 5.727692,
+      "loo_rps": 6.5733,
+      "loo_error": 0.1476
+    }
+  ],
+  "predicted_rps": {
+    "G512x256": 10.516757503706696,
+    "G1200x240": 5.596140287631762,
+    "G640x400": 6.7292421278856,
+    "G1800x160": 4.26349983264353,
+    "G3072x96": 2.629939537691318,
+    "G4096x64": 1.9898017698329047,
+    "G256x768": 5.136448976108366,
+    "G512x1024": 3.407629835280897
+  },
+  "t14_shapes": {
+    "G512x256": {
+      "input": 512,
+      "output": 256,
+      "kind": "interpolation"
+    },
+    "G1200x240": {
+      "input": 1200,
+      "output": 240,
+      "kind": "interpolation"
+    },
+    "G640x400": {
+      "input": 640,
+      "output": 400,
+      "kind": "interpolation"
+    },
+    "G1800x160": {
+      "input": 1800,
+      "output": 160,
+      "kind": "interpolation"
+    },
+    "G3072x96": {
+      "input": 3072,
+      "output": 96,
+      "kind": "extrapolation"
+    },
+    "G4096x64": {
+      "input": 4096,
+      "output": 64,
+      "kind": "extrapolation"
+    },
+    "G256x768": {
+      "input": 256,
+      "output": 768,
+      "kind": "extrapolation"
+    },
+    "G512x1024": {
+      "input": 512,
+      "output": 1024,
+      "kind": "extrapolation"
+    }
+  },
+  "inputs": {
+    "boundary_table": {
+      "path": "/data/nfs_shared_data/xxy/calib_20261003/b50.csv",
+      "sha256": "e3348095b9d2131cf67a5a1134b1b18e509ddfdd213b9fb05dc9ed1acbe24092"
+    },
+    "base_run": "/data/nfs_shared_data/xxy/calib_20261003/run2b",
+    "boundary_supplement_run": "/data/nfs_shared_data/xxy/calib_20261003/supp",
+    "prior_shapes": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "T8",
+      "T9"
+    ],
+    "rates_from": "scripts.calibration_acceptance.boundary_rates"
+  },
+  "created_at_utc": "2026-10-04T11:18:18.525468Z",
+  "code": {
+    "commit": "da0ff2cc5daecc08d5730d465ecbe2f98f1754b3",
+    "dirty": false
+  }
+}
