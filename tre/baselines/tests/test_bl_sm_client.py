@@ -142,3 +142,13 @@ def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
         assert wait_until(lambda: dispatcher.inflight_count() == 0)
         assert len(sm.requests) == 2
         dispatcher.close(join_s=1.0)
+
+
+def test_whole_lock_200_outcomes_are_logged() -> None:
+    """A 200 that is not a full success (floor clamp, unplaced wakes) must show in the log."""
+    from tre_baselines.sm_client import SMResult
+
+    d = SMResult(ok=True, code=200, raw={"taken": 0, "clamped_by_floor": True, "unfilled": 1,
+                                         "refusals": [{"reason": "gpu_busy"}]}).as_dict()
+    assert d["clamped_by_floor"] is True and d["unfilled"] == 1 and d["taken"] == 0
+    assert d["refusals"] == [{"reason": "gpu_busy"}]

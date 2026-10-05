@@ -4,6 +4,7 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tre_baselines.config import load_config
 from tre_baselines.policies import POLICIES, Policy, build_policy
@@ -82,8 +83,15 @@ def test_config_reads_registry_limits_through_common_readers() -> None:
 def test_config_rejects_bad_values(tmp_path) -> None:
     with pytest.raises(ValueError):
         load_config({**ENV, "TRE_BL_ABORT_SLEEP_PATH": "repair"})
-    with pytest.raises(ValueError, match="drains"):  # scale_down drains on the SM on main
-        load_config({**ENV, "TRE_BL_ABORT_SLEEP_PATH": "scale_down"})
+    # The whole-lock registry lists every path as no-drain: scale_down is accepted there,
+    # and refused on a registry where it still drains.
+    assert load_config({**ENV, "TRE_BL_ABORT_SLEEP_PATH": "scale_down"}).abort_sleep_path == "scale_down"
+    doc = yaml.safe_load(Path(REGISTRY).read_text())
+    doc["service_manager"]["sleep"]["no_drain_paths"] = ["urgent"]
+    draining = tmp_path / "registry.yaml"
+    draining.write_text(yaml.safe_dump(doc))
+    with pytest.raises(ValueError, match="drains"):
+        load_config({**ENV, "TRE_REGISTRY_PATH": str(draining), "TRE_BL_ABORT_SLEEP_PATH": "scale_down"})
     for retired in ("TRE_BL_SLEEP_PATH", "TRE_BL_DRAIN_BUDGET_S"):
         with pytest.raises(ValueError, match="retired"):
             load_config({**ENV, retired: "30"})

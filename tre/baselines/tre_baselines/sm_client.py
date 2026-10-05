@@ -14,12 +14,14 @@ Contract (service manager on main, ``tre_sm/api/v2.py``):
   handler returns once the sleep is committed (GPU released) or the wake done.
 * ``GET /v2/state`` -> ``{"version", "models": {m: {"awake", "bound"}}, "bindings":
   [{"serve_id" (= pod name), "model", "node", "gpu_ids", "awake", "hidden"}], ...}``.
-* Refusals are HTTP 409 (writer lock busy, reservation, floor violation, wake conflict,
-  cap). Today most bodies are ``{"detail": "<text>"}``; floor violations carry ``error``.
-  A structured body (``detail, error, reason, node, gpu_ids, scope, binding_id,
-  blocking_binding_id, retry_after_s``) is PROVISIONAL (the T1 line is not merged):
-  :func:`parse_sm_error` reads whichever keys are present, nested under ``detail`` or not,
-  and falls back to the raw text.
+* Refusals are HTTP 409 (writer lock busy ``writer_busy``, wake conflict, cap,
+  ``routable_unknown``). Wake conflicts and ``writer_busy`` carry a structured body
+  (``detail, error, reason, node, gpu_ids, scope, binding_id, blocking_binding_id,
+  retry_after_s``); others only ``{"detail": "<text>"}``. :func:`parse_sm_error` reads
+  whichever keys are present, nested under ``detail`` or not, and falls back to the raw
+  text. The whole-lock SM answers some outcomes with 200, not 409: a shrink clamped at the
+  replica floor (``taken``, ``clamped_by_floor``) and a grow-only scale-up that could not
+  place every wake (``unfilled``, ``refusals``); :meth:`SMResult.as_dict` logs those keys.
 
 The dispatcher gives every model one worker thread and at most one SM call in flight;
 the tick never waits for the SM. Right before each call the worker asks the dispatcher's
@@ -71,7 +73,8 @@ class SMResult:
             "elapsed_s": round(self.elapsed_s, 3),
         }
         if isinstance(self.raw, dict):
-            for key in ("binding_id", "blocking_binding_id", "actions", "at_least", "awake"):
+            for key in ("binding_id", "blocking_binding_id", "actions", "at_least", "awake",
+                        "taken", "clamped_by_floor", "unfilled", "refusals"):
                 if key in self.raw:
                     out[key] = self.raw[key]
         return out
@@ -184,8 +187,8 @@ class SMClient:
 
 
 #: Default sleep path of a scale-down: a no-drain (abort) path on the SM on main
-#: (``DEFAULT_NO_DRAIN_PATHS``) and the whole-lock SM's default; floor violations are
-#: refused (409, counted) rather than silently clamped.
+#: (``DEFAULT_NO_DRAIN_PATHS``) and the whole-lock SM's default. The whole-lock SM clamps a
+#: shrink at the replica floor (200, ``clamped_by_floor`` in the logged result).
 DEFAULT_ABORT_SLEEP_PATH = "urgent"
 
 
