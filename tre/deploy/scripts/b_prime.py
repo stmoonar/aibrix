@@ -184,3 +184,316 @@ def criteria(point: Mapping[str, Any], ci: Mapping[str, Any], gate: Mapping[str,
             crit("its CI95 lower bound", ci["recall_severe_ci95"][0], ">=", gate["recall_severe_ci95_low_min"]),
             crit("CRITICAL false alarm on healthy windows", point["false_alarm"], "<=", gate["false_alarm_max"]),
             crit("its CI95 upper bound", ci["false_alarm_ci95"][1], "<=", gate["false_alarm_ci95_high_max"])]
+
+
+# ------------------------------------------------------- the onset gate (2026-10-05)
+#
+# The next-round accept gate (design docs/calib-next-round-design-20261005.md item 3, user
+# 2026-10-05). B' scored every severe WINDOW; under completion attribution the drain tail
+# after a burst kept windows "severe" after the engine had recovered, so B' measured the
+# label, not the controller. The onset gate scores overload EPISODES instead:
+#
+# * episode = a maximal run of consecutive (<= one re-window step apart) violating windows
+#   of one cell holding >= 1 severe window (severity >= the sealed training cut);
+# * detected = a dwell-confirmed CRITICAL window inside [t_first_severe - lookback, t_end];
+#   lag = t_first_crit - t_first_severe (negative = CRITICAL led the label);
+# * success = detected with lag <= the lag budget (2 ticks = 20 s, derived from the EMA
+#   alpha .632, tau_crit and window filling - not read off M);
+# * gated on the onset episodes of the DYNAMIC cells (steps / ramp / bursts), whose
+#   overload has an onset; hold-cell episodes are disclosed;
+# * the success rate's lower bound - a cell-cluster bootstrap AND a Clopper-Pearson bound
+#   on the effective number of episodes n / (1 + (m - 1) ICC), ICC = the one-way ICC(1) of
+#   the per-cell lags (challenge_checks.posthoc.json's estimator; undefined -> 1, the
+#   conservative end; negative -> 0) - must reach detection_ci_low_min, and at most
+#   miss_tolerance episodes may fail.
+#
+# Every parameter lives in :data:`ONSET_GATE` and is sealed in the freeze (``accept_gate``).
+
+#: Primitives whose overload has an onset: the episodes the onset gate is judged on.
+ONSET_DYNAMIC_PRIMITIVES = ("steps", "ramp", "bursts")
+ONSET_GATE = {
+    "lag_budget_s": 20.0,             # 2 controller ticks (10 s refresh)
+    "lookback_s": 30.0,               # one window before the first severe window
+    "episode_step_ms": 10_000.0,      # consecutive = <= one re-window step apart
+    "detection_ci_low_min": 0.80,
+    "ci_alpha_one_sided": 0.05,       # both lower bounds are one-sided 95 % (design: n_eff 14, 0 misses -> .81)
+    "miss_tolerance": 0,              # design item 3 (i): every onset is caught
+}
+ONSET_GATE_KEYS = tuple(ONSET_GATE)
+#: Window false alarm (design item 3 (ii)): CRITICAL on healthy windows at the gate's dwell.
+WINDOW_FA_GATE = {"false_alarm_max": 0.05, "false_alarm_ci95_high_max": 0.08}
+ICC_UNDEFINED_VALUE = 1.0
+ONSET_RULE = ("episode = maximal run of consecutive violating windows (<= episode_step_ms apart) of one cell "
+              "with >= 1 window of severity >= the sealed training cut; success = a dwell-confirmed CRITICAL "
+              "in [t_first_severe - lookback_s, t_end] with t_first_crit - t_first_severe <= lag_budget_s; "
+              "gated on the episodes of cells whose primitive is in ONSET_DYNAMIC_PRIMITIVES")
+ONSET_CI_RULE = ("both one-sided (ci_alpha_one_sided) lower bounds of the success rate must reach "
+                 "detection_ci_low_min: (a) cell-cluster bootstrap percentile over the cells holding an onset "
+                 "episode; (b) Clopper-Pearson on n_eff = n / (1 + (m - 1) ICC), m = episodes per cell, ICC = "
+                 "one-way ICC(1) of the per-cell lags of detected episodes (undefined -> 1, negative -> 0), "
+                 "x_eff = rate * n_eff")
+
+
+def check_onset_gate(gate: Mapping[str, Any]) -> dict:
+    """``gate`` with exactly :data:`ONSET_GATE_KEYS`, each a finite number in range;
+    raises ``ValueError`` otherwise."""
+    out = {}
+    for k in ONSET_GATE_KEYS:
+        v = gate.get(k) if isinstance(gate, Mapping) else None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+            raise ValueError(f"onset gate {k!r} is {v!r}: needs a finite number >= 0")
+        out[k] = float(v)
+    if not 0 < out["ci_alpha_one_sided"] < 0.5 or out["detection_ci_low_min"] > 1:
+        raise ValueError(f"onset gate {out}: ci_alpha_one_sided in (0, .5), detection_ci_low_min <= 1")
+    out["miss_tolerance"] = int(out["miss_tolerance"])
+    return out
+
+
+def episodes(windows: Sequence[Any], cut: float, *, step_ms: float = ONSET_GATE["episode_step_ms"]) -> list[dict]:
+    """Severe-violation episodes per cell (the rule of :data:`ONSET_RULE`; the post-hoc
+    ``posthoc_hfail_20261005.episodes``). Window instants are ``window_start_ms``."""
+    by: dict[str, list[int]] = defaultdict(list)
+    for i, w in enumerate(windows):
+        by[w.scenario_id].append(i)
+    out = []
+    for sid, idx in sorted(by.items()):
+        idx.sort(key=lambda i: windows[i].window_start_ms)
+        k = 0
+        while k < len(idx):
+            if windows[idx[k]].slo_met:
+                k += 1
+                continue
+            s = k
+            while (k + 1 < len(idx) and not windows[idx[k + 1]].slo_met
+                   and windows[idx[k + 1]].window_start_ms - windows[idx[k]].window_start_ms <= step_ms):
+                k += 1
+            run = idx[s:k + 1]
+            k += 1
+            sev = [i for i in run if severity(windows[i]) >= cut]
+            if sev:
+                out.append({"cell": sid, "t_first_viol": windows[run[0]].window_start_ms,
+                            "t_first_severe": windows[sev[0]].window_start_ms,
+                            "t_end": windows[run[-1]].window_start_ms, "n_violating": len(run), "n_severe": len(sev)})
+    return out
+
+
+def episode_lag_s(windows: Sequence[Any], crit: Sequence[bool], ep: Mapping[str, Any], *,
+                  lookback_s: float = ONSET_GATE["lookback_s"]) -> Optional[float]:
+    """Seconds from the episode's first severe window to the first dwell-confirmed CRITICAL
+    window of its cell in [t_first_severe - lookback, t_end]; None = missed."""
+    lo, hi = ep["t_first_severe"] - lookback_s * 1000.0, ep["t_end"]
+    ts = [w.window_start_ms for i, w in enumerate(windows)
+          if crit[i] and w.scenario_id == ep["cell"] and lo <= w.window_start_ms <= hi]
+    return (min(ts) - ep["t_first_severe"]) / 1000.0 if ts else None
+
+
+def lag_icc(groups: Sequence[Sequence[float]]) -> Optional[float]:
+    """One-way ICC(1) of the lags grouped by cell (the challenge_checks estimator, unbalanced
+    n0); None when undefined (one group, no within-group replicate, or zero variance)."""
+    groups = [list(g) for g in groups if g]
+    allv = [x for g in groups for x in g]
+    if len(groups) < 2 or len(allv) <= len(groups):
+        return None
+    gm = sum(allv) / len(allv)
+    means = [sum(g) / len(g) for g in groups]
+    msb = sum(len(g) * (m - gm) ** 2 for g, m in zip(groups, means)) / (len(groups) - 1)
+    msw = sum((x - m) ** 2 for g, m in zip(groups, means) for x in g) / (len(allv) - len(groups))
+    n0 = (len(allv) - sum(len(g) ** 2 for g in groups) / len(allv)) / (len(groups) - 1)
+    den = msb + (n0 - 1) * msw
+    return (msb - msw) / den if den > 0 else None
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction of the regularised incomplete beta (modified Lentz)."""
+    tiny, qab, qap, qam = 1e-300, a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 500):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-14:
+            break
+    return h
+
+
+def regularized_beta(x: float, a: float, b: float) -> float:
+    """I_x(a, b) for a, b > 0 (no scipy on the test hosts' import path)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbt = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return math.exp(lbt) * _betacf(a, b, x) / a
+    return 1.0 - math.exp(lbt) * _betacf(b, a, 1.0 - x) / b
+
+
+def clopper_pearson_lower(x: float, n: float, alpha: float) -> Optional[float]:
+    """One-sided (1 - alpha) Clopper-Pearson lower bound of a rate with ``x`` successes in
+    ``n`` trials, non-integer (effective) counts allowed: the p with I_p(x, n - x + 1) =
+    alpha; 0 for x = 0, alpha ** (1 / n) for x = n. None for n <= 0."""
+    if not n > 0:
+        return None
+    x = min(max(float(x), 0.0), float(n))
+    if x <= 0.0:
+        return 0.0
+    if x >= n:
+        return alpha ** (1.0 / n)
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if regularized_beta(mid, x, n - x + 1.0) > alpha:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2.0
+
+
+def onset_detection(windows: Sequence[Any], crit: Sequence[bool], *, cut: float,
+                    primitive_of: Mapping[str, str], gate: Mapping[str, Any], n_resamples: int = 1000,
+                    seed: int = 20260922) -> dict:
+    """The onset gate (:data:`ONSET_RULE`, :data:`ONSET_CI_RULE`) of one flag series.
+    ``primitive_of`` maps a scenario id to its cell's primitive. Not evaluable (and not
+    passed) without an episode in a dynamic cell."""
+    g = check_onset_gate(gate)
+    budget, alpha = g["lag_budget_s"], g["ci_alpha_one_sided"]
+    eps = episodes(windows, cut, step_ms=g["episode_step_ms"])
+    for ep in eps:
+        ep["primitive"] = primitive_of.get(ep["cell"], "")
+        ep["lag_s"] = episode_lag_s(windows, crit, ep, lookback_s=g["lookback_s"])
+        ep["success"] = ep["lag_s"] is not None and ep["lag_s"] <= budget
+    onset = [ep for ep in eps if ep["primitive"] in ONSET_DYNAMIC_PRIMITIVES]
+    hold = [ep for ep in eps if ep["primitive"] not in ONSET_DYNAMIC_PRIMITIVES]
+
+    def summary(sel):
+        lags = [ep["lag_s"] for ep in sel if ep["lag_s"] is not None]
+        return {"episodes": len(sel), "detected": len(lags), "within_budget": sum(ep["success"] for ep in sel),
+                "lag_max_s": max(lags) if lags else None,
+                "lag_median_s": sorted(lags)[len(lags) // 2] if lags else None}
+
+    out: dict[str, Any] = {"rule": ONSET_RULE, "ci_rule": ONSET_CI_RULE, "gate": g, "severity_cut": cut,
+                           "dynamic_primitives": list(ONSET_DYNAMIC_PRIMITIVES),
+                           "onset": summary(onset), "hold_disclosed": summary(hold),
+                           "episodes": [{k: ep[k] for k in ("cell", "primitive", "t_first_viol", "t_first_severe",
+                                                            "t_end", "n_violating", "n_severe", "lag_s", "success")}
+                                        for ep in eps]}
+    n = len(onset)
+    if not n:
+        out.update({"evaluable": False, "passed": False, "criteria": [],
+                    "reason": "no severe-violation episode in a dynamic cell"})
+        return out
+    by: dict[str, list[dict]] = defaultdict(list)
+    for ep in onset:
+        by[ep["cell"]].append(ep)
+    cells = sorted(by)
+    succ = sum(ep["success"] for ep in onset)
+    rate = succ / n
+    rng = random.Random(seed)
+    vals = []
+    for _ in range(n_resamples):
+        pick = [rng.choice(cells) for _ in cells]
+        den = sum(len(by[c]) for c in pick)
+        vals.append(sum(ep["success"] for c in pick for ep in by[c]) / den)
+    vals.sort()
+    boot_low = vals[int(alpha * len(vals))] if vals else None
+    icc_raw = lag_icc([[ep["lag_s"] for ep in by[c] if ep["lag_s"] is not None] for c in cells])
+    icc = ICC_UNDEFINED_VALUE if icc_raw is None else min(1.0, max(0.0, icc_raw))
+    m_bar = n / len(cells)
+    n_eff = n / (1.0 + (m_bar - 1.0) * icc)
+    cp_low = clopper_pearson_lower(rate * n_eff, n_eff, alpha)
+
+    def crit_(name, value, op, threshold):
+        met = value is not None and (value >= threshold if op == ">=" else value <= threshold)
+        return {"name": name, "value": value, "op": op, "threshold": threshold, "met": met}
+
+    criteria = [crit_("onset episodes missed or later than the lag budget", n - succ, "<=", g["miss_tolerance"]),
+                crit_("success rate, cell-cluster bootstrap lower bound", boot_low, ">=", g["detection_ci_low_min"]),
+                crit_("success rate, Clopper-Pearson lower bound on n_eff", cp_low, ">=", g["detection_ci_low_min"])]
+    out.update({"evaluable": True, "passed": all(c["met"] for c in criteria), "criteria": criteria,
+                "success_rate": rate, "cells": len(cells), "episodes_per_cell": m_bar,
+                "icc": icc, "icc_raw": icc_raw, "n_eff": n_eff, "x_eff": rate * n_eff,
+                "bootstrap": {"n_resamples": n_resamples, "seed": seed, "lower": boot_low},
+                "clopper_pearson_lower": cp_low})
+    return out
+
+
+def window_fa(point: Mapping[str, Any], ci: Mapping[str, Any], gate: Mapping[str, float] = WINDOW_FA_GATE) -> dict:
+    """Design item 3 (ii): CRITICAL false alarm on healthy windows (``point`` /
+    ``ci`` of :func:`series_point` / :func:`b_prime_boot` at the gate's dwell)."""
+    def crit_(name, value, threshold):
+        v = value if isinstance(value, (int, float)) and math.isfinite(value) else None
+        return {"name": name, "value": v, "op": "<=", "threshold": threshold, "met": v is not None and v <= threshold}
+
+    cs = [crit_("CRITICAL false alarm on healthy windows", point.get("false_alarm"), gate["false_alarm_max"]),
+          crit_("its CI95 upper bound", (ci.get("false_alarm_ci95") or [None, None])[1],
+                gate["false_alarm_ci95_high_max"])]
+    evaluable = point.get("false_alarm") is not None
+    return {"criteria": cs, "evaluable": evaluable, "passed": evaluable and all(c["met"] for c in cs),
+            "gate": dict(gate)}
+
+
+# ---------------------------------------------- the A dead band (disclosure only)
+
+#: s0 = this quantile, over training steady-hold windows whose observed p95 TTFT ratio is
+#: near 1, of (bootstrap 97.5 % p95 ratio) / (observed p95 ratio): the label noise of a
+#: window at the SLO line (challenge_checks.posthoc.json; 1.14 / 1.16 / 1.17 on the hybrid
+#: training sets). The A dead band drops violating windows of severity < s0 (disclosed).
+DEADBAND_RULE = {"quantile": 0.90, "bootstrap": 300, "seed": 20261005, "min_samples": 20,
+                 "near_one": [0.8, 1.25], "primitive": "hold", "upper": 0.975, "min_latency_samples": 10}
+
+
+def label_noise_s0(rows: Sequence[Mapping[str, str]], label: Any, rule: Mapping[str, Any] = DEADBAND_RULE) -> dict:
+    """The A dead band's s0 from training CSV rows (``DEADBAND_RULE``): non-warm-up windows
+    of ``rule["primitive"]`` cells with >= min_samples TTFT samples and an observed p95
+    TTFT / SLO ratio in near_one; per window the bootstrap upper (``upper``) p95 ratio over
+    the observed one; s0 = their ``quantile``."""
+    from scripts.rewindow_from_raw import _guarded_p95
+    from tre_common import slo_labels
+
+    rng = random.Random(int(rule["seed"]))
+    lo_r, hi_r = rule["near_one"]
+    mode, min_lat = label.percentile_mode, int(rule["min_latency_samples"])
+    ups, ns = [], []
+    for r in rows:
+        if r.get("primitive") != rule["primitive"] or r.get("in_warmup") == "True":
+            continue
+        pairs = slo_labels.parse_ttft_len_samples(r.get("ttft_len_samples") or "")
+        n = len(pairs)
+        if n < int(rule["min_samples"]):
+            continue
+        ratios = [t / label.ttft_slo_ms(L) for t, L in pairs]
+        obs = _guarded_p95(ratios, mode, min_lat)
+        if obs is None or not (lo_r <= obs <= hi_r):
+            continue
+        boots = sorted(_guarded_p95([ratios[rng.randrange(n)] for _ in range(n)], mode, min_lat)
+                       for _ in range(int(rule["bootstrap"])))
+        ups.append(boots[int(float(rule["upper"]) * len(boots))] / obs)
+        ns.append(n)
+    ups.sort()
+    s0 = ups[int(float(rule["quantile"]) * len(ups))] if ups else None
+    return {"s0": s0, "windows_used": len(ups), "n_median": sorted(ns)[len(ns) // 2] if ns else None,
+            "rule": dict(rule)}
+
+
+def deadband_ba(windows: Sequence[Any], *, theta: float, s0: float, direction: str) -> dict:
+    """BA at ``theta`` with the violating windows of severity < ``s0`` left out (disclosed)."""
+    from tre_calibration.fit import threshold_balanced_accuracy
+
+    keep = [w for w in windows if math.isfinite(w.signal) and (w.slo_met or severity(w) >= s0)]
+    two = any(w.slo_met for w in keep) and any(not w.slo_met for w in keep)
+    ba = threshold_balanced_accuracy(keep, theta=theta, direction=direction)["balanced_accuracy"] if two else None
+    return {"s0": s0, "balanced_accuracy": ba, "excluded_violating": sum(1 for w in windows if math.isfinite(w.signal))
+            - len(keep), "windows": len(keep)}

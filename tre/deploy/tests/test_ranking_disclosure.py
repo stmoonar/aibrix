@@ -61,7 +61,7 @@ def test_accept_discloses_ranking_per_model_and_pooled_never_gating(tmp_path, ca
     w, res = _accepted(tmp_path)
     out = capsys.readouterr().out
     assert "ranking disclosure (pressure = -Z; not gating)" in out and "| pooled |" in out
-    assert res["format_revision"] == dl.ACCEPT_FORMAT_REVISION == 3
+    assert res["format_revision"] == dl.ACCEPT_FORMAT_REVISION == 4
     r = res["models"][MODEL]
     assert r["windowing"] == dl.DEFAULT_WINDOWING and res["thresholds"]["dwell_windows"] == 2
     d = r["ranking_disclosure"]
@@ -121,7 +121,7 @@ def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_p
     assert base._freeze(w) == 0
     ff = w["freeze"]
     doc = json.loads(ff.read_text())
-    assert doc["format_revision"] == 3
+    assert doc["format_revision"] == 4
     assert doc["models"][MODEL]["windowing"] == {**dl.DEFAULT_WINDOWING,
                                                  "source": "defaults: final.json predates the windowing record"}
     # rewrite it as a revision-1 freeze (no windowing, no B' cut), re-hashed: the D22 shape
@@ -145,12 +145,12 @@ def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_p
     assert res["models"][MODEL]["windowing"] == dl.DEFAULT_WINDOWING
     assert res["models"][MODEL]["holdout_report"]["with_dwell"]["dwell_windows"] == 2
     # a revision the reader does not know is refused
-    doc["format_revision"] = 4
+    doc["format_revision"] = 5
     doc["freeze_sha256"] = dl.canonical_sha256({k: v for k, v in doc.items() if k != "freeze_sha256"})
     data = dl._json_bytes(doc)
     ff.write_bytes(data)
     side.write_text(f"{hashlib.sha256(data).hexdigest()}  {ff.name}\n")
-    with pytest.raises(dl.FreezeError, match="not a format revision 1 / 2 / 3 freeze"):
+    with pytest.raises(dl.FreezeError, match="not a format revision 1 / 2 / 3 / 4 freeze"):
         dl.verify_freeze(ff)
 
 

@@ -142,3 +142,108 @@ def test_the_decision_reports_b_prime_from_accept_at_the_controllers_dwell(tmp_p
     # a dwell accept never stored is not evaluable, never passed
     five = cd.b_prime_from_accept(result_path, online_dwell=5)["models"][MODEL]
     assert five["evaluable"] is False and five["passed"] is False
+
+
+# ------------------------------------------------ the onset gate (design 2026-10-05 item 3)
+
+
+def _ew(cell: str, t_s: float, ratio: float):
+    """One window of an episode timeline: ``ratio`` = p95 latency / SLO (<= 1 healthy)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(scenario_id=cell, window_start_ms=t_s * 1000.0, slo_met=ratio <= 1.0, signal=1.0,
+                           latency_ratio_p95=ratio, latency_ratio_avg=None, health_score=1.0)
+
+
+def test_onset_episodes_score_onsets_not_drain_tails_and_count_misses_and_late_hits() -> None:
+    cut = 5.0
+    # cell -> (primitive, [(t_s, ratio)], CRITICAL instants)
+    timeline = {
+        # severe from 40 s, CRITICAL at 50 / 60 s (lag 10 s); the drain tail 70-110 s stays
+        # violating without CRITICAL: one caught episode, not four tail misses
+        "burst": ("bursts", [(0, .5), (10, .5), (20, .5), (30, 2), (40, 6), (50, 8), (60, 8), (70, 6), (80, 6),
+                             (90, 6), (100, 2), (110, 2), (120, .5)], {50, 60}),
+        "missed": ("steps", [(0, .5), (10, 2), (20, 6), (30, 6), (40, .5)], set()),
+        "late": ("ramp", [(0, .5), (10, 6), (20, 6), (30, 6), (40, 6), (50, .5)], {40}),   # lag 30 s > budget
+        "lead": ("bursts", [(0, .5), (10, 2), (20, 2), (30, 6), (40, .5)], {10}),         # lag -20 s
+        "hold": ("hold", [(0, 6), (10, 6), (20, .5)], set()),                              # disclosed only
+    }
+    windows, crit, prim = [], [], {}
+    for cell, (p, pts, hits) in timeline.items():
+        prim[cell] = p
+        for t, r in pts:
+            windows.append(_ew(cell, t, r))
+            crit.append(t in hits)
+    got = b_prime.onset_detection(windows, crit, cut=cut, primitive_of=prim, gate=b_prime.ONSET_GATE,
+                                  n_resamples=200)
+    lags = {e["cell"]: e["lag_s"] for e in got["episodes"]}
+    assert lags == {"burst": 10.0, "missed": None, "late": 30.0, "lead": -20.0, "hold": None}
+    assert (got["onset"]["episodes"], got["onset"]["detected"], got["onset"]["within_budget"]) == (4, 3, 2)
+    assert got["hold_disclosed"]["episodes"] == 1
+    assert got["criteria"][0]["value"] == 2 and not got["passed"]   # a miss and a late hit fail the gate
+    # the same burst scored per window (B') counts the drain tail as misses
+    burst = [i for i, w in enumerate(windows) if w.scenario_id == "burst"]
+    point = b_prime.series_point([windows[i] for i in burst], theta=1.0, cut=cut, crit=[crit[i] for i in burst])
+    assert point["recall_severe"] == pytest.approx(2 / 6)
+
+
+def test_correlated_episodes_do_not_count_as_independent() -> None:
+    # 3 cells x 2 episodes (60 s apart, beyond the 30 s look-back), all caught at lag 0: no miss,
+    # but identical lags within a cell
+    # leave the ICC undefined -> 1 (the conservative end) -> n_eff = 3 cells, not 6 episodes
+    windows, crit, prim = [], [], {}
+    for c in ("a", "b", "c"):
+        prim[c] = "bursts"
+        for t, r in [(0, 6), (10, .5), (20, .5), (30, .5), (40, .5), (50, .5), (60, 6), (70, .5)]:
+            windows.append(_ew(c, t, r))
+            crit.append(r > 1)
+    got = b_prime.onset_detection(windows, crit, cut=5.0, primitive_of=prim, gate=b_prime.ONSET_GATE,
+                                  n_resamples=200)
+    assert got["onset"]["within_budget"] == 6 and got["icc_raw"] is None and got["icc"] == 1.0
+    assert got["n_eff"] == pytest.approx(3.0)
+    assert got["clopper_pearson_lower"] == pytest.approx(0.05 ** (1 / 3)) and not got["passed"]
+    # the design's power figure: 0 misses on n_eff 14 -> one-sided 95 % lower bound .81
+    assert b_prime.clopper_pearson_lower(14, 14, 0.05) == pytest.approx(0.807, abs=1e-3)
+    assert b_prime.clopper_pearson_lower(13, 14, 0.05) == pytest.approx(0.70327, abs=1e-4)  # scipy beta.ppf
+
+
+def _result(w: dict) -> dict:
+    return json.loads(dl.freeze_paths(w["freeze"])["result"].read_text())
+
+
+def test_the_onset_gate_has_three_verdicts_one_rule_for_every_model(tmp_path, monkeypatch) -> None:
+    # pass: 16 steps cells, one onset episode each, caught at its first window (lag 0); one
+    # episode per cell -> ICC undefined -> 1 -> n_eff 16 -> Clopper-Pearson low .05 ** (1/16) = .83
+    w = base._world(tmp_path / "pass", steps_cells=16)
+    assert base._freeze(w, "onset") == 0
+    gate = dl.verify_freeze(w["freeze"])["accept_gate"]
+    assert gate["rule"] == "onset" and gate["onset"]["lag_budget_s"] == 20.0 and gate["onset"]["miss_tolerance"] == 0
+    assert base._accept(w, base._seal(w)) == 0
+    res = _result(w)
+    r, c = res["models"][MODEL], res["models"][MODEL]["criteria"]
+    assert r["verdict"] == res["verdict"] == dl.VERDICT_PASS and res["passed"]
+    assert (c["onset"]["onset"]["episodes"], c["onset"]["onset"]["within_budget"]) == (16, 16)
+    assert c["onset"]["clopper_pearson_lower"] == pytest.approx(0.05 ** (1 / 16))
+    assert c["window_fa"]["passed"] and c["B_prime"]["gating"] is False and c["B"]["gating"] is False
+    # pass_a_disclosed: only A fails -> go-live allowed (exit 0), A disclosed as a limitation
+    w2 = base._world(tmp_path / "a", steps_cells=16)
+    assert base._freeze(w2, "onset") == 0
+    a_min = dl.A_BA_MIN
+    monkeypatch.setattr(dl, "A_BA_MIN", 1.01)   # BA is 1.0 on this M: A alone fails
+    assert base._accept(w2, base._seal(w2)) == 0
+    monkeypatch.setattr(dl, "A_BA_MIN", a_min)
+    res2 = _result(w2)
+    assert res2["verdict"] == dl.VERDICT_PASS_A_DISCLOSED and res2["passed"] and res2["failed"] == []
+    assert not res2["models"][MODEL]["criteria"]["A"]["passed"]
+    assert len(res2["disclosed_limitations"]) == 1 and "A failed" in res2["disclosed_limitations"][0]
+    # fail: hold-only M has no onset episode -> the onset gate is not evaluable -> fail, exit 3,
+    # though A, the window false alarm, D (and the disclosed B') pass
+    w3 = base._world(tmp_path / "f")
+    assert base._freeze(w3, "onset") == 0
+    assert base._accept(w3, base._seal(w3)) == dl.EXIT_ACCEPT_FAILED
+    res3 = _result(w3)
+    c3 = res3["models"][MODEL]["criteria"]
+    assert res3["verdict"] == dl.VERDICT_FAIL and not res3["passed"]
+    assert c3["A"]["passed"] and c3["window_fa"]["passed"] and c3["D"]["passed"] and c3["B_prime"]["passed"]
+    assert c3["onset"]["evaluable"] is False and res3["failed"] == [f"{MODEL}: onset failed - "
+                                                                    "no severe-violation episode in a dynamic cell"]
