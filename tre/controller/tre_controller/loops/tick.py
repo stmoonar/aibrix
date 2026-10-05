@@ -118,6 +118,11 @@ class PaperStateCache:
                 # Timer cleanup (2026-10-02): a held context was not recomputed - O1 saw
                 # no routable change this tick, so the F4 cooldown applies again.
                 "o1_routable_tracked": False,
+                # I4 (2026-10-04): a held level was not computed from tokens of the
+                # current window - never scale-down / release evidence (the planner's
+                # donor gate), and the UI shows the model UNCONFIRMED.
+                "signal_full_window": False,
+                "signal_hold_reason": "tokens_missing",
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
