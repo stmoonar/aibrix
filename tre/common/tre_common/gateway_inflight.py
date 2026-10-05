@@ -31,6 +31,22 @@ def redis_now_ms(redis: Any) -> int:
     return int(seconds) * 1000 + int(micros) // 1000
 
 
+#: ``service_manager.sleep.instance_staleness_s`` default (registry).
+DEFAULT_INSTANCE_MAX_AGE_MS = 10_000
+
+
+def instance_max_age_ms(registry: Any) -> int:
+    """THE liveness bound of a gateway plugin instance (heartbeat age, ms): the
+    registry's ``service_manager.sleep.instance_staleness_s`` - the bound the
+    service-manager applies before a sleep. Every controller reader of the in-flight
+    mirror (early commit, frozen-scrape demand, idle window) uses it (review
+    2026-10-06 P3-2). The default when the registry has no service-manager section."""
+    service_manager = getattr(registry, "service_manager", None)
+    if not callable(service_manager):
+        return DEFAULT_INSTANCE_MAX_AGE_MS
+    return max(1, int(1000 * float(service_manager().sleep.instance_staleness_s)))
+
+
 def live_gateway_instances(redis: Any, *, max_age_ms: int) -> set[str]:
     """Instance ids whose last heartbeat is at most ``max_age_ms`` old (Redis TIME)."""
     now_ms = redis_now_ms(redis)

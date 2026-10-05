@@ -257,13 +257,13 @@ def test_gateway_inflight_reader_counts_live_instances_only():
     key = "tre:v2:gw:inflight:m-1"
     fields = {b"gw-a": b'{"total":0,"non_continuable":0,"ts":1}', "gw-b": '{"total":2,"non_continuable":0,"ts":1}'}
     live = {"gw-a": NOW_MS, "gw-b": NOW_MS - 2_000}
-    assert GatewayInflightReader(_FakeRedis(live, {key: fields}))(("m-1",)) == 2.0
+    assert GatewayInflightReader(_FakeRedis(live, {key: fields}), max_age_ms=10_000)(("m-1",)) == 2.0
     dead_b = {"gw-a": NOW_MS, "gw-b": NOW_MS - 60_000}  # gw-b stopped heartbeating
     assert GatewayInflightReader(_FakeRedis(dead_b, {key: fields}), max_age_ms=10_000)(("m-1",)) == 0.0
-    assert GatewayInflightReader(_FakeRedis())(("m-1",)) == 0.0  # no field: nothing routed there
-    assert GatewayInflightReader(_FakeRedis({}))(("m-1",)) is None  # nobody counts
-    assert GatewayInflightReader(_FakeRedis({"gw-a": NOW_MS - 60_000}))(("m-1",)) is None
-    assert GatewayInflightReader(_FakeRedis(fail=True))(("m-1",)) is None
+    assert GatewayInflightReader(_FakeRedis(), max_age_ms=10_000)(("m-1",)) == 0.0  # no field: nothing routed there
+    assert GatewayInflightReader(_FakeRedis({}), max_age_ms=10_000)(("m-1",)) is None  # nobody counts
+    assert GatewayInflightReader(_FakeRedis({"gw-a": NOW_MS - 60_000}), max_age_ms=10_000)(("m-1",)) is None
+    assert GatewayInflightReader(_FakeRedis(fail=True), max_age_ms=10_000)(("m-1",)) is None
 
 
 @pytest.mark.parametrize("raw", [b"not-json", b'{"total":"x"}', b'{"non_continuable":0}'])
@@ -273,7 +273,7 @@ def test_an_unreadable_live_inflight_field_is_unknown_and_blocks_early_commit(ra
     field of a dead instance is ignored."""
     key = "tre:v2:gw:inflight:m-1"
     fields = {b"gw-a": b'{"total":0,"non_continuable":0,"ts":1}', b"gw-b": raw}
-    assert GatewayInflightReader(_FakeRedis(hashes={key: fields}))(("m-1",)) is None
+    assert GatewayInflightReader(_FakeRedis(hashes={key: fields}), max_age_ms=10_000)(("m-1",)) is None
     dead_b = {"gw-a": NOW_MS, "gw-b": NOW_MS - 60_000}
     assert GatewayInflightReader(_FakeRedis(dead_b, {key: fields}), max_age_ms=10_000)(("m-1",)) == 0.0
 

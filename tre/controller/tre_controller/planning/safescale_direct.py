@@ -1260,7 +1260,7 @@ class GatewayInflightReader:
     its key expires). Unknown (None) when no instance is live (nothing writes the
     counts), when a live instance's field is unreadable, or on a read error."""
 
-    def __init__(self, redis_client: Any, *, max_age_ms: int = 10_000) -> None:
+    def __init__(self, redis_client: Any, *, max_age_ms: int) -> None:
         self._redis = redis_client
         self._max_age_ms = max(1, int(max_age_ms))
 

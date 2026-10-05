@@ -8,6 +8,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
+from tre_common.gateway_inflight import instance_max_age_ms
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
@@ -354,12 +355,10 @@ def create_controller_dependencies(
             # Timer cleanup (early commit): the hidden pods' running + waiting and their
             # gateway in-flight count (TRE Redis, transparent-sleep coordination keys).
             hidden_scrape=bool(cfg.safescale.early_commit),
-            # Live plugin instances only: the SM's gateway liveness bound (heartbeat age).
+            # Live plugin instances only: the SM's gateway liveness bound (heartbeat age),
+            # the same one the metrics store reads the in-flight mirror with (P3-2).
             gateway_inflight=(
-                GatewayInflightReader(
-                    redis_client,
-                    max_age_ms=int(1000 * registry.service_manager().sleep.instance_staleness_s),
-                )
+                GatewayInflightReader(redis_client, max_age_ms=instance_max_age_ms(registry))
                 if cfg.safescale.early_commit
                 else None
             ),

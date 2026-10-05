@@ -6,7 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
-from tre_common.gateway_inflight import live_gateway_instances, pod_inflight
+from tre_common.gateway_inflight import instance_max_age_ms, live_gateway_instances, pod_inflight
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
 from tre_common.tss import window_is_idle
@@ -74,6 +74,8 @@ class MetricsStore:
         # suffixes (ModelWindowMetrics.suffix_windows) from the docs already read - no
         # extra redis round trip. 0 = off (the SafeScale evidence store, older callers).
         self._suffix_period_ms = int(suffix_period_ms)
+        # P3-2: gateway plugin instance liveness (the registry's SM instance staleness).
+        self._gateway_instance_max_age_ms = instance_max_age_ms(registry)
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
     @property
@@ -199,7 +201,7 @@ class MetricsStore:
                 instant_ticks_ms=all_ticks,
                 scrape_stale_pods=stale_pods,
                 scrape_fresh=scrape_fresh,
-                scrape_stale_inflight=self._stale_inflight(stale_pods, int(window_end_ms) - int(window_start_ms)),
+                scrape_stale_inflight=self._stale_inflight(stale_pods),
             )
         elif scrape_fresh:
             model_metrics = replace(model_metrics, scrape_fresh=True)
@@ -218,9 +220,7 @@ class MetricsStore:
         ):
             model_metrics = replace(
                 model_metrics,
-                gateway_inflight=self._pods_inflight(
-                    tuple(sorted(set(scraped) | set(per_pod))), int(window_end_ms) - int(window_start_ms)
-                ),
+                gateway_inflight=self._pods_inflight(tuple(sorted(set(scraped) | set(per_pod)))),
             )
         if suffix_starts:
             model_metrics = replace(
@@ -239,20 +239,21 @@ class MetricsStore:
             self._window_cache[cache_key] = model_metrics
         return model_metrics
 
-    def _stale_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int]:
+    def _stale_inflight(self, pods: tuple[str, ...]) -> dict[str, int]:
         """The gateway's in-flight count of each scrape-stale pod. Read only when pods
         are stale; an unknown count is 0 here (no evidence: it never invents
         frozen-scrape rescue demand)."""
-        counts = self._pods_inflight(pods, window_ms) or {}
+        counts = self._pods_inflight(pods) or {}
         return {pod: count or 0 for pod, count in counts.items()}
 
-    def _pods_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int | None] | None:
+    def _pods_inflight(self, pods: tuple[str, ...]) -> dict[str, int | None] | None:
         """pod -> routed, unfinished requests at the gateway, summed over the live
-        gateway instances (a heartbeat inside one window); a pod's count is None when a
+        gateway instances (heartbeat at most the registry's
+        ``service_manager.sleep.instance_staleness_s`` old); a pod's count is None when a
         live instance's field is unreadable. None = unknown: the gateway coordination
         keys cannot be read, or no gateway instance is live."""
         try:
-            live = live_gateway_instances(self._redis, max_age_ms=max(1, int(window_ms)))
+            live = live_gateway_instances(self._redis, max_age_ms=self._gateway_instance_max_age_ms)
             if not live:
                 return None
             return {pod: pod_inflight(self._redis, pod, live) for pod in pods}
