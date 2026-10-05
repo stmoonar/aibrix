@@ -36,6 +36,39 @@ _VALID_STATES = {POD_STATE_AWAKE, POD_STATE_SLEEPING, POD_STATE_HIDDEN}
 _ROUTE_GEN_PATCH_ATTEMPTS = 5
 
 
+#: Default HTTP timeout (s) of every Kubernetes API call of the service-manager
+#: (env ``TRE_SM_K8S_REQUEST_TIMEOUT_S``): most calls run under the writer lock,
+#: and the kubernetes client has no timeout of its own.
+DEFAULT_K8S_REQUEST_TIMEOUT_S = 10.0
+
+
+class UnreadablePodBinding(RuntimeError):
+    """A managed, unfinished Pod whose binding cannot be read: the live-Pod view
+    is incomplete, so nothing may be concluded from a binding's absence."""
+
+
+class RequestTimeoutApi:
+    """Wraps a kubernetes API object (``CoreV1Api``, ``AppsV1Api``,
+    ``CustomObjectsApi``): every call gets ``_request_timeout`` unless the caller
+    passes one, so a hung API server cannot hold the writer lock forever (it
+    raises like any other API error)."""
+
+    def __init__(self, api, timeout_s: float = DEFAULT_K8S_REQUEST_TIMEOUT_S) -> None:
+        self._api = api
+        self._timeout_s = float(timeout_s)
+
+    def __getattr__(self, name):
+        attr = getattr(self._api, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            kwargs.setdefault("_request_timeout", self._timeout_s)
+            return attr(*args, **kwargs)
+
+        return call
+
+
 class K8sApi(Protocol):
     def list_namespaced_pod(self, *, namespace: str, label_selector: str | None = None): ...
 
@@ -328,14 +361,25 @@ class K8sOps:
     def list_live_model_pod_binding_ids(self) -> set[str]:
         """Binding ids of every managed model Pod object that still exists and
         has not finished (Pending - e.g. waiting in the startup gate -, Running
-        or terminating). A ``starting`` GPU lease whose binding has no such Pod
-        outside a writer operation is an orphan (B11)."""
+        or terminating). A GPU lease whose binding has no such Pod outside a
+        writer operation is an orphan (B11, 2026-10-02).
+
+        Fail closed (2026-10-06): a managed, unfinished Pod whose binding cannot
+        be read (model label, node, GPU annotation, UID) raises
+        :class:`UnreadablePodBinding` instead of being skipped - skipped, its
+        binding would look gone and its lease would be released while its
+        engine may be alive. Every caller treats a raise as "Pod list
+        unreadable" and releases nothing."""
         binding_ids: set[str] = set()
         for pod in self._live_model_pods():
+            if str((_metadata(pod).get("labels") or {}).get(MANAGED_LABEL)) != "true":
+                continue  # not a TRE model Pod (the LIST selects them; defensive)
             try:
                 binding_ids.add(self._startup_record_from_pod(pod).binding_id)
-            except (KeyError, ValueError):
-                continue
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UnreadablePodBinding(
+                    f"managed Pod {_metadata(pod).get('name')} has no readable binding: {exc}"
+                ) from exc
         return binding_ids
 
     def list_live_model_pod_uids(self) -> set[str]:

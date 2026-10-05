@@ -13,7 +13,7 @@ from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.app import create_service_app
 from tre_sm.clock_check import check_clock_skew
 from tre_sm.gpu_truth import RedisGpuTruth
-from tre_sm.ops.k8s_ops import K8sOps
+from tre_sm.ops.k8s_ops import DEFAULT_K8S_REQUEST_TIMEOUT_S, K8sOps, RequestTimeoutApi
 from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal, log_ignored_drain_settings
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
@@ -324,10 +324,11 @@ def _create_k8s_ops(registry=None) -> K8sOps:
         config.load_kube_config()
 
     namespace = os.environ.get("TRE_MODEL_NAMESPACE", os.environ.get("TARGET_NAMESPACE", "default"))
+    timeout_s = float(os.environ.get("TRE_SM_K8S_REQUEST_TIMEOUT_S", DEFAULT_K8S_REQUEST_TIMEOUT_S))
     return K8sOps(
-        api=client.CoreV1Api(),
-        apps_api=client.AppsV1Api(),
-        route_api=client.CustomObjectsApi(),
+        api=RequestTimeoutApi(client.CoreV1Api(), timeout_s),
+        apps_api=RequestTimeoutApi(client.AppsV1Api(), timeout_s),
+        route_api=RequestTimeoutApi(client.CustomObjectsApi(), timeout_s),
         namespace=namespace,
         route_namespace=os.environ.get("TRE_ROUTE_NAMESPACE", "aibrix-system"),
         gateway_name=os.environ.get("TRE_GATEWAY_NAME", "aibrix-eg"),

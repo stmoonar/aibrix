@@ -9,7 +9,10 @@ Pod list releases nothing."""
 import json
 import logging
 
+from tre_sm.allocator.topology import GPU_IDS_ANNOTATION
+from tre_sm.ops.k8s_ops import MANAGED_LABEL, MODEL_LABEL, K8sOps
 from tre_sm.server import K8sPodClientFromOps
+from tre_sm.state.supervisor import FleetSupervisor
 
 from sm_test_fakes import binding_of
 from test_wholelock_20261002 import World
@@ -70,4 +73,59 @@ def test_reconcile_drop_missing_releases_the_leases_of_the_bindings_it_drops():
     result = world.service.reconcile(drop_missing=True)
 
     assert result["released_leases"] == ["d/node-a/0"]
+    assert {lease.binding_id for lease in world.leases.load()} == {"d/node-a/1"}
+
+
+# ------------------------------------------------ fail closed on the real Pod list (2026-10-06)
+
+
+class _PodListApi:
+    """The CoreV1 Pod LIST the k8s ops read (dict Pods)."""
+
+    def __init__(self, pods):
+        self.pods = pods
+
+    def list_namespaced_pod(self, *, namespace, label_selector=None, **_kwargs):
+        return list(self.pods)
+
+
+def _k8s_pod(name, model, gpus, *, gpu_annotation=True, terminating=False):
+    metadata = {
+        "name": name, "uid": f"uid-{name}",
+        "labels": {MODEL_LABEL: model, MANAGED_LABEL: "true"},
+        "annotations": {GPU_IDS_ANNOTATION: ",".join(str(g) for g in gpus)} if gpu_annotation else {},
+    }
+    if terminating:
+        metadata["deletionTimestamp"] = "2026-10-06T00:00:00Z"
+    return {"metadata": metadata, "spec": {"nodeName": "node-a"}, "status": {"phase": "Running"}}
+
+
+def _k8s_world(pods):
+    world = World()
+    world.runtime.list_live_model_pod_binding_ids = K8sOps(
+        api=_PodListApi(pods), namespace="default"
+    ).list_live_model_pod_binding_ids
+    return world
+
+
+def test_a_managed_pod_with_an_unreadable_binding_releases_nothing():
+    # d-0's Pod is gone, but another managed Pod has no GPU annotation: it may be
+    # d-0's (its binding cannot be read), so the pass must not conclude anything.
+    world = _k8s_world([_k8s_pod("d-1", "d", (1,)), _k8s_pod("d-0-new", "d", (0,), gpu_annotation=False)])
+
+    assert world.service.reap_orphan_leases() == []
+    assert {lease.binding_id for lease in world.leases.load()} == {"d/node-a/0", "d/node-a/1"}
+
+
+def test_one_supervisor_pass_in_observe_releases_a_gone_pods_lease_and_keeps_a_terminating_one():
+    # tre_models.sh down deletes the model Deployments with the SM in observe:
+    # d-0's Pod is gone, d-1's still terminating. One pass frees d-0's GPU (an
+    # overlapping start is no longer refused with lease_conflict) and keeps d-1's
+    # (its engine may still be awake in its grace period).
+    world = _k8s_world([_k8s_pod("d-1", "d", (1,), terminating=True)])
+    world.service._safety_gate.actuation = "observe"
+    world.service.detect_fleet_drift = lambda: []
+
+    FleetSupervisor(world.service, drift_observations_required=1).run_once()
+
     assert {lease.binding_id for lease in world.leases.load()} == {"d/node-a/1"}
