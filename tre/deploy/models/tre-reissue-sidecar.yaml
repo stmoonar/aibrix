@@ -95,7 +95,11 @@ data:
     \    \"vllm_xargs\",\n    \"return_token_ids\",\n    \"stream_options\",\n)\n\
     #: Removed from a completions request continued with a token-id prompt.\nCOMPLETION_CONT_DROP\
     \ = (\"prompt\", \"prompt_embeds\", \"echo\", \"suffix\", \"truncate_prompt_tokens\"\
-    , \"add_special_tokens\")\n\n_ABORT_MARK = b'\"abort\"'\n\n\n\ndef _request_key(name:\
+    , \"add_special_tokens\")\n\n_ABORT_MARK = b'\"abort\"'\n\n#: Start of the message\
+    \ of every error response the sidecar itself produces (``_error``).\n#: A 502\
+    \ / 503 carrying it came from another sidecar and is final for the gateway retry\n\
+    #: loop (``ReissueSidecar._gateway_request``).\nSIDECAR_ERROR_PREFIX = \"tre-reissue\
+    \ sidecar:\"\nSIDECAR_ERROR_MARK = SIDECAR_ERROR_PREFIX.encode()\n\n\n\ndef _request_key(name:\
     \ str, kind: type) -> Any:\n    \"\"\"A ``web.Request`` item key (aiohttp < 3.12\
     \ has no ``web.RequestKey``: a string).\"\"\"\n    return web.RequestKey(name,\
     \ kind) if hasattr(web, \"RequestKey\") else name\n\n\n#: Per-request: the tre_reissue_total\
@@ -893,22 +897,30 @@ data:
     \  ) -> tuple[aiohttp.ClientResponse | None, int, str]:\n        \"\"\"Send a\
     \ not-yet-started request to the gateway, retrying 503 / 502 / connect\n     \
     \   errors (bounded, backoff, Retry-After honoured). (response, attempts, last\
-    \ error).\"\"\"\n        cfg = self.cfg\n        error = \"\"\n        delay =\
-    \ 0.0\n        for attempt in range(1, cfg.retry_attempts + 1):\n            if\
-    \ delay > 0:\n                await asyncio.sleep(delay)\n            backoff\
-    \ = min(cfg.retry_backoff_s * (2 ** (attempt - 1)), cfg.retry_max_backoff_s)\n\
+    \ error).\n\n        One retry layer: a 502 / 503 produced by ANOTHER sidecar\
+    \ (its error message starts\n        with ``SIDECAR_ERROR_MARK``: hop limit, its\
+    \ own retries exhausted, its engine\n        unreachable) is final, not retried\
+    \ - that sidecar already spent its own bounded\n        attempts, and retrying\
+    \ it would multiply the sends per hop. Envoy's / the\n        gateway's own 502\
+    \ / 503 (no routable pod, connect failure) are retried.\"\"\"\n        cfg = self.cfg\n\
+    \        error = \"\"\n        delay = 0.0\n        for attempt in range(1, cfg.retry_attempts\
+    \ + 1):\n            if delay > 0:\n                await asyncio.sleep(delay)\n\
+    \            backoff = min(cfg.retry_backoff_s * (2 ** (attempt - 1)), cfg.retry_max_backoff_s)\n\
     \            try:\n                resp = await self.gateway.request(method, cfg.gateway_url\
     \ + path_qs, data=data, headers=headers)\n            except (aiohttp.ClientError,\
     \ asyncio.TimeoutError, OSError) as exc:\n                error = f\"gateway:\
     \ {type(exc).__name__}: {exc}\"\n                delay = backoff\n           \
     \     continue\n            if resp.status in (502, 503):\n                try:\n\
-    \                    detail = (await resp.read())[:300].decode(\"utf-8\", \"replace\"\
-    )\n                finally:\n                    resp.release()\n            \
-    \    error = f\"gateway HTTP {resp.status}: {detail}\"\n                advised\
-    \ = _retry_after(resp.headers.get(\"Retry-After\"))\n                delay = min(advised\
-    \ if advised is not None else backoff, cfg.retry_max_backoff_s)\n            \
-    \    continue\n            return resp, attempt, \"\"\n        return None, cfg.retry_attempts,\
-    \ error\n\n    # ---------------------------------------------------------------\
+    \                    payload = await resp.read()\n                except (aiohttp.ClientError,\
+    \ asyncio.TimeoutError):\n                    payload = b\"\"\n              \
+    \  finally:\n                    resp.release()\n                detail = payload[:300].decode(\"\
+    utf-8\", \"replace\")\n                if SIDECAR_ERROR_MARK in payload:\n   \
+    \                 return None, attempt, f\"sidecar HTTP {resp.status} (final,\
+    \ not retried): {detail}\"\n                error = f\"gateway HTTP {resp.status}:\
+    \ {detail}\"\n                advised = _retry_after(resp.headers.get(\"Retry-After\"\
+    ))\n                delay = min(advised if advised is not None else backoff, cfg.retry_max_backoff_s)\n\
+    \                continue\n            return resp, attempt, \"\"\n        return\
+    \ None, cfg.retry_attempts, error\n\n    # ---------------------------------------------------------------\
     \ retry path\n\n    async def _retry(\n        self, request: web.Request, raw:\
     \ bytes, depth: int, reason: str, added: AddedTime | None = None\n    ) -> web.StreamResponse:\n\
     \        \"\"\"Forward a request that has not started (nothing sent to the client)\
@@ -1357,7 +1369,7 @@ data:
     \        layer: str | None = None) -> web.Response:\n    \"\"\"An OpenAI-style\
     \ error. ``layer`` names the hop that failed (``sidecar_upstream``:\n    sidecar\
     \ -> local vLLM) so clients / replayers can tell it from engine errors.\"\"\"\n\
-    \    error: dict[str, Any] = {\"message\": f\"tre-reissue sidecar: {message}\"\
+    \    error: dict[str, Any] = {\"message\": f\"{SIDECAR_ERROR_PREFIX} {message}\"\
     , \"type\": err_type, \"code\": status}\n    if layer:\n        error[\"layer\"\
     ] = layer\n    return web.json_response({\"error\": error}, status=status, headers=headers)\n\
     \n\ndef build_app(cfg: Config) -> web.Application:\n    return ReissueSidecar(cfg).build_app()\n\

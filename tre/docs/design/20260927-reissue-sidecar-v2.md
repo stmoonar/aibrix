@@ -41,6 +41,10 @@
 做法：原请求 body **原样**发往 `TRE_GATEWAY_URL`（集群内 DNS），请求头去掉 hop-by-hop、`x-request-id`、`target-pod`、`x-forwarded-*`、`x-envoy-*`，
 其余保留（`routing-strategy`、`model` 等）；`x-tre-exclude-pod` = 入站值 ∪ 本 pod 名；`x-tre-reissue-depth` = 入站 + 1。
 - 网关 503 / 502 / 连接错误：最多 `retry_attempts`（默认 4）次，退避 0.2 s 起倍增、封顶 2 s，服从 `Retry-After`（同样封顶）。
+- **只有一层重试（2026-10-05）**：另一个 sidecar 产生的 502 / 503（`error.message` 以 `tre-reissue sidecar:` 开头：深度超限、它自己的重试已用完、
+  它的本地引擎连不上）是终态，不再重试——那个 sidecar 已经用完了自己的有界重试，再重试会让每一跳的发送次数相乘
+  （嵌套两层时是 `retry_attempts × (1 + retry_attempts)` 次）。Envoy / 网关自己的 502 / 503（没有可路由的 pod、连接失败）照常重试。
+  结果计 `failed{retry_exhausted}`（续发路径计 `failed{continuation_unavailable}`），`error` 字段写明是下游 sidecar 的终态应答。
 - 全部失败：客户端收到 **503 + `Retry-After: 1`**（`error.type = ServiceUnavailable`）。
 - 成功：透传网关响应，加响应头 `x-tre-retried: <attempts>`。
 - 深度超过 `max_depth`（默认 3）：503 + Retry-After（上游 sidecar 会自己退避重试）。

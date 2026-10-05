@@ -152,6 +152,12 @@ COMPLETION_CONT_DROP = ("prompt", "prompt_embeds", "echo", "suffix", "truncate_p
 
 _ABORT_MARK = b'"abort"'
 
+#: Start of the message of every error response the sidecar itself produces (``_error``).
+#: A 502 / 503 carrying it came from another sidecar and is final for the gateway retry
+#: loop (``ReissueSidecar._gateway_request``).
+SIDECAR_ERROR_PREFIX = "tre-reissue sidecar:"
+SIDECAR_ERROR_MARK = SIDECAR_ERROR_PREFIX.encode()
+
 
 
 def _request_key(name: str, kind: type) -> Any:
@@ -1465,7 +1471,13 @@ class ReissueSidecar:
         self, method: str, path_qs: str, data: bytes, headers: dict[str, str]
     ) -> tuple[aiohttp.ClientResponse | None, int, str]:
         """Send a not-yet-started request to the gateway, retrying 503 / 502 / connect
-        errors (bounded, backoff, Retry-After honoured). (response, attempts, last error)."""
+        errors (bounded, backoff, Retry-After honoured). (response, attempts, last error).
+
+        One retry layer: a 502 / 503 produced by ANOTHER sidecar (its error message starts
+        with ``SIDECAR_ERROR_MARK``: hop limit, its own retries exhausted, its engine
+        unreachable) is final, not retried - that sidecar already spent its own bounded
+        attempts, and retrying it would multiply the sends per hop. Envoy's / the
+        gateway's own 502 / 503 (no routable pod, connect failure) are retried."""
         cfg = self.cfg
         error = ""
         delay = 0.0
@@ -1481,9 +1493,14 @@ class ReissueSidecar:
                 continue
             if resp.status in (502, 503):
                 try:
-                    detail = (await resp.read())[:300].decode("utf-8", "replace")
+                    payload = await resp.read()
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    payload = b""
                 finally:
                     resp.release()
+                detail = payload[:300].decode("utf-8", "replace")
+                if SIDECAR_ERROR_MARK in payload:
+                    return None, attempt, f"sidecar HTTP {resp.status} (final, not retried): {detail}"
                 error = f"gateway HTTP {resp.status}: {detail}"
                 advised = _retry_after(resp.headers.get("Retry-After"))
                 delay = min(advised if advised is not None else backoff, cfg.retry_max_backoff_s)
@@ -2186,7 +2203,7 @@ def _error(status: int, message: str, err_type: str, *, headers: dict[str, str] 
            layer: str | None = None) -> web.Response:
     """An OpenAI-style error. ``layer`` names the hop that failed (``sidecar_upstream``:
     sidecar -> local vLLM) so clients / replayers can tell it from engine errors."""
-    error: dict[str, Any] = {"message": f"tre-reissue sidecar: {message}", "type": err_type, "code": status}
+    error: dict[str, Any] = {"message": f"{SIDECAR_ERROR_PREFIX} {message}", "type": err_type, "code": status}
     if layer:
         error["layer"] = layer
     return web.json_response({"error": error}, status=status, headers=headers)

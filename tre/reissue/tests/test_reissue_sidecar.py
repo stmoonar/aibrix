@@ -272,6 +272,27 @@ async def test_retry_hop_limit():
         assert h.sidecar_a.metrics.reissue[("failed", "depth_limit")] == 1
 
 
+@pytest.mark.asyncio
+async def test_a_sidecar_error_is_not_retried_by_the_sidecar_before_it():
+    """T5, one retry layer (I5): A and B both sleep; A's retry reaches B, which retries
+    on its own and gets the gateway's 503 (no routable pod) retry_attempts times. B's
+    final 503 is a sidecar error: A does not retry it. The sends per client request are
+    1 (A) + retry_attempts (B), not retry_attempts x (1 + retry_attempts)."""
+    async with Harness() as h:
+        assert await h.sleep_a() == 200
+        async with h.http.post(h.url("/sleep", h.sb), headers=HIDDEN) as resp:
+            assert resp.status == 200
+        status, headers, raw = await h.post("/v1/completions", completion_body(3))
+        assert status == 503 and headers["Retry-After"] == "1"
+        assert json.loads(raw)["error"]["message"].startswith("tre-reissue sidecar:")
+        sends = [r["headers"]["x-tre-reissue-depth"] for r in h.gateway.requests]
+        attempts = h.sidecar_a.cfg.retry_attempts
+        assert sends.count("1") == 1  # A: one send, B's answer is final
+        assert sends.count("2") == attempts  # B: its own bounded retries of the gateway's 503
+        assert len(sends) == 1 + attempts
+        assert h.sidecar_a.metrics.reissue == {("failed", "retry_exhausted"): 1}
+
+
 # ------------------------------------------------------------- continuation path
 
 
