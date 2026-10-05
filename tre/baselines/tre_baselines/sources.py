@@ -543,6 +543,28 @@ def serving_bindings(state: Mapping[str, Any], models: Iterable[str]) -> dict[st
     return out
 
 
+def wakeable_slots(state: Mapping[str, Any], model: str) -> Optional[int]:
+    """How many sleeping bindings of ``model`` could be woken now without a donor: every
+    GPU of the binding is ``wakeable`` in ``/v2/state`` ``gpus[]`` (no awake binding, no
+    sleep draining, no load or wake in flight, no unexplained memory use), counted
+    GPU-disjointly. None when the state has no ``gpus[]``."""
+    gpus = state.get("gpus")
+    if not isinstance(gpus, list):
+        return None
+    free = {(g.get("node"), int(g.get("gpu"))) for g in gpus
+            if isinstance(g, Mapping) and g.get("wakeable") and g.get("gpu") is not None}
+    used: set = set()
+    count = 0
+    for binding in state.get("bindings") or ():
+        if binding.get("model") != model or binding.get("awake"):
+            continue
+        slot = {(binding.get("node"), int(g)) for g in (binding.get("gpu_ids") or ())}
+        if slot and slot <= free and not slot & used:
+            used |= slot
+            count += 1
+    return count
+
+
 def awake_counts(state: Mapping[str, Any], models: Iterable[str]) -> dict[str, int]:
     counts = state.get("models") or {}
     out: dict[str, int] = {}
@@ -655,6 +677,7 @@ class LiveSource:
                 unscraped=tuple(sorted(unscraped[model])),
                 slo=lim.slo,
                 events_since_ms=self.events.history_since_ms(model),
+                wakeable_slots=wakeable_slots(state, model),
             )
         return ClusterSnapshot(
             now_ms=now_ms,

@@ -518,3 +518,25 @@ def test_refusal_backoff_clears_when_the_sm_state_changes(tmp_path) -> None:
     assert wait_until(lambda: dispatcher.inflight_count() == 0)
     assert line["action"] == "up" and calls == [0, 2]                   # retried at once, not after the wait
     dispatcher.close(join_s=1.0)
+
+
+def test_scale_up_with_free_gpus_does_not_wait_for_a_donor(tmp_path) -> None:
+    """Review P2-6: only a scale-up that needs a donor waits; with wakeable GPUs it goes now."""
+    from dataclasses import replace
+
+    shell, cluster, redis, dispatcher = _shell(tmp_path, StickyScripted({0: {"a": 1, "b": 2, "c": 2}}),
+                                               dry_run=False)
+    cluster.delay_s = 0.2
+    gather = shell.source.gather
+
+    def gather_with_gpus(tick=0):
+        snap = gather(tick)
+        models = dict(snap.models)
+        models["b"] = replace(models["b"], wakeable_slots=1)   # b can wake on a free GPU
+        models["c"] = replace(models["c"], wakeable_slots=0)   # c needs a's GPU
+        return replace(snap, models=models)
+
+    shell.source.gather = gather_with_gpus
+    lines = {l["model"]: l for l in shell.tick_once()}
+    assert (lines["a"]["action"], lines["b"]["action"], lines["c"]["action"]) == ("down", "up", "wait_donor")
+    assert wait_until(lambda: dispatcher.inflight_count() == 0)

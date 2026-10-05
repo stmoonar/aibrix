@@ -140,6 +140,10 @@ class ModelSnapshot:
     #: gap (shell start, a trimmed / recreated stream, a read backlog). None = no event
     #: history (e.g. the source does not read events, or the gap is this tick).
     events_since_ms: Optional[int] = None
+    #: Sleeping bindings of this model the SM could wake right now without a donor: all
+    #: their GPUs ``wakeable`` in ``/v2/state`` ``gpus[]`` (GPU-disjoint count). None =
+    #: unknown (the SM state has no ``gpus[]``).
+    wakeable_slots: Optional[int] = None
 
 
 @dataclass(frozen=True)

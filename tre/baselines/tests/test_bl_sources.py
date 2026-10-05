@@ -319,3 +319,18 @@ def test_a_gap_forgets_pre_gap_tracked_requests(tmp_path) -> None:
     engine["q"] = 2                                       # n1 (lost) and n2 run; "old" is gone
     assert "event_gap" in gaps()                          # stale "old" no longer covers n1
     source.close()
+
+
+def test_wakeable_slots_from_the_sm_gpu_view() -> None:
+    from tre_baselines.sources import wakeable_slots
+
+    state = {"bindings": [
+        {"serve_id": "a0", "model": "a", "node": "n", "gpu_ids": [0], "awake": True},
+        {"serve_id": "a1", "model": "a", "node": "n", "gpu_ids": [1], "awake": False},
+        {"serve_id": "a2", "model": "a", "node": "n", "gpu_ids": [2], "awake": False},
+        {"serve_id": "t0", "model": "t", "node": "n", "gpu_ids": [1, 2], "awake": False},
+        {"serve_id": "t1", "model": "t", "node": "n", "gpu_ids": [2, 3], "awake": False},
+    ], "gpus": [{"node": "n", "gpu": g, "wakeable": g in (1, 2)} for g in range(4)]}
+    assert wakeable_slots(state, "a") == 2
+    assert wakeable_slots(state, "t") == 1          # TP=2: only (1,2) is fully free
+    assert wakeable_slots({"bindings": state["bindings"]}, "a") is None  # no gpus[]: unknown

@@ -22,11 +22,13 @@
   themselves; this one covers any policy that does not.
 * The dispatcher is asynchronous: a model whose previous SM call is still running gets
   ``inflight_skip`` (not queued); the tick never waits for the SM.
-* Donor before dependent (no arbiter): scale-downs are submitted first, and no scale-up is
-  sent while any scale-down call is still in flight (action ``wait_donor``): the SM answers
-  a scale-down only after the sleep is committed and the GPU released, so the scale-up that
-  may need that GPU goes out on the first tick after that answer (state, not a timer;
-  thread scheduling and model names no longer decide who gets a shared GPU).
+* Donor before dependent (no arbiter): scale-downs are submitted first. A scale-up that
+  needs a donor - ``/v2/state`` ``gpus[]`` shows fewer GPU sets the model can wake on
+  than replicas it adds (``ModelSnapshot.wakeable_slots``; unknown counts as none) - is
+  not sent while any scale-down call is in flight (action ``wait_donor``): the SM answers
+  a scale-down only after the sleep is committed and the GPU released, so it goes out on
+  the first tick after that answer (state, not a timer; thread scheduling and model names
+  no longer decide who gets a shared GPU). A scale-up with free GPUs goes out at once.
 * SM refusals are logged (``sm_result`` on the model's next decision line). After a failed
   call the model backs off (:class:`~tre_baselines.sm_client.Backoff`: ``max(retry_after_s,
   tick_s)``, doubling, capped at ``TRE_BL_BACKOFF_MAX_S``, default 10 s); while it waits its
@@ -326,8 +328,9 @@ class BaselineShell:
                 action = "guard_controller_active"
             elif effective_dry:
                 action = "dry_run"
-            elif direction == "up" and (donors := self.dispatcher.inflight_downs()):
-                action = "wait_donor"  # the GPU it may need is released when that call returns
+            elif (direction == "up" and self._needs_donor(snap.models[model], item["clamped"])
+                  and (donors := self.dispatcher.inflight_downs())):
+                action = "wait_donor"  # the GPU it needs is released when that call returns
             elif (wait_s := self.backoff.remaining_s(model, snap.now_ms)) is not None:
                 action = "backoff"
             elif self.dispatcher.submit(model, direction, item["clamped"]):
@@ -382,6 +385,12 @@ class BaselineShell:
             self.stats.scrape_failures += int(extra.get("scrape_failed") or 0)
         self._tick += 1
         return lines
+
+    @staticmethod
+    def _needs_donor(ms: Any, target: int) -> bool:
+        """The scale-up cannot be served from GPUs the model can wake on now."""
+        free = getattr(ms, "wakeable_slots", None)
+        return free is None or free < int(target) - int(ms.awake)
 
     def _note_dispatch(self, model: str, direction: str, now_ms: int) -> None:
         with self._stats_lock:
