@@ -9,6 +9,7 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWi
 from tre_common.gateway_inflight import live_gateway_instances, pod_inflight
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
+from tre_common.tss import window_is_idle
 from tre_common.vllm_metrics import doc_lookup
 from tre_common.window_pods import aggregate_pods
 
@@ -202,6 +203,25 @@ class MetricsStore:
             )
         elif scrape_fresh:
             model_metrics = replace(model_metrics, scrape_fresh=True)
+        # P2-2 (2026-10-06): an idle window needs every serving pod scraped in its last
+        # grid and nothing in flight on it at the gateway (the tick decides on both).
+        grid_start_ms = int(window_end_ms) - int(self._instant_sample_interval_ms)
+        model_metrics = replace(
+            model_metrics,
+            scrape_current_pods=frozenset(
+                pod for pod, value in scraped.items() if value is not None and value >= grid_start_ms
+            ),
+        )
+        if (
+            window_is_idle(model_metrics.prompt_tokens, model_metrics.generation_tokens)
+            and float(model_metrics.avg_running or 0.0) + float(model_metrics.avg_waiting or 0.0) <= 1e-9
+        ):
+            model_metrics = replace(
+                model_metrics,
+                gateway_inflight=self._pods_inflight(
+                    tuple(sorted(set(scraped) | set(per_pod))), int(window_end_ms) - int(window_start_ms)
+                ),
+            )
         if suffix_starts:
             model_metrics = replace(
                 model_metrics,
@@ -220,14 +240,21 @@ class MetricsStore:
         return model_metrics
 
     def _stale_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int]:
-        """The gateway's in-flight count of each scrape-stale pod (live instances: a
-        heartbeat inside one window). Read only when pods are stale; {} when the gateway
-        coordination keys cannot be read."""
+        """The gateway's in-flight count of each scrape-stale pod. Read only when pods
+        are stale; {} when it is unknown (no evidence: the frozen-scrape rescue stays off)."""
+        return self._pods_inflight(pods, window_ms) or {}
+
+    def _pods_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int] | None:
+        """pod -> routed, unfinished requests at the gateway, summed over the live
+        gateway instances (a heartbeat inside one window). None = unknown: the gateway
+        coordination keys cannot be read, or no gateway instance is live."""
         try:
             live = live_gateway_instances(self._redis, max_age_ms=max(1, int(window_ms)))
+            if not live:
+                return None
             return {pod: pod_inflight(self._redis, pod, live) for pod in pods}
-        except Exception:  # noqa: BLE001 - no evidence: the frozen-scrape rescue stays off
-            return {}
+        except Exception:  # noqa: BLE001 - unknown, never zero
+            return None
 
     def _suffix_starts(self, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
         """Gateway boundaries strictly inside an aligned window (O1 suffix starts);

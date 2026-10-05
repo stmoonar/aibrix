@@ -986,7 +986,10 @@ def test_idle_donor_after_its_own_scale_down_releases_the_rest_at_once():
                      rescue_due=True, fairness_due=False, cluster_view=_view(4, fetched_ms=base - 2_000),
                      signal_state=state)
     end = base + GRID
-    after = run_planner_tick(_snap(_window(end, [IDLE] * 3, routable=3)), queue=queue, registry=registry,
+    pods = frozenset(f"m-{i}" for i in range(4))
+    drained = replace(_window(end, [IDLE] * 3, routable=3), scrape_current_pods=pods,
+                      gateway_inflight=dict.fromkeys(pods, 0))
+    after = run_planner_tick(_snap(drained), queue=queue, registry=registry,
                              rescue_due=True, fairness_due=False, cluster_view=_view(3, fetched_ms=end + 3_000),
                              signal_state=state)
     ctx = after.model_contexts["m"]

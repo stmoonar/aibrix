@@ -117,6 +117,14 @@ class ModelWindowMetrics:
     #: ``scrape_stale_pods`` -> routed, unfinished requests on the pod (gateway in-flight
     #: mirror, live gateway instances only; ``tre_common.gateway_inflight``).
     scrape_stale_inflight: dict[str, int] = field(default_factory=dict, compare=False)
+    #: Review 2026-10-06 P2-2: pods whose newest successful gateway scrape
+    #: (``scraped_ms``) lies in the window's last grid ``[window_end - grid, window_end]``
+    #: (gateway clock). An idle window needs every serving pod here.
+    scrape_current_pods: frozenset[str] = field(default=frozenset(), compare=False)
+    #: P2-2: the gateway in-flight count of each pod with docs in the window (live
+    #: gateway instances; ``tre_common.gateway_inflight``), read only when the window has
+    #: no token and no running / waiting request. None = not read or unknown.
+    gateway_inflight: dict[str, int] | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

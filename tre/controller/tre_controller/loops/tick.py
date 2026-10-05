@@ -1309,13 +1309,15 @@ def _model_contexts(
             context["signal_hold_reason"] = "scrape_stale"
         else:
             # Q3 (2026-10-06): the whole current serving window is idle - tokens known
-            # and zero, no running / waiting request - with every serving pod scraped.
+            # and zero, no running / waiting request - with every serving pod scraped in
+            # the window's last grid and nothing in flight on it at the gateway (P2-2).
             # The same at any replica count: an IDLE model is exempt from the O1 donor
             # hold on it (planner). Never on a held or tokens-missing context.
             context["window_idle"] = bool(
                 tokens_available
                 and window_is_idle(metrics.prompt_tokens, metrics.generation_tokens)
                 and float(metrics.avg_running or 0.0) + float(metrics.avg_waiting or 0.0) <= 1e-9
+                and _serving_pods_drained(raw_metrics, routable_by_model, model_name)
             )
         if not tokens_available and stale_pods and scraper_alive:
             demand = _frozen_scrape_demand(raw_metrics, routable_by_model, model_name)
@@ -1411,6 +1413,21 @@ def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
         if binding.awake:
             counts[binding.model] += 1
     return counts
+
+
+def _serving_pods_drained(
+    metrics: ModelWindowMetrics, routable_by_model: dict[str, frozenset[str]] | None, model: str
+) -> bool:
+    """P2-2 (2026-10-06, I3): every serving pod's newest successful scrape lies in the
+    window's last grid (``scrape_current_pods``) and the gateway has no request in flight
+    on it (``gateway_inflight``). A pod scraped only earlier in the window, or an unknown
+    in-flight count, is not idle evidence. Without a fleet view the pods with valid
+    docs serve."""
+    serving = set(routable_by_model.get(model, ())) if routable_by_model is not None else set(metrics.per_pod or ())
+    inflight = getattr(metrics, "gateway_inflight", None)
+    if not serving or inflight is None or not serving <= set(getattr(metrics, "scrape_current_pods", ())):
+        return False
+    return all(inflight.get(pod) == 0 for pod in serving)
 
 
 def _frozen_scrape_demand(

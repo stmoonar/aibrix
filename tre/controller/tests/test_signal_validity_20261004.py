@@ -173,7 +173,7 @@ END = 1_000_000_000_000
 
 
 def _write_pod(redis, model: str, pod: str, *, gen_per_grid: float, running: float, waiting: float,
-               scraped_ms: int | None) -> None:
+               scraped_ms: int | None, prompt_per_grid: float = 500.0) -> None:
     """Gateway docs of one pod on the 10 s grid over (END - 40 s, END]; the counters grow
     by ``gen_per_grid`` per grid until ``scraped_ms`` (the last successful fetch), then
     repeat (a frozen scrape). ``scraped_ms`` None: written by an old gateway, fresh."""
@@ -185,7 +185,7 @@ def _write_pod(redis, model: str, pod: str, *, gen_per_grid: float, running: flo
             base["scraped_ms"] = min(scraped_ms, ts)
         n = 100 + 10 * frozen_at
         redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_histogram_metrics": {
-            f"{model}/request_prompt_tokens": {"sum": 50.0 * n, "count": n, "buckets": {"+Inf": n}},
+            f"{model}/request_prompt_tokens": {"sum": 5_000.0 + prompt_per_grid * frozen_at, "count": n, "buckets": {"+Inf": n}},
             f"{model}/request_generation_tokens": {"sum": gen_per_grid * frozen_at, "count": n, "buckets": {"+Inf": n}},
         }}, ts)
         redis.zadd(f"tre:v2:inst:default/{pod}", {**base, "model_metrics": {
@@ -332,3 +332,32 @@ def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
         assert result.model_contexts["m"]["saturation_reason"] == "scrape_stale_inflight"
     else:
         assert sum(deltas) == 0
+
+
+# ------------------------------------------ IDLE window evidence (2026-10-06 P2-2)
+
+
+@pytest.mark.parametrize("case", ["fresh_drained", "scrape_froze_early", "inflight", "no_live_gateway"])
+def test_an_idle_window_needs_a_last_grid_scrape_and_nothing_in_flight(case):
+    """P2-2: IDLE (whole-surplus release, O1 donor-hold exemption) needs every serving
+    pod scraped in the last grid of the window and zero gateway in-flight on it. A pod
+    whose scrape froze early in the window repeats zero-token docs while traffic
+    arrives; an in-flight request, or no live gateway instance (unknown), is not idle."""
+    redis = _Redis()
+    scraped = END - 25_000 if case == "scrape_froze_early" else END
+    _write_pod(redis, "m", "m-0", gen_per_grid=0, prompt_per_grid=0, running=0, waiting=0, scraped_ms=scraped)
+    if case != "no_live_gateway":
+        redis.instances = {"gw-live": redis.now_ms - 2_000}
+    redis.hashes[rediskeys.gw_inflight_key("m-0")] = {
+        "gw-live": json.dumps({"total": 3 if case in ("scrape_froze_early", "inflight") else 0, "ts": 1})
+    }
+    registry = _registry("m")
+    snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
+        END - 30_000, END, use_cache=False, start_exclusive=True
+    )
+    assert (snapshot.models["m"].prompt_tokens, snapshot.models["m"].generation_tokens) == (0.0, 0.0)
+    view = ClusterView(topology=registry.topology(),
+                       bindings=(Binding(serve_id="m-0", model="m", slot=Slot("n", (0,)), awake=True),))
+    result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
+                              cluster_view=view)
+    assert result.model_contexts["m"]["window_idle"] is (case == "fresh_drained")
