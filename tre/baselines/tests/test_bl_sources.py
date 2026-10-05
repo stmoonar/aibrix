@@ -334,3 +334,9 @@ def test_wakeable_slots_from_the_sm_gpu_view() -> None:
     assert wakeable_slots(state, "a") == 2
     assert wakeable_slots(state, "t") == 1          # TP=2: only (1,2) is fully free
     assert wakeable_slots({"bindings": state["bindings"]}, "a") is None  # no gpus[]: unknown
+
+
+def test_parse_event_stream_flag() -> None:
+    assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r", "stream": "false"}).stream is False
+    assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r", "stream": "true"}).stream is True
+    assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r"}).stream is None

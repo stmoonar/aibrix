@@ -218,6 +218,11 @@ class PreServePolicy:
         #: Cumulative anomaly counters (per model), for tests and the run summary.
         self.anomalies: dict[str, Counter] = {}
 
+    def counters(self) -> Mapping[str, Mapping[str, int]]:
+        """Cumulative anomaly counters per model (ft_without_arr, unknown_req, unknown_pod,
+        tier2_below_t1, ...), reported by the shell for per-run validity."""
+        return {m: dict(c) for m, c in self.anomalies.items()}
+
     # --------------------------------------------------------------- helpers
 
     def map_length(self, model: str) -> int:

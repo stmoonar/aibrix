@@ -165,6 +165,14 @@ def test_empty_window_is_idle_only_when_engines_are_idle():
     assert d.reason == "idle" and d.desired == 0
     d = p.decide(_snap(142_000, awake=3, busy=2.0))[M]      # tracked long requests still decoding
     assert (d.desired, d.reason) == (3, "empty_window_busy")
+    assert p.counters()[M]["empty_window_busy"] == 1            # reported per run
+
+
+def test_arrivals_without_an_input_count_count_like_estimates():
+    no_in = [_ev(99_000, tin=None) for _ in range(2)]
+    d = _policy().decide(_snap(100_000, no_in + [_ev(99_000) for _ in range(8)], awake=4))[M]
+    assert d.reason == "degraded_estimate_frac" and d.inputs["estimate_frac"] == 0.2
+    assert d.inputs["events"] == 8 and d.inputs["skipped_missing_in"] == 2
 
 
 def test_degraded_estimate_fraction():

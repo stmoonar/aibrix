@@ -178,7 +178,9 @@ def test_disable_copies_the_decision_logs_out_before_scaling(tmp_path) -> None:
     dest = tmp_path / "evidence"
     code, out = run(["disable", "--execute", "--collect-dir", str(dest), "--namespace", "ns1"], runner, redis)
     assert code == 0, out
-    get_pods, cp_a, cp_b, scale = runner.calls
+    get_pods, cp_a, cp_b = runner.calls[:3]
+    scale = runner.calls[-1]
+    assert (dest / "run_validity.json").is_file()  # written before the scale-down
     assert get_pods[:6] == ["kubectl", "-n", "ns1", "get", "pods", "-l"]
     assert get_pods[6] == "app.kubernetes.io/name=tre-v2-baseline-scaler"
     assert cp_a == ["kubectl", "cp", "ns1/scaler-a:/var/log/tre-baselines", str(dest / "scaler-a")]
@@ -205,7 +207,8 @@ def test_mark_replay_writes_the_marker_from_the_redis_clock() -> None:
                   FakeRunner(), redis)
     assert code == 0
     doc = json.loads(redis.kv[REPLAY_T0_KEY])
-    assert doc == {"t0_ms": 1_700_000_000_123, "trace_path": "traces/e1/trace.json", "seed": 11}
+    assert doc == {"t0_ms": 1_700_000_000_123, "trace_path": "traces/e1/trace.json", "seed": 11,
+                   "gw_bl_dropped0": 0.0}
     _, out = run(["mark-replay", "--trace", "x.json", "--seed", "1"], FakeRunner(), FakeRedis())
     assert REPLAY_T0_KEY in out and "<redis TIME ms>" in out
 
@@ -223,3 +226,43 @@ def test_kubectl_redis_backend_uses_redis_cli_exec() -> None:
     r.set("k", '{"a": 1}')
     assert calls[0][:8] == ["kubectl", "-n", "ns9", "exec", "deploy/redis-x", "--", "redis-cli", "--raw"]
     assert calls[2][-3:] == ["SET", "k", '{"a": 1}']
+
+
+class MetricsRunner(FakeRunner):
+    """Gateway plugin pods export the dropped-event counter; the scaler its counters."""
+
+    def __init__(self, dropped, **kw):
+        super().__init__(**kw)
+        self.dropped = dropped
+
+    def __call__(self, argv):
+        argv = list(argv)
+        if argv[1:3] == ["get", "--raw"]:
+            self.calls.append(argv)
+            path = argv[3]
+            if "gw-" in path:
+                return RunResult(0, f'tre_gateway_bl_req_events_dropped_total{{reason="buffer_full"}} {self.dropped}\n')
+            return RunResult(0, 'tre_bl_arrivals_total{policy="preserve",model="m"} 40\n'
+                                'tre_bl_nonstream_arrivals_total{policy="preserve",model="m"} 0\n'
+                                'tre_bl_policy_events_total{policy="preserve",model="m",name="ft_without_arr"} 3\n'
+                                'tre_bl_sm_dropped_total{policy="preserve"} 1\n')
+        if argv[3:5] == ["get", "pods"] and "app=tre-gateway-plugins" in argv:
+            self.calls.append(argv)
+            return RunResult(0, "gw-1 gw-2")
+        return super().__call__(argv)
+
+
+def test_run_validity_reports_gateway_drops_since_the_marker_and_policy_counters(tmp_path) -> None:
+    """P2-7: per-run validity lands in the collect dir with the decision logs."""
+    redis = FakeRedis({OWNER_KEY: "tok"})
+    code, _ = run(["mark-replay", "--trace", "t.json", "--seed", "1", "--execute"],
+                  MetricsRunner(3, redis=redis), redis)
+    assert code == 0 and json.loads(redis.kv[REPLAY_T0_KEY])["gw_bl_dropped0"] == 6.0  # 2 pods x 3
+    dest = tmp_path / "c"
+    code, out = run(["disable", "--execute", "--collect-dir", str(dest)], MetricsRunner(4, redis=redis), redis)
+    assert code == 0, out
+    doc = json.loads((dest / "run_validity.json").read_text())
+    assert doc["gw_bl_dropped_delta"] == 2.0 and doc["events_valid"] is False
+    assert doc["arrivals"] == {"m": {"arrivals": 40.0, "nonstream_arrivals": 0.0}}
+    assert doc["policy_events"] == {"m": {"ft_without_arr": 3.0}} and doc["sm"]["tre_bl_sm_dropped_total"] == 1.0
+    assert (dest / "tre-v2-baseline-scaler-abc12.metrics.txt").is_file()

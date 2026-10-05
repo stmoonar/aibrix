@@ -230,6 +230,11 @@ def _opt_str(value: Any) -> Optional[str]:
     return text if text != "" else None
 
 
+def _opt_bool(value: Any) -> Optional[bool]:
+    text = str(_decode(value)).strip().lower() if value is not None else ""
+    return True if text in {"true", "1"} else False if text in {"false", "0"} else None
+
+
 def _decode(value: Any) -> Any:
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
 
@@ -256,6 +261,7 @@ def parse_event(model: str, entry_id: Any, fields: Mapping[Any, Any]) -> Optiona
         status=_opt_str(data.get("status")),
         reissue=reissue,
         entry_id=entry_id,
+        stream=_opt_bool(data.get("stream")),
     )
 
 

@@ -21,7 +21,16 @@ Without ``--execute`` nothing is contacted: the tool prints the commands it woul
   lines are also in the Redis stream ``tre:v2:bl:decisions``, which additionally holds
   the few ticks between the copy and the shutdown). A failed copy aborts before scaling.
 * ``mark-replay`` writes ``tre:v2:bl:replay_t0`` = ``{"t0_ms": <Redis TIME>, "trace_path",
-  "seed"}``.
+  "seed", "gw_bl_dropped0"}``; the last is the gateway plugins' summed
+  ``tre_gateway_bl_req_events_dropped_total`` at that moment (null when unreadable).
+* Per-run validity: with a collect dir, ``disable`` also writes ``run_validity.json`` (and
+  the raw ``<pod>.metrics.txt`` of the scaler) before scaling down: the gateway's dropped
+  request events since the replay marker (``gw_bl_dropped_delta``; any value > 0, a
+  negative one (plugin restart) or null makes the run's event evidence suspect), the
+  shell's arrivals / non-streaming arrivals per model, SM calls dropped / refused, and the
+  policy's per-model counters (``ft_without_arr``, ``unknown_req``, ``unknown_pod``,
+  ``tier2_below_t1``, ``empty_window_busy``, ...). Metrics are read through the API server
+  proxy (``kubectl get --raw .../pods/<pod>:<port>/proxy/metrics``), read only.
 
 Everything that touches the cluster goes through an injectable ``runner`` (``kubectl``)
 and a ``RedisOps`` object, so tests use fakes. Redis is reached directly through
@@ -288,6 +297,7 @@ def cmd_disable(env: Env, a: argparse.Namespace) -> int:
                            "emptyDir and are lost with the pod); pass --skip-collect to scale down without "
                            "copying them", EXIT_REFUSED)
         collect_logs(env, a)
+        collect_validity(env, a)
     _step(env, scale)
     _poll(env, f"owner lock {OWNER_KEY} to disappear", lambda: not env.redis.get(OWNER_KEY),
           a.timeout_s, a.interval_s)
@@ -295,18 +305,115 @@ def cmd_disable(env: Env, a: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def replay_marker(t0_ms: int, trace: str, seed: int) -> str:
-    return json.dumps({"t0_ms": int(t0_ms), "trace_path": trace, "seed": int(seed)}, sort_keys=True)
+def replay_marker(t0_ms: int, trace: str, seed: int, gw_dropped0: Optional[float] = None) -> str:
+    return json.dumps({"t0_ms": int(t0_ms), "trace_path": trace, "seed": int(seed),
+                       "gw_bl_dropped0": gw_dropped0}, sort_keys=True)
+
+
+# ------------------------------------------------------------------ per-run validity
+
+GW_DROPPED = "tre_gateway_bl_req_events_dropped_total"
+
+
+def _proxy_metrics_argv(env: Env, ns: str, pod: str, port: int) -> list[str]:
+    return [env.kubectl, "get", "--raw", f"/api/v1/namespaces/{ns}/pods/{pod}:{port}/proxy/metrics"]
+
+
+def _pods_argv(env: Env, ns: str, selector: str) -> list[str]:
+    return [env.kubectl, "-n", ns, "get", "pods", "-l", selector, "-o", "jsonpath={.items[*].metadata.name}"]
+
+
+def _samples(text: str):
+    from tre_baselines.sources import parse_prometheus_text
+
+    return parse_prometheus_text(text)
+
+
+def gateway_bl_dropped(env: Env, a: argparse.Namespace) -> Optional[float]:
+    """Summed ``tre_gateway_bl_req_events_dropped_total`` over the gateway plugin pods;
+    None when any pod cannot be read (unknown, not 0)."""
+    res = env.runner(_pods_argv(env, a.gw_namespace, a.gw_selector))
+    pods = res.stdout.split() if res.returncode == 0 else []
+    if not pods:
+        return None
+    total = 0.0
+    for pod in pods:
+        res = env.runner(_proxy_metrics_argv(env, a.gw_namespace, pod, a.gw_metrics_port))
+        if res.returncode != 0:
+            return None
+        total += sum(s.value for s in _samples(res.stdout) if s.name == GW_DROPPED)
+    return total
+
+
+def run_validity(shell_metrics: dict[str, str], marker: Optional[dict], gw_now: Optional[float]) -> dict:
+    """The per-run validity record from the scaler pods' ``/metrics`` and the gateway."""
+    by_model: dict[str, dict[str, float]] = {}
+    policy_events: dict[str, dict[str, float]] = {}
+    totals: dict[str, float] = {}
+    for text in shell_metrics.values():
+        for smp in _samples(text):
+            model = smp.labels.get("model")
+            if smp.name in ("tre_bl_arrivals_total", "tre_bl_nonstream_arrivals_total") and model:
+                key = smp.name[len("tre_bl_"):-len("_total")]
+                by_model.setdefault(model, {})[key] = by_model.get(model, {}).get(key, 0) + smp.value
+            elif smp.name == "tre_bl_policy_events_total" and model:
+                name = smp.labels.get("name", "?")
+                policy_events.setdefault(model, {})[name] = policy_events.get(model, {}).get(name, 0) + smp.value
+            elif smp.name in ("tre_bl_sm_calls_total", "tre_bl_sm_failures_total", "tre_bl_sm_dropped_total"):
+                totals[smp.name] = totals.get(smp.name, 0) + smp.value
+    gw0 = (marker or {}).get("gw_bl_dropped0")
+    delta = None if gw0 is None or gw_now is None else gw_now - float(gw0)
+    return {
+        "replay_marker": marker,
+        "gw_bl_dropped_t0": gw0,
+        "gw_bl_dropped_end": gw_now,
+        "gw_bl_dropped_delta": delta,
+        "events_valid": delta == 0,
+        "arrivals": by_model,
+        "policy_events": policy_events,
+        "sm": totals,
+    }
+
+
+def collect_validity(env: Env, a: argparse.Namespace) -> str:
+    """Write ``run_validity.json`` (+ raw scaler metrics) into the collect dir."""
+    pods = _step(env, _list_pods_argv(env, a)).stdout.split()
+    os.makedirs(a.collect_dir, exist_ok=True)
+    metrics: dict[str, str] = {}
+    for pod in pods:
+        res = env.runner(_proxy_metrics_argv(env, a.namespace, pod, a.http_port))
+        if res.returncode == 0:
+            metrics[pod] = res.stdout
+            with open(os.path.join(a.collect_dir, f"{pod}.metrics.txt"), "w", encoding="utf-8") as fh:
+                fh.write(res.stdout)
+        else:
+            env.say(f"# warning: cannot read /metrics of {pod}: {res.stderr.strip()}")
+    raw = env.redis.get(REPLAY_T0_KEY)
+    try:
+        marker = json.loads(raw) if raw else None
+    except ValueError:
+        marker = None
+    doc = run_validity(metrics, marker, gateway_bl_dropped(env, a))
+    path = os.path.join(a.collect_dir, "run_validity.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+    env.say(f"run validity -> {path} (gw_bl_dropped_delta={doc['gw_bl_dropped_delta']})")
+    return path
 
 
 def cmd_mark_replay(env: Env, a: argparse.Namespace) -> int:
     if not a.execute:
         env.say("# dry print (nothing executed); add --execute to run")
+        env.say(f"# gateway dropped events now: {_cmd(_pods_argv(env, a.gw_namespace, a.gw_selector))}, then "
+                f"{_cmd(_proxy_metrics_argv(env, a.gw_namespace, '<pod>', a.gw_metrics_port))}")
         env.say(f"# t0_ms = Redis TIME (ms) at execution; SET {REPLAY_T0_KEY} to:")
         env.say(replay_marker(0, a.trace, a.seed).replace('"t0_ms": 0', '"t0_ms": <redis TIME ms>'))
         return EXIT_OK
+    gw0 = gateway_bl_dropped(env, a)
+    if gw0 is None:
+        env.say("# warning: gateway dropped-event counter unreadable; the run's event validity is unknown")
     t0 = env.redis.time_ms()
-    value = replay_marker(t0, a.trace, a.seed)
+    value = replay_marker(t0, a.trace, a.seed, gw0)
     env.redis.set(REPLAY_T0_KEY, value)
     env.say(f"{REPLAY_T0_KEY} = {value}")
     return EXIT_OK
@@ -325,6 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="direct Redis URL (default env TRE_REDIS_URL; else kubectl exec into --redis-deploy)")
     common.add_argument("--redis-deploy", default="tre-v2-redis")
     common.add_argument("--execute", action="store_true", help="run the commands (default: print only)")
+    common.add_argument("--gw-namespace", default="tre-v2", help="namespace of the gateway plugin pods")
+    common.add_argument("--gw-selector", default="app=tre-gateway-plugins", help="label selector of the plugins")
+    common.add_argument("--gw-metrics-port", type=int, default=8080, help="the plugins' /metrics port")
     common.add_argument("--timeout-s", type=float, default=120.0)
     common.add_argument("--interval-s", type=float, default=2.0)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -340,6 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
     dis.add_argument("--skip-collect", action="store_true",
                      help="scale down without copying the decision logs (they remain in the Redis stream)")
     dis.add_argument("--log-dir", default="/var/log/tre-baselines", help="TRE_BL_LOG_DIR inside the pod")
+    dis.add_argument("--http-port", type=int, default=8080, help="the scaler's /metrics port")
     dis.add_argument("--selector", default=None,
                      help="label selector of the scaler pods (default app.kubernetes.io/name=<deployment>)")
     mk = sub.add_parser("mark-replay", parents=[common], help=f"write {REPLAY_T0_KEY}")

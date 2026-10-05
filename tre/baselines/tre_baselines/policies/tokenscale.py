@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Deque, Mapping, Optional
 
@@ -200,6 +200,19 @@ class TokenScalePolicy:
         self._last_arr_ms: dict[str, int] = {}
         self._skipped_reissue: dict[str, int] = {m: 0 for m in managed}
         self._skipped_missing_in: dict[str, int] = {m: 0 for m in managed}
+        #: Arrival times (window) of events without in_tokens: no lambda contribution, but
+        #: they count like estimates toward ``max_estimate_frac``.
+        self._missing_in: dict[str, Deque[int]] = {m: deque() for m in managed}
+        #: Cumulative per-model counters reported by the shell (``counters()``).
+        self._counts: dict[str, Counter] = {m: Counter() for m in managed}
+
+    def counters(self) -> Mapping[str, Mapping[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for m in self._managed:
+            c = dict(self._counts[m])
+            c.update(skipped_reissue=self._skipped_reissue[m], skipped_missing_in=self._skipped_missing_in[m])
+            out[m] = c
+        return out
 
     def _ingest(self, model: str, ms: ModelSnapshot) -> tuple[int, int, int]:
         """Add new arrivals; returns (new_events, missing_out, misbucketed) of this tick."""
@@ -216,6 +229,7 @@ class TokenScalePolicy:
                 continue
             if ev.in_tokens is None:
                 self._skipped_missing_in[model] += 1
+                self._missing_in[model].append(int(ev.ts_ms))
                 continue
             if ev.max_tokens is None:
                 out_len = self.default_out_tokens
@@ -246,6 +260,9 @@ class TokenScalePolicy:
         cutoff = now_ms - self.window_s * 1000.0
         while win and win[0].ts_ms <= cutoff:
             win.popleft()
+        missing_in = self._missing_in[model]
+        while missing_in and missing_in[0] <= cutoff:
+            missing_in.popleft()
         grid, v_p = self._vel[model]
         lam = [[0.0] * N_OUT for _ in range(N_IN)]
         in_sum = 0
@@ -259,7 +276,9 @@ class TokenScalePolicy:
         lam_in = in_sum / w
         term_b = sum(lam[i][j] / grid[i][j] for i in range(N_IN) for j in range(N_OUT))
         term_p = lam_in / v_p
-        est_frac = (n_est / len(win)) if win else 0.0
+        # an arrival without an input count is no better than an estimate
+        n_all = len(win) + len(missing_in)
+        est_frac = ((n_est + len(missing_in)) / n_all) if n_all else 0.0
         inputs: dict[str, Any] = {
             "lambda_b": {f"{i}{j}": round(lam[i][j], 3) for i in range(N_IN) for j in range(N_OUT)},
             "lambda_in": round(lam_in, 3),
@@ -280,6 +299,7 @@ class TokenScalePolicy:
             inputs["newest_event_age_s"] = round((now_ms - last) / 1000.0, 1)
         gaps = evidence_gaps(ms, now_ms, tick_s, events=True, history_s=self.window_s)
         if est_frac > self.max_estimate_frac:
+            self._counts[model]["degraded_estimate_frac"] += 1
             return Decision(ms.awake, "degraded_estimate_frac", inputs)
         if not win:
             # An empty window alone is unknown, not idle: 0 only on complete evidence with
@@ -287,6 +307,9 @@ class TokenScalePolicy:
             if gaps:
                 return Decision(ms.awake, INCOMPLETE, {**inputs, "gaps": list(gaps)})
             if not ms.pods or any(p.queued for p in ms.pods):
+                # engines still busy: the state equivalent of the paper's drain before a
+                # pod is deleted (decision 2026-10-06); counted and reported
+                self._counts[model]["empty_window_busy"] += 1
                 return Decision(ms.awake, "empty_window_busy", inputs)
             return Decision(0, "idle", inputs)
         desired = math.ceil(max(term_b, term_p) - 1e-9)

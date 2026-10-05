@@ -10,7 +10,7 @@ import redis as redis_lib
 from tre_baselines.config import load_config
 from tre_baselines.loop import BaselineShell, DecisionLog, OwnerLock, make_http_server
 from tre_baselines.policies import build_policy
-from tre_baselines.sm_client import ACTOR, Dispatcher, SMClient
+from tre_baselines.sm_client import Dispatcher, SMClient
 from tre_baselines.sources import K8sPodLister, LiveSource
 
 LOG = logging.getLogger("tre_baselines")
@@ -20,12 +20,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     config = load_config()
     redis = redis_lib.Redis.from_url(config.redis_url, decode_responses=True, socket_timeout=5.0)
+    policy = build_policy(config.policy, config)
+    # x-tre-actor (recorded by the SM with every operation it starts): reports can tell a
+    # baseline's sleeps on the shared abort path from the TRE controller's.
     sm = SMClient(config.sm_url, timeout_s=config.sm_timeout_s, state_timeout_s=config.sm_state_timeout_s,
-                  actor=f"{ACTOR}/{config.policy}")
+                  actor=f"baseline-{getattr(policy, 'label', config.policy)}")
     pods = K8sPodLister(config.model_namespace, port_override=config.metrics_port)
     source = LiveSource(config, redis, sm.get_state, pods.list_routable)
     dispatcher = Dispatcher(sm.put_target, abort_sleep_path=config.abort_sleep_path)
-    policy = build_policy(config.policy, config)
     lock = OwnerLock(redis, config.lock_ttl_s)
     shell = BaselineShell(config, source, policy, dispatcher, redis, lock=lock,
                           decision_log=DecisionLog(config.log_dir, config.policy))

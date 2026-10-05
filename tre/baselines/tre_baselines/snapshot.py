@@ -105,6 +105,8 @@ class RequestEvent:
     status: Optional[str]
     #: "none" | "continued" | "retried" (a reissued request; policies usually skip it).
     reissue: str = "none"
+    #: ``arr`` only: whether the request streams (None = not reported).
+    stream: Optional[bool] = None
     #: The stream entry ID, kept for tie-breaking and debugging.
     entry_id: str = ""
 

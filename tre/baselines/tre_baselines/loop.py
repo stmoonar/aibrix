@@ -161,6 +161,11 @@ class ShellStats:
     controller_guard: bool = False
     guard_ticks: int = 0
     backoff_skips: int = 0
+    #: arr events per model whose request does not stream (expected 0: PreServe's map
+    #: needs ft, which a non-streaming request only gets at the end).
+    nonstream_arrivals: dict[str, int] = field(default_factory=dict)
+    #: arr events per model.
+    arrivals: dict[str, int] = field(default_factory=dict)
 
 
 class DecisionLog:
@@ -291,6 +296,13 @@ class BaselineShell:
                 self.backoff.failed(model, snap.now_ms, done.result.retry_after_s)
                 if done.result.code is not None:  # an SM answer, not a transport error
                     self._refused.add(model)
+        with self._stats_lock:
+            for model, ms in snap.models.items():
+                for ev in ms.events:
+                    if ev.kind == "arr":
+                        self.stats.arrivals[model] = self.stats.arrivals.get(model, 0) + 1
+                        if ev.stream is False:
+                            self.stats.nonstream_arrivals[model] = self.stats.nonstream_arrivals.get(model, 0) + 1
         decisions: Mapping[str, Decision] = self.policy.decide(snap) or {}
 
         needs_events = bool(getattr(self.policy, "needs_events", False))
@@ -473,6 +485,16 @@ class BaselineShell:
         with self._stats_lock:
             return self.stats.consecutive_failures < int(self.config.max_tick_failures)
 
+    def policy_counters(self) -> Mapping[str, Mapping[str, int]]:
+        """The policy's cumulative per-model counters (anomalies, tier2_below_t1,
+        empty_window_busy, ...); empty when the policy has none."""
+        fn = getattr(self.policy, "counters", None)
+        try:
+            return dict(fn()) if callable(fn) else {}
+        except Exception as exc:  # reporting must never break the loop
+            LOG.warning("policy counters failed: %s", exc)
+            return {}
+
     def health_doc(self) -> dict:
         with self._stats_lock:
             s = self.stats
@@ -533,6 +555,16 @@ class BaselineShell:
             lines.append("# TYPE tre_bl_direction_reversals_60s_total counter")
             for model, count in sorted(s.reversals.items()):
                 lines.append(f'tre_bl_direction_reversals_60s_total{{policy="{policy}",model="{model}"}} {count}')
+            lines.append("# TYPE tre_bl_arrivals_total counter")
+            for model, count in sorted(s.arrivals.items()):
+                lines.append(f'tre_bl_arrivals_total{{policy="{policy}",model="{model}"}} {count}')
+            lines.append("# TYPE tre_bl_nonstream_arrivals_total counter")
+            for model, count in sorted(s.nonstream_arrivals.items()):
+                lines.append(f'tre_bl_nonstream_arrivals_total{{policy="{policy}",model="{model}"}} {count}')
+            lines.append("# TYPE tre_bl_policy_events_total counter")
+            for model, counts in sorted(self.policy_counters().items()):
+                for name, count in sorted(counts.items()):
+                    lines.append(f'tre_bl_policy_events_total{{policy="{policy}",model="{model}",name="{name}"}} {count}')
             lines.append("# TYPE tre_bl_event_lag_seconds gauge")
             for model, lag in sorted(s.event_lag_s.items()):
                 lines.append(f'tre_bl_event_lag_seconds{{policy="{policy}",model="{model}"}} {lag:.3f}')
