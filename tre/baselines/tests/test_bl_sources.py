@@ -216,3 +216,74 @@ def test_live_source_bad_state_raises(tmp_path) -> None:
     with pytest.raises(ValueError):
         source.gather()
     source.close()
+
+
+def _metrics(running, waiting=0.0) -> str:
+    return (f'vllm:num_requests_running{{model_name="m"}} {running}\n'
+            f'vllm:num_requests_waiting{{model_name="m"}} {waiting}\n')
+
+
+def test_missing_gauges_are_unknown_not_zero() -> None:
+    snap = pod_snapshot_from_metrics('vllm:generation_tokens_total{model_name="m"} 5\n'
+                                     'vllm:num_requests_waiting{model_name="m"} NaN\n',
+                                     pod="p", model="m", node=None, gpu_ids=(), scraped_at_ms=0)
+    assert snap.running is None and snap.waiting is None and snap.queued is None
+
+
+ONE_POD = {"version": 1, "models": {"m": {"awake": 1, "bound": 1}},
+           "bindings": [{"serve_id": "m-a", "model": "m", "node": "n", "gpu_ids": [0], "awake": True}]}
+
+
+def test_event_gap_cohort_blocks_scale_down_until_drained(tmp_path) -> None:
+    """Shell start / lost events: requests the engine runs but the stream never showed
+    are the cohort; scale-down evidence is incomplete until they are gone (state, not time)."""
+    from tre_baselines.snapshot import evidence_gaps
+
+    config = make_config(tmp_path, {"m": limits("m")})
+    redis = FakeRedis(now_ms=100_000)
+    engine = {"q": 2}  # two requests in flight before the shell started
+    source = LiveSource(config, redis, lambda: ONE_POD,
+                        lambda: [PodEndpoint("m-a", "m", "10.0.0.1", 8000, True)],
+                        fetch_text=lambda u, t: _metrics(engine["q"]))
+    key = req_stream_key("m")
+
+    def gaps():
+        snap = source.gather()
+        redis.advance(2000)
+        return evidence_gaps(snap.models["m"], snap.now_ms, 2.0, events=True)
+
+    assert "event_gap" in gaps()                         # cohort of 2, nothing tracked
+    redis.xadd(key, {"kind": "arr", "req_id": "new", "pod": "m-a"})
+    engine["q"] = 3                                      # cohort still running + the new one
+    assert "event_gap" in gaps()
+    engine["q"] = 1                                      # cohort drained, "new" is tracked
+    assert gaps() == ()
+    redis.xadd(key, {"kind": "done", "req_id": "new", "pod": "m-a"})
+    assert gaps() == ()                                  # verified until the next gap
+    # the stream is trimmed past the cursor: a new cohort, unverified again
+    for i in range(3):
+        redis.advance(1)
+        redis.xadd(key, {"kind": "arr", "req_id": f"lost{i}", "pod": "m-a"})
+    redis.streams[key] = redis.streams[key][-1:]
+    engine["q"] = 3
+    assert "event_gap" in gaps()
+    engine["q"] = 0                                      # an idle engine has nothing unknown
+    assert "event_gap" not in gaps()
+    source.close()
+
+
+def test_trimmed_stream_restarts_the_event_history(tmp_path) -> None:
+    redis = FakeRedis(now_ms=10_000)
+    key = req_stream_key("m")
+    reader = EventReader(redis, ["m"])
+    redis.xadd(key, {"kind": "arr", "req_id": "a", "pod": "p"})
+    redis.advance(1)
+    reader.read(redis.now_ms)
+    assert reader.history_since_ms("m") == 10_001                 # shell start
+    redis.advance(5000)
+    for i in range(3):
+        redis.advance(1)
+        redis.xadd(key, {"kind": "arr", "req_id": f"b{i}", "pod": "p"})
+    redis.streams[key] = redis.streams[key][-1:]          # MAXLEN trimmed past our cursor
+    reader.read(redis.now_ms)
+    assert reader.history_since_ms("m") == redis.now_ms and reader.gaps["m"] == 1

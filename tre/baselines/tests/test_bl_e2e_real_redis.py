@@ -79,7 +79,7 @@ def _clean(r) -> None:
 @dataclass(frozen=True)
 class Load:
     rps: float   # request arrivals per second (events)
-    conc: float  # requests in flight over all pods of the model (engine gauges)
+    conc: float  # mean requests in flight over all pods: each request lasts conc / rps s
 
 
 LOW = Load(0.5, 0.3)
@@ -113,6 +113,9 @@ class World:
         self.load = {m: LOW for m in models}
         self.version = 1
         self.counters = {(m, i): Counters() for m in models for i in range(max_pods)}
+        #: Requests in each engine: between their arr and done events (EventGen), so the
+        #: gauges and the event stream describe the same requests.
+        self.inflight: dict[str, int] = {}
 
     @staticmethod
     def pod_name(model: str, i: int) -> str:
@@ -144,8 +147,8 @@ class World:
         with self.lock:
             if i >= self.awake[model]:
                 return 0.0, 0.0
-            per_pod = self.load[model].conc / self.awake[model]
-            return min(per_pod, self.CAP), max(0.0, per_pod - self.CAP)
+            n = float(self.inflight.get(self.pod_name(model, i), 0))
+            return min(n, self.CAP), max(0.0, n - self.CAP)
 
     def step(self, dt: float) -> None:
         with self.lock:
@@ -272,7 +275,8 @@ def _go_values(kind: str, n: int, common: dict) -> dict[str, str]:
 
 class EventGen(threading.Thread):
     """Poisson-free (fixed interval) arrivals per model at the phase's rps; each request
-    writes arr now, ft 0.1 s later, done 0.4 s later, on a pod that is awake."""
+    writes arr now, ft 0.1 s later and done ``conc / rps`` s later, on a pod that is
+    awake, and is in that pod's engine from its arr to its done."""
 
     def __init__(self, redis, world: World) -> None:
         super().__init__(daemon=True)
@@ -301,11 +305,15 @@ class EventGen(threading.Thread):
                     self._n += 1
                     n, pod = self._n, pods[self._n % len(pods)]
                     req = f"{m}-req-{n}"
-                    for delay, kind in ((0.0, "arr"), (0.1, "ft"), (0.4, "done")):
+                    life = max(0.2, w.load[m].conc / w.load[m].rps)
+                    for delay, kind in ((0.0, "arr"), (0.1, "ft"), (life, "done")):
                         due.append((now + delay, req_stream_key(m), go_event(kind, n, req, pod)))
             due.sort(key=lambda d: d[0])
             while due and due[0][0] <= now:
                 _, key, fields = due.pop(0)
+                delta = {"arr": 1, "done": -1}.get(fields["kind"], 0)
+                with w.lock:  # the engine sees the request exactly while its events say so
+                    w.inflight[fields["pod"]] = w.inflight.get(fields["pod"], 0) + delta
                 self._redis.xadd(key, fields)
                 self.written[fields["kind"]] += 1
             time.sleep(0.005)

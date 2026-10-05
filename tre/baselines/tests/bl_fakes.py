@@ -90,6 +90,10 @@ class FakeRedis:
         ms, _, seq = entry_id.partition("-")
         return int(ms), int(seq or 0)
 
+    def xrange(self, key, min="-", max="+", count=None):
+        entries = list(self.streams.get(key, []))
+        return entries[:count] if count is not None else entries
+
     def xread(self, streams: Mapping[str, str], count: Optional[int] = None, block=None):
         out = []
         for key, cursor in streams.items():

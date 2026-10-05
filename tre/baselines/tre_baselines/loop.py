@@ -9,6 +9,11 @@
   is ``observe`` (or the read fails) the tick is dry-run and every would-be SM call is
   logged as ``guard_controller_active`` (metric ``tre_bl_controller_guard``), so the TRE
   controller and a baseline never scale the same models.
+* Unknown is not idle (backstop): a scale-down is held at ``awake`` (reason
+  ``incomplete``, the policy's own reason in ``inputs.policy_reason``) whenever
+  :func:`~tre_baselines.snapshot.evidence_gaps` lists a gap for the model (with the
+  policy's ``needs_events`` / ``event_history_s``). The policies apply the same gate
+  themselves; this one covers any policy that does not.
 * The dispatcher is asynchronous: a model whose previous SM call is still running gets
   ``inflight_skip`` (not queued); the tick never waits for the SM.
 * No arbiter in the MVP: scale-downs are submitted before scale-ups in the same tick and
@@ -48,9 +53,9 @@ from tre_baselines.keys import (
     OWNER_KEY,
     decision_key,
 )
-from tre_baselines.policies.base import Decision
+from tre_baselines.policies.base import INCOMPLETE, Decision
 from tre_baselines.sm_client import Backoff, Completed, Dispatcher
-from tre_baselines.snapshot import ClusterSnapshot
+from tre_baselines.snapshot import ClusterSnapshot, evidence_gaps
 
 LOG = logging.getLogger(__name__)
 
@@ -229,17 +234,24 @@ class BaselineShell:
                 self.backoff.failed(model, snap.now_ms, done.result.retry_after_s)
         decisions: Mapping[str, Decision] = self.policy.decide(snap) or {}
 
+        needs_events = bool(getattr(self.policy, "needs_events", False))
+        history_s = float(getattr(self.policy, "event_history_s", 0.0) or 0.0)
         planned: list[dict] = []
         for model, ms in snap.models.items():
             decision = decisions.get(model)
             raw = None if decision is None else int(decision.desired)
             clamped = ms.awake if raw is None else clamp(raw, ms.min_replicas, ms.max_replicas)
+            reason = "no_decision" if decision is None else decision.reason
+            inputs = {} if decision is None else dict(decision.inputs)
+            if clamped < ms.awake:
+                gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s, events=needs_events, history_s=history_s)
+                if gaps:  # backstop: never scale down on incomplete evidence
+                    inputs.update(gaps=list(gaps), policy_reason=reason, policy_clamped=clamped)
+                    clamped, reason = ms.awake, INCOMPLETE
             direction = "up" if clamped > ms.awake else "down" if clamped < ms.awake else "none"
             planned.append({
                 "model": model, "awake": ms.awake, "raw_desired": raw, "clamped": clamped,
-                "direction": direction,
-                "reason": "no_decision" if decision is None else decision.reason,
-                "inputs": {} if decision is None else dict(decision.inputs),
+                "direction": direction, "reason": reason, "inputs": inputs,
             })
         order = {"down": 0, "up": 1, "none": 2}
         planned.sort(key=lambda p: (order[p["direction"]], p["model"]))

@@ -19,11 +19,17 @@ Rules:
   returned mapping is left alone this tick (logged as action ``none``).
 * The shell may skip actuation (dry-run, SM call already in flight for the model, not the
   lock owner); the policy is not told, and sees the real ``awake`` again next tick.
+* Unknown is not idle: a policy never returns ``desired < awake`` while
+  :func:`tre_baselines.snapshot.evidence_gaps` lists a gap (use :func:`hold_if_incomplete`;
+  reason ``incomplete``); a scale-up may use whatever evidence there is. A policy that
+  reads the request-event stream sets ``needs_events = True`` (and ``event_history_s``
+  when it needs that much gap-free history); the shell applies the same gate to every
+  decision as a backstop.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from tre_baselines.snapshot import ClusterSnapshot
 
@@ -43,3 +49,18 @@ class Policy(Protocol):
     name: str
 
     def decide(self, snap: ClusterSnapshot) -> Mapping[str, Decision]: ...
+
+
+INCOMPLETE = "incomplete"
+
+
+def hold_if_incomplete(decision: Decision, awake: int, gaps: Sequence[str]) -> Decision:
+    """``decision`` unless it scales down on incomplete evidence: then hold at ``awake``
+    (reason ``incomplete``; the policy's own target and reason stay in the inputs)."""
+    if not gaps:
+        return decision
+    inputs = {**decision.inputs, "gaps": list(gaps)}
+    if decision.desired >= awake:
+        return Decision(decision.desired, decision.reason, inputs)
+    inputs.update(policy_reason=decision.reason, policy_desired=int(decision.desired))
+    return Decision(int(awake), INCOMPLETE, inputs)

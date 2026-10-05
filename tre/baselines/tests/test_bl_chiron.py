@@ -172,6 +172,20 @@ def test_theta_per_model_and_default():
     assert d.desired == 6
 
 
+def test_unknown_is_not_idle_no_scale_down():
+    # Review repro: awake 3, the busy pod is unscraped, the two scraped ones idle -> was 1.
+    pol = dict(busy_def="nonidle", theta={"*": 1 / 3})
+    d = one(policy(**pol), snap([pod("p0", 0, 0, 0, 0), pod("p1", 0, 0, 0, 0)], awake=3, unscraped=("p2",)))
+    assert (d.desired, d.reason) == (3, "incomplete") and d.inputs["policy_desired"] == 1
+    # a missing running/waiting gauge is unknown, not 0
+    d = one(policy(**pol), snap([pod("p0", 0, 0, 0, 0, running=None), pod("p1", 0, 0, 0, 0)], awake=2))
+    assert (d.desired, d.reason) == (2, "incomplete") and "missing_gauges" in d.inputs["gaps"]
+    # scale-up still uses the evidence there is: 2 known busy pods at 1/3 -> 6
+    d = one(policy(**pol), snap([pod("p0", 0, 0, 0, 0, running=1), pod("p1", 0, 0, 0, 0, running=1)],
+                           awake=3, unscraped=("p2",)))
+    assert d.desired == 6 and d.reason == "ibp_target"
+
+
 def test_exact_multiples_do_not_round_up():
     for theta in (1 / 3, 0.3333333333, 0.25, 0.2, 0.5):
         pol = policy(busy_def="nonidle", theta={"*": theta})

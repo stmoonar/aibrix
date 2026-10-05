@@ -26,6 +26,10 @@ b_max           None         ours: cap on B = b_max, else max_num_seqs, else 256
 busy_def        at_cap       ours (D11): at_cap (running+waiting >= B) | nonidle (running > 0)
 theta           {"*": 1/3}   paper's 3x example as the default; per model via chiron_theta
 ==============  ===========  ==============================================================
+
+Unknown is not idle: a pod with a missing gauge is never counted busy (scale-up uses the
+evidence there is) and any gap (:func:`~tre_baselines.snapshot.evidence_gaps`) holds a
+scale-down at ``awake`` (reason ``incomplete``).
 """
 from __future__ import annotations
 
@@ -33,8 +37,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from tre_baselines.policies.base import Decision
-from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot
+from tre_baselines.policies.base import Decision, hold_if_incomplete
+from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, evidence_gaps
 
 DEFAULT_ALPHA = 0.5
 DEFAULT_THETA = 1.0 / 3.0  # the paper's 3x-burst example
@@ -60,6 +64,7 @@ def _num(x: Any, nd: int = 4) -> Optional[float]:
 
 class ChironPolicy:
     name = "chiron"
+    needs_events = False
 
     def __init__(self, config: Any = None) -> None:
         params = dict(getattr(config, "policy_params", None) or {})
@@ -91,7 +96,8 @@ class ChironPolicy:
         """One Alg.1 step for one pod; returns the per-pod inputs entry."""
         info: dict[str, Any] = {}
         c = pod.counters
-        capped_now = pod.running >= st.B  # cap in force during the window that just ended
+        # cap in force during the window that just ended (unknown gauge: not capped)
+        capped_now = pod.running is not None and pod.running >= st.B
         prev, prev_at = st.prev, st.prev_at_ms
         st.prev, st.prev_at_ms = dict(c), pod.scraped_at_ms
         if prev is None or any(k not in c or k not in prev for k in _NEEDED):
@@ -148,17 +154,21 @@ class ChironPolicy:
                 if st is None:
                     st = states[pod.pod] = _PodState(B=min(b_init, b_max))
                 info = self._local(st, pod, ms, b_max)
+                # Unknown gauges are not busy here (scale-up uses the evidence there is);
+                # they are an evidence gap, which blocks the scale-down below.
                 if self.busy_def == "at_cap":
-                    is_busy = pod.running + pod.waiting >= st.B
+                    is_busy = pod.queued is not None and pod.queued >= st.B
                 else:
-                    is_busy = pod.running > 0
+                    is_busy = pod.running is not None and pod.running > 0
                 busy += int(is_busy)
                 info.update(B=_num(st.B, 2), busy=bool(is_busy))
                 per_pod[pod.pod] = info
             ibp = busy / n
             desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
-            out[model] = Decision(desired, "ibp_target", {
+            decision = Decision(desired, "ibp_target", {
                 "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy,
                 "target": desired, "busy_def": self.busy_def, "pods": per_pod,
             })
+            gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
+            out[model] = hold_if_incomplete(decision, ms.awake, gaps)
         return out

@@ -411,3 +411,25 @@ def test_livez_fails_when_the_loop_is_wedged(tmp_path) -> None:
     assert not shell.alive()
     shell._beat = _time.monotonic()
     assert shell.alive()
+
+
+def test_shell_holds_a_scale_down_on_incomplete_evidence(tmp_path) -> None:
+    """Backstop for any policy: an unscraped pod means the load is unknown, not low."""
+    from dataclasses import replace
+
+    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy({0: {"a": 1, "b": 3}}), dry_run=False)
+    gather = shell.source.gather
+
+    def gather_with_gap(tick=0):
+        snap = gather(tick)
+        models = dict(snap.models)
+        models["a"] = replace(models["a"], unscraped=("a-x",))
+        models["b"] = replace(models["b"], unscraped=("b-x",))
+        return replace(snap, models=models)
+
+    shell.source.gather = gather_with_gap
+    lines = {l["model"]: l for l in _run(shell, dispatcher, 1)[0]}
+    assert (lines["a"]["action"], lines["a"]["reason"], lines["a"]["clamped"]) == ("none", "incomplete", 2)
+    assert lines["a"]["inputs"]["policy_reason"] == "scripted" and lines["a"]["inputs"]["gaps"] == ["unscraped"]
+    assert lines["b"]["action"] == "up"                  # scale-up still acts on the evidence there is
+    assert [m for _, m, _, _ in dispatcher.submitted] == ["b"]

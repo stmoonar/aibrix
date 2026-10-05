@@ -13,7 +13,18 @@
   to it. A failed scrape leaves the pod out and is counted.
 * **Request events** - ``XREAD`` of ``tre:v2:bl:req:<model>`` from a cursor kept across
   ticks; the first tick starts at the Redis clock "now" (the ``$`` semantics, which also
-  works for a stream that does not exist yet).
+  works for a stream that does not exist yet). The reader keeps, per model, since when
+  the stream has been read without a gap (``events_since_ms``: reset at start, when the
+  stream was trimmed past the cursor or recreated, and withheld for a tick that left a
+  backlog) and which requests are in flight on which pod (``arr`` without ``done``,
+  :class:`InflightTracker`).
+* **Event coverage** - after a gap (shell start, trimmed / recreated stream) every pod is
+  unverified: requests already running there (the cohort) never had an ``arr`` this shell
+  read. A pod becomes verified at the first scrape whose running + waiting is covered by
+  the requests the stream shows there (the cohort has drained; state, not a timer) and
+  stays verified until the next gap (``PodSnapshot.events_cover``). A pod whose engine
+  reports nothing in flight is verified at once and its tracked requests that arrived
+  before the scrape are dropped (their ``done`` was lost).
 * **Clock** - Redis ``TIME``.
 """
 from __future__ import annotations
@@ -26,7 +37,7 @@ import ssl
 import os
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.request import Request, urlopen
 
@@ -168,8 +179,10 @@ def pod_snapshot_from_metrics(
         model=model,
         node=node,
         gpu_ids=tuple(int(g) for g in gpu_ids),
-        running=(_finite_sum(running) or 0.0) if running else 0.0,
-        waiting=(_finite_sum(waiting) or 0.0) if waiting else 0.0,
+        # A missing or non-finite gauge is unknown (None), never 0: HTTP 200 alone does
+        # not prove the pod is idle.
+        running=_finite_sum(running) if running else None,
+        waiting=_finite_sum(waiting) if waiting else None,
         kv_usage=(sum(kv_values) / len(kv_values)) if kv_values else None,
         counters=counters,
         num_gpu_blocks=_int_label(info, "num_gpu_blocks"),
@@ -246,8 +259,65 @@ def parse_event(model: str, entry_id: Any, fields: Mapping[Any, Any]) -> Optiona
     )
 
 
+class InflightTracker:
+    """Requests per pod according to the event stream: ``arr`` (which names the target pod)
+    adds a request, ``done`` (exactly once per request that had ``arr``) stamps its end.
+
+    ``count(pod, since_ms)`` = requests that may have been in the engine at any time from
+    ``since_ms`` on (no ``done`` yet, or ``done`` at/after ``since_ms``): compared with a
+    scrape that started at ``since_ms`` it over- rather than under-counts, so a request
+    finishing during the scrape never looks like an unknown one. Ended requests are pruned
+    once they are older than the scrape that is compared (:meth:`prune`).
+    """
+
+    def __init__(self) -> None:
+        self._where: dict[str, str] = {}
+        #: pod -> req_id -> [arr ts, done ts or None]
+        self._pods: dict[str, dict[str, list]] = {}
+
+    def apply(self, event: RequestEvent) -> None:
+        if event.kind == "arr" and event.pod:
+            old = self._where.get(event.req_id)
+            if old is not None:
+                self._pods.get(old, {}).pop(event.req_id, None)
+            self._where[event.req_id] = event.pod
+            self._pods.setdefault(event.pod, {})[event.req_id] = [int(event.ts_ms), None]
+        elif event.kind == "done":
+            pod = self._where.pop(event.req_id, None)
+            entry = self._pods.get(pod, {}).get(event.req_id) if pod is not None else None
+            if entry is not None:
+                entry[1] = int(event.ts_ms)
+
+    def count(self, pod: str, since_ms: int) -> int:
+        return sum(1 for _arr, done in self._pods.get(pod, {}).values() if done is None or done >= since_ms)
+
+    def prune(self, before_ms: int) -> None:
+        for reqs in self._pods.values():
+            for req_id in [r for r, (_a, done) in reqs.items() if done is not None and done < before_ms]:
+                del reqs[req_id]
+
+    def engine_idle(self, pod: str, at_ms: int) -> int:
+        """The engine of ``pod`` reported nothing running or waiting in a scrape that
+        started at ``at_ms``: every request tracked there that arrived by then is over
+        (its ``done`` was lost). Returns how many were dropped."""
+        reqs = self._pods.get(pod)
+        if not reqs:
+            return 0
+        gone = [r for r, (arr, done) in reqs.items() if done is None and arr <= at_ms]
+        for req_id in gone:
+            reqs.pop(req_id, None)
+            self._where.pop(req_id, None)
+        return len(gone)
+
+
+def _id_tuple(entry_id: str) -> tuple[int, int]:
+    ms, _, seq = str(entry_id).partition("-")
+    return int(ms), int(seq or 0)
+
+
 class EventReader:
-    """XREAD of every model's stream from cursors kept across ticks."""
+    """XREAD of every model's stream from cursors kept across ticks, with gap detection
+    and per-pod in-flight tracking (see the module docstring)."""
 
     def __init__(self, redis: Any, models: Iterable[str], *, batch: int = 1000, max_rounds: int = 20) -> None:
         self._redis = redis
@@ -258,13 +328,60 @@ class EventReader:
         self.parse_errors = 0
         self.events_total = 0
         self.last_event_ms: dict[str, int] = {}
+        #: Redis ms since which each model's stream has been read without a known gap.
+        self.since_ms: dict[str, int] = {}
+        #: Models whose last read left entries unread (the snapshot withholds history).
+        self.behind: set[str] = set()
+        #: Detected gaps per model (trimmed / recreated stream).
+        self.gaps: dict[str, int] = {m: 0 for m in self._models}
+        self._stream_seen: dict[str, bool] = {}
+        self.inflight: dict[str, InflightTracker] = {m: InflightTracker() for m in self._models}
+        #: Pods whose in-flight requests the stream covers since the model's last gap.
+        self.verified: dict[str, set[str]] = {m: set() for m in self._models}
+
+    def _gap(self, model: str, now_ms: int) -> None:
+        self.since_ms[model] = int(now_ms)
+        self.verified[model].clear()
+        self.gaps[model] += 1
 
     def start(self, now_ms: int) -> None:
         for model in self._models:
-            self.cursors.setdefault(model, f"{int(now_ms)}-0")
+            if model not in self.cursors:
+                self.cursors[model] = f"{int(now_ms)}-0"
+                self.since_ms[model] = int(now_ms)
+
+    def history_since_ms(self, model: str) -> Optional[int]:
+        """Since when the stream is gap-free; None for a tick that left a backlog."""
+        return None if model in self.behind else self.since_ms.get(model)
+
+    def _check_trimmed(self, model: str, now_ms: int) -> None:
+        """A stream we saw before whose first entry is now past our cursor was trimmed
+        (more than MAXLEN entries since the last read) or deleted and recreated: the
+        events in between are lost, so the history restarts now."""
+        try:
+            first = self._redis.xrange(req_stream_key(model), "-", "+", count=1) or []
+        except Exception as exc:  # unknown -> treat as a gap (fail closed)
+            LOG.warning("xrange of %s failed: %s", req_stream_key(model), exc)
+            self._stream_seen[model] = False
+            self._gap(model, now_ms)
+            return
+        seen_before = self._stream_seen.get(model, False)
+        exists = bool(first)
+        self._stream_seen[model] = exists
+        if not exists:
+            if seen_before:  # the stream vanished: whatever was in it is gone
+                self._gap(model, now_ms)
+            return
+        first_id = str(_decode(first[0][0]))
+        if seen_before and _id_tuple(first_id) > _id_tuple(self.cursors[model]):
+            LOG.warning("event stream %s trimmed past the cursor (%s > %s): history restarts",
+                        req_stream_key(model), first_id, self.cursors[model])
+            self._gap(model, now_ms)
 
     def read(self, now_ms: int) -> dict[str, tuple[RequestEvent, ...]]:
         self.start(now_ms)
+        for model in self._models:
+            self._check_trimmed(model, now_ms)
         out: dict[str, list[RequestEvent]] = {model: [] for model in self._models}
         key_to_model = {req_stream_key(m): m for m in self._models}
         pending = set(self._models)
@@ -289,11 +406,13 @@ class EventReader:
                         self.parse_errors += 1
                         continue
                     out[model].append(event)
+                    self.inflight[model].apply(event)
                     self.events_total += 1
                     self.last_event_ms[model] = event.ts_ms
                 if len(entries) >= self._batch:
                     full.add(model)
             pending = full
+        self.behind = set(pending)
         return {model: tuple(events) for model, events in out.items()}
 
 
@@ -489,17 +608,28 @@ class LiveSource:
                 else:
                     targets.append((binding, ep))
         results = list(self._pool.map(lambda t: self._scrape(t, now_ms), targets))
+        failed = sum(len(v) for v in unscraped.values()) + sum(1 for r in results if r is None)
+        self.scrape_total += len(targets)
+        self.scrape_failures += failed
+
+        # Events after the scrape: an arrival the scrape already shows is in the stream.
+        events = self.events.read(now_ms)
         pods: dict[str, list[PodSnapshot]] = {m: [] for m in self._models}
         for (binding, _ep), snap in zip(targets, results):
             if snap is None:
                 unscraped[binding.model].append(binding.pod)
-            else:
-                pods[binding.model].append(snap)
-        failed = sum(len(v) for v in unscraped.values())
-        self.scrape_total += len(targets)
-        self.scrape_failures += failed
-
-        events = self.events.read(now_ms)
+                continue
+            tracker = self.events.inflight[binding.model]
+            verified = self.events.verified[binding.model]
+            if snap.queued == 0:
+                tracker.engine_idle(binding.pod, snap.scraped_at_ms)
+            tracked = tracker.count(binding.pod, snap.scraped_at_ms)
+            if snap.queued is not None and snap.queued <= tracked:
+                verified.add(binding.pod)  # the cohort in flight at the last gap is gone
+            pods[binding.model].append(replace(
+                snap, tracked_inflight=tracked, events_cover=binding.pod in verified))
+        for model in self._models:
+            self.events.inflight[model].prune(now_ms)
         replay = read_replay_info(self._redis)
         lag = {
             m: max(0.0, (now_ms - self.events.last_event_ms[m]) / 1000.0)
@@ -521,6 +651,7 @@ class LiveSource:
                 events=events.get(model, ()),
                 unscraped=tuple(sorted(unscraped[model])),
                 slo=lim.slo,
+                events_since_ms=self.events.history_since_ms(model),
             )
         return ClusterSnapshot(
             now_ms=now_ms,

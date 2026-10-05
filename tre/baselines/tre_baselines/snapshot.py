@@ -10,6 +10,14 @@ three sources and hands it to ``Policy.decide``:
 * the gateway request-event stream ``tre:v2:bl:req:<model>`` (events new since the
   previous tick) and the replay start marker ``tre:v2:bl:replay_t0``.
 
+Unknown is not idle. A missing gauge is ``None`` (never 0); a pod the SM calls serving
+that could not be scraped is in ``unscraped``; the event stream says since when it has
+been read without a gap (``events_since_ms``), how many requests it shows in flight on
+each pod (``tracked_inflight``) and whether that covers everything the engine runs since
+the last gap (``events_cover``). :func:`evidence_gaps` turns these into the reasons a
+snapshot cannot prove that a model's load is low; a policy (and the shell, as a
+backstop) never scales a model down while that list is non-empty.
+
 Every timestamp is on the **Redis server clock** (``TIME`` for ``now_ms`` /
 ``scraped_at_ms``, the millisecond part of the stream entry ID for ``ts_ms``). The two
 nodes' wall clocks differ by minutes, so nothing here uses a local clock.
@@ -49,9 +57,10 @@ class PodSnapshot:
     model: str
     node: Optional[str]
     gpu_ids: tuple[int, ...]
-    #: vllm:num_requests_running / vllm:num_requests_waiting (gauges).
-    running: float
-    waiting: float
+    #: vllm:num_requests_running / vllm:num_requests_waiting (gauges); None when the pod
+    #: did not export a finite value (unknown, not 0).
+    running: Optional[float]
+    waiting: Optional[float]
     #: vllm:kv_cache_usage_perc in [0, 1]; None when the pod does not export it.
     kv_usage: Optional[float]
     #: Cumulative counters keyed by :data:`COUNTER_KEYS`. They reset when the engine
@@ -62,6 +71,20 @@ class PodSnapshot:
     block_size: Optional[int]
     #: Redis server clock (ms) when the scrape round started.
     scraped_at_ms: int
+    #: Requests the gateway event stream shows on this pod that may have been in flight
+    #: during the scrape; None when the source does not track events.
+    tracked_inflight: Optional[int] = None
+    #: True when every request in flight here is known from the event stream: the pod was
+    #: verified (running + waiting covered by tracked requests) since the model's last
+    #: event gap, so the cohort that predates the gap has drained. None = not tracked.
+    events_cover: Optional[bool] = None
+
+    @property
+    def queued(self) -> Optional[float]:
+        """running + waiting, or None when either gauge is unknown."""
+        if self.running is None or self.waiting is None:
+            return None
+        return self.running + self.waiting
 
 
 @dataclass(frozen=True)
@@ -113,6 +136,10 @@ class ModelSnapshot:
     #: The per-request SLO definition (``tre_common.slo_labels.LabelDefinition``), for a
     #: policy that wants the length-dependent TTFT SLO; None when not available.
     slo: Any = None
+    #: Redis-clock ms since which this model's event stream has been read without a known
+    #: gap (shell start, a trimmed / recreated stream, a read backlog). None = no event
+    #: history (e.g. the source does not read events, or the gap is this tick).
+    events_since_ms: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -136,3 +163,47 @@ class ClusterSnapshot:
     #: Tick sequence number (0-based, per shell process).
     tick: int = 0
     extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+#: A scrape older than this many ticks is stale (the pod's state is unknown now).
+STALE_SCRAPE_TICKS = 2.0
+
+
+def evidence_gaps(
+    ms: ModelSnapshot,
+    now_ms: int,
+    tick_s: float,
+    *,
+    events: bool = False,
+    history_s: float = 0.0,
+) -> tuple[str, ...]:
+    """Why ``ms`` cannot prove that the model's load is low (empty = evidence complete).
+
+    * ``unscraped``: a pod the SM calls serving was not scraped;
+    * ``missing_gauges``: a scraped pod lacks running or waiting;
+    * ``stale_scrape``: a pod's scrape is older than :data:`STALE_SCRAPE_TICKS` ticks;
+    * with ``events`` (a policy that reads the request-event stream):
+      ``no_event_history``: the stream has not been read gap-free for ``history_s``
+      (shell start, trimmed stream, backlog); ``event_gap``: a pod may still run requests
+      from before the last gap (``PodSnapshot.events_cover`` not True). The requests in
+      flight at the gap are the cohort; it has drained when the engine's running + waiting
+      is covered by tracked requests (state, not a timer).
+
+    Scale-up may still use whatever evidence is present; only a scale-down needs this
+    list to be empty.
+    """
+    gaps: list[str] = []
+    if ms.unscraped:
+        gaps.append("unscraped")
+    if any(p.queued is None for p in ms.pods):
+        gaps.append("missing_gauges")
+    stale_ms = STALE_SCRAPE_TICKS * float(tick_s) * 1000.0
+    if any(now_ms - p.scraped_at_ms > stale_ms for p in ms.pods):
+        gaps.append("stale_scrape")
+    if events:
+        since = ms.events_since_ms
+        if since is None or now_ms - since < float(history_s) * 1000.0:
+            gaps.append("no_event_history")
+        if any(p.events_cover is not True for p in ms.pods):
+            gaps.append("event_gap")
+    return tuple(gaps)
