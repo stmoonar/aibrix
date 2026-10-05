@@ -187,7 +187,7 @@ def test_planner_view_pending_gate_uses_the_f4_direction_rules():
     assert _deltas(_plan(critical, view_pending={"r": "down"})) == {"r": 1}
     # Donors: an idle model whose scale-down the view does not show yet gives nothing.
     idle = [_cls("i", ModelState.IDLE, 10.0)]
-    assert _deltas(_plan(idle)) == {"i": -1}
+    assert _deltas(_plan(idle)) == {"i": -2}
     assert _deltas(_plan(idle, view_pending={"i": "down"})) == {}
 
 
@@ -196,6 +196,6 @@ def test_the_floor_violation_hold_is_replaced_by_the_sm_floor_headroom():
     idle = [_cls("i", ModelState.IDLE, 10.0)]
     held = _plan(idle, floor_headroom={"i": 0})
     assert _deltas(held) == {} and held.events == []
-    assert _deltas(_plan(idle, floor_headroom={"i": 2})) == {"i": -1}
+    assert _deltas(_plan(idle, floor_headroom={"i": 1})) == {"i": -1}  # bounded by the headroom
     # Never out of a scale-up.
     assert _deltas(_plan([_cls("r", ModelState.LOW, 0.9)], floor_headroom={"r": 0})) == {"r": 1}

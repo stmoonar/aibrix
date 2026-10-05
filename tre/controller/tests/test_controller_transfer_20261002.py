@@ -142,8 +142,8 @@ def test_idle_proactive_shrink_is_a_model_level_target_call_bounded_by_headroom(
 
     [shrink] = plan({}).actions
     assert (shrink.model, shrink.delta, shrink.reason, shrink.pods, shrink.sleep_path) == (
-        "idle", -1, "idle_proactive_immediate", (), "urgent"
-    )
+        "idle", -3, "idle_proactive_immediate", (), "urgent"
+    )  # Q3: the whole surplus down to the floor (1) in one decision
     assert plan({"floor_headroom": 0}).actions == []
 
 

@@ -254,7 +254,7 @@ def test_donor_cooldown_skips_that_donor_without_blocking_the_pair_elsewhere() -
 def test_idle_proactive_shrink_held_during_cooldown() -> None:
     idle = [_cls("i", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
 
-    assert _deltas(_plan(idle, {})) == {"i": -1}
+    assert _deltas(_plan(idle, {})) == {"i": -2}  # Q3: the whole surplus to the floor
     assert _deltas(_plan(idle, {"i": "down"})) == {}
 
 

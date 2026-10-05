@@ -134,6 +134,8 @@ class PaperStateCache:
                 # ... and no evidence count either: a held receiver's rescue is capped
                 # like a thin partial window (planner partial_window_max_step).
                 "signal_evidence_requests": None,
+                # ... and never idle evidence (Q3: the O1 donor-hold exemption).
+                "window_idle": False,
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
@@ -1305,7 +1307,17 @@ def _model_contexts(
             # evidence (the planner's donor gate); a receiver still acts (step-capped).
             context["signal_full_window"] = False
             context["signal_hold_reason"] = "scrape_stale"
-        elif not tokens_available and stale_pods and scraper_alive:
+        else:
+            # Q3 (2026-10-06): the whole current serving window is idle - tokens known
+            # and zero, no running / waiting request - with every serving pod scraped.
+            # The same at any replica count: an IDLE model is exempt from the O1 donor
+            # hold on it (planner). Never on a held or tokens-missing context.
+            context["window_idle"] = bool(
+                tokens_available
+                and window_is_idle(metrics.prompt_tokens, metrics.generation_tokens)
+                and float(metrics.avg_running or 0.0) + float(metrics.avg_waiting or 0.0) <= 1e-9
+            )
+        if not tokens_available and stale_pods and scraper_alive:
             demand = _frozen_scrape_demand(raw_metrics, routable_by_model, model_name)
             if demand is not None:
                 # No serving pod answered /metrics in the whole window while the scraper

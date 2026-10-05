@@ -68,6 +68,22 @@ unchanged). SafeScale's Z after a hide (a breakpoint) is the raw whole window un
 post-hide evidence is warm, then the post-hide window's - both at least as strict as the
 pre-O1 EMA, which weighed the pre-hide windows.
 
+**IDLE donors (Q3, 2026-10-06)**: the exception to the rule above. After its own
+scale-down an IDLE model used to wait a whole window after that breakpoint before its next
+step, so an IDLE surplus left about one step per 30-40 s. An idle window - no prefill or
+decode token and no running / waiting request in the whole current window - is the same
+evidence at any replica count, so the breakpoint changes nothing about it. An IDLE model
+whose context carries `window_idle: true` is exempt from the donor hold, and an IDLE donor
+gives its **whole surplus** in one decision: an `idle_proactive_immediate` shrink goes
+straight to the floor (bounded by the SM `floor_headroom`), a relay to a CRITICAL or LOW
+receiver may take all of it (bounded by the receiver's need and the headroom). This is a
+code rule for IDLE only; `scaling.donor_surplus_release` keeps its value (false) and now
+only affects HIGH donors. HIGH donors keep the O1 hold and one step per tick (their
+evidence - a throughput level - does depend on the replica count). `window_idle` is
+current-window evidence only (I4): the tick sets it from this tick's serving window with
+tokens known and every serving pod scraped; a held context (`tokens_missing`), a
+scrape-stale context and a tokens-missing window never carry it, so those stay held.
+
 **C1 settle**: a rescue target counts as reflected once the model is warm and its
 settle breakpoint (`signal_settle_ms`: the onset, or a count change seen between two
 views of this process - not a first-observation date, review P2-a: after a restart the

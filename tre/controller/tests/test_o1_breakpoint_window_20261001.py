@@ -967,3 +967,55 @@ def test_gateway_clock_falls_back_to_stamp_lag_without_written_ms():
     monitor = GatewayClockMonitor(_OldGateway(), ["m"], state, period_ms=GRID, tolerance_ms=2_000,
                                   clock_ms=lambda: 1_000_000, sleep_s=lambda _s: None)
     assert monitor.check().reason == "gateway_ahead"
+
+
+# ------------------------------------------------- Q3: IDLE donors (2026-10-06)
+
+
+def test_idle_donor_after_its_own_scale_down_releases_the_rest_at_once():
+    """Q3: an idle window is the same evidence at any replica count. Right after its own
+    scale-down (a breakpoint inside the window, no whole window after it) an IDLE model
+    still releases the rest of its surplus - down to its floor, in one decision."""
+    from tre_controller.loops.tick import run_planner_tick
+
+    registry = _registry(10_000.0)
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    base = 3_000_000
+    queue = _Queue({"m": base + 1_500})  # our scale-down 4 -> 3 returned at base + 1.5 s
+    run_planner_tick(_snap(_window(base, [IDLE] * 3, routable=4)), queue=queue, registry=registry,
+                     rescue_due=True, fairness_due=False, cluster_view=_view(4, fetched_ms=base - 2_000),
+                     signal_state=state)
+    end = base + GRID
+    after = run_planner_tick(_snap(_window(end, [IDLE] * 3, routable=3)), queue=queue, registry=registry,
+                             rescue_due=True, fairness_due=False, cluster_view=_view(3, fetched_ms=end + 3_000),
+                             signal_state=state)
+    ctx = after.model_contexts["m"]
+    assert ctx["signal_full_window"] is False and ctx["window_idle"] is True
+    assert after.classifications["m"].state == ModelState.IDLE
+    assert [(a.model, a.delta) for a in after.actions if isinstance(a, ScaleAction)] == [("m", -2)]
+    assert not any(e.startswith("donor_suppressed_breakpoint_window") for e in after.events)
+
+
+def test_o1_donor_hold_exempts_only_current_window_idle_evidence():
+    """Q3 / I4: a HIGH donor keeps the O1 hold; a held context (tokens missing, the last
+    level carried over) is never idle evidence, so its IDLE level stays held too."""
+    from tre_controller.loops.tick import PaperStateCache
+
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    def plan(state: ModelState, ctx: dict):
+        return build_plan(model_contexts={"m": {"assigned_replicas": 3, "routable_pods": 3, "awake_replicas": 3,
+                                                "signal_warm": True, **ctx}},
+                          classifications=[_cls("m", state, 2.0)], model_replicas={"m": 3}, idle_gpus=0, cfg=cfg)
+
+    partial = {"signal_full_window": False, "window_idle": True}
+    assert "donor_suppressed_breakpoint_window:m" not in plan(ModelState.IDLE, partial).events
+    assert "donor_suppressed_breakpoint_window:m" in plan(ModelState.HIGH, partial).events
+    cache = PaperStateCache()
+    fresh = {"routable_pods": 3, "assigned_replicas": 3, "Y_m": 0.0, "Q": 0.0, "signal_full_window": True,
+             "window_idle": True}
+    cache.apply("m", fresh, tokens_available=True)
+    held, _ = cache.apply("m", {"routable_pods": 3, "assigned_replicas": 3}, tokens_available=False)
+    assert held["window_idle"] is False
+    held_plan = plan(ModelState.IDLE, held)
+    assert "donor_suppressed_breakpoint_window:m" in held_plan.events and not held_plan.actions

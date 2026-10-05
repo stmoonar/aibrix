@@ -66,9 +66,11 @@ class PlanConfig:
     # C1 (registry scaling.rescue_max_step_pods): the rescue target may also reach
     # n + this many replicas (HPA-style "max(ratio x n, n + pods)"); 0 = ratio only.
     rescue_max_step_pods: int = 0
-    # C1 review P1 (registry scaling.donor_surplus_release): an immediate IDLE / HIGH
-    # donor of a CRITICAL receiver gives its whole surplus in one tick. Off (default):
-    # one step per tick, as before C1 - scale-up is aggressive, scale-down cautious.
+    # C1 review P1 (registry scaling.donor_surplus_release): an immediate HIGH donor of
+    # a CRITICAL receiver gives its surplus above its tau_high level in one tick. Off
+    # (default): one step per tick - scale-down stays cautious. An IDLE donor always
+    # gives its whole surplus (Q3 2026-10-06, code rule): an idle window is evidence
+    # that does not depend on the replica count.
     donor_surplus_release: bool = False
     #: O1 review P2-1 (evidence-gated): a C1 rescue decided on a partial
     #: (post-breakpoint) window - ``signal_full_window`` False - whose
@@ -524,6 +526,10 @@ def build_plan(
     # takes part in no scale-down - neither HIGH / IDLE donor nor middle-zone donor - until
     # a whole window lies after the breakpoint (scale-down stays cautious); as a receiver
     # it acts once signal_warm (min_evidence_grids complete grids after the breakpoint).
+    # Q3 (2026-10-06): an IDLE model whose whole current window is idle (``window_idle``:
+    # tokens known and zero, no queue, every serving pod scraped - never a held context)
+    # is exempt: no token at any replica count is the same evidence before and after
+    # the breakpoint.
     warmup_suppressed: list[str] = []
     breakpoint_held: list[str] = []
     kept: list = []
@@ -538,7 +544,7 @@ def build_plan(
             if not ctx.get("signal_warm", True):
                 warmup_suppressed.append(item.model_name)
                 continue
-        elif ctx.get("signal_full_window", True) is False:
+        elif ctx.get("signal_full_window", True) is False and not _idle_window_evidence(item, ctx):
             breakpoint_held.append(item.model_name)
             continue
         kept.append(item)
@@ -918,8 +924,8 @@ def build_plan(
             # A model-level scale-down (PUT /target, no receiver, no pod named): the SM
             # picks the replicas and clamps the shrink at the model's replica floor
             # (2026-10-02); the planner still never asks beyond the SM floor_headroom.
+            # Q3 (2026-10-06): the whole surplus down to the floor in one decision.
             shrink = min(
-                _scale_step(pods, cfg.scale_step_ratio),
                 pods - idle_min,
                 _donor_headroom(cfg, idle.model_name, model_contexts, model_replicas),
             )
@@ -1110,7 +1116,11 @@ def build_plan(
                 donor=donor.model_name,
                 receiver=recv.model_name,
                 need=needed,
-                donor_limit=min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take),
+                # Q3: an IDLE donor gives its whole surplus, a HIGH donor one step.
+                donor_limit=min(
+                    donor_pods if donor.state == ModelState.IDLE else _scale_step(donor_pods, cfg.scale_step_ratio),
+                    headroom - planned_take,
+                ),
                 reason="low_fairness_donor_immediate",
                 source_loop="fairness",
                 events=events,
@@ -1893,6 +1903,13 @@ def _try_plan_tp_capacity(
     return None
 
 
+def _idle_window_evidence(item: ModelClassification, ctx: Mapping[str, Any]) -> bool:
+    """Q3 (2026-10-06): an IDLE model whose whole current window is idle evidence
+    (``window_idle``, set by the tick only from this tick's fully scraped window - a
+    held, scrape-stale or tokens-missing context never carries it)."""
+    return item.state == ModelState.IDLE and ctx.get("window_idle") is True
+
+
 def _paper_state_incomplete_models(classifications: list[ModelClassification]) -> tuple[str, ...]:
     return tuple(
         item.model_name
@@ -1987,17 +2004,18 @@ def rescue_desired(
 
 def _donor_give(donor: ModelClassification, donor_pods: int, cfg: PlanConfig) -> int:
     """Replicas an immediate (IDLE / HIGH) donor may give one CRITICAL receiver in one
-    tick, before its floor. Default (and legacy): one step - the paper's bounded
-    pairwise transfer moves at most one step per pair per tick, the donor side
-    included. ``donor_surplus_release`` (opt-in): its surplus - an IDLE donor all of
-    it; a HIGH donor the replicas above ``ceil(n * tau_high / Z)`` (its projected Z
-    stays >= tau_high), never less than one step. The relay is capped by what the
-    receiver still needs either way (caller)."""
+    tick, before its floor. An IDLE donor: all of it (Q3 2026-10-06, code rule - an
+    idle window is evidence that does not depend on the replica count). A HIGH donor,
+    default (and legacy): one step - the paper's bounded pairwise transfer moves at
+    most one step per pair per tick, the donor side included;
+    ``donor_surplus_release`` (opt-in): the replicas above ``ceil(n * tau_high / Z)``
+    (its projected Z stays >= tau_high), never less than one step. The relay is capped
+    by what the receiver still needs and the donor's floor headroom either way (caller)."""
     step = _scale_step(donor_pods, cfg.scale_step_ratio)
-    if cfg.rescue_max_step_ratio <= 0 or not cfg.donor_surplus_release:
-        return step
     if donor.state == ModelState.IDLE:
         return max(step, donor_pods)
+    if cfg.rescue_max_step_ratio <= 0 or not cfg.donor_surplus_release:
+        return step
     z_m = donor.Z_m
     tau_high = donor.tau.tau_high
     if z_m is None or not math.isfinite(z_m) or z_m <= 0 or tau_high <= 0:

@@ -146,15 +146,16 @@ def test_capacity_short_plans_what_exists_and_records_the_partial_target():
 
 
 def test_immediate_donor_gives_one_step_per_tick_by_default():
-    """Review P1: scale-down stays cautious - the relay is the receiver's need, the
-    donor side one step per pair per tick (paper section 4)."""
+    """Review P1: scale-down stays cautious - the relay is the receiver's need, a HIGH
+    donor gives one step per pair per tick (paper section 4). An IDLE donor gives its
+    whole surplus (Q3 2026-10-06: an idle window is evidence at any replica count)."""
     classifications = [
         _cls("r", ModelState.CRITICAL, 0.4),
         _cls("d", ModelState.HIGH, 2.5, tier="surplus"),
     ]
     assert _deltas(_plan(classifications, {"r": 2, "d": 4})) == {"r": 1, "d": -1}
     idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
-    assert _deltas(_plan(idle, {"r": 3, "i": 4})) == {"r": 1, "i": -1}
+    assert _deltas(_plan(idle, {"r": 3, "i": 4})) == {"r": 3, "i": -3}  # floor 1
     # Same as the legacy rescue on the donor side.
     assert _deltas(_plan(classifications, {"r": 2, "d": 4}, ratio=0)) == {"r": 1, "d": -1}
 
@@ -266,7 +267,7 @@ def test_scale_down_paths_are_unchanged_by_c1():
         assert c1.actions == legacy.actions
         assert c1.delayed_down_models == legacy.delayed_down_models
         assert c1.events == legacy.events
-    assert _deltas(_plan(classifications, pods)) == {"i": -1}  # one step, as before
+    assert _deltas(_plan(classifications, pods)) == {"i": -3}  # Q3: IDLE to its floor at once
 
 
 # ------------------------------------------------------ queue + tick wiring

@@ -105,9 +105,9 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     assert guarded.delayed_down_models == set()
     assert guarded.events == ["safescale_probe_suppressed_hot:high"]
 
-    # C1 default: n=2, Z=0.5, tau_crit=0.8 -> target ceil(2*0.8/0.5)=4. Each immediate
-    # donor still gives one step per tick (donor_surplus_release off), so the idle and
-    # the high donor relay one replica each (the high one is then not probed on top).
+    # C1 default: n=2, Z=0.5, tau_crit=0.8 -> target ceil(2*0.8/0.5)=4. The idle donor
+    # gives its whole surplus (Q3: 2 above its floor), which covers the need; the high
+    # donor is then probed proactively (one step, SafeScale), not relayed.
     c1 = build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -116,8 +116,8 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
     )
     c1_actions = [a for a in expand_relays(c1.actions) if isinstance(a, ScaleAction)]
-    assert _deltas(c1_actions) == {"idle": -1, "critical": 2, "high": -1}
-    assert {a.reason for a in c1_actions} == {"critical_donor_immediate"}
+    assert _deltas(c1_actions) == {"idle": -2, "critical": 2, "high": -1}
+    assert {a.reason for a in c1_actions} == {"critical_donor_immediate", "high_proactive_safescale"}
     assert c1.events == ["rescue_target:critical:n=2:z=0.5000:desired=4:covered=2:planned=2"]
 
 

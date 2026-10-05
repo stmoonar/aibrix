@@ -612,9 +612,10 @@ data:
       # (the built-in default); 4 = user decision 2026-10-01 (n = 1 can reach the
       # scaling cap 4 in one decision).
       rescue_max_step_pods: 4
-      # An immediate IDLE / HIGH donor of a CRITICAL receiver gives its whole surplus
-      # (IDLE to its floor, HIGH to its tau_high level) in one tick. false = one step
-      # per tick (scale-down stays cautious).
+      # An immediate HIGH donor of a CRITICAL receiver gives its surplus (down to its
+      # tau_high level) in one tick. false = one step per tick (scale-down stays
+      # cautious). IDLE donors always release their whole surplus to the floor in one
+      # decision (code rule since 2026-10-06, Q3), whatever this says.
       donor_surplus_release: false
       # Fallback only (2026-10-06): while O1 tracks the model, a rescue target this
       # controller dispatched counts as reflected once the decision window starts

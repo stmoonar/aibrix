@@ -488,9 +488,10 @@ class ScalingRegistryConfig:
     #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
     #: floor(ratio * n), n + pods). 0 = the ratio alone.
     rescue_max_step_pods: int = 0
-    #: An immediate IDLE / HIGH donor of a CRITICAL receiver gives its whole surplus in
-    #: one tick (IDLE down to its floor, HIGH down to its tau_high level). Off: one step
-    #: per tick, as before C1 (scale-down stays cautious).
+    #: An immediate HIGH donor of a CRITICAL receiver gives its surplus in one tick
+    #: (down to its tau_high level). Off: one step per tick, as before C1 (scale-down
+    #: stays cautious). IDLE donors always give their whole surplus (down to the floor)
+    #: whatever this says - a code rule since 2026-10-06 (Q3).
     donor_surplus_release: bool = False
     #: A rescue target counts as reflected once the model's decision window starts
     #: ``k * trs.ema_tau_ms`` after the scale-up completed (the EMA'd Z lags the raw

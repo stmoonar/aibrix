@@ -52,7 +52,8 @@ needs; middle-zone donors only behind SafeScale probes. A rescue whose deficit
 exceeds what the donors give this tick takes the rest from the next ticks (the
 target bookkeeping below plans only the remainder). The opt-in
 `scaling.donor_surplus_release` (default false) lets an immediate donor give its
-surplus in one tick: IDLE down to its floor, HIGH down to
+surplus in one tick: IDLE down to its floor (unconditional since 2026-10-06, Q3: an
+idle window is evidence at any replica count; see the O1 doc), HIGH down to
 `ceil(n_d * tau_high / Z_d)` (its projected Z exactly tau_high, never less than
 one step). With it on, a HIGH donor can land on the HIGH/HEALTHY edge and turn
 LOW on a small rise (ping-pong); with it off that cannot happen faster than one
@@ -157,7 +158,7 @@ restart-to-apply; images before 2026-10-01 ignore the section):
 | `rescue_max_step_ratio` | `2.0` | rescue target at most `max(n+1, floor(ratio*n), n+step_pods)`; `0` = legacy one step per window |
 | `rescue_max_step_pods` | `0` (shipped registry: `4`, user decision 2026-10-01) | `step_pods` above (4 = HPA's `max(100%, +4 pods)`) |
 | `scale_up_cooldown_enabled` | `false` | F4 hold of a CRITICAL receiver's scale-up |
-| `donor_surplus_release` | `false` | immediate donors give their surplus instead of one step |
+| `donor_surplus_release` | `false` | immediate HIGH donors give their surplus instead of one step (IDLE donors always give their whole surplus since 2026-10-06, Q3 - see the O1 doc) |
 | `rescue_settle_ema_k` | `2.0` | a target counts as reflected `k * trs.ema_tau_ms` after the window start passes it |
 
 The scaling cap of both experiment arms is `models[].max_awake_replicas` (4 for
