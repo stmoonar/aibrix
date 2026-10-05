@@ -22,6 +22,9 @@ FakeEngine mimics what the sidecar depends on (fork branch tre/transparent-sleep
   ``{"error": {"type": "EngineSleeping"}}`` (or, with ``reject_in_stream``, an SSE stream
   whose only event is that error, as when the check fires inside generate()).
 * ``POST /sleep[?mode=abort|wait]``, ``/wake_up``, ``/is_sleeping``, ``/v1/models``.
+* Served with ``handler_cancellation=True`` (test harness), a closed client connection
+  cancels the generation, as vLLM aborts a request whose connection closed
+  (``disconnected`` counts them).
 """
 from __future__ import annotations
 
@@ -95,6 +98,8 @@ class FakeEngine:
         self.sleeping = False
         self.requests: list[dict[str, Any]] = []
         self.active: dict[str, _Req] = {}
+        #: Generations cancelled because the client (the sidecar) closed the connection.
+        self.disconnected = 0
         self._wake = asyncio.Event()
         self._wake.set()
 
@@ -295,6 +300,9 @@ class FakeEngine:
             except (ConnectionResetError, ConnectionError):
                 req.do_abort()
             return resp
+        except asyncio.CancelledError:
+            self.disconnected += 1
+            raise
         finally:
             self.active.pop(rid, None)
 
@@ -371,11 +379,15 @@ class FakeGateway:
         out_headers = {k: v for k, v in upstream.headers.items()
                        if k.lower() not in ("content-length", "transfer-encoding", "date", "server", "connection")}
         out_headers["target-pod"] = pod
-        resp = web.StreamResponse(status=upstream.status, headers=out_headers)
-        await resp.prepare(request)
-        async for data in upstream.content.iter_any():
-            await resp.write(data)
-        upstream.release()
+        try:
+            resp = web.StreamResponse(status=upstream.status, headers=out_headers)
+            await resp.prepare(request)
+            async for data in upstream.content.iter_any():
+                await resp.write(data)
+        finally:
+            # A body not read to the end closes the pod connection: like Envoy, a client
+            # that went away resets the upstream request.
+            upstream.release()
         await resp.write_eof()
         return resp
 

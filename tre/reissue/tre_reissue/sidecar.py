@@ -33,6 +33,12 @@ Every path is proxied transparently (streaming kept). On top of that:
   Envoy - the side that sends requests - always closes an idle connection first.
 * ``POST /sleep`` (and ``/pause``) must carry ``X-TRE-Hidden: 1`` (sent by the
   service-manager after it hid the pod), else 409: fail closed.
+* A client that goes away cancels its request: the server cancels the handler on a lost
+  connection and every upstream request it holds (local engine, gateway retry or
+  continuation) is closed, so vLLM aborts it (a queued request is not prefilled). An
+  upstream break caused by a sleep, with the client still there, is continued as above.
+* At startup the soft open-files limit is raised to ``nofile_target`` (capped at the hard
+  limit), as vLLM does: some container runtimes start processes with soft 1024.
 * ``GET /tre-reissue/metrics`` (Prometheus text), ``GET /tre-reissue/state``, one JSON log
   line per retry / continuation on stdout.
 
@@ -65,6 +71,11 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
+
+try:
+    import resource
+except ImportError:  # not POSIX: the open-files limit is left alone
+    resource = None  # type: ignore[assignment]
 
 #: The stable ClusterIP Service in front of the tre-v2 Envoy proxy (tre-v2 overlay
 #: gateway-service.yaml; registry gateway.service_name / service_namespace). Override with
@@ -140,6 +151,12 @@ CHAT_TO_COMPLETION_KEYS = (
 COMPLETION_CONT_DROP = ("prompt", "prompt_embeds", "echo", "suffix", "truncate_prompt_tokens", "add_special_tokens")
 
 _ABORT_MARK = b'"abort"'
+
+#: Per-request key (``web.Request`` item): the tre_reissue_total kind owed for a request
+#: whose retry / continuation is under way; ``_account`` clears it. If the client goes
+#: away first, the request is accounted as ``(kind, "client_gone")``.
+_REISSUE_PENDING: Any = (web.RequestKey("tre_reissue_pending", str) if hasattr(web, "RequestKey")
+                         else "tre_reissue_pending")  # aiohttp < 3.12: plain string keys
 
 OVERHEAD_BUCKETS_S = (
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.1, 0.25, 1.0,
@@ -219,6 +236,11 @@ class Config:
     #: Total timeout of /sleep, /pause, /wake_up, /resume.
     control_timeout_s: float = 300.0
     client_max_size: int = 64 * 1024 * 1024
+    #: At startup the soft RLIMIT_NOFILE is raised to min(this, hard limit), never lowered
+    #: (vLLM does the same and gets 65535). Each request in flight holds two or three
+    #: sockets, and some container runtimes start processes with soft 1024 (Docker >= 25 /
+    #: containerd >= 2.0); a pod spec cannot set ulimits. 0 = leave the limit alone.
+    nofile_target: int = 65535
     # --- protocol names (defaults = vLLM >= 0.30 fork + TRE gateway plugin) ---
     completions_path: str = "/v1/completions"
     chat_path: str = "/v1/chat/completions"
@@ -283,6 +305,8 @@ class Config:
         if not cfg.server_keepalive_s > 0 or cfg.gateway_upstream_idle_s < 0:
             raise ValueError("TRE_REISSUE_SERVER_KEEPALIVE_S must be > 0 and "
                              "TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S >= 0")
+        if cfg.nofile_target < 0:
+            raise ValueError("TRE_REISSUE_NOFILE_TARGET must be >= 0")
         if not cfg.gateway_url.startswith(("http://", "https://")):
             raise ValueError(f"TRE_GATEWAY_URL must be an http(s) URL, got {cfg.gateway_url!r}")
         return cfg
@@ -448,7 +472,8 @@ class Metrics:
         for mode, hist in self.gap.items():
             lines += hist.render("tre_reissue_gap_seconds", f'model="{model}",mode="{mode}"')
         lines += [
-            "# HELP tre_reissue_events_total Sidecar events (sleep rejections, state corrections, ...).",
+            "# HELP tre_reissue_events_total Sidecar events (sleep rejections, state corrections, "
+            "client_cancel: the client went away and the request's upstream calls were closed, ...).",
             "# TYPE tre_reissue_events_total counter",
         ]
         for name, value in sorted(self.events.items()):
@@ -864,10 +889,43 @@ def keepalive_is_safe(pool_keepalive_s: float, server_keepalive_s: float) -> boo
     return pool_keepalive_s <= server_keepalive_s - KEEPALIVE_MARGIN_S
 
 
+def server_options(cfg: "Config") -> dict[str, Any]:
+    """Options of the sidecar's own HTTP server (aiohttp ``AppRunner`` / ``Server``).
+
+    ``handler_cancellation``: when the client's connection is lost, aiohttp cancels the
+    handler. A generation handler then closes every upstream request it holds (the local
+    engine, the gateway retry or continuation; ``ClientResponse.release`` closes a
+    connection whose body was not read to the end), and vLLM aborts a request whose
+    connection closed, so a queued request of a client that went away is not prefilled.
+    Sleep / wake calls are shielded from it (see ``handle``). Needs aiohttp >= 3.9."""
+    return {"keepalive_timeout": cfg.server_keepalive_s, "handler_cancellation": True}
+
+
 def serve_kwargs(cfg: "Config") -> dict[str, Any]:
     """Keyword arguments of ``web.run_app`` (the sidecar's own HTTP server)."""
     return {"host": cfg.listen_host, "port": cfg.listen_port, "access_log": None, "print": None,
-            "backlog": 2048, "handle_signals": True, "keepalive_timeout": cfg.server_keepalive_s}
+            "backlog": 2048, "handle_signals": True, **server_options(cfg)}
+
+
+def raise_nofile_limit(target: int) -> dict | None:
+    """Raise this process's soft RLIMIT_NOFILE to ``min(target, hard)``; never lowers it.
+    Logs the before / after values once (one JSON line) and returns that record; a
+    failure is logged as a WARNING and never raised. ``target`` 0 = do nothing."""
+    if target <= 0 or resource is None:
+        return None
+    record: dict[str, Any] = {"event": "tre_reissue_nofile", "target": target}
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        record.update(before=soft, after=soft, hard=hard)
+        unlimited = resource.RLIM_INFINITY
+        want = target if hard == unlimited else min(target, hard)
+        if soft != unlimited and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            record["after"] = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception as exc:  # noqa: BLE001 - the sidecar must start anyway
+        record.update(level="WARNING", error=f"{type(exc).__name__}: {exc}"[:300])
+    _log(record)
+    return record
 
 
 def is_stale_connection_error(exc: BaseException) -> bool:
@@ -1164,10 +1222,13 @@ class ReissueSidecar:
         path = request.path
         method = request.method
         if method == "POST":
+            # Sleep / wake run to the end even if the caller disconnects (the server
+            # cancels handlers on a lost connection, ``server_options``): the engine
+            # finishes the call anyway, and the sleeping mark must follow its answer.
             if path in cfg.sleep_paths:
-                return await self._handle_sleep(request)
+                return await asyncio.shield(self._handle_sleep(request))
             if path in cfg.wake_paths:
-                return await self._handle_wake(request)
+                return await asyncio.shield(self._handle_wake(request))
             if cfg.enabled and path.startswith(cfg.retry_path_prefix):
                 return await self._handle_generation(request, path)
         elif method == "GET":
@@ -1390,8 +1451,10 @@ class ReissueSidecar:
                 delay = backoff
                 continue
             if resp.status in (502, 503):
-                detail = (await resp.read())[:300].decode("utf-8", "replace")
-                resp.release()
+                try:
+                    detail = (await resp.read())[:300].decode("utf-8", "replace")
+                finally:
+                    resp.release()
                 error = f"gateway HTTP {resp.status}: {detail}"
                 advised = _retry_after(resp.headers.get("Retry-After"))
                 delay = min(advised if advised is not None else backoff, cfg.retry_max_backoff_s)
@@ -1408,6 +1471,7 @@ class ReissueSidecar:
         gateway, unchanged apart from the exclude / depth headers."""
         if added is not None:
             added.discard()  # answered elsewhere: not a locally relayed request
+        request[_REISSUE_PENDING] = "retry"
         cfg = self.cfg
         if depth + 1 > cfg.max_depth:
             self._account("failed", "depth_limit", request, depth, retry_of=reason)
@@ -1432,6 +1496,16 @@ class ReissueSidecar:
         added = AddedTime()  # the full client request is read: the sidecar's clock starts
         try:
             return await self._generation(request, path, raw, added)
+        except asyncio.CancelledError:
+            # The client went away (or the server shuts down): the upstream requests
+            # were closed on the way out. A request whose retry / continuation was cut
+            # short still gets its one tre_reissue_total line.
+            added.discard()
+            self.metrics.event("client_cancel")
+            kind = request.pop(_REISSUE_PENDING, None)
+            if kind is not None:
+                self._account(kind, "client_gone", request, _int_header(request.headers.get(self.cfg.depth_header)))
+            raise
         finally:
             self.metrics.observe_added(added)
 
@@ -1581,6 +1655,7 @@ class ReissueSidecar:
                                 resp.close()
                                 return await self._retry(request, raw, depth, reason, added)
                             if action == "continue":
+                                request[_REISSUE_PENDING] = "passthrough_abort"
                                 abort = info
                                 buffer = b"".join(events[index + 1 :]) + buffer
                                 break
@@ -1718,8 +1793,10 @@ class ReissueSidecar:
                 "POST", plan.path, json.dumps(plan.body).encode("utf-8"), headers
             )
             if cont_resp is not None and cont_resp.status != 200:
-                detail = (await cont_resp.read())[:300].decode("utf-8", "replace")
-                cont_resp.release()
+                try:
+                    detail = (await cont_resp.read())[:300].decode("utf-8", "replace")
+                finally:
+                    cont_resp.release()
                 error = f"gateway HTTP {cont_resp.status}: {detail}"
                 cont_resp = None
         if cont_resp is None:
@@ -1905,6 +1982,7 @@ class ReissueSidecar:
         if action != "continue":
             self._account(action, reason, request, depth)
             return web.Response(body=payload, status=resp.status, headers=headers)
+        request[_REISSUE_PENDING] = "passthrough_abort"
         generated = len(info.generated_ids or ())
         usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
         prompt_tokens = usage.get("prompt_tokens")
@@ -1997,6 +2075,7 @@ class ReissueSidecar:
                 choice.pop(cfg.prompt_ids_field, None)
 
     def _account(self, kind: str, reason: str, request: web.Request, depth: int, **extra: Any) -> None:
+        request.pop(_REISSUE_PENDING, None)
         self.metrics.count(kind, reason)
         record = {"event": "tre_reissue", "ts": round(time.time(), 3), "model": self.cfg.model,
                   "pod": self.cfg.pod_name, "kind": kind, "reason": reason, "path": request.path, "depth": depth}
@@ -2087,6 +2166,7 @@ def main() -> None:
     except ImportError:
         pass
     cfg = Config.from_env()
+    raise_nofile_limit(cfg.nofile_target)
     _log({"event": "tre_reissue_start", "model": cfg.model, "pod": cfg.pod_name, "listen": cfg.listen_port,
           "upstream": cfg.upstream_url, "gateway": cfg.gateway_url, "enabled": cfg.enabled,
           "max_depth": cfg.max_depth, "retry_attempts": cfg.retry_attempts,

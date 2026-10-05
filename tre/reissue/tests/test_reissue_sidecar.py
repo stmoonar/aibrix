@@ -3,7 +3,10 @@
 Topology, all in one event loop on localhost: pod A = sidecar A + fake engine A (the pod
 that is put to sleep), pod B = sidecar B + fake engine B, and a fake TRE gateway routing
 among the pods (honouring x-tre-exclude-pod). The client talks to sidecar A as if the
-gateway had routed the request there."""
+gateway had routed the request there. The sidecars are served with their production server
+options; the fake engines and gateway cancel their handler when the client's connection is
+lost (aiohttp's TestServer always does), like vLLM (aborts the request) and Envoy (resets
+the upstream request)."""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +16,7 @@ from dataclasses import replace
 
 import aiohttp
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestServer, make_mocked_request
 
 from fake_vllm_fork import FakeEngine, FakeGateway, detok, reference_tokens, render_chat, tokenize
@@ -22,6 +26,20 @@ from tre_reissue.sidecar import Config, ReissueSidecar
 MODEL = "m"
 PROMPT = "one two three four"
 HIDDEN = {"X-TRE-Hidden": "1"}
+
+
+class _OptionsServer(TestServer):
+    """A TestServer whose runner gets exactly ``options`` (the sidecar's production server
+    options): TestServer itself always turns handler_cancellation on and drops the
+    keyword arguments of its constructor."""
+
+    def __init__(self, app, options: dict) -> None:
+        super().__init__(app)
+        self._options = dict(options)
+
+    async def _make_runner(self, **kwargs):
+        kwargs.update(self._options)
+        return web.AppRunner(self.app, **kwargs)
 
 
 class Harness:
@@ -43,14 +61,14 @@ class Harness:
         base = replace(base, **self.cfg_overrides)
         self.sidecar_a = ReissueSidecar(replace(base, upstream_url=_url(self.ea), pod_name="pod-a"))
         self.sidecar_b = ReissueSidecar(replace(base, upstream_url=_url(self.eb), pod_name="pod-b"))
-        self.sa = await self._serve(self.sidecar_a.build_app())
-        self.sb = await self._serve(self.sidecar_b.build_app())
+        self.sa = await self._serve(self.sidecar_a.build_app(), sc.server_options(base))
+        self.sb = await self._serve(self.sidecar_b.build_app(), sc.server_options(base))
         self.gateway.pods = {"pod-a": _url(self.sa), "pod-b": _url(self.sb)}
         self.http = aiohttp.ClientSession()
         return self
 
-    async def _serve(self, app) -> TestServer:
-        server = TestServer(app)
+    async def _serve(self, app, options: dict | None = None) -> TestServer:
+        server = TestServer(app) if options is None else _OptionsServer(app, options)
         await server.start_server()
         self.servers.append(server)
         return server
@@ -288,6 +306,8 @@ async def test_completion_stream_continued_with_token_ids_exact_seam():
         assert cont["body"]["temperature"] == 0 and cont["body"]["stream"] is True
         assert cont["exclude"] == {"pod-a"} and cont["target"] == "pod-b"
         assert counts(h)["continue"] == 1 and counts(h)["failed"] == 0
+        # the sleep broke the upstream stream, the client stayed: not a client cancel
+        assert "client_cancel" not in h.sidecar_a.metrics.events
 
 
 @pytest.mark.asyncio
@@ -538,6 +558,59 @@ async def test_continuation_after_mode_wait_budget_expiry():
 # ------------------------------------------------------------ control endpoints
 
 
+# ------------------------------------------------------------ client disconnect
+
+
+async def _until(condition, timeout_s: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while not condition():
+        if loop.time() > deadline:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_client_disconnect_closes_the_upstream_request(stream):
+    """The client goes away while its request waits on the engine (queued / prefill:
+    no token yet): the sidecar closes its upstream request and the engine aborts it.
+    Nothing is retried or counted as a reissue."""
+    async with Harness(a={"hold_at": 0}) as h:
+        body = completion_body(8, stream=stream)
+        if not stream:
+            body.pop("stream_options")
+        task = asyncio.ensure_future(h.post("/v1/completions", body))
+        await _until(lambda: h.engine_a.active)
+        task.cancel()  # the client closes its connection
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _until(lambda: h.engine_a.disconnected == 1)
+        assert not h.engine_a.active
+        assert h.sidecar_a.metrics.events.get("client_cancel") == 1
+        assert counts(h) == {"retry": 0, "continue": 0, "failed": 0, "passthrough_abort": 0}
+        assert h.gateway.requests == []
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_during_a_continuation_closes_the_continuation():
+    """Pod A slept mid-stream and the request is being continued on pod B; the client
+    goes away: B's request is closed too (through the gateway), and A accounts the
+    request once, as passthrough_abort / client_gone."""
+    async with Harness(a={"hold_at": 3}, b={"hold_at": 2}) as h:
+        task = asyncio.ensure_future(h.post("/v1/completions", completion_body(12)))
+        await h.engine_a.wait_generated(3)
+        assert await h.sleep_a() == 200
+        await h.engine_b.wait_generated(2)  # B runs the continuation
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _until(lambda: h.engine_b.disconnected == 1)
+        assert not h.engine_b.active
+        assert h.sidecar_a.metrics.reissue == {("passthrough_abort", "client_gone"): 1}
+        assert counts(h, h.sidecar_b) == {"retry": 0, "continue": 0, "failed": 0, "passthrough_abort": 0}
+
+
 @pytest.mark.asyncio
 async def test_sleep_requires_the_hidden_header():
     async with Harness() as h:
@@ -669,6 +742,49 @@ def test_merge_exclude_and_config_from_env():
     assert Config.from_env({}).gateway_url == sc.DEFAULT_GATEWAY_URL
     with pytest.raises(ValueError):
         Config.from_env({"TRE_GATEWAY_URL": "10.0.0.1:80"})
+
+
+class _FakeResource:
+    RLIMIT_NOFILE = 7
+    RLIM_INFINITY = -1
+
+    def __init__(self, soft: int, hard: int, *, fail: bool = False) -> None:
+        self.soft, self.hard, self.fail = soft, hard, fail
+
+    def getrlimit(self, which: int) -> tuple[int, int]:
+        assert which == self.RLIMIT_NOFILE
+        return self.soft, self.hard
+
+    def setrlimit(self, which: int, limits: tuple[int, int]) -> None:
+        if self.fail:
+            raise ValueError("not allowed to raise the current limit")
+        soft, hard = limits
+        assert which == self.RLIMIT_NOFILE and hard == self.hard
+        assert hard == self.RLIM_INFINITY or soft <= hard
+        self.soft = soft
+
+
+@pytest.mark.parametrize("soft, hard, target, after", [
+    (1024, 524288, 65535, 65535),        # Docker >= 25 / containerd >= 2.0 default: raised
+    (1024, 4096, 65535, 4096),           # capped at the hard limit
+    (1048576, 1048576, 65535, 1048576),  # already higher: never lowered
+    (1024, -1, 65535, 65535),            # unlimited hard limit
+    (1024, 524288, 0, 1024),             # 0: left alone
+])
+def test_open_files_limit_is_raised_up_to_the_hard_limit(monkeypatch, soft, hard, target, after):
+    fake = _FakeResource(soft, hard)
+    monkeypatch.setattr(sc, "resource", fake)
+    sc.raise_nofile_limit(target)
+    assert fake.soft == after
+
+
+def test_open_files_limit_failure_only_warns(monkeypatch, capsys):
+    fake = _FakeResource(1024, 524288, fail=True)
+    monkeypatch.setattr(sc, "resource", fake)
+    sc.raise_nofile_limit(65535)  # does not raise
+    assert fake.soft == 1024
+    (line,) = [json.loads(x) for x in capsys.readouterr().out.splitlines() if "tre_reissue_nofile" in x]
+    assert line["level"] == "WARNING" and line["before"] == 1024 and line["after"] == 1024
 
 
 # ------------------------------------------- B4: tre_reissue_proxy_added_seconds
