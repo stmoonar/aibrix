@@ -48,15 +48,21 @@ def _ev(ts, tin=50, mt=20, src="header", reissue="none", kind="arr"):
                         in_src=src, max_tokens=mt, out_tokens=None, status=None, reissue=reissue)
 
 
-def _model(now, events=(), awake=2, busy=0.0, name=M):
+COMPLETE = object()
+
+
+def _model(now, events=(), awake=2, busy=0.0, name=M, cover=True, since=COMPLETE):
+    """Default: complete evidence (the stream covers the pod, 60 s of gap-free events)."""
     pod = PodSnapshot(pod="p", model=name, node=None, gpu_ids=(0,), running=busy, waiting=0.0, kv_usage=0.1,
-                      counters={}, num_gpu_blocks=None, block_size=None, scraped_at_ms=now)
+                      counters={}, num_gpu_blocks=None, block_size=None, scraped_at_ms=now,
+                      tracked_inflight=int(busy), events_cover=cover)
     return ModelSnapshot(model=name, awake=awake, min_replicas=1, max_replicas=8, gpus_per_replica=1,
-                         ttft_slo_ms=500, tpot_slo_ms=75, max_num_seqs=None, pods=(pod,), events=tuple(events))
+                         ttft_slo_ms=500, tpot_slo_ms=75, max_num_seqs=None, pods=(pod,), events=tuple(events),
+                         events_since_ms=now - 60_000 if since is COMPLETE else since)
 
 
-def _snap(now, events=(), awake=2, busy=0.0):
-    return ClusterSnapshot(now_ms=now, tick_s=2.0, models={M: _model(now, events, awake, busy)})
+def _snap(now, events=(), awake=2, busy=0.0, **kw):
+    return ClusterSnapshot(now_ms=now, tick_s=2.0, models={M: _model(now, events, awake, busy, **kw)})
 
 
 def _hand_events(t=95_000):
@@ -134,23 +140,31 @@ def test_rate_zero_never_misbuckets():
     assert d.inputs["misbucketed"] == 0
 
 
-def test_degraded_stale_when_pods_busy():
+def test_unknown_is_not_idle_no_scale_down():
+    # Review repro: first start, no event history, the pod runs 20 requests -> was idle/0.
+    d = _policy().decide(_snap(100_000, awake=3, busy=20.0, cover=False, since=None))[M]
+    assert (d.desired, d.reason) == (3, "incomplete")
+    assert set(d.inputs["gaps"]) == {"no_event_history", "event_gap"}
+    # after a stream gap the pod still runs requests from before it (cohort not drained)
     p = _policy()
     p.decide(_snap(100_000, [_ev(99_000)]))
-    d = p.decide(_snap(140_000, awake=3, busy=4.0))[M]
-    assert d.reason == "degraded_stale_events" and d.desired == 3
+    d = p.decide(_snap(140_000, awake=3, busy=4.0, cover=False))[M]
+    assert (d.desired, d.reason) == (3, "incomplete") and d.inputs["gaps"] == ["event_gap"]
+    # a window not yet covered by gap-free history (5 s of a 10 s window): no scale-down ...
+    d = _policy().decide(_snap(100_000, [_ev(99_000)], awake=3, since=95_000))[M]
+    assert (d.desired, d.reason) == (3, "incomplete") and d.inputs["policy_desired"] == 1
+    # ... but a scale-up still acts on the arrivals seen so far
+    d = _policy().decide(_snap(100_000, _hand_events(99_000), awake=3, since=95_000))[M]
+    assert (d.desired, d.reason) == (6, "velocity")
 
 
-def test_stale_but_pods_idle_is_idle_not_degraded():
+def test_empty_window_is_idle_only_when_engines_are_idle():
     p = _policy()
     p.decide(_snap(100_000, [_ev(99_000)]))
     d = p.decide(_snap(140_000, awake=3, busy=0.0))[M]
     assert d.reason == "idle" and d.desired == 0
-
-
-def test_no_traffic_ever_is_idle():
-    d = _policy().decide(_snap(100_000, awake=2, busy=5.0))[M]
-    assert d.reason == "idle" and d.desired == 0
+    d = p.decide(_snap(142_000, awake=3, busy=2.0))[M]      # tracked long requests still decoding
+    assert (d.desired, d.reason) == (3, "empty_window_busy")
 
 
 def test_degraded_estimate_fraction():

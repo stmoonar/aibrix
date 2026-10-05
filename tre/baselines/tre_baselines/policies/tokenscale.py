@@ -1,4 +1,4 @@
-"""TokenScale baseline (Token-Velocity autoscaler), collapsed to colocated prefill+decode.
+"""TokenScale-colocated baseline (Token-Velocity autoscaler on colocated prefill+decode).
 
 Source: TokenScale SS III-B (token velocity), SS IV-B2 (offline profiling), SS IV-C
 (scaler), Table II (3x3 request buckets). The paper scales separate prefiller and decoder
@@ -12,7 +12,17 @@ pools; TRE serves colocated replicas, so both terms are computed and the larger 
   velocity (paper: prefiller autoscaler, ``I^P = lambda / min(V_P, V_BW)``; V_BW is dropped
   because nothing is transferred between pods here).
 
-Scale-down is immediate (paper: no hysteresis); the shell clamps ``desired``.
+Scale-down is immediate (paper: no hysteresis; a sleep is cheap here and the crowd-out
+cost is reported as a result); the shell clamps ``desired``. Unknown is not idle:
+
+* a scale-down needs complete evidence (:func:`~tre_baselines.snapshot.evidence_gaps`
+  with events, including ``window_s`` of gap-free event history, so a window that started
+  before the shell or a stream gap is never read as low load); otherwise ``desired`` is
+  held at ``awake`` (reason ``incomplete``). A scale-up uses the window as it is.
+* an empty window is not "0 replicas needed" by itself: ``desired`` 0 (reason ``idle``;
+  the shell clamps to the floor) only when the evidence is complete **and** every pod
+  reports nothing running or waiting; otherwise it holds (``incomplete`` /
+  ``empty_window_busy``).
 
 Input: ``ModelSnapshot.events`` of kind ``arr`` (fields ``in_tokens``, ``max_tokens``,
 ``in_src``, ``reissue``, ``ts_ms``); other kinds are ignored.
@@ -42,20 +52,13 @@ key                          default     meaning
 ``seed``                     config.seed RNG seed (``random.Random``). ours
 ``skip_reissue``             true        ignore events with ``reissue != "none"``. ours
 ``window_s``                 10          lambda window over ``ts_ms``. ours (not in paper)
-``stale_s``                  30          stream considered stalled when the newest ``arr``
-                                         is older than this while the pods are busy. ours
 ``max_estimate_frac``        0.05        degraded when the window's share of
                                          ``in_src == "estimate"`` exceeds it. ours
 ===========================  ==========  =================================================
 
-Degraded (``desired = awake``, reason ``degraded_<why>``):
-
-* ``stale_events``: newest ``arr`` older than ``stale_s``, the model has awake pods, events
-  were seen before, and its pods still report running/waiting requests (traffic exists but
-  the event stream stopped). Without busy pods it is plain idleness: ``desired`` 0 (the
-  shell clamps to min), reason ``idle``. Judgement call: events alone cannot tell "stream
-  broken" from "trace ended".
-* ``estimate_frac``: too many token counts are estimates (inaccurate for Chinese text).
+Degraded (``desired = awake``, reason ``degraded_estimate_frac``): too many token counts
+are estimates (inaccurate for Chinese text). A stalled event stream needs no timer of its
+own: requests the engines run but the stream does not show are an ``event_gap``.
 """
 from __future__ import annotations
 
@@ -65,8 +68,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Mapping, Optional
 
-from tre_baselines.policies.base import Decision
-from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot
+from tre_baselines.policies.base import INCOMPLETE, Decision, hold_if_incomplete
+from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, evidence_gaps
 
 N_IN = 3
 N_OUT = 3
@@ -145,11 +148,15 @@ def _parse_edges(model: str, raw: Any, problems: list[str]) -> Optional[tuple[tu
 
 class TokenScalePolicy:
     name = "tokenscale"
+    #: Arm name in decision records and docs (PD-disaggregated policy on colocated replicas).
+    label = "TokenScale-colocated"
+    needs_events = True
 
     def __init__(self, config: Any) -> None:
         p: Mapping[str, Any] = dict(getattr(config, "policy_params", None) or {})
         self.window_s = float(p.get("window_s", 10.0))  # not in paper
-        self.stale_s = float(p.get("stale_s", 30.0))  # not in paper
+        #: A scale-down needs this much gap-free event history (the whole window).
+        self.event_history_s = self.window_s
         self.max_estimate_frac = float(p.get("max_estimate_frac", 0.05))  # not in paper
         self.misbucket_rate = float(p.get("misbucket_rate", 0.15))  # paper: 85 % predictor
         self.skip_reissue = bool(p.get("skip_reissue", True))
@@ -230,10 +237,10 @@ class TokenScalePolicy:
             if model not in self._managed:
                 # Restricted via ``models`` (or absent from the registry): not ours.
                 continue
-            out[model] = self._decide_model(snap.now_ms, model, ms)
+            out[model] = self._decide_model(snap.now_ms, snap.tick_s, model, ms)
         return out
 
-    def _decide_model(self, now_ms: int, model: str, ms: ModelSnapshot) -> Decision:
+    def _decide_model(self, now_ms: int, tick_s: float, model: str, ms: ModelSnapshot) -> Decision:
         n_new, n_missing, n_mis = self._ingest(model, ms)
         win = self._win[model]
         cutoff = now_ms - self.window_s * 1000.0
@@ -269,13 +276,18 @@ class TokenScalePolicy:
             "awake": ms.awake,
         }
         last = self._last_arr_ms.get(model)
-        if last is not None and ms.awake > 0 and now_ms - last > self.stale_s * 1000.0:
-            if any((p.running + p.waiting) > 0 for p in ms.pods):
-                inputs["newest_event_age_s"] = round((now_ms - last) / 1000.0, 1)
-                return Decision(ms.awake, "degraded_stale_events", inputs)
+        if last is not None:
+            inputs["newest_event_age_s"] = round((now_ms - last) / 1000.0, 1)
+        gaps = evidence_gaps(ms, now_ms, tick_s, events=True, history_s=self.window_s)
         if est_frac > self.max_estimate_frac:
             return Decision(ms.awake, "degraded_estimate_frac", inputs)
         if not win:
+            # An empty window alone is unknown, not idle: 0 only on complete evidence with
+            # every engine reporting nothing in flight.
+            if gaps:
+                return Decision(ms.awake, INCOMPLETE, {**inputs, "gaps": list(gaps)})
+            if not ms.pods or any(p.queued for p in ms.pods):
+                return Decision(ms.awake, "empty_window_busy", inputs)
             return Decision(0, "idle", inputs)
         desired = math.ceil(max(term_b, term_p) - 1e-9)
-        return Decision(max(int(desired), 0), "velocity", inputs)
+        return hold_if_incomplete(Decision(max(int(desired), 0), "velocity", inputs), ms.awake, gaps)

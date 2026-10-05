@@ -1,4 +1,4 @@
-# Example params for TRE_BL_POLICY=tokenscale (TRE_BL_POLICY_CONFIG points at this file).
+# TokenScale-colocated example params for TRE_BL_POLICY=tokenscale (TRE_BL_POLICY_CONFIG points at this file).
 # Every velocity below is a PLACEHOLDER: the policy refuses to start with missing / <= 0
 # entries, and real values must be profiled on the current engine
 # (tools/tokenscale_profile.py) -- do not use these numbers for an experiment.
@@ -20,5 +20,4 @@ misbucket_rate: 0.15         # paper: 85 %-accurate length predictor
 seed: 0                      # default: TRE_BL_SEED
 skip_reissue: true
 window_s: 10                 # not in paper
-stale_s: 30                  # not in paper
 max_estimate_frac: 0.05      # not in paper
