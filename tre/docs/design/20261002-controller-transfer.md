@@ -37,10 +37,10 @@ donor 策略不变：CRIT 的 IDLE / HIGH donor 立即释放；公平环的 IDLE
 - 路由视图读不到（Pod LIST / Redis 失败）：结构化 409 `routable_unknown`（什么都没做）。
 - `/target` 缩容按 floor clamp，200 带 `taken`、`clamped_by_floor`；`/v2/state` 带每个 binding 的 `routable`、
   每个模型的 `routable` / `floor` / `floor_headroom`、顶层 `floor_enforced`。
-- 超时：SM 最坏持锁是 `worst_case_lock_hold_s`（默认值下一次接力约 116 s）；客户端看到的最坏一次调用是
-  `worst_case_sleep_call_s` = `writer_lock_wait_s` + 最长持锁 + `io_margin_s`（默认 148 s）。控制器的慢调用超时
+- 超时：SM 最坏持锁是 `worst_case_lock_hold_s`（默认值下约 270 s，含串行 Kubernetes 调用各 7 s 上限）；客户端看到的最坏一次调用是
+  `worst_case_sleep_call_s` = `writer_lock_wait_s` + 最长持锁 + `io_margin_s`（默认 302 s）。控制器的慢调用超时
   （`service_manager.api_call_timeout_s` / `TRE_SM_SLOW_TIMEOUT_SECONDS`，360 s）必须大于它
-  （`app.resolve_sm_call_timeout_s` 启动时用 `sleep_call_timeout_errors` 检查），覆盖"排队等锁 + 本次操作"。控制器里没有依赖旧的分钟级超时做的计算：
+  ；如果设了 `TRE_SM_SLOW_TIMEOUT_SECONDS`，必须 > 302 s（`app.resolve_sm_call_timeout_s` 启动时用 `sleep_call_timeout_errors` 检查），覆盖"排队等锁 + 本次操作"。控制器里没有依赖旧的分钟级超时做的计算：
   接力不重试、无后续跟踪；`commit_max_age_ms`、view 新鲜度等都与 SM 调用时长无关。
 
 ## 3. SM 视图（`/v2/state`）
@@ -181,7 +181,7 @@ refusals（`wake_refused:<model>:<node>/<gpus>:<code>`）、`clamped_by_floor`�
   `unfilled` / `refusals` 返回，下一 tick 重新规划。
 - 中间地带 SafeScale 仍点名探测 pod（取自估算），提交时 receiver 走 `/target` 的 at_least 唤醒，由 SM 选位置；
   这一路径本批不改。
-- 全局写锁下，一次接力（默认值下最坏持锁约 116 s）期间其它模型的 SM 写调用在 SM 侧排队；控制器的 ActionQueue 仍并发
+- 全局写锁下，一次接力（默认值下最坏持锁约 270 s）期间其它模型的 SM 写调用在 SM 侧排队；控制器的 ActionQueue 仍并发
   下发不同模型的动作，排队超时的以 `writer_busy` 返回、下一 tick 重新规划。
 - 纯文本 RetryLater：方案 B 的 `/target`、`/v2/transfers` 不再发（只剩 unhide 未确认醒、Pod 启动准入）。
   10-06 起控制器不再识别 `detail` 以 `retry` 结尾的 409：没有 `error` 码的 409 一律按"结果未知"保守处理

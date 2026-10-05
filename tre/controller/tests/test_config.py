@@ -278,9 +278,13 @@ def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> 
     registry = Registry(ClusterTopology(nodes=()), [], service_manager=parse_service_manager_config(None))
     assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), registry) == 360.0
     assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=400.0), registry) == 400.0
-    # whole-lock (2026-10-02): the worst-case call is 110 s with the defaults
-    with pytest.raises(ValueError, match="TRE_SM_SLOW_TIMEOUT_SECONDS = 100s"):
-        resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=100.0), registry)
+    # The timeout must outlast the SM's worst-case call (common formula: lock wait +
+    # longest writer-lock hold incl. bounded Kubernetes calls + I/O margin).
+    worst = registry.service_manager().worst_case_sleep_call_s()
+    assert worst < 360.0
+    assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=worst + 1.0), registry) == worst + 1.0
+    with pytest.raises(ValueError, match="TRE_SM_SLOW_TIMEOUT_SECONDS"):
+        resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=worst), registry)
     slow = Registry(
         ClusterTopology(nodes=()),
         [],
