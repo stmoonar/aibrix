@@ -18,6 +18,16 @@
 #   REFIT_PARAMS_FILE    the second parameter set the preregistration names (the campaign
 #                        requires one; with a single frozen set, name the freeze file again)
 #   DESIGN_SEED          must equal the preregistration's t14.design_seed
+#
+# Read from the (sidecar-verified) preregistration and passed to the campaign, which checks
+# them again against the preregistration (calibration_t14.check_preregistration):
+#   t14.cell_serial_base                          -> --t14-cell-serial-base
+#   t14.stream_cut.runtime_limit.max_model_error_rate (next round: 0.10)
+#                                                 -> --max-model-error-rate
+#   t14.conditions.label_attribution (next round: hybrid)
+#                                                 -> --fit-label-attribution
+# A key the preregistration does not have is not passed (the 2026-10-03 preregistration has
+# no stream_cut / label_attribution: its 0.10 came from an addendum, given by hand after --).
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 calib_parse_args "$@"
@@ -26,6 +36,25 @@ for v in PREREG_JSON CAPACITY_PRIOR FREEZE_FILE REFIT_PARAMS_FILE DESIGN_SEED; d
 calib_require_file "$PREREG_JSON" "$PREREG_JSON.sha256" "$CAPACITY_PRIOR" "$FREEZE_FILE" "$REFIT_PARAMS_FILE"
 ( cd "$(dirname "$PREREG_JSON")" && sha256sum -c "$(basename "$PREREG_JSON").sha256" ) \
   || calib_die "$PREREG_JSON does not match its sha256 sidecar"
+prereg_value() {   # prereg_value <dotted key> -> the value, or nothing when the key is absent
+  python3 - "$PREREG_JSON" "$1" <<'PY'
+import json, sys
+cur = json.load(open(sys.argv[1]))
+for part in sys.argv[2].split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        sys.exit(0)
+    cur = cur[part]
+print(cur)
+PY
+}
+PREREG_ARGS=()
+for pair in t14.cell_serial_base=--t14-cell-serial-base \
+            t14.stream_cut.runtime_limit.max_model_error_rate=--max-model-error-rate \
+            t14.conditions.label_attribution=--fit-label-attribution; do
+  v="$(prereg_value "${pair%%=*}")"
+  if [[ -n "$v" ]]; then PREREG_ARGS+=("${pair#*=}" "$v"); fi
+done
+echo "from the preregistration: ${PREREG_ARGS[*]:-(none)}"
 for f in "$FREEZE_FILE" "$REFIT_PARAMS_FILE"; do
   ( calib_enter_deploy && python3 -m scripts.dline_refit verify-freeze --freeze-file "$f" ) \
     || calib_die "$f does not verify"
@@ -41,4 +70,5 @@ calib_launch T14 \
   --freeze-file "$FREEZE_FILE" \
   --refit-params-file "$REFIT_PARAMS_FILE" \
   --preregistration-json "$PREREG_JSON" \
-  --design-seed "$DESIGN_SEED"
+  --design-seed "$DESIGN_SEED" \
+  ${PREREG_ARGS[@]+"${PREREG_ARGS[@]}"}

@@ -1,6 +1,35 @@
 #!/usr/bin/env python3
-"""T14 scorer - the preregistered evaluation of the held-out 14b set, round 2026-10-03.
-DRAFT for the owner's review (2026-10-04); not sealed, not run on T14.
+"""T14 scorer - the preregistered evaluation of the held-out 14b set.
+
+Two rule versions, chosen by the preregistration itself (never by a flag):
+
+* **v1** - round 2026-10-03 (``$CALIB_ROOT/t14/preregistration.json`` + the stream-cut and
+  cross-shape addenda; scoring decisions D1-D5 of ``ADDENDUM-T14-scoring``). Gates A and
+  B' (dwell 1). Kept byte-for-byte in behaviour so the sealed ``eval/T14_score.json``
+  reproduces (``label_attribution`` is the only key a v1 output gains).
+* **v2** - the next round (design 2026-10-05, ``schema`` = :data:`PREREG_SCHEMA_V2`): the
+  stream-cut rule, the cross-shape claim rule and D1-D5 are INLINE in the preregistration
+  (``t14.stream_cut``, ``evaluation.cross_shape``, ``evaluation.scoring``); no addendum is
+  read (one is refused). The gate set follows the new acceptance on steady holds:
+
+  - A (BA >= .80, CI95 low >= .75, drop from training <= .08) - a gate, with the
+    pre-declared consequence of an A-only failure (``evaluation.outcome_statements``);
+  - FA: CRITICAL false alarm on healthy windows at dwell 1 <= .05, CI95 high <= .08;
+  - onset episodes: NOT APPLICABLE - T14 is 24 steady holds and has no dynamic cell, so it
+    has no overload onset to catch (the onset gate is judged on M2's dynamic cells);
+  - D (theta CI half width) is a property of the training fit, not of T14 (as in v1);
+  - window B' (severe recall at the freeze's sealed cut) is DISCLOSED, not gating;
+  - the cross-shape claim (D1, D2) is sealed as a claim rule, not a gate.
+
+Label attribution (both versions): the window label's request-to-window attribution
+(``completion`` = every label so far; ``hybrid`` = label v2, TTFT by first token) is read
+from the frozen label (``verdict_for_holdout.label_def["attribution"]``, absent =
+completion), the dataset manifest (``attribution.value``, absent = completion), the T14
+manifest's label, the v2 preregistration (``t14.conditions.label_attribution``) and the
+dry-run record. They must all agree, or the scorer refuses: T14 is scored under ONE
+attribution, the one the dataset carries, and never mixes them.
+
+v1 rule text follows (unchanged).
 
 The rule, as preregistered (``$CALIB_ROOT/t14/preregistration.json``, sha256 59608505...,
 key ``evaluation``) - quoted:
@@ -193,6 +222,25 @@ STATUS_REDRIVE = "void_redrive_required"
 STATUS_RUN_VOID = "run_void"
 CLAIM_NOT_EVALUABLE = "not_evaluable"
 
+#: The ``schema`` of a next-round (v2) preregistration; a preregistration without it is v1.
+PREREG_SCHEMA_V2 = "t14-prereg-v2"
+#: Label attributions (``tre_common.slo_labels.ATTRIBUTIONS`` of label v2; absent = completion).
+ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID = "completion", "hybrid"
+ATTRIBUTIONS = (ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID)
+#: v2: the D1-D5 keys the preregistration's ``evaluation.scoring.decisions`` must carry.
+V2_DECISION_KEYS = ("D1_cross_shape_sd", "D2_single_class_shape", "D3_void_at_audit",
+                    "D4_model_error_without_e2e", "D5_training_ba")
+ONSET_NOT_APPLICABLE = {
+    "status": "not_applicable",
+    "why": ("T14 is 24 steady holds (0.9 / 1.0 / 1.1 x C^_s, 240 s) and has no dynamic cell: there is no "
+            "overload onset to catch. The onset-episode gate of the new acceptance is judged on M2's "
+            "dynamic cells only."),
+}
+V2_VERDICT_RULE = ("only with status 'evaluated': pass iff A (BA >= .80, CI95 low >= .75, drop from training "
+                   "<= .08) and FA (CRITICAL false alarm on healthy windows at dwell 1 <= .05, CI95 high <= .08) "
+                   "are all met; onset episodes not applicable (steady holds); window B' and D disclosed; "
+                   "fail = reported as is, with the pre-declared consequence of an A-only failure")
+
 
 class Refused(RuntimeError):
     def __init__(self, problems: Sequence[str]):
@@ -229,14 +277,96 @@ def _close(a: Any, b: Any, tol: float = 1e-9) -> bool:
         return False
 
 
+def label_attribution(label_def: Optional[Mapping[str, Any]]) -> str:
+    """The request-to-window attribution of a label record (absent = completion, label v1)."""
+    return str((label_def or {}).get("attribution") or ATTRIBUTION_COMPLETION)
+
+
+def freeze_attribution(doc: Mapping[str, Any], model: str) -> str:
+    """The attribution of the label ``model`` was frozen under (the label the scorer labels
+    every window with: ``verdict_for_holdout.label_def``)."""
+    entry = (doc.get("models") or {}).get(model) or {}
+    return label_attribution((entry.get("verdict_for_holdout") or {}).get("label_def") or entry.get("label_def"))
+
+
+def dataset_attribution(directory: Path) -> str:
+    """The attribution a standard dataset was labelled under: its manifest's
+    ``attribution.value`` (``calibration_dataset.dataset_attribution`` when that helper
+    exists - label v2 - else the manifest read by the same contract); absent = completion."""
+    try:
+        from scripts import calibration_dataset as cd
+        helper = getattr(cd, "dataset_attribution", None)
+    except ImportError:            # pragma: no cover - the module is always there in the repo
+        helper = None
+    if helper is not None:
+        try:
+            return str(helper(Path(directory)))
+        except ValueError as exc:          # an unknown attribution in the manifest
+            raise Refused([f"dataset {directory}: {exc}"])
+    d = Path(directory)
+    man = d / "manifest.json" if (d / "manifest.json").exists() else d / "dataset" / "manifest.json"
+    try:
+        doc = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ATTRIBUTION_COMPLETION
+    att = doc.get("attribution")
+    if isinstance(att, Mapping):
+        att = att.get("value")
+    return str(att or ATTRIBUTION_COMPLETION)
+
+
+def check_attributions(sources: Mapping[str, Any]) -> tuple[Optional[str], list[str]]:
+    """``(the one attribution, problems)``: every source (``{what: attribution}``) must name
+    the same known attribution - T14 is scored under one attribution and never mixes them."""
+    problems = [f"{what}: unknown label attribution {a!r} (known: {list(ATTRIBUTIONS)})"
+                for what, a in sources.items() if a not in ATTRIBUTIONS]
+    values = sorted({str(a) for a in sources.values()})
+    if len(values) > 1:
+        problems.append("mixed label attributions - T14 is scored under ONE attribution, the one the dataset "
+                        "carries, and never mixes them: " + ", ".join(f"{w} = {a}" for w, a in sources.items()))
+    return (values[0] if len(values) == 1 and not problems else None), problems
+
+
+def _v2_rule_checks(prereg: Mapping[str, Any]) -> list[str]:
+    """The v2 preregistration's inline rule blocks the scorer implements (beyond the shared
+    A / stream-cut / cross-shape checks)."""
+    from scripts import dline_refit as dl
+
+    problems: list[str] = []
+    t14 = prereg.get("t14") or {}
+    ev = prereg.get("evaluation") or {}
+    fa = ev.get("FA") or {}
+    want_fa = {"false_alarm_max": dl.B_FALSE_ALARM_MAX, "false_alarm_ci95_high_max": dl.B_FALSE_ALARM_CI_HIGH_MAX}
+    gate = fa.get("gate") or {}
+    if any(not _close(gate.get(k), v) for k, v in want_fa.items()):
+        problems.append(f"prereg evaluation.FA.gate {gate} != {want_fa}")
+    if fa.get("dwell_windows") != dl.ONLINE_DWELL_WINDOWS:
+        problems.append(f"prereg evaluation.FA.dwell_windows {fa.get('dwell_windows')!r} != "
+                        f"dline_refit.ONLINE_DWELL_WINDOWS {dl.ONLINE_DWELL_WINDOWS}")
+    if (ev.get("onset_episodes") or {}).get("status") != ONSET_NOT_APPLICABLE["status"]:
+        problems.append("prereg evaluation.onset_episodes.status is not 'not_applicable' (T14 has no dynamic cell)")
+    missing = [k for k in V2_DECISION_KEYS if k not in ((ev.get("scoring") or {}).get("decisions") or {})]
+    if missing:
+        problems.append(f"prereg evaluation.scoring.decisions misses {missing}")
+    if t14.get("void_rule") != VOID_RULE_TEXT:
+        problems.append(f"prereg t14.void_rule {t14.get('void_rule')!r} is not the implemented rule")
+    if "a_only_fail" not in (ev.get("outcome_statements") or {}):
+        problems.append("prereg evaluation.outcome_statements has no pre-declared 'a_only_fail' consequence")
+    if (t14.get("conditions") or {}).get("label_attribution") not in ATTRIBUTIONS:
+        problems.append(f"prereg t14.conditions.label_attribution "
+                        f"{(t14.get('conditions') or {}).get('label_attribution')!r} not in {list(ATTRIBUTIONS)}")
+    return problems
+
+
 def check_inputs(prereg_path: Path, addenda: Sequence[Path], freeze_file: Path) -> dict:
-    """Every check on the prereg, the addenda and the freeze; raises :class:`Refused`."""
+    """Every check on the prereg, the addenda (v1) and the freeze; raises :class:`Refused`."""
     from scripts import b_prime
     from scripts import dline_refit as dl
 
     problems: list[str] = []
     prereg_sha = _sidecar_ok(prereg_path, problems)
     prereg = json.loads(prereg_path.read_text(encoding="utf-8")) if prereg_path.is_file() else {}
+    v2 = prereg.get("schema") == PREREG_SCHEMA_V2
     ev = prereg.get("evaluation") or {}
     a_ci = str((ev.get("A") or {}).get("ci") or "")
     if str(PREREG_RESAMPLES) not in a_ci or str(PREREG_SEED) not in a_ci:
@@ -249,30 +379,40 @@ def check_inputs(prereg_path: Path, addenda: Sequence[Path], freeze_file: Path) 
     if any(not _close(gates.get(k), v) for k, v in want_a.items()):
         problems.append(f"prereg A gates {gates} != the accept constants {want_a}")
     adds: dict[str, dict] = {}
-    for p in addenda:
-        sha = _sidecar_ok(p, problems)
-        doc = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-        if (doc.get("amends") or {}).get("sha256") != prereg_sha:
-            problems.append(f"{p}: amends {(doc.get('amends') or {}).get('sha256')} != the prereg sha256 {prereg_sha}")
-        kind = "streamcut" if "audit_rule" in doc else ("crossshape" if "chapter2_outputs" in doc else None)
-        if kind is None:
-            problems.append(f"{p}: neither the stream-cut nor the cross-shape addendum")
-            continue
-        adds[kind] = {"path": str(p), "sha256": sha, "doc": doc}
-    for kind in ("streamcut", "crossshape"):
-        if kind not in adds:
-            problems.append(f"the {kind} addendum is not given (--addendum)")
-    sc = (adds.get("streamcut") or {}).get("doc") or {}
+    if v2:
+        if addenda:
+            problems.append(f"a {PREREG_SCHEMA_V2} preregistration carries its rules inline (t14.stream_cut, "
+                            f"evaluation.cross_shape, evaluation.scoring); no --addendum is read: {list(map(str, addenda))}")
+        problems += _v2_rule_checks(prereg)
+        sc = (prereg.get("t14") or {}).get("stream_cut") or {}
+        cs = ev.get("cross_shape") or {}
+        where_sc, where_cs = "prereg t14.stream_cut", "prereg evaluation.cross_shape"
+    else:
+        for p in addenda:
+            sha = _sidecar_ok(p, problems)
+            doc = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+            if (doc.get("amends") or {}).get("sha256") != prereg_sha:
+                problems.append(f"{p}: amends {(doc.get('amends') or {}).get('sha256')} != the prereg sha256 {prereg_sha}")
+            kind = "streamcut" if "audit_rule" in doc else ("crossshape" if "chapter2_outputs" in doc else None)
+            if kind is None:
+                problems.append(f"{p}: neither the stream-cut nor the cross-shape addendum")
+                continue
+            adds[kind] = {"path": str(p), "sha256": sha, "doc": doc}
+        for kind in ("streamcut", "crossshape"):
+            if kind not in adds:
+                problems.append(f"the {kind} addendum is not given (--addendum)")
+        sc = (adds.get("streamcut") or {}).get("doc") or {}
+        cs = (((adds.get("crossshape") or {}).get("doc") or {}).get("chapter2_outputs") or {}).get("cross_shape") or {}
+        where_sc, where_cs = "stream-cut addendum", "cross-shape"
     rule = sc.get("audit_rule") or {}
     if "e2e_ms >= 150000" not in str(rule.get("cut") or ""):
-        problems.append(f"stream-cut addendum cut {rule.get('cut')!r} is not 'e2e_ms >= 150000'")
+        problems.append(f"{where_sc} cut {rule.get('cut')!r} is not 'e2e_ms >= 150000'")
     if "0.05" not in str(rule.get("rule") or ""):
-        problems.append("stream-cut addendum rule does not name the 0.05 limit")
+        problems.append(f"{where_sc} rule does not name the 0.05 limit")
     if not _close((sc.get("runtime_limit") or {}).get("max_model_error_rate"), RUNTIME_MODEL_ERROR_LIMIT):
-        problems.append("stream-cut addendum runtime_limit.max_model_error_rate != 0.10")
-    cs = (((adds.get("crossshape") or {}).get("doc") or {}).get("chapter2_outputs") or {}).get("cross_shape") or {}
+        problems.append(f"{where_sc} runtime_limit.max_model_error_rate != 0.10")
     if "SD of the per-shape BA <= the median per-shape BA CI95 half width" not in str(cs.get("claim_rule") or ""):
-        problems.append(f"cross-shape claim rule {cs.get('claim_rule')!r} is not the one implemented")
+        problems.append(f"{where_cs} claim rule {cs.get('claim_rule')!r} is not the one implemented")
 
     model = str((prereg.get("t14") or {}).get("model") or "")
     ps = (prereg.get("parameter_sets") or {}).get("freeze") or {}
@@ -282,6 +422,7 @@ def check_inputs(prereg_path: Path, addenda: Sequence[Path], freeze_file: Path) 
     except dl.FreezeError as exc:
         problems += exc.problems
     freeze_sha = _sha256(freeze_file) if freeze_file.is_file() else None
+    bp_key = "B_prime_disclosure" if v2 else "B_prime"
     if doc:
         if freeze_sha != ps.get("sha256"):
             problems.append(f"freeze file sha256 {freeze_sha} != prereg parameter_sets.freeze.sha256 {ps.get('sha256')}")
@@ -297,24 +438,32 @@ def check_inputs(prereg_path: Path, addenda: Sequence[Path], freeze_file: Path) 
                 if not _close(pub.get(k), want.get(k)):
                     problems.append(f"freeze {model} published {k} {pub.get(k)} != prereg {want.get(k)}")
             cut = (entry.get("b_prime") or {}).get("severity_cut")
-            pre_cut = ((ev.get("B_prime") or {}).get(f"{model}_cut"))
+            pre_cut = ((ev.get(bp_key) or {}).get(f"{model}_cut"))
             if not _close(round(float(cut or 0), 5), pre_cut, 1e-12):
                 problems.append(f"freeze {model} B' cut {cut} != prereg {pre_cut}")
             if str(entry.get("numerator") or "gateway") != "gateway":
                 problems.append(f"freeze {model} numerator {entry.get('numerator')} != gateway (prereg data)")
+            if v2:
+                label = (entry.get("verdict_for_holdout") or {}).get("label_def") or {}
+                want_label = (prereg.get("t14") or {}).get("conditions", {}).get("label_def_sha256")
+                if dl.canonical_sha256(label) != want_label:
+                    problems.append(f"freeze {model} label sha256 {dl.canonical_sha256(label)} != prereg "
+                                    f"t14.conditions.label_def_sha256 {want_label}")
         try:
             gate = b_prime.check_gate(doc.get("b_prime_gate") or {})
-            pre_gate = (ev.get("B_prime") or {}).get("gate") or {}
-            if any(not _close(gate[k], pre_gate.get(k)) for k in b_prime.GATE_KEYS):
-                problems.append(f"freeze B' gate {gate} != prereg {pre_gate}")
-            if int(pre_gate.get("online_dwell_windows", -1)) != dl.ONLINE_DWELL_WINDOWS:
-                problems.append("prereg B' dwell != dline_refit.ONLINE_DWELL_WINDOWS")
+            if not v2:
+                pre_gate = (ev.get("B_prime") or {}).get("gate") or {}
+                if any(not _close(gate[k], pre_gate.get(k)) for k in b_prime.GATE_KEYS):
+                    problems.append(f"freeze B' gate {gate} != prereg {pre_gate}")
+                if int(pre_gate.get("online_dwell_windows", -1)) != dl.ONLINE_DWELL_WINDOWS:
+                    problems.append("prereg B' dwell != dline_refit.ONLINE_DWELL_WINDOWS")
         except ValueError as exc:
             problems.append(f"freeze B' gate: {exc}")
     if problems:
         raise Refused(problems)
     return {"prereg": prereg, "prereg_sha256": prereg_sha, "addenda": adds, "doc": doc,
-            "freeze_sha256": freeze_sha, "model": model}
+            "freeze_sha256": freeze_sha, "model": model, "schema": "v2" if v2 else "v1",
+            "stream_cut": sc, "cross_shape": cs, "freeze_attribution": freeze_attribution(doc, model)}
 
 
 def prereg_cells(prereg: Mapping[str, Any]) -> dict[str, dict]:
@@ -614,6 +763,41 @@ def dry_run_rows(dataset_dir: Path, model: str) -> tuple[list[str], list[dict], 
     return header, rows, cells
 
 
+def fa_gate(entry: Mapping[str, Any], windows: Sequence[Any], *, gate: Mapping[str, float], n_resamples: int,
+            seed: int, b_prime_block: Optional[Mapping[str, Any]] = None) -> dict:
+    """v2 gate FA: the CRITICAL false alarm on healthy windows at the controller's dwell
+    (``dline_refit.ONLINE_DWELL_WINDOWS``) and its cell-bootstrap CI95 - the same flag
+    series, point and bootstrap as B' (``b_prime.series_point`` / ``b_prime_boot``), which
+    do not depend on the severity cut; so FA needs no cut and equals B''s ``false_alarm``
+    at that dwell whenever B' is evaluable (``same_as_b_prime`` records the check)."""
+    from scripts import b_prime
+    from scripts import dline_refit as dl
+    from scripts import theta_verdict as tv
+
+    vh = entry["verdict_for_holdout"]
+    theta, tau_crit = float(vh["published"]["theta_m"]), float(vh["published"]["tau_crit"])
+    direction = vh["fit_config"]["direction"]
+    window_ms = float(dl.windowing_of(entry)["window_ms"])
+    dwell = dl.ONLINE_DWELL_WINDOWS
+    crit = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
+                                   dwell_windows=dwell, window_ms=window_ms)
+    point = b_prime.series_point(windows, theta=theta, cut=math.inf, crit=crit)["false_alarm"]
+    ci = b_prime.b_prime_boot(windows, cut=math.inf, crit=crit, n=n_resamples, seed=seed)["false_alarm_ci95"]
+    healthy = sum(1 for w in windows if math.isfinite(w.signal) and w.slo_met)
+    criteria = [dl._criterion("CRITICAL false alarm on healthy windows (dwell 1)", point, "<=",
+                              gate["false_alarm_max"]),
+                dl._criterion("its CI95 upper bound", ci[1], "<=", gate["false_alarm_ci95_high_max"])]
+    same = None
+    bd = ((b_prime_block or {}).get("by_dwell") or {}).get(str(dwell))
+    if bd:
+        same = _close(bd.get("false_alarm"), point) and all(_close(a, b) for a, b in zip(bd.get("false_alarm_ci95")
+                                                                                        or [], ci))
+    return {"criteria": criteria, "evaluable": healthy > 0, "passed": healthy > 0 and all(c["met"] for c in criteria),
+            "dwell_windows": dwell, "healthy_windows": healthy, "false_alarm": point, "false_alarm_ci95": ci,
+            "gate": dict(gate), "same_as_b_prime": same,
+            "unit": "healthy WINDOWS (slo_met, finite signal) CRITICAL at dwell 1 / healthy windows; CI resamples cells"}
+
+
 def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mapping[str, Any]],
              requests_csv: Path, *, n_resamples: int, dry_run: bool) -> dict:
     from scripts import dline_refit as dl
@@ -641,17 +825,33 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
                                                "runtime_voids": int(v.get("runtime_voids") or 0)}
                                            for k, v in cells.items()})
     vs = void_status(audit)
+    v2 = inp.get("schema") == "v2"
+    if v2:
+        fa = fa_gate(entry, windows, gate=(inp["prereg"]["evaluation"]["FA"]["gate"]), n_resamples=n_resamples,
+                     seed=PREREG_SEED, b_prime_block=crit["B_prime"])
+        gate_ok = a_ok and bool(fa["passed"])
+    else:
+        gate_ok = a_ok and bp_ok
     if dry_run:
         status, verdict = "dry_run", None
     elif vs["void_status_primary"]["status"] != STATUS_EVALUATED:
         status, verdict = vs["void_status_primary"]["status"], None
     else:
-        status, verdict = STATUS_EVALUATED, ("pass" if a_ok and bp_ok else "fail")
+        status, verdict = STATUS_EVALUATED, ("pass" if gate_ok else "fail")
     dropped = hd.audit_csv(csv_path, entry, model=model, sealed_to_h2=False, read_holdout=True)
+    bp_unit = ("recall_severe = severe violating WINDOWS CRITICAL at dwell 1 / severe violating windows "
+               "(b_prime.series_point; per window, not per episode); CI resamples cells")
+    if v2:
+        head = {"A": crit["A"], "FA": fa, "onset_episodes": dict(ONSET_NOT_APPLICABLE),
+                "B_prime_disclosure": {**crit["B_prime"], "gating": False,
+                                       "note": "window B' is disclosed, not gating (v2 rule)"},
+                "B_prime_unit": bp_unit,
+                "a_only_failure": {"value": (not a_ok) and bool(fa["passed"]),
+                                   "consequence": inp["prereg"]["evaluation"]["outcome_statements"]["a_only_fail"]}}
+    else:
+        head = {"A": crit["A"], "B_prime": crit["B_prime"], "B_prime_unit": bp_unit}
     metrics = {
-        "A": crit["A"], "B_prime": crit["B_prime"],
-        "B_prime_unit": "recall_severe = severe violating WINDOWS CRITICAL at dwell 1 / severe violating windows "
-                        "(b_prime.series_point; per window, not per episode); CI resamples cells",
+        **head,
         "disclosed": {"B_old": crit["B"], "C": crit["C"], "D": crit["D"],
                       "ranking_disclosure": ev["ranking_disclosure"], "holdout_report": ev["holdout_report"]},
         "b_prime_config": bp_summary,
@@ -664,8 +864,9 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
         "kv_missing_samples": kv_missing(cells),
     }
     out = {"status": status, "verdict": verdict,
-           "verdict_rule": "only with status 'evaluated': pass iff A (BA >= .80, CI95 low >= .75, drop from "
-                           "training <= .08) and B' (dwell 1) all met; fail = reported as is",
+           "verdict_rule": V2_VERDICT_RULE if v2 else (
+               "only with status 'evaluated': pass iff A (BA >= .80, CI95 low >= .75, drop from "
+               "training <= .08) and B' (dwell 1) all met; fail = reported as is"),
            "void_status": vs, "censoring_audit": audit}
     if status == STATUS_EVALUATED:
         out["evaluation"] = metrics
@@ -677,9 +878,12 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
     return out
 
 
-def check_dry_run_record(path: Optional[Path], scorer_sha: str, code: Mapping[str, Any]) -> list[str]:
+def check_dry_run_record(path: Optional[Path], scorer_sha: str, code: Mapping[str, Any], *,
+                         prereg_sha256: Optional[str] = None, attribution: Optional[str] = None) -> list[str]:
     """'dry run on the frozen / training set first': a real run needs a dry-run output of
-    this commit and this scorer file, from a clean tree."""
+    this commit and this scorer file, from a clean tree - and, when given, of the same
+    preregistration and the same label attribution (a v1 dry-run record has no attribution:
+    completion)."""
     if path is None:
         return ["--dry-run-result is required for a real run (dry run on the frozen / training set first)"]
     try:
@@ -695,6 +899,12 @@ def check_dry_run_record(path: Optional[Path], scorer_sha: str, code: Mapping[st
         problems.append(f"{path}: dry run of commit {(d.get('code') or {}).get('commit')}, not {code.get('commit')}")
     if (d.get("scorer") or {}).get("sha256") != scorer_sha:
         problems.append(f"{path}: dry run of another scorer file")
+    if prereg_sha256 is not None and (d.get("prereg") or {}).get("sha256") != prereg_sha256:
+        problems.append(f"{path}: dry run under another preregistration ({(d.get('prereg') or {}).get('sha256')})")
+    if attribution is not None:
+        had = (d.get("label_attribution") or {}).get("value") or ATTRIBUTION_COMPLETION
+        if had != attribution:
+            problems.append(f"mixed label attributions: {path} is a dry run under {had!r}, this run is {attribution!r}")
     return problems
 
 
@@ -703,10 +913,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prereg", type=Path, required=True)
-    ap.add_argument("--addendum", type=Path, action="append", default=[], help="both T14 addenda")
+    ap.add_argument("--addendum", type=Path, action="append", default=[],
+                    help="v1 only: both T14 addenda (a v2 preregistration carries its rules inline)")
     ap.add_argument("--freeze-file", type=Path, required=True)
     ap.add_argument("--t14-manifest", type=Path, default=None)
-    ap.add_argument("--dataset", type=Path, default=None, help="the T14 standard dataset directory")
+    ap.add_argument("--dataset", type=Path, default=None,
+                    help="the T14 standard dataset directory of the frozen label's attribution "
+                         "(<run>/dataset = completion, <run>/dataset_hybrid = hybrid); a mismatch is refused")
     ap.add_argument("--dry-run-dataset", type=Path, default=None,
                     help="a TRAINING dataset instead of T14 (proves the code runs; no verdict)")
     ap.add_argument("--dry-run-result", type=Path, default=None,
@@ -729,19 +942,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     code = dl.code_state()
     try:
         inp = check_inputs(args.prereg, args.addendum, args.freeze_file)
+        att_sources: dict[str, str] = {"frozen label (freeze verdict_for_holdout.label_def)": inp["freeze_attribution"]}
+        if inp["schema"] == "v2":
+            att_sources["prereg t14.conditions.label_attribution"] = str(
+                inp["prereg"]["t14"]["conditions"]["label_attribution"])
         if dry:
             ds = args.dry_run_dataset
             ds = ds / "dataset" if not (ds / "windows.csv").exists() and (ds / "dataset" / "windows.csv").exists() else ds
             if any(part in ("M", "T14") for part in ds.resolve().parts):
                 raise Refused([f"{ds}: the dry run never reads M / T14"])
+            att_sources[f"dataset {ds}"] = dataset_attribution(ds)
+            attribution, pr = check_attributions(att_sources)
+            if pr:
+                raise Refused(pr)
             header, rows, cells = dry_run_rows(ds, inp["model"])
             manifest_info = {"dry_run_dataset": str(ds)}
         else:
-            pr = check_dry_run_record(args.dry_run_result, scorer["sha256"], code)
+            pr = check_dry_run_record(args.dry_run_result, scorer["sha256"], code,
+                                      prereg_sha256=inp["prereg_sha256"], attribution=inp["freeze_attribution"])
             if pr:
                 raise Refused(pr)
             man, cells, ds = manifest_rows(inp, args.t14_manifest, args.dataset)
             src = dl.DatasetSource.parse(f"T14={ds}", sealed_to_h2=False)
+            att_sources["T14 manifest label_def"] = label_attribution(man.get("label_def"))
+            att_sources[f"dataset {src.directory}"] = dataset_attribution(src.directory)
+            attribution, pr = check_attributions(att_sources)
+            if pr:
+                raise Refused(pr)
             if dl.dataset_numerator(src.directory) != "gateway":
                 raise Refused([f"{ds}: not a gateway-numerator dataset"])
             m, pr = dl.collect_m_rows([src], {inp["model"]: man})
@@ -761,9 +988,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     csv_path = work / f"{inp['model']}_t14_validation.csv"
     _write_csv(csv_path, header, rows)
     os.chmod(csv_path, 0o444)
+    v2 = inp["schema"] == "v2"
     result = {
-        "what": ("T14 evaluation by the preregistered rule (DRAFT scorer; prereg t14/preregistration.json + "
-                 "ADDENDUM-T14-streamcut + ADDENDUM-T14-crossshape; decisions D1-D5 of 2026-10-04)"),
+        "what": (("T14 evaluation by the preregistered rule v2 (next round: rules inline in the preregistration; "
+                  "gates A and FA, onset not applicable, window B' disclosed; decisions D1-D5)") if v2 else
+                 ("T14 evaluation by the preregistered rule (DRAFT scorer; prereg t14/preregistration.json + "
+                  "ADDENDUM-T14-streamcut + ADDENDUM-T14-crossshape; decisions D1-D5 of 2026-10-04)")),
+        "rule_version": inp["schema"],
+        "label_attribution": {"value": attribution, "sources": att_sources,
+                              "rule": "every source names the same attribution, or the scorer refuses"},
         "dry_run": dry,
         "dry_run_note": ("DRY RUN on a TRAINING dataset with fake kinds - not T14, no verdict" if dry else None),
         "scorer": scorer,
@@ -786,13 +1019,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fh.write("\n")
     os.chmod(args.out, 0o444)
     body = result.get("evaluation") or result["disclosure_not_an_evaluation"]
-    a, bp = body["A"], body["B_prime"]
-    print(f"[{inp['model']}] status {result['status']} verdict {result['verdict']} "
+    a, bp = body["A"], (body.get("FA") or body["B_prime"])
+    gate_name = "FA" if v2 else "B'"
+    print(f"[{inp['model']}] rule {inp['schema']} attribution {attribution} status {result['status']} verdict {result['verdict']} "
           f"(voided cells {result['void_status']['voided_cells']}; primary "
           f"{result['void_status']['void_status_primary']['status']}; run-level sensitivity "
           f"{result['void_status']['void_status_run_level_sensitivity']['status']}): "
           f"A {'pass' if a['passed'] else 'FAIL'} (BA {a['criteria'][0]['value']}, CI low {a['criteria'][1]['value']}); "
-          f"B' {'pass' if bp['passed'] else 'FAIL'} ({[(c['name'], c['value']) for c in bp.get('criteria', [])]})")
+          f"{gate_name} {'pass' if bp['passed'] else 'FAIL'} "
+          f"({[(c['name'], c['value']) for c in bp.get('criteria', [])]})")
+    if v2:
+        bd = body["B_prime_disclosure"]
+        print(f"  window B' (disclosed): {[(c['name'], c['value']) for c in bd.get('criteria', [])]}; "
+              f"A-only failure {body['a_only_failure']['value']}; onset episodes {body['onset_episodes']['status']}")
     for kind, block in body["cross_shape"].items():
         cl = block["claim"]
         print(f"  {kind}: per-shape BA " + ", ".join(f"{s} {t['ba']}" for s, t in block["per_shape"].items())
