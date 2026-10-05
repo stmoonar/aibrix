@@ -235,3 +235,32 @@ def test_m2_run_records_the_rho_star_source_and_seals(tmp_path, monkeypatch, att
     (unsealed / MODEL / ac.M_SHA256SUMS).write_text("")
     with pytest.raises(ValueError, match="sealed M run"):
         ac.m2_rho_star(MODEL, unsealed)
+
+
+def test_m2_three_models_in_sequence_under_one_root_and_a_restart_with_an_offset(tmp_path) -> None:
+    """Review 2026-10-05 P1-1: the three models launch one after another into one root (each
+    run's ledger holds only its own codes and is a sibling, not an earlier ledger); an
+    aborted model's re-run into a new root collides with its own old ledger unless it takes a
+    new --m2-serial-offset, and then passes."""
+    root = tmp_path / "next-20261005" / "M2"
+
+    def launch(model: str, out: Path, offset: int = 0) -> dict:
+        cells, spikes, ids = ac.m2_id_check(model, SEED, offset, [tmp_path], out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "plan.json").write_text(json.dumps({"composition_name": ac.COMPOSITION_M2,
+                                                   "design_seed": SEED, "models": [model]}))
+        (out / "cells.jsonl").write_text("".join(
+            json.dumps({"cell_id": c.cell_id, "arrival_seed": c.arrival_seed}) + "\n" for c in cells))
+        return ids
+
+    for model in ac.M2_RHO_STAR:
+        assert launch(model, root / model)["problems"] == []
+    # dsqwen-14b aborted; its re-run into a new root, same codes -> refused ...
+    again = ac.m2_id_check("dsqwen-14b", SEED, 0, [tmp_path], root.parent / "M2-rerun" / "dsqwen-14b")[2]
+    assert any("cell codes already in a ledger" in p for p in again["problems"])
+    # ... with the next offset: new codes, new seeds -> passes, and the offset is recorded
+    ids = launch("dsqwen-14b", root.parent / "M2-rerun" / "dsqwen-14b", offset=ac.M2_SERIAL_OFFSET_STEP)
+    assert ids["problems"] == [] and ids["serial_offset"] == ac.M2_SERIAL_OFFSET_STEP
+    assert ids["cell_serial_base"] == ac.M2_CELL_SERIAL_BASE + ac.M2_SERIAL_OFFSET_STEP
+    with pytest.raises(ValueError):
+        ac.m2_serial_base(50)

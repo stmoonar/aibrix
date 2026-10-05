@@ -173,6 +173,12 @@ DEFAULT_COMPOSITION = COMPOSITION_M1
 #: Clear of every earlier serial range: the supplements 50_000 / 60_000, P1 62_000, M
 #: 70_000 / 70_500, T14 80_500 (and checked against the ledgers at run time).
 M2_CELL_SERIAL_BASE = 74_000
+#: Restart rule (review 2026-10-05): a model's M2 that has to be re-run goes into a NEW root
+#: with ``--m2-serial-offset`` (a multiple of this step, recorded in the plan and the
+#: manifest), so its cell codes - and so its arrival / spike seeds and prompt keys - are new
+#: and never collide with the aborted run's ledger. 0 = the first run.
+M2_SERIAL_OFFSET_STEP = 100
+M2_SERIAL_OFFSET_MAX = 900
 M2_DESIGN_SEED = 20261005
 #: The drain gate before every M2 cell (= P1's): a 1.4 x rho* hold leaves a backlog.
 M2_DRAIN_LIMIT_S = 300.0
@@ -423,10 +429,21 @@ def place(cells: Sequence[design.DesignCell], anchors: Mapping[str, float],
                                  f"{profile_seconds(cell.rho_profile)} s, M fixes {item.seconds} s")
 
 
-def m2_cells(model: str, design_seed: int) -> tuple[list[design.DesignCell], dict[str, list[dict]]]:
+def m2_serial_base(serial_offset: int = 0) -> int:
+    """The first serial - 1 of an M2 run: :data:`M2_CELL_SERIAL_BASE` + the restart offset
+    (a multiple of :data:`M2_SERIAL_OFFSET_STEP`, at most :data:`M2_SERIAL_OFFSET_MAX`)."""
+    off = int(serial_offset)
+    if off < 0 or off > M2_SERIAL_OFFSET_MAX or off % M2_SERIAL_OFFSET_STEP:
+        raise ValueError(f"--m2-serial-offset {serial_offset}: a multiple of {M2_SERIAL_OFFSET_STEP} "
+                         f"in [0, {M2_SERIAL_OFFSET_MAX}]")
+    return M2_CELL_SERIAL_BASE + off
+
+
+def m2_cells(model: str, design_seed: int, serial_offset: int = 0
+             ) -> tuple[list[design.DesignCell], dict[str, list[dict]]]:
     """M2's 24 cells (ids and seeds fixed, load filled in by :func:`place`) and the spike
-    plan of each burst cell."""
-    factory = design.CellFactory(model, design_seed, serial_base=M2_CELL_SERIAL_BASE)
+    plan of each burst cell; ``serial_offset`` is the restart rule (:func:`m2_serial_base`)."""
+    factory = design.CellFactory(model, design_seed, serial_base=m2_serial_base(serial_offset))
     cells, spikes, burst_index = [], {}, 0
     for item in M2_COMPOSITION:
         if item.kind == KIND_HOLD:
@@ -596,6 +613,42 @@ def check_new_ids(cells_by_model: Mapping[str, Sequence[design.DesignCell]],
     return {"roots": [str(Path(r).resolve()) for r in roots], "ledgers_scanned": len(seen["files"]),
             "codes_in_ledgers": len(seen["codes"]), "seeds_in_ledgers": len(seen["seeds"]),
             "m2_codes": len(codes), "m2_seeds": len(seeds), "problems": problems}
+
+
+def sibling_m2_dirs(roots: Sequence[Path], model: str, design_seed: int) -> list[Path]:
+    """Directories under ``roots`` holding another model's M2 run of this design seed (its
+    ``plan.json``): they are this collection's own siblings, never an earlier ledger."""
+    out = []
+    for root in roots:
+        root = Path(root)
+        if not root.exists():
+            continue
+        for plan_path in sorted(root.rglob("plan.json")):
+            try:
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (isinstance(plan, dict) and plan.get("composition_name") == COMPOSITION_M2
+                    and int(plan.get("design_seed") or -1) == int(design_seed)
+                    and model not in (plan.get("models") or [])):
+                out.append(plan_path.parent)
+    return out
+
+
+def m2_id_check(model: str, design_seed: int, serial_offset: int, roots: Sequence[Path],
+                out_dir: Path) -> tuple[list[design.DesignCell], dict[str, list[dict]], dict]:
+    """``model``'s M2 cells and spikes, and the check that ITS codes and seeds are new: absent
+    from every ledger under ``roots`` except its own out-dir and its sibling models' M2 runs
+    of the same design seed (:func:`sibling_m2_dirs`). Another model's codes are never
+    compared (the codes carry the model block), so the three models launch in any order; a
+    re-run of an aborted model needs a new ``serial_offset`` (its old ledger holds its codes)."""
+    cells, spikes = m2_cells(model, design_seed, serial_offset)
+    siblings = sibling_m2_dirs(roots, model, design_seed)
+    ids = check_new_ids({model: cells}, {model: spikes}, roots, skip=[out_dir, *siblings])
+    ids.update({"model": model, "serial_offset": int(serial_offset),
+                "cell_serial_base": m2_serial_base(serial_offset),
+                "siblings_skipped": [str(Path(d).resolve()) for d in siblings]})
+    return cells, spikes, ids
 
 
 def interleaved_order(cells: Sequence[design.DesignCell], model: str,
@@ -1293,7 +1346,8 @@ def build_plan_m2(args, model: str, cells: Sequence[design.DesignCell],
         "admission_cap": cap.as_dict(),
         "models": [model],
         "design_seed": int(args.design_seed),
-        "cell_serial_base": M2_CELL_SERIAL_BASE,
+        "cell_serial_base": ids["cell_serial_base"],
+        "m2_serial_offset": ids["serial_offset"],
         "cooldown_s": args.cooldown_s,
         "drain_limit_s": M2_DRAIN_LIMIT_S,
         "run_manifest": ladder.RUN_MANIFEST,
@@ -1328,7 +1382,8 @@ def build_plan_m2(args, model: str, cells: Sequence[design.DesignCell],
         "label": labels,
         "label_attribution": attribution,
         "design_seed": int(args.design_seed),
-        "cell_serial_base": M2_CELL_SERIAL_BASE,
+        "cell_serial_base": ids["cell_serial_base"],
+        "m2_serial_offset": ids["serial_offset"],
         "seed_derivation": ("calibration_design.CellFactory (arrival seed and prompt key per cell "
                             "id); spike seeds derived_seed(design_seed, model, cell_id, 'spike', k); "
                             "cell order from derived_seed(design_seed, model, 'acceptance-order'), "
@@ -1408,12 +1463,10 @@ def run_acceptance_set_m2(args, *, drive: Optional[Callable] = None,
     labels = label_documents(args, model)
     cap = training.resolve_cap(args)
     seed = int(args.design_seed)
-    per_model = {m: m2_cells(m, seed) for m in M2_RHO_STAR}
-    cells, spikes = per_model[model]
+    offset = int(getattr(args, "m2_serial_offset", 0) or 0)
     roots = [Path(args.rho_star_run).resolve().parent,
              *(Path(r) for r in (getattr(args, "ledger_root", None) or []))]
-    ids = check_new_ids({m: v[0] for m, v in per_model.items()},
-                        {m: v[1] for m, v in per_model.items()}, roots, skip=[out_dir])
+    cells, spikes, ids = m2_id_check(model, seed, offset, roots, out_dir)
     if ids["problems"]:
         raise ValueError(f"M2 ids / seeds are not new: {ids['problems']}")
     spike_check = m2_spike_check(model, spikes, cells, rho_star, cap)
@@ -1446,7 +1499,7 @@ def run_acceptance_set_m2(args, *, drive: Optional[Callable] = None,
     capacities = {s: b["capacity_rps"] for s, b in rho_star["shapes"].items()}
     run = AcceptanceRun(
         args, model, capacities,
-        factory=design.CellFactory(model, seed, serial_base=M2_CELL_SERIAL_BASE), cap=cap,
+        factory=design.CellFactory(model, seed, serial_base=m2_serial_base(offset)), cap=cap,
         out_dir=out_dir, raw_dir=raw_dir, drive=drive, sample=sample_factory(model),
         capacity_source="m_rho_star_reuse", sleep=sleep, clock=clock,
         cells=cells, bursts={}, items=M2_COMPOSITION, spikes=spikes)

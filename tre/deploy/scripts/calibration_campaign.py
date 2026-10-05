@@ -2699,6 +2699,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--rho-star-run", type=Path, default=None,
                     help="--composition m2-20261005: the sealed M root whose measured rho* M2 "
                          "reuses (checked against the design constants, hashed into the plan)")
+    ap.add_argument("--m2-serial-offset", type=int, default=0,
+                    help="--composition m2-20261005: restart rule - a model's M2 re-run into a NEW "
+                         "root takes a fresh offset (a multiple of 100, recorded in the plan and the "
+                         "manifest) so its cell codes and seeds are new (default 0 = the first run)")
     ap.add_argument("--ledger-root", type=Path, action="append", default=[],
                     help="--composition m2-20261005: a root whose ledgers (cells.jsonl / "
                          "cells.csv) M2's cell codes and seeds must not appear in (repeatable; "
@@ -2813,6 +2817,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.design_seed = 20261005  # M2: new seeds (calibration_acceptance.M2_DESIGN_SEED)
         else:
             args.design_seed = 20260923
+    if args.m2_serial_offset and args.composition != "m2-20261005":
+        ap.error("--m2-serial-offset belongs to --acceptance-set --composition m2-20261005")
     if (args.composition or args.rho_star_run or args.ledger_root) and not args.acceptance_set:
         ap.error("--composition / --rho-star-run / --ledger-root belong to --acceptance-set")
     collection = bool(args.training_supplement or args.acceptance_set or args.t14_set)
