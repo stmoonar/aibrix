@@ -229,9 +229,46 @@ def relay_basis(view: "ClusterView | None", donor: str, receiver: str) -> RelayB
     )
 
 
-#: SM refusals of a relay that say nothing about the fleet (the writer lock was busy,
-#: the routable view could not be read): any newer fleet view releases their hold.
-TRANSIENT_RELAY_REFUSALS = frozenset({"writer_busy", "routable_unknown"})
+#: SM refusal codes (409) of a relay that say something about the fleet: the replica
+#: floor of the SM's own view. Every other refusal - code-less (a 503 while the SM
+#: shuts down, a 400), ``writer_busy``, ``routable_unknown`` - says nothing about it.
+FLEET_RELAY_REFUSALS = frozenset({"floor_violation"})
+#: Wake refusals inside a no-pair answer that pass without a fleet change (SM wake
+#: error codes ``resident_loading`` / ``truth_unavailable`` / ``lease_conflict``, reason
+#: ``resident_unknown``): a Pod still loading, a gpu-truth sample missing, a lease held.
+TRANSIENT_RELAY_WAKE_REFUSALS = frozenset({"resident_loading", "truth_unavailable", "lease_conflict", "resident_unknown"})
+#: SM transfer skip reasons only a fleet change undoes (``occupant_*``: the receiver's
+#: GPUs hold another model / a hidden / a busy occupant; ``receiver_cap``).
+FLEET_RELAY_SKIP_PREFIX = "occupant_"
+FLEET_RELAY_SKIPS = frozenset({"receiver_cap"})
+
+
+def relay_hold_reason(summary: Mapping[str, Any]) -> tuple[str, bool]:
+    """(reason, fleet) of a relay answered with nothing done, from its transfer
+    summary (review 2026-10-06 P2-1). ``fleet``: the answer follows from the fleet
+    view the relay was planned from (``floor_violation``, ``clamped_by_floor``, a
+    pair tried and failed, unfilled for ``occupant_*`` / ``receiver_cap`` only, an SM
+    without the endpoint), so only a new SM state version or floor view releases its
+    hold. Anything else is transient: any newer view releases it."""
+    outcome = summary.get("outcome")
+    if outcome == "unsupported":
+        return "unsupported", True
+    if outcome == "refused":
+        code = summary.get("code")
+        return str(code or "refused"), code in FLEET_RELAY_REFUSALS
+    if summary.get("clamped_by_floor"):
+        return "clamped_by_floor", True
+    if summary.get("pairs"):
+        return "no_pair_done", True
+    skipped = sorted(str(key) for key in (summary.get("skipped") or {}))
+    reason = "unfilled" + (f"({','.join(skipped)})" if skipped else "")
+    for codes in summary.get("refusal_codes") or ():
+        if set(map(str, codes)) & TRANSIENT_RELAY_WAKE_REFUSALS:
+            return reason, False
+    fleet = bool(skipped) and all(
+        key.startswith(FLEET_RELAY_SKIP_PREFIX) or key in FLEET_RELAY_SKIPS for key in skipped
+    )
+    return reason, fleet
 
 
 @dataclass(frozen=True)
@@ -240,21 +277,18 @@ class RelayHold:
     floor-clamped, unfilled - never an unknown outcome) is not planned again for the
     same donor -> receiver pair while the fleet view it was planned from is still
     current (review P2-1: no new writer-lock call for the same answer). A state gate,
-    not a timer: a new SM state version or a changed floor view of either model
-    releases it; a transient refusal (:data:`TRANSIENT_RELAY_REFUSALS`), or a view
-    without an SM version, is released by any newer view."""
+    not a timer: for a fleet-derived answer (:func:`relay_hold_reason`) a new SM state
+    version or a changed floor view of either model releases it; a transient answer,
+    or a view without an SM version, is released by any newer view."""
 
     basis: RelayBasis
     reason: str
+    fleet: bool = True
 
     def holds(self, current: RelayBasis | None) -> bool:
         if current is None:
             return False
-        if (
-            self.reason in TRANSIENT_RELAY_REFUSALS
-            or current.sm_version is None
-            or self.basis.sm_version is None
-        ):
+        if not self.fleet or current.sm_version is None or self.basis.sm_version is None:
             return current == self.basis
         return replace(current, view_ms=None) == replace(self.basis, view_ms=None)
 

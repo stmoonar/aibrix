@@ -115,3 +115,26 @@ def test_the_view_carries_the_sm_state_version():
     view = cluster_view_from_state({"version": 42, "bindings": [], "models": {}}, TOPOLOGY)
     assert view.sm_version == 42
     assert cluster_view_from_state({"bindings": []}, TOPOLOGY).sm_version is None
+
+
+def test_a_503_during_sm_shutdown_does_not_hold_the_relay():
+    """Review 2026-10-06 P2-1: a code-less refusal (503 while the SM shuts down) says
+    nothing about the fleet: the next tick (a newer view, same SM version and floors)
+    sends the relay to the CRITICAL receiver again."""
+    down = ServiceManagerError("HTTP 503", status=503).result()
+    queue = ActionQueue(_sm(dict(down, retriable=False)))
+    _run(queue, _plan(_view(5)))
+    assert len(_relays(_plan(_view(5, fetched_ms=2_000), queue))) == 1
+
+
+def test_a_no_pair_answer_with_only_transient_wake_refusals_does_not_hold_the_relay():
+    loading = {"error": "resident_loading", "reason": "lease_starting", "node": "n", "gpu_ids": [0]}
+    body = transfer_body(0, unfilled=1, refusals=[loading])
+    queue = ActionQueue(_sm({"ok": False, "partial": True, "status": 409, "response": body}))
+    _run(queue, _plan(_view(5)))
+    assert len(_relays(_plan(_view(5, fetched_ms=2_000), queue))) == 1
+    # A fleet-derived no-pair answer (the receiver GPUs hold another model) is held.
+    foreign = transfer_body(0, unfilled=1, skipped={"occupant_not_donor_model": 1})
+    queue = ActionQueue(_sm({"ok": False, "partial": True, "status": 409, "response": foreign}))
+    _run(queue, _plan(_view(5)))
+    assert _relays(_plan(_view(5, fetched_ms=2_000), queue)) == []

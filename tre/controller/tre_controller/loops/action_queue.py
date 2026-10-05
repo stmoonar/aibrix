@@ -20,6 +20,7 @@ from tre_controller.planning.planner import (
     SourceLoop,
     TransferIntent,
     UnhideAction,
+    relay_hold_reason,
 )
 
 if False:  # annotations are strings (from __future__); avoids an import cycle
@@ -491,16 +492,8 @@ class ActionQueue:
         if (result.done or 0) > 0 or outcome == "unknown" or result.done is None or action.basis is None:
             self._relay_holds.pop(pair, None)
             return
-        if outcome in ("refused", "unsupported"):
-            reason = str(summary.get("code") or outcome)
-        elif summary.get("clamped_by_floor"):
-            reason = "clamped_by_floor"
-        elif summary.get("pairs"):
-            reason = "no_pair_done"
-        else:
-            skipped = summary.get("skipped") or {}
-            reason = "unfilled" + (f"({','.join(sorted(map(str, skipped)))})" if skipped else "")
-        self._relay_holds[pair] = RelayHold(basis=action.basis, reason=reason)
+        reason, fleet = relay_hold_reason(summary)
+        self._relay_holds[pair] = RelayHold(basis=action.basis, reason=reason, fleet=fleet)
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
         """C1: model -> its last rescue target (copies). The planner tick keeps the
@@ -1939,6 +1932,12 @@ def _transfer_summary(body: dict) -> dict:
         "clamped_by_floor": bool(body.get("clamped_by_floor")),
         "pairs": pairs,
         "refusals": len(body.get("refusals") or ()),
+        # (error code, reason) of each wake refusal: the relay hold tells a transient
+        # refusal (a Pod loading, no gpu-truth) from a fleet one (relay_hold_reason).
+        "refusal_codes": [
+            [str(item.get("error") or ""), str(item.get("reason") or "")]
+            for item in body.get("refusals") or () if isinstance(item, dict)
+        ],
         "skipped": {str(key): value for key, value in skipped.items()},
         "picked": [
             entry.get("serve_id") for entry in body.get("picked") or () if isinstance(entry, dict)
