@@ -242,8 +242,20 @@ CROSS_SHAPE_CI_METHOD = {
                  "until the shape's window count is reached, truncate; BA at the published theta; a "
                  "single-class resample is skipped"),
     "block_length_why": ("the method docs' 'independent samples ~ windows / 6' (theta-recalibration.md section 3; "
-                         "preregistration-20261003 interval note): one block spans the overlap of a window's "
-                         "neighbours, so blocks are about independent"),
+                         "preregistration-20261003 interval note); that wording came from the earlier 5 s step: "
+                         "with 30 s windows on a 10 s step the overlap spans 3 windows "
+                         "(dline_refit.WINDOWS_PER_INDEPENDENT = 3), so a 6-window block is conservative"),
+}
+#: Rule v2's noise yardstick of the cross-shape claim (coordinator 2026-10-05, decided before
+#: sealing on a TRAINING-only check): the median per-shape CI95 half width is taken only over
+#: shapes whose CI is non-degenerate; the claim rule itself is unchanged.
+CROSS_SHAPE_YARDSTICK = {
+    "median_over": "shapes of the kind with both classes AND a per-shape CI95 half width > 0",
+    "min_qualifying_shapes": 2,
+    "fewer_than_min": "not_evaluable (never false)",
+    "sd_over": "every shape of the kind with both classes (D1 sample SD); D2 single-class handling unchanged",
+    "why": ("a zero-width CI at BA = 1 or .5 reflects perfect separation or a one-sided classification in 3 "
+            "cells, not zero sampling uncertainty, so it must not set the noise yardstick"),
 }
 #: Label attributions (``tre_common.slo_labels.ATTRIBUTIONS`` of label v2; absent = completion).
 ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID = "completion", "hybrid"
@@ -376,6 +388,10 @@ def _v2_rule_checks(prereg: Mapping[str, Any]) -> list[str]:
     if json.dumps(ci_m, sort_keys=True) != json.dumps(CROSS_SHAPE_CI_METHOD, sort_keys=True):
         problems.append(f"prereg evaluation.cross_shape.ci_method {ci_m!r} is not the implemented per-shape CI "
                         f"{CROSS_SHAPE_CI_METHOD!r}")
+    ys = (ev.get("cross_shape") or {}).get("yardstick")
+    if json.dumps(ys, sort_keys=True) != json.dumps(CROSS_SHAPE_YARDSTICK, sort_keys=True):
+        problems.append(f"prereg evaluation.cross_shape.yardstick {ys!r} is not the implemented one "
+                        f"{CROSS_SHAPE_YARDSTICK!r}")
     if t14.get("void_rule") != VOID_RULE_TEXT:
         problems.append(f"prereg t14.void_rule {t14.get('void_rule')!r} is not the implemented rule")
     if "pass_a_disclosed" not in (ev.get("outcome_statements") or {}):
@@ -749,12 +765,38 @@ def _ba_ci_auroc(entry: Mapping[str, Any], windows: Sequence[Any], *, n_resample
             "auroc": au.get("value"), "auroc_ci95": au.get("ci95"), "auroc_resamples_used": au.get("resamples_used")}
 
 
-def claim(table: Mapping[str, Mapping[str, Any]]) -> dict:
-    """The cross-shape claim of one kind (D1, D2)."""
+def claim(table: Mapping[str, Mapping[str, Any]], yardstick: Optional[Mapping[str, Any]] = None) -> dict:
+    """The cross-shape claim of one kind (D1, D2). ``yardstick`` (rule v2,
+    :data:`CROSS_SHAPE_YARDSTICK`): the median half width only over the non-degenerate shapes
+    (both classes, half width > 0), not evaluable below ``min_qualifying_shapes``; None =
+    rule v1 (every shape with a CI)."""
     single = sorted(s for s, t in table.items() if t["single_class"])
     bas = [t["ba"] for s, t in sorted(table.items()) if not t["single_class"]]
     halves = [t["ba_ci95_half_width"] for s, t in sorted(table.items())
               if not t["single_class"] and t["ba_ci95_half_width"] is not None]
+    if yardstick is not None:
+        degenerate = sorted(s for s, t in table.items() if not t["single_class"]
+                            and not (t["ba_ci95_half_width"] or 0) > 0)
+        halves = [h for h in halves if h > 0]
+        sd_s = statistics.stdev(bas) if len(bas) >= 2 else None
+        sd_p = statistics.pstdev(bas) if bas else None
+        med = statistics.median(halves) if halves else None
+        out = {"rule": "'one theta transfers across shapes' iff the SD (sample, n-1) of the per-shape BA <= the "
+                       "median per-shape BA CI95 half width over the non-degenerate shapes",
+               "yardstick": dict(yardstick), "shapes": len(table), "single_class_shapes": single,
+               "degenerate_ci_shapes": degenerate, "yardstick_shapes": len(halves),
+               "role": "claim rule for the text; not an acceptance gate"}
+        need = int(yardstick["min_qualifying_shapes"])
+        if not table or single or sd_s is None or len(halves) < need:
+            out.update({"one_theta_transfers": CLAIM_NOT_EVALUABLE,
+                        "why": ("single-class shape(s) " + str(single) + ": BA undefined, the shape is not dropped (D2)"
+                                if single else f"fewer than {need} shapes with a non-degenerate CI (or with a BA)"),
+                        "disclosure_only": {"sd_sample": sd_s, "sd_population": sd_p, "median_ci95_half_width": med,
+                                            "shapes_with_ba": len(bas)}})
+        else:
+            out.update({"one_theta_transfers": sd_s <= med, "sd_sample": sd_s, "median_ci95_half_width": med,
+                        "disclosure_population_sd": {"sd_population": sd_p, "would_claim": sd_p <= med}})
+        return out
     sd_s = statistics.stdev(bas) if len(bas) >= 2 else None
     sd_p = statistics.pstdev(bas) if bas else None
     med = statistics.median(halves) if halves else None
@@ -792,7 +834,7 @@ def cross_shape(entry: Mapping[str, Any], windows: Sequence[Any], shape_of: Mapp
         out[kind] = {"per_shape": table,
                      "pooled_disclosure": (_ba_ci_auroc(entry, pooled, n_resamples=n_resamples, seed=seed,
                                                         ci_method=ci_method) if pooled else None),
-                     "claim": claim(table)}
+                     "claim": claim(table, CROSS_SHAPE_YARDSTICK if ci_method is not None else None)}
     return out
 
 

@@ -288,6 +288,14 @@ def build(args) -> dict:
                          "bootstrap degenerates with 3 cells per shape); AUROC CI as ranking_disclosure"),
                 "claim_rule": CROSS_SHAPE_CLAIM_RULE,
                 "ci_method": dict(t14_score.CROSS_SHAPE_CI_METHOD),
+                "yardstick": dict(t14_score.CROSS_SHAPE_YARDSTICK),
+                "ci_notes": ("the 6-window block is conservative relative to dline_refit.WINDOWS_PER_INDEPENDENT = 3 "
+                             "(30 s windows on a 10 s step); the 'windows / 6' wording of the method docs came from "
+                             "the earlier 5 s step. A zero-width per-shape CI at BA = 1 or .5 reflects perfect "
+                             "separation or a one-sided classification in 3 cells, not zero sampling uncertainty, so "
+                             "the median half width is taken over the non-degenerate shapes only (fewer than 2 in a "
+                             "kind: not_evaluable). Decided 2026-10-05 before sealing, on a TRAINING-only check "
+                             "(next-20261005/t14_ci_check/); no T14 claim was computed under this rule."),
                 "role": "claim rule for the text, sealed under the hybrid label; not an acceptance gate"},
             "scoring": {"decisions": DECISIONS, "disclosure_rules": DISCLOSURE_RULES,
                         "scorer": {"module": "scripts.analysis.t14_score (rule v2)",

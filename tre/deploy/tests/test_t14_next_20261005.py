@@ -104,3 +104,16 @@ def test_the_per_shape_ci_does_not_degenerate_with_three_cells_per_shape() -> No
     assert mb["half_width"] is not None and mb["half_width"] > 0.01
     assert mb["blocks"] == 3 * (20 - t14.CROSS_SHAPE_CI_METHOD["block_windows"] + 1)
     assert mb["method"]["block_windows"] == 6 and mb["method"]["blocks_within"] == "cell"
+
+
+def test_the_v2_yardstick_skips_degenerate_cis_and_needs_two_shapes() -> None:
+    ys = t14.CROSS_SHAPE_YARDSTICK
+    table = {"P1": _shape(1.0, 0.0), "P2": _shape(1.0, 0.0),            # perfect separation: width 0
+             "N1": _shape(0.84, 0.08), "N2": _shape(0.88, 0.10)}
+    c = t14.claim(table, ys)
+    assert c["median_ci95_half_width"] == 0.09 and c["yardstick_shapes"] == 2
+    assert c["degenerate_ci_shapes"] == ["P1", "P2"]
+    assert c["sd_sample"] == statistics.stdev([1.0, 1.0, 0.84, 0.88])  # D1 over every shape with both classes
+    assert c["one_theta_transfers"] is True                             # SD .082 <= .09 (noisy shapes only)
+    one = {"P1": _shape(1.0, 0.0), "P2": _shape(0.5, 0.0), "N1": _shape(0.86, 0.08)}
+    assert t14.claim(one, ys)["one_theta_transfers"] == t14.CLAIM_NOT_EVALUABLE
