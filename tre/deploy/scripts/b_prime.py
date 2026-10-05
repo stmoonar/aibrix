@@ -205,11 +205,11 @@ def criteria(point: Mapping[str, Any], ci: Mapping[str, Any], gate: Mapping[str,
 #   alpha .632, tau_crit and window filling - not read off M);
 # * gated on the onset episodes of the DYNAMIC cells (steps / ramp / bursts), whose
 #   overload has an onset; hold-cell episodes are disclosed;
-# * the success rate's lower bound - a cell-cluster bootstrap AND a Clopper-Pearson bound
-#   on the effective number of episodes n / (1 + (m - 1) ICC), ICC = the one-way ICC(1) of
-#   the per-cell lags (challenge_checks.posthoc.json's estimator; undefined -> 1, the
-#   conservative end; negative -> 0) - must reach detection_ci_low_min, and at most
-#   miss_tolerance episodes may fail.
+# * at most miss_tolerance episodes may fail, and the Clopper-Pearson lower bound of the
+#   success rate on the effective number of episodes n / (1 + (m - 1) ICC), ICC = the
+#   one-way ICC(1) of the per-cell lags (challenge_checks.posthoc.json's estimator;
+#   undefined -> 1, the conservative end; negative -> 0), must reach detection_ci_low_min;
+#   a cell-cluster bootstrap bound is disclosed (it never decides with miss_tolerance 0).
 #
 # Every parameter lives in :data:`ONSET_GATE` and is sealed in the freeze (``accept_gate``).
 
@@ -237,11 +237,12 @@ ONSET_RULE = ("episode = maximal run of consecutive violating windows (<= episod
               "ONSET_DYNAMIC_PRIMITIVES")
 #: Sealed with the onset parameters: how the look-back is clipped (coordinator 2026-10-05).
 ONSET_LOOKBACK_CLIP = "previous_episode_end_exclusive"
-ONSET_CI_RULE = ("both one-sided (ci_alpha_one_sided) lower bounds of the success rate must reach "
-                 "detection_ci_low_min: (a) cell-cluster bootstrap percentile over the cells holding an onset "
-                 "episode; (b) Clopper-Pearson on n_eff = n / (1 + (m - 1) ICC), m = episodes per cell, ICC = "
-                 "one-way ICC(1) of the per-cell lags of detected episodes (undefined -> 1, negative -> 0), "
-                 "x_eff = rate * n_eff")
+ONSET_CI_RULE = ("decides: at most miss_tolerance onset episodes missed (or later than the lag budget) AND the "
+                 "one-sided (ci_alpha_one_sided) Clopper-Pearson lower bound of the success rate on n_eff = "
+                 "n / (1 + (m - 1) ICC) reaches detection_ci_low_min (m = episodes per cell, ICC = one-way ICC(1) "
+                 "of the per-cell lags of detected episodes, undefined -> 1, negative -> 0; x_eff = rate * "
+                 "n_eff). The cell-cluster bootstrap percentile lower bound is disclosed, not deciding (with "
+                 "miss_tolerance 0 it is 1 whenever the miss criterion passes)")
 
 
 def check_onset_gate(gate: Mapping[str, Any]) -> dict:
@@ -384,10 +385,21 @@ def onset_detection(windows: Sequence[Any], crit: Sequence[bool], *, cut: float,
     g = check_onset_gate(gate)
     budget, alpha = g["lag_budget_s"], g["ci_alpha_one_sided"]
     eps = episodes(windows, cut, step_ms=g["episode_step_ms"])
+    starts: dict[str, set] = defaultdict(set)
+    for w in windows:
+        starts[w.scenario_id].add(w.window_start_ms)
     for ep in eps:
         ep["primitive"] = primitive_of.get(ep["cell"], "")
         ep["lag_s"] = episode_lag_s(windows, crit, ep, lookback_s=g["lookback_s"])
         ep["success"] = ep["lag_s"] is not None and ep["lag_s"] <= budget
+        # disclosure (review 2026-10-05 P3-7): the lag from the first VIOLATING window, and
+        # whether the window right before the episode is missing from the labelled set (an
+        # unlabelled / dropped window: the min-n guard can delay where an onset is seen)
+        ep["lag_from_first_violating_s"] = (None if ep["lag_s"] is None else
+                                            ep["lag_s"] + (ep["t_first_severe"] - ep["t_first_viol"]) / 1000.0)
+        before = ep["t_first_viol"] - g["episode_step_ms"]
+        ep["preceded_by_unlabelled_window"] = (before >= min(starts[ep["cell"]])
+                                               and before not in starts[ep["cell"]])
     onset = [ep for ep in eps if ep["primitive"] in ONSET_DYNAMIC_PRIMITIVES]
     hold = [ep for ep in eps if ep["primitive"] not in ONSET_DYNAMIC_PRIMITIVES]
 
@@ -403,7 +415,9 @@ def onset_detection(windows: Sequence[Any], crit: Sequence[bool], *, cut: float,
                            "lookback_clip": ONSET_LOOKBACK_CLIP,
                            "episodes": [{k: ep[k] for k in ("cell", "primitive", "t_end_prev", "t_first_viol",
                                                             "t_first_severe",
-                                                            "t_end", "n_violating", "n_severe", "lag_s", "success")}
+                                                            "t_end", "n_violating", "n_severe", "lag_s", "success",
+                                                            "lag_from_first_violating_s",
+                                                            "preceded_by_unlabelled_window")}
                                         for ep in eps]}
     n = len(onset)
     if not n:
@@ -435,12 +449,11 @@ def onset_detection(windows: Sequence[Any], crit: Sequence[bool], *, cut: float,
         return {"name": name, "value": value, "op": op, "threshold": threshold, "met": met}
 
     criteria = [crit_("onset episodes missed or later than the lag budget", n - succ, "<=", g["miss_tolerance"]),
-                crit_("success rate, cell-cluster bootstrap lower bound", boot_low, ">=", g["detection_ci_low_min"]),
                 crit_("success rate, Clopper-Pearson lower bound on n_eff", cp_low, ">=", g["detection_ci_low_min"])]
     out.update({"evaluable": True, "passed": all(c["met"] for c in criteria), "criteria": criteria,
                 "success_rate": rate, "cells": len(cells), "episodes_per_cell": m_bar,
                 "icc": icc, "icc_raw": icc_raw, "n_eff": n_eff, "x_eff": rate * n_eff,
-                "bootstrap": {"n_resamples": n_resamples, "seed": seed, "lower": boot_low},
+                "bootstrap": {"n_resamples": n_resamples, "seed": seed, "lower": boot_low, "deciding": False},
                 "clopper_pearson_lower": cp_low})
     return out
 

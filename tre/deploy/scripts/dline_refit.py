@@ -95,8 +95,9 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     (2026-10-03) also seals each model's B' severity cut (``b_prime``: the .65 quantile of
     the TRAINING violating windows' severity, :mod:`scripts.b_prime`) and the B' gate
     (``b_prime_gate``), so the cut exists before M / T14 is collected. Revision 4
-    (2026-10-05) also seals the accept gate (``accept_gate``: ``--accept-gate onset``, the
-    default, or ``b_prime``) with every onset-gate parameter, each model's theta selection
+    (2026-10-05) also seals the accept gate (``accept_gate``: always the onset gate - one gate, no fork;
+    accept refuses a sealed gate that differs from the running code's) with every onset-gate
+    parameter, refuses a tau other than 10 s (the lag budget's base), each model's theta selection
     plateau (uncertainty band), absolute thresholds, label attribution, dynamic-training record and
     the A dead band's s0 (training label noise, :func:`scripts.b_prime.label_noise_s0`).
 ``verify-freeze``
@@ -470,6 +471,27 @@ def label_attribution(label_def: Optional[Mapping[str, Any]]) -> str:
     """The attribution of a label record (``LabelDefinition.as_dict()``); absent = completion
     (every v1 record)."""
     return str((label_def or {}).get("attribution") or ATTRIBUTION_COMPLETION)
+
+
+def attribution_of_inputs(*, fit_dir: Optional[Path] = None, datasets: Iterable[Path] = (),
+                          label_def: Optional[Mapping[str, Any]] = None, what: str = "inputs") -> str:
+    """The one label attribution of a standalone tool's inputs (review 2026-10-05 P3-11):
+    every record that states one - the fit dir's trainset.json, each dataset manifest, a
+    label record - must agree; the agreed value is returned (completion when none of them
+    states another, i.e. inputs made before label v2). Two different ones are a refusal
+    (SystemExit), never a silent default."""
+    found: dict[str, str] = {}
+    if fit_dir is not None and (Path(fit_dir) / TRAINSET_MANIFEST).exists():
+        found[f"{Path(fit_dir) / TRAINSET_MANIFEST}"] = trainset_attribution(Path(fit_dir))
+    for d in datasets:
+        if d is not None and Path(d).exists():
+            found[str(d)] = dataset_attribution(Path(d))
+    if label_def is not None:
+        found["label record"] = label_attribution(label_def)
+    values = set(found.values())
+    if len(values) > 1:
+        raise SystemExit(f"{what}: label attributions disagree {found}: refusing rather than mixing label v1 / v2")
+    return values.pop() if values else ATTRIBUTION_COMPLETION
 
 
 def trainset_attribution(fit_dir: Path) -> str:
@@ -1572,10 +1594,15 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
 #: record and the A dead band's s0. A revision <= 3 freeze accepts under the A, B', D gate.
 FREEZE_FORMAT_REVISION = 4
 FREEZE_READABLE_REVISIONS = (1, 2, 3, 4)
-#: ``freeze --accept-gate``: onset = design 2026-10-05 item 3 (the default); b_prime = the
-#: 2026-10-03 gate (A, B', D).
+#: The accept gate of a NEW (revision 4) freeze is always onset (design 2026-10-05 item 3;
+#: review 2026-10-05: one gate, no fork). b_prime names the 2026-10-03 gate (A, B', D) that a
+#: freeze of revision <= 3 still accepts under; a revision-4 freeze sealing anything else
+#: than the running code's onset gate is refused (:func:`accept_gate_problems`).
 ACCEPT_GATE_ONSET, ACCEPT_GATE_B_PRIME = "onset", "b_prime"
 ACCEPT_GATES = (ACCEPT_GATE_ONSET, ACCEPT_GATE_B_PRIME)
+#: The onset gate's lag budget (2 ticks, 20 s) is derived from the EMA alpha .632 of
+#: tau = 10 s (design item 3 (i)): a freeze of another tau is refused under it.
+ONSET_TAU_S = 10.0
 #: Three-way verdict of the onset gate (user 2026-10-05, decision 2; one rule for every model).
 VERDICT_PASS, VERDICT_PASS_A_DISCLOSED, VERDICT_FAIL = "pass", "pass_a_disclosed", "fail"
 ONSET_GATING_CRITERIA = ("onset", "window_fa", "A", "D")
@@ -1964,7 +1991,7 @@ def training_load_paths(trainset_manifest: Mapping) -> tuple[dict[str, dict], li
 
 
 def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequence[str], arm: str,
-                 freeze_file: Path, *, command: Sequence[str] = (), accept_gate: str = ACCEPT_GATE_ONSET) -> dict:
+                 freeze_file: Path, *, command: Sequence[str] = ()) -> dict:
     """D22: freeze every model's published parameters into ``freeze_file`` (or refuse,
     raising :class:`FreezeError` with every reason, before anything is written)."""
     fp = freeze_paths(freeze_file)
@@ -1974,14 +2001,18 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
             problems.append(f"{fp[key]} already exists: a freeze is never overwritten")
     if len(set(models)) != len(models):
         problems.append(f"a model is given twice: {list(models)}")
-    if accept_gate not in ACCEPT_GATES:
-        problems.append(f"accept gate {accept_gate!r} not in {ACCEPT_GATES}")
+    accept_gate = ACCEPT_GATE_ONSET
     entries: dict[str, dict] = {}
     for model in models:
         entry, pr = freeze_model(out_root, fit_dir_of(model), model, arm)
         problems += [f"{model}: {x}" for x in pr]
         if entry is not None:
             entries[model] = entry
+            tau_s = (entry.get("published") or {}).get("tau_s")
+            if not _same(tau_s, ONSET_TAU_S):
+                # review 2026-10-05 P2-3: the 20 s lag budget is alpha .632 of tau 10 s
+                problems.append(f"{model}: tau_s {tau_s!r} != {ONSET_TAU_S:g}: the onset gate's lag budget "
+                                "(2 ticks) is derived from the EMA of tau 10 s")
     if problems:
         raise FreezeError(problems)
     doc = {
@@ -2442,6 +2473,32 @@ def b_prime_evaluation(windows: Sequence[Any], *, theta: float, tau_crit: float,
     return out
 
 
+def accept_gate_problems(doc: Mapping[str, Any]) -> list[str]:
+    """Review 2026-10-05 P2-2: a revision-4 freeze's sealed accept gate must be the running
+    code's - the onset rule (no other gate for a new freeze), every numeric parameter, the
+    episode / CI / look-back rules, the dynamic primitives, the undefined-ICC value, the
+    window false alarm and the verdict rule. Any difference is a refusal (the gate decides
+    with code, and the code must be the one that was sealed)."""
+    rec = doc.get("accept_gate")
+    if not isinstance(rec, Mapping):
+        return []
+    want = accept_gate_record(ACCEPT_GATE_ONSET)
+    out = []
+    if rec.get("rule") != ACCEPT_GATE_ONSET:
+        out.append(f"the freeze seals accept gate {rec.get('rule')!r}; a revision-4 freeze has only {ACCEPT_GATE_ONSET!r}")
+    for key in ("gating_criteria", "window_fa", "dwell_windows", "verdict_rule"):
+        if not _same_doc(rec.get(key), want[key]):
+            out.append(f"sealed accept_gate.{key} {rec.get(key)!r} != this code's {want[key]!r}")
+    for key, value in want["onset"].items():
+        if not _same_doc((rec.get("onset") or {}).get(key), value):
+            out.append(f"sealed accept_gate.onset.{key} {(rec.get('onset') or {}).get(key)!r} != this code's {value!r}")
+    return out
+
+
+def _same_doc(a: Any, b: Any) -> bool:
+    return canonical_json(a) == canonical_json(b) if not isinstance(a, (int, float)) else _same(a, b)
+
+
 def accept_gate_of(doc: Mapping[str, Any]) -> dict:
     """The accept gate of a freeze: its sealed ``accept_gate`` (revision 4), else - an older
     freeze - the A, B', D gate with the onset-gate defaults for the disclosure."""
@@ -2615,6 +2672,18 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
             problems.append(f"dataset {s.name} ({s.directory}) carries {have!r} label attribution; the freeze's "
                             f"label for {wrong} is {sorted({frozen_attr[m_] for m_ in wrong})} (use the matching "
                             "dataset directory, e.g. dataset_hybrid/, or rebuild with calibration_dataset --attribution)")
+    problems += [f"freeze: {x}" for x in accept_gate_problems(doc)]
+    for model_, entry_ in sorted(doc["models"].items()):
+        bp_ = entry_.get("b_prime")
+        if not isinstance(entry_.get("a_deadband"), Mapping) and isinstance(bp_, Mapping):
+            # review 2026-10-05 P3-10: an older freeze's s0 is computed at accept from its training
+            # CSV - only from the very file the freeze sealed
+            tcsv = Path(bp_.get("training_csv") or "")
+            if not tcsv.is_file():
+                problems.append(f"{model_}: the freeze's training CSV {tcsv} (A dead band s0) is missing")
+            elif sha256_file(tcsv) != bp_.get("training_csv_sha256"):
+                problems.append(f"{model_}: the freeze's training CSV {tcsv} changed after the freeze "
+                                "(the A dead band's s0 is computed from it)")
     m: dict = {"header": {}, "rows": {}, "placed": {}}
     if not problems:
         m, pr = collect_m_rows(sources, manifests)
@@ -3040,10 +3109,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="trainset: the train-split dynamic cells (steps / ramp / bursts) train with the "
                          "constant-load cells, equal weight per window (design 2026-10-05 item 2; recorded "
                          "in trainset.json); default: D16, constant-load cells only")
-    ap.add_argument("--accept-gate", choices=ACCEPT_GATES, default=ACCEPT_GATE_ONSET,
-                    help="freeze: the accept gate sealed in the freeze - onset (default; design 2026-10-05 "
-                         "item 3: onset episodes, window false alarm, A, D, three-way verdict) or b_prime "
-                         "(the 2026-10-03 A, B', D gate)")
     ap.add_argument("--no-sentinels", action="store_true",
                     help="trainset: leave the sentinel cells out of the training set (default: they train)")
     ap.add_argument("--alpha-rule", choices=ALPHA_RULES, default="d4prime")
@@ -3179,8 +3244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.freeze_file is None:
             ap.error("freeze needs --freeze-file")
         try:
-            doc = stage_freeze(args.out_dir, fit_dir, args.model, args.arm, args.freeze_file, command=command,
-                               accept_gate=args.accept_gate)
+            doc = stage_freeze(args.out_dir, fit_dir, args.model, args.arm, args.freeze_file, command=command)
         except FreezeError as exc:
             print(f"freeze REFUSED - nothing was written ({len(exc.problems)} problem(s)):")
             for x in exc.problems:

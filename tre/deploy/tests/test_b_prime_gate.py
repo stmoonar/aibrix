@@ -262,3 +262,67 @@ def test_a_critical_of_an_earlier_episode_is_never_credited_to_the_next() -> Non
                                       n_resamples=50)
         assert [e["lag_s"] for e in got["episodes"]] == [0.0, lag2]
         assert [e["t_end_prev"] for e in got["episodes"]] == [None, 20_000.0]
+
+
+# ------------------------------------------- review 2026-10-05 P2-5 / P2-2 / P2-3 / P3-13
+
+
+def test_the_verdict_fails_whenever_a_gate_other_than_a_fails() -> None:
+    ok, ko = {"passed": True}, {"passed": False}
+    crit = lambda **f: {g: f.get(g, ok) for g in dl.ONSET_GATING_CRITERIA}  # noqa: E731
+    assert dl.verdict_of(crit()) == dl.VERDICT_PASS
+    assert dl.verdict_of(crit(A=ko)) == dl.VERDICT_PASS_A_DISCLOSED
+    assert dl.verdict_of(crit(A=ko, D=ko)) == dl.VERDICT_FAIL      # D is not waived with A
+    assert dl.verdict_of(crit(D=ko)) == dl.VERDICT_FAIL
+    assert dl.verdict_of(crit(window_fa=ko)) == dl.VERDICT_FAIL
+    assert dl.verdict_of(crit(onset=ko, A=ko)) == dl.VERDICT_FAIL
+
+
+def test_accept_refuses_a_dataset_of_another_label_attribution(tmp_path, capsys) -> None:
+    w = base._world(tmp_path, steps_cells=16)
+    assert base._freeze(w, "onset") == 0          # completion (label v1) freeze
+    man = w["mdir"] / "manifest.json"
+    man.write_text(json.dumps({**json.loads(man.read_text()), "attribution": {"value": "hybrid"}}))
+    assert base._accept(w, base._seal(w)) == dl.EXIT_REFUSED
+    assert "label attribution" in capsys.readouterr().out
+    assert base._written(w) == ["params_freeze.json", "params_freeze.json.sha256"]
+
+
+def test_freeze_refuses_a_fitted_label_whose_attribution_is_not_the_trainsets(tmp_path, capsys) -> None:
+    w = base._world(tmp_path)
+    d = w["out"] / MODEL / base.ARM
+    for name in ("final.json", "verdict_final.json"):     # a fit labelled hybrid on completion data
+        doc = json.loads((d / name).read_text())
+        doc["label_def"] = {**doc["label_def"], "attribution": "hybrid"}
+        (d / name).write_text(json.dumps(doc))
+    assert base._freeze(w, "onset") == dl.EXIT_REFUSED
+    assert "attribution 'hybrid' != the training datasets' 'completion'" in capsys.readouterr().out
+    assert not w["freeze"].exists()
+
+
+def test_accept_refuses_a_sealed_onset_gate_that_is_not_this_codes(tmp_path, capsys) -> None:
+    w = base._world(tmp_path, steps_cells=16)
+    assert base._freeze(w, "onset") == 0
+    ff = Path(w["freeze"])
+    doc = json.loads(ff.read_text())
+    doc["accept_gate"]["onset"]["lookback_clip"] = "none"
+    doc.pop("freeze_sha256")
+    doc["freeze_sha256"] = dl.canonical_sha256(doc)
+    data = dl._json_bytes(doc)
+    side = Path(f"{ff}.sha256")
+    for p in (ff, side):
+        os.chmod(p, 0o644)
+    ff.write_bytes(data)
+    side.write_text(f"{hashlib.sha256(data).hexdigest()}  {ff.name}\n")
+    assert base._accept(w, base._seal(w)) == dl.EXIT_REFUSED
+    assert "accept_gate.onset.lookback_clip" in capsys.readouterr().out
+
+
+def test_a_new_freeze_has_one_gate_and_refuses_another_tau(tmp_path, monkeypatch, capsys) -> None:
+    w = base._world(tmp_path)
+    with pytest.raises(SystemExit):   # no --accept-gate any more: one gate, no fork
+        dl.main(["freeze", "--model", MODEL, "--arm", base.ARM, "--fit-dir", str(w["fit"]), "--out-dir",
+                 str(w["out"]), "--freeze-file", str(w["freeze"]), "--accept-gate", "b_prime"])
+    monkeypatch.setattr(dl, "ONSET_TAU_S", 5.0)   # the lag budget's base tau != the fit's 10 s
+    assert base._freeze(w, "onset") == dl.EXIT_REFUSED
+    assert "tau_s 10.0 != 5" in capsys.readouterr().out and not w["freeze"].exists()

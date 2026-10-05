@@ -51,7 +51,8 @@ def params_from_freeze(path: Path, *, verify: bool = True) -> dict[str, dict]:
     return {m: {"vh": e["verdict_for_holdout"], "windowing": dl.windowing_of(e)} for m, e in doc["models"].items()}
 
 
-def params_from_json(path: Path, *, registry: Optional[str] = None) -> dict[str, dict]:
+def params_from_json(path: Path, *, registry: Optional[str] = None,
+                     attribution: Optional[str] = None) -> dict[str, dict]:
     """model -> {"vh", "windowing"} from explicit per-model parameters (module docstring)."""
     from tre_common import slo_labels
 
@@ -67,7 +68,7 @@ def params_from_json(path: Path, *, registry: Optional[str] = None) -> dict[str,
         if "label_def" in q:
             label = slo_labels.LabelDefinition.from_dict(q["label_def"])
         else:
-            label = dl.label_for(model, q.get("arm", "primary"), registry)
+            label = dl.label_for(model, q.get("arm", "primary"), registry, attribution)
         vh = {"model": model, "signal": "tss", "signal_spec": spec.as_dict(), "label_def": label.as_dict(),
               "trim_ramp_windows": int(q.get("trim_ramp_windows", dl.TRIM_RAMP_WINDOWS)),
               "fit_config": {"direction": q.get("direction", spec.direction)},
@@ -226,11 +227,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error(str(exc))
     if len({s.name for s in sources}) != len(sources):
         ap.error(f"two datasets share a run name: {[s.name for s in sources]}")
+    # the datasets' one label attribution (refused when they disagree): a parameter set
+    # without a label record takes it, one with a label record must state the same
+    ds_attr = dl.attribution_of_inputs(datasets=[s.directory for s in sources], what="ranking_report datasets")
     try:
         params = (params_from_freeze(args.freeze_file, verify=not args.no_verify) if args.freeze_file
-                  else params_from_json(args.params_json, registry=args.registry))
+                  else params_from_json(args.params_json, registry=args.registry, attribution=ds_attr))
     except dl.FreezeError as exc:
         print(f"ranking_report: the freeze does not verify: {exc}", file=sys.stderr)
+        return dl.EXIT_REFUSED
+    wrong = {m: dl.label_attribution(p["vh"]["label_def"]) for m, p in params.items()
+             if dl.label_attribution(p["vh"]["label_def"]) != ds_attr}
+    if wrong:
+        print(f"ranking_report: the parameters' labels {wrong} != the datasets' attribution {ds_attr!r}",
+              file=sys.stderr)
         return dl.EXIT_REFUSED
     models = args.model or sorted(params)
     missing = [m for m in models if m not in params]

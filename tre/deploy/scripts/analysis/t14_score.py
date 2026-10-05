@@ -6,14 +6,16 @@ Two rule versions, chosen by the preregistration itself (never by a flag):
 * **v1** - round 2026-10-03 (``$CALIB_ROOT/t14/preregistration.json`` + the stream-cut and
   cross-shape addenda; scoring decisions D1-D5 of ``ADDENDUM-T14-scoring``). Gates A and
   B' (dwell 1). Kept byte-for-byte in behaviour so the sealed ``eval/T14_score.json``
-  reproduces (``label_attribution`` is the only key a v1 output gains).
+  reproduces (a v1 output gains only ``label_attribution`` and ``rule_version``).
 * **v2** - the next round (design 2026-10-05, ``schema`` = :data:`PREREG_SCHEMA_V2`): the
   stream-cut rule, the cross-shape claim rule and D1-D5 are INLINE in the preregistration
   (``t14.stream_cut``, ``evaluation.cross_shape``, ``evaluation.scoring``); no addendum is
   read (one is refused). The gate set follows the new acceptance on steady holds:
 
-  - A (BA >= .80, CI95 low >= .75, drop from training <= .08) - a gate, with the
-    pre-declared consequence of an A-only failure (``evaluation.outcome_statements``);
+  - A (BA >= .80, CI95 low >= .75, drop from training <= .08) - a gate; the verdict is the
+    accept's three-way one: ``pass`` (A and FA), ``pass_a_disclosed`` (only A fails - the
+    pre-declared consequence ``evaluation.outcome_statements.pass_a_disclosed``: go-live
+    allowed, A disclosed as a limitation), ``fail`` (anything else);
   - FA: CRITICAL false alarm on healthy windows at dwell 1 <= .05, CI95 high <= .08;
   - onset episodes: NOT APPLICABLE - T14 is 24 steady holds and has no dynamic cell, so it
     has no overload onset to catch (the onset gate is judged on M2's dynamic cells);

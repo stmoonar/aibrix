@@ -163,9 +163,30 @@ def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = Fa
 
 
 def _freeze(w: dict, gate: str = "b_prime") -> int:
-    # the A, B', D gate: these tests pin it on hold-only M (the onset gate: test_dline_onset_gate.py)
-    return dl.main(["freeze", "--model", MODEL, "--arm", ARM, "--fit-dir", str(w["fit"]), "--out-dir", str(w["out"]),
-                    "--freeze-file", str(w["freeze"]), "--accept-gate", gate])
+    """A new freeze is always revision 4 with the onset gate. ``gate="b_prime"`` (these tests
+    pin the A, B', D path on hold-only M) re-seals it as a revision-3 freeze - the older-freeze
+    path accept keeps - with a valid self hash and sidecar (the onset gate: test_b_prime_gate.py)."""
+    code = dl.main(["freeze", "--model", MODEL, "--arm", ARM, "--fit-dir", str(w["fit"]), "--out-dir", str(w["out"]),
+                    "--freeze-file", str(w["freeze"])])
+    if code == 0 and gate == "b_prime":
+        import hashlib
+        import os
+
+        ff = Path(w["freeze"])
+        doc = json.loads(ff.read_text())
+        doc.pop("accept_gate")
+        doc.pop("freeze_sha256")
+        doc["format_revision"] = 3
+        doc["freeze_sha256"] = dl.canonical_sha256(doc)
+        data = dl._json_bytes(doc)
+        side = Path(f"{ff}.sha256")
+        for p in (ff, side):
+            os.chmod(p, 0o644)
+        ff.write_bytes(data)
+        side.write_text(f"{hashlib.sha256(data).hexdigest()}  {ff.name}\n")
+        for p in (ff, side):
+            os.chmod(p, 0o444)
+    return code
 
 
 def _seal(w: dict, *, label_def=None, freeze_sha=None, cells=None, sums_extra: list[Path] = ()) -> Path:

@@ -1230,15 +1230,18 @@ def closed_loop_rows(
 
     arms = label if label is not None else slo_labels.slo_targets(
         ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    # the label decides the evidence attribution (label v2 hybrid: TTFT / min-n by first token),
+    # exactly as rewindow_from_raw.label_cell does - never a v1 table under a v2 label
+    attribution = rewindow_from_raw.label_attribution(arms)
     rows: list[dict] = []
     for wm, result in zip(windows, results):
         client = rewindow_from_raw.aggregate_window(
             list(raw_records), [], wm.model, wm.window_start_ms, wm.window_end_ms,
             percentile_mode=percentile_mode, min_latency_samples=min_latency_samples,
-            instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+            instant_sample_interval_ms=SCRAPE_INTERVAL_MS, attribution=attribution,
         )
         evidence = rewindow_from_raw.window_request_evidence(
-            raw_records, wm.window_start_ms, wm.window_end_ms)
+            raw_records, wm.window_start_ms, wm.window_end_ms, attribution=attribution)
         rows.append(window_row(
             cell, wm, result.TRS if result.defined else None, result.Q_ctl,
             client=client, server=wm,

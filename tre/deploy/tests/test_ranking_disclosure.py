@@ -121,7 +121,7 @@ def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_p
     assert base._freeze(w) == 0
     ff = w["freeze"]
     doc = json.loads(ff.read_text())
-    assert doc["format_revision"] == 4
+    assert doc["format_revision"] == 3  # base._freeze re-seals the revision-4 freeze as revision 3
     assert doc["models"][MODEL]["windowing"] == {**dl.DEFAULT_WINDOWING,
                                                  "source": "defaults: final.json predates the windowing record"}
     # rewrite it as a revision-1 freeze (no windowing, no B' cut), re-hashed: the D22 shape

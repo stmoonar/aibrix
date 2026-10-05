@@ -434,11 +434,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--wp-grid", choices=WP_GRIDS, default="with_zero")
     args = ap.parse_args(argv)
-    label = dr.label_for(args.model, args.arm, args.registry)
     sources = sources_from_trainset(args.fit_dir)
     for t in args.requests_dataset:
         run, _, d = t.partition("=")
         sources[run] = Path(d)
+    attribution = dr.attribution_of_inputs(fit_dir=args.fit_dir, datasets=sources.values(), what="v1_lambda_fit")
+    label = dr.label_for(args.model, args.arm, args.registry, attribution)
     doc = fit_model(args.model, label, dr.paths(args.fit_dir, args.model)["fitting"],
                     trim=dr.TRIM_RAMP_WINDOWS, sources=sources, wp_grid=args.wp_grid)
     args.out.write_text(json.dumps(doc, indent=1, default=str))

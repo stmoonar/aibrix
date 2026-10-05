@@ -93,14 +93,15 @@ def stage_resplit_fit(out: Path, seed: int, model: str, registry: str, *, wp_gri
                       max_ci: Optional[float] = None) -> None:
     fit = RESPLIT / f"seed_{seed}" / "fit"
     p = dr.paths(fit, model)
-    lab = dr.label_for(model, "primary", registry)
+    sources = v1.sources_from_trainset(FIT)
+    sources["M"] = M_DATASET
+    lab = dr.label_for(model, "primary", registry,
+                       dr.attribution_of_inputs(fit_dir=fit, datasets=sources.values(), what="v1_lambda_compare"))
     od = out / "resplit" / f"seed_{seed}" / "refit" / model / "primary"
     od.mkdir(parents=True, exist_ok=True)
     dr.D13_MAX_CI_FRACTION = max_ci
     alpha_doc = {"published_tau_s": 10.0, "rule": "fixed (D18, not swept)", "published_alpha": dr.alpha_of(10.0)}
     (od / "alpha.json").write_text(json.dumps(alpha_doc, indent=1))
-    sources = v1.sources_from_trainset(FIT)
-    sources["M"] = M_DATASET
     wp = dr.stage_wp_v1(model, lab, p, alpha_doc, sources, wp_grid=wp_grid)
     (od / "wp.json").write_text(json.dumps(wp, indent=1, default=str))
     fin = dr.stage_final(model, lab, p, wp, od, holdout=False)
