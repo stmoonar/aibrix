@@ -650,6 +650,28 @@ def test_settle_waits_k_ema_time_constants_after_the_window_start():
             parse_scaling_config({"rescue_settle_ema_k": bad})
 
 
+def test_settle_extension_applies_only_while_o1_does_not_track_the_model():
+    """Q2 (2026-10-06): while O1 tracks the model (its breakpoint restarts the EMA and the
+    evidence gate holds the receiver) a target this process dispatched settles on the
+    window-start rule alone; the k * ema_tau extension is the fallback when O1 does not
+    track it, and for a target whose done_ms is not an observed completion (covered by a
+    probe preemption whose unhide is still to come; restored after a restart)."""
+    queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
+    plan = RescuePlan(target=4, desired=4, base=2, covered=2)
+    queue.submit([ScaleAction("critical", 2, "critical_idle_capacity", "rescue", receiver="critical", rescue=plan)])
+    asyncio.run(queue.drain_once())
+    registry = _registry_with_tau(10_000.0)  # default k = 2 -> 20 s
+    tracked = {"critical": {"o1_routable_tracked": True}}
+    untracked = {"critical": {"o1_routable_tracked": False}}
+    assert "critical" not in _rescue_bases(_snapshot(65_000), queue, registry, tracked)
+    assert "critical" in _rescue_bases(_snapshot(64_999), queue, registry, tracked)  # still before it
+    assert "critical" in _rescue_bases(_snapshot(84_999), queue, registry, untracked)
+    assert "critical" not in _rescue_bases(_snapshot(85_000), queue, registry, untracked)
+    covered = ActionQueue(_Client(), now_ms=_Clock(65_000))
+    covered.record_rescue_covered("critical", RescuePlan(target=4, desired=4, base=2, covered=4))
+    assert "critical" in _rescue_bases(_snapshot(84_999), covered, registry, tracked)
+
+
 def test_tp_slot_loop_without_occupancy_counts_one_slot():
     # Defensive (build_plan always has an occupancy with a cluster view): the allocator
     # path does not claim, so a second iteration would count the same slot again.

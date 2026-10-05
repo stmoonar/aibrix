@@ -616,9 +616,12 @@ data:
       # (IDLE to its floor, HIGH to its tau_high level) in one tick. false = one step
       # per tick (scale-down stays cautious).
       donor_surplus_release: false
-      # A rescue target counts as reflected once the decision window starts
-      # k * trs.ema_tau_ms after it completed (the EMA'd Z lags the window). 0 = the
-      # window start alone.
+      # Fallback only (2026-10-06): while O1 tracks the model, a rescue target this
+      # controller dispatched counts as reflected once the decision window starts
+      # after it completed (the breakpoint restarts the EMA, the evidence gate holds
+      # the receiver). Otherwise (O1 off / suspended / held context, a restored or
+      # probe-covered target) the window must start k * trs.ema_tau_ms after it
+      # completed (the EMA'd Z lags the window). 0 = the window start alone.
       rescue_settle_ema_k: 2.0
       # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
       # ADR-0015): a model decides on the part of its 30 s metrics window after its last

@@ -509,10 +509,15 @@ def _link_saturation_steps(
 
 
 def rescue_settle_ms(registry: Registry | None, model: str) -> float:
-    """C1 review P2-3: how long after a rescue target completed the decision window
-    must start before it counts as reflected - ``scaling.rescue_settle_ema_k`` times
-    the model's ``trs.ema_tau_ms`` (the EMA'd Z lags the raw window by about its time
-    constant). 0 without a registry, a scaling section or a tau (legacy fixed-alpha)."""
+    """C1 review P2-3, fallback only (Q2, 2026-10-06): how long after a rescue target
+    completed the decision window must start before it counts as reflected while O1
+    does NOT track the model (O1 off / suspended, no fleet view, stale-held context,
+    hold fallback) - ``scaling.rescue_settle_ema_k`` times the model's
+    ``trs.ema_tau_ms`` (the EMA'd Z lags the raw window by about its time constant).
+    While O1 tracks the model the extension is 0 for a target this process dispatched
+    (:func:`_rescue_bases`): the routable change is a breakpoint that restarts the EMA
+    and the O1 evidence gate holds the receiver until post-change grids exist. 0 without a registry, a scaling section or
+    a tau (legacy fixed-alpha)."""
     scaling = getattr(registry, "scaling", None)
     if registry is None or not callable(scaling):
         return 0.0
@@ -534,7 +539,8 @@ def _rescue_bases(
 ) -> dict[str, RescueBasis]:
     """C1: per model, the last rescue target the queue issued whose effect the model's
     decision signal does not fully reflect yet: still running, or the window starts
-    before it completed (the F4 rule) plus ``rescue_settle_ms`` for the EMA."""
+    before it completed (the F4 rule) plus, only while O1 does not track the model,
+    ``rescue_settle_ms`` for the EMA (Q2: with O1 the evidence gate replaces it)."""
     targets = getattr(queue, "rescue_targets", None)
     if not callable(targets):
         return {}
@@ -551,11 +557,16 @@ def _rescue_bases(
         metrics = snapshot.models.get(model)
         if metrics is None:
             continue
-        if record.done_ms is not None and metrics.window_start_ms >= record.done_ms + rescue_settle_ms(
-            registry, model
-        ):
+        context = (contexts or {}).get(model)
+        # Q2: no EMA-lag extension while O1 tracks the model and done_ms is an observed
+        # completion (a target this process dispatched: seq > 0). A restored target (done
+        # stamped at the restart, the SM may still be waking - review P2-a) or one covered
+        # by a probe preemption (its unhide still to come) keeps the fallback.
+        observed = int(getattr(record, "seq", 0) or 0) > 0
+        settle_ms = 0.0 if observed and _o1_tracks(context) else rescue_settle_ms(registry, model)
+        if record.done_ms is not None and metrics.window_start_ms >= record.done_ms + settle_ms:
             continue  # settled: the signal describes the new replica count
-        if record.done_ms is not None and _o1_settled((contexts or {}).get(model), int(record.done_ms)):
+        if record.done_ms is not None and _o1_settled(context, int(record.done_ms)):
             continue  # O1: decided on evidence gathered after the scale-up's breakpoint
         bases[model] = RescueBasis(base=int(record.base), covered=int(record.covered))
     return bases

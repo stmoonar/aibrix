@@ -75,7 +75,15 @@ restored in-flight target is stamped done=now while the SM may still be waking) 
 after the target's `done_ms`: its Z then describes the new replica count with a fresh EMA, so the
 `rescue_settle_ema_k` extension is not needed. A target that changed nothing (all parts
 failed) never moves the breakpoint and settles by the old window-start rule, which stays
-as the fallback. In-flight protection and the base / covered bookkeeping are unchanged.
+as the fallback. **Q2 (2026-10-06)**: while O1 tracks the model (`o1_routable_tracked`)
+the window-start rule runs with an effective `k = 0` for a target this process dispatched
+(the window must only start after `done_ms`): the breakpoint restarts the EMA and the
+evidence gate holds the receiver, so the EMA-lag extension only delays a decision on
+evidence that is already new. `rescue_settle_ema_k * ema_tau` applies only as the
+fallback: O1 does not track the model (O1 off / suspended, no fleet view, stale-held
+context, hold fallback), or the target's `done_ms` is not an observed completion (restored
+after a restart - review P2-a; covered by a probe preemption whose unhide is still to
+come). The registry key stays as that fallback. In-flight protection and the base / covered bookkeeping are unchanged.
 
 **Review round 2 (2026-10-01)**:
 

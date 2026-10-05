@@ -200,4 +200,6 @@ With the O1 breakpoint window (`20261001-o1-breakpoint-window.md`, ADR-0015) a c
 rescue target is a routable-count breakpoint: the target counts as reflected once the model
 is warm (2 complete grids) after a breakpoint at or after its `done_ms`, with the EMA
 restarted there. The `rescue_settle_ema_k` window-start rule stays as the fallback (a target
-that changed nothing never moves the breakpoint). One judgement, not two.
+that changed nothing never moves the breakpoint). One judgement, not two. Since 2026-10-06
+(Q2) the window-start rule uses `k = 0` while O1 tracks the model; `k * ema_tau` is only the
+fallback when O1 does not track it (see the O1 doc, C1 settle).
