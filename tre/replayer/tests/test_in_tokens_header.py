@@ -119,7 +119,13 @@ def test_run_trace_counts_with_the_registry_tokenizer_and_records_the_flag(tmp_p
     assert all(IN_TOKENS_HEADER not in headers for headers, _ in sent)
 
     sent.clear()
+    import tempfile
+
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     summary = rt.run_trace(str(trace), send_in_tokens=True, **common)
+    assert list(scratch.glob("tre-replay-prompts-*")) == []  # the counted prompts are removed at exit
     weights = {m.name: m.weights_path for m in load_registry().models()}["dsqwen-7b"]
     assert summary["send_in_tokens"] is True
     assert summary["in_tokens_header"]["tokenizers"] == {"dsqwen-7b": weights}

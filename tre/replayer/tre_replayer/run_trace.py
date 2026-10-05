@@ -105,10 +105,31 @@ def run_trace(
     # tre_replayer.engine.prompt_store. Without a path there is nowhere to put them and
     # the sender falls back to fitting inline - except with --send-in-tokens, which counts
     # the prompts before the run and so materialises them into a temporary file.
+    tmp_prompt_dir = None
     if prompt_path is None and send_in_tokens:
         import tempfile
 
-        prompt_path = str(Path(tempfile.mkdtemp(prefix="tre-replay-prompts-")) / "prompts.jsonl")
+        tmp_prompt_dir = tempfile.mkdtemp(prefix="tre-replay-prompts-")
+        prompt_path = str(Path(tmp_prompt_dir) / "prompts.jsonl")
+    try:
+        return _run_replay(
+            trace_path, schedule, gateway_url=gateway_url, dry_run=dry_run, out_path=out_path,
+            prompt_path=prompt_path, prompt_workers=prompt_workers, max_in_flight=max_in_flight,
+            routing_strategy=routing_strategy, corpus_lang=corpus_lang, zh_ratio=zh_ratio,
+            send_in_tokens=send_in_tokens, tokenizer_paths=tokenizer_paths, sleep=sleep,
+            registry_path=registry_path, window_ms=window_ms, step_ms=step_ms,
+            trim_ramp_windows=trim_ramp_windows, rps_timeline_path=rps_timeline_path,
+        )
+    finally:
+        if tmp_prompt_dir is not None:  # the counted prompts are not needed after the run
+            import shutil
+
+            shutil.rmtree(tmp_prompt_dir, ignore_errors=True)
+
+
+def _run_replay(trace_path, schedule, *, gateway_url, dry_run, out_path, prompt_path, prompt_workers,
+                max_in_flight, routing_strategy, corpus_lang, zh_ratio, send_in_tokens, tokenizer_paths, sleep,
+                registry_path, window_ms, step_ms, trim_ramp_windows, rps_timeline_path):
     prompt_store = (
         None
         if prompt_path is None
