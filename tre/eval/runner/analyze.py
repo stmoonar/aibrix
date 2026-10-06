@@ -3,6 +3,7 @@
 import collections
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ D = Path(sys.argv[1])
 T_LOAD = int((D / "load_start_epoch").read_text())
 T_END = int((D / "load_end_epoch").read_text())
 S = {"arm": D.name, "load_s": T_END - T_LOAD}
+MODELS = [m for m in os.environ.get("MODELS", "dsqwen-7b,dsllama-8b,dsqwen-14b").split(",") if m]
 
 
 def pct(xs, p):
@@ -26,7 +28,7 @@ def pct(xs, p):
 # ---- client
 recs = [json.loads(l) for l in open(D / "client/performance_metrics.json") if l.strip()]
 cl = {}
-for m in ["ALL", "dsqwen-7b", "dsllama-8b", "dsqwen-14b"]:
+for m in ["ALL"] + MODELS:
     rs = [r for r in recs if m == "ALL" or r["model_name"] == m]
     ok = [r for r in rs if r["success"]]
     cl[m] = {
@@ -76,7 +78,7 @@ S["client"] = cl
 rows = [json.loads(l) for l in open(D / "layout.jsonl") if l.strip()]
 rows = [r for r in rows if "models" in r]
 lay = {}
-for m in ["dsqwen-7b", "dsllama-8b", "dsqwen-14b"]:
+for m in MODELS:
     seq = [(r["ts"], len(r["models"][m]["awake"]), len(set(r["models"][m]["awake"]) - set(r["models"][m]["hidden"])))
            for r in rows if m in r["models"]]
     win = [x for x in seq if T_LOAD <= x[0] <= T_END + 30]

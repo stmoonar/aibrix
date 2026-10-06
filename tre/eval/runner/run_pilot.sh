@@ -4,7 +4,7 @@
 #
 # PLAN = space-separated items  <TRACE>:<arm>,<arm>[:<run_tag>]
 #   default (batch 1, 2026-10-05): Alternating_hot_model_periodic_A, TRE then APA.
-#   output: $PILOT_ROOT/<TRACE>/<arm>[-<run_tag>]; an existing result dir is never overwritten
+#   output: $PILOT_ROOT/<TRACE>[_s<seed>]/<arm>[-<run_tag>]; an existing result dir is never overwritten
 #   (run_arm_pilot.sh refuses), so a repeat of the same trace/arm needs a run_tag.
 # ABBA later (spreads drift over the order): run the reverse pair with a tag, e.g.
 #   PLAN="Alternating_hot_model_periodic_A:apa,tre:r2"              # B A  -> .../apa-r2, .../tre-r2
@@ -15,7 +15,9 @@
 #   PLAN="Alternating_hot_model_periodic_A:chiron,tokenscale,preserve Alternating_hot_model_periodic_A:tre:drift1"
 # Stop after the current arm: touch $PILOT_ROOT/STOP_PILOT
 set -euo pipefail
-PILOT_ROOT="${PILOT_ROOT:-/data/nfs_shared_data/xxy/pilot-e1-20261005}"
+# shellcheck source=lib_env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_env.sh"   # runner.env (PILOT_ROOT, ...)
+need_env PILOT_ROOT
 export PILOT_ROOT
 GAP_S="${GAP_S:-120}"     # extra idle between runs (engines already drained + 60 s warm-up inside run_arm)
 PLAN="${PLAN:-Alternating_hot_model_periodic_A:tre,apa}"
@@ -29,7 +31,7 @@ for item in $PLAN; do
     [ "$first" = 1 ] || sleep "$GAP_S"
     first=0
     echo "[$(date +%F' '%T)] start $NAME/$ARM${TAG:+ tag=$TAG}"
-    RC=0; RUN_TAG="$TAG" bash "$PILOT_ROOT/tools/run_arm_pilot.sh" "$ARM" "$NAME" || RC=$?
+    RC=0; RUN_TAG="$TAG" bash "$RUNNER_DIR/run_arm_pilot.sh" "$ARM" "$NAME" || RC=$?
     [ "$RC" = 0 ] || { echo "[$(date +%F' '%T)] FAILED $NAME/$ARM rc=$RC (cluster may be mid-arm: see RUN.md 'stop')"; exit 1; }
     echo "[$(date +%F' '%T)] done $NAME/$ARM"
   done

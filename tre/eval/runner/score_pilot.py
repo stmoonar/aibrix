@@ -27,14 +27,17 @@ import yaml
 
 ap = argparse.ArgumentParser()
 ap.add_argument("src")
-ap.add_argument("--registry", default="/data/nfs_shared_data/xxy/aibrix-wt/calib-theta-20261003/tre/deploy/registry.yaml",
-                help="registry whose slo block (c/b, k, floor, tpot, e2e) is used; default = the calib branch (new c/b)")
+ap.add_argument("--registry", default=os.environ.get("SCORE_REGISTRY"),
+                help="registry whose slo block (c/b, k, floor, tpot, e2e) is used (the runner passes the live "
+                     "registry recorded at arm start; default: env SCORE_REGISTRY)")
 ap.add_argument("--trim-s", type=float, default=30.0)
 ap.add_argument("--out")
 ap.add_argument("--traces", help="traces.json with per-request max_output_tokens (default: next to the metrics file)")
 ap.add_argument("--validity", help="run_validity.json of a baseline arm (adds run_validity / valid)")
 ap.add_argument("--arm-label", help="arm label recorded with --validity (e.g. Chiron-global)")
 a = ap.parse_args()
+if not a.registry:
+    ap.error("--registry (or env SCORE_REGISTRY) is required")
 src = a.src if a.src.endswith(".json") else os.path.join(a.src, "performance_metrics.json")
 traces_path = a.traces or os.path.join(os.path.dirname(os.path.abspath(src)), "traces.json")
 max_tok = {}

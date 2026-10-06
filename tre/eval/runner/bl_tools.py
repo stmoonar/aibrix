@@ -2,7 +2,7 @@
 """bl_tools.py - helpers of the baseline arms of the pilot runner and the sanity script.
 
 Read-only against the cluster except `del-key` (one baseline-only Redis key). Redis is reached
-directly (redis-py, `--redis host[:port]`, the tre-v2-redis ClusterIP from 76).
+directly (redis-py, `--redis host[:port]`, the TRE Redis ClusterIP from the client host).
 
   redis-ms        --redis H                         print Redis TIME in ms
   del-key         --redis H --key K                 DEL K (the stale replay marker before an arm)
@@ -19,6 +19,10 @@ directly (redis-py, `--redis host[:port]`, the tre-v2-redis ClusterIP from 76).
                                                     from PATH; prints a JSON record
   client-header   --meta loadgen_run_meta.json      print the x-tre-bl-in-tokens precount summary
                                                     (exit 1 when any request was sent without the header)
+  open-probes     --redis H                         print the number of open (probing / committing)
+                                                    SafeScale probes of the TRE controller
+  trace-manifest  --out F --name N --trace T --config C [--segments S] [--source-manifest M] [--seed K]
+                                                    trace_manifest.json {trace/config/segments sha256, seed}
 Sanity (baseline_sanity.sh):
   capacity        --policy-dir D --model m [--src auto|mu|vb] [--in 492] [--out 400] [--rps X]
                                                     print JSON {rps, tok_s, src} of 1.0x one-replica capacity
@@ -112,6 +116,46 @@ def cmd_dump_streams(a) -> int:
                 n += 1
         counts[m] = n
     print(json.dumps(counts))
+    return 0
+
+
+PROBES_KEY = "tre:v2:controller:safescale:probes"  # = tre_common.rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY
+
+
+def cmd_open_probes(a) -> int:
+    n = 0
+    for raw in (_redis(a.redis).hgetall(PROBES_KEY) or {}).values():
+        try:
+            n += json.loads(raw).get("status") in ("probing", "committing")
+        except (ValueError, AttributeError):
+            continue
+    print(n)
+    return 0
+
+
+def _sha256(path):
+    import hashlib
+
+    if not path or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_trace_manifest(a) -> int:
+    seed = a.seed if a.seed not in (None, "") else None
+    if seed is not None and seed.lstrip("-").isdigit():
+        seed = int(seed)
+    doc = {"trace_name": a.name, "trace_file": a.trace, "trace_sha256": _sha256(a.trace),
+           "config_file": a.config, "config_sha256": _sha256(a.config),
+           "segments_file": a.segments if a.segments and os.path.isfile(a.segments) else None,
+           "segments_sha256": _sha256(a.segments), "source_manifest_sha256": _sha256(a.source_manifest),
+           "seed": seed}
+    json.dump(doc, open(a.out, "w"), indent=1)
+    print(json.dumps({k: doc[k] for k in ("trace_name", "seed", "trace_sha256")}))
     return 0
 
 
@@ -623,6 +667,10 @@ def main(argv=None) -> int:
     p.add_argument("--live", required=True); p.add_argument("--registry", required=True)
     p.add_argument("--frozen"); p.add_argument("--trace"); p.set_defaults(fn=cmd_check_policy)
     p = sub.add_parser("client-header"); p.add_argument("--meta", required=True); p.set_defaults(fn=cmd_client_header)
+    p = sub.add_parser("open-probes"); p.add_argument("--redis", required=True); p.set_defaults(fn=cmd_open_probes)
+    p = sub.add_parser("trace-manifest"); p.add_argument("--out", required=True); p.add_argument("--name", required=True)
+    p.add_argument("--trace", required=True); p.add_argument("--config", required=True); p.add_argument("--segments")
+    p.add_argument("--source-manifest"); p.add_argument("--seed"); p.set_defaults(fn=cmd_trace_manifest)
     p = sub.add_parser("capacity"); p.add_argument("--policy-dir", required=True); p.add_argument("--model", required=True)
     p.add_argument("--src", default="auto", choices=["auto", "mu", "vb"]); p.add_argument("--in", dest="tin", type=int, default=492)
     p.add_argument("--out", dest="tout", type=int, default=400); p.add_argument("--rps", type=float, default=None)

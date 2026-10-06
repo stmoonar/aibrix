@@ -12,8 +12,10 @@ import re
 import sys
 from collections import Counter
 
-TP = {"dsqwen-14b": 2}
-MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
+# Models and TP sizes: env MODELS (comma list, runner.env) / TP_SIZES ("model=tp,..."); defaults =
+# the pilot's three models.
+MODELS = tuple(m for m in os.environ.get("MODELS", "dsqwen-7b,dsllama-8b,dsqwen-14b").split(",") if m)
+TP = {k: int(v) for k, v in (p.split("=", 1) for p in os.environ.get("TP_SIZES", "dsqwen-14b=2").split(",") if "=" in p)}
 
 
 def load(p):

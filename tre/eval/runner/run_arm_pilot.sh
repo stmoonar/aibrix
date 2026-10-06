@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Pilot (informal, not paper data): one arm of one ICSE-final v1 trace through the
-# tre-v2 gateway 31094. Derived from smoke-e1-20260930/tools/run_arm.sh. Changes vs that file:
+# tre-v2 gateway ($GW). Derived from smoke-e1-20260930/tools/run_arm.sh. Changes vs that file:
 #   1. trace NAME argument: TRACE + loadgen CONFIG are chosen per trace (was: Alternating config
 #      hard-coded even when another trace file was passed);
 #   2. per-trace output dir under $PILOT_ROOT ($RUN_TAG suffix for repeats; never overwrites);
 #   3. baseline = explicit binding ids via tre/deploy/scripts/release/awake_ctl.py restore-ids
-#      (2026-10-05 layout after the sidecar redeploy: 7b node9/0, 8b node9/1, 14b node10/0,1);
+#      ($BASELINE in runner.env: one binding per model at the start);
 #      the awake set is VERIFIED after every restore, the runner stops if it differs
 #      (the 99_restore.sh failure mode: a 409 on a swap that is reported as success);
 #   4. wait until every routable engine is idle (running+waiting = 0) before the controller restart;
@@ -15,10 +15,10 @@
 #   7. (2026-10-05) loadgen_v1 runs from $LOADGEN_TRE_DIR (default: main tree), its git sha + dirty
 #      state are recorded; `--ignore-eos` is sent when IGNORE_EOS=1 (default) and the tree must have it;
 #   8. (2026-10-05) sidecar `tre_reissue_nofile` startup line recorded per pod at run start
-#      (sidecar_nofile.tsv; expect after>=65535: 65535 on node10, 1048576 on node9); record only.
+#      (sidecar_nofile.tsv; expect after>=65535: 65535 where the runtime soft limit is 1024, else the hard limit); record only.
 #   9. (2026-10-06) baseline arms chiron | tokenscale | preserve (labels Chiron-global /
 #      TokenScale-colocated / PreServe-oracle, in arm_label): run mode observe/active, TRE scaling
-#      off (ENABLE_TRE_SCALING=false) and 0 APA CRs (decision source NONE), policy ConfigMap
+#      off (2026-10-07: controller run mode observe, see 11) and 0 APA CRs (decision source NONE), policy ConfigMap
 #      checked (non-empty, no placeholder, = $BL_CM_FILE when given), `arm enable --policy --execute`
 #      (waits for /healthz + owner lock), `arm mark-replay` at the first send (MARK_AT), loadgen
 #      with --ignore-eos --send-in-tokens, `arm disable --collect-dir $D/baseline
@@ -32,7 +32,21 @@
 #      runs exactly (stream left as found, no header); baseline arms need both and always get
 #      them (gw_parity is recorded in arm_meta.json). The stream is put back to its pre-arm
 #      state at the end of every arm.
-# CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller env + restarts, SM power, load,
+#  11. (2026-10-07, in-repo tre/eval/runner) site settings come from runner.env (see
+#      runner.env.example; no IP / NodePort / node name / NFS path in the scripts); the runner's
+#      git sha is recorded (runner_sha). Evaluation data gaps (docs eval-metrics-spec §7):
+#      G1 APA and baseline arms run the controller in run mode observe with its decision pipeline
+#         ON (the scaling env switch is gone): signal_log + decision snapshots for every arm;
+#         baseline arms wait until no SafeScale probe is open before the shell starts;
+#      G2/G3/G10/G12 sampler: every awake pod incl. hidden at 1 Hz with its routable label and
+#         counters (pod_metrics_1s.jsonl), SM routable view, per-GPU map on change (gpu_map.jsonl),
+#         APA status 1 Hz, gpu-truth 1 Hz;  G8 kubelet /stats/summary -> resource_usage.jsonl (5 s);
+#      G4b gateway per-request events dumped for every arm with the stream on (gateway_events/);
+#      G5/G13 trace phase table + trace manifest (sha256, seed) copied into the arm dir; a seeded
+#         trace gets a _s<seed> trace directory;  G6/G7 clock_offsets.json + components.json at arm
+#         start and end (node of every TRE component, image IDs from pod status on all nodes);
+#      G9 sm.ts.log = SM log with kubelet timestamps (uvicorn access lines get a time).
+# CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
 set -euo pipefail
@@ -46,26 +60,33 @@ case "$ARM" in
   preserve) ARM_LABEL=PreServe-oracle; IS_BL=1 ;;
   *) echo "arm must be tre|apa|chiron|tokenscale|preserve" >&2; exit 2;;
 esac
-PILOT_ROOT="${PILOT_ROOT:-/data/nfs_shared_data/xxy/pilot-e1-20261005}"
+# shellcheck source=lib_env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_env.sh"   # runner.env: every site setting below
+need_env PILOT_ROOT TRE_DIR LOADGEN_TRE_DIR ICSE TRACE_FILE LOADGEN_CONFIG_ROOT GW MODELS BASELINE TRE_NS MODEL_NS APA_NS \
+  AIBRIX_NS CONTROLLER_DEPLOY SM_DEPLOY SM_SVC SM_PORT REDIS_SVC REDIS_PORT GW_NS GW_DEPLOY GW_SELECTOR BL_NS BL_DEPLOY
 PILOT_ROUND="${PILOT_ROUND:-$(basename "$PILOT_ROOT")}"
-TOOLS="${TOOLS:-$PILOT_ROOT/tools}"                 # copy of smoke-e1 tools + this script + score_pilot.py
-D=$PILOT_ROOT/$NAME/$ARM${RUN_TAG:+-$RUN_TAG}
-TRE="${TRE_DIR:-/data/nfs_shared_data/xxy/aibrix/tre}"          # deploy scripts (toggle, run mode, awake_ctl), baselines arm tool
-LG="${LOADGEN_TRE_DIR:-/data/nfs_shared_data/xxy/aibrix/tre}"   # loadgen_v1 + replayer (the client); sha recorded
+TOOLS="${TOOLS:-$RUNNER_DIR}"                       # this directory (sampler, snap, scoring, bl_tools)
+TRE="$TRE_DIR"                                      # deploy scripts (toggle, run mode, awake_ctl), baselines arm tool
+LG="$LOADGEN_TRE_DIR"                               # loadgen_v1 + replayer (the client); sha recorded
 IGNORE_EOS="${IGNORE_EOS:-1}"
-ICSE="${ICSE:-/root/aibrix-main/CustomTraceGenerator/config/icse_final}"
-TRACE="$ICSE/$NAME/traces_tre.effective.json"       # same request plan for both arms (as smoke-e1)
-CFG="$LG/loadgen_v1/configs/traces_v14/$NAME/config.yaml"
-GW="${GW:-http://192.168.223.76:31094}"
-MARKER="${MARKER:-/data/nfs_shared_data/xxy/TRE_EXCLUSIVE_WINDOW}"
+TRACE_DIR="$ICSE/$NAME"
+TRACE="$TRACE_DIR/$TRACE_FILE"                      # same request plan for every arm (as smoke-e1)
+CFG="$LOADGEN_CONFIG_ROOT/$NAME/config.yaml"
+# G13: the trace seed (TRACE_SEED, else the v2 generator manifest next to the trace); a seeded
+# trace's results go to <trace>_s<seed>/ (unless the trace directory name already ends so).
+if [ -z "${TRACE_SEED:-}" ] && [ -f "$TRACE_DIR/${TRACE_SOURCE_MANIFEST:-manifest.json}" ]; then
+  TRACE_SEED=$(python3 -c 'import json,sys;v=json.load(open(sys.argv[1])).get("seed");print("" if v is None else v)' "$TRACE_DIR/${TRACE_SOURCE_MANIFEST:-manifest.json}" 2>/dev/null || true)
+fi
+TRACE_SEED="${TRACE_SEED:-}"
+OUT_NAME="$NAME"
+if [ -n "$TRACE_SEED" ]; then case "$NAME" in *_s"$TRACE_SEED") ;; *) OUT_NAME="${NAME}_s$TRACE_SEED" ;; esac; fi
+D=$PILOT_ROOT/$OUT_NAME/$ARM${RUN_TAG:+-$RUN_TAG}
 REQUIRE_MARKER="${REQUIRE_MARKER:-1}"
 IDLE_S="${IDLE_S:-60}"; POST_S="${POST_S:-30}"
-BASELINE="${BASELINE:-dsqwen-7b/nscc-ds-4a100-node9/0 dsllama-8b/nscc-ds-4a100-node9/1 dsqwen-14b/nscc-ds-4a100-node10/0,1}"
 SCORE_REGISTRY="${SCORE_REGISTRY:-$D/live-registry.yaml}"   # default: the live registry recorded at arm start
+PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for open SafeScale probes to resolve
 # ---- gateway parity + baseline arms (2026-10-06)
 GW_PARITY="${GW_PARITY:-1}"                      # 1: every arm gets event stream on + x-tre-bl-in-tokens
-GW_NS="${GW_NS:-tre-v2}"; GW_DEPLOY="${GW_DEPLOY:-tre-gateway-plugins}"; GW_SELECTOR="${GW_SELECTOR:-app=tre-gateway-plugins}"
-BL_NS="${BL_NS:-tre-v2}"; BL_DEPLOY="${BL_DEPLOY:-tre-v2-baseline-scaler}"
 BL_CM_FILE="${BL_CM_FILE:-}"                     # frozen policy-configmaps.yaml (feat/baseline-params-20261006); empty = check live only
 BL_CM_APPLY="${BL_CM_APPLY:-0}"                  # 1: kubectl apply BL_CM_FILE when the live ConfigMap differs
 BL_SEED="${BL_SEED:-0}"                          # TRE_BL_SEED of the shell + the replay marker's seed (policy RNGs)
@@ -107,10 +128,11 @@ if [ "$IS_BL" = 1 ]; then
   [ "$R" = 0 ] || { echo "$BL_DEPLOY has $R replicas (another baseline arm running?); refusing" >&2; exit 2; }
 fi
 
-SMIP=$(kubectl -n tre-v2 get svc tre-v2-service-manager -o jsonpath='{.spec.clusterIP}')
-SM=http://$SMIP:8000
+SMIP=$(kubectl -n "$TRE_NS" get svc "$SM_SVC" -o jsonpath='{.spec.clusterIP}')
+SM=http://$SMIP:$SM_PORT
 export SM_URL=$SM
-REDIS_HOST=$(kubectl -n tre-v2 get svc tre-v2-redis -o jsonpath='{.spec.clusterIP}')
+REDIS_HOST=$(kubectl -n "$TRE_NS" get svc "$REDIS_SVC" -o jsonpath='{.spec.clusterIP}')
+export REDIS_URL="redis://$REDIS_HOST:$REDIS_PORT/0"
 mkdir -p "$D"
 log() { echo "[$(date +%F' '%T)] $*" | tee -a "$D/runner.log"; }
 mode() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; bash "$TRE/deploy/scripts/set_run_mode.sh" status | tr '\n' ' '; }
@@ -125,9 +147,9 @@ wait_no_hidden() {
 }
 wait_engines_idle() {   # every Ready model pod: vllm running+waiting == 0 (max 300 s; sidecar :8000 proxies /metrics)
   for i in $(seq 1 60); do
-    BUSY=$(kubectl -n default get pods -l tre.aibrix.io/managed=true -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | while read -r IP; do
+    BUSY=$(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | while read -r IP; do
       [ -n "$IP" ] || continue
-      curl -s --max-time 3 "http://$IP:8000/metrics" | awk '/^vllm:num_requests_(running|waiting)\{/ {s+=$2} END {print s+0}'
+      curl -s --max-time 3 "http://$IP:$ENGINE_PORT/metrics" | awk '/^vllm:num_requests_(running|waiting)\{/ {s+=$2} END {print s+0}'
     done | awk '{s+=$1} END {print s+0}')
     [ "$BUSY" = 0 ] && return 0; sleep 5
   done
@@ -145,21 +167,21 @@ reset_baseline() {
   log "reset: awake after restore: $(awake_set)"
 }
 restart_controller() {
-  kubectl -n tre-v2 rollout restart deploy/tre-v2-controller >/dev/null
-  kubectl -n tre-v2 rollout status deploy/tre-v2-controller --timeout=180s >/dev/null
+  kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY" >/dev/null
+  kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >/dev/null
   date +%s > "$D/controller_restart_epoch"
-  log "controller restarted: $(kubectl -n tre-v2 get pods -l app.kubernetes.io/name=tre-v2-controller -o name | tr '\n' ' ')"
+  log "controller restarted: $(kubectl -n "$TRE_NS" get pods -l "$CONTROLLER_SELECTOR" -o name | tr '\n' ' ')"
 }
 record_sidecar_nofile() {   # startup line of the (fixed) sidecar; record only, never fails the run
   printf 'pod\tnode\tbefore\tafter\thard\ttarget\n' > "$D/sidecar_nofile.tsv"
-  local P LINE
-  for P in $(kubectl -n default get pods -l tre.aibrix.io/managed=true -o name); do
-    LINE=$(kubectl -n default logs "$P" -c tre-reissue-sidecar --limit-bytes=2000000 2>/dev/null | grep -m1 '"tre_reissue_nofile"' || true)
-    printf '%s\t%s\n' "${P#pod/}" "${LINE:-MISSING}" | python3 -c '
+  local P N LINE
+  kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' | while read -r P N; do
+    [ -n "$P" ] || continue
+    LINE=$(kubectl -n "$MODEL_NS" logs "$P" -c "$SIDECAR_CONTAINER" --limit-bytes=2000000 2>/dev/null | grep -m1 '"tre_reissue_nofile"' || true)
+    printf '%s\t%s\t%s\n' "$P" "${N:-?}" "${LINE:-MISSING}" | python3 -c '
 import sys, json
 for l in sys.stdin:
-    pod, raw = l.rstrip("\n").split("\t", 1)
-    node = "node10" if "node10" in pod else ("node9" if "node9" in pod else "?")
+    pod, node, raw = l.rstrip("\n").split("\t", 2)
     try: r = json.loads(raw)
     except ValueError: r = {}
     print("\t".join(str(x) for x in (pod, node, r.get("before"), r.get("after"), r.get("hard"), r.get("target"))))' >> "$D/sidecar_nofile.tsv"
@@ -167,7 +189,7 @@ for l in sys.stdin:
   local total ok
   total=$(($(wc -l < "$D/sidecar_nofile.tsv") - 1))
   ok=$(awk -F'\t' 'NR>1 && $4 ~ /^[0-9]+$/ && $4 >= 65535' "$D/sidecar_nofile.tsv" | wc -l)
-  log "sidecar nofile: $ok/$total pods with after>=65535 (node10 expect 65535, node9 1048576); see sidecar_nofile.tsv"
+  log "sidecar nofile: $ok/$total pods with after>=65535 (65535 where the runtime soft limit is 1024, else the hard limit); see sidecar_nofile.tsv"
 }
 # ---- gateway request-event stream (TRE_BL_REQ_EVENTS on the plugin deployment; "" = unset = off)
 events_get() { kubectl -n "$GW_NS" get deploy "$GW_DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="TRE_BL_REQ_EVENTS")].value}'; }
@@ -184,7 +206,21 @@ events_set() {   # events_set <value> | events_set UNSET ; rollout only when it 
   log "gateway event stream: '${cur:-UNSET}' -> '$(events_get || true)' (plugins: $(kubectl -n "$GW_NS" get pods -l "$GW_SELECTOR" --no-headers 2>/dev/null | awk '{print $1":"$2":"$3}' | tr '\n' ' '))"
 }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \
-               --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "redis://$REDIS_HOST:6379/0" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
+               --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "$REDIS_URL" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
+# G1: a baseline shell starts only when the observe controller has no open SafeScale probe. The
+# observe controller's single SM write is the rollback unhide of its OWN open probes, and that
+# PUT .../routable replaces the model's hidden set; with none open it never writes to the SM.
+wait_no_open_probes() {
+  local i n
+  for i in $(seq 1 $(( (PROBE_WAIT_S + 4) / 5 ))); do
+    n=$(BLT open-probes --redis "$REDIS_HOST" 2>/dev/null || echo "?")
+    [ "$n" = 0 ] && return 0; sleep 5
+  done
+  log "ERROR $n open SafeScale probe(s) after ${PROBE_WAIT_S} s in observe mode; refusing to start the baseline shell"; exit 4
+}
+# G6/G7: clock offsets of every node vs this host, node + image IDs of every component
+probe_clocks() { python3 "$TOOLS/clock_probe.py" "$D/clock_offsets.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN clock probe ($1) failed"; }
+record_components() { python3 "$TOOLS/components.py" "$D/components.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN components ($1) failed"; }
 BLT() { python3 "$TOOLS/bl_tools.py" "$@"; }
 BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET
 on_exit() {   # safety net: never leave a baseline shell actuating or the stream flipped after a crash
@@ -205,18 +241,28 @@ log "=== arm=$ARM ($ARM_LABEL) trace=$NAME file=$TRACE cfg=$CFG round=$PILOT_ROU
 echo "$ARM_LABEL" > "$D/arm_label"
 log "marker: $(head -c 300 "$MARKER" 2>/dev/null || echo none)"
 sha256sum "$TRACE" "$CFG" | tee -a "$D/runner.log"
+runner_sha > "$D/runner_sha"
+log "runner: $(tr '\n' ' ' < "$D/runner_sha")"
+# G5/G13: phase table + trace manifest (sha256, seed) next to the results
+SEG_SRC="$TRACE_DIR/${TRACE_SEGMENTS_FILE:-trace.json}"; SRC_MAN="$TRACE_DIR/${TRACE_SOURCE_MANIFEST:-manifest.json}"
+[ -f "$SEG_SRC" ] && cp "$SEG_SRC" "$D/trace_segments.json"
+[ -f "$SRC_MAN" ] && cp "$SRC_MAN" "$D/trace_source_manifest.json"
+BLT trace-manifest --out "$D/trace_manifest.json" --name "$NAME" --trace "$TRACE" --config "$CFG" \
+  --segments "$SEG_SRC" --source-manifest "$SRC_MAN" --seed "$TRACE_SEED" >> "$D/runner.log" 2>&1 || log "WARN trace manifest failed"
 git -C "$TRE" rev-parse HEAD > "$D/tre_sha"
 { echo "dir=$LG"; echo "sha=$(git -C "$LG" rev-parse HEAD)"; echo "branch=$(git -C "$LG" rev-parse --abbrev-ref HEAD)";
   echo "dirty_files=$(git -C "$LG" status --porcelain -- loadgen_v1 replayer | wc -l)"; echo "ignore_eos=$IGNORE_EOS"; echo "send_in_tokens=$SEND_IN_TOKENS"; } > "$D/loadgen_sha"
 log "loadgen: $(tr '\n' ' ' < "$D/loadgen_sha")"
-kubectl -n tre-v2 get deploy -o jsonpath='{range .items[*]}{.metadata.name} {.spec.template.spec.containers[0].image}{"\n"}{end}' > "$D/images.txt"
-docker images --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null | grep -E 'tre-v2-|gateway-plugins|vllm-openai-tre' > "$D/image_ids_node10.txt" || true
-kubectl -n default get pods -l tre.aibrix.io/managed=true -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image} {.status.containerStatuses[0].imageID}{"\n"}{end}' > "$D/model_images.txt"
-kubectl -n tre-v2 get cm tre-v2-registry -o jsonpath='{.data.registry\.yaml}' > "$D/live-registry.yaml"
+kubectl -n "$TRE_NS" get deploy -o jsonpath='{range .items[*]}{.metadata.name} {.spec.template.spec.containers[0].image}{"\n"}{end}' > "$D/images.txt"
+# this host's docker only (as before); components.json has the image IDs on every node (G7)
+docker images --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null | grep -E 'tre-v2-|gateway-plugins|vllm-openai-tre' > "$D/image_ids_$(hostname -s).txt" || true
+kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image} {.status.containerStatuses[0].imageID}{"\n"}{end}' > "$D/model_images.txt"
+kubectl -n "$TRE_NS" get cm tre-v2-registry -o jsonpath='{.data.registry\.yaml}' > "$D/live-registry.yaml"
 EV_BEFORE=$(events_get); EV_BEFORE=${EV_BEFORE:-UNSET}
 python3 -c 'import json,sys; json.dump(dict(arm=sys.argv[1], label=sys.argv[2], gw_parity=int(sys.argv[3]), events_wanted=int(sys.argv[4]),
-  send_in_tokens=int(sys.argv[5]), events_before=sys.argv[6], bl_seed=int(sys.argv[7]), mark_at=sys.argv[8], bl_cm_file=sys.argv[9] or None),
-  open(sys.argv[10], "w"), indent=1)' "$ARM" "$ARM_LABEL" "$GW_PARITY" "$WANT_EVENTS" "$SEND_IN_TOKENS" "$EV_BEFORE" "$BL_SEED" "$MARK_AT" "$BL_CM_FILE" "$D/arm_meta.json"
+  send_in_tokens=int(sys.argv[5]), events_before=sys.argv[6], bl_seed=int(sys.argv[7]), mark_at=sys.argv[8], bl_cm_file=sys.argv[9] or None,
+  trace_seed=sys.argv[11] or None, controller_mode="active" if sys.argv[1] == "tre" else "observe"),
+  open(sys.argv[10], "w"), indent=1)' "$ARM" "$ARM_LABEL" "$GW_PARITY" "$WANT_EVENTS" "$SEND_IN_TOKENS" "$EV_BEFORE" "$BL_SEED" "$MARK_AT" "$BL_CM_FILE" "$D/arm_meta.json" "$TRACE_SEED"
 log "gateway parity: GW_PARITY=$GW_PARITY events_wanted=$WANT_EVENTS send_in_tokens=$SEND_IN_TOKENS (stream before: $EV_BEFORE)"
 if [ "$IS_BL" = 1 ]; then
   # policy ConfigMap: live content must be the frozen parameters (BL_CM_FILE) and no placeholder
@@ -247,17 +293,17 @@ if [ "$WANT_EVENTS" = 1 ]; then
 fi
 reset_baseline
 wait_engines_idle || true
+# Decision source = run mode + APA CRs + baseline owner lock (toggle_tre_apa.sh status). The
+# controller computes and records its signals and decisions in every arm; it actuates only in
+# run mode active (TRE arm). APA / baseline arms: controller observe (counterfactual log, G1).
 if [ "$ARM" = tre ]; then
   bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode >> "$D/runner.log" 2>&1
 elif [ "$ARM" = apa ]; then
   bash "$TRE/deploy/scripts/toggle_tre_apa.sh" apa --keep-run-mode >> "$D/runner.log" 2>&1
-  kubectl -n tre-v2 set env deploy/tre-v2-controller ENABLE_TRE_SCALING=true >> "$D/runner.log" 2>&1   # counterfactual logging only
 else
-  # decision source NONE before the shell: 0 APA CRs (toggle tre removes them) and TRE scaling off
-  N_APA=$(kubectl -n default get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
+  # decision source NONE before the shell: 0 APA CRs (toggle tre removes them), controller observe
+  N_APA=$(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
   [ "$N_APA" = 0 ] || bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode >> "$D/runner.log" 2>&1
-  kubectl -n tre-v2 set env deploy/tre-v2-controller ENABLE_TRE_SCALING=false >> "$D/runner.log" 2>&1
-  kubectl -n tre-v2 rollout status deploy/tre-v2-controller --timeout=180s >> "$D/runner.log" 2>&1
   kubectl -n "$BL_NS" set env "deploy/$BL_DEPLOY" "TRE_BL_SEED=$BL_SEED" >> "$D/runner.log" 2>&1   # 0 replicas: template only
 fi
 bash "$TRE/deploy/scripts/toggle_tre_apa.sh" status --keep-run-mode >> "$D/runner.log" 2>&1 || true
@@ -265,14 +311,18 @@ if [ "$IS_BL" = 1 ]; then
   ST=$(bash "$TRE/deploy/scripts/toggle_tre_apa.sh" status --keep-run-mode 2>/dev/null | grep 'active decision source' || true)
   case "$ST" in *NONE*) log "decision source before the shell: $ST" ;; *) log "ERROR decision source is not NONE: $ST"; exit 4;; esac
 fi
-kubectl -n default get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_before.yaml" 2>&1 || true
+kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_before.yaml" 2>&1 || true
 python3 "$TOOLS/snap.py" "$D/snap_before.json" "$SM" >> "$D/runner.log" 2>&1
 log "awake at start: $(awake_set)"
 if [ "$ARM" = tre ]; then log "run mode -> $(mode active active)"; else log "run mode -> $(mode observe active)"; fi
 restart_controller
 T_RESTART=$(cat "$D/controller_restart_epoch"); START_ISO=$(date -u -d @"$T_RESTART" +%FT%TZ); echo "$START_ISO" > "$D/start_iso"
 T_IDLE0=$T_RESTART
+probe_clocks start
+record_components start
+BLT redis-ms --redis "$REDIS_HOST" > "$D/arm_start_redis_ms" 2>/dev/null || true
 if [ "$IS_BL" = 1 ]; then
+  wait_no_open_probes
   BLT del-key --redis "$REDIS_HOST" --key tre:v2:bl:replay_t0 >> "$D/runner.log" 2>&1   # no stale marker from an earlier run
   BL_ENABLED=1
   ARM_TOOL enable --policy "$ARM" --execute --timeout-s 180 >> "$D/runner.log" 2>&1 \
@@ -287,12 +337,12 @@ if [ "$IS_BL" = 1 ]; then
   fi
 fi
 rm -f "$D/STOP"
-nohup python3 "$TOOLS/sampler.py" "$D" "$SM" > "$D/sampler.log" 2>&1 &
+nohup python3 "$TOOLS/sampler.py" "$D" "$SM" "$REDIS_URL" > "$D/sampler.log" 2>&1 &
 SAMPLER=$!
 if [ "$ARM" = apa ]; then
   N=0
   for i in $(seq 1 36); do
-    N=$(kubectl -n default get podautoscalers.autoscaling.aibrix.ai -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="AbleToScale")].status}{"\n"}{end}' | grep -c True || true)
+    N=$(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="AbleToScale")].status}{"\n"}{end}' | grep -c True || true)
     [ "$N" = 3 ] && break; sleep 5
   done
   log "APA AbleToScale=True count: $N"
@@ -313,7 +363,7 @@ run_loadgen() {
 if [ "$IS_BL" = 1 ] && [ "$MARK_AT" = first-send ]; then
   run_loadgen &   # baseline arms: the replay marker is written at the first send (gateway arr event)
   LGPID=$!
-  FIRST=$(BLT wait-first-arr --redis "$REDIS_HOST" --since-ms "$(cat "$D/load_start_redis_ms")" --models dsqwen-7b,dsllama-8b,dsqwen-14b --timeout-s 300)
+  FIRST=$(BLT wait-first-arr --redis "$REDIS_HOST" --since-ms "$(cat "$D/load_start_redis_ms")" --models "$MODELS" --timeout-s 300)
   [ -n "$FIRST" ] || log "WARN no gateway arr event within 300 s of load start; marking now"
   ARM_TOOL mark-replay --trace "$TRACE" --seed "$BL_SEED" --execute >> "$D/runner.log" 2>&1 || log "ERROR mark-replay failed (PreServe Tier-1 inactive)"
   echo "${FIRST:-null}" > "$D/first_arr_redis_ms"
@@ -337,22 +387,27 @@ if [ "$IS_BL" = 1 ]; then
   log "baseline shell disabled; validity: $(python3 -c 'import json,sys;v=json.load(open(sys.argv[1]));print({k:v.get(k) for k in ("events_valid","invalid_because","gw_bl_dropped_delta")})' "$D/baseline/run_validity.json" 2>&1)"
 fi
 touch "$D/STOP"; wait $SAMPLER || true
+probe_clocks end
+record_components end
 python3 "$TOOLS/snap.py" "$D/snap_after.json" "$SM" >> "$D/runner.log" 2>&1
-kubectl -n tre-v2 logs deploy/tre-v2-controller --since-time="$START_ISO" > "$D/controller.log" 2>&1 || true
-kubectl -n tre-v2 logs deploy/tre-v2-service-manager --since-time="$START_ISO" > "$D/sm.log" 2>&1 || true
-kubectl -n tre-v2 logs deploy/tre-gateway-plugins --since-time="$START_ISO" > "$D/gateway-plugins.log" 2>&1 || true
+kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" --since-time="$START_ISO" > "$D/controller.log" 2>&1 || true
+kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" > "$D/sm.log" 2>&1 || true
+# G9: the same SM log with kubelet timestamps (uvicorn access lines carry no time of their own)
+kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" --timestamps > "$D/sm.ts.log" 2>&1 || true
+kubectl -n "$GW_NS" logs "deploy/$GW_DEPLOY" --since-time="$START_ISO" > "$D/gateway-plugins.log" 2>&1 || true
 mkdir -p "$D/sidecar"
-for P in $(kubectl -n default get pods -l tre.aibrix.io/managed=true -o name); do
-  kubectl -n default logs "$P" -c tre-reissue-sidecar --since-time="$START_ISO" 2>/dev/null > "$D/sidecar/${P#pod/}.log" || true
+for P in $(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o name); do
+  kubectl -n "$MODEL_NS" logs "$P" -c "$SIDECAR_CONTAINER" --since-time="$START_ISO" 2>/dev/null > "$D/sidecar/${P#pod/}.log" || true
 done
 grep -l -i "too many open files" "$D"/sidecar/*.log > "$D/EMFILE_PODS" 2>/dev/null || true
-kubectl -n aibrix-system logs deploy/aibrix-controller-manager --since-time="$START_ISO" 2>/dev/null \
-  | grep -i -E "podautoscal|apa|scale|dsqwen|dsllama" > "$D/aibrix-controller-manager.log" || true
-kubectl -n default get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_after.yaml" 2>&1 || true
-python3 - "$D" "$T_RESTART" <<'PY'
-import json, sys, redis, subprocess
+APA_GREP="podautoscal|apa|scale|$(echo "$MODELS" | tr ',' '|')"
+kubectl -n "$AIBRIX_NS" logs "deploy/$APA_CTRL_DEPLOY" --since-time="$START_ISO" 2>/dev/null \
+  | grep -i -E "$APA_GREP" > "$D/aibrix-controller-manager.log" || true
+kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_after.yaml" 2>&1 || true
+python3 - "$D" "$T_RESTART" "$REDIS_URL" <<'PY'
+import json, sys, redis
 d, t0 = sys.argv[1], int(sys.argv[2]) * 1000
-r = redis.Redis(host=subprocess.check_output(["kubectl","-n","tre-v2","get","svc","tre-v2-redis","-o","jsonpath={.spec.clusterIP}"],text=True).strip(), port=6379, decode_responses=True)
+r = redis.Redis.from_url(sys.argv[3], decode_responses=True)
 probes = dict(r.hgetall("tre:v2:controller:safescale:probes"))
 journals = {}
 for k in r.scan_iter(match="tre:v2:controller:safescale:probe:*:journal", count=1000):
@@ -366,13 +421,16 @@ with open(f"{d}/signal_log.jsonl", "w") as f:
 print("probes", len(probes), "journals", len(journals))
 PY
 if [ "$IS_BL" = 1 ]; then
-  log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models dsqwen-7b,dsllama-8b,dsqwen-14b 2>&1)"
+  log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models "$MODELS" 2>&1)"
+elif [ "$WANT_EVENTS" = 1 ] && [ -s "$D/arm_start_redis_ms" ]; then
+  # G4b: the gateway per-request events of TRE / APA arms too (the stream was on)
+  log "gateway events: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/arm_start_redis_ms")" --out-dir "$D/gateway_events" --models "$MODELS" 2>&1)"
 fi
 ( cd "$TRE/deploy" && PYTHONPATH="$TRE/deploy:$TRE/common" python3 -m scripts.analysis.safescale_summary "$D/safescale.json" > "$D/safescale_summary.json" 2>&1 ) || true
 log "collected; awake at end: $(awake_set); EMFILE pods: $(wc -l < "$D/EMFILE_PODS")"
 reset_baseline
 bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode >> "$D/runner.log" 2>&1
-log "restore: APA CRs live: $(kubectl -n default get podautoscalers.autoscaling.aibrix.ai -o name | wc -l)"
+log "restore: APA CRs live: $(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name | wc -l)"
 log "restore: run mode -> $(mode observe active)"
 if [ "$EVENTS_CHANGED" = 1 ]; then events_set "$EV_BEFORE"; EVENTS_CHANGED=0; log "restore: gateway event stream -> '$(events_get)' (pre-arm '$EV_BEFORE')"; fi
 if [ "$IS_BL" = 1 ]; then

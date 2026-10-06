@@ -15,8 +15,6 @@ case "$a" in
   *"get deploy tre-gateway-plugins"*TRE_BL_REQ_EVENTS*) cat $S/events 2>/dev/null || true ;;
   *"set env deploy/tre-gateway-plugins TRE_BL_REQ_EVENTS-"*) rm -f $S/events ;;
   *"set env deploy/tre-gateway-plugins TRE_BL_REQ_EVENTS="*) echo -n "${a##*TRE_BL_REQ_EVENTS=}" > $S/events ;;
-  *"get deploy tre-v2-controller"*ENABLE_TRE_SCALING*) cat $S/tre_scaling 2>/dev/null || echo true ;;
-  *"set env deploy/tre-v2-controller ENABLE_TRE_SCALING="*) echo -n "${a##*ENABLE_TRE_SCALING=}" > $S/tre_scaling ;;
   *"get cm tre-v2-registry"*) cat __H__/state/registry.yaml ;;
   *"get cm tre-v2-baseline-"*) p=${a#*tre-v2-baseline-}; p=${p%% *}; cat __H__/state/policy-$p.yaml ;;
   *"patch cm tre-v2-baseline-preserve"*) echo "$a" >> $S/cm_patches ;;
@@ -75,8 +73,8 @@ EOF
 cat > $T/deploy/scripts/toggle_tre_apa.sh <<'EOF'
 #!/usr/bin/env bash
 S=__H__/state; echo "toggle $*" >> $S/calls.log
-case "$1" in tre) echo -n true > $S/tre_scaling ;; apa) echo -n false > $S/tre_scaling ;; status)
-  v=$(cat $S/tre_scaling 2>/dev/null || echo true); if [ "$v" = true ]; then echo "active decision source: TRE"; else echo "active decision source: NONE (both stopped)"; fi ;; esac
+case "$1" in tre|apa) : ;; status)
+  m=$(cut -d' ' -f1 $S/mode 2>/dev/null || echo observe); if [ "$m" = active ]; then echo "active decision source: TRE"; else echo "active decision source: NONE (TRE observes, no APA CR, no baseline shell)"; fi ;; esac
 EOF
 printf 'import sys\nprint("awake_ctl", sys.argv[1:])\n' > $T/deploy/scripts/release/awake_ctl.py
 touch $T/deploy/scripts/__init__.py $T/deploy/scripts/analysis/__init__.py
@@ -145,7 +143,8 @@ ids = ["dsqwen-7b/nscc-ds-4a100-node9/0", "dsllama-8b/nscc-ds-4a100-node9/1", "d
 json.dump({"version": 1, "models": {}, "bindings": [{"binding_id": i, "awake": True, "hidden": False} for i in ids]}, open(sys.argv[1], "w"))
 EOF
 # ---------- tools
-cp $SRC/run_arm_pilot.sh $SRC/run_pilot.sh $SRC/baseline_sanity.sh $SRC/bl_tools.py $SRC/score_pilot.py $H/tools/
+cp $SRC/run_arm_pilot.sh $SRC/run_pilot.sh $SRC/baseline_sanity.sh $SRC/bl_tools.py $SRC/score_pilot.py \
+   $SRC/lib_env.sh $SRC/runner.env.example $SRC/clock_probe.py $SRC/components.py $SRC/k8s_names.py $H/tools/
 printf 'import os,sys,time\nd=sys.argv[1]\nfor _ in range(600):\n    if os.path.exists(d+"/STOP"): break\n    time.sleep(0.05)\n' > $H/tools/sampler.py
 printf 'import json,sys\njson.dump({}, open(sys.argv[1],"w"))\n' > $H/tools/snap.py
 printf 'print("analyze ok")\n' > $H/tools/analyze.py

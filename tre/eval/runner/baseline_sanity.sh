@@ -3,7 +3,8 @@
 # with a synthetic single-model load (tre_replayer.run_trace, replay profile: /v1/completions,
 # stream, ignore_eos, in 492 / max_tokens 400 = the hot alt trace shape, x-tre-bl-in-tokens sent).
 # Every part: dry-run shell first (TRE_BL_DRY_RUN=true), then the actuating shell; SM active,
-# controller observe, TRE scaling off, 0 APA CRs, gateway event stream on. CHANGES CLUSTER STATE.
+# controller observe (decisions recorded, no actuation), 0 APA CRs, gateway event stream on.
+# Site settings: runner.env (runner.env.example). CHANGES CLUSTER STATE.
 #
 # Usage: baseline_sanity.sh <chiron|tokenscale|preserve> [PART ...]      (nohup it; log in $SD/sanity.log)
 #   PARTS (default "S1 S23 S3B S4"):
@@ -39,20 +40,18 @@ set -euo pipefail
 ARM="${1:-}"; shift || true
 case "$ARM" in chiron|tokenscale|preserve) ;; *) echo "usage: $0 <chiron|tokenscale|preserve> [S1 S23 S3B S4]" >&2; exit 2;; esac
 PARTS="${*:-${PARTS:-S1 S23 S3B S4}}"
-PILOT_ROOT="${PILOT_ROOT:-/data/nfs_shared_data/xxy/pilot-e1-20261005}"
+# shellcheck source=lib_env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_env.sh"   # runner.env: site settings
+need_env PILOT_ROOT TRE_DIR LOADGEN_TRE_DIR GW MODELS BASELINE TRE_NS MODEL_NS APA_NS SM_SVC SM_PORT REDIS_SVC REDIS_PORT \
+  GW_NS GW_DEPLOY GW_SELECTOR BL_NS BL_DEPLOY
 PILOT_ROUND="${PILOT_ROUND:-$(basename "$PILOT_ROOT")}"
-TOOLS="${TOOLS:-$PILOT_ROOT/tools}"
+TOOLS="${TOOLS:-$RUNNER_DIR}"
 SANITY_ROOT="${SANITY_ROOT:-$PILOT_ROOT/sanity}"
 SD="$SANITY_ROOT/$ARM${SANITY_TAG:+-$SANITY_TAG}"
-TRE="${TRE_DIR:-/data/nfs_shared_data/xxy/aibrix/tre}"
-LG="${LOADGEN_TRE_DIR:-/data/nfs_shared_data/xxy/aibrix/tre}"       # replayer (client)
-GW="${GW:-http://192.168.223.76:31094}"
-MARKER="${MARKER:-/data/nfs_shared_data/xxy/TRE_EXCLUSIVE_WINDOW}"
+TRE="$TRE_DIR"
+LG="$LOADGEN_TRE_DIR"                                                 # replayer (client)
 REQUIRE_MARKER="${REQUIRE_MARKER:-1}"
-BASELINE="${BASELINE:-dsqwen-7b/nscc-ds-4a100-node9/0 dsllama-8b/nscc-ds-4a100-node9/1 dsqwen-14b/nscc-ds-4a100-node10/0,1}"
-GW_NS="${GW_NS:-tre-v2}"; GW_DEPLOY="${GW_DEPLOY:-tre-gateway-plugins}"; GW_SELECTOR="${GW_SELECTOR:-app=tre-gateway-plugins}"
-BL_NS="${BL_NS:-tre-v2}"; BL_DEPLOY="${BL_DEPLOY:-tre-v2-baseline-scaler}"
-MODEL="${MODEL:-dsqwen-7b}"; MODEL2="${MODEL2:-dsllama-8b}"
+MODEL="${MODEL:-$(echo "$MODELS" | cut -d, -f1)}"; MODEL2="${MODEL2:-$(echo "$MODELS" | cut -d, -f2)}"
 IN_TOK="${IN_TOK:-492}"; OUT_TOK="${OUT_TOK:-400}"
 case "$ARM" in tokenscale) DEF_CAP=vb ;; *) DEF_CAP=mu ;; esac
 CAP_SRC="${CAP_SRC:-$DEF_CAP}"                    # mu (PreServe mu_t) | vb (TokenScale V_b) | auto
@@ -86,14 +85,14 @@ fi
 grep -q -- "--send-in-tokens" "$LG/replayer/tre_replayer/run_trace.py" || { echo "$LG replayer has no --send-in-tokens" >&2; exit 2; }
 R=$(kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}')
 [ "$R" = 0 ] || { echo "$BL_DEPLOY has $R replicas (an arm is running?); refusing" >&2; exit 2; }
-SMIP=$(kubectl -n tre-v2 get svc tre-v2-service-manager -o jsonpath='{.spec.clusterIP}'); SM=http://$SMIP:8000; export SM_URL=$SM
-REDIS_HOST=$(kubectl -n tre-v2 get svc tre-v2-redis -o jsonpath='{.spec.clusterIP}')
+SMIP=$(kubectl -n "$TRE_NS" get svc "$SM_SVC" -o jsonpath='{.spec.clusterIP}'); SM=http://$SMIP:$SM_PORT; export SM_URL=$SM
+REDIS_HOST=$(kubectl -n "$TRE_NS" get svc "$REDIS_SVC" -o jsonpath='{.spec.clusterIP}')
 mkdir -p "$SD/policies"
 LOGF="$SD/sanity.log"
 log() { echo "[$(date +%F' '%T)] $*" | tee -a "$LOGF"; }
 BLT() { python3 "$TOOLS/bl_tools.py" "$@"; }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \
-               --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "redis://$REDIS_HOST:6379/0" \
+               --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "redis://$REDIS_HOST:$REDIS_PORT/0" \
                --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
 mode() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; bash "$TRE/deploy/scripts/set_run_mode.sh" status | tr '\n' ' '; }
 awake_ids() { curl -s "$SM/v2/state" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(" ".join(sorted(b["binding_id"] for b in d["bindings"] if b["awake"])))'; }
@@ -105,9 +104,9 @@ wait_no_hidden() {
 }
 wait_engines_idle() {
   for i in $(seq 1 60); do
-    BUSY=$(kubectl -n default get pods -l tre.aibrix.io/managed=true -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | while read -r IP; do
+    BUSY=$(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | while read -r IP; do
       [ -n "$IP" ] || continue
-      curl -s --max-time 3 "http://$IP:8000/metrics" | awk '/^vllm:num_requests_(running|waiting)\{/ {s+=$2} END {print s+0}'
+      curl -s --max-time 3 "http://$IP:$ENGINE_PORT/metrics" | awk '/^vllm:num_requests_(running|waiting)\{/ {s+=$2} END {print s+0}'
     done | awk '{s+=$1} END {print s+0}')
     [ "$BUSY" = 0 ] && return 0; sleep 5
   done; log "WARN engines still busy after 300 s"; return 1
@@ -149,7 +148,7 @@ trap on_exit EXIT
 
 log "=== sanity arm=$ARM parts=[$PARTS] model=$MODEL model2=$MODEL2 cap_src=$CAP_SRC dir=$SD"
 git -C "$TRE" rev-parse HEAD > "$SD/tre_sha"; git -C "$LG" rev-parse HEAD > "$SD/client_sha"
-kubectl -n tre-v2 get cm tre-v2-registry -o jsonpath='{.data.registry\.yaml}' > "$SD/live-registry.yaml"
+kubectl -n "$TRE_NS" get cm tre-v2-registry -o jsonpath='{.data.registry\.yaml}' > "$SD/live-registry.yaml"
 for P in chiron tokenscale preserve; do
   kubectl -n "$BL_NS" get cm "tre-v2-baseline-$P" -o jsonpath="{.data.$P\.yaml}" > "$SD/policies/$P.yaml"
 done
@@ -166,10 +165,10 @@ PRESERVE_WIN=$(python3 -c 'import yaml,sys;print((yaml.safe_load(open(sys.argv[1
 [ "$ARM" = preserve ] && PRESERVE_WIN=$PRESERVE_SANITY_WINDOW_S
 
 # ---- decision source NONE, event stream on, shell seed
-N_APA=$(kubectl -n default get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
+# (2026-10-07) NONE = controller run mode observe (set by reset_baseline) + 0 APA CRs + no
+# baseline owner lock; the controller keeps computing and logging its decisions.
+N_APA=$(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
 [ "$N_APA" = 0 ] || bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode >> "$LOGF" 2>&1
-kubectl -n tre-v2 set env deploy/tre-v2-controller ENABLE_TRE_SCALING=false >> "$LOGF" 2>&1
-kubectl -n tre-v2 rollout status deploy/tre-v2-controller --timeout=180s >> "$LOGF" 2>&1
 ST=$(bash "$TRE/deploy/scripts/toggle_tre_apa.sh" status --keep-run-mode 2>/dev/null | grep 'active decision source' || true)
 case "$ST" in *NONE*) log "decision source: $ST" ;; *) log "ERROR decision source is not NONE: $ST"; exit 4;; esac
 EV_BEFORE=$(events_get); EV_BEFORE=${EV_BEFORE:-UNSET}
