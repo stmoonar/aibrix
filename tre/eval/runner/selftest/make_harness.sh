@@ -19,7 +19,8 @@ case "$a" in
   *"get cm tre-v2-baseline-"*) p=${a#*tre-v2-baseline-}; p=${p%% *}; cat __H__/state/policy-$p.yaml ;;
   *"patch cm tre-v2-baseline-preserve"*) echo "$a" >> $S/cm_patches ;;
   *"get --raw"*) printf 'tre_gateway_bl_req_events_written_total 5\n' ;;
-  *"get podautoscalers"*-o\ name*) ;;
+  *"get podautoscalers"*AbleToScale*) [ -e $S/apa_crs ] && printf "True\nTrue\nTrue\n" ;;
+  *"get podautoscalers"*-o\ name*) [ -e $S/apa_crs ] && printf "podautoscaler/a\npodautoscaler/b\npodautoscaler/c\n" ;;
   *"get podautoscalers"*) echo "items: []" ;;
   *"get pods"*"-o name"*) echo "pod/dsqwen-7b-nscc-ds-4a100-node9-gpu-0-x" ;;
   *"get pods"*"podIP"*) echo 10.0.0.9 ;;
@@ -73,10 +74,16 @@ EOF
 cat > $T/deploy/scripts/toggle_tre_apa.sh <<'EOF'
 #!/usr/bin/env bash
 S=__H__/state; echo "toggle $*" >> $S/calls.log
-case "$1" in tre|apa) : ;; status)
+case "$1" in tre) rm -f $S/apa_crs ;; apa) touch $S/apa_crs ;; status)
   m=$(cut -d' ' -f1 $S/mode 2>/dev/null || echo observe); if [ "$m" = active ]; then echo "active decision source: TRE"; else echo "active decision source: NONE (TRE observes, no APA CR, no baseline shell)"; fi ;; esac
 EOF
-printf 'import sys\nprint("awake_ctl", sys.argv[1:])\n' > $T/deploy/scripts/release/awake_ctl.py
+# fake awake_ctl: records whether APA CRs are live at restore time; fails like the real 409 when they are
+cat > $T/deploy/scripts/release/awake_ctl.py <<'EOF'
+import os, sys
+S = "__H__/state"; live = os.path.exists(S + "/apa_crs")
+open(S + "/calls.log", "a").write("awake_ctl %s apa_crs_live=%d\n" % (" ".join(sys.argv[1:2]), live))
+print("awake_ctl", sys.argv[1:]); sys.exit(3 if live else 0)
+EOF
 touch $T/deploy/scripts/__init__.py $T/deploy/scripts/analysis/__init__.py
 printf 'print("{}")\n' > $T/deploy/scripts/analysis/safescale_summary.py
 touch $T/baselines/tre_baselines/__init__.py $T/baselines/tre_baselines/tools/__init__.py
@@ -102,7 +109,7 @@ elif cmd == "disable":
         if os.path.exists(dec):
             import shutil; shutil.copy(dec, d + "/pod-x/decisions-p-x.jsonl")
 EOF
-sed -i "s#__H__#$H#g" $T/deploy/scripts/*.sh $T/baselines/tre_baselines/tools/arm.py; chmod +x $T/deploy/scripts/*.sh
+sed -i "s#__H__#$H#g" $T/deploy/scripts/*.sh $T/deploy/scripts/release/awake_ctl.py $T/baselines/tre_baselines/tools/arm.py; chmod +x $T/deploy/scripts/*.sh
 # fake loadgen + replayer
 mkdir -p $T/loadgen_v1/tre_loadgen_v1 $T/loadgen_v1/configs/traces_v14/Alt $T/replayer/tre_replayer
 cat > $T/loadgen_v1/tre_loadgen_v1/cli.py <<'EOF'

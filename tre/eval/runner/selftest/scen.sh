@@ -27,3 +27,9 @@ for f in runner_sha trace_manifest.json clock_offsets.json arm_start_redis_ms; d
 ls $H/pilot/Alt/tre/gateway_events 2>/dev/null | head -3
 echo "== 2026-10-07: chiron waits for no open probe (fake redis: none) and starts"; reset; run nice bash $H/tools/run_arm_pilot.sh chiron Alt >/dev/null 2>&1; echo rc=$?; grep -E "decision source|baseline shell enabled" $H/pilot/Alt/chiron/runner.log | cut -c1-120
 echo "== 2026-10-07: seeded trace -> Alt_s7 directory"; reset; echo '{"seed": 7}' > $H/icse/Alt/manifest.json; run nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?; ls $H/pilot; python3 -c "import json;print(json.load(open('$H/pilot/Alt_s7/tre/trace_manifest.json'))['seed'])"
+echo "== 2026-10-07: apa arm: decision source off (0 APA CRs) before every restore (asserted)"; reset; run nice bash $H/tools/run_arm_pilot.sh apa Alt >/dev/null 2>&1; echo rc=$?
+grep -E "^toggle (tre|apa)|^awake_ctl" $H/state/calls.log
+if ! grep -q "^awake_ctl restore-ids" $H/state/calls.log; then echo "FAIL: no restore-ids call"
+elif grep -q "^awake_ctl restore-ids apa_crs_live=1" $H/state/calls.log; then echo "FAIL: restore-ids ran with APA CRs live"
+elif [ "$(grep -c '^awake_ctl restore-ids' $H/state/calls.log)" != 2 ]; then echo "FAIL: want 2 restores (arm start + end)"
+else echo "PASS: both restores with 0 APA CRs"; fi

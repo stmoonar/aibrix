@@ -51,6 +51,8 @@
 #      (loadgen config, else $LOADGEN_CONFIG_ROOT/<NAME>/config.yaml), ARM_OUT_DIR (result directory,
 #      else $PILOT_ROOT/<trace>[_s<seed>]/<arm>[-tag]), ARM_LABEL_OVERRIDE (arm_label, e.g. a PreServe
 #      variant) and ARM_VARIANT (the campaign arm id, recorded in arm_meta.json).
+#  13. (2026-10-07) post-arm cleanup: decision source off (toggle tre, 0 APA CRs verified) BEFORE the
+#      restore to $BASELINE, as reset_canonical.sh (APA scaled the restored replica down again: 409).
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
@@ -434,9 +436,17 @@ elif [ "$WANT_EVENTS" = 1 ] && [ -s "$D/arm_start_redis_ms" ]; then
 fi
 ( cd "$TRE/deploy" && PYTHONPATH="$TRE/deploy:$TRE/common" python3 -m scripts.analysis.safescale_summary "$D/safescale.json" > "$D/safescale_summary.json" 2>&1 ) || true
 log "collected; awake at end: $(awake_set); EMFILE pods: $(wc -l < "$D/EMFILE_PODS")"
-reset_baseline
+# Decision source off BEFORE any restore / wake (same order as reset_canonical.sh): the APA
+# controller polls about every 1 s and scales a replica that restore-ids just woke back down
+# (SM scale_service path=apa), and restore-ids then fails with 409 slot_occupied (exit 3, arm
+# INVALID after load and collection). observe/observe first: the controller restart inside
+# toggle tre comes up observing. Everything measured is collected above.
+log "restore: observe/observe -> $(mode observe observe)"
 bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode >> "$D/runner.log" 2>&1
-log "restore: APA CRs live: $(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name | wc -l)"
+N_APA=$(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
+log "restore: APA CRs live: $N_APA"
+[ "$N_APA" = 0 ] || { log "ERROR $N_APA APA CR(s) still live after toggle tre; not restoring"; exit 3; }
+reset_baseline
 log "restore: run mode -> $(mode observe active)"
 if [ "$EVENTS_CHANGED" = 1 ]; then events_set "$EV_BEFORE"; EVENTS_CHANGED=0; log "restore: gateway event stream -> '$(events_get)' (pre-arm '$EV_BEFORE')"; fi
 if [ "$IS_BL" = 1 ]; then
