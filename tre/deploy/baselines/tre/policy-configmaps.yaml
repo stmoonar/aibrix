@@ -5,9 +5,11 @@
 # the live engine of images 20261006-bb54543e (vLLM 0.30.0-ts, one awake replica per model):
 #   - Chiron-global theta_trace: tools/chiron_theta --method peak_mean --interval-s 5 on the
 #     hot alt trace (CPU only); sensitivity row "*": 1/3.
-#   - TokenScale-colocated V_b / V_P and PreServe-oracle mu: one run of tools/tokenscale_profile
-#     (closed loop, in 492 / out 400 + out=1 ladder, 60 s steps, 15 s warm-up); the sha256 of
-#     profile.yaml / profile_raw.csv is in the commit message.
+#   - TokenScale-colocated V_b / V_P: tools/tokenscale_profile, closed loop (in 492 / out 400
+#     + out=1 ladder, 60 s steps, 15 s warm-up).
+#   - PreServe-oracle mu: tools/tokenscale_profile --open-loop (Poisson rates 0.3 ... 1.3 x the
+#     calibration rho* x C_s token rate, 110 s steps, 20 s warm-up).
+#   The sha256 of each run's profile.yaml / profile_raw.csv is in the commit messages.
 # Disclose: TokenScale buckets degenerate to one cell (constant trace shape; all nine = V_b,
 # lookups clamp); PreServe mu_p : mu_d fixed by the shape (one free quantity).
 # Do not change any value after a comparison has been seen.
@@ -90,10 +92,11 @@ data:
     lead_s: 0
     tier1: oracle_noisy
     noise_sigma: 0.07717607558419906   # lognormal sigma for mean APE 6.17 % (paper Table 1); sensitivity 0.30
-    mu:                      # tok/s per replica: highest closed-loop step meeting p95 TTFT <= max(500, 5(c+bL))
-      dsqwen-7b: {p: 1399.9, d: 1137.1, t: 2537.0}     # and p95 TPOT <= 75 ms (concurrency 16)
-      dsllama-8b: {p: 1224.6, d: 1041.7, t: 2266.4}    # concurrency 16
-      dsqwen-14b: {p: 612.2, d: 509.5, t: 1121.8}      # concurrency 8
+    mu:                      # tok/s per replica (engine counters): highest open-loop Poisson rate whose
+                             # steady-state requests meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms
+      dsqwen-7b: {p: 4404.3, d: 3579.5, t: 7983.9}     # 9.330 req/s offered (0.9 x), p95 TTFT 380 ms
+      dsllama-8b: {p: 3515.3, d: 2888.4, t: 6403.6}    # 7.400 req/s (1.0 x), p95 TTFT 472 ms
+      dsqwen-14b: {p: 3381.8, d: 2762.3, t: 6144.1}    # 7.099 req/s (1.0 x), p95 TTFT 499 ms (at the edge)
     # Tier-2 (paper §4.3.1 / §4.3.2)
     map_factor: 1.2
     lookahead_iters: 100

@@ -112,16 +112,23 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
   (`kv_request_tokens`, engine cache info), recorded as `b_max` / `b_max_src` per decision; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
-- TokenScale-colocated and PreServe-oracle, one run (`tools/tokenscale_profile`): the hot alt
-  trace has one shape (in ~492, out 400), so the buckets degenerate to one cell (disclose).
-  `python3 -m tre_baselines.tools.tokenscale_profile --models dsqwen-7b,dsllama-8b,dsqwen-14b
-  --gateway-url <chat endpoint URL> --sm-url <SM> --out-dir <dir> --i-have-user-approval`
-  with exactly one awake replica per model (checked), models in parallel: closed loop
-  1/2/4/8/12/16/24/32/48/64 (extended while still gaining > 5 %), 60 s steps, 15 s warm-up;
-  prefill/decode tok/s from the replica's vLLM token counters, p95 TTFT/TPOT per step.
-  V_b = peak (in+out) tok/s, V_P = peak prefill tok/s with out=1; PreServe mu = the highest
-  step meeting p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the registry).
-  ~20 min, needs an exclusive window. Disclose: closed loop -> mu slightly optimistic.
+- TokenScale-colocated and PreServe-oracle (`tools/tokenscale_profile`, run from `tre/` with
+  `PYTHONPATH=common:deploy:calibration:replayer:loadgen_v1:baselines`; the senders import
+  `tre_replayer`): the hot alt trace has one shape (in ~492, out 400), so the buckets
+  degenerate to one cell (disclose). Exactly one awake replica per model (checked), models in
+  parallel, needs an exclusive window.
+  - TokenScale V_b / V_P, closed loop: `python3 -m tre_baselines.tools.tokenscale_profile
+    --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url <chat endpoint URL> --sm-url <SM>
+    --out-dir <dir> --i-have-user-approval`: concurrency 1/2/4/8/12/16/24/32/48/64 (extended
+    while still gaining > 5 %), 60 s steps, 15 s warm-up; prefill/decode tok/s from the
+    replica's vLLM token counters. V_b = peak (in+out) tok/s, V_P = peak prefill tok/s with
+    out=1 (~20 min).
+  - PreServe mu, open loop: the same command plus `--open-loop --base-rps <model>=<req/s>,...`
+    (1.0x = calibration rho* x C_s token rate / (in + out)): Poisson rates 0.3 ... 1.3 x,
+    110 s steps, 20 s warm-up; mu = engine tok/s of the highest rate whose requests sent in the
+    measured window meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the
+    registry), with >= 150 of them (~20 min). The closed-loop mu is not used: a constant output
+    length keeps the workers in lockstep (bursts of c prefills), which biased it 3-6x low.
 - PreServe-oracle: `window_s` 600 (sensitivity 60), `noise_sigma` 0.0772 (sensitivity 0.30).
   (`tools/preserve_mu` over a calibration capture is a cross-check only.)
 
