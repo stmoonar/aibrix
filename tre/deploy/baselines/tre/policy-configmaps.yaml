@@ -1,8 +1,16 @@
 # Per-policy parameters, mounted together at /etc/tre-baselines/<policy>.yaml; the shell
-# reads the file named by TRE_BL_POLICY_CONFIG. Empty until the parameters are measured
-# (Chiron-global theta_trace, TokenScale-colocated V_b/V_P and bucket edges,
-# PreServe-oracle mu and trace_path): those policies refuse to start on {} (fail closed).
-# Freeze all of them in one config commit before any comparison.
+# reads the file named by TRE_BL_POLICY_CONFIG.
+#
+# FROZEN baseline parameters (2026-10-06, branch feat/baseline-params-20261006), measured on
+# the live engine of images 20261006-bb54543e (vLLM 0.30.0-ts, one awake replica per model):
+#   - Chiron-global theta_trace: tools/chiron_theta --method peak_mean --interval-s 5 on the
+#     hot alt trace (CPU only); sensitivity row "*": 1/3.
+#   - TokenScale-colocated V_b / V_P and PreServe-oracle mu: one run of tools/tokenscale_profile
+#     (closed loop, in 492 / out 400 + out=1 ladder, 60 s steps, 15 s warm-up); the sha256 of
+#     profile.yaml / profile_raw.csv is in the commit message.
+# Disclose: TokenScale buckets degenerate to one cell (constant trace shape; all nine = V_b,
+# lookups clamp); PreServe mu_p : mu_d fixed by the shape (one free quantity).
+# Do not change any value after a comparison has been seen.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,7 +20,13 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   chiron.yaml: |
-    {}
+    alpha: 0.5               # paper: Alg.1 smoothing factor
+    kv_request_tokens: 892   # in + out of one trace-shape request (492 + 400): caps the virtual B
+    busy_def: effective      # busy = ceil(sum(running+waiting) / mean virtual B) (disclosed adaptation)
+    theta:                   # theta_trace, peak_mean 5 s on the replayed hot alt trace
+      dsqwen-7b: 0.4598
+      dsllama-8b: 0.5343
+      dsqwen-14b: 0.4598
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -23,7 +37,36 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   tokenscale.yaml: |
-    {}
+    bucket_edges:            # tools/tokenscale_buckets on the per-request hot alt schedule
+      dsqwen-7b: {in: [489, 494], out: [400, 400]}
+      dsllama-8b: {in: [493, 497], out: [400, 400]}
+      dsqwen-14b: {in: [489, 494], out: [400, 400]}
+    velocity:                # (in+out) tok/s per replica: V_b = peak of the in 492 / out 400 ladder
+      dsqwen-7b:             # (one cell, written to all nine); v_prefill = V_P, peak of the out=1 ladder
+        buckets:
+          - [11109.4, 11109.4, 11109.4]
+          - [11109.4, 11109.4, 11109.4]
+          - [11109.4, 11109.4, 11109.4]
+        v_prefill: 17223.5
+      dsllama-8b:
+        buckets:
+          - [7984.8, 7984.8, 7984.8]
+          - [7984.8, 7984.8, 7984.8]
+          - [7984.8, 7984.8, 7984.8]
+        v_prefill: 16388.0
+      dsqwen-14b:
+        buckets:
+          - [8317.2, 8317.2, 8317.2]
+          - [8317.2, 8317.2, 8317.2]
+          - [8317.2, 8317.2, 8317.2]
+        v_prefill: 13687.7
+    out_len_source: max_tokens
+    default_out_tokens: 256  # not in paper
+    misbucket_rate: 0.15     # paper: 85 %-accurate length predictor
+    seed: 0
+    skip_reissue: true
+    window_s: 10             # not in paper
+    max_estimate_frac: 0.05  # not in paper
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -34,4 +77,31 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   preserve.yaml: |
-    {}
+    # Tier-1: the replayed trace + noise (oracle, not mLSTM: disclose). The trace is read from
+    # the per-environment trace volume (README "Trace volume"; on 75/76 the overlay
+    # deploy/baselines/tre-cluster-75-76): the per-request schedule the client replays, with the
+    # prompts stripped (same oracle). The replay marker must name the same trace (last
+    # trace_match_parts components). trace_seed only matters for a segment trace.json.
+    trace_path: /etc/tre-baselines-traces/Alternating_hot_model_periodic_A/traces_tre.effective.json
+    trace_seed: 0
+    trace_schedule: poisson
+    trace_match_parts: 2
+    window_s: 600            # paper: 10 min (sensitivity 60)
+    lead_s: 0
+    tier1: oracle_noisy
+    noise_sigma: 0.07717607558419906   # lognormal sigma for mean APE 6.17 % (paper Table 1); sensitivity 0.30
+    mu:                      # tok/s per replica: highest closed-loop step meeting p95 TTFT <= max(500, 5(c+bL))
+      dsqwen-7b: {p: 1399.9, d: 1137.1, t: 2537.0}     # and p95 TPOT <= 75 ms (concurrency 16)
+      dsllama-8b: {p: 1224.6, d: 1041.7, t: 2266.4}    # concurrency 16
+      dsqwen-14b: {p: 612.2, d: 509.5, t: 1121.8}      # concurrency 8
+    # Tier-2 (paper §4.3.1 / §4.3.2)
+    map_factor: 1.2
+    lookahead_iters: 100
+    kv_high: 0.95
+    overload_frac: 0.10
+    t_f: 0.30
+    out_len_is_upper_bound: true
+    ext_frac: 0.2
+    kv_agree_tol: 0.15
+    hold_mode: target
+    req_ttl_s: 1800

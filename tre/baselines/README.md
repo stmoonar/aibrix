@@ -187,10 +187,11 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   refusals (and honours `retry_after_s` when present).
 - **Campaign.** `campaign_queue.py` does not have the three baseline arms yet (it should
   call the arm tool: `enable`, `mark-replay` at replay start, `disable --collect-dir`).
-- **Unmeasured parameters.** TokenScale velocities V_b / V_P, Chiron theta_trace and
-  PreServe mu have not been measured on the current engine; the example files hold
-  placeholders (the policies refuse to start on them). Freeze all of them in one config
-  commit before any comparison.
+- **Frozen parameters.** Chiron theta_trace, TokenScale V_b / V_P and PreServe mu were
+  measured on the 20261006 engine and are frozen in `deploy/baselines/tre/policy-configmaps.yaml`
+  (the example files keep placeholders; the policies refuse to start on them). PreServe's
+  `trace_path` must name the replayed trace in the trace volume (75/76 cluster: overlay
+  `deploy/baselines/tre-cluster-75-76`, hostPath).
 - **Stale owner.** The pre-call check leaves the time between the check and the SM
   handling the request; closing it needs the SM to reject a stale owner generation.
 - The E1 trace format and where the `*.effective.json` (per-request schedule) lands are

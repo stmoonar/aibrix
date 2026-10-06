@@ -82,11 +82,42 @@ def test_trace_volume_is_a_patchable_empty_dir() -> None:
     assert example["trace_path"].startswith("/etc/tre-baselines-traces/")
 
 
-def test_policy_configmaps_present() -> None:
+def test_policy_configmaps_hold_frozen_parameters() -> None:
+    """The shipped ConfigMaps are the frozen baseline parameters: every policy starts on
+    them for every registry model (the policies refuse missing / placeholder values)."""
+    from types import SimpleNamespace
+
+    from tre_common.registry import load_registry
+
+    from tre_baselines.config import Config, model_limits
+    from tre_baselines.policies import build_policy
+    from tre_baselines.policies.preserve import PreServePolicy
+
+    models = model_limits(load_registry(str(DEPLOY_ROOT / "registry.yaml")), strict=False)
+    assert models
     for policy in POLICIES:
         cm = _one("ConfigMap", f"tre-v2-baseline-{policy}")
         assert cm["metadata"]["namespace"] == "tre-v2"
-        assert yaml.safe_load(cm["data"][f"{policy}.yaml"]) == {}
+        params = yaml.safe_load(cm["data"][f"{policy}.yaml"])
+        cfg = Config(sm_url="x", redis_url="y", policy=policy, policy_params=params, models=models)
+        if policy == "preserve":
+            # Tier-1 reads the trace at start from the per-environment trace volume
+            assert params["trace_path"].startswith("/etc/tre-baselines-traces/")
+            PreServePolicy(cfg, oracle=SimpleNamespace(window_s=float(params["window_s"]), max_tokens_max={}))
+        else:
+            build_policy(policy, cfg)
+
+
+def test_cluster_overlay_mounts_traces_read_only_and_stays_off() -> None:
+    """The 75/76 overlay only swaps the trace volume to a host directory; the mount stays
+    read-only (base) and the deployment ships at 0 replicas."""
+    kust = yaml.safe_load((DEPLOY_ROOT / "baselines" / "tre-cluster-75-76" / "kustomization.yaml").read_text(encoding="utf-8"))
+    assert kust["resources"] == ["../tre"]
+    (patch,) = kust["patches"]
+    doc = yaml.safe_load(patch["patch"])
+    assert set(doc["spec"]) == {"template"}  # no replicas / env override
+    (vol,) = doc["spec"]["template"]["spec"]["volumes"]
+    assert vol["name"] == "traces" and vol["emptyDir"] is None and vol["hostPath"]["type"] == "Directory"
 
 
 def test_rbac_is_read_only() -> None:

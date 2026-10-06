@@ -1,0 +1,23 @@
+# Environment overlay for the 75/76 cluster: the base ships the `traces` volume as an
+# emptyDir (nothing environment-specific baked in); here it is the shared NFS directory
+# that holds the replayed traces (present on every node), read-only. PreServe's
+# trace_path (/etc/tre-baselines-traces/<case>/<file>) must name a file under it.
+# The replicas stay 0: an arm is started by the arm tool / runner.
+#   kubectl apply -k tre/deploy/baselines/tre-cluster-75-76
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../tre
+patches:
+  - target: {kind: Deployment, name: tre-v2-baseline-scaler}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: tre-v2-baseline-scaler, namespace: tre-v2}
+      spec:
+        template:
+          spec:
+            volumes:
+              - name: traces
+                emptyDir: null
+                hostPath: {path: /data/nfs_shared_data/xxy/baseline-traces, type: Directory}
