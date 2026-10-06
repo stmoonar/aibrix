@@ -16,7 +16,8 @@
    "dsqwen-14b": 0.98
   },
   "rho_rule": "v1 Real_conv mean-rho shares (1.15/0.89/0.78) scaled to mean G 4.5",
-  "in_min": 32
+  "in_min": 32,
+  "hold": "v1 method (docs/trace-design-v2.md, 'Real-* 的 v1 方法'): slice, model mapping and count scaling follow v1; v1's scaling factor was picked after seeing results, so the factor for the current engine needs a decision (options in the doc); this spec is the superseded conv/code-2024 weekday variant"
  },
  "audit": {
   "hot": false,

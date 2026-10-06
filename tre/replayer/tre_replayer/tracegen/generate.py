@@ -131,10 +131,16 @@ def _synthetic_rows(spec: dict, seed: int, cap: Capacity, fits: dict) -> list[tu
 
 def _real_rows(spec: dict, seed: int, cap: Capacity, fits: dict, azure_csv: dict) -> tuple[list, dict]:
     real = spec["real"]
+    if real.get("hold"):
+        raise ValueError(f"{spec['trace']}: on hold - {real['hold']}")
     ds = real["dataset"]
     if ds not in azure_csv:
         raise ValueError(f"real slice needs --azure-csv {ds}=<path>")
     fit = fits[ds]
+    want = fit["source"]["sha256"]
+    got = azure.sha256_file(azure_csv[ds])
+    if got != want:  # the dataset is named by sha256, never by path
+        raise ValueError(f"{azure_csv[ds]}: sha256 {got} is not dataset {ds} ({want})")
     dur = float(spec["duration_s"])
     by_seed = real.get("offsets_s_by_seed")
     offset = float(by_seed[str(seed)] if by_seed else real["offset_s"])

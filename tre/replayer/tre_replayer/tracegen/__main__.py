@@ -79,6 +79,9 @@ def main(argv=None) -> int:
     if args.cmd == "generate":
         from .generate import generate
         spec = json.loads(Path(args.spec).read_text())
+        if spec.get("real", {}).get("hold"):
+            print(f"{spec['trace']}: skipped, on hold ({spec['real']['hold'][:80]}...)", file=sys.stderr)
+            return 0
         for seed in args.seed or spec["seeds"]:
             d = Path(args.out_root) / spec["trace"] / f"seed{seed}"
             man = generate(args.spec, seed, d, capacity_path=args.capacity, fits_path=args.fits,
