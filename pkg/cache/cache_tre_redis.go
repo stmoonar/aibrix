@@ -259,6 +259,24 @@ func unionStringSets(a map[string]struct{}, b map[string]struct{}) map[string]st
 	return out
 }
 
+// nearestBoundaryMS returns the wall-clock multiple of intervalMS nearest to
+// nowMS. The ticker runs on the monotonic clock, aligned once at start, so a
+// tick lands just after a boundary; if the wall clock later steps backward a
+// little, a floor would stamp the tick with the previous boundary (written
+// twice, the current one skipped until a restart). Rounding to the nearest
+// boundary keeps every tick on its own boundary while |step| < intervalMS/2.
+func nearestBoundaryMS(nowMS, intervalMS int64) int64 {
+	if intervalMS <= 0 {
+		return nowMS
+	}
+	shifted := nowMS + intervalMS/2
+	rem := shifted % intervalMS
+	if rem < 0 {
+		rem += intervalMS
+	}
+	return shifted - rem
+}
+
 // initTREPodMetricsTraceCache writes the TRE pod metrics doc once per
 // RequestTraceWriteInterval. Like the upstream trace writer (initTraceCache),
 // it first waits for the next wall-clock boundary, so the doc for boundary T
@@ -282,8 +300,7 @@ func initTREPodMetricsTraceCache(store *Store, stopCh <-chan struct{}) {
 			select {
 			case <-ticker.C:
 				nowMS := time.Now().UnixMilli()
-				intervalMS := int64(RequestTraceWriteInterval / time.Millisecond)
-				roundT := nowMS - nowMS%intervalMS
+				roundT := nearestBoundaryMS(nowMS, int64(RequestTraceWriteInterval/time.Millisecond))
 				if err := store.writeTREPodMetricsToRedis(context.Background(), roundT); err != nil {
 					klog.ErrorS(err, "error storing TRE pod metrics to redis")
 				}

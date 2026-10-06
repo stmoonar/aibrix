@@ -43,3 +43,27 @@ func TestTickerAlignmentDelayLandsOnBoundary(t *testing.T) {
 		}
 	}
 }
+
+// A tick slightly before its boundary (wall clock stepped back after the
+// ticker was aligned) is still stamped with that boundary, not the previous
+// one; ticks after it are unchanged.
+func TestNearestBoundaryMSSurvivesABackwardClockStep(t *testing.T) {
+	const interval = int64(10_000)
+	const boundary = int64(1791295340_000)
+	cases := map[int64]int64{
+		boundary:                  boundary,
+		boundary + 300:            boundary,
+		boundary - 200:            boundary, // floor would give boundary - interval
+		boundary - interval/2 + 1: boundary,
+		boundary + interval/2 - 1: boundary,
+		boundary + interval - 150: boundary + interval,
+	}
+	for now, want := range cases {
+		if got := nearestBoundaryMS(now, interval); got != want {
+			t.Fatalf("nearestBoundaryMS(%d) = %d, want %d", now, got, want)
+		}
+	}
+	if got := nearestBoundaryMS(-200, interval); got != 0 {
+		t.Fatalf("negative input: got %d, want 0", got)
+	}
+}
