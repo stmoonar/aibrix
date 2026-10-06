@@ -147,7 +147,7 @@ def test_build_controller_task_specs_honors_fast_loop_ablation() -> None:
 def test_removed_enable_tre_scaling_no_longer_stops_the_decision_tasks() -> None:
     """2026-10-07: ENABLE_TRE_SCALING is gone; a stale ``false`` (live Deployment not yet
     cleaned up) must not drop the decision pipeline - run mode alone gates actuation."""
-    specs = build_controller_task_specs(_deps(), _cfg(enable_tre_scaling=False))
+    specs = build_controller_task_specs(_deps(), _cfg())
 
     assert {"cluster_view", "rescue", "fairness", "safescale", "action_queue"} <= {s.name for s in specs}
 

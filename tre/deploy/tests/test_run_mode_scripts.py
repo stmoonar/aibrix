@@ -27,7 +27,8 @@ for i in "${!args[@]}"; do
     op="${cmd[0]}"
     mkdir -p "$FAKE_DIR/kv"
     case "$op" in
-      GET) [[ -f "$FAKE_DIR/kv/${cmd[1]}" ]] && cat "$FAKE_DIR/kv/${cmd[1]}" || echo "" ;;
+      GET) [[ -f "$FAKE_DIR/redis_down" ]] && exit 1
+           [[ -f "$FAKE_DIR/kv/${cmd[1]}" ]] && cat "$FAKE_DIR/kv/${cmd[1]}" || echo "" ;;
       SET) printf '%s\n' "${cmd[2]}" > "$FAKE_DIR/kv/${cmd[1]}"; echo OK ;;
       MSET)
         j=1
@@ -166,3 +167,13 @@ def test_deploy_models_plain_apply_without_run_mode_warns_on_missing_keys(fake):
     result = run("deploy_models.sh")
     assert (kv(CTRL), kv(SM)) == (None, None)
     assert f"{SM} missing -> SM treats as observe" in result.stderr
+
+
+def test_toggle_fails_closed_when_redis_is_unreadable(fake, tmp_path):
+    """An unreadable controller-mode key must abort `apa` (no CR apply) and `status`."""
+    run, _kv, calls = fake
+    (tmp_path / "redis_down").write_text("", encoding="utf-8")
+    apa = run("toggle_tre_apa.sh", "apa", "--keep-run-mode", check=False)
+    assert apa.returncode != 0 and "redis unreadable" in apa.stderr
+    assert run("toggle_tre_apa.sh", "status", check=False).returncode != 0
+    assert not any(" apply -f " in line for line in calls())

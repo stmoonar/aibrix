@@ -1378,43 +1378,45 @@ data:
     \        \"\"\"One ``tre_reissue`` log line. ``ts`` = when it is written (for\
     \ a continuation:\n        its end); ``abort_ts`` (continuations only) = the abort\
     \ moment ``gap_ms`` starts\n        from; ``request_id`` = the client's ``x-tre-request-id``\
-    \ (else ``x-request-id``),\n        the key that joins this line to the client's\
-    \ own record.\"\"\"\n        request.pop(_REISSUE_PENDING, None)\n        self.metrics.count(kind,\
-    \ reason)\n        record = {\"event\": \"tre_reissue\", \"ts\": round(time.time(),\
-    \ 3), \"model\": self.cfg.model,\n                  \"pod\": self.cfg.pod_name,\
-    \ \"kind\": kind, \"reason\": reason, \"path\": request.path, \"depth\": depth}\n\
-    \        if extra.get(\"request_id\") is None:\n            extra[\"request_id\"\
-    ] = request_id_of(request.headers)\n        for key, value in extra.items():\n\
-    \            if value is None or value == \"\" or value is False:\n          \
-    \      continue\n            record[key] = value\n        _log(record)\n\n\n#:\
-    \ The client's request id: ours first (Envoy may overwrite x-request-id on external\n\
-    #: requests and never touches this one), then the generic one.\nREQUEST_ID_HEADERS\
-    \ = (\"x-tre-request-id\", \"x-request-id\")\n\n\ndef request_id_of(headers: Any)\
-    \ -> str | None:\n    for name in REQUEST_ID_HEADERS:\n        value = (headers.get(name)\
-    \ or \"\").strip()\n        if value:\n            return value\n    return None\n\
-    \n\ndef _ms(seconds: float | None) -> float | None:\n    \"\"\"Log field ``gap_ms``\
-    \ (abort -> first continuation token, milliseconds). Logs written\n    before\
-    \ 2026-09-30 carry the same millisecond value under the misleading name\n    ``gap_s``;\
-    \ readers of old logs must treat ``gap_s`` as milliseconds too. The metric\n \
-    \   ``tre_reissue_gap_seconds`` is (and was) in seconds.\"\"\"\n    return None\
-    \ if seconds is None else round(seconds * 1000.0, 1)\n\n\ndef _strip_ids(obj:\
-    \ dict, cfg: Config, body: dict) -> dict:\n    \"\"\"The aborted response without\
-    \ the token-id fields the fork added for us (kept\n    when the client asked for\
-    \ them with return_token_ids).\"\"\"\n    merged = dict(obj)\n    if body.get(\"\
-    return_token_ids\"):\n        return merged\n    merged.pop(cfg.prompt_ids_field,\
-    \ None)\n    choices = []\n    for choice in obj.get(\"choices\") or ():\n   \
-    \     if isinstance(choice, dict):\n            choice = {k: v for k, v in choice.items()\n\
-    \                      if k not in (cfg.prompt_ids_field, cfg.token_ids_field,\
-    \ cfg.generated_ids_field)}\n        choices.append(choice)\n    merged[\"choices\"\
-    ] = choices\n    return merged\n\n\ndef _set_choice(obj: dict, chat: bool, text:\
-    \ str, finish: str | None, stop_reason: Any) -> None:\n    choices = obj.get(\"\
-    choices\") or [{\"index\": 0}]\n    choice = dict(choices[0])\n    if chat:\n\
-    \        message = dict(choice.get(\"message\") or {\"role\": \"assistant\"})\n\
-    \        message[\"content\"] = text\n        choice[\"message\"] = message\n\
-    \    else:\n        choice[\"text\"] = text\n    choice[\"finish_reason\"] = finish\n\
-    \    choice[\"stop_reason\"] = stop_reason\n    obj[\"choices\"] = [choice] +\
-    \ list(choices[1:])\n\n\ndef _is_sleeping_payload(payload: bytes, error_type:\
-    \ str) -> bool:\n    try:\n        return is_sleeping_error(json.loads(payload),\
+    \ (else the gateway's ``x-request-id``, not joinable),\n        the key that joins\
+    \ this line to the client's own record.\"\"\"\n        request.pop(_REISSUE_PENDING,\
+    \ None)\n        self.metrics.count(kind, reason)\n        record = {\"event\"\
+    : \"tre_reissue\", \"ts\": round(time.time(), 3), \"model\": self.cfg.model,\n\
+    \                  \"pod\": self.cfg.pod_name, \"kind\": kind, \"reason\": reason,\
+    \ \"path\": request.path, \"depth\": depth}\n        if extra.get(\"request_id\"\
+    ) is None:\n            extra[\"request_id\"] = request_id_of(request.headers)\n\
+    \        for key, value in extra.items():\n            if value is None or value\
+    \ == \"\" or value is False:\n                continue\n            record[key]\
+    \ = value\n        _log(record)\n\n\n#: The client's request id. Only ``x-tre-request-id``\
+    \ joins with the client records: the\n#: gateway overwrites ``x-request-id`` with\
+    \ its own uuid (gateway_req_body.go:215), so the\n#: generic one is a fallback\
+    \ that identifies the gateway request only. Truncated to 128\n#: characters (header-controlled\
+    \ input).\nREQUEST_ID_HEADERS = (\"x-tre-request-id\", \"x-request-id\")\n\n\n\
+    def request_id_of(headers: Any) -> str | None:\n    for name in REQUEST_ID_HEADERS:\n\
+    \        value = (headers.get(name) or \"\").strip()\n        if value:\n    \
+    \        return value[:128]\n    return None\n\n\ndef _ms(seconds: float | None)\
+    \ -> float | None:\n    \"\"\"Log field ``gap_ms`` (abort -> first continuation\
+    \ token, milliseconds). Logs written\n    before 2026-09-30 carry the same millisecond\
+    \ value under the misleading name\n    ``gap_s``; readers of old logs must treat\
+    \ ``gap_s`` as milliseconds too. The metric\n    ``tre_reissue_gap_seconds`` is\
+    \ (and was) in seconds.\"\"\"\n    return None if seconds is None else round(seconds\
+    \ * 1000.0, 1)\n\n\ndef _strip_ids(obj: dict, cfg: Config, body: dict) -> dict:\n\
+    \    \"\"\"The aborted response without the token-id fields the fork added for\
+    \ us (kept\n    when the client asked for them with return_token_ids).\"\"\"\n\
+    \    merged = dict(obj)\n    if body.get(\"return_token_ids\"):\n        return\
+    \ merged\n    merged.pop(cfg.prompt_ids_field, None)\n    choices = []\n    for\
+    \ choice in obj.get(\"choices\") or ():\n        if isinstance(choice, dict):\n\
+    \            choice = {k: v for k, v in choice.items()\n                     \
+    \ if k not in (cfg.prompt_ids_field, cfg.token_ids_field, cfg.generated_ids_field)}\n\
+    \        choices.append(choice)\n    merged[\"choices\"] = choices\n    return\
+    \ merged\n\n\ndef _set_choice(obj: dict, chat: bool, text: str, finish: str |\
+    \ None, stop_reason: Any) -> None:\n    choices = obj.get(\"choices\") or [{\"\
+    index\": 0}]\n    choice = dict(choices[0])\n    if chat:\n        message = dict(choice.get(\"\
+    message\") or {\"role\": \"assistant\"})\n        message[\"content\"] = text\n\
+    \        choice[\"message\"] = message\n    else:\n        choice[\"text\"] =\
+    \ text\n    choice[\"finish_reason\"] = finish\n    choice[\"stop_reason\"] =\
+    \ stop_reason\n    obj[\"choices\"] = [choice] + list(choices[1:])\n\n\ndef _is_sleeping_payload(payload:\
+    \ bytes, error_type: str) -> bool:\n    try:\n        return is_sleeping_error(json.loads(payload),\
     \ error_type)\n    except ValueError:\n        return False\n\n\ndef _body_model(raw:\
     \ bytes) -> str | None:\n    try:\n        body = json.loads(raw)\n    except\
     \ ValueError:\n        return None\n    return body.get(\"model\") if isinstance(body,\

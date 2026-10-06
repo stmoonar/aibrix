@@ -23,7 +23,7 @@
 # Run mode (2026-09-28, set_run_mode.sh): the controller mode and the SM actuation are
 # independent switches, and BOTH arms run the SM actuation active (symmetric self-heal):
 #   tre -> controller active  + SM active   (set once TRE is the only decision source)
-#   apa -> controller observe + SM active   (set FIRST, before TRE scaling is switched off)
+#   apa -> controller observe + SM active   (set FIRST: the controller stops actuating before the APA CRs go live)
 # --keep-run-mode leaves both keys alone (campaign_queue.py sets them itself per arm).
 #
 # Both the TRE controller (tre-v2 ns) and the patched aibrix podautoscaler controller
@@ -62,14 +62,25 @@ die() { echo "[toggle][ERROR] $*" >&2; exit 1; }
 
 rcli() { "$KUBECTL" -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw "$@"; }
 
-# Controller run mode; missing key = observe (the controller's own fail-closed reading).
+# Redis reads are fail-closed: an unreadable key aborts instead of reading as observe / no
+# owner (else `apa --keep-run-mode` could apply the CRs while the controller is still active).
+# Controller run mode, trimmed + lowercased like the controller's parse_mode. Empty = key
+# missing = observe (controller semantics); anything but active / observe aborts.
 controller_mode() {
-  local v; v="$(rcli GET "$CONTROLLER_MODE_KEY" 2>/dev/null | tr -d '\r' || true)"
-  [[ "$v" == "active" ]] && echo active || echo observe
+  local v; v="$(rcli GET "$CONTROLLER_MODE_KEY" | tr -d '\r')" || die "redis unreadable (GET $CONTROLLER_MODE_KEY)"
+  v="$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$v" in
+    active) echo active ;;
+    observe|"") echo observe ;;
+    *) die "unexpected controller mode '$v' in $CONTROLLER_MODE_KEY" ;;
+  esac
 }
 
 # Baseline shell owner lock holder ("" = no shell holds it).
-bl_owner() { rcli GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
+bl_owner() {
+  local v; v="$(rcli GET "$BL_OWNER_KEY" | tr -d '\r')" || die "redis unreadable (GET $BL_OWNER_KEY)"
+  printf '%s' "$v"
+}
 
 apa_cr_count() {
   kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai \
@@ -114,7 +125,12 @@ cmd_tre() {
   kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY"
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
   set_run_mode active active
-  log "done: TRE is the active decision source (controller mode $(controller_mode))"
+  local m; m="$(controller_mode)"
+  if [[ "$m" == active ]]; then
+    log "done: TRE is the active decision source (controller mode active)"
+  else
+    log "done: controller mode is $m; the controller will not actuate until run mode is active (not TRE-driven yet)"
+  fi
 }
 
 cmd_apa() {

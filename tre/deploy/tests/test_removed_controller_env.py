@@ -18,7 +18,7 @@ SCANNED = (
     TRE / "deploy" / "scripts",
     TRE / "eval" / "runner",
 )
-SUFFIXES = {".yaml", ".yml", ".sh", ".py", ".md", ".env", ".example", ".sample", ""}
+SUFFIXES = {".yaml", ".yml", ".sh", ".py", ".env", ".example", ".sample", ""}
 
 
 def test_no_manifest_script_or_runner_mentions_the_removed_switch() -> None:

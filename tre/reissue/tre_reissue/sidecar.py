@@ -2177,7 +2177,7 @@ class ReissueSidecar:
     def _account(self, kind: str, reason: str, request: web.Request, depth: int, **extra: Any) -> None:
         """One ``tre_reissue`` log line. ``ts`` = when it is written (for a continuation:
         its end); ``abort_ts`` (continuations only) = the abort moment ``gap_ms`` starts
-        from; ``request_id`` = the client's ``x-tre-request-id`` (else ``x-request-id``),
+        from; ``request_id`` = the client's ``x-tre-request-id`` (else the gateway's ``x-request-id``, not joinable),
         the key that joins this line to the client's own record."""
         request.pop(_REISSUE_PENDING, None)
         self.metrics.count(kind, reason)
@@ -2192,8 +2192,10 @@ class ReissueSidecar:
         _log(record)
 
 
-#: The client's request id: ours first (Envoy may overwrite x-request-id on external
-#: requests and never touches this one), then the generic one.
+#: The client's request id. Only ``x-tre-request-id`` joins with the client records: the
+#: gateway overwrites ``x-request-id`` with its own uuid (gateway_req_body.go:215), so the
+#: generic one is a fallback that identifies the gateway request only. Truncated to 128
+#: characters (header-controlled input).
 REQUEST_ID_HEADERS = ("x-tre-request-id", "x-request-id")
 
 
@@ -2201,7 +2203,7 @@ def request_id_of(headers: Any) -> str | None:
     for name in REQUEST_ID_HEADERS:
         value = (headers.get(name) or "").strip()
         if value:
-            return value
+            return value[:128]
     return None
 
 
