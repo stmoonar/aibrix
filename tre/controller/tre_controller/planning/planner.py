@@ -573,6 +573,8 @@ def build_plan(
     # it compares ``waiting`` of the pods in both samples, and after a wake the old pods'
     # waiting drains to 0 while running stays high, so it never held after a wake and
     # the hold lasted 2 grids anyway. Without free capacity, or a LOW receiver: held.
+    # Only an O1 evidence hold is exempt (``_O1_EXEMPT_HOLD_REASONS``): a held context
+    # (``tokens_missing``), a stale scrape or a hold fallback is not current evidence.
     warmup_suppressed: list[str] = []
     breakpoint_held: list[str] = []
     o1_exempt: dict[str, Mapping[str, Any] | None] = {}
@@ -586,7 +588,11 @@ def build_plan(
             continue
         if item.role == ModelRole.RECEIVER:
             if not ctx.get("signal_warm", True):
-                if item.state == ModelState.CRITICAL and ctx.get("signal_full_window") is False:
+                if (
+                    item.state == ModelState.CRITICAL
+                    and ctx.get("signal_full_window") is False
+                    and ctx.get("signal_hold_reason") in _O1_EXEMPT_HOLD_REASONS
+                ):
                     o1_exempt[item.model_name] = ctx.get("o1_queue_rise")
                     kept.append(item)
                     continue
@@ -692,11 +698,14 @@ def build_plan(
             basis = rescue_bases.get(recv.model_name)
             exempt = recv.model_name in o1_exempt
             if exempt:
-                # H3 review P1-2: one piece of queue evidence buys at most one wake until
-                # that wake is visible - an earlier target the routable count does not
-                # show yet, or a fleet view older than the last action (view-pending),
-                # holds the exempt receiver (no timer: the next view / count releases it).
-                if (basis is not None and basis.covered > recv_pods) or (
+                # H3 review P1-2 / 2026-10-07: one piece of stale evidence buys one wake.
+                # An earlier rescue target O1 has not settled yet (``_rescue_bases``: no
+                # warm window after its breakpoint, landed or not), or a fleet view older
+                # than the last action (view-pending), holds the exempt receiver - released
+                # on evidence, not time. Before, a landed target released it and the next
+                # step re-asked rescue_desired from the new count with the old window's Z
+                # (the old count's): it climbed to max_awake on one stale window.
+                if basis is not None or (
                     view_pending and recv.model_name in view_pending
                 ):
                     events.append(
@@ -705,9 +714,6 @@ def build_plan(
                         f":view_pending={bool(view_pending and recv.model_name in view_pending)}"
                     )
                     return None
-                # The earlier target has landed (the routable count shows it): the step
-                # builds on the current count (the target is not re-asked).
-                basis = None
             base = basis.base if basis is not None else recv_pods
             covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
             desired = rescue_desired(
@@ -2086,6 +2092,13 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
             and not getattr(item, "saturation_rescue", False)
         )
     )
+
+
+#: The O1 evidence holds (``SignalState.effective_window`` reasons) a CRITICAL receiver
+#: on free capacity is exempt from (H3).
+_O1_EXEMPT_HOLD_REASONS = frozenset(
+    {"no_complete_grid", "no_suffix", "evidence_grids", "evidence_tokens", "evidence_requests"}
+)
 
 
 def _o1_exempt_event(
