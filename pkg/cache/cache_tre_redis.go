@@ -259,10 +259,25 @@ func unionStringSets(a map[string]struct{}, b map[string]struct{}) map[string]st
 	return out
 }
 
+// initTREPodMetricsTraceCache writes the TRE pod metrics doc once per
+// RequestTraceWriteInterval. Like the upstream trace writer (initTraceCache),
+// it first waits for the next wall-clock boundary, so the doc for boundary T
+// is written at about T instead of T + (pod start time mod interval). Without
+// this the phase the controller learns depended on when the gateway started.
 func initTREPodMetricsTraceCache(store *Store, stopCh <-chan struct{}) {
-	ticker := time.NewTicker(RequestTraceWriteInterval)
 	go func() {
+		if delay := tickerAlignmentDelay(time.Now(), RequestTraceWriteInterval, MaxRequestTraceIntervalOffset); delay > 0 {
+			alignTimer := time.NewTimer(delay)
+			select {
+			case <-alignTimer.C:
+			case <-stopCh:
+				alignTimer.Stop()
+				return
+			}
+		}
+		ticker := time.NewTicker(RequestTraceWriteInterval)
 		defer ticker.Stop()
+		klog.Infof("TRE pod metrics ticker start at %s", time.Now())
 		for {
 			select {
 			case <-ticker.C:

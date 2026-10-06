@@ -486,6 +486,21 @@ func initProfileCache(store *Store, stopCh <-chan struct{}, forTesting bool) {
 	}()
 }
 
+// tickerAlignmentDelay returns how long to wait before starting a ticker of
+// period interval so that its ticks land on wall-clock multiples of interval.
+// If now is already within maxOffset after a boundary it returns 0 (start
+// immediately); otherwise it returns the time until the next boundary.
+func tickerAlignmentDelay(now time.Time, interval, maxOffset time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	offset := time.Duration(now.UnixNano()) % interval
+	if offset > maxOffset {
+		return interval - offset
+	}
+	return 0
+}
+
 // initTraceCache initializes request tracing cache
 // Parameters:
 //
@@ -493,13 +508,12 @@ func initProfileCache(store *Store, stopCh <-chan struct{}, forTesting bool) {
 //	stopCh: Stop signal channel
 func initTraceCache(redisClient *redis.Client, stopCh <-chan struct{}) {
 	// Calculate time offset for window alignment
-	tickerOffset := time.Duration(time.Now().UnixNano()) % RequestTraceWriteInterval
 	var traceAlignmentTimer *time.Timer
 	var traceTicker *time.Ticker
 
 	// Select alignment method based on offset
-	if tickerOffset > MaxRequestTraceIntervalOffset {
-		traceAlignmentTimer = time.NewTimer(RequestTraceWriteInterval - tickerOffset)
+	if delay := tickerAlignmentDelay(time.Now(), RequestTraceWriteInterval, MaxRequestTraceIntervalOffset); delay > 0 {
+		traceAlignmentTimer = time.NewTimer(delay)
 	} else {
 		traceTicker = time.NewTicker(RequestTraceWriteInterval)
 	}

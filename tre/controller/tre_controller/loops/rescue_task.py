@@ -39,10 +39,12 @@ class DecisionWriter(Protocol):
 
 
 class RescueTaskConfig(Protocol):
-    # Wake period of the loop (TRE_RESCUE_INTERVAL_SECONDS, 5 s). The loop only reads the
-    # latest snapshot; with the phase-aligned sampler snapshots change every 10 s and a
-    # re-read of the same window_end_ms advances neither the EMA nor the band dwell, so
-    # the effective decision cadence is 10 s (acted on <= rescue_interval_s after publish).
+    # Fallback wake period of the loop (TRE_RESCUE_INTERVAL_SECONDS, 5 s). H1 (2026-10-06):
+    # the loop ticks right after every snapshot publish (SnapshotBox.wait_newer: the
+    # sampler's learned phase offset plus the fetch), and at the latest rescue_interval_s
+    # after its previous tick when nothing is published (free_running mode, stale
+    # windows). A re-read of the same window_end_ms advances neither the EMA nor the band
+    # dwell, so the effective decision cadence stays 10 s - now with no phase lag.
     rescue_interval_s: float
 
 
@@ -109,7 +111,9 @@ async def rescue_task(
     maintenance: "MaintenanceWatch | None" = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
+    wait_newer = getattr(snapshot_box, "wait_newer", None)
     while True:
+        seen_version = getattr(snapshot_box, "version", None)
         snapshot = snapshot_box.get()
         if snapshot is not None:
             current_view = _current_cluster_view(cluster_view, cluster_view_box)
@@ -156,7 +160,11 @@ async def rescue_task(
                     )
                 else:
                     decision_writer.write("rescue", snapshot, result)
-        await sleep(cfg.rescue_interval_s)
+        if callable(wait_newer) and seen_version is not None:
+            # Next tick on the next publish; rescue_interval_s is the fallback.
+            await wait_newer(seen_version, cfg.rescue_interval_s, sleep=sleep)
+        else:
+            await sleep(cfg.rescue_interval_s)
 
 
 def _current_cluster_view(

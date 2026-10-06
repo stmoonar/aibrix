@@ -613,6 +613,27 @@ def build_plan(
     ]
     middle_zone.sort(key=lambda item: (0 if item.state == ModelState.HEALTHY else 1, -(item.Z_m or 0.0)))
 
+    def low_need(recv: ModelClassification) -> tuple[int, int] | None:
+        """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
+        if recv.model_name in inflight_models:
+            return None
+        if deltas.get(recv.model_name, 0) > 0:
+            # H1 (2026-10-06): already scaled up in this plan (the rescue section woke
+            # it from sleeping capacity) - one LOW step per plan, never two.
+            return None
+        if cooldown.blocks(recv.model_name, "up"):
+            return None
+        recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
+        recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
+        receiver_capacity = (
+            _max_replicas(cfg, recv.model_name)
+            - _awake_replicas(recv.model_name, model_contexts, model_replicas)
+        )
+        if receiver_capacity <= 0:
+            return None
+        needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
+        return needed, min(needed, max(0, recv_assigned - recv_pods))
+
     rescue_bases = rescue_bases or {}
     c1 = cfg.rescue_max_step_ratio > 0
     if cfg.rescue_due:
@@ -944,6 +965,48 @@ def build_plan(
                 if recv.model_name in rescue_ctx:
                     _tag_rescue_actions(actions, first_action, recv, rescue_ctx[recv.model_name], events)
 
+        # H1 (2026-10-06): a LOW receiver with a sleeping binding on a free GPU is woken
+        # here, right after the snapshot is published, instead of waiting for the
+        # fairness loop's cadence (up to 10 s). Only free sleeping capacity, and only
+        # after every CRITICAL receiver has claimed its wakes; creates, donor relays and
+        # middle-zone probes for LOW stay with the fairness loop. A LOW model woken here
+        # is not planned again by the fairness section of this plan (``low_need``) and
+        # is in flight / O1-held for the next fairness tick, like any other scale-up.
+        # Without a fleet view no GPU is known to be free: LOW stays with fairness.
+        rescue_low_needs = (
+            {recv.model_name: low_need(recv) for recv in low_receivers} if occupancy is not None else {}
+        )
+        reserved_rescue_low = _plan_joint_wakes(
+            occupancy,
+            [(model, need[1]) for model, need in rescue_low_needs.items() if need is not None],
+            events=events,
+        )
+        for recv in low_receivers:
+            need = rescue_low_needs.get(recv.model_name)
+            if need is None:
+                continue
+            gain, wake_pods = _take_reserved_wakes(
+                occupancy,
+                reserved_rescue_low,
+                receiver=recv.model_name,
+                need=need[1],
+                # Not reported here: the fairness loop reports a blocked LOW wake.
+                events=[],
+                blocked_event="low_rescue_sleeping_blocked",
+            )
+            if gain > 0:
+                _add_scale_action(
+                    actions,
+                    deltas,
+                    model=recv.model_name,
+                    delta=gain,
+                    reason="low_rescue_sleeping_capacity",
+                    source_loop="rescue",
+                    receiver=recv.model_name,
+                    pods=wake_pods,
+                    hint=True,
+                )
+
         for idle in idle_models:
             if idle.model_name in active_probe_models or idle.model_name in inflight_models:
                 continue
@@ -1024,24 +1087,6 @@ def build_plan(
     if not cfg.fairness_due:
         events.append("fairness_skipped_by_cadence")
         return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
-
-    def low_need(recv: ModelClassification) -> tuple[int, int] | None:
-        """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
-        if recv.model_name in inflight_models:
-            return None
-        if cooldown.blocks(recv.model_name, "up"):
-            return None
-        recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
-        recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
-        receiver_capacity = (
-            _max_replicas(cfg, recv.model_name)
-            - _awake_replicas(recv.model_name, model_contexts, model_replicas)
-            - max(0, deltas.get(recv.model_name, 0))
-        )
-        if receiver_capacity <= 0:
-            return None
-        needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
-        return needed, min(needed, max(0, recv_assigned - recv_pods))
 
     # A LOW receiver is never a donor, so its need does not change while earlier
     # receivers are planned: computed (and its wakes assigned jointly) up front.
