@@ -23,6 +23,20 @@ load would fill if packed: ``busy = ceil(sum_pods(running + waiting) / mean B)``
 the pods' virtual batch caps from the local loop. ``at_cap`` / ``nonidle`` remain for
 sensitivity runs.
 
+State band on the scale-down edge (ours, part of adaptation 4, decision 2026-10-06). With
+x = sum_q / mean B, busy rises to k as soon as x > k - 1 (the ceil above, unchanged), but
+falls from k to k - 1 only when x <= k - 1 - h (``busy_band_h``); from 1 to 0 only when
+sum_q = 0. Under packing the paper's count is ~ceil(x) and its hysteresis is implicit: a
+request that spilled to instance k runs there to completion (~20 s on our trace), so k stays
+"running" while x dips. We re-pack every tick and lose that state; the band restores it on
+the down edge only. It is a state gate, not a timer. The previous busy is per-model state;
+it restarts from the ceil on a shell restart (new policy object), when the model has no
+pods, and when the awake pod set changes in a way this policy did not ask for (a pod
+replaced, another actuator, an owner / run-mode change that moved pods: :func:`_carried`).
+The policy's own scale step keeps it (a reset there would re-open the flap at every step).
+With an evidence gap it may rise but not fall (the gap cannot prove the load is low).
+``h = 0`` is exactly the old ceil (sensitivity row). Only ``busy_def: effective`` is banded.
+
 Params (``config.policy_params``; see ``examples/chiron.yaml``):
 
 ==============  ===========  ==============================================================
@@ -41,7 +55,10 @@ kv_request_tokens None       ours: in + out tokens of one request of the trace s
 busy_def        effective    ours (see above): effective (packed busy count) | at_cap
                              (running+waiting >= B) | nonidle (running > 0); the last two
                              only as sensitivity runs
-theta           (required)   ``{model | "*": theta}`` or one number; no silent default: the
+busy_band_h     0.25         ours (see above): ``{model | "*": h}`` or one number >= 0; main
+                             runs h = max(0.25, 3 sigma(sum_q) / mean B) from the sanity 3x
+                             plateau (30 s windows); 0 = no band (sensitivity row)
+theta         (required)   ``{model | "*": theta}`` or one number; no silent default: the
                              main runs use theta_trace (``tools/chiron_theta``), the 3x
                              example (1/3) is a sensitivity row; the policy refuses to start
                              without it for a managed model
@@ -66,6 +83,45 @@ DEFAULT_B = 256  # not in paper; chosen: order of the engine default max-num-seq
 _CEIL_TOL = 1e-6
 BUSY_DEFS = ("effective", "at_cap", "nonidle")
 _NEEDED = ("gen_tokens", "itl_sum", "itl_count")
+#: Scale-down band in units of mean B (spec floor of max(0.25, 3 sigma / B)).
+DEFAULT_BUSY_BAND_H = 0.25
+
+
+def banded_busy(prev: Optional[int], x: float, h: float) -> int:
+    """Packed busy count for load ``x`` = sum_q / mean B, given the previous count.
+
+    Up edge: ceil(x) (unchanged). Down edge: from k to k - 1 only when x <= k - 1 - h
+    (k = 1 -> 0 only when x = 0). ``prev`` None or ``h`` = 0 gives ceil(x) exactly."""
+    c = int(math.ceil(x - _CEIL_TOL)) if x > 0 else 0
+    if prev is None or c >= prev:
+        return c
+    k = prev
+    while k > c and (k == 1 or x <= k - 1 - h + _CEIL_TOL):
+        k -= 1
+    return k
+
+
+@dataclass
+class _Band:
+    busy: int
+    pods: frozenset  # the awake pod set the count was made on
+    desired: int     # what this policy asked for on that tick
+
+
+def _carried(band: Optional[_Band], pods: frozenset) -> Optional[int]:
+    """The previous busy if it still applies to ``pods``, else None (restart from the ceil).
+
+    It applies on the same pod set and after a move this policy asked for (pods only added
+    up to its desired, or only removed down to it). Any other change - a pod replaced,
+    another actuator, an owner or run-mode change that moved pods - restarts the band."""
+    if band is None:
+        return None
+    if pods == band.pods:
+        return band.busy
+    old, n = band.pods, len(pods)
+    if (pods > old and n <= band.desired) or (pods < old and n >= band.desired):
+        return band.busy
+    return None
 
 
 @dataclass
@@ -116,7 +172,18 @@ class ChironPolicy:
         missing = [m for m in (getattr(config, "models", None) or {}) if m not in self.theta and "*" not in self.theta]
         if missing:
             raise ValueError(f"chiron: no theta for {sorted(missing)} (and no '*')")
+        band = params.get("busy_band_h", DEFAULT_BUSY_BAND_H)
+        if not isinstance(band, Mapping):
+            band = {"*": band}
+        self.busy_band_h = {str(k): float(v) for k, v in band.items()}
+        if any(not (v >= 0.0 and math.isfinite(v)) for v in self.busy_band_h.values()):
+            raise ValueError("chiron: busy_band_h must be a finite number >= 0")
         self._state: dict[str, dict[str, _PodState]] = {}
+        self._band: dict[str, _Band] = {}
+
+    def _h_for(self, model: str) -> float:
+        h = self.busy_band_h
+        return h[model] if model in h else h.get("*", DEFAULT_BUSY_BAND_H)
 
     def _theta_for(self, model: str) -> float:
         try:
@@ -195,8 +262,10 @@ class ChironPolicy:
             n = len(ms.pods)
             theta = self._theta_for(model)
             if n == 0:
+                self._band.pop(model, None)
                 out[model] = Decision(ms.awake, "no_pods", {"N": 0, "theta": _num(theta)})
                 continue
+            gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
             per_pod: dict[str, Any] = {}
             busy = 0
             queued = 0.0
@@ -220,8 +289,16 @@ class ChironPolicy:
             extra: dict[str, Any] = {}
             if self.busy_def == "effective":
                 b_mean = sum(caps) / len(caps)
-                busy = int(math.ceil(queued / b_mean - _CEIL_TOL)) if queued > 0 else 0
-                extra = {"queued": _num(queued, 2), "B_mean": _num(b_mean, 2)}
+                x = queued / b_mean
+                h = self._h_for(model)
+                pods_now = frozenset(live)
+                prev = _carried(self._band.get(model), pods_now)
+                busy_ceil = banded_busy(None, x, 0.0)
+                busy = banded_busy(prev, x, h)
+                if gaps and prev is not None:  # unknown pods: may rise, cannot fall
+                    busy = max(busy, prev)
+                extra = {"queued": _num(queued, 2), "B_mean": _num(b_mean, 2), "busy_ceil": busy_ceil,
+                         "band_h": _num(h), "busy_prev": prev}
             ibp = busy / n
             desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
             decision = Decision(desired, "ibp_target", {
@@ -229,6 +306,8 @@ class ChironPolicy:
                 "target": desired, "busy_def": self.busy_def, "b_max": _num(b_max, 1), "b_max_src": self._b_max_src,
                 "pods": per_pod,
             })
-            gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
-            out[model] = hold_if_incomplete(decision, ms.awake, gaps)
+            final = hold_if_incomplete(decision, ms.awake, gaps)
+            if self.busy_def == "effective":
+                self._band[model] = _Band(busy, pods_now, int(final.desired))
+            out[model] = final
         return out

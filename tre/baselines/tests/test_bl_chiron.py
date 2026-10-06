@@ -296,3 +296,28 @@ def test_b_max_is_what_the_kv_cache_holds_for_the_trace_shape():
     assert (d.inputs["b_max"], d.inputs["b_max_src"]) == (1024, "max_num_seqs")
     d = one(policy(b_max=50, kv_request_tokens=892), snap([kv_pod(20381)]))
     assert (d.inputs["b_max"], d.inputs["b_max_src"]) == (50, "param")
+
+
+def test_busy_band_no_flap_around_b_and_h0_is_the_old_ceil():
+    """Sanity 2026-10-06: sum_q noisy around one B flipped busy 1 <-> 2 every few ticks.
+    With h > 0 busy rises at sum_q > B and falls only at sum_q <= (1 - h) B; h = 0 is the
+    old ceil; a real drop scales down on the next tick (state gate, no timer)."""
+    theta, B, cap, h = 0.5, 100.0, 8, 0.3
+    noisy = [0.6, 1.05, 0.9, 1.1, 0.85, 0.95, 1.2, 0.75, 1.02, 0.88]  # x = sum_q / B after the first
+
+    def run(h, xs):
+        pol = policy(theta={"*": theta}, b_init=B, b_max=B, busy_band_h=h)
+        awake, seen = 2, []
+        for t, x in enumerate(xs):  # load spread evenly; awake follows the policy (own steps)
+            pods = [pod(f"p{i}", t * 2000, 0, 0, 0, running=x * B / awake) for i in range(awake)]
+            d = one(pol, snap(pods, awake=awake, t_ms=t * 2000, max_num_seqs=None, tick=t))
+            seen.append(d.desired)
+            awake = max(1, min(cap, d.desired))
+        return seen
+
+    ceil_ref = [max(1, math.ceil(math.ceil(x - 1e-9) / theta)) for x in noisy]
+    assert run(0.0, noisy) == ceil_ref                  # h = 0: exactly the old behaviour
+    assert len(set(ceil_ref[1:])) == 2                  # ... which flaps 2 <-> 4
+    assert run(h, noisy) == [2] + [4] * (len(noisy) - 1)  # band: up once, no flap
+    dropped = run(h, noisy + [0.69])                    # sum_q <= (1 - h) B: down next tick
+    assert dropped[-1] == 2 and dropped[-2] == 4
