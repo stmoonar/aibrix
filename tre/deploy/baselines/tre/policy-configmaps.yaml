@@ -12,6 +12,7 @@
 #     (closed-loop maxima): sensitivity/tokenscale-aggressive.yaml.
 #   - PreServe-oracle mu: tools/tokenscale_profile --open-loop (Poisson rates 0.3 ... 1.3 x the
 #     calibration rho* x C_s token rate, 110 s steps, 20 s warm-up).
+#     PreServe window_s 30 (rule in the ConfigMap; methodology 10-06); paper 600 is a sensitivity row.
 #   The sha256 of each run's profile.yaml / profile_raw.csv is in the commit messages.
 # Disclose: TokenScale buckets degenerate to one cell (constant trace shape; all nine = V_b,
 # lookups clamp); PreServe mu_p : mu_d fixed by the shape (one free quantity).
@@ -98,7 +99,10 @@ data:
     trace_seed: 0
     trace_schedule: poisson
     trace_match_parts: 2
-    window_s: 600            # paper: 10 min (sensitivity 60)
+    window_s: 30             # rule (fixed before any comparison, trace metadata only): the largest W in
+                             # {30, 60, 120, 300, 600} with W <= P/4 and W >= 10 x wake_p95; P = 220 s (same-model
+                             # hot period of the hot alt trace), wake_p95 ~3 s -> 30. Paper: 10 min = window >> action
+                             # time and << load period. Sensitivity: sensitivity/preserve-window600.yaml (paper value)
     lead_s: 0
     tier1: oracle_noisy
     noise_sigma: 0.07717607558419906   # lognormal sigma for mean APE 6.17 % (paper Table 1); sensitivity 0.30

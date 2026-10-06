@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
@@ -155,23 +156,35 @@ def test_dockerfile_contract() -> None:
         assert forbidden not in dockerfile
 
 
-def test_tokenscale_aggressive_sensitivity_differs_from_main_only_in_velocity() -> None:
-    """The sensitivity row replaces the main TokenScale ConfigMap while applied: same name,
-    same parameters except the velocities, and it starts the policy for every model."""
+SENSITIVITY_ROWS = (  # (file, policy, the only key that differs from the main ConfigMap)
+    ("tokenscale-aggressive.yaml", "tokenscale", "velocity"),
+    ("preserve-window600.yaml", "preserve", "window_s"),
+)
+
+
+@pytest.mark.parametrize("fname,policy,key", SENSITIVITY_ROWS)
+def test_sensitivity_rows_differ_from_main_only_in_their_key(fname: str, policy: str, key: str) -> None:
+    """A sensitivity row replaces the main ConfigMap of its policy while applied: same name,
+    same parameters except its one key, and it starts the policy for every model."""
+    from types import SimpleNamespace
+
     from tre_common.registry import load_registry
 
     from tre_baselines.config import Config, model_limits
     from tre_baselines.policies import build_policy
+    from tre_baselines.policies.preserve import PreServePolicy
 
-    path = BL_DIR / "sensitivity" / "tokenscale-aggressive.yaml"
-    text = path.read_text(encoding="utf-8")
+    text = (BL_DIR / "sensitivity" / fname).read_text(encoding="utf-8")
     assert not IP_RE.search(text) and "nscc-" not in text and "/data/nfs_shared_data" not in text
     (sens,) = [d for d in yaml.safe_load_all(text) if d]
-    main = _one("ConfigMap", "tre-v2-baseline-tokenscale")
+    main = _one("ConfigMap", f"tre-v2-baseline-{policy}")
     assert sens["metadata"] == main["metadata"]
-    sp, mp = (yaml.safe_load(d["data"]["tokenscale.yaml"]) for d in (sens, main))
-    assert sp["velocity"] != mp["velocity"]
-    assert {k: v for k, v in sp.items() if k != "velocity"} == {k: v for k, v in mp.items() if k != "velocity"}
+    sp, mp = (yaml.safe_load(d["data"][f"{policy}.yaml"]) for d in (sens, main))
+    assert sp[key] != mp[key]
+    assert {k: v for k, v in sp.items() if k != key} == {k: v for k, v in mp.items() if k != key}
     models = model_limits(load_registry(str(DEPLOY_ROOT / "registry.yaml")), strict=False)
-    build_policy("tokenscale", Config(sm_url="x", redis_url="y", policy="tokenscale", policy_params=sp,
-                                      models=models))
+    cfg = Config(sm_url="x", redis_url="y", policy=policy, policy_params=sp, models=models)
+    if policy == "preserve":
+        PreServePolicy(cfg, oracle=SimpleNamespace(window_s=float(sp["window_s"]), max_tokens_max={}))
+    else:
+        build_policy(policy, cfg)

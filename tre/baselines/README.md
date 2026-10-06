@@ -133,7 +133,7 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
     measured window meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the
     registry), with >= 150 of them (~20 min). The closed-loop mu is not used: a constant output
     length keeps the workers in lockstep (bursts of c prefills), which biased it 3-6x low.
-- PreServe-oracle: `window_s` 600 (sensitivity 60), `noise_sigma` 0.0772 (sensitivity 0.30).
+- PreServe-oracle: `window_s` 30 (rule W <= P/4, W >= 10 x wake_p95, see policy-configmaps.yaml; sensitivity 600 = paper, `sensitivity/preserve-window600.yaml`), `noise_sigma` 0.0772 (sensitivity 0.30).
   (`tools/preserve_mu` over a calibration capture is a cross-check only.)
 
 ## Trace volume (PreServe Tier-1)
