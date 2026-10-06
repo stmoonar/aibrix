@@ -5,8 +5,9 @@
 # the live engine of images 20261006-bb54543e (vLLM 0.30.0-ts, one awake replica per model):
 #   - Chiron-global theta_trace: tools/chiron_theta --method peak_mean --interval-s 5 on the
 #     hot alt trace (CPU only); sensitivity row "*": 1/3.
-#   - TokenScale-colocated V_b / V_P: tools/tokenscale_profile, closed loop (in 492 / out 400
-#     + out=1 ladder, 60 s steps, 15 s warm-up).
+#   - TokenScale-colocated V_b / V_P: tools/tokenscale_profile --open-loop, velocity at the knee
+#     of Poisson rate ladders (in 492 / out 400 and out=1). Sensitivity row "TokenScale-aggressive"
+#     (closed-loop maxima): sensitivity/tokenscale-aggressive.yaml.
 #   - PreServe-oracle mu: tools/tokenscale_profile --open-loop (Poisson rates 0.3 ... 1.3 x the
 #     calibration rho* x C_s token rate, 110 s steps, 20 s warm-up).
 #   The sha256 of each run's profile.yaml / profile_raw.csv is in the commit messages.
@@ -43,25 +44,28 @@ data:
       dsqwen-7b: {in: [489, 494], out: [400, 400]}
       dsllama-8b: {in: [493, 497], out: [400, 400]}
       dsqwen-14b: {in: [489, 494], out: [400, 400]}
-    velocity:                # (in+out) tok/s per replica: V_b = peak of the in 492 / out 400 ladder
-      dsqwen-7b:             # (one cell, written to all nine); v_prefill = V_P, peak of the out=1 ladder
+    velocity:                # tok/s per replica at the KNEE of open-loop Poisson ladders (highest throughput
+                             # with a bounded waiting queue: slope(num_requests_waiting) <= 2 % x offered req/s);
+                             # V_b = (in+out) tok/s, in 492 / out 400; v_prefill = V_P = prefill tok/s, out = 1
+                             # (one cell, written to all nine). Closed-loop maxima: sensitivity/tokenscale-aggressive.yaml
+      dsqwen-7b:             # V_b at 10.885 req/s (1.05 x), V_P at 35.0 req/s
         buckets:
-          - [11109.4, 11109.4, 11109.4]
-          - [11109.4, 11109.4, 11109.4]
-          - [11109.4, 11109.4, 11109.4]
-        v_prefill: 17223.5
-      dsllama-8b:
+          - [9313.7, 9313.7, 9313.7]
+          - [9313.7, 9313.7, 9313.7]
+          - [9313.7, 9313.7, 9313.7]
+        v_prefill: 16819.9
+      dsllama-8b:            # V_b at 8.14 req/s (1.1 x), V_P at 33.3 req/s
         buckets:
-          - [7984.8, 7984.8, 7984.8]
-          - [7984.8, 7984.8, 7984.8]
-          - [7984.8, 7984.8, 7984.8]
-        v_prefill: 16388.0
-      dsqwen-14b:
+          - [6929.6, 6929.6, 6929.6]
+          - [6929.6, 6929.6, 6929.6]
+          - [6929.6, 6929.6, 6929.6]
+        v_prefill: 16036.6
+      dsqwen-14b:            # V_b at 7.809 req/s (1.1 x), V_P at 27.8 req/s
         buckets:
-          - [8317.2, 8317.2, 8317.2]
-          - [8317.2, 8317.2, 8317.2]
-          - [8317.2, 8317.2, 8317.2]
-        v_prefill: 13687.7
+          - [6648.8, 6648.8, 6648.8]
+          - [6648.8, 6648.8, 6648.8]
+          - [6648.8, 6648.8, 6648.8]
+        v_prefill: 13394.8
     out_len_source: max_tokens
     default_out_tokens: 256  # not in paper
     misbucket_rate: 0.15     # paper: 85 %-accurate length predictor

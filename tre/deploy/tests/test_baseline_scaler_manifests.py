@@ -153,3 +153,25 @@ def test_dockerfile_contract() -> None:
     assert 'CMD ["python", "-m", "tre_baselines.main"]' in dockerfile
     for forbidden in ("COPY service-manager", "COPY controller", "COPY reissue"):
         assert forbidden not in dockerfile
+
+
+def test_tokenscale_aggressive_sensitivity_differs_from_main_only_in_velocity() -> None:
+    """The sensitivity row replaces the main TokenScale ConfigMap while applied: same name,
+    same parameters except the velocities, and it starts the policy for every model."""
+    from tre_common.registry import load_registry
+
+    from tre_baselines.config import Config, model_limits
+    from tre_baselines.policies import build_policy
+
+    path = BL_DIR / "sensitivity" / "tokenscale-aggressive.yaml"
+    text = path.read_text(encoding="utf-8")
+    assert not IP_RE.search(text) and "nscc-" not in text and "/data/nfs_shared_data" not in text
+    (sens,) = [d for d in yaml.safe_load_all(text) if d]
+    main = _one("ConfigMap", "tre-v2-baseline-tokenscale")
+    assert sens["metadata"] == main["metadata"]
+    sp, mp = (yaml.safe_load(d["data"]["tokenscale.yaml"]) for d in (sens, main))
+    assert sp["velocity"] != mp["velocity"]
+    assert {k: v for k, v in sp.items() if k != "velocity"} == {k: v for k, v in mp.items() if k != "velocity"}
+    models = model_limits(load_registry(str(DEPLOY_ROOT / "registry.yaml")), strict=False)
+    build_policy("tokenscale", Config(sm_url="x", redis_url="y", policy="tokenscale", policy_params=sp,
+                                      models=models))

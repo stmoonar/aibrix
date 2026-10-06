@@ -1,0 +1,47 @@
+# SENSITIVITY ROW "TokenScale-aggressive" (2026-10-06): the TokenScale-colocated parameters
+# with the CLOSED-LOOP maximum velocities instead of the open-loop knee of the main runs
+# (policy-configmaps.yaml). Everything except `velocity` is identical to the main ConfigMap.
+# Same ConfigMap name, so it replaces the main TokenScale parameters while applied:
+#   kubectl apply -f tre/deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml   # this row
+#   kubectl apply -f tre/deploy/baselines/tre/policy-configmaps.yaml                    # back to main
+# (the shell reads its parameters at start: apply before enabling the arm). Not part of the
+# kustomization on purpose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-tokenscale
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  tokenscale.yaml: |
+    bucket_edges:            # tools/tokenscale_buckets on the per-request hot alt schedule
+      dsqwen-7b: {in: [489, 494], out: [400, 400]}
+      dsllama-8b: {in: [493, 497], out: [400, 400]}
+      dsqwen-14b: {in: [489, 494], out: [400, 400]}
+    velocity:                # AGGRESSIVE: closed-loop maxima, V_b = peak (in+out) tok/s of the in 492 / out 400
+      dsqwen-7b:             # concurrency ladder, V_P = peak prefill tok/s of the out=1 ladder (one cell -> all nine)
+        buckets:
+          - [11109.4, 11109.4, 11109.4]
+          - [11109.4, 11109.4, 11109.4]
+          - [11109.4, 11109.4, 11109.4]
+        v_prefill: 17223.5
+      dsllama-8b:
+        buckets:
+          - [7984.8, 7984.8, 7984.8]
+          - [7984.8, 7984.8, 7984.8]
+          - [7984.8, 7984.8, 7984.8]
+        v_prefill: 16388.0
+      dsqwen-14b:
+        buckets:
+          - [8317.2, 8317.2, 8317.2]
+          - [8317.2, 8317.2, 8317.2]
+          - [8317.2, 8317.2, 8317.2]
+        v_prefill: 13687.7
+    out_len_source: max_tokens
+    default_out_tokens: 256  # not in paper
+    misbucket_rate: 0.15     # paper: 85 %-accurate length predictor
+    seed: 0
+    skip_reissue: true
+    window_s: 10             # not in paper
+    max_estimate_frac: 0.05  # not in paper

@@ -117,14 +117,18 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   `tre_replayer`): the hot alt trace has one shape (in ~492, out 400), so the buckets
   degenerate to one cell (disclose). Exactly one awake replica per model (checked), models in
   parallel, needs an exclusive window.
-  - TokenScale V_b / V_P, closed loop: `python3 -m tre_baselines.tools.tokenscale_profile
-    --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url <chat endpoint URL> --sm-url <SM>
-    --out-dir <dir> --i-have-user-approval`: concurrency 1/2/4/8/12/16/24/32/48/64 (extended
-    while still gaining > 5 %), 60 s steps, 15 s warm-up; prefill/decode tok/s from the
-    replica's vLLM token counters. V_b = peak (in+out) tok/s, V_P = peak prefill tok/s with
-    out=1 (~20 min).
-  - PreServe mu, open loop: the same command plus `--open-loop --base-rps <model>=<req/s>,...`
-    (1.0x = calibration rho* x C_s token rate / (in + out)): Poisson rates 0.3 ... 1.3 x,
+  - TokenScale V_b / V_P (main runs), open loop: `python3 -m tre_baselines.tools.tokenscale_profile
+    --open-loop --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url <chat endpoint URL> --sm-url <SM>
+    --out-dir <dir> --raw-dir <dir>/raw --base-rps <model>=<req/s>,... --prefill-base-rps <model>=<req/s>,...
+    --prefill-rate-factors 0.5,0.7,0.8,0.9,1.0,1.1,1.2 --i-have-user-approval`: velocity at the KNEE of the
+    Poisson ladders = the highest-throughput step whose waiting queue is bounded (least-squares slope of
+    `vllm:num_requests_waiting` over the measured window <= 2 % of the offered req/s). V_b = (in+out) tok/s
+    on the mixed ladder, V_P = prefill tok/s on the out=1 ladder.
+  - Sensitivity "TokenScale-aggressive": the closed-loop maxima (the same command without `--open-loop`:
+    concurrency 1 ... 64, extended while gaining > 5 %, 60 s steps; V_b = peak (in+out) tok/s, V_P = peak
+    prefill tok/s with out=1), shipped as `deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml`.
+  - PreServe mu, open loop: the mixed ladder of the same `--open-loop` run (`--base-rps`;
+    1.0x = calibration rho* x C_s token rate / (in + out)): Poisson rates 0.3 ... 1.3 x,
     110 s steps, 20 s warm-up; mu = engine tok/s of the highest rate whose requests sent in the
     measured window meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the
     registry), with >= 150 of them (~20 min). The closed-loop mu is not used: a constant output
@@ -196,7 +200,8 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   call the arm tool: `enable`, `mark-replay` at replay start, `disable --collect-dir`).
 - **Frozen parameters.** Chiron theta_trace, TokenScale V_b / V_P and PreServe mu were
   measured on the 20261006 engine and are frozen in `deploy/baselines/tre/policy-configmaps.yaml`
-  (the example files keep placeholders; the policies refuse to start on them). PreServe's
+  (the example files keep placeholders; the policies refuse to start on them); the TokenScale
+  sensitivity row is `deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml`. PreServe's
   `trace_path` must name the replayed trace in the trace volume (75/76 cluster: overlay
   `deploy/baselines/tre-cluster-75-76`, hostPath).
 - **Stale owner.** The pre-call check leaves the time between the check and the SM
