@@ -1,0 +1,29 @@
+{
+ "trace": "Real_code",
+ "duration_s": 720,
+ "isolates": "non-periodic production load (Azure code 2024 week): real arrivals and lengths, prefill-dominated",
+ "real": {
+  "dataset": "code2024",
+  "offsets_s_by_seed": {
+   "1": 302400,
+   "2": 388800,
+   "3": 475200
+  },
+  "offset_rule": "first three weekdays (Mon-Wed) of the file at 12:00 UTC (file starts Fri 2024-05-10 00:00 UTC)",
+  "rho": {
+   "dsllama-8b": 1.75,
+   "dsqwen-7b": 1.48,
+   "dsqwen-14b": 0.64
+  },
+  "rho_rule": "v1 Real_code mean-rho shares (1.12/0.95/0.41) scaled to mean G 4.5",
+  "in_min": 32
+ },
+ "audit": {
+  "hot": false,
+  "r1a_stat": "p99",
+  "r3_reference": "code2024",
+  "exempt": {
+   "R1b": "design: real slices are scaled to mean G 4.5 with p99 G <= 6.8 (design table: no static-sum target); static sum is reported, not judged"
+  }
+ }
+}

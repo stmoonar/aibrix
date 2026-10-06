@@ -1,0 +1,68 @@
+{
+ "trace": "Sinusoidal",
+ "duration_s": 1080,
+ "isolates": "A4 gradual + A6 periodic; same levels/phases as Alternating, only the waveform differs (three-phase -> G constant)",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "sinusoid",
+     "mean": 1.5,
+     "amp": 0.9,
+     "period_s": 360,
+     "phase_deg": 0
+    }
+   }
+  },
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "sinusoid",
+     "mean": 1.5,
+     "amp": 0.9,
+     "period_s": 360,
+     "phase_deg": 120
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "sinusoid",
+     "mean": 1.0,
+     "amp": 0.45,
+     "period_s": 360,
+     "phase_deg": 240
+    }
+   }
+  }
+ },
+ "audit": {
+  "exempt": {
+   "R5": {
+    "dsqwen-14b": "design: 14b amplitude halved (2 GPU per replica) to keep G constant; peak 1.45 = 2 replicas"
+   }
+  }
+ }
+}

@@ -1,0 +1,72 @@
+{
+ "trace": "Alternating_72s",
+ "duration_s": 1080,
+ "isolates": "sensitivity row: Alternating with 72 s segments (fast switching, D-sensitive)",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "square",
+     "low": 0.8,
+     "high": 2.4,
+     "period_s": 216,
+     "high_s": 72,
+     "offset_s": 0
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "square",
+     "low": 0.8,
+     "high": 2.4,
+     "period_s": 216,
+     "high_s": 72,
+     "offset_s": 72
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "square",
+     "low": 1.0,
+     "high": 1.8,
+     "period_s": 216,
+     "high_s": 72,
+     "offset_s": 144
+    }
+   }
+  }
+ },
+ "audit": {
+  "exempt": {
+   "R5": {
+    "dsqwen-14b": "design: Δ14 = Δ7/2 keeps G constant (14b replica = 2 GPU); 14b hot 1.8 = 3 replicas, one 2-GPU step"
+   },
+   "R2": "sensitivity row: 72 s segments by design"
+  }
+ }
+}

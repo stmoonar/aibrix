@@ -1,0 +1,122 @@
+{
+ "trace": "Decode_burst",
+ "duration_s": 1260,
+ "isolates": "A5 decode: KV growth at constant arrival rate; slow decay (700) = scale-down evidence; models in turn 8b, 7b, 14b",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho_ref",
+    "fn": 0.8
+   },
+   "lengths": {
+    "out": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        400
+       ],
+       [
+        120,
+        1200
+       ],
+       [
+        360,
+        700
+       ],
+       [
+        480,
+        400
+       ]
+      ]
+     }
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho_ref",
+    "fn": 0.8
+   },
+   "lengths": {
+    "out": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        400
+       ],
+       [
+        480,
+        1270
+       ],
+       [
+        720,
+        700
+       ],
+       [
+        840,
+        400
+       ]
+      ]
+     }
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho_ref",
+    "fn": 0.8
+   },
+   "lengths": {
+    "out": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        400
+       ],
+       [
+        840,
+        1230
+       ],
+       [
+        1080,
+        700
+       ],
+       [
+        1200,
+        400
+       ]
+      ]
+     }
+    }
+   }
+  }
+ },
+ "audit": {},
+ "adjustments": [
+  "R5: burst out mean 7b 1200 -> 1270 and 14b 1200 -> 1230 (design rho at out 1200 was 1.91 / 1.96 < 2.0; minimal out for 2.0 is 1264 / 1226 at in 492 and req/s fixed at rho_base 0.8)"
+ ]
+}

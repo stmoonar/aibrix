@@ -1,0 +1,103 @@
+{
+ "trace": "Simul_spike",
+ "duration_s": 1200,
+ "isolates": "A2=3 + rescue: three models hot at once; 3 spikes need exactly 8 GPUs, the last one is a marked overload",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 0.5,
+     "starts_s": [
+      75,
+      375,
+      675,
+      975
+     ],
+     "width_s": 150,
+     "peaks": [
+      1.7,
+      1.7,
+      1.7,
+      2.2
+     ]
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 0.5,
+     "starts_s": [
+      75,
+      375,
+      675,
+      975
+     ],
+     "width_s": 150,
+     "peaks": [
+      1.7,
+      1.7,
+      1.7,
+      2.2
+     ]
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 0.5,
+     "starts_s": [
+      75,
+      375,
+      675,
+      975
+     ],
+     "width_s": 150,
+     "peaks": [
+      1.4,
+      1.4,
+      1.4,
+      1.6
+     ]
+    }
+   }
+  }
+ },
+ "audit": {
+  "overload_windows_s": [
+   [
+    975,
+    1128
+   ]
+  ],
+  "exempt": {
+   "R5": "design: three models at >= 2.0 at once need 3+3+6 = 12 GPUs > 8; normal spikes 1.7/1.7/1.4"
+  }
+ },
+ "layout_note": "spikes at 75-225, 375-525, 675-825, 975-1125 s (150 s wide, 150 s apart, 75 s of base at each end); the overload spike is the last one, so the three normal spikes are not preceded by its backlog"
+}

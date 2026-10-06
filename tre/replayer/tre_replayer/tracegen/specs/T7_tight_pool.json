@@ -1,0 +1,74 @@
+{
+ "trace": "T7_tight_pool",
+ "duration_s": 1200,
+ "isolates": "A3 + no idle donor: base 2/2/2 replicas fills the pool; 240 s surges 8b, 7b, 14b in turn (pre-registered answers in the design doc)",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 1.1,
+     "starts_s": [
+      120
+     ],
+     "width_s": 240,
+     "peaks": [
+      2.6
+     ]
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 1.1,
+     "starts_s": [
+      480
+     ],
+     "width_s": 240,
+     "peaks": [
+      2.6
+     ]
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 1.0,
+     "starts_s": [
+      840
+     ],
+     "width_s": 240,
+     "peaks": [
+      2.0
+     ]
+    }
+   }
+  }
+ },
+ "audit": {}
+}
