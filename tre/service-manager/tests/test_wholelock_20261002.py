@@ -571,3 +571,46 @@ def test_stale_operation_records_are_superseded_except_fleet_repairs():
     finally:
         FakeHandle.supersede = original
     assert superseded == ["op-dead"]
+
+
+# ------------------------------------------------------------ best-effort growth
+@pytest.mark.parametrize("at_least", [True, False])
+def test_a_growth_wakes_every_feasible_binding_and_reports_the_rest(at_least):
+    """2026-10-06 (v1 execute_scale_up semantics): r asks for 3, only r-2 is
+    placeable (r-0 / r-1 sit under the awake d-0 / d-1) - r-2 wakes, the other two
+    are reported (``unfilled``, their blockers); 200 grow-only, 409 ``partial``
+    (same response in the body) for an exact target."""
+    world = World()
+
+    response = world.client.put("/v2/models/r/target", json={"wake_replicas": 3, "at_least": at_least})
+
+    assert response.status_code == (200 if at_least else 409), response.text
+    body = response.json()
+    if not at_least:
+        assert body["error"] == "partial"
+    assert body["unfilled"] == 2
+    assert [a["serve_id"] for a in body["actions"] if a["action"] == "wake"] == ["r-2"]
+    assert {r["blocking_binding_id"] for r in body["refusals"]} == {"d/node-a/0", "d/node-a/1"}
+    assert all("retry_after_s" in r for r in body["refusals"])
+    assert world.awake("r-2") and world.stored_awake("r-2")
+    assert not world.awake("r-0") and not world.awake("r-1")
+    assert world.awake("d-0") and world.awake("d-1")
+    assert world.violations == []
+
+
+def test_v1_scale_service_up_answers_200_with_what_woke():
+    """APA /scale_service keeps the v1 contract: 200 with ``actual`` = replicas
+    woken (the AIBrix client warns on actual < requested); nothing placeable is
+    also 200 with actual 0, as v1."""
+    world = World()
+
+    def up(n):
+        return world.client.post("/scale_service", params={"model_name": "r", "scale_type": "up", "scale_value": n})
+
+    first = up(3)
+    assert (first.status_code, first.json()) == (200, {"requested": 3, "actual": 1})
+    assert world.awake("r-2")
+
+    second = up(1)
+    assert (second.status_code, second.json()) == (200, {"requested": 1, "actual": 0})
+    assert not world.awake("r-0") and not world.awake("r-1") and world.violations == []

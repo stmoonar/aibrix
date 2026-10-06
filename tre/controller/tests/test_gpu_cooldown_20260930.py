@@ -271,3 +271,32 @@ def test_hinted_wake_sends_no_avoid_gpus():
     queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
     asyncio.run(queue.drain_once())
     assert seen == {"hints": ("8b-1",)}  # GPU use is serialized by the SM, not the queue
+
+
+def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
+    """SM best effort (2026-10-06): an exact growth the SM filled in part answers 409
+    ``partial`` with its response; the controller counts what woke (``changed`` /
+    ``picked``, an "up" last action) and never re-sends the relative call."""
+    from tre_controller.sm_client import ServiceManagerClient
+
+    body = dict(STRUCTURED, error="partial", reason="partial", unfilled=1,
+                actions=[{"action": "wake", "serve_id": "8b-2"}],
+                picked=[{"serve_id": "8b-2", "node": "node9", "gpu_ids": [2], "hinted": False}],
+                refusals=[STRUCTURED])
+
+    class Transport:
+        calls = 0
+
+        async def request(self, method, url, *, json=None, timeout_s):
+            if method == "GET":
+                return {"models": {"dsllama-8b": {"awake": 1, "bound": 4}}}
+            Transport.calls += 1
+            raise ServiceManagerError("HTTP 409", status=409, body=body)
+
+    queue = ActionQueue(ServiceManagerClient("http://sm", transport=Transport()), now_ms=lambda: 5)
+    queue.submit([ScaleAction("dsllama-8b", 2, "critical_sleeping_capacity", "rescue")])
+    (result,) = asyncio.run(queue.drain_once())
+
+    assert result.ok is False and result.retriable is False and Transport.calls == 1
+    assert result.changed == ("8b-2",) and len(result.picked) == 1
+    assert queue.last_actions() == {"dsllama-8b": (5, "up")}

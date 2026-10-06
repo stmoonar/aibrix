@@ -1625,6 +1625,16 @@ class ActionQueue:
         ``taken`` - 0 changed nothing; a clamp is an event (``scale_clamped_by_floor``),
         never a hold."""
         result = _dispatch_result(model=action.model, action_kind="scale", response=response)
+        if action.delta > 0 and response.get("partial"):
+            # 409 ``partial`` of an exact growth (SM best effort, 2026-10-06): some
+            # replicas DID wake - reported with them (``changed`` / ``picked``),
+            # never as "nothing happened"; not retried (relative), the planner re-plans.
+            body = response.get("response") or {}
+            woke = tuple(
+                str(item.get("serve_id")) for item in body.get("actions") or ()
+                if isinstance(item, dict) and item.get("action") == "wake" and item.get("serve_id")
+            )
+            return replace(result, retriable=False, changed=woke, picked=tuple(body.get("picked") or ()))
         if action.delta >= 0 or not result.ok:
             return result
         body = response.get("response") or {}

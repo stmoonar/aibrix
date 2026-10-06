@@ -5,6 +5,9 @@ from fastapi import APIRouter, HTTPException, Query
 
 
 def create_v1_compat_router(service) -> APIRouter:
+    # v2 imports this module: its errors are imported here, once v2 is loaded.
+    from tre_sm.api.v2 import TargetPartial, WakeConflict, WakeFailed
+
     router = APIRouter()
 
     @router.post("/models_replicas")
@@ -44,6 +47,19 @@ def create_v1_compat_router(service) -> APIRouter:
             # sleep of the service-manager); a scale-up ignores it. ``actual``
             # is the number of wake / sleep actions of THIS call.
             response = service.put_model_target(model_name, wake_replicas=target, sleep_path="apa")
+        except TargetPartial as exc:
+            # v1 contract (execute_scale_up, best effort): 200 with what woke; the
+            # APA client warns on actual < requested.
+            response = exc.response
+        except WakeConflict as exc:
+            if scale_type != "up" or isinstance(exc, WakeFailed):
+                # Unchanged: a shrink refusal or a wake that itself failed is a 400
+                # (WakeConflict is a ValueError).
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # No sleeping binding could be placed (refused before any change): v1
+            # answered 200 with actual 0, and so does this (the APA client warns and
+            # re-reconciles; an error only makes it requeue with backoff).
+            return {"requested": scale_value, "actual": 0}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"requested": scale_value, "actual": len(response["actions"])}

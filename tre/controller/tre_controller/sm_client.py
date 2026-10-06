@@ -219,7 +219,14 @@ class ServiceManagerClient:
             )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
-            return exc.result()
+            result = exc.result()
+            body = exc.body or {}
+            if exc.status == 409 and body.get("error") == "partial" and isinstance(body.get("actions"), list):
+                # An exact growth the SM filled in part (2026-10-06): the body is the
+                # target response (``actions``, ``picked``, ``unfilled``, ``refusals``).
+                result["partial"] = True
+                result["response"] = body
+            return result
 
     async def scale_model_to(self, model: str, target: int) -> dict:
         """Grow ``model`` to at least ``target`` awake replicas (absolute and
