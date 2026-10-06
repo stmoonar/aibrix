@@ -1,0 +1,72 @@
+{
+ "trace": "Steady",
+ "duration_s": 720,
+ "isolates": "A6 only: jitter / over-reaction when no transfer is needed (control; TRE should gain nothing)",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "ou",
+     "level": 1.25,
+     "rel_sd": 0.05,
+     "tau_s": 120,
+     "clip_rel": 0.1
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "ou",
+     "level": 1.15,
+     "rel_sd": 0.05,
+     "tau_s": 120,
+     "clip_rel": 0.1
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "ou",
+     "level": 1.0,
+     "rel_sd": 0.05,
+     "tau_s": 120,
+     "clip_rel": 0.1
+    }
+   }
+  }
+ },
+ "audit": {
+  "hot": false,
+  "exempt": {
+   "R1b": "control: deliberately fits the pool (static 8)"
+  }
+ },
+ "seeds": [
+  1,
+  2,
+  3
+ ]
+}

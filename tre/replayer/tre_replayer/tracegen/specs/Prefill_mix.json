@@ -1,0 +1,255 @@
+{
+ "trace": "Prefill_mix",
+ "duration_s": 1080,
+ "isolates": "A5: several models stage-skewed at once; each 180 s every model takes one of prefill-heavy / decode-heavy / balanced, rotating",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho_ref",
+    "fn": 0.8
+   },
+   "lengths": {
+    "in": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        2000
+       ],
+       [
+        180,
+        300
+       ],
+       [
+        360,
+        492
+       ],
+       [
+        540,
+        2000
+       ],
+       [
+        720,
+        300
+       ],
+       [
+        900,
+        492
+       ]
+      ]
+     }
+    },
+    "out": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        150
+       ],
+       [
+        180,
+        1300
+       ],
+       [
+        360,
+        400
+       ],
+       [
+        540,
+        150
+       ],
+       [
+        720,
+        1300
+       ],
+       [
+        900,
+        400
+       ]
+      ]
+     }
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho_ref",
+    "fn": 0.8
+   },
+   "lengths": {
+    "in": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        300
+       ],
+       [
+        180,
+        492
+       ],
+       [
+        360,
+        2000
+       ],
+       [
+        540,
+        300
+       ],
+       [
+        720,
+        492
+       ],
+       [
+        900,
+        2000
+       ]
+      ]
+     }
+    },
+    "out": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        1340
+       ],
+       [
+        180,
+        400
+       ],
+       [
+        360,
+        150
+       ],
+       [
+        540,
+        1340
+       ],
+       [
+        720,
+        400
+       ],
+       [
+        900,
+        150
+       ]
+      ]
+     }
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho_ref",
+    "fn": 0.8
+   },
+   "lengths": {
+    "in": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        492
+       ],
+       [
+        180,
+        2000
+       ],
+       [
+        360,
+        300
+       ],
+       [
+        540,
+        492
+       ],
+       [
+        720,
+        2000
+       ],
+       [
+        900,
+        300
+       ]
+      ]
+     }
+    },
+    "out": {
+     "mean": {
+      "kind": "steps",
+      "points": [
+       [
+        0,
+        400
+       ],
+       [
+        180,
+        150
+       ],
+       [
+        360,
+        900
+       ],
+       [
+        540,
+        400
+       ],
+       [
+        720,
+        150
+       ],
+       [
+        900,
+        900
+       ]
+      ]
+     }
+    }
+   }
+  }
+ },
+ "audit": {
+  "hot_rho": {
+   "dsllama-8b": 1.5,
+   "dsqwen-7b": 1.5,
+   "dsqwen-14b": 1.3
+  },
+  "exempt": {
+   "R5": {
+    "dsqwen-14b": "design: 14b decode-heavy is 300/900 (rho 1.44), not 300/1300"
+   }
+  }
+ },
+ "adjustments": [
+  "R5: 7b decode-heavy out mean 1300 -> 1340 (design rho at 300/1300 was 1.95 < 2.0; minimal out for 2.0 is 1333)"
+ ],
+ "seeds": [
+  1,
+  2,
+  3
+ ]
+}
