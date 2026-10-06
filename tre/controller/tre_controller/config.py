@@ -22,6 +22,22 @@ REMOVED_TIMER_ENV = (
 
 LOG = logging.getLogger(__name__)
 
+#: Removed 2026-10-07: actuation is governed only by the run mode (tre:v2:controller:mode,
+#: observe | active). ENABLE_TRE_SCALING=false used to stop the whole decision pipeline
+#: (signals, decision snapshots, signal log), not just scaling; the decision tasks now
+#: always run and an observe controller computes and records only. A live Deployment that
+#: still sets the variable gets one warning and the value is ignored.
+REMOVED_ENV_VARS = ("ENABLE_TRE_SCALING",)
+
+
+def _warn_removed_env(values: Mapping[str, str]) -> None:
+    for name in REMOVED_ENV_VARS:
+        if name in values:
+            LOG.warning(
+                "%s=%r is ignored (removed 2026-10-07): actuation follows the run mode "
+                "tre:v2:controller:mode only; remove it from the Deployment", name, values.get(name)
+            )
+
 SIGNAL_SOURCES = {
     "zm",
     "latency_p95",
@@ -151,7 +167,6 @@ class ControllerConfig:
     signal_warmup_ms: int
     paper_stale_max_windows: int
     incomplete_policy: str
-    enable_tre_scaling: bool
     ablation_disable_fast_loop: bool
     ablation_disable_safescale: bool
     disable_eta_gate: bool
@@ -226,6 +241,7 @@ class ControllerConfig:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
         values = os.environ if env is None else env
+        _warn_removed_env(values)
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"
         default_state_dir = repo_tre_dir / ".runtime"
@@ -386,7 +402,6 @@ class ControllerConfig:
             signal_warmup_ms=signal_warmup_ms,
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
             incomplete_policy=incomplete_policy,
-            enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),
             ablation_disable_fast_loop=_get_bool(values, "TRE_ABLATION_DISABLE_FAST_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),
             disable_eta_gate=_get_bool(values, "TRE_DISABLE_ETA_GATE", False),

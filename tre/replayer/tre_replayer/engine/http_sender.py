@@ -493,7 +493,7 @@ class StreamingHttpSender:
         if not request.prompt:
             raise ValueError(f"{request.request_id}: the e1_v1 profile sends the trace's own prompt; it has none")
         kwargs = self._v1.kwargs_for(request.model, request.prompt, request.max_output_tokens,
-                                     request.in_tokens_header)
+                                     request.in_tokens_header, request_id=request.request_id)
         wire_ts = self._mono()
         in_flight_at_send = self._in_flight.inc()
         try:

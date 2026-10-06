@@ -13,7 +13,7 @@ Centralized values:
 - Registry and runtime state paths: `TRE_REGISTRY_PATH`, `TRE_RUNTIME_STATE_DIR`.
 - Loop cadence: `TRE_MONITOR_INTERVAL_SECONDS`, `TRE_RESCUE_INTERVAL_SECONDS`, `TRE_FAIRNESS_INTERVAL_SECONDS`.
 - Metrics windowing: `TRE_METRICS_WINDOW_MS`, `TRE_INSTANT_SAMPLE_INTERVAL_MS`, `TRE_PERCENTILE_MODE`.
-- P5 ablation switches: `ENABLE_TRE_SCALING`, `TRE_ABLATION_DISABLE_FAST_LOOP`, `TRE_ABLATION_DISABLE_SAFESCALE`.
+- P5 ablation switches: `TRE_ABLATION_DISABLE_FAST_LOOP`, `TRE_ABLATION_DISABLE_SAFESCALE` (`ENABLE_TRE_SCALING` removed 2026-10-07: actuation follows the run mode only).
 - Signal source switch: `TRE_SIGNAL_SOURCE=zm|latency_p95|queue_len|kv_cache`.
 - Legacy controller constants found in the frozen upstream controller: `PROACTIVE_RELEASE_MIN_TRS` and all `SAFE_SCALE_*` knobs.
 
@@ -439,7 +439,7 @@ The app assembly slice adds the controller task boundary from the P5 asyncio des
 Implemented pieces:
 
 - `ControllerDependencies` groups the metrics store, `SnapshotBox`, `ActionQueue`, and registry used by runtime tasks.
-- `build_controller_task_specs()` always starts `metrics`; starts `rescue`, `fairness`, and `action_queue` only when `ENABLE_TRE_SCALING` is true; and honors `TRE_ABLATION_DISABLE_FAST_LOOP` by omitting only `rescue`.
+- `build_controller_task_specs()` always starts `metrics`; starts `rescue`, `fairness`, and `action_queue` always (2026-10-07; before: only with `ENABLE_TRE_SCALING` true) - run mode observe makes them compute and record only; and honors `TRE_ABLATION_DISABLE_FAST_LOOP` by omitting only `rescue`.
 - `rescue_task()` and `fairness_task()` are long-running async wrappers over the tested single-tick functions. They read only `SnapshotBox`, submit through the queue, and sleep for the configured interval.
 - `ActionQueue.run()` repeatedly drains pending actions and sleeps, keeping service-manager HTTP calls confined to the queue boundary.
 

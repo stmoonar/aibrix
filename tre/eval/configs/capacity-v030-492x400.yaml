@@ -1,0 +1,8 @@
+# Per-replica request rate at offered load rho = 1 (req/s) for the 492-in / 400-out shape on the
+# vLLM 0.30 engine (docs/trace-design-v2: req/s = rho * V_b / 892). Used only to draw rho, the
+# offered load in replica-equivalents, next to the awake / routable replica counts.
+# Other shapes: rho = rps * (in / V_p + out / V_d); replace these numbers per trace family.
+capacity_rps_per_replica:
+  dsqwen-7b: 10.4
+  dsllama-8b: 7.8
+  dsqwen-14b: 7.5

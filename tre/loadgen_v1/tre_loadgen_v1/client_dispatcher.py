@@ -67,7 +67,7 @@ from tre_replayer.engine.http_sender import (  # noqa: E402
 )
 from tre_replayer.engine.metrics import summarize_v1_records  # noqa: E402
 from tre_replayer.engine.procpool import ProcessPoolRunner, RunnerError  # noqa: E402
-from tre_replayer.engine.profiles import PROFILE_E1_V1, V1ChatOptions  # noqa: E402
+from tre_replayer.engine.profiles import PROFILE_E1_V1, REQUEST_ID_HEADER, V1ChatOptions  # noqa: E402,F401
 from tre_replayer.engine.schedule import ScheduledRequest  # noqa: E402
 
 from .config_manager import ConfigManager  # noqa: E402
@@ -89,6 +89,7 @@ def v1_options_from_config(config: Any) -> V1ChatOptions:
         streaming=bool(getattr(client, "enable_streaming", True)),
         ignore_eos=bool(getattr(client, "ignore_eos", False)),
         send_in_tokens=bool(getattr(client, "send_in_tokens", False)),
+        send_request_id=bool(getattr(client, "send_request_id", True)),
     )
 
 

@@ -1,10 +1,10 @@
 PYTHON ?= python3
-TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(CURDIR)/controller/tests:$(CURDIR)/service-manager:$(CURDIR)/calibration:$(CURDIR)/replayer:$(CURDIR)/loadgen_v1:$(CURDIR)/reissue:$(CURDIR)/ui:$(CURDIR)/baselines:$(PYTHONPATH)
+TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(CURDIR)/controller/tests:$(CURDIR)/service-manager:$(CURDIR)/calibration:$(CURDIR)/replayer:$(CURDIR)/loadgen_v1:$(CURDIR)/reissue:$(CURDIR)/ui:$(CURDIR)/baselines:$(CURDIR)/eval:$(PYTHONPATH)
 
 .PHONY: check check-serial check-redis smoke manifests
 
 # Test suites (directory names); `make check SUITES="controller service-manager"` runs a subset.
-SUITES ?= common deploy controller service-manager calibration replayer loadgen_v1 reissue ui baselines
+SUITES ?= common deploy controller service-manager calibration replayer loadgen_v1 reissue ui baselines eval
 CHECK_LOG_DIR ?= .check-logs
 
 # Default: one pytest process per suite, all in parallel (no xdist needed). Per-suite
@@ -33,7 +33,7 @@ check:
 
 # Original serial behaviour (single pytest process over all suites).
 check-serial:
-	PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q common/tests deploy/tests controller/tests service-manager/tests calibration/tests replayer/tests loadgen_v1/tests reissue/tests ui/tests baselines/tests
+	PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q common/tests deploy/tests controller/tests service-manager/tests calibration/tests replayer/tests loadgen_v1/tests reissue/tests ui/tests baselines/tests eval/tests
 
 # Real-Redis Lua tests (fair writer lock, maintenance lock) and the sleep primitive end to
 # end (real Redis + HTTP) against a throwaway Redis container that is removed afterwards.

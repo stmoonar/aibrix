@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot
@@ -55,7 +56,10 @@ class DecisionSnapshotWriter:
             _LOGGER.warning("decision_snapshot_redis_write_failed: %s", exc)
         self._append_history(snapshot, result)
         self._signal_log_writer.write(snapshot, result)
-        _LOGGER.info(json.dumps({"event": "trs_calc_result", **payload}, separators=(",", ":")))
+        # ``now_ms``: wall clock of the decision (``ts_ms`` is the metrics window
+        # boundary the tick read, grid-aligned) - evaluation data, log line only.
+        _LOGGER.info(json.dumps({"event": "trs_calc_result", "now_ms": str(int(time.time() * 1000)), **payload},
+                                separators=(",", ":")))
 
     def _append_history(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
         # S5.1: per-model decision time-series, scored by window_end_ms. rescue and fairness

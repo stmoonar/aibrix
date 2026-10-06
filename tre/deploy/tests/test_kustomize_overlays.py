@@ -164,7 +164,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert stats["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-namespace"] == "tre-v2"
     assert stats["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-name"] == "tre-aibrix-eg"
     assert stats["spec"]["ports"] == [{"name": "metrics", "port": 19001, "targetPort": 19001, "protocol": "TCP"}]
-    assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
+    # Removed 2026-10-07 (run mode alone gates actuation).
+    assert "ENABLE_TRE_SCALING" not in _env(controller)
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"
     assert _env(controller)["TRE_METRICS_REDIS_URL"] == "redis://tre-v2-redis:6379/0"

@@ -1234,8 +1234,7 @@ class ReissueSidecar:
         (with the request id) besides the rate-limited WARNING."""
         error = f"{type(exc).__name__}: {exc}"[:300]
         if account:
-            self._account("failed", "upstream_unavailable", request, depth, error=error, status=status,
-                          request_id=request.headers.get("x-request-id"))
+            self._account("failed", "upstream_unavailable", request, depth, error=error, status=status)
         if account or status == 503:  # not: a probe finding the engine not (yet) listening
             self._warn(f"upstream_{status}", {"event": "tre_upstream_unavailable", "status": status,
                                               "path": request.path, "error": error})
@@ -1424,8 +1423,9 @@ class ReissueSidecar:
             if not state.active:
                 state.epoch += 1
             self.metrics.event("sleep_failed")
-            _log({"event": "tre_sleep_failed", "model": cfg.model, "pod": cfg.pod_name, "status": status,
-                  "error": payload if status is None else None})
+            _log({"event": "tre_sleep_failed", "ts": round(started, 3), "model": cfg.model, "pod": cfg.pod_name,
+                  "status": status, "error": payload if status is None else None,
+                  "duration_s": round(time.time() - started, 3)})
             if status is None:
                 return _error(502, str(payload), "BadGateway")
             return web.Response(body=payload, status=status, headers=headers)
@@ -1433,8 +1433,8 @@ class ReissueSidecar:
             state.sleeping = True
         state.last_sleep = {"ts": started, "path": request.path, "query": request.query_string,
                             "duration_s": round(time.time() - started, 3)}
-        _log({"event": "tre_sleep", "model": cfg.model, "pod": cfg.pod_name, "path": request.path_qs,
-              "duration_s": state.last_sleep["duration_s"]})
+        _log({"event": "tre_sleep", "ts": round(started, 3), "model": cfg.model, "pod": cfg.pod_name,
+              "path": request.path_qs, "duration_s": state.last_sleep["duration_s"]})
         return web.Response(body=payload, status=status, headers=headers)
 
     async def _handle_wake(self, request: web.Request) -> web.StreamResponse:
@@ -1814,6 +1814,7 @@ class ReissueSidecar:
         chat = path == cfg.chat_path
         added = added or AddedTime()
         t_abort = time.monotonic()
+        abort_ts = round(time.time(), 3)  # log field: the moment gap_ms is measured from
         generated = len(abort.generated_ids or ())
         prompt_tokens = (first_usage or {}).get("prompt_tokens")
         if not isinstance(prompt_tokens, int):
@@ -1872,7 +1873,7 @@ class ReissueSidecar:
             parts.append(sse(with_text(abort.obj, text, "length") | {cfg.continued_field: 0}))
             await self._finish_stream(request, client, parts, base, merged_usage(prompt_tokens, generated, None),
                                       wants_usage, 0)
-            self._account("continue", "budget_spent", request, depth, generated=generated)
+            self._account("continue", "budget_spent", request, depth, generated=generated, abort_ts=abort_ts)
             return
         cont_resp = None
         attempts = 0
@@ -1896,7 +1897,7 @@ class ReissueSidecar:
             await self._finish_stream(request, client, parts, base, merged_usage(prompt_tokens, generated, None),
                                       wants_usage, None)
             self._account("failed", "continuation_unavailable", request, depth, generated=generated,
-                          attempts=attempts, error=error)
+                          attempts=attempts, error=error, abort_ts=abort_ts)
             return
         target = _target(cont_resp)
         cont_usage: dict | None = None
@@ -1996,7 +1997,8 @@ class ReissueSidecar:
                 held_sent = True
         except ConnectionResetError:
             cont_resp.close()
-            self._account("passthrough_abort", "client_gone", request, depth, generated=generated, target=target)
+            self._account("passthrough_abort", "client_gone", request, depth, generated=generated, target=target,
+                          abort_ts=abort_ts)
             return
         finally:
             cont_resp.release()
@@ -2017,7 +2019,8 @@ class ReissueSidecar:
                                   merged_usage(prompt_tokens, generated, cont_usage), wants_usage,
                                   segments if outcome == "continue" else None)
         self._account(outcome, reason, request, depth, generated=generated, attempts=attempts, target=target,
-                      gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam)
+                      gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam,
+                      abort_ts=abort_ts)
 
     async def _finish_stream(self, request: web.Request, client: web.StreamResponse, parts: list[bytes],
                              base: dict, usage: dict, wants_usage: bool, segments: int | None) -> None:
@@ -2093,10 +2096,11 @@ class ReissueSidecar:
         except ValueError as exc:
             plan, error = None, str(exc)
         t_abort = time.monotonic()
+        abort_ts = round(time.time(), 3)  # log field: the moment gap_ms is measured from
         if plan is None and not error:
             _set_choice(merged, chat, first_text, "length", None)
             merged["usage"] = merged_usage(prompt_tokens, generated, None)
-            self._account("continue", "budget_spent", request, depth, generated=generated)
+            self._account("continue", "budget_spent", request, depth, generated=generated, abort_ts=abort_ts)
             return web.json_response(merged, headers={cfg.continued_header: "0"})
         second = None
         attempts = 0
@@ -2129,7 +2133,8 @@ class ReissueSidecar:
         finish = second_choice.get("finish_reason") if isinstance(second_choice, dict) else None
         if second is None or finish in (None, "abort"):
             self._account("failed", "continuation_aborted" if finish == "abort" else "continuation_unavailable",
-                          request, depth, generated=generated, attempts=attempts, target=target, error=error)
+                          request, depth, generated=generated, attempts=attempts, target=target, error=error,
+                          abort_ts=abort_ts)
             return web.Response(body=payload, status=resp.status, headers=headers)
         gap_s = time.monotonic() - t_abort
         self.metrics.gap["nonstream"].observe(gap_s)
@@ -2154,7 +2159,8 @@ class ReissueSidecar:
         merged["usage"] = merged_usage(prompt_tokens, generated, cont_usage)
         segments = 1 + nested
         self._account("continue", "abort_sleep", request, depth, generated=generated, attempts=attempts,
-                      target=target, gap_ms=_ms(gap_s), segments=segments, stop_at_seam=stop_at_seam)
+                      target=target, gap_ms=_ms(gap_s), segments=segments, stop_at_seam=stop_at_seam,
+                      abort_ts=abort_ts)
         return web.json_response(merged, headers={cfg.continued_header: str(segments)})
 
     # ------------------------------------------------------------------ logging
@@ -2169,15 +2175,34 @@ class ReissueSidecar:
                 choice.pop(cfg.prompt_ids_field, None)
 
     def _account(self, kind: str, reason: str, request: web.Request, depth: int, **extra: Any) -> None:
+        """One ``tre_reissue`` log line. ``ts`` = when it is written (for a continuation:
+        its end); ``abort_ts`` (continuations only) = the abort moment ``gap_ms`` starts
+        from; ``request_id`` = the client's ``x-tre-request-id`` (else ``x-request-id``),
+        the key that joins this line to the client's own record."""
         request.pop(_REISSUE_PENDING, None)
         self.metrics.count(kind, reason)
         record = {"event": "tre_reissue", "ts": round(time.time(), 3), "model": self.cfg.model,
                   "pod": self.cfg.pod_name, "kind": kind, "reason": reason, "path": request.path, "depth": depth}
+        if extra.get("request_id") is None:
+            extra["request_id"] = request_id_of(request.headers)
         for key, value in extra.items():
             if value is None or value == "" or value is False:
                 continue
             record[key] = value
         _log(record)
+
+
+#: The client's request id: ours first (Envoy may overwrite x-request-id on external
+#: requests and never touches this one), then the generic one.
+REQUEST_ID_HEADERS = ("x-tre-request-id", "x-request-id")
+
+
+def request_id_of(headers: Any) -> str | None:
+    for name in REQUEST_ID_HEADERS:
+        value = (headers.get(name) or "").strip()
+        if value:
+            return value
+    return None
 
 
 def _ms(seconds: float | None) -> float | None:

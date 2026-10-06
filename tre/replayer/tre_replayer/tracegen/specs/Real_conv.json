@@ -1,0 +1,34 @@
+{
+ "trace": "Real_conv",
+ "duration_s": 720,
+ "isolates": "non-periodic production load (Azure conv 2024 week): real arrivals and lengths",
+ "real": {
+  "dataset": "conv2024",
+  "offsets_s_by_seed": {
+   "1": 129600,
+   "2": 216000,
+   "3": 302400
+  },
+  "offset_rule": "first three weekdays (Mon-Wed) of the file at 12:00 UTC (file starts Sun 2024-05-12 00:00 UTC)",
+  "rho": {
+   "dsllama-8b": 1.43,
+   "dsqwen-7b": 1.11,
+   "dsqwen-14b": 0.98
+  },
+  "rho_rule": "v1 Real_conv mean-rho shares (1.15/0.89/0.78) scaled to mean G 4.5",
+  "in_min": 32
+ },
+ "audit": {
+  "hot": false,
+  "r1a_stat": "p99",
+  "r3_reference": "conv2024",
+  "exempt": {
+   "R1b": "design: real slices are scaled to mean G 4.5 with p99 G <= 6.8 (design table: no static-sum target); static sum is reported, not judged"
+  }
+ },
+ "seeds": [
+  1,
+  2,
+  3
+ ]
+}

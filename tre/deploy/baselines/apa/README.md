@@ -70,8 +70,11 @@ Both the TRE controller and the patched APA controller push scaling through
 service-manager. Running both at once makes them fight over the same pods. Exactly one arm
 may be live:
 
-- **APA arm**: `ENABLE_TRE_SCALING=false` on `tre-v2-controller` **and** these PA CRs applied.
-- **TRE arm**: PA CRs deleted **and** `ENABLE_TRE_SCALING=true`.
+- **APA arm**: controller run mode `observe` (`tre:v2:controller:mode`; it keeps computing
+  and logging its decisions, never actuates) **and** these PA CRs applied.
+- **TRE arm**: PA CRs deleted **and** controller run mode `active`.
+- The controller's former scaling env switch was removed (2026-10-07); the decision source
+  is run mode + PA CRs + the baseline owner lock (`toggle_tre_apa.sh status`).
 
 `toggle_tre_apa.sh` always stops the old source and verifies it is gone before starting the
 new one.

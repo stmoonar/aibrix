@@ -5,12 +5,20 @@
 # one (endgame plan / REFACTOR_PLAN experiment-3 arms; supersedes the old
 # CustomTraceGenerator/toggle_tre_apa_hot_switch.sh, which used pre-v2 resource names).
 #
-#   tre    : APA off  -> delete APA PodAutoscaler CRs, verify none remain,
-#            then TRE on -> set ENABLE_TRE_SCALING=true and restart the controller.
-#   apa    : TRE off  -> set ENABLE_TRE_SCALING=false, wait for the rollout, verify it is off,
-#            then APA on -> apply the APA PodAutoscaler CRs.
-#   status : print the active source (checks the controller env AND the live PA CRs)
-#            and the run mode.
+#   tre    : APA off  -> delete APA PodAutoscaler CRs, verify none remain (and no baseline
+#            shell holds the owner lock), restart the controller, then controller active.
+#   apa    : TRE off  -> controller observe (verified), no baseline owner lock, then APA on
+#            -> apply the APA PodAutoscaler CRs.
+#   status : print the active source and the run mode.
+#
+# Decision source (2026-10-07): the TRE controller acts only in run mode `active`; in
+# `observe` it still computes and records signals and decisions (counterfactual log of
+# the APA and baseline arms) but never actuates. The controller's former scaling env
+# switch was removed (it stopped the whole decision pipeline, not just scaling). So the source is read from
+#   TRE      = tre:v2:controller:mode == active
+#   APA      = live PodAutoscaler CRs (label tre.aibrix.io/baseline=apa)
+#   BASELINE = the baseline shell's owner lock tre:v2:bl:owner is held
+# exactly one of them = that source, none = NONE, more than one = CONFLICT.
 #
 # Run mode (2026-09-28, set_run_mode.sh): the controller mode and the SM actuation are
 # independent switches, and BOTH arms run the SM actuation active (symmetric self-heal):
@@ -33,6 +41,10 @@ APA_CRS=(dsqwen-7b-apa.yaml dsllama-8b-apa.yaml dsqwen-14b-apa.yaml)
 APA_ANCHORS=(dsqwen-7b-apa-anchor.yaml dsllama-8b-apa-anchor.yaml dsqwen-14b-apa-anchor.yaml)
 
 SET_RUN_MODE="${SET_RUN_MODE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/set_run_mode.sh}"
+REDIS_DEPLOY="${REDIS_DEPLOY:-tre-v2-redis}"
+KUBECTL="${KUBECTL:-kubectl}"
+CONTROLLER_MODE_KEY="tre:v2:controller:mode"
+BL_OWNER_KEY="tre:v2:bl:owner"
 KEEP_RUN_MODE=0
 
 log() { echo "[toggle] $*"; }
@@ -48,12 +60,16 @@ set_run_mode() {
 }
 die() { echo "[toggle][ERROR] $*" >&2; exit 1; }
 
-tre_scaling_enabled() {
-  local v
-  v="$(kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" \
-        -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_TRE_SCALING")].value}' 2>/dev/null || true)"
-  [[ "$v" == "true" || "$v" == "True" || "$v" == "1" ]]
+rcli() { "$KUBECTL" -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw "$@"; }
+
+# Controller run mode; missing key = observe (the controller's own fail-closed reading).
+controller_mode() {
+  local v; v="$(rcli GET "$CONTROLLER_MODE_KEY" 2>/dev/null | tr -d '\r' || true)"
+  [[ "$v" == "active" ]] && echo active || echo observe
 }
+
+# Baseline shell owner lock holder ("" = no shell holds it).
+bl_owner() { rcli GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
 
 apa_cr_count() {
   kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai \
@@ -84,36 +100,34 @@ delete_apa_anchors() {
   done
 }
 
-set_tre_scaling() {
-  kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "ENABLE_TRE_SCALING=$1"
-  kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
-}
-
 cmd_tre() {
   log "switching to TRE"
   log "1/3 stopping APA baseline: deleting PodAutoscaler CRs"
   delete_apa_crs
-  local n; n="$(apa_cr_count)"
+  local n owner; n="$(apa_cr_count)"
   [[ "$n" -eq 0 ]] || die "APA still has $n PodAutoscaler CR(s); refusing to enable TRE (would double-drive scaling)"
-  log "2/3 verified 0 APA PodAutoscaler CRs; deleting APA scale anchors"
+  owner="$(bl_owner)"
+  [[ -z "$owner" ]] || die "a baseline shell holds $BL_OWNER_KEY ($owner); refusing to enable TRE (would double-drive scaling)"
+  log "2/3 verified 0 APA PodAutoscaler CRs and no baseline owner lock; deleting APA scale anchors"
   delete_apa_anchors
-  log "3/3 enabling TRE scaling + restarting controller"
-  set_tre_scaling true
+  log "3/3 restarting the controller"
   kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY"
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
   set_run_mode active active
-  log "done: TRE is the active decision source"
+  log "done: TRE is the active decision source (controller mode $(controller_mode))"
 }
 
 cmd_apa() {
   log "switching to APA (KVCache baseline)"
   # Controller observe first: the TRE controller stops acting before anything else
-  # changes. SM actuation active, as in the TRE arm.
+  # changes (it keeps computing and logging its decisions). SM actuation active, as in
+  # the TRE arm.
   set_run_mode observe active
-  log "1/3 stopping TRE: ENABLE_TRE_SCALING=false"
-  set_tre_scaling false
-  if tre_scaling_enabled; then die "TRE scaling still enabled after set env; refusing to apply APA (would double-drive scaling)"; fi
-  log "2/3 verified TRE scaling is off"
+  log "1/3 stopping TRE: controller run mode observe"
+  [[ "$(controller_mode)" == observe ]] || die "TRE controller mode is still active; refusing to apply APA (would double-drive scaling)"
+  local owner; owner="$(bl_owner)"
+  [[ -z "$owner" ]] || die "a baseline shell holds $BL_OWNER_KEY ($owner); refusing to apply APA (would double-drive scaling)"
+  log "2/3 verified the TRE controller observes and no baseline owner lock"
   log "3/3 applying APA scale anchors + PodAutoscaler CRs"
   apply_apa_anchors
   apply_apa_crs
@@ -121,19 +135,22 @@ cmd_apa() {
 }
 
 cmd_status() {
-  local tre="off" n
-  tre_scaling_enabled && tre="on"
+  local mode n owner sources=()
+  mode="$(controller_mode)"
   n="$(apa_cr_count)"
-  echo "TRE scaling (ENABLE_TRE_SCALING): $tre"
+  owner="$(bl_owner)"
+  echo "TRE controller mode:               $mode (observe = decisions recorded, no actuation)"
   echo "APA PodAutoscaler CRs live:        $n"
-  if [[ "$tre" == "on" && "$n" -eq 0 ]]; then
-    echo "active decision source: TRE"
-  elif [[ "$tre" == "off" && "$n" -gt 0 ]]; then
-    echo "active decision source: APA"
-  elif [[ "$tre" == "off" && "$n" -eq 0 ]]; then
-    echo "active decision source: NONE (both stopped)"
+  echo "baseline owner lock ($BL_OWNER_KEY): ${owner:-none}"
+  [[ "$mode" == active ]] && sources+=(TRE)
+  [[ "$n" -gt 0 ]] && sources+=(APA)
+  [[ -n "$owner" ]] && sources+=(BASELINE)
+  if [[ ${#sources[@]} -eq 0 ]]; then
+    echo "active decision source: NONE (TRE observes, no APA CR, no baseline shell)"
+  elif [[ ${#sources[@]} -eq 1 ]]; then
+    echo "active decision source: ${sources[0]}"
   else
-    echo "active decision source: CONFLICT (both TRE and APA are live -- run 'tre' or 'apa' to fix)"
+    echo "active decision source: CONFLICT (${sources[*]} are all live -- run 'tre' or 'apa' to fix)"
   fi
   bash "$SET_RUN_MODE" status || true
 }

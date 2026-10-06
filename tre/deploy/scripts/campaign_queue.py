@@ -567,7 +567,6 @@ class CampaignRunner:
 
     def configure_controller(self, config: ArmConfig) -> None:
         values = [
-            "ENABLE_TRE_SCALING=true",
             f"TRE_SIGNAL_SOURCE={config.signal_source}",
             f"TRE_DISABLE_ETA_GATE={'true' if config.disable_eta_gate else 'false'}",
         ]
@@ -769,7 +768,6 @@ class CampaignRunner:
             raise RuntimeError("registry params hash does not match manifest")
         env = self.controller_env()
         expected_env = {
-            "ENABLE_TRE_SCALING": "true",
             "TRE_SIGNAL_SOURCE": config.signal_source,
             "TRE_DISABLE_ETA_GATE": "true" if config.disable_eta_gate else "false",
         }

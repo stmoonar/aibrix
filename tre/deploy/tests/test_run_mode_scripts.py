@@ -41,10 +41,8 @@ for i in "${!args[@]}"; do
   fi
 done
 case "$*" in
-  *"jsonpath={.spec.template.spec.containers[0].env"*)
-    [[ -f "$FAKE_DIR/tre_scaling" ]] && cat "$FAKE_DIR/tre_scaling" ;;
-  *"set env"*ENABLE_TRE_SCALING=*)
-    echo "${*##*ENABLE_TRE_SCALING=}" > "$FAKE_DIR/tre_scaling" ;;
+  *"get podautoscalers"*)
+    [[ -f "$FAKE_DIR/apa_crs" ]] && cat "$FAKE_DIR/apa_crs" ;;
 esac
 exit 0
 """
@@ -101,8 +99,9 @@ def test_toggle_apa_sets_controller_observe_first_and_sm_active(fake):
     assert (kv(CTRL), kv(SM)) == ("observe", "active")
     log = calls()
     mset = next(i for i, line in enumerate(log) if " MSET " in line)
-    stop_tre = next(i for i, line in enumerate(log) if "ENABLE_TRE_SCALING=false" in line)
-    assert mset < stop_tre  # the controller stops acting before the source switch
+    apply_apa = next(i for i, line in enumerate(log) if " apply -f " in line)
+    assert mset < apply_apa  # the controller stops acting before the source switch
+    assert not any("set env" in line for line in log)  # run mode alone, no env switch
 
 
 def test_toggle_tre_sets_both_active_after_the_switch(fake):
@@ -113,6 +112,37 @@ def test_toggle_tre_sets_both_active_after_the_switch(fake):
     mset = next(i for i, line in enumerate(log) if " MSET " in line)
     restart = next(i for i, line in enumerate(log) if "rollout restart" in line)
     assert mset > restart
+
+
+def test_toggle_refuses_apa_while_the_controller_is_active_or_a_baseline_shell_owns(fake, tmp_path):
+    run, kv, calls = fake
+    run("set_run_mode.sh", "active", "active")
+    assert run("toggle_tre_apa.sh", "apa", "--keep-run-mode", check=False).returncode != 0
+    run("set_run_mode.sh", "observe", "active")
+    (tmp_path / "kv" / "tre:v2:bl:owner").write_text("scaler-pod:1:abcd\n", encoding="utf-8")
+    assert run("toggle_tre_apa.sh", "apa", "--keep-run-mode", check=False).returncode != 0
+    assert run("toggle_tre_apa.sh", "tre", "--keep-run-mode", check=False).returncode != 0
+    assert not any(" apply -f " in line for line in calls())
+
+
+@pytest.mark.parametrize(
+    "mode, crs, owner, source",
+    [
+        ("observe", "", "", "NONE"),
+        ("active", "", "", "TRE"),
+        ("observe", "podautoscaler/a\n", "", "APA"),
+        ("observe", "", "shell:1", "BASELINE"),
+        ("active", "", "shell:1", "CONFLICT"),
+    ],
+)
+def test_toggle_status_decision_source_is_run_mode_apa_crs_and_owner_lock(fake, tmp_path, mode, crs, owner, source):
+    run, _kv, _calls = fake
+    run("set_run_mode.sh", mode, "active")
+    (tmp_path / "apa_crs").write_text(crs, encoding="utf-8")
+    if owner:
+        (tmp_path / "kv" / "tre:v2:bl:owner").write_text(owner + "\n", encoding="utf-8")
+    out = run("toggle_tre_apa.sh", "status").stdout
+    assert f"active decision source: {source}" in out
 
 
 def test_toggle_keep_run_mode_leaves_both_keys_alone(fake):
