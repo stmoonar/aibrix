@@ -166,3 +166,41 @@ def test_audit_measures_hot_runs_depth_and_design_g(tmp_path):
     assert r["G_judged"] == pytest.approx(2.4 + 2 * 1.0, abs=1e-6) and r["R1_basis"] == "design"
     assert r["R5"] == "met" and r["R2"] == "FAIL"        # 100 s hot runs < 150 s
     assert r["models"]["dsqwen-14b"]["R2"] is None       # flat: no hot runs to judge
+
+
+def test_outputs_are_capped_by_the_route_timeout_rule_and_keep_their_mean(tmp_path):
+    """out_max = floor((0.8 * 150 s - TTFT_knee_p95) / TPOT_knee_p95): no output may be longer
+    (it would be cut by the route timeout even at knee speed), and the target mean still holds."""
+    from tre_replayer.tracegen.capacity import load_capacity, route_out_max
+    cap = load_capacity()
+    m = cap.models["dsqwen-7b"]
+    assert m.out_max == route_out_max(150.0, 0.8, m.knee_p95_ttft_s, m.knee_p95_tpot_s)
+    assert (m.out_max + 1) * m.knee_p95_tpot_s + m.knee_p95_ttft_s > 120.0 >= m.out_max * m.knee_p95_tpot_s + m.knee_p95_ttft_s
+    long_out = dict(LEN, out={"dist": "lognormal", "sigma": 0.86, "mean": 1300, "min": 1})
+    spec = {"trace": "unit", "duration_s": 300, "defaults": {"lengths": long_out}, "audit": {},
+            "models": {"dsqwen-7b": {"rate": {"unit": "rps", "fn": 20}}}}
+    man = generate.generate(_write(tmp_path, spec), 1, tmp_path / "run")
+    outs = [r["max_output_tokens"] for r in json.loads((tmp_path / "run/design.json").read_text())]
+    assert max(outs) <= m.out_max < max(outs) + 200          # the cap binds
+    assert sum(outs) / len(outs) == pytest.approx(1300, rel=0.03)
+    assert man["out_cap"]["out_max"]["dsqwen-7b"] == m.out_max
+    assert audit.audit_run(tmp_path / "run")["out_cap_ok"]
+
+
+def test_every_spec_can_be_replayed_by_name(tmp_path):
+    """The runner looks up $LOADGEN_CONFIG_ROOT/<trace>_s<k>/config.yaml: the committed configs
+    are what the generator writes now, every seed has its name, and the config loads."""
+    from pathlib import Path
+    from tre_loadgen_v1.config_manager import ConfigManager
+    from tre_replayer.tracegen.names import write_configs
+    here = Path(generate.__file__).resolve().parent
+    committed = here.parents[2] / "loadgen_v1" / "configs" / "traces_v2"
+    specs = sorted((here / "specs").glob("*.json"))
+    write_configs(specs, tmp_path)
+    for sp in specs:
+        spec = json.loads(sp.read_text())
+        t = spec["trace"]
+        assert (committed / t / "config.yaml").read_text() == (tmp_path / t / "config.yaml").read_text()
+        for k in spec["seeds"]:
+            cfg = ConfigManager(str(committed / f"{t}_s{k}" / "config.yaml")).load_config()
+            assert [m.name for m in cfg.models] == ["dsllama-8b", "dsqwen-7b", "dsqwen-14b"]

@@ -118,5 +118,10 @@
  "audit": {},
  "adjustments": [
   "R5: burst out mean 7b 1200 -> 1270 and 14b 1200 -> 1230 (design rho at out 1200 was 1.91 / 1.96 < 2.0; minimal out for 2.0 is 1264 / 1226 at in 492 and req/s fixed at rho_base 0.8)"
+ ],
+ "seeds": [
+  1,
+  2,
+  3
  ]
 }

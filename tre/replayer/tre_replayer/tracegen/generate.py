@@ -69,7 +69,9 @@ class ModelPlan:
         lspec = _merge(spec.get("defaults", {}).get("lengths", {}), mspec.get("lengths", {}))
         self.lengths = {}
         for side in ("in", "out"):
-            s = lspec[side]
+            s = dict(lspec[side])
+            if side == "out" and self.cap.out_max is not None:  # route-timeout cap (capacity.route_cap)
+                s["max"] = min(int(s["max"]), self.cap.out_max) if s.get("max") is not None else self.cap.out_max
             mean_fn = rates.build(s["mean"], duration_s=dur, rng=rng_for(seed, spec["trace"], name, f"{side}-mean"))
             self.lengths[side] = LengthModel(s, fits, mean_fn)
         r = mspec["rate"]
@@ -159,17 +161,23 @@ def _real_rows(spec: dict, seed: int, cap: Capacity, fits: dict, azure_csv: dict
         raise AssertionError("split probabilities exceed 1")
     rng = rng_for(seed, spec["trace"], "*", "split")
     out = []
+    capped = {m: 0 for m in real["rho"]}
     for t, i, o in rows_all:
         u = rng.random()
         acc = 0.0
         for m, p in probs:
             acc += p
             if u < acc:
+                cap_m = cap.models[m].out_max
+                if cap_m is not None and o > cap_m:  # route-timeout cap, per model
+                    o = cap_m
+                    capped[m] += 1
                 out.append((t, m, i, o))
                 break
     info = {"dataset": ds, "offset_s": offset, "windows": copies, "native_rate": rate0,
             "rows_used": len(rows_all), "target_lambda": lam, "split_p": dict(probs),
-            "clamp": {"in": [in_min, in_max], "out": [1, out_max]}}
+            "clamp": {"in": [in_min, in_max], "out": [1, out_max]},
+            "route_cap_clamped": capped}
     return out, info
 
 
@@ -267,6 +275,12 @@ def generate(spec_path: str | Path, seed: int, out_dir: str | Path, *, capacity_
         "spec_file": Path(spec_path).name, "spec_sha256": sha256_bytes(spec_bytes), "spec": spec,
         "capacity": cap.raw, "fits": {k: {kk: fits[k][kk] for kk in ("source", "in", "out", "arrivals")} for k in used_fits},
         "generation": info,
+        "out_cap": {"rule": (cap.raw.get("route_cap") or {}).get("rule"),
+                    "timeout_s": (cap.raw.get("route_cap") or {}).get("timeout_s"),
+                    "frac": (cap.raw.get("route_cap") or {}).get("frac"),
+                    "out_max": {m: c.out_max for m, c in cap.models.items()},
+                    "knee_p95": {m: {"ttft_s": c.knee_p95_ttft_s, "tpot_s": c.knee_p95_tpot_s}
+                                 for m, c in cap.models.items()}},
         "design": {"file": DESIGN_FILE, "sha256": sha256_bytes(plan), "requests": len(rows),
                    "per_model": summary(rows, float(spec["duration_s"]))},
         "client_contract": "replay the effective file with tre_loadgen_v1 --trace-file <effective> --ignore-eos: "

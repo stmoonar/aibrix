@@ -64,5 +64,10 @@
     "dsqwen-14b": "design: 14b amplitude halved (2 GPU per replica) to keep G constant; peak 1.45 = 2 replicas"
    }
   }
- }
+ },
+ "seeds": [
+  1,
+  2,
+  3
+ ]
 }

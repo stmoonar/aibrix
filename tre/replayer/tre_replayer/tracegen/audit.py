@@ -22,12 +22,15 @@ at the SLO margin = ``max(floor, ceil(rho / u))``, ``u`` = 0.85, capped at ``max
 * **R5** depth: the median design rho over a model's hot runs (= the plateau) is ``>= 2.0``.
 * Exemptions: ``audit.exempt`` {"R1a"|"R1b"|"R2"|"R3"|"R5": reason} or
   {"R5": {"<model>": reason}} - reported as "exempt", never as "met".
+* **Out cap**: no request's ``max_output_tokens`` above the model's route-timeout cap
+  (``capacity.route_cap``; ``out_cap_ok``).
 * **In flight** (Little's law at the knee): a request occupies its replica for
   ``W = ttft_knee + out * tpot_knee``. ``L(t)`` = requests in flight at knee speed. Per
   replica: static allocation (peak) = ``L / r``; lagged oracle (replicas follow the design
   rho delayed by ``audit.lag_s`` = 30 s, each model alone, pool ignored) adds a fluid backlog
   ``B += work - r`` and gives ``(L * min(1, r / rho) + B / cost) / r``; compared with the
-  ~420 open-file limit of the reissue sidecar on node10 (``audit.inflight_limit``). Also the
+  ~420 open-file limit the reissue sidecar had on node10 before its fd fix
+  (``audit.inflight_limit``; reported, no longer a design limit). Also the
   backlog wait ``B / r`` and the share of requests whose ``W`` alone exceeds the 150 s route
   timeout (``audit.route_timeout_s``).
 """
@@ -115,6 +118,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
         wsum = 0.0
         over_route = 0
         wmax = 0.0
+        omax = 0
         for r in rows:
             if r["model_name"] != m:
                 continue
@@ -124,6 +128,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
             k = min(ns - 1, int(t))
             counts[k] += 1
             work_s[k] += c
+            omax = max(omax, r["max_output_tokens"])
             w = mc.service_s(r["max_output_tokens"])
             wmax = max(wmax, w)
             over_route += w > a.get("route_timeout_s", ROUTE_TIMEOUT_S)
@@ -138,7 +143,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
             L.append(acc)
         mean_cost = wsum / n if n else 1.0
         per[m] = {"rho_bins": rho_bins, "counts": counts, "work_s": work_s, "L": L, "n": n,
-                  "mean_cost": mean_cost, "w_max_s": wmax, "over_route": over_route}
+                  "mean_cost": mean_cost, "w_max_s": wmax, "out_max_seen": omax, "over_route": over_route}
 
     # realised rho on 10 s and 30 s bins; design rho on a 1 s grid (synthetic plans) - real
     # slices have no design, their "design" is the realised 30 s series
@@ -249,6 +254,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
             "inflight_per_replica_static_max": max(p["L"]) / r_static if p["L"] else 0,
             "replicas_static": r_static,
             "inflight_per_replica_lag_max": worst_lag, "backlog_wait_max_s": worst_wait,
+            "out_max_seen": p["out_max_seen"], "out_cap": mc.out_max,
             "w_max_s": p["w_max_s"], "over_route_timeout_frac": p["over_route"] / p["n"] if p["n"] else 0.0,
         }
         r2 = None if not complete else all(x >= r2_min - ramp_slack for x in hot_s)
@@ -276,6 +282,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
     out["inflight_limit"] = limit
     out["inflight_lag_max"] = max(v["inflight_per_replica_lag_max"] for v in out["models"].values())
     out["inflight_ok"] = out["inflight_lag_max"] <= limit
+    out["out_cap_ok"] = all(v["out_cap"] is None or v["out_max_seen"] <= v["out_cap"] for v in out["models"].values())
     return out
 
 
@@ -288,8 +295,8 @@ def _f(x, d=2):
 
 
 def markdown(results: list[dict]) -> str:
-    lines = ["| trace | seed | dur s | req | mean ρ 8b/7b/14b | peak ρ 8b/7b/14b (design) | G judged (basis) | G realised 30 s max | static Σ | R1a / R1b | R2 (min hot s) | R3 (CV ratio) | R5 (hot ρ) | in-flight/replica lag 30 s (static) | W>150 s |",
-             "|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---:|"]
+    lines = ["| trace | seed | dur s | req | mean ρ 8b/7b/14b | peak ρ 8b/7b/14b (design) | G judged (basis) | G realised 30 s max | static Σ | R1a / R1b | R2 (min hot s) | R3 (CV ratio) | R5 (hot ρ) | in-flight/replica lag 30 s (static) | max out / cap | W>150 s |",
+             "|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|---:|"]
     for r in results:
         ms = [m for m in ORDER if m in r["models"]]
         g = lambda k, d=2: "/".join(_f(r["models"][m][k], d) for m in ms)
@@ -304,8 +311,9 @@ def markdown(results: list[dict]) -> str:
         if r["overload_windows_s"]:
             gx += f"; overload {r['G_max']:.2f}"
         st = f"{r['static_excl_overload']}" + (f" → {r['static']}" if r["static"] != r["static_excl_overload"] else "")
-        flag = "" if r["inflight_ok"] else f" **>{r['inflight_limit']}**"
+        flag = "" if r["inflight_ok"] else f" (>{r['inflight_limit']})"
+        oc = "/".join(f"{r['models'][m]['out_max_seen']}≤{r['models'][m]['out_cap']}" for m in ms) + ("" if r["out_cap_ok"] else " **FAIL**")
         lines.append(f"| {r['trace']} | {r['seed']} | {r['duration_s']:.0f} | {r['requests']} | {g('mean_rho')} | {g('peak_rho')} | "
                      f"{gx} | {r['G_realised_30s_max']:.2f} | {st} | {r['R1a']} / {r['R1b']} | {r['R2']} ({hot}) | {r['R3']} ({cvr}) | "
-                     f"{r['R5']} ({lvl}) | {inf} ({inf_s}){flag} | {wt * 100:.2f}% |")
+                     f"{r['R5']} ({lvl}) | {inf} ({inf_s}){flag} | {oc} | {wt * 100:.2f}% |")
     return "\n".join(lines) + "\n"

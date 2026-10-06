@@ -67,5 +67,12 @@
     "dsqwen-14b": "design: Δ14 = Δ7/2 keeps G constant (14b replica = 2 GPU); 14b hot 1.8 = 3 replicas, one 2-GPU step"
    }
   }
- }
+ },
+ "seeds": [
+  1,
+  2,
+  3,
+  4,
+  5
+ ]
 }

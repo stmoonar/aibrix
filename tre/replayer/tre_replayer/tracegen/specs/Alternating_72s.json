@@ -68,5 +68,10 @@
    },
    "R2": "sensitivity row: 72 s segments by design"
   }
- }
+ },
+ "seeds": [
+  1,
+  2,
+  3
+ ]
 }

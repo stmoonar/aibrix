@@ -1,13 +1,55 @@
 {
-  "name": "capacity_20261006",
-  "note": "Per-replica open-loop capacity of the current engine (vLLM 0.30 patched image, chat completions, ignore_eos), shape in 492 / out 400. v_b = open-loop knee (tok/s, in+out), v_p = prefill-only knee; v_d is derived (in/v_p + out/v_d = 892/v_b), see tracegen.capacity. knee_ttft_s / knee_tpot_s = mean TTFT / TPOT per request at the knee rate, linearly interpolated between the two open-loop steps around v_b/892 req/s; used only for the audit's in-flight (Little's law) and route-timeout estimates. Re-derive (and re-generate every trace) after any engine / theta change.",
-  "source": "baseline-params-20261006: profile-knee/profile.yaml (v_b 7b, v_p all; v_b 8b/14b from profile-openloop knee search as in trace-audit-20261007 sec. 2), profile-openloop/raw/*_i492_o400_r*.jsonl (TTFT/TPOT means)",
-  "pool_gpus": 8,
-  "u_target": 0.85,
-  "ref_shape": {"in": 492, "out": 400},
-  "models": {
-    "dsqwen-7b":  {"v_b": 9313.7, "v_p": 16819.9, "gpus": 1, "max_awake": 4, "floor": 1, "knee_ttft_s": 0.41, "knee_tpot_s": 0.035},
-    "dsllama-8b": {"v_b": 6929.6, "v_p": 16036.6, "gpus": 1, "max_awake": 4, "floor": 1, "knee_ttft_s": 0.343, "knee_tpot_s": 0.0365},
-    "dsqwen-14b": {"v_b": 6648.8, "v_p": 13394.8, "gpus": 2, "max_awake": 4, "floor": 1, "knee_ttft_s": 0.359, "knee_tpot_s": 0.0397}
+ "name": "capacity_20261006",
+ "note": "Per-replica open-loop capacity of the current engine (vLLM 0.30 patched image, chat completions, ignore_eos), shape in 492 / out 400. v_b = open-loop knee (tok/s, in+out), v_p = prefill-only knee; v_d is derived (in/v_p + out/v_d = 892/v_b), see tracegen.capacity. knee_ttft_s / knee_tpot_s = mean TTFT / TPOT per request at the knee rate, linearly interpolated between the two open-loop steps around v_b/892 req/s; used only for the audit's in-flight (Little's law) and route-timeout estimates. Re-derive (and re-generate every trace) after any engine / theta change.",
+ "source": "baseline-params-20261006: profile-knee/profile.yaml (v_b 7b, v_p all; v_b 8b/14b from profile-openloop knee search as in trace-audit-20261007 sec. 2), profile-openloop/raw/*_i492_o400_r*.jsonl (TTFT/TPOT means)",
+ "pool_gpus": 8,
+ "u_target": 0.85,
+ "ref_shape": {
+  "in": 492,
+  "out": 400
+ },
+ "models": {
+  "dsqwen-7b": {
+   "v_b": 9313.7,
+   "v_p": 16819.9,
+   "gpus": 1,
+   "max_awake": 4,
+   "floor": 1,
+   "knee_ttft_s": 0.41,
+   "knee_tpot_s": 0.035,
+   "knee_p95_ttft_s": 0.834175,
+   "knee_p95_tpot_s": 0.05454,
+   "knee_step": "profile-knee step 10.885 req/s (tok/s 9313.7 = v_b)"
+  },
+  "dsllama-8b": {
+   "v_b": 6929.6,
+   "v_p": 16036.6,
+   "gpus": 1,
+   "max_awake": 4,
+   "floor": 1,
+   "knee_ttft_s": 0.343,
+   "knee_tpot_s": 0.0365,
+   "knee_p95_ttft_s": 0.623515,
+   "knee_p95_tpot_s": 0.049163,
+   "knee_step": "profile-openloop step 8.14 req/s (tok/s 6929.6 = v_b)"
+  },
+  "dsqwen-14b": {
+   "v_b": 6648.8,
+   "v_p": 13394.8,
+   "gpus": 2,
+   "max_awake": 4,
+   "floor": 1,
+   "knee_ttft_s": 0.359,
+   "knee_tpot_s": 0.0397,
+   "knee_p95_ttft_s": 0.661689,
+   "knee_p95_tpot_s": 0.056348,
+   "knee_step": "profile-openloop step 7.8089 req/s (tok/s 6648.8 = v_b)"
   }
+ },
+ "route_cap": {
+  "timeout_s": 150.0,
+  "frac": 0.8,
+  "rule": "out_max[m] = floor((frac * timeout_s - knee_p95_ttft_s[m]) / knee_p95_tpot_s[m]): an output that long still finishes inside 80 % of the 150 s route timeout at the knee's p95 TTFT / TPOT; applied as the upper truncation of every output length (synthetic and real)",
+  "knee_step_rule": "the open-loop 492/400 step whose tok/s defines v_b; for 8b / 14b that step is in profile-openloop, because their profile-knee steps (8.88 / 8.52 req/s) were unbounded queues (TTFT p95 10.5 s / 3.4 s) and do not define v_b"
+ }
 }

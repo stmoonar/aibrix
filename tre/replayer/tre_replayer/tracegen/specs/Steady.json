@@ -63,5 +63,10 @@
   "exempt": {
    "R1b": "control: deliberately fits the pool (static 8)"
   }
- }
+ },
+ "seeds": [
+  1,
+  2,
+  3
+ ]
 }

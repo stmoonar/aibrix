@@ -4,7 +4,9 @@
 ``conv2023:in``). For a target mean ``m`` the location ``mu`` is solved so that the mean of
 the *truncated* distribution is ``m``; the upper truncation is the ``trunc_q`` quantile
 (default p99.5) of the untruncated lognormal with that same ``mu`` (so the cut moves with
-the mean), the lower one is ``min_tokens``. Draws are by inverse CDF in log space and
+the mean), lowered to ``max_tokens`` when that is smaller (the route-timeout cap,
+``capacity.route_out_max``; the mean is still the target, the tail is cut), the lower one
+is ``min_tokens``. Draws are by inverse CDF in log space and
 rounded to whole tokens. ``dist: fixed`` gives every request ``round(m)``.
 """
 from __future__ import annotations
@@ -57,14 +59,17 @@ def solve(mean: float, sigma: float, *, min_tokens: float = 1.0, trunc_q: float 
             hi = min(hi, max_tokens)
         return TruncLogNormal(mu, sigma, float(min_tokens), max(hi, float(min_tokens) + 1))
 
-    lo_mu, hi_mu = math.log(max(mean, 1.0)) - 4 * sigma - 2, math.log(max(mean, 1.0)) + 2
+    lo_mu, hi_mu = math.log(max(mean, 1.0)) - 4 * sigma - 2, math.log(max(mean, 1.0)) + 4 * sigma + 2
     for _ in range(100):
         mid = (lo_mu + hi_mu) / 2
         if make(mid).mean < mean:
             lo_mu = mid
         else:
             hi_mu = mid
-    return make((lo_mu + hi_mu) / 2)
+    d = make((lo_mu + hi_mu) / 2)
+    if abs(d.mean - mean) > max(0.5, 1e-3 * mean):
+        raise ValueError(f"no truncated lognormal (sigma {sigma}, max {max_tokens}) has mean {mean}")
+    return d
 
 
 class LengthModel:

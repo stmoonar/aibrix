@@ -28,6 +28,9 @@ class ModelCap:
     floor: int
     knee_ttft_s: float
     knee_tpot_s: float
+    knee_p95_ttft_s: float | None = None
+    knee_p95_tpot_s: float | None = None
+    out_max: int | None = None
 
     def cost(self, in_tokens: float, out_tokens: float) -> float:
         """Replica-seconds of one request at the knee."""
@@ -53,15 +56,26 @@ class Capacity:
         return min(m.max_awake, max(m.floor, math.ceil(rho / self.u_target - 1e-9)))
 
 
+def route_out_max(timeout_s: float, frac: float, ttft_s: float, tpot_s: float) -> int:
+    """Longest output that finishes within ``frac`` of the route timeout at the knee:
+    ``floor((frac * timeout_s - ttft_s) / tpot_s)``."""
+    return int(math.floor((frac * timeout_s - ttft_s) / tpot_s))
+
+
 def load_capacity(path: str | Path | None = None) -> Capacity:
     raw = json.loads(Path(path or DEFAULT_CAPACITY).read_text())
     ref_in, ref_out = int(raw["ref_shape"]["in"]), int(raw["ref_shape"]["out"])
     models = {}
+    rc = raw.get("route_cap")
     for name, m in raw["models"].items():
         v_d = ref_out / ((ref_in + ref_out) / m["v_b"] - ref_in / m["v_p"])
+        out_max = None
+        if rc and m.get("knee_p95_tpot_s"):
+            out_max = route_out_max(rc["timeout_s"], rc["frac"], m["knee_p95_ttft_s"], m["knee_p95_tpot_s"])
         models[name] = ModelCap(name, float(m["v_b"]), float(m["v_p"]), v_d, int(m["gpus"]),
                                 int(m["max_awake"]), int(m.get("floor", 1)),
-                                float(m["knee_ttft_s"]), float(m["knee_tpot_s"]))
+                                float(m["knee_ttft_s"]), float(m["knee_tpot_s"]),
+                                m.get("knee_p95_ttft_s"), m.get("knee_p95_tpot_s"), out_max)
     return Capacity(raw["name"], int(raw["pool_gpus"]), float(raw["u_target"]), ref_in, ref_out, models, raw)
 
 

@@ -25,5 +25,10 @@
   "exempt": {
    "R1b": "design: real slices are scaled to mean G 4.5 with p99 G <= 6.8 (design table: no static-sum target); static sum is reported, not judged"
   }
- }
+ },
+ "seeds": [
+  1,
+  2,
+  3
+ ]
 }

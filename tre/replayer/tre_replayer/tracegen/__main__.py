@@ -27,7 +27,7 @@ def main(argv=None) -> int:
 
     g = sub.add_parser("generate", help="spec + seed -> design.json + manifest.json")
     g.add_argument("--spec", required=True)
-    g.add_argument("--seed", type=int, action="append", required=True, help="repeatable")
+    g.add_argument("--seed", type=int, action="append", help="repeatable; default: the spec's seeds")
     g.add_argument("--out-root", required=True, help="writes <out-root>/<trace>/seed<k>/")
     g.add_argument("--capacity")
     g.add_argument("--fits")
@@ -49,7 +49,24 @@ def main(argv=None) -> int:
     a.add_argument("--json", help="write all results here")
     a.add_argument("--md", help="write the markdown table here")
 
+    c = sub.add_parser("loadgen-configs", help="<config root>/<trace>/config.yaml + <trace>_s<k> links")
+    c.add_argument("--spec", nargs="+", required=True)
+    c.add_argument("--config-root", required=True)
+    c.add_argument("--capacity")
+
+    n = sub.add_parser("link-names", help="<out root>/by-name/<trace>_s<k> -> ../<trace>/seed<k>")
+    n.add_argument("out_root")
+
     args = p.parse_args(argv)
+    if args.cmd == "loadgen-configs":
+        from .names import write_configs
+        for f in write_configs(args.spec, args.config_root, args.capacity):
+            print(f)
+        return 0
+    if args.cmd == "link-names":
+        from .names import link_names
+        print(len(link_names(args.out_root)), "links")
+        return 0
     if args.cmd == "fit":
         from . import azure
         out = Path(args.out)
@@ -62,7 +79,7 @@ def main(argv=None) -> int:
     if args.cmd == "generate":
         from .generate import generate
         spec = json.loads(Path(args.spec).read_text())
-        for seed in args.seed:
+        for seed in args.seed or spec["seeds"]:
             d = Path(args.out_root) / spec["trace"] / f"seed{seed}"
             man = generate(args.spec, seed, d, capacity_path=args.capacity, fits_path=args.fits,
                            azure_csv=_kv(args.azure_csv))

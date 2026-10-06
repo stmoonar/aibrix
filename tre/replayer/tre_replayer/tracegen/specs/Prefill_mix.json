@@ -246,5 +246,10 @@
  },
  "adjustments": [
   "R5: 7b decode-heavy out mean 1300 -> 1340 (design rho at 300/1300 was 1.95 < 2.0; minimal out for 2.0 is 1333)"
+ ],
+ "seeds": [
+  1,
+  2,
+  3
  ]
 }
