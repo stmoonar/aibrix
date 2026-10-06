@@ -93,9 +93,14 @@ decision); waiting for 2 grids is then a timer in disguise (pilot E1 drift1: 8b 
 context; **2026-10-07: no longer required**, see below). It then takes **free capacity only** - its sleeping bindings on free GPUs, free
 slot groups (no donor, no middle-zone SafeScale probe, no TP same-slot shrink, no defrag) -
 and **one replica per decision** (`max(1, breakpoint_partial_max_step)`: Z is the held
-window's old-regime value). An earlier C1 target that has landed (covered <= routable)
-does not block it; one that has not landed yet (covered > routable, or a fleet view older
-than the last action) holds it (`receiver_o1_exempt_pending`). Exempt receivers are planned
+window's old-regime value). An earlier C1 rescue target O1 has not settled yet (the C1
+basis of `_rescue_bases`, landed or not), or a fleet view older than the last action, holds
+it (`receiver_o1_exempt_pending`): one stale window buys one wake (2026-10-07; before, a
+landed target released it and the next step re-asked the target from the new count with
+the old window's Z, climbing to `max_awake`). LOW sleeping-capacity wakes carry no rescue
+target and do not block it. Only the O1 evidence holds are exempt (`no_complete_grid`,
+`no_suffix`, `evidence_grids`, `evidence_tokens`, `evidence_requests`); a held context
+(`tokens_missing`), `scrape_stale` and a hold fallback stay held. Exempt receivers are planned
 after warm TSS and saturation receivers. Everything else keeps O1: steps from donors, every
 scale-down, LOW receivers.
 
@@ -104,7 +109,7 @@ the pods present in both samples only; after a wake the old pods' waiting drains
 their running stays ~150/pod, so it could never hold after a wake and the receiver sat out
 the full 2 grids (~22 s) with free GPUs. At the hot-segment onset the window has no
 post-breakpoint sample (`no_complete_grid`), so it was None there too. A CRITICAL receiver
-on free capacity is now exempt whenever its previous step has landed. `o1_queue_rise` is
+on free capacity is now exempt whenever its previous step has settled. `o1_queue_rise` is
 still computed and logged (decision snapshot, the exempt event's `queue_rise=yes|no`); the
 paragraph below describes that measurement.
 
