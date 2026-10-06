@@ -149,8 +149,8 @@ spec:
             # re-probed on new evidence (registry safescale.rollback_retry_z_margin).
             # A rollback to an older image restores its backed-up Deployment (env included).
             # --- Ablation switches (D4); production defaults ---
-            - name: ENABLE_TRE_SCALING
-              value: "true"
+            # (The scaling on/off env switch was removed 2026-10-07: actuation follows the
+            # run mode tre:v2:controller:mode only.)
             - name: TRE_ABLATION_DISABLE_FAST_LOOP
               value: "false"
             - name: TRE_ABLATION_DISABLE_SAFESCALE

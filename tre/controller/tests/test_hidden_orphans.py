@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from types import SimpleNamespace
 
 from tre_common import rediskeys
-from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 
@@ -135,24 +133,3 @@ def test_config_exposes_orphan_scan_knobs():
     )
     assert configured.orphan_scan_enabled is False
     assert configured.orphan_grace_s == 42.0
-
-
-def test_orphan_task_runs_even_when_scaling_is_disabled():
-    class FakeDetector:
-        async def run(self):
-            return None
-
-    deps = SimpleNamespace(
-        store=object(),
-        snapshot_box=object(),
-        profiler=None,
-        hidden_orphan_detector=FakeDetector(),
-    )
-    cfg = SimpleNamespace(
-        enable_tre_scaling=False,
-        orphan_scan_enabled=True,
-    )
-
-    specs = build_controller_task_specs(deps, cfg)
-
-    assert tuple(spec.name for spec in specs) == ("metrics", "hidden_orphans")

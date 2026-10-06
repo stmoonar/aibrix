@@ -99,8 +99,9 @@ def build_controller_task_specs(
         and deps.hidden_orphan_detector is not None
     ):
         specs.append(ControllerTaskSpec("hidden_orphans", deps.hidden_orphan_detector.run))
-    if not bool(getattr(cfg, "enable_tre_scaling", True)):
-        return tuple(specs)
+    # 2026-10-07: no ENABLE_TRE_SCALING early return any more - the decision tasks
+    # (cluster view, rescue, fairness, SafeScale, queue) always run; whether they act is
+    # the run mode's business alone (observe: compute and record, never actuate).
 
     specs.append(
         ControllerTaskSpec(
