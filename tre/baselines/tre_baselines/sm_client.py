@@ -24,7 +24,13 @@ Contract (service manager on main, ``tre_sm/api/v2.py``):
   place every wake (``unfilled``, ``refusals``); :meth:`SMResult.as_dict` logs those keys.
 
 The dispatcher gives every model one worker thread and at most one SM call in flight;
-the tick never waits for the SM. Right before each call the worker asks the dispatcher's
+the tick never waits for the SM. A scale-up from ``awake`` to ``target`` goes out one
+replica at a time (``awake+1``, ``awake+2``, ... each a grow-only call) and stops at the
+first refusal: the SM refuses a whole target when any wake it needs is blocked
+(``tre_sm/api/v2.py`` ``_plan_target``), so one call for several replicas would leave a GPU
+that is free right now unused while another is still held. The answer reports how far it
+got (``Completed.reached``; ``partial_fill`` = some granted, then refused). This is a
+substrate adaptation for the baseline arms; the SM is unchanged. Right before each call the worker asks the dispatcher's
 ``guard`` (set by the shell: still the owner-lock holder, controller still in observe);
 when the answer is a reason, the call is dropped (``SMResult.error = "dropped"``,
 ``reason`` = why) and never reaches the SM. :class:`Backoff` spaces out retries after
@@ -256,14 +262,38 @@ class Completed:
     direction: str
     target: int
     body: Mapping[str, Any]
+    #: The answer to the last call made (a refusal when the steps stopped early).
     result: SMResult
     submitted_seq: int
+    #: Awake count the scale-up started from (None: one call for ``target``).
+    start: Optional[int] = None
+    #: Highest target the SM granted (None: no call granted).
+    reached: Optional[int] = None
+    #: SM calls made for this job (a dropped step is not a call).
+    steps: int = 1
+
+    @property
+    def progressed(self) -> bool:
+        """At least one replica was added (the SM state changed because of us)."""
+        return self.reached is not None and (self.start is None or self.reached > self.start)
+
+    @property
+    def partial_fill(self) -> bool:
+        """A stepped scale-up that got some replicas, then was refused or dropped."""
+        return (not self.result.ok) and self.start is not None and self.progressed
+
+    def as_dict(self) -> dict[str, Any]:
+        out = {"direction": self.direction, "target": self.target, **self.result.as_dict()}
+        if self.start is not None:
+            out.update(start=self.start, reached=self.reached, steps=self.steps,
+                       partial_fill=self.partial_fill)
+        return out
 
 
 @dataclass
 class _Worker:
     thread: threading.Thread
-    jobs: "queue.Queue[Optional[tuple[int, str, int, dict]]]"
+    jobs: "queue.Queue[Optional[tuple[int, str, int, Optional[int]]]]"
 
 
 class Dispatcher:
@@ -303,8 +333,13 @@ class Dispatcher:
         with self._lock:
             return sorted(m for m, (direction, _t) in self._inflight.items() if direction == "down")
 
-    def submit(self, model: str, direction: str, target: int) -> bool:
-        body = target_body(direction, target, abort_sleep_path=self._abort_sleep_path)
+    def submit(self, model: str, direction: str, target: int, start: Optional[int] = None) -> bool:
+        """Queue one scale action. ``start`` (scale-up only) = the awake count the decision
+        saw: the worker then asks for ``start+1``, ``start+2``, ... ``target`` one call at a
+        time and stops at the first refusal. Without it, one call for ``target``."""
+        target_body(direction, target, abort_sleep_path=self._abort_sleep_path)  # validates
+        if direction != "up" or start is None or int(start) >= int(target):
+            start = None
         with self._lock:
             if self._closed:
                 raise RuntimeError("dispatcher is closed")
@@ -323,34 +358,66 @@ class Dispatcher:
                 worker = _Worker(thread=thread, jobs=jobs)
                 self._workers[model] = worker
                 thread.start()
-        worker.jobs.put((seq, direction, int(target), body))
+        worker.jobs.put((seq, direction, int(target), None if start is None else int(start)))
         return True
 
-    def _run(self, model: str, jobs: "queue.Queue[Optional[tuple[int, str, int, dict]]]") -> None:
+    def _check_guard(self, model: str, direction: str, target: int) -> Optional[str]:
+        try:
+            why = self.guard() if self.guard is not None else None
+        except Exception as exc:  # cannot tell whether we may act: do not act
+            why = f"guard_failed: {exc!r}"[:200]
+        if why:
+            LOG.warning("SM call %s %s->%s dropped: %s", model, direction, target, why)
+        return why or None
+
+    def _call(self, model: str, body: dict) -> SMResult:
+        try:
+            return self._put(model, body)
+        except Exception as exc:  # the client should not raise; never lose the flag
+            LOG.exception("SM call for %s raised", model)
+            return SMResult(ok=False, error="exception", detail=repr(exc)[:2000])
+
+    def _run(self, model: str, jobs: "queue.Queue[Optional[tuple[int, str, int, Optional[int]]]]") -> None:
         while True:
             job = jobs.get()
             if job is None:
                 return
-            seq, direction, target, body = job
+            seq, direction, target, start = job
             try:
-                why = self.guard() if self.guard is not None else None
-            except Exception as exc:  # cannot tell whether we may act: do not act
-                why = f"guard_failed: {exc!r}"[:200]
-            if why:
-                LOG.warning("SM call %s %s->%s dropped: %s", model, direction, target, why)
-                result = SMResult(ok=False, error=DROPPED, reason=str(why))
-                self._results.put(Completed(model, direction, target, body, result, seq))
-                with self._lock:
-                    self._inflight.pop(model, None)
-                continue
-            try:
-                result = self._put(model, body)
-            except Exception as exc:  # the client should not raise; never lose the flag
-                LOG.exception("SM call for %s raised", model)
-                result = SMResult(ok=False, error="exception", detail=repr(exc)[:2000])
-            self._results.put(Completed(model, direction, target, body, result, seq))
+                done = self._execute(model, seq, direction, target, start)
+            except Exception as exc:  # never lose the in-flight flag
+                LOG.exception("SM job for %s failed", model)
+                body = target_body(direction, target, abort_sleep_path=self._abort_sleep_path)
+                done = Completed(model, direction, target, body,
+                                 SMResult(ok=False, error="exception", detail=repr(exc)[:2000]), seq,
+                                 start=start)
+            self._results.put(done)
             with self._lock:
                 self._inflight.pop(model, None)
+
+    def _execute(self, model: str, seq: int, direction: str, target: int, start: Optional[int]) -> Completed:
+        steps = [target] if start is None else list(range(start + 1, target + 1))
+        reached: Optional[int] = None
+        calls = 0
+        body = target_body(direction, steps[0], abort_sleep_path=self._abort_sleep_path)
+        result = SMResult(ok=False, error=DROPPED, reason="no_step")
+        for step in steps:
+            # Owner lock and controller mode are checked again before every call.
+            why = self._check_guard(model, direction, step)
+            if why:
+                result = SMResult(ok=False, error=DROPPED, reason=str(why))
+                break
+            body = target_body(direction, step, abort_sleep_path=self._abort_sleep_path)
+            result = self._call(model, body)
+            calls += 1
+            if not result.ok:
+                if reached is not None:
+                    LOG.info("SM partial fill %s: %s of %s->%s, then %s", model, reached, start, target,
+                             result.as_dict())
+                break
+            reached = step
+        return Completed(model, direction, target, body, result, seq, start=start,
+                         reached=reached, steps=calls)
 
     def drain_results(self) -> list[Completed]:
         out: list[Completed] = []

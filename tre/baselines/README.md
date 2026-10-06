@@ -66,7 +66,12 @@ curl -s localhost:8080/healthz ; curl -s localhost:8080/livez ; curl -s localhos
 `guard_controller_active` instead of calling the SM (metric `tre_bl_controller_guard`);
 the SM worker checks both again right before each call. After an SM refusal a model backs
 off (`max(retry_after_s, tick)`, doubling, capped at `TRE_BL_BACKOFF_MAX_S` = 10 s; action
-`backoff`); a refusal is retried at once when the SM state version changes. Remaining
+`backoff`); a refusal is retried at once when the SM state changes (store version or the
+wakeable GPU set in `/v2/state` `gpus[]`). A scale-up is sent one replica at a time
+(`awake+1`, `awake+2`, ... each grow-only) and stops at the first 409, because the SM
+refuses a whole multi-replica target when one wake is blocked; granted-then-refused is
+`sm_result.partial_fill` (metric `tre_bl_partial_fills_total`) and is asked again next
+tick. Remaining
 timers and what they guard: the owner-lock TTL (mutual exclusion after a crash), the SM
 call timeout and the backoff cap (liveness: retries whose cause `/v2/state` does not
 show), `/livez` stall (k8s probe); the policy windows (TokenScale `window_s`, PreServe

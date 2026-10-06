@@ -115,6 +115,20 @@ def test_dispatcher_one_inflight_per_model() -> None:
     d.close(join_s=1.0)
 
 
+def test_stepped_scale_up_checks_the_guard_before_every_step() -> None:
+    """Bug #4 per step: losing the owner lock between two steps drops the rest."""
+    cluster = FakeCluster(awake={"a": 1})
+    answers = iter([None, "owner_lost"])
+    d = Dispatcher(cluster.put_target, guard=lambda: next(answers))
+    assert d.submit("a", "up", 4, start=1)
+    assert wait_until(lambda: d.inflight_count() == 0)
+    (done,) = d.drain_results()
+    assert [b["wake_replicas"] for _, b in cluster.calls] == [2] and cluster.awake["a"] == 2
+    assert done.result.error == "dropped" and done.result.reason == "owner_lost"
+    assert (done.reached, done.steps, done.partial_fill) == (2, 1, True)
+    d.close(join_s=1.0)
+
+
 def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
     """An SM call slower than two ticks: later ticks log inflight_skip, send nothing, and
     return immediately; the result shows up on the first tick after it completed."""
@@ -124,7 +138,7 @@ def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
         redis = FakeRedis()
         client = SMClient(sm.url, timeout_s=5.0)
         dispatcher = Dispatcher(client.put_target)
-        policy = ScriptedPolicy({t: {"a": 3} for t in range(10)})
+        policy = ScriptedPolicy({t: {"a": 2} for t in range(10)})   # one step (awake 1)
         shell = BaselineShell(config, FakeSource(config, cluster, redis), policy, dispatcher, redis)
         actions = []
         for _ in range(3):
@@ -136,7 +150,7 @@ def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
         assert len(sm.requests) == 1
         assert wait_until(lambda: dispatcher.inflight_count() == 0)
         line = shell.tick_once()[0]
-        assert line["sm_result"]["ok"] is True and line["sm_result"]["target"] == 3
+        assert line["sm_result"]["ok"] is True and line["sm_result"]["target"] == 2
         # FakeCluster was not told about the stub's success, so the policy asks again.
         assert line["action"] == "up"
         assert wait_until(lambda: dispatcher.inflight_count() == 0)

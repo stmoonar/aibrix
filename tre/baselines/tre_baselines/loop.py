@@ -34,8 +34,16 @@
   tick_s)``, doubling, capped at ``TRE_BL_BACKOFF_MAX_S``, default 10 s); while it waits its
   line says ``backoff`` and no call is sent. A success, the desired count back at awake, or
   - for a refusal (an HTTP answer, not a transport error) - any change of the SM state
-  version (``/v2/state`` ``version``) resets it: the state that caused the refusal is gone.
-  The remaining wait only bounds retries whose cause the state does not show.
+  resets it: the store ``version`` of ``/v2/state`` or the set of wakeable GPUs in its
+  ``gpus[]`` (a lease, a journaled wake or a gpu-truth sample can block a wake without
+  bumping the version). The state that caused the refusal is gone. The remaining wait only
+  bounds retries whose cause the state does not show.
+* Scale-ups are stepped (:class:`~tre_baselines.sm_client.Dispatcher`): ``awake+1``,
+  ``awake+2``, ... until the target or the first refusal, because the SM refuses a whole
+  multi-replica target when one wake is blocked. Some replicas granted, then refused =
+  ``partial_fill`` (``sm_result.partial_fill``, ``reached``; metric
+  ``tre_bl_partial_fills_total``); it counts as progress (no backoff), so the next tick
+  asks again from the new awake count.
 * One JSONL line per model per tick (``policy`` = the ``TRE_BL_POLICY`` key, ``arm`` = the
   adapted arm's name, e.g. ``PreServe-oracle``) to
   ``$TRE_BL_LOG_DIR/decisions-<policy>-<YYYYMMDD>.jsonl``
@@ -161,6 +169,8 @@ class ShellStats:
     controller_guard: bool = False
     guard_ticks: int = 0
     backoff_skips: int = 0
+    #: Stepped scale-ups that got some replicas, then a refusal (per model).
+    partial_fills: dict[str, int] = field(default_factory=dict)
     #: arr events per model whose request does not stream (expected 0: PreServe's map
     #: needs ft, which a non-streaming request only gets at the end).
     nonstream_arrivals: dict[str, int] = field(default_factory=dict)
@@ -284,7 +294,7 @@ class BaselineShell:
         snap = self.source.gather(self._tick)
         # After the gather: a tick whose gather raises leaves the results for the next one.
         results = self._collect_results()
-        version = (snap.extra or {}).get("sm_state_version")
+        version = self._state_key(snap.extra or {})
         if version is not None and version != self._sm_version:
             if self._sm_version is not None:  # the SM state changed: retry refused models now
                 for model in self._refused:
@@ -292,7 +302,10 @@ class BaselineShell:
                 self._refused.clear()
             self._sm_version = version
         for model, done in results.items():
-            if done.result.ok:
+            if done.partial_fill:
+                with self._stats_lock:
+                    self.stats.partial_fills[model] = self.stats.partial_fills.get(model, 0) + 1
+            if done.result.ok or done.progressed:  # a partial fill is progress: ask again next tick
                 self.backoff.reset(model)
                 self._refused.discard(model)
             elif done.result.error != DROPPED:  # a dropped call never reached the SM
@@ -335,6 +348,7 @@ class BaselineShell:
         lines: list[dict] = []
         for item in planned:
             model, direction = item["model"], item["direction"]
+            ms = snap.models[model]
             wait_s = None
             donors: list[str] = []
             if direction == "none":
@@ -350,7 +364,8 @@ class BaselineShell:
                 action = "wait_donor"  # the GPU it needs is released when that call returns
             elif (wait_s := self.backoff.remaining_s(model, snap.now_ms)) is not None:
                 action = "backoff"
-            elif self.dispatcher.submit(model, direction, item["clamped"]):
+            elif self.dispatcher.submit(model, direction, item["clamped"],
+                                        start=ms.awake if direction == "up" else None):
                 action = direction
                 self._note_dispatch(model, direction, snap.now_ms)
             else:
@@ -375,9 +390,7 @@ class BaselineShell:
                 line["backoff_delay_s"] = self.backoff.delay_s(model)
             done = results.get(model)
             if done is not None:
-                line["sm_result"] = {
-                    "direction": done.direction, "target": done.target, **done.result.as_dict()
-                }
+                line["sm_result"] = done.as_dict()
             lines.append(line)
             with self._stats_lock:
                 key = (model, action)
@@ -402,6 +415,17 @@ class BaselineShell:
             self.stats.scrape_failures += int(extra.get("scrape_failed") or 0)
         self._tick += 1
         return lines
+
+    @staticmethod
+    def _state_key(extra: Mapping[str, Any]) -> Any:
+        """What a refusal backoff is cleared on: the SM store version plus, when the source
+        reports it, the wakeable GPU set (leases / journal / gpu-truth do not bump the
+        version)."""
+        version = extra.get("sm_state_version")
+        gpus = extra.get("sm_wakeable_gpus")
+        if gpus is None:
+            return version
+        return (version, tuple(gpus))
 
     @staticmethod
     def _needs_donor(ms: Any, target: int) -> bool:
@@ -560,6 +584,9 @@ class BaselineShell:
             lines.append("# TYPE tre_bl_direction_reversals_60s_total counter")
             for model, count in sorted(s.reversals.items()):
                 lines.append(f'tre_bl_direction_reversals_60s_total{{policy="{policy}",model="{model}"}} {count}')
+            lines.append("# TYPE tre_bl_partial_fills_total counter")
+            for model, count in sorted(s.partial_fills.items()):
+                lines.append(f'tre_bl_partial_fills_total{{policy="{policy}",model="{model}"}} {count}')
             lines.append("# TYPE tre_bl_arrivals_total counter")
             for model, count in sorted(s.arrivals.items()):
                 lines.append(f'tre_bl_arrivals_total{{policy="{policy}",model="{model}"}} {count}')
