@@ -84,6 +84,40 @@ current-window evidence only (I4): the tick sets it from this tick's serving win
 tokens known and every serving pod scraped; a held context (`tokens_missing`), a
 scrape-stale context and a tokens-missing window never carry it, so those stay held.
 
+**CRITICAL receivers on free capacity (H3, 2026-10-06)**: the receiver hold is narrowed to
+what it guards against - an over-scale decided on a window that still describes the old
+regime. On a free GPU such an over-scale costs one wake (slept again by a later donor
+decision); waiting for 2 grids is then a timer in disguise (pilot E1 drift1: 8b held +36 ->
++68 s at Z ~ 0.3, KV 1.0, free GPUs). A CRITICAL receiver whose `signal_warm` is false is
+**not held** when its queue rose since the breakpoint (`o1_queue_rise` in the tick
+context). It then takes **free capacity only** - its sleeping bindings on free GPUs, free
+slot groups (no donor, no middle-zone SafeScale probe, no TP same-slot shrink, no defrag) -
+and **one replica per decision** (`max(1, breakpoint_partial_max_step)`: Z is the held
+window's old-regime value). An earlier C1 target that has landed (covered <= routable)
+does not block it. Exempt receivers are planned after warm TSS and saturation receivers.
+Everything else keeps O1: steps from donors, every scale-down, LOW receivers, a flat queue.
+
+*Queue rising* (state only, no timer): every O1-tracked read records the model's queue
+sample - the routable pods' (serving window minus hidden probe pods) newest gateway instant
+samples of the window's last grid: `q = sum(running) + lambda_wait * sum(waiting)` (the TSS
+queue term on instant values, no qmin) and `waiting`, stamped with the newest pod stamp;
+the last 8 stamps are kept. On a held window the current sample takes only pods stamped
+**after** the breakpoint; it rises when `q` or `waiting` is strictly higher than the newest
+recorded sample stamped **at or before** the breakpoint. No post-breakpoint sample (the
+window predates the change), no baseline (restart, history gone) or not higher: held. A
+held context (tokens missing) never carries the evidence. The gauges do not wait for
+completions, so the first post-breakpoint sample is evidence the token window cannot give
+for another 1-2 grids. Onset breakpoints count too (idle -> hot: the onset window's sample
+is the baseline, the next window's the evidence; the saturation rescue is unchanged and
+takes precedence). Known false positive: right after a scale-up the new pods' running
+count grows to its steady level, so `q` can rise while the fleet already copes; the cost
+is one wake on a free GPU, bounded by the one-step cap and `max_awake_replicas`.
+
+Events: `receiver_o1_exempt_free_gpu:<model>:<hold reason>:planned=<n>:bp=<ms>:q=<base>-><now>:waiting=<base>-><now>:sample_ms=<base>-><now>`
+when the exemption planned a step; otherwise (no free capacity, nothing needed, no rescue
+this tick) the usual `receiver_held_breakpoint_window:<model>:<reason>`. Decision snapshot
+`model_states.<model>.o1_queue_rise` (when present).
+
 **C1 settle**: a rescue target counts as reflected once the model is warm and its
 settle breakpoint (`signal_settle_ms`: the onset, or a count change seen between two
 views of this process - not a first-observation date, review P2-a: after a restart the
