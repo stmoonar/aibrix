@@ -147,3 +147,14 @@ def test_tick_measures_the_queue_rise_from_samples_after_the_breakpoint():
     assert flat.model_contexts["m"]["o1_queue_rise"] is None
     assert not [a for a in flat.actions if isinstance(a, ScaleAction)]
     assert "receiver_held_breakpoint_window:m:no_complete_grid" in flat.events
+
+
+def test_queue_rise_counts_only_pods_of_both_samples_and_ignores_jitter():
+    """Review P1-1: the woken pod's running requests are no rise while the old pod's
+    waiting fell; a flat queue that jitters by one request is no rise either."""
+    woke = _after_scale_up({"m-0": (30.0, 15.0), "m-1": (40.0, 0.0)})
+    assert woke.model_contexts["m"]["o1_queue_rise"] is None
+    assert not [a for a in woke.actions if isinstance(a, ScaleAction)]
+
+    noisy = _after_scale_up({"m-0": (31.0, 21.0), "m-1": (0.0, 0.0)})
+    assert noisy.model_contexts["m"]["o1_queue_rise"] is None

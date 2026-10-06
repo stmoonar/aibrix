@@ -1364,15 +1364,21 @@ def _queue_sample(
     metrics: ModelWindowMetrics, hidden_pods, fresh_after_ms: int, lambda_wait: float
 ) -> QueueSample | None:
     """H3: the routable pods' (serving window minus hidden probe pods) newest instant
-    samples stamped after ``fresh_after_ms``, as one :class:`QueueSample`."""
+    samples stamped after ``fresh_after_ms``, as one :class:`QueueSample` (with the
+    per-pod values: a rise is measured on the pods of both samples, review P1-1)."""
     sample = saturation_sample(metrics, hidden_pods=hidden_pods, fresh_after_ms=fresh_after_ms)
     if sample is None:
         return None
+    lam = float(lambda_wait)
     return QueueSample(
         sample_ms=int(sample.sample_ms),
-        q=float(sample.running) + float(lambda_wait) * float(sample.waiting),
+        q=float(sample.running) + lam * float(sample.waiting),
         waiting=float(sample.waiting),
         pods=int(sample.pods),
+        per_pod=tuple(
+            (str(pod.pod), float(pod.running) + lam * float(pod.waiting), float(pod.waiting))
+            for pod in sample.per_pod
+        ),
     )
 
 

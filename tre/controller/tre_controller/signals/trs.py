@@ -82,12 +82,21 @@ class QueueSample:
     """A model's engine queue from its routable pods' newest gateway instant samples
     (H3, 2026-10-06): ``q`` = sum of running + lambda_wait * waiting (the TSS queue term
     on instant values, no qmin), ``waiting`` = sum of ``num_requests_waiting``,
-    ``sample_ms`` = the newest pod stamp (gateway grid boundary, at or before the scrape)."""
+    ``sample_ms`` = the newest pod stamp (gateway grid boundary, at or before the scrape).
+    ``per_pod`` = (pod, q, waiting) of each sampled pod: a rise is measured on the pods
+    of both samples only (review P1-1)."""
 
     sample_ms: int
     q: float
     waiting: float
     pods: int
+    per_pod: tuple[tuple[str, float, float], ...] = ()
+
+
+#: H3 review P1-1: ``waiting`` must exceed the baseline by max(this, ratio * baseline)
+#: to count as rising (a flat queue jitters by a request or two between samples).
+QUEUE_RISE_MIN_ABS = 1.0
+QUEUE_RISE_MIN_RATIO = 0.1
 
 
 #: H3: queue samples kept per model (one per distinct stamp, ~10 s apart). A baseline
@@ -639,10 +648,13 @@ class SignalState:
     ) -> dict[str, Any] | None:
         """H3 "queue rising since the breakpoint": ``current`` - a sample of every
         included pod taken after ``breakpoint_ms`` (stamp > breakpoint) - shows more
-        queue than the baseline, the newest recorded sample stamped at or before the
-        breakpoint: ``q`` higher or ``waiting`` higher (strictly). No baseline (history
-        too short, after a restart), no post-breakpoint sample, or not higher -> None.
-        State only: the samples the window reads already carry, no timer."""
+        waiting requests than the baseline, the newest recorded sample stamped at or
+        before the breakpoint. Review P1-1: compared on the pods present in both samples
+        only (a pod woken at the breakpoint adds running requests, not a rise; a pod gone
+        removes its queue, not a fall), and on ``waiting`` with a margin: rising iff
+        waiting_now > waiting_base + max(1, 0.1 * waiting_base). No baseline (history
+        too short, after a restart), no post-breakpoint sample, no common pod, or not
+        higher -> None. State only: the samples the window reads already carry, no timer."""
         if current is None or breakpoint_ms is None or int(current.sample_ms) <= int(breakpoint_ms):
             return None
         base = None
@@ -651,18 +663,26 @@ class SignalState:
                 base = sample
         if base is None:
             return None
-        if not (current.q > base.q or current.waiting > base.waiting):
+        base_pods = {pod: (q, waiting) for pod, q, waiting in base.per_pod}
+        now_pods = {pod: (q, waiting) for pod, q, waiting in current.per_pod}
+        common = sorted(set(base_pods) & set(now_pods))
+        if not common:
+            return None
+        base_waiting = sum(base_pods[pod][1] for pod in common)
+        waiting = sum(now_pods[pod][1] for pod in common)
+        if waiting <= base_waiting + max(QUEUE_RISE_MIN_ABS, QUEUE_RISE_MIN_RATIO * base_waiting):
             return None
         return {
             "breakpoint_ms": int(breakpoint_ms),
             "base_ms": base.sample_ms,
-            "base_q": base.q,
-            "base_waiting": base.waiting,
+            "base_q": sum(base_pods[pod][0] for pod in common),
+            "base_waiting": base_waiting,
             "base_pods": base.pods,
             "sample_ms": int(current.sample_ms),
-            "q": current.q,
-            "waiting": current.waiting,
+            "q": sum(now_pods[pod][0] for pod in common),
+            "waiting": waiting,
             "pods": current.pods,
+            "common_pods": len(common),
         }
 
     def breakpoint_ms(self, model: str) -> int | None:
