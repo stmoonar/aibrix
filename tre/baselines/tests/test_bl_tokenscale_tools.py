@@ -262,3 +262,90 @@ def test_profile_records_the_registry_and_c_b_used(tmp_path):
     doc = yaml.safe_load((out / "profile.yaml").read_text(encoding="utf-8"))
     assert doc["registry"] == "file:r.yaml"
     assert doc["slo"]["a"]["ttft_idle_c_ms"] == 41.1 and doc["slo"]["a"]["ttft_idle_b_ms_per_token"] == 0.0694
+
+
+# ------------------------------------------------------------------ open loop (PreServe mu)
+
+
+def test_open_loop_measure_sends_poisson_chat_and_reads_engine_counters(tmp_path, monkeypatch):
+    """--open-loop: the calibration open-loop sender against a fake vLLM; rates from the
+    engine counters of the measured window, latencies of the requests sent in it."""
+    from tre_replayer.engine import http_sender
+
+    monkeypatch.setattr(http_sender, "build_prompt", lambda n, key, *a, **k: f"prompt {key}")
+    fake = _FakeVllm()
+    try:
+        measure = tp.make_openloop_measure(fake.url, lambda m: [fake.metrics], raw_dir=tmp_path / "raw",
+                                           sender_processes=1, prompt_dir_enabled=False, sample_s=0.1,
+                                           drain_poll_s=0.05)
+        step = measure("dsqwen-7b", 128, 4, 40.0, 1.5, 0.3)
+    finally:
+        fake.close()
+    assert len(fake.bodies) >= 20, "the Poisson schedule was not sent"
+    prompts = [b["messages"][0]["content"] for b in fake.bodies]
+    assert len(set(prompts)) == len(prompts)                     # distinct prompts
+    for body in fake.bodies:
+        assert body["model"] == "dsqwen-7b" and body["ignore_eos"] is True and body["temperature"] == 0
+        assert body["max_tokens"] == 4 and body["stream"] is True
+    assert step.valid and step.rate_rps == 40.0 and step.arrived > 0 and step.failed == 0
+    assert step.completed == step.arrived < len(fake.bodies)      # only the steady-state window
+    assert step.achieved_rps == pytest.approx(step.arrived / 1.2, rel=1e-3)
+    assert step.prefill_tok_s > 0 and step.decode_tok_s == pytest.approx(step.prefill_tok_s * 4 / 120, rel=0.35)
+    assert step.ttft_p95_ms is not None and step.tpot_p95_ms is not None
+    assert fake.running == 0                                       # drained before the return
+    # the engine's waiting gauge (always 0 here) is sampled: a flat, bounded queue
+    assert step.waiting_slope == pytest.approx(0.0) and tp.queue_bounded(step) is True
+    assert step.preemptions is None                                 # the fake has no preemption counter
+    (engine,) = (tmp_path / "raw").glob("*.engine.jsonl")           # the 1 Hz engine samples are kept
+    rows = [json.loads(ln) for ln in engine.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) >= 5 and all(r["waiting"] == 0 and r["prompt_tokens_total"] is not None for r in rows)
+
+
+def test_open_loop_failures_count_against_the_step_and_mu_is_the_highest_passing_rate():
+    recs = [{"send_ts_ms": 10, "http_status": 200, "ttft_ms": 100.0, "tpot_ms": 20.0, "done_ts_ms": 50},
+            {"send_ts_ms": 20, "http_status": 504, "ttft_ms": None, "tpot_ms": None, "done_ts_ms": None},
+            {"send_ts_ms": 5, "http_status": 200, "ttft_ms": 1.0, "tpot_ms": 1.0, "done_ts_ms": 9}]  # warm-up
+    arrived, completed, ttft, tpot = tp.steady_latencies(recs, 10, 30)
+    assert (arrived, completed) == (2, 1) and ttft == float("inf") and tpot == float("inf")
+
+    def step(rate, ttft, n=200):
+        return tp.StepMeasure(0, 90, n, rate * 492, rate * 400, ttft, 30.0, rate_rps=rate, arrived=n, failed=0)
+
+    steps = [step(1.0, 200.0), step(2.0, 700.0), step(3.0, 400.0), step(4.0, 900.0), step(5.0, 100.0, n=10)]
+    mu = tp.preserve_mu(steps, 500.0, 75.0, min_completed=150)
+    assert mu["rate_rps"] == 3.0 and mu["t"] == pytest.approx(3.0 * 892)  # rate 5 has too few requests
+    assert tp.non_monotone(steps, 500.0, 75.0, min_completed=150) == [2.0]
+
+
+def test_knee_is_the_highest_throughput_step_with_a_bounded_waiting_queue():
+    def step(rate, tok, slope, n=300):
+        return tp.StepMeasure(0, 90, n, tok * 0.55, tok * 0.45, 100.0, 20.0, rate_rps=rate, arrived=n, failed=0,
+                              waiting_slope=slope)
+
+    steps = [step(5.0, 4000, 0.0), step(8.0, 6500, 0.01), step(9.0, 6900, 0.15),   # 0.15 <= 2 % x 9
+             step(10.0, 7100, 0.5), step(12.0, 7200, 2.0)]                         # growing queues
+    k = tp.knee(steps, "tok_s")
+    assert k["value"] == 6900 and k["rate_rps"] == 9.0 and k["bracketed"] and k["first_unbounded_rps"] == 10.0
+    assert tp.knee(steps[:3], "tok_s")["bracketed"] is False                      # nothing seen above it
+    assert tp.knee([step(5.0, 4000, None)], "tok_s") is None                       # no gauge: no evidence
+
+
+def test_open_loop_dry_run_writes_mu_and_knee_velocities(tmp_path, capsys):
+    out = tmp_path / "o"
+    assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--open-loop", "--base-rps", "a=10",
+                    "--prefill-base-rps", "a=30", "--prefill-rate-factors", "0.5,0.9,1.2"],
+                   slo_for=lambda m: SLO) == 0
+    doc = yaml.safe_load((out / "profile.yaml").read_text(encoding="utf-8"))
+    assert doc["mode"] == "open_loop" and doc["mu"]["a"]["rate_rps"] > 0
+    knee = doc["knee"]["a"]
+    assert knee["v_b"]["rate_rps"] == 10.0 and knee["v_b"]["bracketed"]           # 1.1 x 10 is unbounded
+    assert knee["v_p"]["rate_rps"] == 27.0 and knee["v_p"]["value"] == pytest.approx(27.0 * 492)
+    assert doc["velocity"]["a"]["v_prefill"] == knee["v_p"]["value"]
+    assert doc["velocity"]["a"]["buckets"] == [[knee["v_b"]["value"]] * 3] * 3
+    # per-model override: no mixed steps for a, only the out=1 ladder; then no base rate is needed
+    assert tp.main(["--models", "a", "--out-dir", str(tmp_path / "p"), "--dry-run", "--open-loop",
+                    "--model-rate-factors", "a=", "--prefill-base-rps", "a=30", "--prefill-rate-factors", "0.5"],
+                   slo_for=lambda m: SLO) == 0
+    doc = yaml.safe_load((tmp_path / "p" / "profile.yaml").read_text(encoding="utf-8"))
+    assert doc["mu"]["a"] is None and doc["knee"]["a"]["v_p"]["rate_rps"] == 15.0
+    assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--open-loop"], slo_for=lambda m: SLO) == 2

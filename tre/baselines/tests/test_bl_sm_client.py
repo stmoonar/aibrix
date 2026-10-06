@@ -115,6 +115,20 @@ def test_dispatcher_one_inflight_per_model() -> None:
     d.close(join_s=1.0)
 
 
+def test_stepped_scale_up_checks_the_guard_before_every_step() -> None:
+    """Bug #4 per step: losing the owner lock between two steps drops the rest."""
+    cluster = FakeCluster(awake={"a": 1})
+    answers = iter([None, "owner_lost"])
+    d = Dispatcher(cluster.put_target, guard=lambda: next(answers))
+    assert d.submit("a", "up", 4, start=1)
+    assert wait_until(lambda: d.inflight_count() == 0)
+    (done,) = d.drain_results()
+    assert [b["wake_replicas"] for _, b in cluster.calls] == [2] and cluster.awake["a"] == 2
+    assert done.result.error == "dropped" and done.result.reason == "owner_lost"
+    assert (done.reached, done.steps, done.partial_fill) == (2, 1, True)
+    d.close(join_s=1.0)
+
+
 def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
     """An SM call slower than two ticks: later ticks log inflight_skip, send nothing, and
     return immediately; the result shows up on the first tick after it completed."""
@@ -124,7 +138,7 @@ def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
         redis = FakeRedis()
         client = SMClient(sm.url, timeout_s=5.0)
         dispatcher = Dispatcher(client.put_target)
-        policy = ScriptedPolicy({t: {"a": 3} for t in range(10)})
+        policy = ScriptedPolicy({t: {"a": 2} for t in range(10)})   # one step (awake 1)
         shell = BaselineShell(config, FakeSource(config, cluster, redis), policy, dispatcher, redis)
         actions = []
         for _ in range(3):
@@ -136,7 +150,7 @@ def test_slow_sm_call_no_duplicate_and_tick_not_blocked(tmp_path) -> None:
         assert len(sm.requests) == 1
         assert wait_until(lambda: dispatcher.inflight_count() == 0)
         line = shell.tick_once()[0]
-        assert line["sm_result"]["ok"] is True and line["sm_result"]["target"] == 3
+        assert line["sm_result"]["ok"] is True and line["sm_result"]["target"] == 2
         # FakeCluster was not told about the stub's success, so the policy asks again.
         assert line["action"] == "up"
         assert wait_until(lambda: dispatcher.inflight_count() == 0)
@@ -152,3 +166,30 @@ def test_whole_lock_200_outcomes_are_logged() -> None:
                                          "refusals": [{"reason": "gpu_busy"}]}).as_dict()
     assert d["clamped_by_floor"] is True and d["unfilled"] == 1 and d["taken"] == 0
     assert d["refusals"] == [{"reason": "gpu_busy"}]
+
+
+def test_wakes_an_sm_partial_fill_reports_are_counted_as_done() -> None:
+    """The SM filling partially itself: a 200 with ``unfilled`` (grow-only) or a 409
+    ``partial`` that lists wakes done. The wakes it reports count; the rest is a refusal
+    located by the SM's first refusal."""
+    from tre_baselines.sm_client import SMResult
+
+    refusal = {"error": "gpu_busy", "reason": "slot_occupied", "node": "n", "gpu_ids": [0], "scope": "gpu",
+               "blocking_binding_id": "x/n/0", "retry_after_s": 30.0}
+    answers = {
+        "a": [SMResult(ok=True, code=200, raw={"actions": [{"action": "wake"}]}),
+              SMResult(ok=True, code=200, raw={"actions": [], "unfilled": 1, "refusals": [refusal]})],
+        "b": [SMResult(ok=False, code=409, error="partial", reason="partial", node="n", gpu_ids=(0,),
+                       raw={"actions": [{"action": "wake", "serve_id": "b1"}], "unfilled": 1})],
+    }
+    d = Dispatcher(lambda model, body: answers[model].pop(0))
+    assert d.submit("a", "up", 4, start=1) and d.submit("b", "up", 3, start=1)
+    assert wait_until(lambda: d.inflight_count() == 0)
+    done = {c.model: c for c in d.drain_results()}
+    a, b = done["a"], done["b"]
+    assert (a.reached, a.steps, a.partial_fill, a.result.ok) == (2, 2, True, False)   # step 3 woke nothing
+    assert (a.result.reason, a.result.node, a.result.gpu_ids, a.result.blocking_binding_id) == (
+        "slot_occupied", "n", (0,), "x/n/0")
+    assert a.as_dict()["unfilled"] == 1
+    assert (b.reached, b.steps, b.partial_fill) == (2, 1, True)                      # 1 + the wake done
+    d.close(join_s=1.0)

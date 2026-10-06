@@ -3,7 +3,7 @@
 The baseline autoscalers of TRE v2 (scaling parts only) as one small service, the
 **baseline shell**. Each arm is an adaptation and is named so in decision records and
 docs: **Chiron-global** (`TRE_BL_POLICY=chiron`; only the global instance loop scales, B
-is virtual), **TokenScale-colocated** (`tokenscale`; the PD-disaggregated velocity policy
+is static = engine max_num_seqs; the virtual Alg.1 B is a sensitivity row), **TokenScale-colocated** (`tokenscale`; the PD-disaggregated velocity policy
 on colocated P+D replicas), **PreServe-oracle** (`preserve`; Tier-1 is the replayed trace
 plus noise, not mLSTM; `max_tokens` as the length prediction). Every tick it builds a snapshot (service
 manager `/v2/state`, each awake pod's `/metrics`, the gateway request-event stream
@@ -64,12 +64,26 @@ curl -s localhost:8080/healthz ; curl -s localhost:8080/livez ; curl -s localhos
 `tre:v2:bl:owner` **and** the TRE controller is in observe mode: the shell reads
 `tre:v2:controller:mode` every tick (missing = observe) and otherwise logs
 `guard_controller_active` instead of calling the SM (metric `tre_bl_controller_guard`);
-the SM worker checks both again right before each call. After an SM refusal a model backs
-off (`max(retry_after_s, tick)`, doubling, capped at `TRE_BL_BACKOFF_MAX_S` = 10 s; action
-`backoff`); a refusal is retried at once when the SM state version changes. Remaining
+the SM worker checks both again right before each call. A refused scale-up is not a
+model-wide pause (the SM's `retry_after_s` scopes the refused GPUs): the shell records the
+refused `node/gpu`, the blocking binding and the state the call was decided on, logs
+`wait_refusal` (metric `tre_bl_refusal_waits_total`) and sends nothing while that state is
+unchanged; the next scale-up goes on the first tick where the blocking binding is no
+longer awake, a GPU of a sleeping binding of the model became free, or the store version /
+wakeable GPU set of `/v2/state` changed (`retry_evidence` on the line). Only a cause
+`/v2/state` cannot show (writer lock, failed wake, text-only 409) is also retried after the
+SM's `retry_after_s` (none: next tick). A failed scale-down or an unanswered call backs off
+(`max(retry_after_s, tick)`, doubling, capped at `TRE_BL_BACKOFF_MAX_S` = 10 s; action
+`backoff`; a refused scale-down is retried at once when the SM state changes). A scale-up
+is sent one replica at a time
+(`awake+1`, `awake+2`, ... each grow-only) and stops at the first 409, because the SM
+refuses a whole multi-replica target when one wake is blocked; granted-then-refused is
+`sm_result.partial_fill` (metric `tre_bl_partial_fills_total`) and is asked again next
+tick. An SM that fills partially itself (200 `unfilled`, or a 409 listing wakes done) is
+counted the same way. Remaining
 timers and what they guard: the owner-lock TTL (mutual exclusion after a crash), the SM
-call timeout and the backoff cap (liveness: retries whose cause `/v2/state` does not
-show), `/livez` stall (k8s probe); the policy windows (TokenScale `window_s`, PreServe
+call timeout, the SM's `retry_after_s` for refusals whose cause `/v2/state` does not show
+and the backoff cap (liveness), `/livez` stall (k8s probe); the policy windows (TokenScale `window_s`, PreServe
 `window_s` and its once-per-window scale-down) are the papers' mechanisms. Every decision line also goes
 to the Redis stream `tre:v2:bl:decisions` (`TRE_BL_DECISION_STREAM`, MAXLEN ~ 100000).
 `/healthz` (readiness) turns 503 after repeated failed ticks; `/livez` (liveness) only
@@ -106,23 +120,37 @@ each policy's docstring lists every key, marking what is from the paper and what
 choice (`# not in paper`). TokenScale velocities, Chiron theta and PreServe mu have no
 usable default and must be measured (`tools/`); the policies refuse to start without them:
 
-- Chiron-global: `busy_def: effective` (busy = ceil(sum(running+waiting) / mean virtual B),
+- Chiron-global: `batch_mode: static` with `static_b` = engine max_num_seqs (256) for the main
+  runs (Chiron's ablation with static batch sizes; the engine batch size cannot change at run time,
+  so a virtual Alg.1 B only tracks load noise), `batch_mode: alg1` as a sensitivity row
+  (`deploy/baselines/tre/sensitivity/chiron-alg1.yaml`); `busy_def: effective` (busy = ceil(sum(running+waiting) / mean B),
   the packed busy count; the paper's IBP assumes packing routing, ours spreads) for the main
   runs, `nonidle` / `at_cap` only as sensitivity runs; part of the same adaptation: B is capped
-  at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
+  (alg1) at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
   (`kv_request_tokens`, engine cache info), recorded as `b_max` / `b_max_src` per decision; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
-- TokenScale-colocated and PreServe-oracle, one run (`tools/tokenscale_profile`): the hot alt
-  trace has one shape (in ~492, out 400), so the buckets degenerate to one cell (disclose).
-  `python3 -m tre_baselines.tools.tokenscale_profile --models dsqwen-7b,dsllama-8b,dsqwen-14b
-  --gateway-url <chat endpoint URL> --sm-url <SM> --out-dir <dir> --i-have-user-approval`
-  with exactly one awake replica per model (checked), models in parallel: closed loop
-  1/2/4/8/12/16/24/32/48/64 (extended while still gaining > 5 %), 60 s steps, 15 s warm-up;
-  prefill/decode tok/s from the replica's vLLM token counters, p95 TTFT/TPOT per step.
-  V_b = peak (in+out) tok/s, V_P = peak prefill tok/s with out=1; PreServe mu = the highest
-  step meeting p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the registry).
-  ~20 min, needs an exclusive window. Disclose: closed loop -> mu slightly optimistic.
-- PreServe-oracle: `window_s` 600 (sensitivity 60), `noise_sigma` 0.0772 (sensitivity 0.30).
+- TokenScale-colocated and PreServe-oracle (`tools/tokenscale_profile`, run from `tre/` with
+  `PYTHONPATH=common:deploy:calibration:replayer:loadgen_v1:baselines`; the senders import
+  `tre_replayer`): the hot alt trace has one shape (in ~492, out 400), so the buckets
+  degenerate to one cell (disclose). Exactly one awake replica per model (checked), models in
+  parallel, needs an exclusive window.
+  - TokenScale V_b / V_P (main runs), open loop: `python3 -m tre_baselines.tools.tokenscale_profile
+    --open-loop --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url <chat endpoint URL> --sm-url <SM>
+    --out-dir <dir> --raw-dir <dir>/raw --base-rps <model>=<req/s>,... --prefill-base-rps <model>=<req/s>,...
+    --prefill-rate-factors 0.5,0.7,0.8,0.9,1.0,1.1,1.2 --i-have-user-approval`: velocity at the KNEE of the
+    Poisson ladders = the highest-throughput step whose waiting queue is bounded (least-squares slope of
+    `vllm:num_requests_waiting` over the measured window <= 2 % of the offered req/s). V_b = (in+out) tok/s
+    on the mixed ladder, V_P = prefill tok/s on the out=1 ladder.
+  - Sensitivity "TokenScale-aggressive": the closed-loop maxima (the same command without `--open-loop`:
+    concurrency 1 ... 64, extended while gaining > 5 %, 60 s steps; V_b = peak (in+out) tok/s, V_P = peak
+    prefill tok/s with out=1), shipped as `deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml`.
+  - PreServe mu, open loop: the mixed ladder of the same `--open-loop` run (`--base-rps`;
+    1.0x = calibration rho* x C_s token rate / (in + out)): Poisson rates 0.3 ... 1.3 x,
+    110 s steps, 20 s warm-up; mu = engine tok/s of the highest rate whose requests sent in the
+    measured window meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the
+    registry), with >= 150 of them (~20 min). The closed-loop mu is not used: a constant output
+    length keeps the workers in lockstep (bursts of c prefills), which biased it 3-6x low.
+- PreServe-oracle: `window_s` 30 (rule W <= P/4, W >= 10 x wake_p95, see policy-configmaps.yaml; sensitivity 600 = paper, `sensitivity/preserve-window600.yaml`), `noise_sigma` 0.0772 (sensitivity 0.30).
   (`tools/preserve_mu` over a calibration capture is a cross-check only.)
 
 ## Trace volume (PreServe Tier-1)
@@ -187,10 +215,12 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   refusals (and honours `retry_after_s` when present).
 - **Campaign.** `campaign_queue.py` does not have the three baseline arms yet (it should
   call the arm tool: `enable`, `mark-replay` at replay start, `disable --collect-dir`).
-- **Unmeasured parameters.** TokenScale velocities V_b / V_P, Chiron theta_trace and
-  PreServe mu have not been measured on the current engine; the example files hold
-  placeholders (the policies refuse to start on them). Freeze all of them in one config
-  commit before any comparison.
+- **Frozen parameters.** Chiron theta_trace, TokenScale V_b / V_P and PreServe mu were
+  measured on the 20261006 engine and are frozen in `deploy/baselines/tre/policy-configmaps.yaml`
+  (the example files keep placeholders; the policies refuse to start on them); the TokenScale
+  sensitivity row is `deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml`. PreServe's
+  `trace_path` must name the replayed trace in the trace volume (75/76 cluster: overlay
+  `deploy/baselines/tre-cluster-75-76`, hostPath).
 - **Stale owner.** The pre-call check leaves the time between the check and the SM
   handling the request; closing it needs the SM to reject a stale owner generation.
 - The E1 trace format and where the `*.effective.json` (per-request schedule) lands are

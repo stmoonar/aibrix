@@ -1,0 +1,47 @@
+# SENSITIVITY ROW "PreServe-window600" (2026-10-06): the PreServe-oracle parameters with the paper
+# window (window_s 600) instead of the main 30 s (policy-configmaps.yaml: rule W <= P/4, W >= 10 x wake_p95).
+# Everything except `window_s` is identical to the main ConfigMap. On the 720 s hot alt trace Tier-1 fires
+# twice and sizes on the whole-trace mean (disclose).
+# Same ConfigMap name, so it replaces the main PreServe parameters while applied:
+#   kubectl apply -f tre/deploy/baselines/tre/sensitivity/preserve-window600.yaml   # this row
+#   kubectl apply -f tre/deploy/baselines/tre/policy-configmaps.yaml                 # back to main
+# (the shell reads its parameters at start: apply before enabling the arm). Not part of the
+# kustomization on purpose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-preserve
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  preserve.yaml: |
+    # Tier-1: the replayed trace + noise (oracle, not mLSTM: disclose). The trace is read from
+    # the per-environment trace volume (README "Trace volume"; on 75/76 the overlay
+    # deploy/baselines/tre-cluster-75-76): the per-request schedule the client replays, with the
+    # prompts stripped (same oracle). The replay marker must name the same trace (last
+    # trace_match_parts components). trace_seed only matters for a segment trace.json.
+    trace_path: /etc/tre-baselines-traces/Alternating_hot_model_periodic_A/traces_tre.effective.json
+    trace_seed: 0
+    trace_schedule: poisson
+    trace_match_parts: 2
+    window_s: 600            # SENSITIVITY: the paper value (10 min); main runs: 30 (rule in policy-configmaps.yaml)
+    lead_s: 0
+    tier1: oracle_noisy
+    noise_sigma: 0.07717607558419906   # lognormal sigma for mean APE 6.17 % (paper Table 1); sensitivity 0.30
+    mu:                      # tok/s per replica (engine counters): highest open-loop Poisson rate whose
+                             # steady-state requests meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms
+      dsqwen-7b: {p: 4404.3, d: 3579.5, t: 7983.9}     # 9.330 req/s offered (0.9 x), p95 TTFT 380 ms
+      dsllama-8b: {p: 3515.3, d: 2888.4, t: 6403.6}    # 7.400 req/s (1.0 x), p95 TTFT 472 ms
+      dsqwen-14b: {p: 3381.8, d: 2762.3, t: 6144.1}    # 7.099 req/s (1.0 x), p95 TTFT 499 ms (at the edge)
+    # Tier-2 (paper §4.3.1 / §4.3.2)
+    map_factor: 1.2
+    lookahead_iters: 100
+    kv_high: 0.95
+    overload_frac: 0.10
+    t_f: 0.30
+    out_len_is_upper_bound: true
+    ext_frac: 0.2
+    kv_agree_tol: 0.15
+    hold_mode: target
+    req_ttl_s: 1800

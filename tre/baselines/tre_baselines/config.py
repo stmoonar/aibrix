@@ -42,8 +42,10 @@ Environment:
                             ``TRE_BL_SLEEP_PATH`` / ``TRE_BL_DRAIN_BUDGET_S`` are refused.
 ``TRE_BL_MAX_TICK_FAILURES`` consecutive failed ticks before /healthz is 503 (default 5)
 ``TRE_BL_LOCK_TTL_S``       owner-lock TTL (default 30)
-``TRE_BL_BACKOFF_MAX_S``    cap of the per-model backoff after SM refusals (default 10; a
-                            refusal is retried at once when the SM state version changes)
+``TRE_BL_BACKOFF_MAX_S``    cap of the per-model backoff after a failed scale-down or an
+                            unanswered SM call (default 10; a refused scale-down is retried
+                            at once when the SM state changes). Scale-up refusals have no
+                            timer: they wait for evidence of a state change.
 ``TRE_BL_LIVENESS_STALL_S`` ``/livez`` fails when the loop has not ticked for this long
                             (default 120)
 ``TRE_BL_HTTP_PORT``        /healthz + /metrics port (default 8080)

@@ -429,7 +429,7 @@ class Harness:
 def _policy_params(policy: str, tmp_path) -> dict:
     if policy == "chiron":
         # default busy_def (effective): busy = ceil(in flight / B); theta 1 -> one pod per B
-        return {"b_init": 4, "b_max": 4, "theta": {"*": 1.0}}
+        return {"batch_mode": "static", "static_b": 4, "theta": {"*": 1.0}}
     if policy == "tokenscale":
         vel = {"buckets": [[200.0] * 3] * 3, "v_prefill": 1000.0}
         return {"models": [A, B], "bucket_edges": {"*": {"in": [50, 150], "out": [50, 150]}},
@@ -574,7 +574,8 @@ def test_sm_refusals_do_not_stop_the_loop(tmp_path, redis_url, redis) -> None:
 
     params = _policy_params("chiron", tmp_path)
     with Harness(tmp_path, redis_url, redis, "chiron", params, dry_run=False, hook=hook) as h:
-        # refusal 1 (retry_after 2 s) then refusal 2 (backoff 4 s): the third call ~7 s in
+        # refusal 1 (a cause /v2/state cannot show: retry_after 2 s) then refusal 2 (text only:
+        # next tick), then through
         h.phase("high", 10.0, {A: HIGH, B: LOW})
         assert h.shell.healthy()
         ticks_before_stop = h.shell.stats.ticks
@@ -587,7 +588,7 @@ def test_sm_refusals_do_not_stop_the_loop(tmp_path, redis_url, redis) -> None:
     assert results[1]["detail"] == "writer lock busy"
     assert any(r["ok"] for r in results[2:])                       # it kept trying and got through
     mine = [ln for ln in lines if ln["model"] == A]
-    assert any(ln["action"] == "backoff" for ln in mine)            # but not every tick
+    assert any(ln["action"] == "wait_refusal" for ln in mine)       # but not every tick
     a_puts = [p for p in h.puts if p[0] == A]
     assert len(a_puts) < sum(ln["direction"] == "up" for ln in mine)
     assert max(ln["awake"] for ln in lines if ln["model"] == A) >= 2

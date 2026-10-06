@@ -1,9 +1,12 @@
 # Chiron-global baseline params (TRE_BL_POLICY=chiron, TRE_BL_POLICY_CONFIG=<this file>).
-# Only the global (instance) loop scales; B is virtual (busy test only, never pushed to
+# Only the global (instance) loop scales; B only feeds the busy test (never pushed to
 # the engine) - disclose as an adaptation.
-alpha: 0.5          # paper: Alg.1 smoothing factor
-# b_init: 256       # ours: initial virtual B; default = model max_num_seqs, else 256
-# b_max: 256        # ours: cap on B; default = min(max_num_seqs, KV tokens / kv_request_tokens)
+batch_mode: static  # main runs: static per-instance batch size (Chiron's ablation with static
+                    # batch sizes); alg1 = the virtual Alg.1 loop (sensitivity row only)
+static_b: 256       # REQUIRED in static mode (no default): the engine max_num_seqs
+alpha: 0.5          # paper: Alg.1 smoothing factor (alg1 only)
+# b_init: 256       # alg1 only; ours: initial virtual B; default = model max_num_seqs, else 256
+# b_max: 256        # alg1 only; ours: cap on B; default = min(max_num_seqs, KV tokens / kv_request_tokens)
 kv_request_tokens: 892  # in + out of one request of the trace shape (profile shape 492 + 400)
 busy_def: effective # main runs: busy = ceil(sum(running+waiting) / mean B) - the packed busy count
                     # (our gateway spreads requests; disclosed adaptation). Sensitivity only:

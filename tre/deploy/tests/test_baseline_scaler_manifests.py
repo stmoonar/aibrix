@@ -5,12 +5,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 TRE_ROOT = DEPLOY_ROOT.parent
 BL_DIR = DEPLOY_ROOT / "baselines" / "tre"
 POLICIES = ("chiron", "tokenscale", "preserve")
+BASELINE_SCALER_TAG = "20261006-43444853"  # built from that commit (clean git archive of tre/)
 IP_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 
@@ -55,6 +57,10 @@ def test_deployment_ships_off_and_dry_run() -> None:
     assert names.index("TRE_BL_POLICY") < names.index("TRE_BL_POLICY_CONFIG")  # $(VAR) needs it first
     image = container["image"]
     assert image.startswith("tre-v2-baseline-scaler:") and not image.endswith(":latest")
+    # the deployed tag: bump it here, in baseline-scaler.yaml and in kustomization.yaml together
+    kustomization = yaml.safe_load((BL_DIR / "kustomization.yaml").read_text(encoding="utf-8"))
+    (img,) = [i for i in kustomization["images"] if i["name"] == "tre-v2-baseline-scaler"]
+    assert image == f"tre-v2-baseline-scaler:{BASELINE_SCALER_TAG}" and img["newTag"] == BASELINE_SCALER_TAG
     mounts = {m["name"]: m["mountPath"] for m in container["volumeMounts"]}
     assert mounts["registry"] == "/etc/tre" and mounts["policies"] == "/etc/tre-baselines"
     volumes = {v["name"]: v for v in pod["volumes"]}
@@ -82,11 +88,42 @@ def test_trace_volume_is_a_patchable_empty_dir() -> None:
     assert example["trace_path"].startswith("/etc/tre-baselines-traces/")
 
 
-def test_policy_configmaps_present() -> None:
+def test_policy_configmaps_hold_frozen_parameters() -> None:
+    """The shipped ConfigMaps are the frozen baseline parameters: every policy starts on
+    them for every registry model (the policies refuse missing / placeholder values)."""
+    from types import SimpleNamespace
+
+    from tre_common.registry import load_registry
+
+    from tre_baselines.config import Config, model_limits
+    from tre_baselines.policies import build_policy
+    from tre_baselines.policies.preserve import PreServePolicy
+
+    models = model_limits(load_registry(str(DEPLOY_ROOT / "registry.yaml")), strict=False)
+    assert models
     for policy in POLICIES:
         cm = _one("ConfigMap", f"tre-v2-baseline-{policy}")
         assert cm["metadata"]["namespace"] == "tre-v2"
-        assert yaml.safe_load(cm["data"][f"{policy}.yaml"]) == {}
+        params = yaml.safe_load(cm["data"][f"{policy}.yaml"])
+        cfg = Config(sm_url="x", redis_url="y", policy=policy, policy_params=params, models=models)
+        if policy == "preserve":
+            # Tier-1 reads the trace at start from the per-environment trace volume
+            assert params["trace_path"].startswith("/etc/tre-baselines-traces/")
+            PreServePolicy(cfg, oracle=SimpleNamespace(window_s=float(params["window_s"]), max_tokens_max={}))
+        else:
+            build_policy(policy, cfg)
+
+
+def test_cluster_overlay_mounts_traces_read_only_and_stays_off() -> None:
+    """The 75/76 overlay only swaps the trace volume to a host directory; the mount stays
+    read-only (base) and the deployment ships at 0 replicas."""
+    kust = yaml.safe_load((DEPLOY_ROOT / "baselines" / "tre-cluster-75-76" / "kustomization.yaml").read_text(encoding="utf-8"))
+    assert kust["resources"] == ["../tre"]
+    (patch,) = kust["patches"]
+    doc = yaml.safe_load(patch["patch"])
+    assert set(doc["spec"]) == {"template"}  # no replicas / env override
+    (vol,) = doc["spec"]["template"]["spec"]["volumes"]
+    assert vol["name"] == "traces" and vol["emptyDir"] is None and vol["hostPath"]["type"] == "Directory"
 
 
 def test_rbac_is_read_only() -> None:
@@ -122,3 +159,39 @@ def test_dockerfile_contract() -> None:
     assert 'CMD ["python", "-m", "tre_baselines.main"]' in dockerfile
     for forbidden in ("COPY service-manager", "COPY controller", "COPY reissue"):
         assert forbidden not in dockerfile
+
+
+SENSITIVITY_ROWS = (  # (file, policy, the only key that differs from the main ConfigMap)
+    ("tokenscale-aggressive.yaml", "tokenscale", "velocity"),
+    ("preserve-window600.yaml", "preserve", "window_s"),
+    ("chiron-alg1.yaml", "chiron", "batch_mode"),
+    ("tokenscale-window10.yaml", "tokenscale", "window_s"),
+)
+
+
+@pytest.mark.parametrize("fname,policy,key", SENSITIVITY_ROWS)
+def test_sensitivity_rows_differ_from_main_only_in_their_key(fname: str, policy: str, key: str) -> None:
+    """A sensitivity row replaces the main ConfigMap of its policy while applied: same name,
+    same parameters except its one key, and it starts the policy for every model."""
+    from types import SimpleNamespace
+
+    from tre_common.registry import load_registry
+
+    from tre_baselines.config import Config, model_limits
+    from tre_baselines.policies import build_policy
+    from tre_baselines.policies.preserve import PreServePolicy
+
+    text = (BL_DIR / "sensitivity" / fname).read_text(encoding="utf-8")
+    assert not IP_RE.search(text) and "nscc-" not in text and "/data/nfs_shared_data" not in text
+    (sens,) = [d for d in yaml.safe_load_all(text) if d]
+    main = _one("ConfigMap", f"tre-v2-baseline-{policy}")
+    assert sens["metadata"] == main["metadata"]
+    sp, mp = (yaml.safe_load(d["data"][f"{policy}.yaml"]) for d in (sens, main))
+    assert sp[key] != mp[key]
+    assert {k: v for k, v in sp.items() if k != key} == {k: v for k, v in mp.items() if k != key}
+    models = model_limits(load_registry(str(DEPLOY_ROOT / "registry.yaml")), strict=False)
+    cfg = Config(sm_url="x", redis_url="y", policy=policy, policy_params=sp, models=models)
+    if policy == "preserve":
+        PreServePolicy(cfg, oracle=SimpleNamespace(window_s=float(sp["window_s"]), max_tokens_max={}))
+    else:
+        build_policy(policy, cfg)

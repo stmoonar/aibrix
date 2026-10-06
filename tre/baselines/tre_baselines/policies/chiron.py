@@ -1,9 +1,20 @@
-"""Chiron baseline (interactive-only, virtual batch cap): Alg.1 local loop + global IBP loop.
+"""Chiron baseline (interactive-only): per-instance batch size B + global IBP loop.
 
-Source: Chiron section 4.1 (Algorithm 1) and sections 5.1-5.2. The batch size ``B`` is
-*virtual*: it is never pushed to the engine, it only feeds the busy test of the global loop.
+Source: Chiron section 4.1 (Algorithm 1) and sections 5.1-5.2. ``B`` only feeds the busy
+test of the global loop; it is never pushed to the engine.
 
-Local loop (per pod, every tick), from deltas of the pod's cumulative counters:
+``batch_mode`` (decision 2026-10-06, methodology "10-06 sanity 第二轮"):
+
+* ``static`` (main runs): B = ``static_b`` for every pod, fixed (set it to the engine's
+  max_num_seqs, 256). This is the paper's own ablation that replaces the local autoscaler
+  with static batch sizes. Reason: Alg.1 acts on the engine's real batch cap, and TBP only
+  means something when a throughput change was caused by the previous B change. The
+  substrate cannot change max_num_seqs at run time, so a virtual B leaves the engine
+  unchanged and TBP tracks load noise ("halve vs ~x1.1 grow" is a random walk towards
+  B = 1; sanity S4: 8b B 153 -> 1, target stuck at the cap). The Alg.1 loop does not run.
+* ``alg1`` (sensitivity row ``sensitivity/chiron-alg1.yaml``): the virtual Alg.1 loop below.
+
+Local loop (alg1 only; per pod, every tick), from deltas of the pod's cumulative counters:
   ITL = d(itl_sum)/d(itl_count); LBP = ITL/ITL_SLO; thr = d(gen_tokens)/dt;
   TBP = thr_prev/thr only when the cap was binding on the previous tick, else
   neutral (dropped from the max; a literal 1 would forbid growth);
@@ -20,17 +31,35 @@ instances running interactive requests under *packing* routing. Our gateway spre
 requests over every awake pod, so "pods with running > 0" grows with N itself and the
 target ratchets to the cap. The default ``busy_def: effective`` counts the instances the
 load would fill if packed: ``busy = ceil(sum_pods(running + waiting) / mean B)``, with B
-the pods' virtual batch caps from the local loop. ``at_cap`` / ``nonidle`` remain for
+the pods' batch sizes (``static_b``, or the virtual caps of the alg1 loop). ``at_cap`` / ``nonidle`` remain for
 sensitivity runs.
+
+State band on the scale-down edge (ours, part of adaptation 4, decision 2026-10-06). With
+x = sum_q / mean B, busy rises to k as soon as x > k - 1 (the ceil above, unchanged), but
+falls from k to k - 1 only when x <= k - 1 - h (``busy_band_h``); from 1 to 0 only when
+sum_q = 0. Under packing the paper's count is ~ceil(x) and its hysteresis is implicit: a
+request that spilled to instance k runs there to completion (~20 s on our trace), so k stays
+"running" while x dips. We re-pack every tick and lose that state; the band restores it on
+the down edge only. It is a state gate, not a timer. The previous busy is per-model state;
+it restarts from the ceil on a shell restart (new policy object), when the model has no
+pods, and when the awake pod set changes in a way this policy did not ask for (a pod
+replaced, another actuator, an owner / run-mode change that moved pods: :func:`_carried`).
+The policy's own scale step keeps it (a reset there would re-open the flap at every step).
+With an evidence gap it may rise but not fall (the gap cannot prove the load is low).
+``h = 0`` is exactly the old ceil (sensitivity row). Only ``busy_def: effective`` is banded.
 
 Params (``config.policy_params``; see ``examples/chiron.yaml``):
 
 ==============  ===========  ==============================================================
 key             default      origin
 ==============  ===========  ==============================================================
-alpha           0.5          paper (Alg.1 smoothing factor)
-b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256
-b_max           None         ours (part of adaptation 4): cap on B = b_max, else
+batch_mode      static       static (paper ablation: static batch size; main) | alg1
+static_b        (required    B of every pod in static mode, an int > 0 (main: the engine
+                in static)   max_num_seqs, 256); no default; ignored in alg1
+alpha           0.5          paper (Alg.1 smoothing factor); alg1 only
+b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256;
+                             alg1 only
+b_max           None         ours (part of adaptation 4; alg1 only): cap on B = b_max, else
                              min(max_num_seqs, floor(num_gpu_blocks x block_size /
                              kv_request_tokens)) - the requests of the trace shape the
                              engine's KV cache holds at once (num_gpu_blocks / block_size
@@ -41,7 +70,10 @@ kv_request_tokens None       ours: in + out tokens of one request of the trace s
 busy_def        effective    ours (see above): effective (packed busy count) | at_cap
                              (running+waiting >= B) | nonidle (running > 0); the last two
                              only as sensitivity runs
-theta           (required)   ``{model | "*": theta}`` or one number; no silent default: the
+busy_band_h     0.25         ours (see above): ``{model | "*": h}`` or one number >= 0; main
+                             runs h = max(0.25, 3 sigma(sum_q) / mean B) from the sanity 3x
+                             plateau (30 s windows); 0 = no band (sensitivity row)
+theta         (required)   ``{model | "*": theta}`` or one number; no silent default: the
                              main runs use theta_trace (``tools/chiron_theta``), the 3x
                              example (1/3) is a sensitivity row; the policy refuses to start
                              without it for a managed model
@@ -65,7 +97,47 @@ DEFAULT_B = 256  # not in paper; chosen: order of the engine default max-num-seq
 #: busy / theta within this of an integer is that integer (theta written as 0.3333333333).
 _CEIL_TOL = 1e-6
 BUSY_DEFS = ("effective", "at_cap", "nonidle")
+BATCH_MODES = ("static", "alg1")
 _NEEDED = ("gen_tokens", "itl_sum", "itl_count")
+#: Scale-down band in units of mean B (spec floor of max(0.25, 3 sigma / B)).
+DEFAULT_BUSY_BAND_H = 0.25
+
+
+def banded_busy(prev: Optional[int], x: float, h: float) -> int:
+    """Packed busy count for load ``x`` = sum_q / mean B, given the previous count.
+
+    Up edge: ceil(x) (unchanged). Down edge: from k to k - 1 only when x <= k - 1 - h
+    (k = 1 -> 0 only when x = 0). ``prev`` None or ``h`` = 0 gives ceil(x) exactly."""
+    c = int(math.ceil(x - _CEIL_TOL)) if x > 0 else 0
+    if prev is None or c >= prev:
+        return c
+    k = prev
+    while k > c and (k == 1 or x <= k - 1 - h + _CEIL_TOL):
+        k -= 1
+    return k
+
+
+@dataclass
+class _Band:
+    busy: int
+    pods: frozenset  # the awake pod set the count was made on
+    desired: int     # what this policy asked for on that tick
+
+
+def _carried(band: Optional[_Band], pods: frozenset) -> Optional[int]:
+    """The previous busy if it still applies to ``pods``, else None (restart from the ceil).
+
+    It applies on the same pod set and after a move this policy asked for (pods only added
+    up to its desired, or only removed down to it). Any other change - a pod replaced,
+    another actuator, an owner or run-mode change that moved pods - restarts the band."""
+    if band is None:
+        return None
+    if pods == band.pods:
+        return band.busy
+    old, n = band.pods, len(pods)
+    if (pods > old and n <= band.desired) or (pods < old and n >= band.desired):
+        return band.busy
+    return None
 
 
 @dataclass
@@ -89,6 +161,16 @@ class ChironPolicy:
 
     def __init__(self, config: Any = None) -> None:
         params = dict(getattr(config, "policy_params", None) or {})
+        self.batch_mode = str(params.get("batch_mode", "static"))
+        if self.batch_mode not in BATCH_MODES:
+            raise ValueError(f"chiron: batch_mode must be one of {BATCH_MODES}")
+        self.static_b: Optional[int] = None
+        if self.batch_mode == "static":
+            sb = params.get("static_b")
+            if isinstance(sb, bool) or not isinstance(sb, int) or sb <= 0:
+                raise ValueError("chiron: batch_mode static needs static_b, an int > 0 "
+                                 "(the engine max_num_seqs; no default)")
+            self.static_b = sb
         self.alpha = float(params.get("alpha", DEFAULT_ALPHA))
         if not 0.0 < self.alpha <= 1.0:
             raise ValueError("chiron: alpha must be in (0, 1]")
@@ -116,7 +198,18 @@ class ChironPolicy:
         missing = [m for m in (getattr(config, "models", None) or {}) if m not in self.theta and "*" not in self.theta]
         if missing:
             raise ValueError(f"chiron: no theta for {sorted(missing)} (and no '*')")
+        band = params.get("busy_band_h", DEFAULT_BUSY_BAND_H)
+        if not isinstance(band, Mapping):
+            band = {"*": band}
+        self.busy_band_h = {str(k): float(v) for k, v in band.items()}
+        if any(not (v >= 0.0 and math.isfinite(v)) for v in self.busy_band_h.values()):
+            raise ValueError("chiron: busy_band_h must be a finite number >= 0")
         self._state: dict[str, dict[str, _PodState]] = {}
+        self._band: dict[str, _Band] = {}
+
+    def _h_for(self, model: str) -> float:
+        h = self.busy_band_h
+        return h[model] if model in h else h.get("*", DEFAULT_BUSY_BAND_H)
 
     def _theta_for(self, model: str) -> float:
         try:
@@ -138,6 +231,9 @@ class ChironPolicy:
         return float(seqs), "max_num_seqs"
 
     def _b_bounds(self, ms: ModelSnapshot) -> tuple[float, float]:
+        if self.static_b is not None:  # static mode: B is static_b, recorded as such
+            self._b_max_src = "static_b"
+            return float(self.static_b), float(self.static_b)
         b_init = self.b_init if self.b_init is not None else (ms.max_num_seqs or DEFAULT_B)
         b_max, self._b_max_src = self._b_max(ms)
         return float(b_init), float(b_max)
@@ -195,8 +291,10 @@ class ChironPolicy:
             n = len(ms.pods)
             theta = self._theta_for(model)
             if n == 0:
+                self._band.pop(model, None)
                 out[model] = Decision(ms.awake, "no_pods", {"N": 0, "theta": _num(theta)})
                 continue
+            gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
             per_pod: dict[str, Any] = {}
             busy = 0
             queued = 0.0
@@ -205,7 +303,8 @@ class ChironPolicy:
                 st = states.get(pod.pod)
                 if st is None:
                     st = states[pod.pod] = _PodState(B=min(b_init, b_max))
-                info = self._local(st, pod, ms, b_max)
+                # static mode: B stays static_b, the Alg.1 loop does not run
+                info = self._local(st, pod, ms, b_max) if self.static_b is None else {}
                 # Unknown gauges are not busy here (scale-up uses the evidence there is);
                 # they are an evidence gap, which blocks the scale-down below.
                 caps.append(st.B)
@@ -220,15 +319,25 @@ class ChironPolicy:
             extra: dict[str, Any] = {}
             if self.busy_def == "effective":
                 b_mean = sum(caps) / len(caps)
-                busy = int(math.ceil(queued / b_mean - _CEIL_TOL)) if queued > 0 else 0
-                extra = {"queued": _num(queued, 2), "B_mean": _num(b_mean, 2)}
+                x = queued / b_mean
+                h = self._h_for(model)
+                pods_now = frozenset(live)
+                prev = _carried(self._band.get(model), pods_now)
+                busy_ceil = banded_busy(None, x, 0.0)
+                busy = banded_busy(prev, x, h)
+                if gaps and prev is not None:  # unknown pods: may rise, cannot fall
+                    busy = max(busy, prev)
+                extra = {"queued": _num(queued, 2), "B_mean": _num(b_mean, 2), "busy_ceil": busy_ceil,
+                         "band_h": _num(h), "busy_prev": prev}
             ibp = busy / n
             desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
             decision = Decision(desired, "ibp_target", {
                 "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy, **extra,
-                "target": desired, "busy_def": self.busy_def, "b_max": _num(b_max, 1), "b_max_src": self._b_max_src,
+                "target": desired, "busy_def": self.busy_def, "batch_mode": self.batch_mode, "b_max": _num(b_max, 1), "b_max_src": self._b_max_src,
                 "pods": per_pod,
             })
-            gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
-            out[model] = hold_if_incomplete(decision, ms.awake, gaps)
+            final = hold_if_incomplete(decision, ms.awake, gaps)
+            if self.busy_def == "effective":
+                self._band[model] = _Band(busy, pods_now, int(final.desired))
+            out[model] = final
         return out
