@@ -1,0 +1,33 @@
+# SENSITIVITY ROW "Chiron-alg1" (2026-10-06): the Chiron-global parameters with the virtual Alg.1
+# local loop (batch_mode alg1) instead of the static per-instance batch size of the main runs
+# (batch_mode static, static_b 256 = engine max_num_seqs; policy-configmaps.yaml). Everything except
+# `batch_mode` is identical to the main ConfigMap. B is virtual (never pushed to the engine), so its
+# throughput-backpressure signal tracks load noise (sanity S4: 8b B 153 -> 1, target at the cap; disclose).
+# busy_band_h 0.34 was derived with B ~251 (not recomputed for this row).
+# Same ConfigMap name, so it replaces the main Chiron parameters while applied:
+#   kubectl apply -f tre/deploy/baselines/tre/sensitivity/chiron-alg1.yaml      # this row
+#   kubectl apply -f tre/deploy/baselines/tre/policy-configmaps.yaml           # back to main
+# (the shell reads its parameters at start: apply before enabling the arm). Not part of the
+# kustomization on purpose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-chiron
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  chiron.yaml: |
+    batch_mode: alg1         # SENSITIVITY: the virtual Alg.1 loop; main runs: static (static_b 256, policy-configmaps.yaml)
+    static_b: 256            # ignored in alg1 (kept so that only batch_mode differs from the main ConfigMap)
+    alpha: 0.5               # paper: Alg.1 smoothing factor (alg1 sensitivity row only)
+    kv_request_tokens: 892   # in + out of one trace-shape request (492 + 400): caps the virtual B (alg1 only)
+    busy_def: effective      # busy = ceil(sum(running+waiting) / mean B) (disclosed adaptation)
+    theta:                   # theta_trace, peak_mean 5 s on the replayed hot alt trace
+      dsqwen-7b: 0.4598
+      dsllama-8b: 0.5343
+      dsqwen-14b: 0.4598
+    busy_band_h:             # max(0.25, 3 sigma(sum_q)/B), sanity S23 3x plateau, 30 s windows (7b sigma 28.8, B 251.4)
+      dsqwen-7b: 0.34
+      dsllama-8b: 0.34       # no plateau data: 7b value (sqrt(B) scaling would give 0.44)
+      dsqwen-14b: 0.34       # (sqrt(B) scaling: 0.36)

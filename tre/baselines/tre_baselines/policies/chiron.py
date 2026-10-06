@@ -1,9 +1,20 @@
-"""Chiron baseline (interactive-only, virtual batch cap): Alg.1 local loop + global IBP loop.
+"""Chiron baseline (interactive-only): per-instance batch size B + global IBP loop.
 
-Source: Chiron section 4.1 (Algorithm 1) and sections 5.1-5.2. The batch size ``B`` is
-*virtual*: it is never pushed to the engine, it only feeds the busy test of the global loop.
+Source: Chiron section 4.1 (Algorithm 1) and sections 5.1-5.2. ``B`` only feeds the busy
+test of the global loop; it is never pushed to the engine.
 
-Local loop (per pod, every tick), from deltas of the pod's cumulative counters:
+``batch_mode`` (decision 2026-10-06, methodology "10-06 sanity 第二轮"):
+
+* ``static`` (main runs): B = ``static_b`` for every pod, fixed (set it to the engine's
+  max_num_seqs, 256). This is the paper's own ablation that replaces the local autoscaler
+  with static batch sizes. Reason: Alg.1 acts on the engine's real batch cap, and TBP only
+  means something when a throughput change was caused by the previous B change. The
+  substrate cannot change max_num_seqs at run time, so a virtual B leaves the engine
+  unchanged and TBP tracks load noise ("halve vs ~x1.1 grow" is a random walk towards
+  B = 1; sanity S4: 8b B 153 -> 1, target stuck at the cap). The Alg.1 loop does not run.
+* ``alg1`` (sensitivity row ``sensitivity/chiron-alg1.yaml``): the virtual Alg.1 loop below.
+
+Local loop (alg1 only; per pod, every tick), from deltas of the pod's cumulative counters:
   ITL = d(itl_sum)/d(itl_count); LBP = ITL/ITL_SLO; thr = d(gen_tokens)/dt;
   TBP = thr_prev/thr only when the cap was binding on the previous tick, else
   neutral (dropped from the max; a literal 1 would forbid growth);
@@ -20,7 +31,7 @@ instances running interactive requests under *packing* routing. Our gateway spre
 requests over every awake pod, so "pods with running > 0" grows with N itself and the
 target ratchets to the cap. The default ``busy_def: effective`` counts the instances the
 load would fill if packed: ``busy = ceil(sum_pods(running + waiting) / mean B)``, with B
-the pods' virtual batch caps from the local loop. ``at_cap`` / ``nonidle`` remain for
+the pods' batch sizes (``static_b``, or the virtual caps of the alg1 loop). ``at_cap`` / ``nonidle`` remain for
 sensitivity runs.
 
 State band on the scale-down edge (ours, part of adaptation 4, decision 2026-10-06). With
@@ -42,9 +53,13 @@ Params (``config.policy_params``; see ``examples/chiron.yaml``):
 ==============  ===========  ==============================================================
 key             default      origin
 ==============  ===========  ==============================================================
-alpha           0.5          paper (Alg.1 smoothing factor)
-b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256
-b_max           None         ours (part of adaptation 4): cap on B = b_max, else
+batch_mode      static       static (paper ablation: static batch size; main) | alg1
+static_b        (required    B of every pod in static mode, an int > 0 (main: the engine
+                in static)   max_num_seqs, 256); no default; ignored in alg1
+alpha           0.5          paper (Alg.1 smoothing factor); alg1 only
+b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256;
+                             alg1 only
+b_max           None         ours (part of adaptation 4; alg1 only): cap on B = b_max, else
                              min(max_num_seqs, floor(num_gpu_blocks x block_size /
                              kv_request_tokens)) - the requests of the trace shape the
                              engine's KV cache holds at once (num_gpu_blocks / block_size
@@ -82,6 +97,7 @@ DEFAULT_B = 256  # not in paper; chosen: order of the engine default max-num-seq
 #: busy / theta within this of an integer is that integer (theta written as 0.3333333333).
 _CEIL_TOL = 1e-6
 BUSY_DEFS = ("effective", "at_cap", "nonidle")
+BATCH_MODES = ("static", "alg1")
 _NEEDED = ("gen_tokens", "itl_sum", "itl_count")
 #: Scale-down band in units of mean B (spec floor of max(0.25, 3 sigma / B)).
 DEFAULT_BUSY_BAND_H = 0.25
@@ -145,6 +161,16 @@ class ChironPolicy:
 
     def __init__(self, config: Any = None) -> None:
         params = dict(getattr(config, "policy_params", None) or {})
+        self.batch_mode = str(params.get("batch_mode", "static"))
+        if self.batch_mode not in BATCH_MODES:
+            raise ValueError(f"chiron: batch_mode must be one of {BATCH_MODES}")
+        self.static_b: Optional[int] = None
+        if self.batch_mode == "static":
+            sb = params.get("static_b")
+            if isinstance(sb, bool) or not isinstance(sb, int) or sb <= 0:
+                raise ValueError("chiron: batch_mode static needs static_b, an int > 0 "
+                                 "(the engine max_num_seqs; no default)")
+            self.static_b = sb
         self.alpha = float(params.get("alpha", DEFAULT_ALPHA))
         if not 0.0 < self.alpha <= 1.0:
             raise ValueError("chiron: alpha must be in (0, 1]")
@@ -205,6 +231,9 @@ class ChironPolicy:
         return float(seqs), "max_num_seqs"
 
     def _b_bounds(self, ms: ModelSnapshot) -> tuple[float, float]:
+        if self.static_b is not None:  # static mode: B is static_b, recorded as such
+            self._b_max_src = "static_b"
+            return float(self.static_b), float(self.static_b)
         b_init = self.b_init if self.b_init is not None else (ms.max_num_seqs or DEFAULT_B)
         b_max, self._b_max_src = self._b_max(ms)
         return float(b_init), float(b_max)
@@ -274,7 +303,8 @@ class ChironPolicy:
                 st = states.get(pod.pod)
                 if st is None:
                     st = states[pod.pod] = _PodState(B=min(b_init, b_max))
-                info = self._local(st, pod, ms, b_max)
+                # static mode: B stays static_b, the Alg.1 loop does not run
+                info = self._local(st, pod, ms, b_max) if self.static_b is None else {}
                 # Unknown gauges are not busy here (scale-up uses the evidence there is);
                 # they are an evidence gap, which blocks the scale-down below.
                 caps.append(st.B)
@@ -303,7 +333,7 @@ class ChironPolicy:
             desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
             decision = Decision(desired, "ibp_target", {
                 "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy, **extra,
-                "target": desired, "busy_def": self.busy_def, "b_max": _num(b_max, 1), "b_max_src": self._b_max_src,
+                "target": desired, "busy_def": self.busy_def, "batch_mode": self.batch_mode, "b_max": _num(b_max, 1), "b_max_src": self._b_max_src,
                 "pods": per_pod,
             })
             final = hold_if_incomplete(decision, ms.awake, gaps)

@@ -159,6 +159,7 @@ def test_dockerfile_contract() -> None:
 SENSITIVITY_ROWS = (  # (file, policy, the only key that differs from the main ConfigMap)
     ("tokenscale-aggressive.yaml", "tokenscale", "velocity"),
     ("preserve-window600.yaml", "preserve", "window_s"),
+    ("chiron-alg1.yaml", "chiron", "batch_mode"),
 )
 
 

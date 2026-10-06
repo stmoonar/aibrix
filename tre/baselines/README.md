@@ -3,7 +3,7 @@
 The baseline autoscalers of TRE v2 (scaling parts only) as one small service, the
 **baseline shell**. Each arm is an adaptation and is named so in decision records and
 docs: **Chiron-global** (`TRE_BL_POLICY=chiron`; only the global instance loop scales, B
-is virtual), **TokenScale-colocated** (`tokenscale`; the PD-disaggregated velocity policy
+is static = engine max_num_seqs; the virtual Alg.1 B is a sensitivity row), **TokenScale-colocated** (`tokenscale`; the PD-disaggregated velocity policy
 on colocated P+D replicas), **PreServe-oracle** (`preserve`; Tier-1 is the replayed trace
 plus noise, not mLSTM; `max_tokens` as the length prediction). Every tick it builds a snapshot (service
 manager `/v2/state`, each awake pod's `/metrics`, the gateway request-event stream
@@ -106,10 +106,13 @@ each policy's docstring lists every key, marking what is from the paper and what
 choice (`# not in paper`). TokenScale velocities, Chiron theta and PreServe mu have no
 usable default and must be measured (`tools/`); the policies refuse to start without them:
 
-- Chiron-global: `busy_def: effective` (busy = ceil(sum(running+waiting) / mean virtual B),
+- Chiron-global: `batch_mode: static` with `static_b` = engine max_num_seqs (256) for the main
+  runs (Chiron's ablation with static batch sizes; the engine batch size cannot change at run time,
+  so a virtual Alg.1 B only tracks load noise), `batch_mode: alg1` as a sensitivity row
+  (`deploy/baselines/tre/sensitivity/chiron-alg1.yaml`); `busy_def: effective` (busy = ceil(sum(running+waiting) / mean B),
   the packed busy count; the paper's IBP assumes packing routing, ours spreads) for the main
   runs, `nonidle` / `at_cap` only as sensitivity runs; part of the same adaptation: B is capped
-  at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
+  (alg1) at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
   (`kv_request_tokens`, engine cache info), recorded as `b_max` / `b_max_src` per decision; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
 - TokenScale-colocated and PreServe-oracle (`tools/tokenscale_profile`, run from `tre/` with

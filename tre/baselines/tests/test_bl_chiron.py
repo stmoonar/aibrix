@@ -31,6 +31,7 @@ def snap(pods, awake=None, t_ms=0, unscraped=(), max_num_seqs=100, tick=0):
 
 def policy(**params):
     params.setdefault("theta", {"*": 1 / 3})
+    params.setdefault("batch_mode", "alg1")  # most tests here exercise the Alg.1 loop
     return ChironPolicy(SimpleNamespace(policy_params=params))
 
 
@@ -235,6 +236,11 @@ def test_bad_params():
         policy(alpha=0)
     with pytest.raises(ValueError):
         policy(theta={"*": 0})
+    for bad in (None, 0, 2.5, True):  # static mode: static_b from config, no default
+        with pytest.raises(ValueError):
+            policy(batch_mode="static", static_b=bad)
+    with pytest.raises(ValueError):
+        policy(batch_mode="bogus")
 
 
 def test_deterministic_and_json_able():
@@ -255,7 +261,7 @@ def test_deterministic_and_json_able():
 
 def test_registered():
     assert POLICIES["chiron"] is ChironPolicy
-    assert build_policy("chiron", SimpleNamespace(policy_params={"theta": 0.5})).name == "chiron"
+    assert build_policy("chiron", SimpleNamespace(policy_params={"theta": 0.5, "static_b": 256})).name == "chiron"
 
 
 def test_effective_busy_spread_load_gives_a_constant_target_no_ratchet():
@@ -321,3 +327,28 @@ def test_busy_band_no_flap_around_b_and_h0_is_the_old_ceil():
     assert run(h, noisy) == [2] + [4] * (len(noisy) - 1)  # band: up once, no flap
     dropped = run(h, noisy + [0.69])                    # sum_q <= (1 - h) B: down next tick
     assert dropped[-1] == 2 and dropped[-2] == 4
+
+
+def test_static_b_never_moves_under_falling_throughput_alg1_collapses():
+    """Sanity S4 (2026-10-06): the cap binds (running >= B), latency is low and throughput
+    only falls with the load. Alg.1's TBP halves the virtual B every tick (8b: 153 -> 1) and
+    busy = ceil(sum_q / B) pins the target at the cap. Static mode (main): B = static_b on
+    every tick and the target follows the load."""
+    def run(**params):
+        pol = policy(theta={"*": 0.5}, **params)
+        gen = itl_n = 0
+        seen = []
+        for t in range(12):
+            d_gen = 0 if t == 0 else 2000 - 150 * t  # falling throughput
+            gen, itl_n = gen + d_gen, itl_n + d_gen    # ITL .02 s -> LBP .2
+            d = one(pol, snap([pod("p0", t * 2000, gen, 0.02 * itl_n, itl_n, running=256)],
+                              t_ms=t * 2000, max_num_seqs=256, tick=t))
+            seen.append((info(d)["B"], d.desired))
+        return seen
+
+    static = run(batch_mode="static", static_b=256)
+    assert {b for b, _ in static} == {256}
+    assert {n for _, n in static} == {2}                  # ceil(256 / 256) = 1 busy, theta .5
+    alg1 = run(batch_mode="alg1")                          # old behaviour kept for the sensitivity row
+    assert alg1[1][0] == 256 and alg1[2][0] == 128 and alg1[-1][0] == 1
+    assert alg1[-1][1] == 512                              # busy 256 / theta .5: the shell clamps to the cap

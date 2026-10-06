@@ -140,7 +140,7 @@ def test_arms_are_named_as_adaptations(tmp_path) -> None:
 
     config = make_config(tmp_path, {"a": limits("a")}, policy="chiron")
     cluster = FakeCluster(awake={"a": 1})
-    policy = ChironPolicy(dataclasses.replace(config, policy_params={"theta": 0.5}))
+    policy = ChironPolicy(dataclasses.replace(config, policy_params={"theta": 0.5, "static_b": 256}))
     shell = BaselineShell(config, FakeSource(config, cluster, FakeRedis()), policy, Dispatcher(cluster.put_target))
     assert {line["arm"] for line in shell.tick_once()} == {"Chiron-global"}
     assert shell.health_doc()["arm"] == "Chiron-global"

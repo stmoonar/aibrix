@@ -7,6 +7,9 @@
 #     hot alt trace (CPU only); sensitivity row "*": 1/3.
 #     busy_band_h (scale-down state band, adaptation 4): max(0.25, 3 sigma(sum_q) / B) from the
 #     sanity S2 3x plateau; sensitivity row: 0 (the plain ceil).
+#     batch_mode static, static_b 256 = engine max_num_seqs (methodology 10-06 sanity round 2):
+#     Chiron's own ablation with static batch sizes; the virtual Alg.1 B collapses (S4: 153 -> 1)
+#     because the engine batch size cannot change at run time. Sensitivity row: sensitivity/chiron-alg1.yaml.
 #   - TokenScale-colocated V_b / V_P: tools/tokenscale_profile --open-loop, velocity at the knee
 #     of Poisson rate ladders (in 492 / out 400 and out=1). Sensitivity row "TokenScale-aggressive"
 #     (closed-loop maxima): sensitivity/tokenscale-aggressive.yaml.
@@ -26,9 +29,11 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   chiron.yaml: |
-    alpha: 0.5               # paper: Alg.1 smoothing factor
-    kv_request_tokens: 892   # in + out of one trace-shape request (492 + 400): caps the virtual B
-    busy_def: effective      # busy = ceil(sum(running+waiting) / mean virtual B) (disclosed adaptation)
+    batch_mode: static       # paper ablation: static per-instance batch size (Alg.1 virtual B collapses, S4 153 -> 1)
+    static_b: 256            # = engine max_num_seqs (the engine batch size cannot change at run time)
+    alpha: 0.5               # paper: Alg.1 smoothing factor (alg1 sensitivity row only)
+    kv_request_tokens: 892   # in + out of one trace-shape request (492 + 400): caps the virtual B (alg1 only)
+    busy_def: effective      # busy = ceil(sum(running+waiting) / mean B) (disclosed adaptation)
     theta:                   # theta_trace, peak_mean 5 s on the replayed hot alt trace
       dsqwen-7b: 0.4598
       dsllama-8b: 0.5343
