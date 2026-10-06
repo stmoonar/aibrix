@@ -67,7 +67,8 @@ ORDER = ("dsllama-8b", "dsqwen-7b", "dsqwen-14b")
 
 
 def _models(spec: dict) -> list[str]:
-    ms = set(spec.get("models", {})) | set(spec.get("real", {}).get("rho", {}))
+    real = spec.get("real", {})
+    ms = set(spec.get("models", {})) | set(real.get("rho", {})) | set(real.get("v1_factor", {}))
     return [m for m in ORDER if m in ms] + sorted(ms - set(ORDER))
 
 

@@ -193,7 +193,10 @@ def design_rows(spec: dict, seed: int, cap: Capacity | None = None, fits: dict |
     cap = cap or load_capacity()
     fits = fits if fits is not None else load_fits()
     info: dict[str, Any] = {}
-    if "real" in spec:
+    if "real" in spec and spec["real"].get("method") == "v1":
+        from . import realv1
+        raw, info["real"] = realv1.rows(spec, seed, cap, azure_csv or {}, rng_for)
+    elif "real" in spec:
         raw, info["real"] = _real_rows(spec, seed, cap, fits, azure_csv or {})
     else:
         raw = _synthetic_rows(spec, seed, cap, fits)
