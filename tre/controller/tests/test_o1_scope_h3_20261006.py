@@ -45,14 +45,14 @@ def _held(**extra) -> dict:
             "signal_evidence_requests": 500.0, **extra}
 
 
-def _plan(contexts: dict, states: dict, *, idle_gpus: int, bases=None):
+def _plan(contexts: dict, states: dict, *, idle_gpus: int, bases=None, **kwargs):
     cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_max_step_ratio=2.0,
                      partial_window_max_step=1, partial_window_lowevidence_requests=10)
     return build_plan(
         model_contexts=contexts,
         classifications=[_cls(model, state, z) for model, (state, z) in states.items()],
         model_replicas={model: int(ctx["assigned_replicas"]) for model, ctx in contexts.items()},
-        idle_gpus=idle_gpus, cfg=cfg, rescue_bases=bases,
+        idle_gpus=idle_gpus, cfg=cfg, rescue_bases=bases, **kwargs,
     )
 
 
@@ -70,6 +70,45 @@ def test_critical_receiver_with_rising_queue_takes_a_free_gpu_despite_the_hold()
     landed = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2,
                    bases={"m": RescueBasis(base=1, covered=2)})
     assert _ups(landed) == 1
+
+
+def test_one_queue_rise_buys_one_wake_until_it_is_visible():
+    """Review P1-2: an earlier exempt step the routable count does not show yet, or a
+    fleet view older than the last action, holds the exempt receiver."""
+    unseen = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2,
+                   bases={"m": RescueBasis(base=2, covered=3)})
+    assert _ups(unseen) == 0
+    assert "receiver_held_breakpoint_window:m:no_complete_grid" in unseen.events
+    pending = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2,
+                    view_pending={"m": "up"})
+    assert _ups(pending) == 0
+
+
+def test_exempt_receiver_does_not_take_the_free_gpu_a_confirmed_receiver_needs():
+    """Review P2-1: the exempt receiver's wakes are assigned after the TSS-confirmed
+    CRITICAL receivers: the one free GPU (where the exempt model also sleeps) goes to
+    the confirmed receiver's create."""
+    from tre_controller.planning.planner import ClusterView
+    from tre_sm.allocator.slots import Binding, Slot
+    from test_planner_slot_occupancy import TOPOLOGY
+
+    awake = {"a": [("node9", 0), ("node9", 2), ("node9", 3), ("node10", 0)],
+             "e": [("node10", 1), ("node10", 2)], "c": [("node10", 3)]}
+    bindings = [Binding(f"{m}-{n}{g}", m, Slot(n, (g,)), awake=True) for m, gpus in awake.items() for n, g in gpus]
+    bindings.append(Binding("e-s", "e", Slot("node9", (1,)), awake=False))  # the free GPU
+    contexts = {
+        "a": {"assigned_replicas": 4, "routable_pods": 4, "awake_replicas": 4, "signal_warm": True,
+              "signal_full_window": True},
+        "c": {"assigned_replicas": 1, "routable_pods": 1, "awake_replicas": 1, "signal_warm": True,
+              "signal_full_window": True},
+        "e": _held(assigned_replicas=3, o1_queue_rise=RISE),
+    }
+    states = {"a": (ModelState.HEALTHY, 1.1), "c": (ModelState.CRITICAL, 0.05), "e": (ModelState.CRITICAL, 0.05)}
+    plan = _plan(contexts, states, idle_gpus=1, cluster_view=ClusterView(TOPOLOGY, tuple(bindings)))
+    assert [(a.model, a.delta, a.reason) for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0] == [
+        ("c", 1, "critical_idle_capacity")
+    ]
+    assert "receiver_held_breakpoint_window:e:no_complete_grid" in plan.events
 
 
 def test_step_that_needs_a_donor_keeps_the_hold():

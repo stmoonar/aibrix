@@ -690,8 +690,21 @@ def build_plan(
             # the window's Z describes and only what exceeds that scale-up is planned.
             basis = rescue_bases.get(recv.model_name)
             exempt = recv.model_name in o1_exempt
-            if exempt and basis is not None and basis.covered <= recv_pods:
-                # H3: the earlier target has landed (the routable count shows it) and the
+            if exempt:
+                # H3 review P1-2: one piece of queue evidence buys at most one wake until
+                # that wake is visible - an earlier target the routable count does not
+                # show yet, or a fleet view older than the last action (view-pending),
+                # holds the exempt receiver (no timer: the next view / count releases it).
+                if (basis is not None and basis.covered > recv_pods) or (
+                    view_pending and recv.model_name in view_pending
+                ):
+                    events.append(
+                        f"receiver_o1_exempt_pending:{recv.model_name}"
+                        f":covered={basis.covered if basis is not None else None}:routable={recv_pods}"
+                        f":view_pending={bool(view_pending and recv.model_name in view_pending)}"
+                    )
+                    return None
+                # The earlier target has landed (the routable count shows it) and the
                 # queue sampled after that breakpoint still rose: the evidence describes
                 # the current count, the step builds on it (the target is not re-asked).
                 basis = None
@@ -771,11 +784,20 @@ def build_plan(
         # Every CRITICAL receiver's sleeping-binding wakes are assigned jointly up
         # front, so an earlier receiver never takes the one free slot a later one
         # can wake into while it had another (multi-receiver slot stealing).
+        # H3 review P2-1: O1-exempt receivers (the weakest evidence) are not part of
+        # it - their wakes are assigned in a second pass, after every other CRITICAL
+        # receiver has planned its wakes and creates (like the LOW rescue section),
+        # so they never take a free GPU a confirmed receiver needs.
         reserved_wakes = _plan_joint_wakes(
             occupancy,
-            [(model, need[1]) for model, need in critical_needs.items() if need is not None],
+            [
+                (model, need[1])
+                for model, need in critical_needs.items()
+                if need is not None and model not in o1_exempt
+            ],
             events=events,
         )
+        reserved_exempt_wakes: dict[str, list[Binding]] | None = None
         for recv in critical_receivers:
             need = critical_needs[recv.model_name]
             if need is None:
@@ -784,10 +806,22 @@ def build_plan(
             first_action = len(actions)
             # H3: an O1-exempt receiver takes free capacity only.
             free_only = recv.model_name in o1_exempt
+            if free_only and reserved_exempt_wakes is None:
+                # Exempt receivers sort last (``_critical_order``): every confirmed
+                # receiver is planned by now.
+                reserved_exempt_wakes = _plan_joint_wakes(
+                    occupancy,
+                    [
+                        (model, item[1])
+                        for model, item in critical_needs.items()
+                        if item is not None and model in o1_exempt
+                    ],
+                    events=events,
+                )
             try:
                 gain_from_sleeping, wake_pods = _take_reserved_wakes(
                     occupancy,
-                    reserved_wakes,
+                    reserved_exempt_wakes if free_only else reserved_wakes,
                     receiver=recv.model_name,
                     need=wake_need,
                     events=events,
