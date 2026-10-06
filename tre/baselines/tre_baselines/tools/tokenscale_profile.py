@@ -415,10 +415,12 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
         def sampler(now: int) -> dict:
             text = scrape(model)
             samples.append((int(now), text))
-            from tre_baselines.sources import parse_prometheus_text
-
-            vals = {x.name: x.value for x in parse_prometheus_text(text)}
-            return {"running": vals.get("vllm:num_requests_running"), "waiting": vals.get("vllm:num_requests_waiting")}
+            # persisted 1 Hz to <raw>/<model>_<cell>.engine.jsonl (with raw_dir)
+            return {"running": counter_sum(text, "vllm:num_requests_running"),
+                    "waiting": counter_sum(text, WAITING_GAUGE),
+                    "prompt_tokens_total": counter_sum(text, PROMPT_COUNTER),
+                    "generation_tokens_total": counter_sum(text, GEN_COUNTER),
+                    "preemptions_total": counter_sum(text, PREEMPT_COUNTER)}
 
         seg = RpsSegment(model=model, start_s=0.0, end_s=float(step_s), rps=float(rate_rps),
                          input_tokens=int(in_tokens), max_output_tokens=int(out_tokens))
@@ -428,8 +430,10 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
             base.mkdir(parents=True, exist_ok=True)
             raw = base / f"{model}_{cell_id}.jsonl"
             raw.unlink(missing_ok=True)
+            (base / f"{model}_{cell_id}.engine.jsonl").unlink(missing_ok=True)
             start_ms, _end_ms, guard = openloop.drive_cell_schedule(
                 gateway_url, model, cell_id, [seg], seed=seed, raw_path=raw, instant_sampler=sampler,
+                instant_path=base / f"{model}_{cell_id}.engine.jsonl" if raw_dir is not None else None,
                 instant_interval_s=sample_s, prompt_mode=prompt_mode,
                 prompt_dir=Path(tmp) / "prompts" if prompt_dir_enabled else None,
                 routing_strategy=routing_strategy, stream_call=stream_call, request_key=f"{run_key}|{model}|{cell_id}",

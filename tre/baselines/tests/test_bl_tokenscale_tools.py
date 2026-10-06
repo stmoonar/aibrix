@@ -296,6 +296,9 @@ def test_open_loop_measure_sends_poisson_chat_and_reads_engine_counters(tmp_path
     # the engine's waiting gauge (always 0 here) is sampled: a flat, bounded queue
     assert step.waiting_slope == pytest.approx(0.0) and tp.queue_bounded(step) is True
     assert step.preemptions is None                                 # the fake has no preemption counter
+    (engine,) = (tmp_path / "raw").glob("*.engine.jsonl")           # the 1 Hz engine samples are kept
+    rows = [json.loads(ln) for ln in engine.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) >= 5 and all(r["waiting"] == 0 and r["prompt_tokens_total"] is not None for r in rows)
 
 
 def test_open_loop_failures_count_against_the_step_and_mu_is_the_highest_passing_rate():
