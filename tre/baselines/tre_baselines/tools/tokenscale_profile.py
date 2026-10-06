@@ -356,7 +356,7 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
                 gateway_url, model, cell_id, [seg], seed=seed, raw_path=raw, instant_sampler=sampler,
                 instant_interval_s=sample_s, prompt_mode=prompt_mode,
                 prompt_dir=Path(tmp) / "prompts" if prompt_dir_enabled else None,
-                routing_strategy=routing_strategy, stream_call=stream_call, request_key=f"{run_key}|{model}",
+                routing_strategy=routing_strategy, stream_call=stream_call, request_key=f"{run_key}|{model}|{cell_id}",
                 api=api, sender_processes=sender_processes)
             records = [json.loads(ln) for ln in raw.read_text(encoding="utf-8").splitlines() if ln.strip()] \
                 if raw.exists() else []
