@@ -225,12 +225,14 @@ def test_disabled_keeps_the_tss_rules():
 
 def test_o1_hold_with_full_kv_triggers():
     """First completions: the onset is a breakpoint, O1 holds the model for two grids
-    (no_complete_grid, evidence_grids); KV >= 0.9 on both -> rescue on the second."""
+    (no_complete_grid, evidence_grids); KV >= 0.9 on both -> rescue on the second. The
+    first tick takes one free GPU through the CRITICAL free-capacity exemption (2026-10-07)."""
     state = _state()
     e1, e2 = BASE + 3 * GRID, BASE + 4 * GRID
     first = _tick(state, _window(e1, [IDLE, IDLE, BURST], (0.0, 0.95)), awake=1)
     assert first.model_contexts["m"]["signal_hold_reason"] == "no_complete_grid"
-    assert not first.actions and first.model_contexts["m"]["saturation_reason"] == "o1_hold"
+    assert first.model_contexts["m"]["saturation_reason"] == "o1_hold" and _planned(first) == 1
+    assert any(e.startswith("receiver_o1_exempt_free_gpu:m:no_complete_grid:") for e in first.events)
     second = _tick(state, _window(e2, [IDLE, BURST, BURST], (0.0, 0.95)), awake=1)
     assert second.model_contexts["m"]["signal_hold_reason"] == "evidence_grids"
     assert second.classifications["m"].saturation_rescue and _planned(second) == 1
@@ -471,8 +473,9 @@ def test_partial_max_step_is_wired_from_the_registry_through_the_tick():
             planned.append(_planned(result))
         return planned
 
-    assert run(2.0) == [0, 0, 1]  # 4 completed in the 20 s suffix: +1 (rescue_low_evidence_step)
-    assert run(10.0) == [0, 0, 3]  # 20 completed: the whole deficit (capped by max_awake 4)
+    # The first two (held) ticks: one free-GPU step each (CRITICAL exemption, 2026-10-07).
+    assert run(2.0) == [1, 1, 1]  # 4 completed in the 20 s suffix: +1 (rescue_low_evidence_step)
+    assert run(10.0) == [1, 1, 3]  # 20 completed: the whole deficit (capped by max_awake 4)
 
 
 # ======================================================= review fixes (2026-10-02)

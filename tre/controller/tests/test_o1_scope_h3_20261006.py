@@ -2,9 +2,9 @@
 
 O1 holds a receiver after a breakpoint so a window that still describes the old regime
 does not over-scale it. On a free GPU an over-scale costs one wake: a CRITICAL receiver
-whose queue rose since the breakpoint (a post-breakpoint instant sample above the newest
-pre-breakpoint one) takes free capacity only, one step per decision. Donor steps, every
-scale-down, LOW receivers and a flat queue keep the hold.
+takes free capacity only, one step per decision, once its previous step is visible.
+Donor steps, every scale-down and LOW receivers keep the hold. 2026-10-07: the exemption
+no longer needs a queue rise (``o1_queue_rise`` is still measured and logged).
 """
 from __future__ import annotations
 
@@ -66,22 +66,6 @@ def test_critical_receiver_with_rising_queue_takes_a_free_gpu_despite_the_hold()
     assert any(e.startswith("receiver_o1_exempt_free_gpu:m:no_complete_grid:planned=1:bp=1000:q=80.0->120.0")
                for e in plan.events)
     assert not any(e.startswith("receiver_held_breakpoint_window:m") for e in plan.events)
-    # A landed earlier rescue target (covered <= routable) does not block the step.
-    landed = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2,
-                   bases={"m": RescueBasis(base=1, covered=2)})
-    assert _ups(landed) == 1
-
-
-def test_one_queue_rise_buys_one_wake_until_it_is_visible():
-    """Review P1-2: an earlier exempt step the routable count does not show yet, or a
-    fleet view older than the last action, holds the exempt receiver."""
-    unseen = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2,
-                   bases={"m": RescueBasis(base=2, covered=3)})
-    assert _ups(unseen) == 0
-    assert "receiver_held_breakpoint_window:m:no_complete_grid" in unseen.events
-    pending = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2,
-                    view_pending={"m": "up"})
-    assert _ups(pending) == 0
 
 
 def test_exempt_receiver_does_not_take_the_free_gpu_a_confirmed_receiver_needs():
@@ -137,10 +121,44 @@ def test_scale_down_and_low_receiver_after_a_breakpoint_stay_held():
     assert not plan.actions
 
 
-def test_flat_queue_keeps_the_hold_with_a_free_gpu():
-    plan = _plan({"m": _held(o1_queue_rise=None)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2)
-    assert _ups(plan) == 0
-    assert "receiver_held_breakpoint_window:m:no_complete_grid" in plan.events
+def test_critical_receiver_on_a_free_gpu_needs_no_queue_rise_one_wake_per_settled_step():
+    """2026-10-07 regression: after a wake the old pods' waiting drains while running
+    stays high, so a queue rise never showed and the CRITICAL receiver sat out 2 grids
+    with free GPUs. CRITICAL + free GPU + O1 evidence hold + no unsettled rescue target
+    -> one step, no rise needed. One stale window buys one wake: an earlier target O1
+    has not settled (landed or not) or a pending view -> pending, no second wake; once
+    settled the receiver acts again. LOW, a held (tokens_missing) context and a stale
+    scrape -> held."""
+    crit = {"m": (ModelState.CRITICAL, 0.05)}
+    for reason in ("no_complete_grid", "no_suffix", "evidence_grids", "evidence_tokens", "evidence_requests"):
+        plan = _plan({"m": _held(o1_queue_rise=None, signal_hold_reason=reason)}, crit, idle_gpus=2)
+        assert _ups(plan) == 1
+        assert any(e.startswith(f"receiver_o1_exempt_free_gpu:m:{reason}:planned=1:")
+                   and e.endswith(":queue_rise=no") for e in plan.events)
+        assert not any(e.startswith("receiver_held_breakpoint_window:m") for e in plan.events)
+    # The exempt wake 2 -> 3 landed (routable 3) but O1 has not settled it, or it is not
+    # visible yet, or the view predates the last action: no second wake.
+    landed = _plan({"m": _held(o1_queue_rise=None, routable_pods=3, awake_replicas=3, assigned_replicas=3)},
+                   crit, idle_gpus=1, bases={"m": RescueBasis(base=2, covered=3)})
+    unseen = _plan({"m": _held(o1_queue_rise=None)}, crit, idle_gpus=2, bases={"m": RescueBasis(base=2, covered=3)})
+    view = _plan({"m": _held(o1_queue_rise=None)}, crit, idle_gpus=2, view_pending={"m": "up"})
+    for pending in (landed, unseen, view):
+        assert _ups(pending) == 0
+        assert any(e.startswith("receiver_o1_exempt_pending:m:") for e in pending.events)
+        assert "receiver_held_breakpoint_window:m:no_complete_grid" in pending.events
+    # Settled (``_rescue_bases`` drops the target): warm -> the normal TSS rescue.
+    settled = _plan({"m": _held(signal_warm=True, signal_full_window=True, signal_hold_reason=None,
+                                routable_pods=3, awake_replicas=3, assigned_replicas=3)},
+                    crit, idle_gpus=1)
+    assert _ups(settled) == 1
+    assert not any(e.startswith(("receiver_o1_exempt", "receiver_held_breakpoint_window")) for e in settled.events)
+    for reason in ("tokens_missing", "scrape_stale", None):
+        stale = _plan({"m": _held(o1_queue_rise=None, signal_hold_reason=reason)}, crit, idle_gpus=2)
+        assert _ups(stale) == 0
+        assert not any(e.startswith("receiver_o1_exempt") for e in stale.events)
+    low = _plan({"m": _held(o1_queue_rise=None)}, {"m": (ModelState.LOW, 0.9)}, idle_gpus=2)
+    assert _ups(low) == 0
+    assert "receiver_held_breakpoint_window:m:no_complete_grid" in low.events
 
 
 def _pods(end: int, samples: dict[str, tuple[float, float]]) -> dict[str, PodWindowMetrics]:
@@ -181,11 +199,9 @@ def test_tick_measures_the_queue_rise_from_samples_after_the_breakpoint():
     assert [(a.model, a.delta) for a in rising.actions if isinstance(a, ScaleAction)] == [("m", 1)]
     assert any(e.startswith("receiver_o1_exempt_free_gpu:m:") for e in rising.events)
 
-    # The added replica absorbs the load: q 82.5 -> 56.25, waiting 20 -> 10 - held.
+    # The added replica absorbs the load: q 82.5 -> 56.25, waiting 20 -> 10 - no rise.
     flat = _after_scale_up({"m-0": (20.0, 10.0), "m-1": (10.0, 0.0)})
     assert flat.model_contexts["m"]["o1_queue_rise"] is None
-    assert not [a for a in flat.actions if isinstance(a, ScaleAction)]
-    assert "receiver_held_breakpoint_window:m:no_complete_grid" in flat.events
 
 
 def test_queue_rise_counts_only_pods_of_both_samples_and_ignores_jitter():
@@ -193,7 +209,6 @@ def test_queue_rise_counts_only_pods_of_both_samples_and_ignores_jitter():
     waiting fell; a flat queue that jitters by one request is no rise either."""
     woke = _after_scale_up({"m-0": (30.0, 15.0), "m-1": (40.0, 0.0)})
     assert woke.model_contexts["m"]["o1_queue_rise"] is None
-    assert not [a for a in woke.actions if isinstance(a, ScaleAction)]
 
     noisy = _after_scale_up({"m-0": (31.0, 21.0), "m-1": (0.0, 0.0)})
     assert noisy.model_contexts["m"]["o1_queue_rise"] is None

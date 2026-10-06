@@ -90,12 +90,28 @@ regime. On a free GPU such an over-scale costs one wake (slept again by a later 
 decision); waiting for 2 grids is then a timer in disguise (pilot E1 drift1: 8b held +36 ->
 +68 s at Z ~ 0.3, KV 1.0, free GPUs). A CRITICAL receiver whose `signal_warm` is false is
 **not held** when its queue rose since the breakpoint (`o1_queue_rise` in the tick
-context). It then takes **free capacity only** - its sleeping bindings on free GPUs, free
+context; **2026-10-07: no longer required**, see below). It then takes **free capacity only** - its sleeping bindings on free GPUs, free
 slot groups (no donor, no middle-zone SafeScale probe, no TP same-slot shrink, no defrag) -
 and **one replica per decision** (`max(1, breakpoint_partial_max_step)`: Z is the held
-window's old-regime value). An earlier C1 target that has landed (covered <= routable)
-does not block it. Exempt receivers are planned after warm TSS and saturation receivers.
-Everything else keeps O1: steps from donors, every scale-down, LOW receivers, a flat queue.
+window's old-regime value). An earlier C1 rescue target O1 has not settled yet (the C1
+basis of `_rescue_bases`, landed or not), or a fleet view older than the last action, holds
+it (`receiver_o1_exempt_pending`): one stale window buys one wake (2026-10-07; before, a
+landed target released it and the next step re-asked the target from the new count with
+the old window's Z, climbing to `max_awake`). LOW sleeping-capacity wakes carry no rescue
+target and do not block it. Only the O1 evidence holds are exempt (`no_complete_grid`,
+`no_suffix`, `evidence_grids`, `evidence_tokens`, `evidence_requests`); a held context
+(`tokens_missing`), `scrape_stale` and a hold fallback stay held. Exempt receivers are planned
+after warm TSS and saturation receivers. Everything else keeps O1: steps from donors, every
+scale-down, LOW receivers.
+
+**2026-10-07: queue rise dropped from the exemption.** `queue_rise` compares `waiting` on
+the pods present in both samples only; after a wake the old pods' waiting drains to 0 while
+their running stays ~150/pod, so it could never hold after a wake and the receiver sat out
+the full 2 grids (~22 s) with free GPUs. At the hot-segment onset the window has no
+post-breakpoint sample (`no_complete_grid`), so it was None there too. A CRITICAL receiver
+on free capacity is now exempt whenever its previous step has settled. `o1_queue_rise` is
+still computed and logged (decision snapshot, the exempt event's `queue_rise=yes|no`); the
+paragraph below describes that measurement.
 
 *Queue rising* (state only, no timer): every O1-tracked read records the model's queue
 sample - the routable pods' (serving window minus hidden probe pods) newest gateway instant
@@ -113,7 +129,8 @@ takes precedence). Known false positive: right after a scale-up the new pods' ru
 count grows to its steady level, so `q` can rise while the fleet already copes; the cost
 is one wake on a free GPU, bounded by the one-step cap and `max_awake_replicas`.
 
-Events: `receiver_o1_exempt_free_gpu:<model>:<hold reason>:planned=<n>:bp=<ms>:q=<base>-><now>:waiting=<base>-><now>:sample_ms=<base>-><now>`
+Events: `receiver_o1_exempt_free_gpu:<model>:<hold reason>:planned=<n>:bp=<ms>:q=<base>-><now>:waiting=<base>-><now>:sample_ms=<base>-><now>:queue_rise=<yes|no>`
+(queue fields `none` without a rise)
 when the exemption planned a step; otherwise (no free capacity, nothing needed, no rescue
 this tick) the usual `receiver_held_breakpoint_window:<model>:<reason>`. Decision snapshot
 `model_states.<model>.o1_queue_rise` (when present).
