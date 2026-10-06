@@ -113,6 +113,16 @@ def test_request_wire_format_matches_v1(run):
     assert headers["x-stainless-retry-count"] == "0"
 
 
+def test_every_request_and_retry_carries_the_trace_request_id(run):
+    # The join key between the client's records and the reissue sidecar's log lines.
+    for t in run["traces"]:
+        reqs = _server_reqs(run, t.prompt)
+        assert reqs, t.request_id
+        for req in reqs:  # SDK retries resend it too
+            assert req["headers"]["x-tre-request-id"] == t.request_id
+            assert req["headers"]["x-request-id"] == t.request_id
+
+
 def test_null_max_output_tokens_falls_back_to_model_config(run):
     t = next(t for t in run["traces"] if t.request_id == "ok-0")  # max_output_tokens=None
     (req,) = _server_reqs(run, t.prompt)

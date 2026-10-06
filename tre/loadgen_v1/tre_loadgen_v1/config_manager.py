@@ -69,6 +69,9 @@ class ClientConfig:
     ignore_eos: bool = False
     # [v2] opt-in: 每个请求加 x-tre-bl-in-tokens 头 = 套 chat 模板后的 prompt token 数（默认关）
     send_in_tokens: bool = False
+    # [v2] 默认开: 每个请求加 x-request-id / x-tre-request-id 头 = trace 的 request_id
+    # （reissue sidecar 日志按它和客户端记录对齐）；--no-request-id-header 关
+    send_request_id: bool = True
     # [v2] 可选 {模型名: tokenizer 目录}；未给的模型按 tre_replayer.engine.model_tokenizer 的顺序解析
     # （TRE_TOKENIZER_PATHS、TRE_REGISTRY_PATH / /etc/tre/registry.yaml 的 weights_path）
     tokenizer_paths: Optional[Dict[str, str]] = None
@@ -310,6 +313,7 @@ class ConfigManager:
             max_retries=client_dict.get('max_retries', 2),
             ignore_eos=bool(client_dict.get('ignore_eos', False)),
             send_in_tokens=bool(client_dict.get('send_in_tokens', False)),
+            send_request_id=bool(client_dict.get('send_request_id', True)),
             tokenizer_paths=client_dict.get('tokenizer_paths') or None
         )
 

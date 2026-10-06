@@ -746,9 +746,8 @@ data:
     \ line each\n        (with the request id) besides the rate-limited WARNING.\"\
     \"\"\n        error = f\"{type(exc).__name__}: {exc}\"[:300]\n        if account:\n\
     \            self._account(\"failed\", \"upstream_unavailable\", request, depth,\
-    \ error=error, status=status,\n                          request_id=request.headers.get(\"\
-    x-request-id\"))\n        if account or status == 503:  # not: a probe finding\
-    \ the engine not (yet) listening\n            self._warn(f\"upstream_{status}\"\
+    \ error=error, status=status)\n        if account or status == 503:  # not: a\
+    \ probe finding the engine not (yet) listening\n            self._warn(f\"upstream_{status}\"\
     , {\"event\": \"tre_upstream_unavailable\", \"status\": status,\n            \
     \                                  \"path\": request.path, \"error\": error})\n\
     \        if status == 503:\n            return _error(503, f\"local engine connection\
@@ -869,30 +868,31 @@ data:
     \ not 200 <= status < 300:\n            # The engine did not confirm: roll back\
     \ (a probe corrects it if it slept anyway).\n            if not state.active:\n\
     \                state.epoch += 1\n            self.metrics.event(\"sleep_failed\"\
-    )\n            _log({\"event\": \"tre_sleep_failed\", \"model\": cfg.model, \"\
-    pod\": cfg.pod_name, \"status\": status,\n                  \"error\": payload\
-    \ if status is None else None})\n            if status is None:\n            \
-    \    return _error(502, str(payload), \"BadGateway\")\n            return web.Response(body=payload,\
-    \ status=status, headers=headers)\n        if not state.sleeping:\n          \
-    \  state.sleeping = True\n        state.last_sleep = {\"ts\": started, \"path\"\
-    : request.path, \"query\": request.query_string,\n                           \
-    \ \"duration_s\": round(time.time() - started, 3)}\n        _log({\"event\": \"\
-    tre_sleep\", \"model\": cfg.model, \"pod\": cfg.pod_name, \"path\": request.path_qs,\n\
-    \              \"duration_s\": state.last_sleep[\"duration_s\"]})\n        return\
-    \ web.Response(body=payload, status=status, headers=headers)\n\n    async def\
-    \ _handle_wake(self, request: web.Request) -> web.StreamResponse:\n        state\
-    \ = self.state\n        body = await request.read()\n        state.waking += 1\n\
-    \        try:\n            status, payload, headers = await self._control_call(request,\
-    \ body, HOP_BY_HOP)\n        finally:\n            state.waking -= 1\n       \
-    \ if status is None:\n            return _error(502, str(payload), \"BadGateway\"\
-    )\n        if 200 <= status < 300:\n            state.sleeping = False\n     \
-    \       state.epoch += 1\n        return web.Response(body=payload, status=status,\
-    \ headers=headers)\n\n    async def _handle_is_sleeping(self, request: web.Request)\
-    \ -> web.StreamResponse:\n        \"\"\"Proxied /is_sleeping; its answer also\
-    \ re-syncs the sleeping mark.\"\"\"\n        epoch = self.state.epoch\n      \
-    \  try:\n            async with await self._local_request(\n                \"\
-    GET\", self.cfg.upstream_url + request.path_qs, headers=forward_headers(request.headers,\
-    \ HOP_BY_HOP),\n                timeout=self._timeout(self.cfg.proxy_timeout_s),\n\
+    )\n            _log({\"event\": \"tre_sleep_failed\", \"ts\": round(started, 3),\
+    \ \"model\": cfg.model, \"pod\": cfg.pod_name,\n                  \"status\":\
+    \ status, \"error\": payload if status is None else None,\n                  \"\
+    duration_s\": round(time.time() - started, 3)})\n            if status is None:\n\
+    \                return _error(502, str(payload), \"BadGateway\")\n          \
+    \  return web.Response(body=payload, status=status, headers=headers)\n       \
+    \ if not state.sleeping:\n            state.sleeping = True\n        state.last_sleep\
+    \ = {\"ts\": started, \"path\": request.path, \"query\": request.query_string,\n\
+    \                            \"duration_s\": round(time.time() - started, 3)}\n\
+    \        _log({\"event\": \"tre_sleep\", \"ts\": round(started, 3), \"model\"\
+    : cfg.model, \"pod\": cfg.pod_name,\n              \"path\": request.path_qs,\
+    \ \"duration_s\": state.last_sleep[\"duration_s\"]})\n        return web.Response(body=payload,\
+    \ status=status, headers=headers)\n\n    async def _handle_wake(self, request:\
+    \ web.Request) -> web.StreamResponse:\n        state = self.state\n        body\
+    \ = await request.read()\n        state.waking += 1\n        try:\n          \
+    \  status, payload, headers = await self._control_call(request, body, HOP_BY_HOP)\n\
+    \        finally:\n            state.waking -= 1\n        if status is None:\n\
+    \            return _error(502, str(payload), \"BadGateway\")\n        if 200\
+    \ <= status < 300:\n            state.sleeping = False\n            state.epoch\
+    \ += 1\n        return web.Response(body=payload, status=status, headers=headers)\n\
+    \n    async def _handle_is_sleeping(self, request: web.Request) -> web.StreamResponse:\n\
+    \        \"\"\"Proxied /is_sleeping; its answer also re-syncs the sleeping mark.\"\
+    \"\"\n        epoch = self.state.epoch\n        try:\n            async with await\
+    \ self._local_request(\n                \"GET\", self.cfg.upstream_url + request.path_qs,\
+    \ headers=forward_headers(request.headers, HOP_BY_HOP),\n                timeout=self._timeout(self.cfg.proxy_timeout_s),\n\
     \            ) as resp:\n                payload, status, headers = await resp.read(),\
     \ resp.status, response_headers(resp.headers)\n        except asyncio.TimeoutError:\n\
     \            return _error(504, \"upstream timed out\", \"GatewayTimeout\")\n\
@@ -1131,9 +1131,10 @@ data:
     \ processing / write counts as relay\n        time; the continuation request through\
     \ the gateway is upstream time.\"\"\"\n        cfg = self.cfg\n        chat =\
     \ path == cfg.chat_path\n        added = added or AddedTime()\n        t_abort\
-    \ = time.monotonic()\n        generated = len(abort.generated_ids or ())\n   \
-    \     prompt_tokens = (first_usage or {}).get(\"prompt_tokens\")\n        if not\
-    \ isinstance(prompt_tokens, int):\n            prompt_tokens = len(abort.prompt_ids\
+    \ = time.monotonic()\n        abort_ts = round(time.time(), 3)  # log field: the\
+    \ moment gap_ms is measured from\n        generated = len(abort.generated_ids\
+    \ or ())\n        prompt_tokens = (first_usage or {}).get(\"prompt_tokens\")\n\
+    \        if not isinstance(prompt_tokens, int):\n            prompt_tokens = len(abort.prompt_ids\
     \ or ())\n        wants_usage = bool((body.get(\"stream_options\") or {}).get(\"\
     include_usage\"))\n        base = {k: abort.obj.get(k) for k in (\"id\", \"object\"\
     , \"created\", \"model\")}\n        include = bool(body.get(\"include_stop_str_in_output\"\
@@ -1168,9 +1169,9 @@ data:
     \ text, \"length\") | {cfg.continued_field: 0}))\n            await self._finish_stream(request,\
     \ client, parts, base, merged_usage(prompt_tokens, generated, None),\n       \
     \                               wants_usage, 0)\n            self._account(\"\
-    continue\", \"budget_spent\", request, depth, generated=generated)\n         \
-    \   return\n        cont_resp = None\n        attempts = 0\n        error = plan_error\n\
-    \        if plan is not None:\n            headers = self._gateway_headers(request,\
+    continue\", \"budget_spent\", request, depth, generated=generated, abort_ts=abort_ts)\n\
+    \            return\n        cont_resp = None\n        attempts = 0\n        error\
+    \ = plan_error\n        if plan is not None:\n            headers = self._gateway_headers(request,\
     \ model=body.get(\"model\"), depth=depth + 1)\n            headers[\"Content-Type\"\
     ] = \"application/json\"\n            cont_resp, attempts, error = await self._gateway_request(\n\
     \                \"POST\", plan.path, json.dumps(plan.body).encode(\"utf-8\"),\
@@ -1184,22 +1185,23 @@ data:
     \ base, merged_usage(prompt_tokens, generated, None),\n                      \
     \                wants_usage, None)\n            self._account(\"failed\", \"\
     continuation_unavailable\", request, depth, generated=generated,\n           \
-    \               attempts=attempts, error=error)\n            return\n        target\
-    \ = _target(cont_resp)\n        cont_usage: dict | None = None\n        cont_finish:\
-    \ str | None = None\n        segments = 1\n        gap_s: float | None = None\n\
-    \        pending_text = \"\"\n        consumed = 0\n        stopped_at_seam =\
-    \ False\n        cont_failed = False\n        error = \"\"\n        buf = b\"\"\
-    \n        try:\n            if parts:\n                await client.write(b\"\"\
-    .join(parts))\n                parts = []\n            try:\n                async\
-    \ for data in cont_resp.content.iter_any():\n                    added.start()\n\
-    \                    buf += data\n                    events, buf = split_events(buf)\n\
-    \                    out: list[bytes] = []\n                    for event in events:\n\
-    \                        obj = event_obj(event)\n                        if obj\
-    \ is None:\n                            continue  # [DONE], comments (a nested\
-    \ sidecar's), junk\n                        if \"error\" in obj and not obj.get(\"\
-    choices\"):\n                            cont_failed, error = True, f\"continuation\
-    \ error event: {str(obj.get('error'))[:200]}\"\n                            continue\n\
-    \                        if plan.as_chat:\n                            obj = completion_chunk_as_chat(obj,\
+    \               attempts=attempts, error=error, abort_ts=abort_ts)\n         \
+    \   return\n        target = _target(cont_resp)\n        cont_usage: dict | None\
+    \ = None\n        cont_finish: str | None = None\n        segments = 1\n     \
+    \   gap_s: float | None = None\n        pending_text = \"\"\n        consumed\
+    \ = 0\n        stopped_at_seam = False\n        cont_failed = False\n        error\
+    \ = \"\"\n        buf = b\"\"\n        try:\n            if parts:\n         \
+    \       await client.write(b\"\".join(parts))\n                parts = []\n  \
+    \          try:\n                async for data in cont_resp.content.iter_any():\n\
+    \                    added.start()\n                    buf += data\n        \
+    \            events, buf = split_events(buf)\n                    out: list[bytes]\
+    \ = []\n                    for event in events:\n                        obj\
+    \ = event_obj(event)\n                        if obj is None:\n              \
+    \              continue  # [DONE], comments (a nested sidecar's), junk\n     \
+    \                   if \"error\" in obj and not obj.get(\"choices\"):\n      \
+    \                      cont_failed, error = True, f\"continuation error event:\
+    \ {str(obj.get('error'))[:200]}\"\n                            continue\n    \
+    \                    if plan.as_chat:\n                            obj = completion_chunk_as_chat(obj,\
     \ stream=True)\n                        if is_usage_only(obj):\n             \
     \               cont_usage = obj[\"usage\"]\n                            continue\n\
     \                        nested = obj.pop(cfg.continued_field, None)\n       \
@@ -1249,26 +1251,27 @@ data:
     \ completing a seam stop.\n                await client.write(b\"\".join(flush_pending()))\n\
     \                held_sent = True\n        except ConnectionResetError:\n    \
     \        cont_resp.close()\n            self._account(\"passthrough_abort\", \"\
-    client_gone\", request, depth, generated=generated, target=target)\n         \
-    \   return\n        finally:\n            cont_resp.release()\n        if stopped_at_seam:\n\
-    \            self.metrics.event(\"stop_at_seam\")\n            cont_usage = {\"\
-    completion_tokens\": consumed}\n        if gap_s is not None:\n            self.metrics.gap[\"\
-    stream\"].observe(gap_s)\n        tail_parts: list[bytes] = []\n        if cont_failed\
-    \ or cont_finish is None or cont_finish == \"abort\":\n            outcome, reason\
-    \ = \"failed\", (\"continuation_aborted\" if cont_finish == \"abort\" else \"\
-    continuation_broken\")\n            if cont_finish is None:\n                #\
-    \ No finish chunk reached the client: close the stream as aborted.\n         \
-    \       tail_parts.append(sse(with_text(abort.obj, \"\" if held_sent else held,\
-    \ \"abort\")))\n        else:\n            outcome, reason = \"continue\", \"\
-    abort_sleep\"\n        await self._finish_stream(request, client, tail_parts,\
-    \ base,\n                                  merged_usage(prompt_tokens, generated,\
-    \ cont_usage), wants_usage,\n                                  segments if outcome\
-    \ == \"continue\" else None)\n        self._account(outcome, reason, request,\
-    \ depth, generated=generated, attempts=attempts, target=target,\n            \
-    \          gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam)\n\
-    \n    async def _finish_stream(self, request: web.Request, client: web.StreamResponse,\
-    \ parts: list[bytes],\n                             base: dict, usage: dict, wants_usage:\
-    \ bool, segments: int | None) -> None:\n        if wants_usage:\n            parts.append(sse(dict(base,\
+    client_gone\", request, depth, generated=generated, target=target,\n         \
+    \                 abort_ts=abort_ts)\n            return\n        finally:\n \
+    \           cont_resp.release()\n        if stopped_at_seam:\n            self.metrics.event(\"\
+    stop_at_seam\")\n            cont_usage = {\"completion_tokens\": consumed}\n\
+    \        if gap_s is not None:\n            self.metrics.gap[\"stream\"].observe(gap_s)\n\
+    \        tail_parts: list[bytes] = []\n        if cont_failed or cont_finish is\
+    \ None or cont_finish == \"abort\":\n            outcome, reason = \"failed\"\
+    , (\"continuation_aborted\" if cont_finish == \"abort\" else \"continuation_broken\"\
+    )\n            if cont_finish is None:\n                # No finish chunk reached\
+    \ the client: close the stream as aborted.\n                tail_parts.append(sse(with_text(abort.obj,\
+    \ \"\" if held_sent else held, \"abort\")))\n        else:\n            outcome,\
+    \ reason = \"continue\", \"abort_sleep\"\n        await self._finish_stream(request,\
+    \ client, tail_parts, base,\n                                  merged_usage(prompt_tokens,\
+    \ generated, cont_usage), wants_usage,\n                                  segments\
+    \ if outcome == \"continue\" else None)\n        self._account(outcome, reason,\
+    \ request, depth, generated=generated, attempts=attempts, target=target,\n   \
+    \                   gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam,\n\
+    \                      abort_ts=abort_ts)\n\n    async def _finish_stream(self,\
+    \ request: web.Request, client: web.StreamResponse, parts: list[bytes],\n    \
+    \                         base: dict, usage: dict, wants_usage: bool, segments:\
+    \ int | None) -> None:\n        if wants_usage:\n            parts.append(sse(dict(base,\
     \ choices=[], usage=usage)))\n        if segments:\n            parts.append(f\"\
     : {self.cfg.continued_header}: {segments}\\n\\n\".encode())\n        parts.append(SSE_DONE)\n\
     \        try:\n            await client.write(b\"\".join(parts))\n           \
@@ -1314,21 +1317,22 @@ data:
     \                max_model_len=self._max_model_len or await self._fetch_max_model_len(),\
     \ cfg=cfg,\n            )\n            error = \"\"\n        except ValueError\
     \ as exc:\n            plan, error = None, str(exc)\n        t_abort = time.monotonic()\n\
-    \        if plan is None and not error:\n            _set_choice(merged, chat,\
-    \ first_text, \"length\", None)\n            merged[\"usage\"] = merged_usage(prompt_tokens,\
+    \        abort_ts = round(time.time(), 3)  # log field: the moment gap_ms is measured\
+    \ from\n        if plan is None and not error:\n            _set_choice(merged,\
+    \ chat, first_text, \"length\", None)\n            merged[\"usage\"] = merged_usage(prompt_tokens,\
     \ generated, None)\n            self._account(\"continue\", \"budget_spent\",\
-    \ request, depth, generated=generated)\n            return web.json_response(merged,\
-    \ headers={cfg.continued_header: \"0\"})\n        second = None\n        attempts\
-    \ = 0\n        target = \"\"\n        nested = 0\n        if plan is not None:\n\
-    \            gw_headers = self._gateway_headers(request, model=body.get(\"model\"\
-    ), depth=depth + 1)\n            gw_headers[\"Content-Type\"] = \"application/json\"\
-    \n            added.stop()  # the continuation through the gateway is upstream\
-    \ time\n            cont_resp, attempts, error = await self._gateway_request(\n\
-    \                \"POST\", plan.path, json.dumps(plan.body).encode(\"utf-8\"),\
-    \ gw_headers\n            )\n            if cont_resp is None:\n             \
-    \   added.start()\n            else:\n                try:\n                 \
-    \   cont_payload = await cont_resp.read()\n                    target = _target(cont_resp)\n\
-    \                    nested = _int_header(cont_resp.headers.get(cfg.continued_header))\n\
+    \ request, depth, generated=generated, abort_ts=abort_ts)\n            return\
+    \ web.json_response(merged, headers={cfg.continued_header: \"0\"})\n        second\
+    \ = None\n        attempts = 0\n        target = \"\"\n        nested = 0\n  \
+    \      if plan is not None:\n            gw_headers = self._gateway_headers(request,\
+    \ model=body.get(\"model\"), depth=depth + 1)\n            gw_headers[\"Content-Type\"\
+    ] = \"application/json\"\n            added.stop()  # the continuation through\
+    \ the gateway is upstream time\n            cont_resp, attempts, error = await\
+    \ self._gateway_request(\n                \"POST\", plan.path, json.dumps(plan.body).encode(\"\
+    utf-8\"), gw_headers\n            )\n            if cont_resp is None:\n     \
+    \           added.start()\n            else:\n                try:\n         \
+    \           cont_payload = await cont_resp.read()\n                    target\
+    \ = _target(cont_resp)\n                    nested = _int_header(cont_resp.headers.get(cfg.continued_header))\n\
     \                    if cont_resp.status != 200:\n                        error\
     \ = f\"gateway HTTP {cont_resp.status}: {cont_payload[:300].decode('utf-8', 'replace')}\"\
     \n                    else:\n                        second = json.loads(cont_payload)\n\
@@ -1341,15 +1345,16 @@ data:
     \ is None or finish in (None, \"abort\"):\n            self._account(\"failed\"\
     , \"continuation_aborted\" if finish == \"abort\" else \"continuation_unavailable\"\
     ,\n                          request, depth, generated=generated, attempts=attempts,\
-    \ target=target, error=error)\n            return web.Response(body=payload, status=resp.status,\
-    \ headers=headers)\n        gap_s = time.monotonic() - t_abort\n        self.metrics.gap[\"\
-    nonstream\"].observe(gap_s)\n        second_text = second_choice.get(\"text\"\
-    ) if plan.as_chat or not chat else None\n        if second_text is None:\n   \
-    \         second_text = choice_text(second_choice, chat)\n        text = first_text\
-    \ + (second_text or \"\")\n        stop_reason = second_choice.get(\"stop_reason\"\
-    )\n        stop_at_seam = False\n        stops = stop_strings(body)\n        if\
-    \ stops:\n            window = max(len(s) for s in stops) - 1\n            tail_start\
-    \ = max(0, len(first_text) - window)\n            cut = find_seam_stop(first_text[tail_start:],\
+    \ target=target, error=error,\n                          abort_ts=abort_ts)\n\
+    \            return web.Response(body=payload, status=resp.status, headers=headers)\n\
+    \        gap_s = time.monotonic() - t_abort\n        self.metrics.gap[\"nonstream\"\
+    ].observe(gap_s)\n        second_text = second_choice.get(\"text\") if plan.as_chat\
+    \ or not chat else None\n        if second_text is None:\n            second_text\
+    \ = choice_text(second_choice, chat)\n        text = first_text + (second_text\
+    \ or \"\")\n        stop_reason = second_choice.get(\"stop_reason\")\n       \
+    \ stop_at_seam = False\n        stops = stop_strings(body)\n        if stops:\n\
+    \            window = max(len(s) for s in stops) - 1\n            tail_start =\
+    \ max(0, len(first_text) - window)\n            cut = find_seam_stop(first_text[tail_start:],\
     \ second_text or \"\", stops,\n                                 bool(body.get(\"\
     include_stop_str_in_output\")))\n            if cut is not None:\n           \
     \     text = first_text[:tail_start] + (first_text[tail_start:] + (second_text\
@@ -1360,44 +1365,56 @@ data:
     ] = merged_usage(prompt_tokens, generated, cont_usage)\n        segments = 1 +\
     \ nested\n        self._account(\"continue\", \"abort_sleep\", request, depth,\
     \ generated=generated, attempts=attempts,\n                      target=target,\
-    \ gap_ms=_ms(gap_s), segments=segments, stop_at_seam=stop_at_seam)\n        return\
-    \ web.json_response(merged, headers={cfg.continued_header: str(segments)})\n\n\
-    \    # ------------------------------------------------------------------ logging\n\
-    \n    def _scrub(self, obj: dict) -> None:\n        \"\"\"Drop the abort-only\
-    \ token-id fields of the fork from a chunk the client sees.\"\"\"\n        cfg\
-    \ = self.cfg\n        obj.pop(cfg.prompt_ids_field, None)\n        for choice\
-    \ in obj.get(\"choices\") or ():\n            if isinstance(choice, dict):\n \
-    \               choice.pop(cfg.generated_ids_field, None)\n                choice.pop(cfg.prompt_ids_field,\
-    \ None)\n\n    def _account(self, kind: str, reason: str, request: web.Request,\
-    \ depth: int, **extra: Any) -> None:\n        request.pop(_REISSUE_PENDING, None)\n\
-    \        self.metrics.count(kind, reason)\n        record = {\"event\": \"tre_reissue\"\
-    , \"ts\": round(time.time(), 3), \"model\": self.cfg.model,\n                \
-    \  \"pod\": self.cfg.pod_name, \"kind\": kind, \"reason\": reason, \"path\": request.path,\
-    \ \"depth\": depth}\n        for key, value in extra.items():\n            if\
-    \ value is None or value == \"\" or value is False:\n                continue\n\
-    \            record[key] = value\n        _log(record)\n\n\ndef _ms(seconds: float\
-    \ | None) -> float | None:\n    \"\"\"Log field ``gap_ms`` (abort -> first continuation\
-    \ token, milliseconds). Logs written\n    before 2026-09-30 carry the same millisecond\
-    \ value under the misleading name\n    ``gap_s``; readers of old logs must treat\
-    \ ``gap_s`` as milliseconds too. The metric\n    ``tre_reissue_gap_seconds`` is\
-    \ (and was) in seconds.\"\"\"\n    return None if seconds is None else round(seconds\
-    \ * 1000.0, 1)\n\n\ndef _strip_ids(obj: dict, cfg: Config, body: dict) -> dict:\n\
-    \    \"\"\"The aborted response without the token-id fields the fork added for\
-    \ us (kept\n    when the client asked for them with return_token_ids).\"\"\"\n\
-    \    merged = dict(obj)\n    if body.get(\"return_token_ids\"):\n        return\
-    \ merged\n    merged.pop(cfg.prompt_ids_field, None)\n    choices = []\n    for\
-    \ choice in obj.get(\"choices\") or ():\n        if isinstance(choice, dict):\n\
-    \            choice = {k: v for k, v in choice.items()\n                     \
-    \ if k not in (cfg.prompt_ids_field, cfg.token_ids_field, cfg.generated_ids_field)}\n\
-    \        choices.append(choice)\n    merged[\"choices\"] = choices\n    return\
-    \ merged\n\n\ndef _set_choice(obj: dict, chat: bool, text: str, finish: str |\
-    \ None, stop_reason: Any) -> None:\n    choices = obj.get(\"choices\") or [{\"\
-    index\": 0}]\n    choice = dict(choices[0])\n    if chat:\n        message = dict(choice.get(\"\
-    message\") or {\"role\": \"assistant\"})\n        message[\"content\"] = text\n\
-    \        choice[\"message\"] = message\n    else:\n        choice[\"text\"] =\
-    \ text\n    choice[\"finish_reason\"] = finish\n    choice[\"stop_reason\"] =\
-    \ stop_reason\n    obj[\"choices\"] = [choice] + list(choices[1:])\n\n\ndef _is_sleeping_payload(payload:\
-    \ bytes, error_type: str) -> bool:\n    try:\n        return is_sleeping_error(json.loads(payload),\
+    \ gap_ms=_ms(gap_s), segments=segments, stop_at_seam=stop_at_seam,\n         \
+    \             abort_ts=abort_ts)\n        return web.json_response(merged, headers={cfg.continued_header:\
+    \ str(segments)})\n\n    # ------------------------------------------------------------------\
+    \ logging\n\n    def _scrub(self, obj: dict) -> None:\n        \"\"\"Drop the\
+    \ abort-only token-id fields of the fork from a chunk the client sees.\"\"\"\n\
+    \        cfg = self.cfg\n        obj.pop(cfg.prompt_ids_field, None)\n       \
+    \ for choice in obj.get(\"choices\") or ():\n            if isinstance(choice,\
+    \ dict):\n                choice.pop(cfg.generated_ids_field, None)\n        \
+    \        choice.pop(cfg.prompt_ids_field, None)\n\n    def _account(self, kind:\
+    \ str, reason: str, request: web.Request, depth: int, **extra: Any) -> None:\n\
+    \        \"\"\"One ``tre_reissue`` log line. ``ts`` = when it is written (for\
+    \ a continuation:\n        its end); ``abort_ts`` (continuations only) = the abort\
+    \ moment ``gap_ms`` starts\n        from; ``request_id`` = the client's ``x-tre-request-id``\
+    \ (else ``x-request-id``),\n        the key that joins this line to the client's\
+    \ own record.\"\"\"\n        request.pop(_REISSUE_PENDING, None)\n        self.metrics.count(kind,\
+    \ reason)\n        record = {\"event\": \"tre_reissue\", \"ts\": round(time.time(),\
+    \ 3), \"model\": self.cfg.model,\n                  \"pod\": self.cfg.pod_name,\
+    \ \"kind\": kind, \"reason\": reason, \"path\": request.path, \"depth\": depth}\n\
+    \        if extra.get(\"request_id\") is None:\n            extra[\"request_id\"\
+    ] = request_id_of(request.headers)\n        for key, value in extra.items():\n\
+    \            if value is None or value == \"\" or value is False:\n          \
+    \      continue\n            record[key] = value\n        _log(record)\n\n\n#:\
+    \ The client's request id: ours first (Envoy may overwrite x-request-id on external\n\
+    #: requests and never touches this one), then the generic one.\nREQUEST_ID_HEADERS\
+    \ = (\"x-tre-request-id\", \"x-request-id\")\n\n\ndef request_id_of(headers: Any)\
+    \ -> str | None:\n    for name in REQUEST_ID_HEADERS:\n        value = (headers.get(name)\
+    \ or \"\").strip()\n        if value:\n            return value\n    return None\n\
+    \n\ndef _ms(seconds: float | None) -> float | None:\n    \"\"\"Log field ``gap_ms``\
+    \ (abort -> first continuation token, milliseconds). Logs written\n    before\
+    \ 2026-09-30 carry the same millisecond value under the misleading name\n    ``gap_s``;\
+    \ readers of old logs must treat ``gap_s`` as milliseconds too. The metric\n \
+    \   ``tre_reissue_gap_seconds`` is (and was) in seconds.\"\"\"\n    return None\
+    \ if seconds is None else round(seconds * 1000.0, 1)\n\n\ndef _strip_ids(obj:\
+    \ dict, cfg: Config, body: dict) -> dict:\n    \"\"\"The aborted response without\
+    \ the token-id fields the fork added for us (kept\n    when the client asked for\
+    \ them with return_token_ids).\"\"\"\n    merged = dict(obj)\n    if body.get(\"\
+    return_token_ids\"):\n        return merged\n    merged.pop(cfg.prompt_ids_field,\
+    \ None)\n    choices = []\n    for choice in obj.get(\"choices\") or ():\n   \
+    \     if isinstance(choice, dict):\n            choice = {k: v for k, v in choice.items()\n\
+    \                      if k not in (cfg.prompt_ids_field, cfg.token_ids_field,\
+    \ cfg.generated_ids_field)}\n        choices.append(choice)\n    merged[\"choices\"\
+    ] = choices\n    return merged\n\n\ndef _set_choice(obj: dict, chat: bool, text:\
+    \ str, finish: str | None, stop_reason: Any) -> None:\n    choices = obj.get(\"\
+    choices\") or [{\"index\": 0}]\n    choice = dict(choices[0])\n    if chat:\n\
+    \        message = dict(choice.get(\"message\") or {\"role\": \"assistant\"})\n\
+    \        message[\"content\"] = text\n        choice[\"message\"] = message\n\
+    \    else:\n        choice[\"text\"] = text\n    choice[\"finish_reason\"] = finish\n\
+    \    choice[\"stop_reason\"] = stop_reason\n    obj[\"choices\"] = [choice] +\
+    \ list(choices[1:])\n\n\ndef _is_sleeping_payload(payload: bytes, error_type:\
+    \ str) -> bool:\n    try:\n        return is_sleeping_error(json.loads(payload),\
     \ error_type)\n    except ValueError:\n        return False\n\n\ndef _body_model(raw:\
     \ bytes) -> str | None:\n    try:\n        body = json.loads(raw)\n    except\
     \ ValueError:\n        return None\n    return body.get(\"model\") if isinstance(body,\

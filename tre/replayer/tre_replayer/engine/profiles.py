@@ -112,6 +112,16 @@ def fixed_length_timeout_s(max_tokens: int) -> float:
 V1_UNKNOWN_MODEL_PARAMS = {"max_tokens": 128, "temperature": 0.0}
 
 
+#: The request-id headers e1_v1 sends (``V1ChatOptions.send_request_id``); the sidecar
+#: reads ``x-tre-request-id`` first.
+REQUEST_ID_HEADER = "x-tre-request-id"
+REQUEST_ID_HEADERS = ("x-request-id", REQUEST_ID_HEADER)
+
+
+def request_id_headers(request_id: str) -> dict[str, str]:
+    return {name: str(request_id) for name in REQUEST_ID_HEADERS}
+
+
 @dataclass
 class V1ChatOptions:
     """The ``e1_v1`` request parameters - v1's config: per-model ``max_tokens`` /
@@ -134,10 +144,16 @@ class V1ChatOptions:
     #: exact templated prompt length (SDK ``extra_headers``), counted before the run
     #: (:mod:`tre_replayer.engine.in_tokens`); omitted for a request without a count.
     send_in_tokens: bool = False
+    #: Default on: send the trace's request id as ``x-request-id`` and
+    #: ``x-tre-request-id`` (SDK ``extra_headers``; Envoy may overwrite the first on an
+    #: external request, never the second), so the reissue sidecar's log lines join the
+    #: client's records by request id. Off: loadgen_v1 ``--no-request-id-header``.
+    send_request_id: bool = True
 
     def kwargs_for(self, model: str, prompt: str, max_output_tokens: Optional[int],
-                   in_tokens: Optional[int] = None) -> dict[str, Any]:
-        """``chat.completions.create`` keyword arguments, as v1 built them."""
+                   in_tokens: Optional[int] = None, request_id: Optional[str] = None) -> dict[str, Any]:
+        """``chat.completions.create`` keyword arguments, as v1 built them (plus the
+        opt-in / request-id headers)."""
         params = self.model_params.get(model)
         if params is None:
             params = V1_UNKNOWN_MODEL_PARAMS
@@ -157,10 +173,13 @@ class V1ChatOptions:
             kwargs["max_tokens"] = max_tokens
         if self.ignore_eos:
             kwargs["extra_body"] = {"ignore_eos": True}
+        headers: dict[str, str] = {}
         if self.send_in_tokens:
-            headers = header_for(in_tokens)
-            if headers:
-                kwargs["extra_headers"] = headers
+            headers.update(header_for(in_tokens) or {})
+        if self.send_request_id and request_id:
+            headers.update(request_id_headers(request_id))
+        if headers:
+            kwargs["extra_headers"] = headers
         return kwargs
 
     def as_dict(self) -> dict:

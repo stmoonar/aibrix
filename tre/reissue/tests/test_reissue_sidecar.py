@@ -381,6 +381,24 @@ async def test_continuation_log_line_reports_the_gap_in_milliseconds(stream, cap
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_continuation_log_line_joins_the_client_request_id(stream, capsys):
+    # x-tre-request-id wins over x-request-id (which Envoy may overwrite on the way in).
+    ids = {"x-tre-request-id": "req_000042", "x-request-id": "envoy-generated"}
+    async with Harness(a={"hold_at": 7}) as h:
+        status, _, _ = await h.post("/v1/completions", completion_body(24, stream=stream), headers=ids,
+                                    sleep_after=7)
+        assert status == 200
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    (cont,) = [r for r in records if r.get("event") == "tre_reissue" and r.get("kind") == "continue"]
+    assert cont["request_id"] == "req_000042"
+    (slept,) = [r for r in records if r.get("event") == "tre_sleep"]
+    # sleep start <= abort moment <= continuation end (all epoch seconds)
+    assert isinstance(slept["ts"], float) and isinstance(cont["abort_ts"], float)
+    assert slept["ts"] <= cont["abort_ts"] <= cont["ts"]
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_continued_as_token_id_completion():
     async with Harness(a={"hold_at": 5}) as h:
         body = chat_body(None, stream_options={"include_usage": False})  # no limit: max_model_len - prompt
