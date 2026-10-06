@@ -1,0 +1,8 @@
+# tracegen writes plans only under --out-root (outside the repo); never commit data here.
+*.csv
+*.npy
+design.json
+manifest.json
+traces_*.json
+audit.json
+audit.md

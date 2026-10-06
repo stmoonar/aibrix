@@ -1,34 +1,59 @@
 {
  "trace": "Real_conv",
  "duration_s": 720,
- "isolates": "non-periodic production load (Azure conv 2024 week): real arrivals and lengths",
+ "isolates": "non-periodic production load, built the v1 way (Real_conv_2023_slice_*_tok70; source is the Azure conv 2024 week)",
+ "seeds": [
+  1,
+  2,
+  3
+ ],
  "real": {
-  "dataset": "conv2024",
-  "offsets_s_by_seed": {
-   "1": 129600,
-   "2": 216000,
-   "3": 302400
+  "method": "v1",
+  "source": "v1_traces_v9",
+  "source_note": "v1 traces_v9 per-model files (v1 steps 1-3, v1's own requests and lengths); datasets/azure-llm-inference/v1-retrace/traces_v9; counts reproduced exactly from conv 2024 [118800,126000) s",
+  "slice_by_seed": {
+   "1": "Real_conv_2023_slice_a_tok70",
+   "2": "Real_conv_2023_slice_b_tok70",
+   "3": "Real_conv_2023_slice_c_tok70"
   },
-  "offset_rule": "first three weekdays (Mon-Wed) of the file at 12:00 UTC (file starts Sun 2024-05-12 00:00 UTC)",
-  "rho": {
-   "dsllama-8b": 1.43,
-   "dsqwen-7b": 1.11,
-   "dsqwen-14b": 0.98
+  "files_sha256": {
+   "Real_conv_2023_slice_a_tok70/dsllama-8b.json": "52a845224e53b041edf56bf4e03345f8d401bd3b006aa4b50968fbfe3cdb0f63",
+   "Real_conv_2023_slice_a_tok70/dsqwen-7b.json": "7959b65c23699e43eba052033954a51f42f33929b1a7c17229f49a8da49a9363",
+   "Real_conv_2023_slice_a_tok70/dsqwen-14b.json": "019dac2453130c74c739c420fa0a679c397874d38385deab49ddbf4f3b6130eb",
+   "Real_conv_2023_slice_b_tok70/dsllama-8b.json": "0e7113d291177e96496114caa0a9c8953673901afacf4d04799d64ea8b686216",
+   "Real_conv_2023_slice_b_tok70/dsqwen-7b.json": "e079fa179806e372358a73031e0883d6c1f8e1dc4904894650feed23bd874652",
+   "Real_conv_2023_slice_b_tok70/dsqwen-14b.json": "acf9c3560429abe96095a5c0454136262803572b593abedfb0537cab02e0fc3a",
+   "Real_conv_2023_slice_c_tok70/dsllama-8b.json": "9045aee805ef3712fa4fe5fc1e5fb233cdf7c2ea44215b9994aaff1fc3351a32",
+   "Real_conv_2023_slice_c_tok70/dsqwen-7b.json": "568331b34d71a8f97b3eadc1f9ca5759a505cb7c77bf8404e2ebc2fb92a28271",
+   "Real_conv_2023_slice_c_tok70/dsqwen-14b.json": "ad1d18020f6763ec08e9338ccb56175fad68f0958d5b73ed98a3d45b912734ce"
   },
-  "rho_rule": "v1 Real_conv mean-rho shares (1.15/0.89/0.78) scaled to mean G 4.5",
-  "in_min": 32
+  "v1_factor": {
+   "dsllama-8b": 4,
+   "dsqwen-7b": 4,
+   "dsqwen-14b": 4
+  },
+  "dup_jitter": [
+   0.85,
+   1.15
+  ],
+  "k_rule": {
+   "target_mean_g": 4.5,
+   "p99_30s_g_max": 6.8,
+   "rule": "one k per trace (factor_m = k x v1_factor_m, keeping v1's per-model ratios), solved so the mean over the trace's slices of the expected mean G is 4.5 (round 2 Real-* rule); p99 of 30 s G <= 6.8 checked by the audit. Deviation from v1: v1's factors were chosen after seeing results"
+  },
+  "k": 1.2083,
+  "k_solved": {
+   "by": "python3 -m tre_replayer.tracegen solve-k",
+   "mean_g_at_k": 4.467,
+   "mean_g_at_v1_factor": 3.725
+  }
  },
  "audit": {
   "hot": false,
   "r1a_stat": "p99",
   "r3_reference": "conv2024",
   "exempt": {
-   "R1b": "design: real slices are scaled to mean G 4.5 with p99 G <= 6.8 (design table: no static-sum target); static sum is reported, not judged"
+   "R1b": "design: real slices are scaled to mean G 4.5 with p99 G <= 6.8 (no static-sum target); static sum is reported, not judged"
   }
- },
- "seeds": [
-  1,
-  2,
-  3
- ]
+ }
 }

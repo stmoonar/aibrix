@@ -31,7 +31,8 @@ def main(argv=None) -> int:
     g.add_argument("--out-root", required=True, help="writes <out-root>/<trace>/seed<k>/")
     g.add_argument("--capacity")
     g.add_argument("--fits")
-    g.add_argument("--azure-csv", action="append", help="NAME=PATH for real slices")
+    g.add_argument("--azure-csv", "--source", action="append", dest="azure_csv",
+                   help="NAME=PATH of a dataset a real slice names (checked by sha256)")
 
     m = sub.add_parser("materialize", help="design -> traces_tre.effective.json (prompts) + verify")
     m.add_argument("run_dir", nargs="+")
@@ -54,6 +55,11 @@ def main(argv=None) -> int:
     c.add_argument("--config-root", required=True)
     c.add_argument("--capacity")
 
+    k = sub.add_parser("solve-k", help="v1-method real slice: the factor k for the spec's k_rule")
+    k.add_argument("--spec", required=True)
+    k.add_argument("--source", action="append", required=True, help="NAME=PATH")
+    k.add_argument("--capacity")
+
     n = sub.add_parser("link-names", help="<out root>/by-name/<trace>_s<k> -> ../<trace>/seed<k>")
     n.add_argument("out_root")
 
@@ -62,6 +68,12 @@ def main(argv=None) -> int:
         from .names import write_configs
         for f in write_configs(args.spec, args.config_root, args.capacity):
             print(f)
+        return 0
+    if args.cmd == "solve-k":
+        from .capacity import load_capacity
+        from .realv1 import solve_k
+        print(json.dumps(solve_k(json.loads(Path(args.spec).read_text()), load_capacity(args.capacity),
+                                 _kv(args.source)), indent=1))
         return 0
     if args.cmd == "link-names":
         from .names import link_names
@@ -79,6 +91,9 @@ def main(argv=None) -> int:
     if args.cmd == "generate":
         from .generate import generate
         spec = json.loads(Path(args.spec).read_text())
+        if spec.get("real", {}).get("hold"):
+            print(f"{spec['trace']}: skipped, on hold ({spec['real']['hold'][:80]}...)", file=sys.stderr)
+            return 0
         for seed in args.seed or spec["seeds"]:
             d = Path(args.out_root) / spec["trace"] / f"seed{seed}"
             man = generate(args.spec, seed, d, capacity_path=args.capacity, fits_path=args.fits,

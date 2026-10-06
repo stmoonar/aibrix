@@ -204,3 +204,37 @@ def test_every_spec_can_be_replayed_by_name(tmp_path):
         for k in spec["seeds"]:
             cfg = ConfigManager(str(committed / f"{t}_s{k}" / "config.yaml")).load_config()
             assert [m.name for m in cfg.models] == ["dsllama-8b", "dsqwen-7b", "dsqwen-14b"]
+
+
+def test_real_slices_scale_v1_seconds_by_one_factor_and_cap_outputs(tmp_path):
+    """v1 method: each second keeps its base requests and gets round(n * k * v1_factor) in all;
+    added ones are jittered copies of that second's requests; outputs above out_max are capped;
+    a source file with another sha256 is refused."""
+    from collections import Counter
+    from tre_replayer.tracegen import azure
+    from tre_replayer.tracegen.capacity import load_capacity
+    cap = load_capacity()
+    src = tmp_path / "v9" / "S"
+    src.mkdir(parents=True)
+    files = {}
+    for m in ("dsllama-8b", "dsqwen-7b", "dsqwen-14b"):
+        data = [{"start_time": s, "end_time": s + 1, "rps": 1 + s % 3,
+                 "requests": [{"input_tokens": 300 + 10 * j, "output_tokens": 100 if j else 9000}
+                              for j in range(1 + s % 3)]} for s in range(60)]
+        (src / f"{m}.json").write_text(json.dumps(data))
+        files[f"S/{m}.json"] = azure.sha256_file(src / f"{m}.json")
+    real = {"method": "v1", "source": "v1", "slice_by_seed": {"1": "S"}, "files_sha256": files,
+            "v1_factor": {"dsllama-8b": 4, "dsqwen-7b": 4, "dsqwen-14b": 2}, "k": 1.5,
+            "dup_jitter": [0.85, 1.15], "k_rule": {"target_mean_g": 4.5}}
+    spec = {"trace": "unitreal", "duration_s": 60, "real": real, "audit": {"hot": False}}
+    generate.generate(_write(tmp_path, spec), 1, tmp_path / "run", azure_csv={"v1": str(tmp_path / "v9")})
+    rows = json.loads((tmp_path / "run/design.json").read_text())
+    for m, f in (("dsqwen-7b", 6.0), ("dsqwen-14b", 3.0)):
+        got = Counter(int(r["timestamp"]) for r in rows if r["model_name"] == m)
+        assert all(got[s] == round((1 + s % 3) * f) for s in range(60))
+        ins = [r["prompt_length"] for r in rows if r["model_name"] == m and int(r["timestamp"]) == 2]
+        assert {300, 310, 320} <= set(ins) and all(255 <= x <= 368 for x in ins)
+        assert max(r["max_output_tokens"] for r in rows if r["model_name"] == m) == cap.models[m].out_max
+    files["S/dsqwen-7b.json"] = "0" * 64
+    with pytest.raises(ValueError, match="sha256"):
+        generate.generate(_write(tmp_path, spec), 1, tmp_path / "run2", azure_csv={"v1": str(tmp_path / "v9")})
