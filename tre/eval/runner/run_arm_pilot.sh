@@ -46,6 +46,11 @@
 #         trace gets a _s<seed> trace directory;  G6/G7 clock_offsets.json + components.json at arm
 #         start and end (node of every TRE component, image IDs from pod status on all nodes);
 #      G9 sm.ts.log = SM log with kubelet timestamps (uvicorn access lines get a time).
+#  12. (2026-10-07, run_campaign.sh) optional per-arm overrides set by the campaign runner (unset =
+#      unchanged behaviour): ARM_TRACE_DIR (trace directory, else $ICSE/<NAME>), ARM_LOADGEN_CONFIG
+#      (loadgen config, else $LOADGEN_CONFIG_ROOT/<NAME>/config.yaml), ARM_OUT_DIR (result directory,
+#      else $PILOT_ROOT/<trace>[_s<seed>]/<arm>[-tag]), ARM_LABEL_OVERRIDE (arm_label, e.g. a PreServe
+#      variant) and ARM_VARIANT (the campaign arm id, recorded in arm_meta.json).
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
@@ -60,6 +65,7 @@ case "$ARM" in
   preserve) ARM_LABEL=PreServe-oracle; IS_BL=1 ;;
   *) echo "arm must be tre|apa|chiron|tokenscale|preserve" >&2; exit 2;;
 esac
+ARM_LABEL="${ARM_LABEL_OVERRIDE:-$ARM_LABEL}"
 # shellcheck source=lib_env.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_env.sh"   # runner.env: every site setting below
 need_env PILOT_ROOT TRE_DIR LOADGEN_TRE_DIR ICSE TRACE_FILE LOADGEN_CONFIG_ROOT GW MODELS BASELINE TRE_NS MODEL_NS APA_NS \
@@ -69,9 +75,9 @@ TOOLS="${TOOLS:-$RUNNER_DIR}"                       # this directory (sampler, s
 TRE="$TRE_DIR"                                      # deploy scripts (toggle, run mode, awake_ctl), baselines arm tool
 LG="$LOADGEN_TRE_DIR"                               # loadgen_v1 + replayer (the client); sha recorded
 IGNORE_EOS="${IGNORE_EOS:-1}"
-TRACE_DIR="$ICSE/$NAME"
+TRACE_DIR="${ARM_TRACE_DIR:-$ICSE/$NAME}"
 TRACE="$TRACE_DIR/$TRACE_FILE"                      # same request plan for every arm (as smoke-e1)
-CFG="$LOADGEN_CONFIG_ROOT/$NAME/config.yaml"
+CFG="${ARM_LOADGEN_CONFIG:-$LOADGEN_CONFIG_ROOT/$NAME/config.yaml}"
 # G13: the trace seed (TRACE_SEED, else the v2 generator manifest next to the trace); a seeded
 # trace's results go to <trace>_s<seed>/ (unless the trace directory name already ends so).
 if [ -z "${TRACE_SEED:-}" ] && [ -f "$TRACE_DIR/${TRACE_SOURCE_MANIFEST:-manifest.json}" ]; then
@@ -80,7 +86,7 @@ fi
 TRACE_SEED="${TRACE_SEED:-}"
 OUT_NAME="$NAME"
 if [ -n "$TRACE_SEED" ]; then case "$NAME" in *_s"$TRACE_SEED") ;; *) OUT_NAME="${NAME}_s$TRACE_SEED" ;; esac; fi
-D=$PILOT_ROOT/$OUT_NAME/$ARM${RUN_TAG:+-$RUN_TAG}
+D="${ARM_OUT_DIR:-$PILOT_ROOT/$OUT_NAME/$ARM${RUN_TAG:+-$RUN_TAG}}"
 REQUIRE_MARKER="${REQUIRE_MARKER:-1}"
 IDLE_S="${IDLE_S:-60}"; POST_S="${POST_S:-30}"
 SCORE_REGISTRY="${SCORE_REGISTRY:-$D/live-registry.yaml}"   # default: the live registry recorded at arm start
@@ -261,8 +267,8 @@ kubectl -n "$TRE_NS" get cm tre-v2-registry -o jsonpath='{.data.registry\.yaml}'
 EV_BEFORE=$(events_get); EV_BEFORE=${EV_BEFORE:-UNSET}
 python3 -c 'import json,sys; json.dump(dict(arm=sys.argv[1], label=sys.argv[2], gw_parity=int(sys.argv[3]), events_wanted=int(sys.argv[4]),
   send_in_tokens=int(sys.argv[5]), events_before=sys.argv[6], bl_seed=int(sys.argv[7]), mark_at=sys.argv[8], bl_cm_file=sys.argv[9] or None,
-  trace_seed=sys.argv[11] or None, controller_mode="active" if sys.argv[1] == "tre" else "observe"),
-  open(sys.argv[10], "w"), indent=1)' "$ARM" "$ARM_LABEL" "$GW_PARITY" "$WANT_EVENTS" "$SEND_IN_TOKENS" "$EV_BEFORE" "$BL_SEED" "$MARK_AT" "$BL_CM_FILE" "$D/arm_meta.json" "$TRACE_SEED"
+  trace_seed=sys.argv[11] or None, controller_mode="active" if sys.argv[1] == "tre" else "observe", variant=sys.argv[12] or None),
+  open(sys.argv[10], "w"), indent=1)' "$ARM" "$ARM_LABEL" "$GW_PARITY" "$WANT_EVENTS" "$SEND_IN_TOKENS" "$EV_BEFORE" "$BL_SEED" "$MARK_AT" "$BL_CM_FILE" "$D/arm_meta.json" "$TRACE_SEED" "${ARM_VARIANT:-}"
 log "gateway parity: GW_PARITY=$GW_PARITY events_wanted=$WANT_EVENTS send_in_tokens=$SEND_IN_TOKENS (stream before: $EV_BEFORE)"
 if [ "$IS_BL" = 1 ]; then
   # policy ConfigMap: live content must be the frozen parameters (BL_CM_FILE) and no placeholder
