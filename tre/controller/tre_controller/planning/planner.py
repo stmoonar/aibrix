@@ -566,14 +566,16 @@ def build_plan(
     # the breakpoint.
     # H3 (2026-10-06): O1 guards against over-scaling on a window that still describes
     # the old regime. On a free GPU an over-scale costs one wake, so a CRITICAL receiver
-    # whose queue rose since the breakpoint (``o1_queue_rise``: a post-breakpoint
-    # instant sample above the pre-breakpoint one, tick ``_o1_queue_rise``) is not held:
-    # it takes free capacity only (its sleeping bindings on free GPUs, free slot groups;
-    # no donor, no SafeScale probe, no TP shrink, no defrag) and one step per decision.
-    # Without free capacity, a LOW receiver, or a flat queue: held as before.
+    # is not held: it takes free capacity only (its sleeping bindings on free GPUs, free
+    # slot groups; no donor, no SafeScale probe, no TP shrink, no defrag) and one step
+    # per decision, once its previous step is visible (``receiver_o1_exempt_pending``).
+    # 2026-10-07: no longer gated on ``o1_queue_rise`` (still computed, logged only):
+    # it compares ``waiting`` of the pods in both samples, and after a wake the old pods'
+    # waiting drains to 0 while running stays high, so it never held after a wake and
+    # the hold lasted 2 grids anyway. Without free capacity, or a LOW receiver: held.
     warmup_suppressed: list[str] = []
     breakpoint_held: list[str] = []
-    o1_exempt: dict[str, Mapping[str, Any]] = {}
+    o1_exempt: dict[str, Mapping[str, Any] | None] = {}
     kept: list = []
     for item in classifications:
         ctx = model_contexts.get(item.model_name, {})
@@ -584,9 +586,8 @@ def build_plan(
             continue
         if item.role == ModelRole.RECEIVER:
             if not ctx.get("signal_warm", True):
-                rise = ctx.get("o1_queue_rise")
-                if item.state == ModelState.CRITICAL and rise and ctx.get("signal_full_window") is False:
-                    o1_exempt[item.model_name] = rise
+                if item.state == ModelState.CRITICAL and ctx.get("signal_full_window") is False:
+                    o1_exempt[item.model_name] = ctx.get("o1_queue_rise")
                     kept.append(item)
                     continue
                 warmup_suppressed.append(item.model_name)
@@ -704,9 +705,8 @@ def build_plan(
                         f":view_pending={bool(view_pending and recv.model_name in view_pending)}"
                     )
                     return None
-                # The earlier target has landed (the routable count shows it) and the
-                # queue sampled after that breakpoint still rose: the evidence describes
-                # the current count, the step builds on it (the target is not re-asked).
+                # The earlier target has landed (the routable count shows it): the step
+                # builds on the current count (the target is not re-asked).
                 basis = None
             base = basis.base if basis is not None else recv_pods
             covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
@@ -733,7 +733,7 @@ def build_plan(
             if exempt:
                 # H3: Z is the held window's (old regime) value - one step per decision,
                 # like a thin partial window; each step is a new breakpoint, and the next
-                # needs a new post-breakpoint queue sample that still rises.
+                # waits until this one is visible (``receiver_o1_exempt_pending``).
                 raw_need = min(raw_need, max(1, cfg.partial_window_max_step))
             if raw_need <= 0:
                 if basis is not None:
@@ -2089,17 +2089,19 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
 
 
 def _o1_exempt_event(
-    model: str, model_contexts: Mapping[str, Any], rise: Mapping[str, Any], planned: int
+    model: str, model_contexts: Mapping[str, Any], rise: Mapping[str, Any] | None, planned: int
 ) -> str:
-    """H3: ``receiver_o1_exempt_free_gpu`` with its evidence (the hold it skipped, the
-    breakpoint, the pre / post-breakpoint queue samples)."""
+    """H3: ``receiver_o1_exempt_free_gpu`` with the hold it skipped, the breakpoint and
+    the queue-rise samples (log only, ``none`` when the queue did not rise)."""
     ctx = model_contexts.get(model) or {}
+    queue = rise or {}
     return (
         f"receiver_o1_exempt_free_gpu:{model}:{ctx.get('signal_hold_reason')}:planned={planned}"
-        f":bp={rise.get('breakpoint_ms')}"
-        f":q={_num_text(rise.get('base_q'), 1)}->{_num_text(rise.get('q'), 1)}"
-        f":waiting={_num_text(rise.get('base_waiting'))}->{_num_text(rise.get('waiting'))}"
-        f":sample_ms={rise.get('base_ms')}->{rise.get('sample_ms')}"
+        f":bp={queue.get('breakpoint_ms', ctx.get('signal_breakpoint_ms'))}"
+        f":q={_num_text(queue.get('base_q'), 1)}->{_num_text(queue.get('q'), 1)}"
+        f":waiting={_num_text(queue.get('base_waiting'))}->{_num_text(queue.get('waiting'))}"
+        f":sample_ms={queue.get('base_ms')}->{queue.get('sample_ms')}"
+        f":queue_rise={'yes' if rise else 'no'}"
     )
 
 

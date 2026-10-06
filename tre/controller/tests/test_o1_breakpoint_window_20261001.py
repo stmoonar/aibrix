@@ -544,14 +544,17 @@ def test_trickle_from_idle_never_scales_and_a_burst_scales_after_two_grids():
     trickle = [IDLE, IDLE, IDLE] + [TRICKLE] * 8
     # No guard at all: the filling window reads CRITICAL (the ADR-0013 failure).
     assert _run(SignalState(warmup_ms=0), trickle, registry)
-    # Pre-O1 guard and O1: no scale-up on a trickle.
+    # Pre-O1 guard: no scale-up on a trickle. O1 (2026-10-07): a CRITICAL receiver on a
+    # free GPU is not held, so the filling window's false CRITICAL costs one wake.
     assert _run(SignalState(warmup_ms=-1), trickle, registry) == []
-    assert _run(SignalState(warmup_ms=-1, breakpoint=O1), trickle, registry) == []
+    assert _run(SignalState(warmup_ms=-1, breakpoint=O1), trickle, registry) == [(onset, 1)]
 
     burst = [IDLE, IDLE, IDLE] + [BURST] * 6
     o1 = _run(SignalState(warmup_ms=-1, breakpoint=O1), burst, registry)
     legacy = _run(SignalState(warmup_ms=-1), burst, registry)
-    assert o1 and o1[0][0] == onset + 2 * GRID  # 20 s of evidence after the onset grid
+    # 2026-10-07: CRITICAL on a free GPU acts at the onset, one step per decision (this
+    # queue models no in-flight target, so every tick may step).
+    assert o1 and o1[0] == (onset, 1) and all(n == 1 for _, n in o1)
     assert legacy and legacy[0][0] == onset + 3 * GRID  # the whole window after the onset
     # The fallback switch restores the pre-O1 behaviour exactly.
     fallback = BreakpointWindowConfig(enabled=False, onset_guard=True, grid_ms=GRID)
@@ -706,7 +709,8 @@ def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
         run_rescue_tick(_snap(_window(end, ([IDLE] * 3 + [thin] * 3)[i - 2 : i + 1])), queue=queue,
                         registry=registry, signal_state=state)
     ups = _ups(queue.submitted)
-    assert ups and sum(a.delta for a in ups) == 1
+    # One step per decision (this queue models no in-flight target, so every tick may step).
+    assert ups and all(a.delta == 1 for a in ups)
     # A deep overload (Z = 0.10) with 10+ completions in the suffix: the whole deficit.
     DEEP = (1000.0, 30.0, 100.0, 100.0)
     state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(grid_ms=GRID))
@@ -715,7 +719,9 @@ def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
         end = 1_000_000 + (i + 1) * GRID
         run_rescue_tick(_snap(_window(end, ([IDLE] * 3 + [DEEP] * 3)[i - 2 : i + 1])), queue=queue,
                         registry=registry, signal_state=state)
-    assert sum(a.delta for a in _ups(queue.submitted)) == 3  # 1 -> 4 (scaling cap)
+    # Held ticks: +1 each (CRITICAL free-GPU exemption); the warm one the whole deficit,
+    # 1 -> 4 (scaling cap; this queue keeps routable at 1).
+    assert [a.delta for a in _ups(queue.submitted)] == [1, 1, 3]
 
 
 def test_starving_receiver_falls_back_to_the_whole_window_after_hold_max_windows():
@@ -812,7 +818,7 @@ def test_held_receiver_event_names_the_hold_reason():
     ctx = {"m": {"assigned_replicas": 1, "routable_pods": 1, "signal_warm": False,
                  "signal_full_window": False, "signal_hold_reason": "evidence_grids"}}
     plan = build_plan(model_contexts=ctx, classifications=[_cls("m", ModelState.CRITICAL, 0.5)],
-                      model_replicas={"m": 1}, idle_gpus=3, cfg=cfg)
+                      model_replicas={"m": 1}, idle_gpus=0, cfg=cfg)  # no free GPU: held
     assert "receiver_held_breakpoint_window:m:evidence_grids" in plan.events
     assert not any(e.startswith("receiver_suppressed_signal_warmup") for e in plan.events)
 
