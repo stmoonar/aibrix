@@ -76,6 +76,25 @@ class EffectiveWindow:
     numerator_scale: float = 1.0
     reason: str | None = None
 
+
+@dataclass(frozen=True)
+class QueueSample:
+    """A model's engine queue from its routable pods' newest gateway instant samples
+    (H3, 2026-10-06): ``q`` = sum of running + lambda_wait * waiting (the TSS queue term
+    on instant values, no qmin), ``waiting`` = sum of ``num_requests_waiting``,
+    ``sample_ms`` = the newest pod stamp (gateway grid boundary, at or before the scrape)."""
+
+    sample_ms: int
+    q: float
+    waiting: float
+    pods: int
+
+
+#: H3: queue samples kept per model (one per distinct stamp, ~10 s apart). A baseline
+#: older than this is gone: the receiver stays held, as before H3.
+QUEUE_SAMPLE_HISTORY = 8
+
+
 @dataclass
 class TRSInput:
     """Inputs of one window's TSS (the unified definition, ``tre_common.tss``).
@@ -416,6 +435,8 @@ class SignalState:
         # One EMA per (model, alternative signal), same tau/alpha as the TSS EMA
         # (plan §6.9 item 4); see tre_controller.signals.sources._thresholded_signal.
         self._signal_ema: dict[tuple[str, str], TssEma] = {}
+        # H3 (2026-10-06): model -> its recent QueueSamples, oldest first (queue_rise).
+        self._queue_samples: dict[str, list[QueueSample]] = {}
 
     def computer_for(self, model: str, *, ema_alpha: float, ema_tau_ms: float | None) -> TRSComputer:
         computer = self._by_model.get(model)
@@ -597,6 +618,52 @@ class SignalState:
         change = self._change_ms.get(model) if self._change_seen.get(model) else None
         points = [point for point in (self._onset_ms.get(model), change) if point is not None]
         return max(points) if points else None
+
+    def note_queue_sample(self, model: str, sample: QueueSample | None) -> None:
+        """Record ``model``'s queue sample of a window read (H3). One entry per stamp
+        (the rescue / fairness re-reads of a window replace it); an older stamp than the
+        newest kept is ignored."""
+        if sample is None:
+            return
+        history = self._queue_samples.setdefault(model, [])
+        if history and int(sample.sample_ms) < history[-1].sample_ms:
+            return
+        if history and int(sample.sample_ms) == history[-1].sample_ms:
+            history[-1] = sample
+        else:
+            history.append(sample)
+        del history[:-QUEUE_SAMPLE_HISTORY]
+
+    def queue_rise(
+        self, model: str, breakpoint_ms: int | None, current: QueueSample | None
+    ) -> dict[str, Any] | None:
+        """H3 "queue rising since the breakpoint": ``current`` - a sample of every
+        included pod taken after ``breakpoint_ms`` (stamp > breakpoint) - shows more
+        queue than the baseline, the newest recorded sample stamped at or before the
+        breakpoint: ``q`` higher or ``waiting`` higher (strictly). No baseline (history
+        too short, after a restart), no post-breakpoint sample, or not higher -> None.
+        State only: the samples the window reads already carry, no timer."""
+        if current is None or breakpoint_ms is None or int(current.sample_ms) <= int(breakpoint_ms):
+            return None
+        base = None
+        for sample in self._queue_samples.get(model, ()):
+            if sample.sample_ms <= int(breakpoint_ms):
+                base = sample
+        if base is None:
+            return None
+        if not (current.q > base.q or current.waiting > base.waiting):
+            return None
+        return {
+            "breakpoint_ms": int(breakpoint_ms),
+            "base_ms": base.sample_ms,
+            "base_q": base.q,
+            "base_waiting": base.waiting,
+            "base_pods": base.pods,
+            "sample_ms": int(current.sample_ms),
+            "q": current.q,
+            "waiting": current.waiting,
+            "pods": current.pods,
+        }
 
     def breakpoint_ms(self, model: str) -> int | None:
         """``max(traffic onset, last routable-count change)`` of ``model`` (O1)."""

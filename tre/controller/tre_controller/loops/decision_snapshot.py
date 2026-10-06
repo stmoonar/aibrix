@@ -183,6 +183,10 @@ def _model_states(
             # 2026-10-02: the SM replica floor view the planner bounded donors by.
             out[model]["floor"] = context.get("floor")
             out[model]["floor_headroom"] = context.get("floor_headroom")
+        if context.get("o1_queue_rise") is not None:
+            # H3 (2026-10-06): the queue evidence that exempts a CRITICAL receiver from
+            # the O1 hold on free capacity (pre / post-breakpoint samples).
+            out[model]["o1_queue_rise"] = dict(context["o1_queue_rise"])
         if "saturation_ticks" in context:
             # Onset saturation rescue (only with the tracker on): the latest-sample
             # engine gauges, the eligibility reason and the confirmed-window count.

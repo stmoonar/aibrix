@@ -46,7 +46,7 @@ from tre_controller.signals.saturation import (
     saturation_sample,
 )
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
-from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
+from tre_controller.signals.trs import QueueSample, SignalState, TRSComputer, TRSInput
 from tre_sm.allocator.slots import natural_key, release_order
 
 
@@ -136,6 +136,8 @@ class PaperStateCache:
                 "signal_evidence_requests": None,
                 # ... and never idle evidence (Q3: the O1 donor-hold exemption).
                 "window_idle": False,
+                # ... nor queue evidence (H3: the O1 receiver-hold exemption).
+                "o1_queue_rise": None,
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
@@ -1266,6 +1268,10 @@ def _model_contexts(
                         ),
                     }
                 )
+                context["o1_queue_rise"] = _o1_queue_rise(
+                    signal_state, model_name, metrics, spec, window, signal_warm,
+                    hidden_pods.get(model_name, ()),
+                )
         else:
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
             # not that the model is idle (a live idle pod reports zero-delta tokens, which is the
@@ -1352,6 +1358,53 @@ def _model_contexts(
             events.extend(model_events)
         contexts[model_name] = context
     return contexts, tuple(events)
+
+
+def _queue_sample(
+    metrics: ModelWindowMetrics, hidden_pods, fresh_after_ms: int, lambda_wait: float
+) -> QueueSample | None:
+    """H3: the routable pods' (serving window minus hidden probe pods) newest instant
+    samples stamped after ``fresh_after_ms``, as one :class:`QueueSample`."""
+    sample = saturation_sample(metrics, hidden_pods=hidden_pods, fresh_after_ms=fresh_after_ms)
+    if sample is None:
+        return None
+    return QueueSample(
+        sample_ms=int(sample.sample_ms),
+        q=float(sample.running) + float(lambda_wait) * float(sample.waiting),
+        waiting=float(sample.waiting),
+        pods=int(sample.pods),
+    )
+
+
+def _o1_queue_rise(
+    signal_state: SignalState,
+    model_name: str,
+    metrics: ModelWindowMetrics,
+    spec: ModelSpec,
+    window,
+    signal_warm: bool,
+    hidden_pods,
+) -> dict | None:
+    """H3 (2026-10-06): queue evidence for the O1 receiver-hold exemption (planner).
+
+    Every O1-tracked read records the window's queue sample (pods sampled in its last
+    grid) - the baselines. On a held window (``signal_warm`` False, breakpoint inside
+    the window) the current sample takes only pods sampled after the breakpoint and is
+    compared with the newest recorded sample at or before it
+    (:meth:`SignalState.queue_rise`). The instant gauges do not wait for completions, so
+    a sample after the breakpoint is evidence the token window cannot give yet."""
+    breakpoint = getattr(signal_state, "breakpoint", None)
+    grid = int(getattr(breakpoint, "grid_ms", 0) or 0)
+    if grid <= 0:
+        return None
+    end = int(metrics.window_end_ms)
+    lam = float(spec.trs.lambda_wait)
+    signal_state.note_queue_sample(model_name, _queue_sample(metrics, hidden_pods, end - grid, lam))
+    point = getattr(window, "breakpoint_ms", None)
+    if signal_warm or window is None or window.full or point is None:
+        return None
+    current = _queue_sample(metrics, hidden_pods, max(end - grid, int(point)), lam)
+    return signal_state.queue_rise(model_name, int(point), current)
 
 
 def _signal_theta(spec: ModelSpec, source: str) -> float | None:
