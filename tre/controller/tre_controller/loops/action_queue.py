@@ -164,6 +164,10 @@ class DispatchResult:
     #: (O1 / view-pending), recorded as the model's last action and counted for its
     #: rescue target.
     changed: tuple[str, ...] = ()
+    #: Review P2-2 (2026-10-06): a growth the SM filled in part (409 ``partial`` /
+    #: 200 ``unfilled``) that woke nothing (no ``wake`` action, nothing ``picked``):
+    #: the routable set did not change - no O1 / view-pending stamp.
+    woke_none: bool = False
 
 
 @dataclass
@@ -1527,7 +1531,8 @@ class ActionQueue:
         """O1 / view-pending stamps, after the SM answered: a failed or partial call may
         still have changed the routable set, so it is stamped too - except a call that
         certainly changed nothing (2026-10-02): a model-level shrink with ``taken: 0``,
-        a relay side without any pair, a refused / unsupported relay."""
+        a relay side without any pair, a refused / unsupported relay, a partial /
+        unfilled growth that woke nothing (review P2-2)."""
         now = int(self._now_ms())
 
         def stamp(target: str, direction: int, hold: str) -> None:
@@ -1545,6 +1550,8 @@ class ActionQueue:
             return
         if result.not_executed:
             return  # refused before any change (writer_busy, routable_unknown, ...)
+        if result.woke_none:
+            return  # a partial / unfilled growth that woke nothing (review P2-2)
         if isinstance(action, ScaleAction) and action.delta < 0 and result.ok and result.taken == 0:
             return  # the replica floor clamped the shrink to nothing: no change
         stamp(getattr(action, "model", model), _routable_direction(action), _view_hold_direction(action))
@@ -1633,7 +1640,10 @@ class ActionQueue:
             # never as "nothing happened"; not retried (relative), the planner re-plans.
             body = response.get("response") or {}
             self._refusal_events(action.model, body)  # "partial" is no WAKE_ERROR_CODE
-            return replace(result, retriable=False, changed=_woke(body), picked=tuple(body.get("picked") or ()))
+            woke, picked = _woke(body), tuple(body.get("picked") or ())
+            return replace(
+                result, retriable=False, changed=woke, picked=picked, woke_none=not (woke or picked)
+            )
         if action.delta >= 0 or not result.ok:
             return result
         body = response.get("response") or {}
@@ -1763,9 +1773,10 @@ class ActionQueue:
         unfilled = int(body.get("unfilled") or 0)
         if unfilled > 0:
             # What did wake is reported (``changed``): stamped and recorded as "up".
+            woke = _woke(body)
             return replace(
                 result, ok=False, error=f"partial: {unfilled} of {action.delta} wakes unfilled",
-                retriable=False, picked=picked, changed=_woke(body),
+                retriable=False, picked=picked, changed=woke, woke_none=not (woke or picked),
             )
         return replace(result, picked=picked)
 
@@ -1790,7 +1801,8 @@ class ActionQueue:
             )
         )
         self._refusal_events(action.model, body)
-        return replace(result, picked=tuple(body.get("picked") or ()))
+        picked = tuple(body.get("picked") or ())
+        return replace(result, picked=picked, woke_none=not (_woke(body) or picked))
 
     def _refusal_events(self, model: str, body: dict) -> None:
         """``refusals[]`` of a /target response: one ``wake_refused`` event each."""

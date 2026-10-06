@@ -303,3 +303,32 @@ def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
     assert result.changed == ("8b-2",) and len(result.picked) == 1
     assert queue.last_actions() == {"dsllama-8b": (5, "up")}
     assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]  # its refusals
+
+
+def test_a_partial_growth_that_woke_nothing_is_no_routable_change():
+    """Review P2-2: a 200 ``unfilled`` hinted wake / a 409 ``partial`` growth with no
+    wake and nothing picked did not change the routable set: no O1 / view stamp."""
+    from tre_controller.sm_client import ServiceManagerClient
+
+    class Unfilled:
+        async def scale_model_hinted(self, model, delta, *, hints):
+            return {"ok": True, "response": {"picked": [], "unfilled": 1, "actions": [], "refusals": [STRUCTURED]}}
+
+    queue = ActionQueue(Unfilled(), now_ms=lambda: 3)
+    queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
+    (result,) = asyncio.run(queue.drain_once())
+    assert result.ok is False and queue.routable_changes() == {} and queue.view_changes() == {}
+
+    body = dict(STRUCTURED, error="partial", reason="partial", unfilled=2, actions=[], picked=[],
+                refusals=[STRUCTURED])
+
+    class Transport:
+        async def request(self, method, url, *, json=None, timeout_s):
+            if method == "GET":
+                return {"models": {"dsllama-8b": {"awake": 1, "bound": 4}}}
+            raise ServiceManagerError("HTTP 409", status=409, body=body)
+
+    queue = ActionQueue(ServiceManagerClient("http://sm", transport=Transport()), now_ms=lambda: 5)
+    queue.submit([ScaleAction("dsllama-8b", 2, "critical_sleeping_capacity", "rescue")])
+    (result,) = asyncio.run(queue.drain_once())
+    assert result.ok is False and queue.routable_changes() == {} and queue.view_changes() == {}
