@@ -1,0 +1,51 @@
+# SENSITIVITY ROW "TokenScale-window10" (2026-10-06): the TokenScale-colocated parameters with a 10 s
+# lambda window (the code default; the paper gives no window length) instead of the main 30 s (= TRE's
+# TSS window; methodology 10-06: the window is fixed before results and not shorter than TRE's).
+# Everything except `window_s` is identical to the main ConfigMap.
+# Same ConfigMap name, so it replaces the main TokenScale parameters while applied:
+#   kubectl apply -f tre/deploy/baselines/tre/sensitivity/tokenscale-window10.yaml   # this row
+#   kubectl apply -f tre/deploy/baselines/tre/policy-configmaps.yaml                 # back to main
+# (the shell reads its parameters at start: apply before enabling the arm). Not part of the
+# kustomization on purpose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-tokenscale
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  tokenscale.yaml: |
+    bucket_edges:            # tools/tokenscale_buckets on the per-request hot alt schedule
+      dsqwen-7b: {in: [489, 494], out: [400, 400]}
+      dsllama-8b: {in: [493, 497], out: [400, 400]}
+      dsqwen-14b: {in: [489, 494], out: [400, 400]}
+    velocity:                # tok/s per replica at the KNEE of open-loop Poisson ladders (highest throughput
+                             # with a bounded waiting queue: slope(num_requests_waiting) <= 2 % x offered req/s);
+                             # V_b = (in+out) tok/s, in 492 / out 400; v_prefill = V_P = prefill tok/s, out = 1
+                             # (one cell, written to all nine). Closed-loop maxima: sensitivity/tokenscale-aggressive.yaml
+      dsqwen-7b:             # V_b at 10.885 req/s (1.05 x), V_P at 35.0 req/s
+        buckets:
+          - [9313.7, 9313.7, 9313.7]
+          - [9313.7, 9313.7, 9313.7]
+          - [9313.7, 9313.7, 9313.7]
+        v_prefill: 16819.9
+      dsllama-8b:            # V_b at 8.14 req/s (1.1 x), V_P at 33.3 req/s
+        buckets:
+          - [6929.6, 6929.6, 6929.6]
+          - [6929.6, 6929.6, 6929.6]
+          - [6929.6, 6929.6, 6929.6]
+        v_prefill: 16036.6
+      dsqwen-14b:            # V_b at 7.809 req/s (1.1 x), V_P at 27.8 req/s
+        buckets:
+          - [6648.8, 6648.8, 6648.8]
+          - [6648.8, 6648.8, 6648.8]
+          - [6648.8, 6648.8, 6648.8]
+        v_prefill: 13394.8
+    out_len_source: max_tokens
+    default_out_tokens: 256  # not in paper
+    misbucket_rate: 0.15     # paper: 85 %-accurate length predictor
+    seed: 0
+    skip_reissue: true
+    window_s: 10             # SENSITIVITY: the code default (not in paper); main runs: 30 (= TRE TSS window, policy-configmaps.yaml)
+    max_estimate_frac: 0.05  # not in paper

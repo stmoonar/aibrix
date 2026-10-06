@@ -43,5 +43,5 @@ data:
     misbucket_rate: 0.15     # paper: 85 %-accurate length predictor
     seed: 0
     skip_reissue: true
-    window_s: 10             # not in paper
+    window_s: 30             # = TRE TSS window (30 s); paper gives no value; 10 s code default = sensitivity/tokenscale-window10.yaml
     max_estimate_frac: 0.05  # not in paper
