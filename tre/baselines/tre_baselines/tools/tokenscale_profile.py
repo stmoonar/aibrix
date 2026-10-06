@@ -49,7 +49,7 @@ The SLO and c/b come from ``--registry`` or, by default, the live ConfigMap
 ``tre-v2/tre-v2-registry`` (read with ``kubectl get``); the source and the c/b used are
 written into ``profile.yaml``. Each model's ladders run in their own process.
 
-Open loop (``--open-loop``, decision 2026-10-06, PreServe mu only): a closed loop with a
+Open loop (``--open-loop``, decisions 2026-10-06): a closed loop with a
 constant output length runs in lockstep (every worker resends at once, so p95 TTFT measures
 a burst of ``c`` prefills) and biased mu low. With ``--open-loop`` each step instead offers
 Poisson arrivals at ``--base-rps[model] x factor`` (``--rate-factors``, default 0.3 ... 1.3)
@@ -59,7 +59,15 @@ counters between the end of the warm-up and the step end; p95 TTFT / TPOT are th
 the requests *sent* in that window (a failed request counts as infinite). mu = the
 highest rate passing both SLOs with at least ``--min-completed`` (150) such requests; a
 failing rate below a passing one is reported (``non_monotone_rates``: lengthen the steps).
-No velocity is written in this mode (V_b / V_P stay the closed-loop saturation peaks).
+TokenScale velocity at the knee: per step the tool also records the least-squares slope
+of the engine's ``vllm:num_requests_waiting`` over the measured window (1 Hz scrapes), its
+last / max value, the ``vllm:num_preemptions_total`` delta and the slope of the client-side
+queue (sent, no first token). A step's queue is bounded iff that waiting slope is <=
+``--knee-slope-frac`` (2 %) x the offered req/s; the knee is the highest-throughput bounded
+step (``bracketed`` says whether a higher rate was seen unbounded). V_b = (in+out) tok/s at
+the knee of the mixed ladder; V_P = prefill tok/s at the knee of an out=1 ladder
+(``--prefill-base-rps`` x ``--prefill-rate-factors``). ``--model-rate-factors`` overrides the
+mixed factors per model (``model=`` = none). The closed-loop maxima are a sensitivity row.
 
 Cost: (len(ladder) x 2) x step_s per model, models in parallel (default ~20 min).
 Sending needs ``--i-have-user-approval``; ``--dry-run`` uses a synthetic stub.
@@ -121,6 +129,15 @@ class StepMeasure:
     arrived: Optional[int] = None
     achieved_rps: Optional[float] = None
     failed: Optional[int] = None
+    #: Open loop only, over the measured window: least-squares slope (req/s) of the
+    #: engine's vllm:num_requests_waiting (1 Hz scrapes), its last / max value, the
+    #: vllm:num_preemptions_total delta, and the slope of the client-side queue (sent,
+    #: no first token yet; a cross-check that needs no engine gauge).
+    waiting_slope: Optional[float] = None
+    waiting_last: Optional[float] = None
+    waiting_max: Optional[float] = None
+    preemptions: Optional[float] = None
+    client_queue_slope: Optional[float] = None
 
     @property
     def tok_s(self) -> Optional[float]:
@@ -286,6 +303,65 @@ def steady_latencies(records: Sequence[dict], lo_ms: int, hi_ms: int) -> tuple[i
     return len(arrived), len(ok), ttft, tpot
 
 
+PREEMPT_COUNTER = "vllm:num_preemptions_total"
+WAITING_GAUGE = "vllm:num_requests_waiting"
+
+
+def slope(points: Sequence[tuple[float, float]]) -> Optional[float]:
+    """Least-squares slope of (t_s, y) points (None with fewer than 3 or no time spread)."""
+    pts = [(float(t), float(y)) for t, y in points if y is not None and math.isfinite(y)]
+    if len(pts) < 3:
+        return None
+    mt = sum(t for t, _ in pts) / len(pts)
+    my = sum(y for _, y in pts) / len(pts)
+    den = sum((t - mt) ** 2 for t, _ in pts)
+    return None if den <= 0 else sum((t - mt) * (y - my) for t, y in pts) / den
+
+
+def client_queue_series(records: Sequence[dict], lo_ms: int, hi_ms: int, step_ms: int = 1000) -> list[tuple[float, float]]:
+    """(t_s, requests sent but without a first token yet) every ``step_ms`` in [lo, hi]."""
+    out = []
+    for t in range(int(lo_ms), int(hi_ms) + 1, int(step_ms)):
+        q = sum(1 for r in records if r.get("send_ts_ms") is not None and r["send_ts_ms"] <= t
+                and (r.get("recv_first_token_ts_ms") is None or r["recv_first_token_ts_ms"] > t))
+        out.append(((t - lo_ms) / 1000.0, float(q)))
+    return out
+
+
+#: Knee rule (decision 2026-10-06, TokenScale V_b / V_P): a step's waiting queue is
+#: BOUNDED when the least-squares slope of vllm:num_requests_waiting over the measured
+#: window is at most this fraction of the offered rate (req/s per req/s). An overloaded
+#: step's queue grows at about (offered - served) req/s; on the 10-06 open-loop run the
+#: client-side queue grew at <= 0.2 % of the rate on every step below the knee and at
+#: >= 3.7 % above it, so 2 % separates them.
+DEFAULT_KNEE_SLOPE_FRAC = 0.02
+
+
+def queue_bounded(s: StepMeasure, slope_frac: float = DEFAULT_KNEE_SLOPE_FRAC) -> Optional[bool]:
+    """None when the step has no waiting series (no evidence either way)."""
+    if s.waiting_slope is None or s.rate_rps is None:
+        return None
+    return s.waiting_slope <= slope_frac * float(s.rate_rps)
+
+
+def knee(steps: Sequence[StepMeasure], rate: str = "tok_s", slope_frac: float = DEFAULT_KNEE_SLOPE_FRAC,
+         min_completed: int = 1) -> Optional[dict]:
+    """The highest ``rate`` (tok_s | prefill_tok_s) of a valid step whose waiting queue is
+    bounded, plus whether a higher offered rate was seen unbounded (``bracketed``; if not,
+    the knee may lie above the ladder)."""
+    ok = [s for s in steps if s.valid and getattr(s, rate) is not None and s.completed >= max(1, min_completed)
+          and queue_bounded(s, slope_frac)]
+    if not ok:
+        return None
+    best = max(ok, key=lambda s: getattr(s, rate))
+    above = [s for s in steps if s.rate_rps is not None and s.rate_rps > best.rate_rps
+             and queue_bounded(s, slope_frac) is False]
+    return {"value": round(getattr(best, rate), 1), "rate_rps": round(best.rate_rps, 3),
+            "achieved_rps": best.achieved_rps, "waiting_slope": best.waiting_slope,
+            "preemptions": best.preemptions, "bracketed": bool(above),
+            "first_unbounded_rps": round(min(s.rate_rps for s in above), 3) if above else None}
+
+
 #: Open-loop step: measure(model, in_tokens, out_tokens, rate_rps, step_s, warmup_s)
 OpenMeasure = Callable[[str, int, int, float, float, float], StepMeasure]
 
@@ -376,6 +452,22 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
             prefill, decode = engine_rates(a[1], b[1], window)
         arrived, completed, ttft, tpot = steady_latencies(records, lo, hi)
         span = (hi - lo) / 1000.0
+        waits = []
+        for ts, text in samples:
+            if lo <= ts <= hi:
+                w = counter_sum(text, WAITING_GAUGE)
+                if w is not None:
+                    waits.append(((ts - lo) / 1000.0, w))
+        w_slope = slope(waits)
+        preempt = None
+        if a is not None and b is not None:
+            pa, pb = counter_sum(a[1], PREEMPT_COUNTER), counter_sum(b[1], PREEMPT_COUNTER)
+            preempt = None if pa is None or pb is None or pb < pa else pb - pa
+        cq = slope(client_queue_series(records, lo, hi))
+        queue = dict(waiting_slope=None if w_slope is None else round(w_slope, 4),
+                     waiting_last=waits[-1][1] if waits else None,
+                     waiting_max=max((w for _, w in waits), default=None), preemptions=preempt,
+                     client_queue_slope=None if cq is None else round(cq, 4))
         notes = []
         notes.append(f"sender p99 lateness {guard.p99_delay_ms:.0f} ms")
         if guard.issues or guard.void_reasons:
@@ -386,10 +478,11 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
                 return StepMeasure(0, round(window, 3), completed, None, None, ttft, tpot, valid=False,
                                    note=f"fleet changed: expected {want}, a={view_a}, b={view_b}",
                                    rate_rps=float(rate_rps), arrived=arrived, failed=arrived - completed,
-                                   achieved_rps=round(arrived / span, 3) if span > 0 else None)
+                                   achieved_rps=round(arrived / span, 3) if span > 0 else None, **queue)
         return StepMeasure(0, round(window, 3), completed, prefill, decode, ttft, tpot,
                            note="; ".join(notes) or None, rate_rps=float(rate_rps), arrived=arrived,
-                           failed=arrived - completed, achieved_rps=round(arrived / span, 3) if span > 0 else None)
+                           failed=arrived - completed, achieved_rps=round(arrived / span, 3) if span > 0 else None,
+                           **queue)
 
     return measure
 
@@ -402,19 +495,39 @@ DEFAULT_OPEN_MIN_COMPLETED = 150
 
 def profile_model_open(measure: OpenMeasure, model: str, in_tokens: int, out_tokens: int, slo: Any, *,
                        base_rps: float, factors: Sequence[float], step_s: float, warmup_s: float,
-                       min_completed: int = DEFAULT_OPEN_MIN_COMPLETED) -> tuple[dict, list[dict]]:
-    """The open-loop rate ladder of one model -> ({mu, slo, ...}, raw rows)."""
-    steps: list[StepMeasure] = []
-    for f in factors:
-        steps.append(measure(model, in_tokens, out_tokens, float(base_rps) * float(f), step_s, warmup_s))
-        if not steps[-1].valid:
-            break
-    aborted = next((s.note for s in steps if not s.valid), None)
+                       min_completed: int = DEFAULT_OPEN_MIN_COMPLETED, prefill_base_rps: Optional[float] = None,
+                       prefill_factors: Sequence[float] = (),
+                       slope_frac: float = DEFAULT_KNEE_SLOPE_FRAC) -> tuple[dict, list[dict]]:
+    """The open-loop ladders of one model -> ({mu, knee, velocity, slo, ...}, raw rows).
+
+    Mixed ladder (``out_tokens``, rates ``base_rps x factors``): PreServe mu (SLO rule)
+    and TokenScale V_b = (in+out) tok/s at the knee. Prefill ladder (out = 1, rates
+    ``prefill_base_rps x prefill_factors``): V_P = prefill tok/s at the knee. Either
+    ladder may be empty (its outputs are then None)."""
+    ladders = [("mixed", int(out_tokens), float(base_rps or 0.0), tuple(factors))]
+    if prefill_base_rps and prefill_factors:
+        ladders.append(("prefill", 1, float(prefill_base_rps), tuple(prefill_factors)))
+    runs: dict[str, list[StepMeasure]] = {"mixed": [], "prefill": []}
+    aborted = None
+    for kind, out, base, fs in ladders:
+        for f in fs:
+            if aborted:
+                break
+            st = measure(model, in_tokens, out, base * float(f), step_s, warmup_s)
+            runs[kind].append(st)
+            if not st.valid:
+                aborted = st.note
+    mixed, prefill = runs["mixed"], runs["prefill"]
     ttft_slo, tpot_slo = float(slo.ttft_slo_ms(in_tokens)), float(slo.tpot_p95_ms)
+    v_b = None if aborted else knee(mixed, "tok_s", slope_frac, min_completed)
+    v_p = None if aborted else knee(prefill, "prefill_tok_s", slope_frac, min_completed)
     result = {
-        "mu": None if aborted else preserve_mu(steps, ttft_slo, tpot_slo, min_completed),
-        "base_rps": base_rps,
-        "non_monotone_rates": [round(x, 3) for x in non_monotone(steps, ttft_slo, tpot_slo, min_completed)],
+        "mu": None if aborted else preserve_mu(mixed, ttft_slo, tpot_slo, min_completed),
+        "knee": {"v_b": v_b, "v_p": v_p, "slope_frac": slope_frac},
+        "velocity": None if v_b is None or v_p is None else
+        {"buckets": [[v_b["value"]] * 3 for _ in range(3)], "v_prefill": v_p["value"]},
+        "base_rps": base_rps, "prefill_base_rps": prefill_base_rps,
+        "non_monotone_rates": [round(x, 3) for x in non_monotone(mixed, ttft_slo, tpot_slo, min_completed)],
         "slo": {"ttft_p95_ms": round(ttft_slo, 1), "tpot_p95_ms": tpot_slo, "in_tokens": in_tokens,
                 "ttft_idle_c_ms": getattr(slo, "ttft_idle_c_ms", None),
                 "ttft_idle_b_ms_per_token": getattr(slo, "ttft_idle_b_ms_per_token", None),
@@ -422,25 +535,29 @@ def profile_model_open(measure: OpenMeasure, model: str, in_tokens: int, out_tok
                 "ttft_floor_ms": getattr(slo, "ttft_floor_ms", None)},
         "aborted": aborted,
     }
-    rows = [dict(model=model, kind="open", in_tokens=in_tokens, out_tokens=out_tokens, **asdict(s), tok_s=s.tok_s,
-                 passes=step_passes(s, ttft_slo, tpot_slo, min_completed)) for s in steps]
+    rows = [dict(model=model, kind=f"open_{kind}", in_tokens=in_tokens, out_tokens=out, **asdict(s), tok_s=s.tok_s,
+                 passes=step_passes(s, ttft_slo, tpot_slo, min_completed) if kind == "mixed" else None,
+                 queue_bounded=queue_bounded(s, slope_frac))
+            for kind, out, steps in (("mixed", out_tokens, mixed), ("prefill", 1, prefill)) for s in steps]
     return result, rows
 
 
-def make_stub_open_measure(capacity_rps: float = 10.0, in_tokens_share: float = 492 / 892) -> OpenMeasure:
-    """Synthetic open-loop steps: served rate saturates at ``capacity_rps``, TTFT explodes
-    above it."""
+def make_stub_open_measure(capacity_rps: float = 10.0, prefill_capacity_rps: float = 30.0) -> OpenMeasure:
+    """Synthetic open-loop steps: served rate saturates at the capacity, TTFT explodes and
+    the waiting queue grows at (offered - served) above it."""
 
     def measure(model: str, in_tokens: int, out_tokens: int, rate_rps: float, step_s: float,
                 warmup_s: float) -> StepMeasure:
-        served = min(rate_rps, capacity_rps)
-        tok = served * (in_tokens + out_tokens)
+        cap = prefill_capacity_rps if out_tokens <= 1 else capacity_rps
+        served = min(rate_rps, cap)
         window = step_s - warmup_s
-        rho = rate_rps / capacity_rps
+        rho = rate_rps / cap
         ttft = 100.0 / max(1e-3, 1.0 - rho) if rho < 1 else 1e5
         n = int(rate_rps * window)
-        return StepMeasure(0, window, n, tok * in_tokens_share, tok * (1 - in_tokens_share), ttft, 20.0 + 20 * rho,
-                           rate_rps=rate_rps, arrived=n, achieved_rps=rate_rps, failed=0)
+        return StepMeasure(0, window, n, served * in_tokens, served * out_tokens, ttft,
+                           None if out_tokens <= 1 else 20.0 + 20 * rho, rate_rps=rate_rps, arrived=n,
+                           achieved_rps=rate_rps, failed=0, waiting_slope=max(0.0, rate_rps - cap),
+                           preemptions=0.0)
 
     return measure
 
@@ -687,6 +804,19 @@ def _factors(text: str) -> tuple[float, ...]:
     return tuple(sorted(vals))
 
 
+def _model_factors(text: str) -> dict[str, tuple[float, ...]]:
+    """``model=f1:f2,model2=`` -> per-model rate factors (empty = no steps for that model)."""
+    out: dict[str, tuple[float, ...]] = {}
+    for part in (x.strip() for x in text.split(",")):
+        if not part:
+            continue
+        name, sep, value = part.partition("=")
+        if not sep or not name.strip():
+            raise argparse.ArgumentTypeError(f"{part!r} is not model=f1:f2")
+        out[name.strip()] = _factors(value.replace(":", ",")) if value.strip() else ()
+    return out
+
+
 def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
          slo_for: Optional[Callable[[str], Any]] = None) -> int:
     ap = argparse.ArgumentParser(description="TokenScale V_b/V_P + PreServe mu profiling (one awake replica per model)")
@@ -715,10 +845,18 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     ap.add_argument("--extend-gain", type=float, default=DEFAULT_EXTEND_GAIN)
     ap.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
     ap.add_argument("--open-loop", action="store_true",
-                    help="PreServe mu only: Poisson rate ladder (--base-rps x --rate-factors), no velocity")
+                    help="Poisson rate ladders: PreServe mu + TokenScale V_b at the knee (mixed, --base-rps x "
+                         "--rate-factors) and V_P at the knee (out=1, --prefill-base-rps x --prefill-rate-factors)")
     ap.add_argument("--base-rps", type=_base_rps, default={},
-                    help="open loop: model=req/s,... (1.0x of each model's ladder)")
+                    help="open loop: model=req/s,... (1.0x of each model's mixed ladder)")
     ap.add_argument("--rate-factors", type=_factors, default=DEFAULT_RATE_FACTORS)
+    ap.add_argument("--model-rate-factors", type=_model_factors, default={},
+                    help="open loop: per-model override of --rate-factors, model=f1:f2,... (model= : no mixed steps)")
+    ap.add_argument("--prefill-base-rps", type=_base_rps, default={},
+                    help="open loop: model=req/s,... (1.0x of each model's out=1 ladder; omit = no V_P ladder)")
+    ap.add_argument("--prefill-rate-factors", type=_factors, default=None)
+    ap.add_argument("--knee-slope-frac", type=float, default=DEFAULT_KNEE_SLOPE_FRAC,
+                    help="queue bounded iff slope(num_requests_waiting) <= this x offered req/s")
     ap.add_argument("--min-completed", type=int, default=DEFAULT_OPEN_MIN_COMPLETED,
                     help="open loop: completed steady-state requests a step needs to count for mu")
     ap.add_argument("--schedule-seed", type=int, default=1234, help="open loop: Poisson arrival seed")
@@ -728,9 +866,21 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
         args.step_s = 110.0 if args.open_loop else 60.0
     if args.warmup_s is None:
         args.warmup_s = 20.0 if args.open_loop else 15.0
-    if args.open_loop and any(m not in args.base_rps for m in models):
-        print(f"error: --open-loop needs --base-rps for every model ({models})", file=sys.stderr)
-        return 2
+    def mixed_factors(m: str) -> tuple[float, ...]:
+        return args.model_rate_factors.get(m, args.rate_factors)
+
+    def prefill_factors(m: str) -> tuple[float, ...]:
+        return tuple(args.prefill_rate_factors or ()) if m in args.prefill_base_rps else ()
+
+    if args.open_loop:
+        no_base = [m for m in models if mixed_factors(m) and m not in args.base_rps]
+        if no_base:
+            print(f"error: --open-loop needs --base-rps for {no_base} (or --model-rate-factors {no_base[0]}=)",
+                  file=sys.stderr)
+            return 2
+        if args.prefill_base_rps and not args.prefill_rate_factors:
+            print("error: --prefill-base-rps needs --prefill-rate-factors", file=sys.stderr)
+            return 2
     if args.warmup_s >= args.step_s:
         print("error: --warmup-s must be < --step-s", file=sys.stderr)
         return 2
@@ -742,9 +892,11 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
         print("error: a real run needs --gateway-url and --sm-url", file=sys.stderr)
         return 2
     if args.open_loop:
-        minutes = len(args.rate_factors) * args.step_s / 60
-        print(f"estimated time: ~{minutes:.0f} min + drains per model (models in parallel), open loop, "
-              f"rates x {list(args.rate_factors)} of {args.base_rps}")
+        steps = {m: len(mixed_factors(m)) + len(prefill_factors(m)) for m in models}
+        minutes = max(steps.values(), default=0) * args.step_s / 60
+        print(f"estimated time: ~{minutes:.0f} min + drains (models in parallel; steps per model {steps}), open loop: "
+              f"mixed x {({m: list(mixed_factors(m)) for m in models})} of {args.base_rps}; "
+              f"out=1 x {({m: list(prefill_factors(m)) for m in models})} of {args.prefill_base_rps}")
     else:
         minutes = 2 * len(args.concurrency) * args.step_s / 60
         print(f"estimated time: ~{minutes:.0f} min per model (models in parallel), ladder {list(args.concurrency)}")
@@ -810,8 +962,10 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     def one(model: str) -> tuple[dict, list[dict]]:
         if args.open_loop:
             return profile_model_open(measure, model, args.in_tokens, args.out_tokens, slos[model],
-                                      base_rps=args.base_rps[model], factors=args.rate_factors, step_s=args.step_s,
-                                      warmup_s=args.warmup_s, min_completed=args.min_completed)
+                                      base_rps=args.base_rps.get(model), factors=mixed_factors(model),
+                                      step_s=args.step_s, warmup_s=args.warmup_s, min_completed=args.min_completed,
+                                      prefill_base_rps=args.prefill_base_rps.get(model),
+                                      prefill_factors=prefill_factors(model), slope_frac=args.knee_slope_frac)
         return profile_model(measure, model, args.in_tokens, args.out_tokens, slos[model], step_s=args.step_s,
                              warmup_s=args.warmup_s, ladder=args.concurrency, extend_gain=args.extend_gain,
                              max_concurrency=args.max_concurrency)
@@ -828,10 +982,16 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     }
     if args.open_loop:
         doc.update({
-            "schedule_seed": args.schedule_seed, "rate_factors": list(args.rate_factors),
-            "min_completed": args.min_completed,
+            "schedule_seed": args.schedule_seed, "min_completed": args.min_completed,
+            "rate_factors": {m: list(mixed_factors(m)) for m in models},
+            "prefill_rate_factors": {m: list(prefill_factors(m)) for m in models},
             "base_rps": {m: r["base_rps"] for m, (r, _) in results.items()},
+            "prefill_base_rps": {m: r["prefill_base_rps"] for m, (r, _) in results.items()},
             "non_monotone_rates": {m: r["non_monotone_rates"] for m, (r, _) in results.items()},
+            "knee_rule": f"queue bounded iff least-squares slope of vllm:num_requests_waiting over the measured "
+                         f"window <= {args.knee_slope_frac:g} x offered req/s; knee = highest tok/s of a bounded step",
+            "knee": {m: r["knee"] for m, (r, _) in results.items()},
+            "velocity": {m: r["velocity"] for m, (r, _) in results.items()},
         })
     else:
         doc["velocity"] = {m: r["velocity"] for m, (r, _) in results.items()}
@@ -854,7 +1014,15 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     if doc["aborted"]:
         print(f"error: aborted / failed: {doc['aborted']}", file=sys.stderr)
         return EXIT_ABORTED
-    missing = [m for m, (r, _) in results.items() if r["mu"] is None or r.get("velocity", 0) is None]
+    missing = [m for m, (r, _) in results.items() if (r["mu"] is None and not args.open_loop)
+               or (not args.open_loop and r["velocity"] is None)
+               or (args.open_loop and mixed_factors(m) and r["mu"] is None)]
+    unbracketed = {m: [k for k, v in (r.get("knee") or {}).items() if isinstance(v, dict) and not v["bracketed"]]
+                   for m, (r, _) in results.items()}
+    unbracketed = {m: v for m, v in unbracketed.items() if v}
+    if unbracketed:
+        print(f"warning: knee not bracketed (no unbounded step above it; it may lie higher): {unbracketed}",
+              file=sys.stderr)
     bumpy = {m: r["non_monotone_rates"] for m, (r, _) in results.items() if r.get("non_monotone_rates")}
     if bumpy:
         print(f"warning: SLO verdict not monotone in the rate (failing below a passing rate): {bumpy}; "

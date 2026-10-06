@@ -293,6 +293,9 @@ def test_open_loop_measure_sends_poisson_chat_and_reads_engine_counters(tmp_path
     assert step.prefill_tok_s > 0 and step.decode_tok_s == pytest.approx(step.prefill_tok_s * 4 / 120, rel=0.35)
     assert step.ttft_p95_ms is not None and step.tpot_p95_ms is not None
     assert fake.running == 0                                       # drained before the return
+    # the engine's waiting gauge (always 0 here) is sampled: a flat, bounded queue
+    assert step.waiting_slope == pytest.approx(0.0) and tp.queue_bounded(step) is True
+    assert step.preemptions is None                                 # the fake has no preemption counter
 
 
 def test_open_loop_failures_count_against_the_step_and_mu_is_the_highest_passing_rate():
@@ -311,10 +314,35 @@ def test_open_loop_failures_count_against_the_step_and_mu_is_the_highest_passing
     assert tp.non_monotone(steps, 500.0, 75.0, min_completed=150) == [2.0]
 
 
-def test_open_loop_dry_run_writes_mu_without_velocity(tmp_path, capsys):
+def test_knee_is_the_highest_throughput_step_with_a_bounded_waiting_queue():
+    def step(rate, tok, slope, n=300):
+        return tp.StepMeasure(0, 90, n, tok * 0.55, tok * 0.45, 100.0, 20.0, rate_rps=rate, arrived=n, failed=0,
+                              waiting_slope=slope)
+
+    steps = [step(5.0, 4000, 0.0), step(8.0, 6500, 0.01), step(9.0, 6900, 0.15),   # 0.15 <= 2 % x 9
+             step(10.0, 7100, 0.5), step(12.0, 7200, 2.0)]                         # growing queues
+    k = tp.knee(steps, "tok_s")
+    assert k["value"] == 6900 and k["rate_rps"] == 9.0 and k["bracketed"] and k["first_unbounded_rps"] == 10.0
+    assert tp.knee(steps[:3], "tok_s")["bracketed"] is False                      # nothing seen above it
+    assert tp.knee([step(5.0, 4000, None)], "tok_s") is None                       # no gauge: no evidence
+
+
+def test_open_loop_dry_run_writes_mu_and_knee_velocities(tmp_path, capsys):
     out = tmp_path / "o"
-    assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--open-loop", "--base-rps", "a=10"],
+    assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--open-loop", "--base-rps", "a=10",
+                    "--prefill-base-rps", "a=30", "--prefill-rate-factors", "0.5,0.9,1.2"],
                    slo_for=lambda m: SLO) == 0
     doc = yaml.safe_load((out / "profile.yaml").read_text(encoding="utf-8"))
-    assert doc["mode"] == "open_loop" and "velocity" not in doc and doc["mu"]["a"]["rate_rps"] > 0
+    assert doc["mode"] == "open_loop" and doc["mu"]["a"]["rate_rps"] > 0
+    knee = doc["knee"]["a"]
+    assert knee["v_b"]["rate_rps"] == 10.0 and knee["v_b"]["bracketed"]           # 1.1 x 10 is unbounded
+    assert knee["v_p"]["rate_rps"] == 27.0 and knee["v_p"]["value"] == pytest.approx(27.0 * 492)
+    assert doc["velocity"]["a"]["v_prefill"] == knee["v_p"]["value"]
+    assert doc["velocity"]["a"]["buckets"] == [[knee["v_b"]["value"]] * 3] * 3
+    # per-model override: no mixed steps for a, only the out=1 ladder; then no base rate is needed
+    assert tp.main(["--models", "a", "--out-dir", str(tmp_path / "p"), "--dry-run", "--open-loop",
+                    "--model-rate-factors", "a=", "--prefill-base-rps", "a=30", "--prefill-rate-factors", "0.5"],
+                   slo_for=lambda m: SLO) == 0
+    doc = yaml.safe_load((tmp_path / "p" / "profile.yaml").read_text(encoding="utf-8"))
+    assert doc["mu"]["a"] is None and doc["knee"]["a"]["v_p"]["rate_rps"] == 15.0
     assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--open-loop"], slo_for=lambda m: SLO) == 2
