@@ -28,9 +28,9 @@ Outputs (``--out-dir``): ``profile.yaml`` and ``profile_raw.csv``:
 * PreServe ``mu`` (``p`` / ``d`` / ``t``): prefill / decode / total tok/s of the highest
   step whose p95 TTFT <= the model's TTFT SLO at this input length
   (``max(floor, k (c + b L))`` from the registry, the SLO labels use) and p95 TPOT <= its
-  TPOT SLO (75 ms). mu_p : mu_d is fixed by the shape (one free quantity; disclose). A
-  closed loop keeps shorter queues than an open one, so mu is slightly optimistic
-  (disclose; cross-check with the calibration rho* x token mix).
+  TPOT SLO (75 ms). mu_p : mu_d is fixed by the shape (one free quantity; disclose).
+  Measured 2026-10-06, the closed-loop mu came out 0.16-0.34 x the calibration rho* x
+  token mix (lockstep bursts, see "Open loop" below): measure mu with ``--open-loop``.
 
 Validity gates (state, not timers):
 
@@ -48,6 +48,18 @@ Validity gates (state, not timers):
 The SLO and c/b come from ``--registry`` or, by default, the live ConfigMap
 ``tre-v2/tre-v2-registry`` (read with ``kubectl get``); the source and the c/b used are
 written into ``profile.yaml``. Each model's ladders run in their own process.
+
+Open loop (``--open-loop``, decision 2026-10-06, PreServe mu only): a closed loop with a
+constant output length runs in lockstep (every worker resends at once, so p95 TTFT measures
+a burst of ``c`` prefills) and biased mu low. With ``--open-loop`` each step instead offers
+Poisson arrivals at ``--base-rps[model] x factor`` (``--rate-factors``, default 0.3 ... 1.3)
+through the calibration's open-loop sender (``openloop.drive_cell_schedule``) for
+``--step-s`` (110; the first ``--warmup-s`` 20 dropped). Token rates are the engine
+counters between the end of the warm-up and the step end; p95 TTFT / TPOT are those of
+the requests *sent* in that window (a failed request counts as infinite). mu = the
+highest rate passing both SLOs with at least ``--min-completed`` (150) such requests; a
+failing rate below a passing one is reported (``non_monotone_rates``: lengthen the steps).
+No velocity is written in this mode (V_b / V_P stay the closed-loop saturation peaks).
 
 Cost: (len(ladder) x 2) x step_s per model, models in parallel (default ~20 min).
 Sending needs ``--i-have-user-approval``; ``--dry-run`` uses a synthetic stub.
@@ -103,6 +115,12 @@ class StepMeasure:
     #: False when the fleet changed during the step (its rates are then None).
     valid: bool = True
     note: Optional[str] = None
+    #: Open loop only: the offered Poisson rate, the requests that arrived inside the
+    #: measured window (their achieved rate) and how many of those did not complete.
+    rate_rps: Optional[float] = None
+    arrived: Optional[int] = None
+    achieved_rps: Optional[float] = None
+    failed: Optional[int] = None
 
     @property
     def tok_s(self) -> Optional[float]:
@@ -254,6 +272,179 @@ def make_http_measure(gateway_url: str, metrics_urls: Callable[[str], Sequence[s
     return measure
 
 
+def steady_latencies(records: Sequence[dict], lo_ms: int, hi_ms: int) -> tuple[int, int, Optional[float], Optional[float]]:
+    """(arrived, completed, p95 TTFT ms, p95 TPOT ms) of the requests SENT inside
+    ``[lo, hi]`` (steady state of an open-loop step). A request that did not complete (non
+    200, stream error, no first token) counts as an infinite TTFT and TPOT, so failures
+    can only make the step fail."""
+    arrived = [r for r in records if r.get("send_ts_ms") is not None and lo_ms <= r["send_ts_ms"] <= hi_ms]
+    ok = [r for r in arrived if r.get("http_status") == 200 and not r.get("stream_error")
+          and r.get("ttft_ms") is not None and r.get("done_ts_ms") is not None]
+    failed = len(arrived) - len(ok)
+    ttft = p95([r["ttft_ms"] for r in ok] + [math.inf] * failed)
+    tpot = p95([r.get("tpot_ms") for r in ok] + [math.inf] * failed)
+    return len(arrived), len(ok), ttft, tpot
+
+
+#: Open-loop step: measure(model, in_tokens, out_tokens, rate_rps, step_s, warmup_s)
+OpenMeasure = Callable[[str, int, int, float, float, float], StepMeasure]
+
+
+def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequence[str]], *,
+                          api: str = "chat", prompt_mode: str = "natural", routing_strategy: Optional[str] = None,
+                          run_key: str = "bl-profile-ol", seed: int = 1234, stream_call: Optional[Callable] = None,
+                          fetch: Callable[[str], str] = http_get_text, raw_dir: Optional[Path] = None,
+                          sender_processes: Optional[int] = None, prompt_dir_enabled: bool = True,
+                          fleet_view: Optional[Callable[[str], Any]] = None,
+                          expected: Optional[dict[str, Any]] = None, sample_s: float = 1.0,
+                          drain_poll_s: float = 0.5, drain_cap_s: float = DEFAULT_DRAIN_CAP_S,
+                          sleep: Callable[[float], None] = time.sleep) -> OpenMeasure:
+    """One step = Poisson arrivals at ``rate_rps`` for ``step_s`` through the calibration's
+    open-loop sender (``openloop.drive_cell_schedule``: one ``RpsSegment``, prompts
+    materialised before the step, chat, ``ignore_eos``, temperature 0). The replica's
+    ``/metrics`` is scraped every ``sample_s`` by the sender's sidecar; the token rates
+    come from the samples nearest to the end of the warm-up and to the step end. The
+    latencies are those of the requests sent between those two instants. The call returns
+    after every request finished and the replica reports nothing in flight."""
+    from scripts import openloop  # lazy: tre/deploy on PYTHONPATH
+    from tre_replayer.engine.schedule import RpsSegment
+
+    def scrape(model: str) -> str:
+        return "\n".join(fetch(url) for url in metrics_urls(model))
+
+    def drain(model: str) -> None:
+        deadline = time.monotonic() + drain_cap_s
+        while True:
+            try:
+                q = queued(scrape(model))
+            except Exception:  # noqa: BLE001 - unreadable: not idle
+                q = None
+            if q == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise ProfileAbort(f"{model}: replica still has {q} requests in flight {drain_cap_s:g}s after the step")
+            sleep(drain_poll_s)
+
+    def view(model: str) -> Any:
+        try:
+            return fleet_view(model) if fleet_view is not None else None
+        except Exception as exc:  # noqa: BLE001 - unknown fleet: not valid
+            return f"<unreadable: {exc!r}>"
+
+    def measure(model: str, in_tokens: int, out_tokens: int, rate_rps: float, step_s: float,
+                warmup_s: float) -> StepMeasure:
+        cell_id = f"i{int(in_tokens)}_o{int(out_tokens)}_r{rate_rps:.3f}"
+        samples: list[tuple[int, str]] = []
+
+        def sampler(now: int) -> dict:
+            text = scrape(model)
+            samples.append((int(now), text))
+            from tre_baselines.sources import parse_prometheus_text
+
+            vals = {x.name: x.value for x in parse_prometheus_text(text)}
+            return {"running": vals.get("vllm:num_requests_running"), "waiting": vals.get("vllm:num_requests_waiting")}
+
+        seg = RpsSegment(model=model, start_s=0.0, end_s=float(step_s), rps=float(rate_rps),
+                         input_tokens=int(in_tokens), max_output_tokens=int(out_tokens))
+        view_a = view(model)
+        with tempfile.TemporaryDirectory(prefix="bl-profile-ol-") as tmp:
+            base = Path(raw_dir) if raw_dir is not None else Path(tmp)
+            base.mkdir(parents=True, exist_ok=True)
+            raw = base / f"{model}_{cell_id}.jsonl"
+            raw.unlink(missing_ok=True)
+            start_ms, _end_ms, guard = openloop.drive_cell_schedule(
+                gateway_url, model, cell_id, [seg], seed=seed, raw_path=raw, instant_sampler=sampler,
+                instant_interval_s=sample_s, prompt_mode=prompt_mode,
+                prompt_dir=Path(tmp) / "prompts" if prompt_dir_enabled else None,
+                routing_strategy=routing_strategy, stream_call=stream_call, request_key=f"{run_key}|{model}",
+                api=api, sender_processes=sender_processes)
+            records = [json.loads(ln) for ln in raw.read_text(encoding="utf-8").splitlines() if ln.strip()] \
+                if raw.exists() else []
+        drain(model)
+        view_b = view(model)
+        lo, hi = int(start_ms + warmup_s * 1000), int(start_ms + step_s * 1000)
+
+        def nearest(target: int) -> Optional[tuple[int, str]]:
+            best = min(samples, key=lambda s: abs(s[0] - target), default=None)
+            return best if best is not None and abs(best[0] - target) <= max(2000, 2 * sample_s * 1000) else None
+
+        a, b = nearest(lo), nearest(hi)
+        prefill = decode = None
+        window = (hi - lo) / 1000.0
+        if a is not None and b is not None and b[0] > a[0]:
+            window = (b[0] - a[0]) / 1000.0
+            prefill, decode = engine_rates(a[1], b[1], window)
+        arrived, completed, ttft, tpot = steady_latencies(records, lo, hi)
+        span = (hi - lo) / 1000.0
+        notes = []
+        notes.append(f"sender p99 lateness {guard.p99_delay_ms:.0f} ms")
+        if guard.issues or guard.void_reasons:
+            notes.append(f"sender guard: issues={list(guard.issues)} void={list(guard.void_reasons)}")
+        if fleet_view is not None:
+            want = (expected or {}).get(model)
+            if not view_a == view_b == want:
+                return StepMeasure(0, round(window, 3), completed, None, None, ttft, tpot, valid=False,
+                                   note=f"fleet changed: expected {want}, a={view_a}, b={view_b}",
+                                   rate_rps=float(rate_rps), arrived=arrived, failed=arrived - completed,
+                                   achieved_rps=round(arrived / span, 3) if span > 0 else None)
+        return StepMeasure(0, round(window, 3), completed, prefill, decode, ttft, tpot,
+                           note="; ".join(notes) or None, rate_rps=float(rate_rps), arrived=arrived,
+                           failed=arrived - completed, achieved_rps=round(arrived / span, 3) if span > 0 else None)
+
+    return measure
+
+
+#: Open-loop rate ladder, x each model's base rate (decision 2026-10-06, PreServe mu).
+DEFAULT_RATE_FACTORS = (0.3, 0.5, 0.7, 0.8, 0.9, 1.0, 1.1, 1.3)
+#: A step counts for mu only with at least this many completed steady-state requests.
+DEFAULT_OPEN_MIN_COMPLETED = 150
+
+
+def profile_model_open(measure: OpenMeasure, model: str, in_tokens: int, out_tokens: int, slo: Any, *,
+                       base_rps: float, factors: Sequence[float], step_s: float, warmup_s: float,
+                       min_completed: int = DEFAULT_OPEN_MIN_COMPLETED) -> tuple[dict, list[dict]]:
+    """The open-loop rate ladder of one model -> ({mu, slo, ...}, raw rows)."""
+    steps: list[StepMeasure] = []
+    for f in factors:
+        steps.append(measure(model, in_tokens, out_tokens, float(base_rps) * float(f), step_s, warmup_s))
+        if not steps[-1].valid:
+            break
+    aborted = next((s.note for s in steps if not s.valid), None)
+    ttft_slo, tpot_slo = float(slo.ttft_slo_ms(in_tokens)), float(slo.tpot_p95_ms)
+    result = {
+        "mu": None if aborted else preserve_mu(steps, ttft_slo, tpot_slo, min_completed),
+        "base_rps": base_rps,
+        "non_monotone_rates": [round(x, 3) for x in non_monotone(steps, ttft_slo, tpot_slo, min_completed)],
+        "slo": {"ttft_p95_ms": round(ttft_slo, 1), "tpot_p95_ms": tpot_slo, "in_tokens": in_tokens,
+                "ttft_idle_c_ms": getattr(slo, "ttft_idle_c_ms", None),
+                "ttft_idle_b_ms_per_token": getattr(slo, "ttft_idle_b_ms_per_token", None),
+                "ttft_slowdown_k": getattr(slo, "ttft_slowdown_k", None),
+                "ttft_floor_ms": getattr(slo, "ttft_floor_ms", None)},
+        "aborted": aborted,
+    }
+    rows = [dict(model=model, kind="open", in_tokens=in_tokens, out_tokens=out_tokens, **asdict(s), tok_s=s.tok_s,
+                 passes=step_passes(s, ttft_slo, tpot_slo, min_completed)) for s in steps]
+    return result, rows
+
+
+def make_stub_open_measure(capacity_rps: float = 10.0, in_tokens_share: float = 492 / 892) -> OpenMeasure:
+    """Synthetic open-loop steps: served rate saturates at ``capacity_rps``, TTFT explodes
+    above it."""
+
+    def measure(model: str, in_tokens: int, out_tokens: int, rate_rps: float, step_s: float,
+                warmup_s: float) -> StepMeasure:
+        served = min(rate_rps, capacity_rps)
+        tok = served * (in_tokens + out_tokens)
+        window = step_s - warmup_s
+        rho = rate_rps / capacity_rps
+        ttft = 100.0 / max(1e-3, 1.0 - rho) if rho < 1 else 1e5
+        n = int(rate_rps * window)
+        return StepMeasure(0, window, n, tok * in_tokens_share, tok * (1 - in_tokens_share), ttft, 20.0 + 20 * rho,
+                           rate_rps=rate_rps, arrived=n, achieved_rps=rate_rps, failed=0)
+
+    return measure
+
+
 def make_stub_measure(vmax_tok_s: float = 10000.0, c_half: float = 4.0, vmax_prefill_tok_s: float = 30000.0,
                       ttft_ms_per_c: float = 30.0, tpot_ms_per_c: float = 2.0) -> Measure:
     """Synthetic saturating throughput and latencies that grow with concurrency."""
@@ -309,15 +500,40 @@ def _best(values: Sequence[Optional[float]]) -> Optional[float]:
     return max(vals) if vals else None
 
 
-def preserve_mu(steps: Sequence[StepMeasure], ttft_slo_ms: float, tpot_slo_ms: float) -> Optional[dict[str, float]]:
-    """mu from the highest-concurrency step meeting both p95 SLOs (None if none does)."""
-    ok = [s for s in steps if s.completed > 0 and s.tok_s is not None and s.ttft_p95_ms is not None
-          and s.tpot_p95_ms is not None and s.ttft_p95_ms <= ttft_slo_ms and s.tpot_p95_ms <= tpot_slo_ms]
+def _load(s: StepMeasure) -> float:
+    """The step's load level: the offered rate (open loop) or the concurrency (closed)."""
+    return float(s.rate_rps) if s.rate_rps is not None else float(s.concurrency)
+
+
+def step_passes(s: StepMeasure, ttft_slo_ms: float, tpot_slo_ms: float, min_completed: int = 1) -> bool:
+    return (s.valid and s.completed >= max(1, min_completed) and s.tok_s is not None
+            and s.ttft_p95_ms is not None and s.tpot_p95_ms is not None
+            and s.ttft_p95_ms <= ttft_slo_ms and s.tpot_p95_ms <= tpot_slo_ms)
+
+
+def preserve_mu(steps: Sequence[StepMeasure], ttft_slo_ms: float, tpot_slo_ms: float,
+                min_completed: int = 1) -> Optional[dict[str, float]]:
+    """mu from the highest-load step meeting both p95 SLOs (None if none does)."""
+    ok = [s for s in steps if step_passes(s, ttft_slo_ms, tpot_slo_ms, min_completed)]
     if not ok:
         return None
-    best = max(ok, key=lambda s: s.concurrency)
-    return {"p": round(best.prefill_tok_s, 1), "d": round(best.decode_tok_s, 1), "t": round(best.tok_s, 1),
-            "concurrency": best.concurrency}
+    best = max(ok, key=_load)
+    out = {"p": round(best.prefill_tok_s, 1), "d": round(best.decode_tok_s, 1), "t": round(best.tok_s, 1)}
+    if best.rate_rps is not None:
+        out.update(rate_rps=round(best.rate_rps, 3), achieved_rps=best.achieved_rps)
+    else:
+        out["concurrency"] = best.concurrency
+    return out
+
+
+def non_monotone(steps: Sequence[StepMeasure], ttft_slo_ms: float, tpot_slo_ms: float,
+                 min_completed: int = 1) -> list[float]:
+    """Load levels that fail an SLO although a higher one passes (the verdict is not
+    monotone). A step with too few completed requests is no evidence either way."""
+    passing = [_load(s) for s in steps if step_passes(s, ttft_slo_ms, tpot_slo_ms, min_completed)]
+    top = max(passing, default=None)
+    return [] if top is None else [_load(s) for s in steps if _load(s) < top and s.completed >= min_completed
+                                   and not step_passes(s, ttft_slo_ms, tpot_slo_ms, min_completed)]
 
 
 def profile_model(measure: Measure, model: str, in_tokens: int, out_tokens: int, slo: Any, *, step_s: float,
@@ -445,6 +661,32 @@ def _ladder(text: str) -> tuple[int, ...]:
     return ladder
 
 
+def _base_rps(text: str) -> dict[str, float]:
+    out = {}
+    for part in (x.strip() for x in text.split(",")):
+        if not part:
+            continue
+        name, sep, value = part.partition("=")
+        try:
+            rate = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"--base-rps: {part!r} is not model=req/s") from exc
+        if not sep or not name or not rate > 0:
+            raise argparse.ArgumentTypeError(f"--base-rps: {part!r} is not model=req/s with req/s > 0")
+        out[name.strip()] = rate
+    return out
+
+
+def _factors(text: str) -> tuple[float, ...]:
+    try:
+        vals = tuple(float(x) for x in text.split(",") if x.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not vals or any(not v > 0 for v in vals):
+        raise argparse.ArgumentTypeError("rate factors must be > 0")
+    return tuple(sorted(vals))
+
+
 def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
          slo_for: Optional[Callable[[str], Any]] = None) -> int:
     ap = argparse.ArgumentParser(description="TokenScale V_b/V_P + PreServe mu profiling (one awake replica per model)")
@@ -466,14 +708,29 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     ap.add_argument("--raw-dir", default=None, help="keep the per-request raw JSONL here")
     ap.add_argument("--dry-run", action="store_true", help="synthetic stub; nothing is sent")
     ap.add_argument("--i-have-user-approval", action="store_true", help="required to send real requests")
-    ap.add_argument("--step-s", type=float, default=60.0)
-    ap.add_argument("--warmup-s", type=float, default=15.0)
+    ap.add_argument("--step-s", type=float, default=None, help="default 60 (closed loop) / 110 (open loop)")
+    ap.add_argument("--warmup-s", type=float, default=None, help="default 15 (closed loop) / 20 (open loop)")
     ap.add_argument("--drain-cap-s", type=float, default=DEFAULT_DRAIN_CAP_S)
     ap.add_argument("--concurrency", type=_ladder, default=DEFAULT_LADDER)
     ap.add_argument("--extend-gain", type=float, default=DEFAULT_EXTEND_GAIN)
     ap.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
+    ap.add_argument("--open-loop", action="store_true",
+                    help="PreServe mu only: Poisson rate ladder (--base-rps x --rate-factors), no velocity")
+    ap.add_argument("--base-rps", type=_base_rps, default={},
+                    help="open loop: model=req/s,... (1.0x of each model's ladder)")
+    ap.add_argument("--rate-factors", type=_factors, default=DEFAULT_RATE_FACTORS)
+    ap.add_argument("--min-completed", type=int, default=DEFAULT_OPEN_MIN_COMPLETED,
+                    help="open loop: completed steady-state requests a step needs to count for mu")
+    ap.add_argument("--schedule-seed", type=int, default=1234, help="open loop: Poisson arrival seed")
     args = ap.parse_args(argv)
     models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if args.step_s is None:
+        args.step_s = 110.0 if args.open_loop else 60.0
+    if args.warmup_s is None:
+        args.warmup_s = 20.0 if args.open_loop else 15.0
+    if args.open_loop and any(m not in args.base_rps for m in models):
+        print(f"error: --open-loop needs --base-rps for every model ({models})", file=sys.stderr)
+        return 2
     if args.warmup_s >= args.step_s:
         print("error: --warmup-s must be < --step-s", file=sys.stderr)
         return 2
@@ -484,8 +741,13 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     if real and (not args.gateway_url or not args.sm_url):
         print("error: a real run needs --gateway-url and --sm-url", file=sys.stderr)
         return 2
-    minutes = 2 * len(args.concurrency) * args.step_s / 60
-    print(f"estimated time: ~{minutes:.0f} min per model (models in parallel), ladder {list(args.concurrency)}")
+    if args.open_loop:
+        minutes = len(args.rate_factors) * args.step_s / 60
+        print(f"estimated time: ~{minutes:.0f} min + drains per model (models in parallel), open loop, "
+              f"rates x {list(args.rate_factors)} of {args.base_rps}")
+    else:
+        minutes = 2 * len(args.concurrency) * args.step_s / 60
+        print(f"estimated time: ~{minutes:.0f} min per model (models in parallel), ladder {list(args.concurrency)}")
     registry_source = f"file:{args.registry}" if args.registry else "shared registry file (dry-run)"
     registry_path = args.registry
     if slo_for is None:
@@ -504,7 +766,7 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
         return 2
     if measure is None:
         if args.dry_run:
-            measure = make_stub_measure()
+            measure = make_stub_open_measure() if args.open_loop else make_stub_measure()
         else:
             from tre_baselines.tools import arm
 
@@ -535,11 +797,21 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
                 return (tuple(sorted(awake_bindings(get_state(args.sm_url), m))), routable(m))
 
             expected = {m: fleet_view(m) for m in models}
-            measure = make_http_measure(args.gateway_url, lambda m: urls[m], routing_strategy=args.routing_strategy,
-                                        raw_dir=Path(args.raw_dir) if args.raw_dir else None,
-                                        fleet_view=fleet_view, expected=expected, drain_cap_s=args.drain_cap_s)
+            if args.open_loop:
+                measure = make_openloop_measure(args.gateway_url, lambda m: urls[m],
+                                                routing_strategy=args.routing_strategy, seed=args.schedule_seed,
+                                                raw_dir=Path(args.raw_dir) if args.raw_dir else None,
+                                                fleet_view=fleet_view, expected=expected, drain_cap_s=args.drain_cap_s)
+            else:
+                measure = make_http_measure(args.gateway_url, lambda m: urls[m], routing_strategy=args.routing_strategy,
+                                            raw_dir=Path(args.raw_dir) if args.raw_dir else None,
+                                            fleet_view=fleet_view, expected=expected, drain_cap_s=args.drain_cap_s)
 
     def one(model: str) -> tuple[dict, list[dict]]:
+        if args.open_loop:
+            return profile_model_open(measure, model, args.in_tokens, args.out_tokens, slos[model],
+                                      base_rps=args.base_rps[model], factors=args.rate_factors, step_s=args.step_s,
+                                      warmup_s=args.warmup_s, min_completed=args.min_completed)
         return profile_model(measure, model, args.in_tokens, args.out_tokens, slos[model], step_s=args.step_s,
                              warmup_s=args.warmup_s, ladder=args.concurrency, extend_gain=args.extend_gain,
                              max_concurrency=args.max_concurrency)
@@ -551,11 +823,23 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
         "shape": {"in_tokens": args.in_tokens, "out_tokens": args.out_tokens,
                   "note": "TokenScale buckets degenerate to one cell (all nine = V_b); disclose"},
         "registry": registry_source,
-        "velocity": {m: r["velocity"] for m, (r, _) in results.items()},
+        "mode": "open_loop" if args.open_loop else "closed_loop",
+        "step_s": args.step_s, "warmup_s": args.warmup_s,
+    }
+    if args.open_loop:
+        doc.update({
+            "schedule_seed": args.schedule_seed, "rate_factors": list(args.rate_factors),
+            "min_completed": args.min_completed,
+            "base_rps": {m: r["base_rps"] for m, (r, _) in results.items()},
+            "non_monotone_rates": {m: r["non_monotone_rates"] for m, (r, _) in results.items()},
+        })
+    else:
+        doc["velocity"] = {m: r["velocity"] for m, (r, _) in results.items()}
+    doc.update({
         "mu": {m: r["mu"] for m, (r, _) in results.items()},
         "slo": {m: r["slo"] for m, (r, _) in results.items()},
         "aborted": {**{m: r["aborted"] for m, (r, _) in results.items() if r["aborted"]}, **errors},
-    }
+    })
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(doc, sort_keys=False, default_flow_style=None)
@@ -570,7 +854,11 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     if doc["aborted"]:
         print(f"error: aborted / failed: {doc['aborted']}", file=sys.stderr)
         return EXIT_ABORTED
-    missing = [m for m, (r, _) in results.items() if r["mu"] is None or r["velocity"] is None]
+    missing = [m for m, (r, _) in results.items() if r["mu"] is None or r.get("velocity", 0) is None]
+    bumpy = {m: r["non_monotone_rates"] for m, (r, _) in results.items() if r.get("non_monotone_rates")}
+    if bumpy:
+        print(f"warning: SLO verdict not monotone in the rate (failing below a passing rate): {bumpy}; "
+              "lengthen the steps (--step-s)", file=sys.stderr)
     if missing:
         print(f"warning: no SLO-meeting step / unreadable counters for {missing}: see profile_raw.csv", file=sys.stderr)
     return 0
