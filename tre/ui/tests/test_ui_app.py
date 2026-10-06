@@ -187,6 +187,26 @@ def test_ui_operate_proxies_to_service_manager_and_audits() -> None:
     assert client.post("/api/ops/models/nope/target", json={"wake_replicas": 1}).status_code == 404
 
 
+def test_ui_target_filled_in_part_is_a_409_with_what_woke() -> None:
+    """An exact console target the SM filled in part (409 ``partial``) is passed
+    through with its body, not turned into a 502."""
+    import io
+    import json
+    from urllib.error import HTTPError
+
+    client, sm = _client()
+    body = {"error": "partial", "actions": [{"action": "wake", "serve_id": "m1-1"}], "unfilled": 1}
+
+    def partial(method, path, payload=None):
+        raise HTTPError(path, 409, "Conflict", {}, io.BytesIO(json.dumps(body).encode()))
+
+    sm.request = partial
+    response = client.post("/api/ops/models/m1/target", json={"wake_replicas": 2})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["actions"] == body["actions"]
+
+
 # ---- sampler-backed live endpoints ----
 
 def test_ui_snapshot_is_composite_and_cached() -> None:

@@ -330,7 +330,9 @@ class OperationCoordinator:
             handle.stop()
             try:
                 handle.finish(
-                    status="failed" if error else "succeeded",
+                    # An error may name its own final status (``operation_status``:
+                    # a model target filled in part is ``partial``, 2026-10-06).
+                    status=(getattr(error, "operation_status", None) or "failed") if error else "succeeded",
                     error=str(error) if error else None,
                 )
             finally:

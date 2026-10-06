@@ -571,3 +571,103 @@ def test_stale_operation_records_are_superseded_except_fleet_repairs():
     finally:
         FakeHandle.supersede = original
     assert superseded == ["op-dead"]
+
+
+# ------------------------------------------------------------ best-effort growth
+@pytest.mark.parametrize("at_least", [True, False])
+def test_a_growth_wakes_every_feasible_binding_and_reports_the_rest(at_least):
+    """2026-10-06 (v1 execute_scale_up semantics): r asks for 3, only r-2 is
+    placeable (r-0 / r-1 sit under the awake d-0 / d-1) - r-2 wakes, the other two
+    are reported (``unfilled``, their blockers); 200 grow-only, 409 ``partial``
+    (same response in the body) for an exact target."""
+    world = World()
+
+    response = world.client.put("/v2/models/r/target", json={"wake_replicas": 3, "at_least": at_least})
+
+    assert response.status_code == (200 if at_least else 409), response.text
+    body = response.json()
+    if not at_least:
+        assert body["error"] == "partial"
+    assert body["unfilled"] == 2
+    assert [a["serve_id"] for a in body["actions"] if a["action"] == "wake"] == ["r-2"]
+    assert {r["blocking_binding_id"] for r in body["refusals"]} == {"d/node-a/0", "d/node-a/1"}
+    assert all("retry_after_s" in r for r in body["refusals"])
+    assert world.awake("r-2") and world.stored_awake("r-2")
+    assert not world.awake("r-0") and not world.awake("r-1")
+    assert world.awake("d-0") and world.awake("d-1")
+    assert world.lease("r-0") is None and world.lease("r-1") is None
+    assert _desired_power(world) == {"r/node-a/0": "sleeping", "r/node-a/1": "sleeping", "r/node-a/2": "awake"}
+    assert world.violations == [] and world.journals() == ({}, {})
+
+
+def _desired_power(world, model="r"):
+    return {b.binding_id: b.power for b in world.fleet.load_desired().bindings if b.model == model}
+
+
+#: r-0 sits under the awake d-0; r-2 / r-3 are placeable.
+_TWO_PLACEABLE = (
+    ("d-0", "d", (0,), "awake"),
+    ("r-0", "r", (0,), "sleeping"),
+    ("r-2", "r", (2,), "sleeping"),
+    ("r-3", "r", (3,), "sleeping"),
+)
+
+
+def test_a_partial_growth_whose_feasible_wake_fails_leaks_no_lease_or_journal():
+    """Of r's 3 wakes, r-0 is unplaceable and r-3's /wake_up fails: r-2 stays
+    awake; the failed and the unfilled bindings keep no lease, no journal entry
+    and their desired power stays sleeping."""
+    world = World(pods=_TWO_PLACEABLE)
+    guarded = world.vllm.wake_up
+
+    def wake_up(pod_ip, *, port=None):
+        if pod_ip == world.ip_of["r-3"]:
+            return Result(False, "engine error")
+        return guarded(pod_ip, port=port)
+
+    world.vllm.wake_up = wake_up
+    response = world.client.put("/v2/models/r/target", json={"wake_replicas": 3, "at_least": True})
+
+    assert response.status_code == 409 and response.json()["error"] == "wake_failed", response.text
+    assert world.awake("r-2") and world.lease("r-2") == "awake"
+    assert not world.awake("r-3") and world.lease("r-3") is None and not world.stored_awake("r-3")
+    assert not world.awake("r-0") and world.lease("r-0") is None
+    assert _desired_power(world) == {"r/node-a/0": "sleeping", "r/node-a/2": "awake", "r/node-a/3": "sleeping"}
+    assert world.violations == [] and world.journals() == ({}, {})
+
+
+def test_a_growth_past_the_bindings_with_a_refused_sibling_creates_no_pod():
+    """r asks for 4 with 3 bindings, r-0 unplaceable: r-2 / r-3 wake, the rest is
+    unfilled - no cold create once a wake was refused."""
+    world = World(pods=_TWO_PLACEABLE)
+    created = []
+    world.runtime.create_model_deployment = lambda model, slot: created.append((model, slot))
+    world.runtime.delete_model_deployment = lambda *a, **k: None
+    world.runtime.wait_pod_deleted = lambda *a, **k: None
+    world.runtime.wait_pod_ready = lambda *a, **k: None
+
+    response = world.client.put("/v2/models/r/target", json={"wake_replicas": 4, "at_least": True})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["unfilled"] == 2 and created == []
+    assert sorted(a["serve_id"] for a in body["actions"]) == ["r-2", "r-3"]
+    assert not world.awake("r-0") and world.violations == [] and world.journals() == ({}, {})
+
+
+def test_v1_scale_service_up_answers_200_with_what_woke():
+    """APA /scale_service keeps the v1 contract: 200 with ``actual`` = replicas
+    woken (the AIBrix client warns on actual < requested); nothing placeable is
+    also 200 with actual 0, as v1."""
+    world = World()
+
+    def up(n):
+        return world.client.post("/scale_service", params={"model_name": "r", "scale_type": "up", "scale_value": n})
+
+    first = up(3)
+    assert (first.status_code, first.json()) == (200, {"requested": 3, "actual": 1})
+    assert world.awake("r-2")
+
+    second = up(1)
+    assert (second.status_code, second.json()) == (200, {"requested": 1, "actual": 0})
+    assert not world.awake("r-0") and not world.awake("r-1") and world.violations == []

@@ -606,6 +606,12 @@ class ServiceManagerV2:
         ``at_least``: grow-only (review 3 P2-1) - a model that already has
         ``wake_replicas`` or more awake bindings is left as it is (no-op).
 
+        A growth is best effort (2026-10-06, as v1 ``execute_scale_up``): every
+        feasible binding up to the target wakes, an infeasible one never blocks
+        them. Some unfilled: ``unfilled`` / ``refusals`` - 200 with ``at_least``,
+        else 409 ``partial`` carrying the same response (:class:`TargetPartial`).
+        None feasible: 409 with the first refusal, nothing changed.
+
         Desired state follows the outcome (review 2 P2-3): only the bindings that
         slept go "sleeping"; a failed wake's desired record is restored.
         ``drain_budget_s`` is deprecated and ignored (the SM never drains).
@@ -698,8 +704,11 @@ class ServiceManagerV2:
             return response
         if plan["wake"] and not plan["create"] and self._physical_wake_capable():
             before = self._desired_records()
+            # Every wake the target asks for (the plan's feasible ones plus what
+            # it left unfilled): the prepare re-checks each and fills what it can.
+            need = len(plan["wake"]) + int(plan.get("unfilled") or 0)
             tickets, refusals = self._prepare_target_wakes(
-                model, len(plan["wake"]), snapshot.bindings, hints, before, avoid_gpus=avoid_gpus
+                model, need, snapshot.bindings, hints, before, avoid_gpus=avoid_gpus
             )
             try:
                 with self._desired_guard(reason="model_target_request"):
@@ -717,36 +726,51 @@ class ServiceManagerV2:
             response["version"] = self._store.load().version
             response["actions"] = [_wake_action(ticket) for ticket in tickets]
             response["picked"] = [_picked(ticket) for ticket in tickets]
-            unfilled = len(plan["wake"]) - len(tickets)
-            if unfilled:
-                response["unfilled"] = unfilled
-                # Where the SM could not wake (the controller cools those GPUs down).
-                response["refusals"] = [
-                    exc.body(retry_after_s=self.wake_retry_after_s(exc.scope))
-                    for exc in refusals
-                    if isinstance(exc, WakeConflict)
-                ]
-                if not at_least:
-                    # P2-7: an exact target (APA /scale_service) that could not be met
-                    # is not a success; what did wake stays awake (committed).
-                    first = response["refusals"][0] if response["refusals"] else {}
-                    raise WakeConflict(
-                        f"model target of {model}: {unfilled} of {len(tickets) + unfilled} wakes could not "
-                        f"be placed (woke {[t.binding.serve_id for t in tickets]}); refusals: "
-                        f"{[r.get('reason') for r in response['refusals']]}",
-                        reason="partial", node=first.get("node"), gpus=first.get("gpu_ids") or (),
-                        blocking_binding_id=first.get("blocking_binding_id"),
-                    )
-            return response
+            return self._finish_growth(
+                model, response, unfilled=need - len(tickets), refusals=refusals, at_least=at_least
+            )
         with self._desired_guard(reason="model_target_request") as guard:
             self._set_model_desired_target(
                 model=model,
                 target_bindings=plan["target_bindings"],
                 reason="model_target_request",
             )
-            return self._apply_model_target_plan(
+            response = self._apply_model_target_plan(
                 model, wake_replicas, snapshot, plan, response, guard=guard
             )
+        return self._finish_growth(
+            model, response, unfilled=int(plan.get("unfilled") or 0),
+            refusals=plan.get("refusals") or (), at_least=at_least,
+        )
+
+    def _finish_growth(
+        self, model: str, response: dict, *, unfilled: int, refusals, at_least: bool
+    ) -> dict:
+        """A growth that woke some of its wakes but not all (best effort, like v1
+        ``execute_scale_up``; planner and prepare alike, 2026-10-06): what woke stays
+        awake (committed); ``unfilled`` / ``refusals`` say what could not be placed
+        and why. Grow-only (``at_least``): 200 with them. An exact target (APA
+        /scale_service, P2-7): 409 ``partial`` whose body carries the same response
+        (``actions``, ``picked``, ``unfilled``, ``refusals``) - the caller accounts by
+        what woke. A growth with nothing feasible never gets here (its first
+        refusal is raised before any change)."""
+        if unfilled <= 0:
+            return response
+        response["unfilled"] = unfilled
+        response["refusals"] = [
+            exc.body(retry_after_s=self.wake_retry_after_s(exc.scope))
+            for exc in refusals
+            if isinstance(exc, WakeConflict)
+        ]
+        if at_least:
+            return response
+        woke = [action["serve_id"] for action in response.get("actions") or () if action.get("action") == "wake"]
+        raise TargetPartial(
+            f"model target of {model}: {unfilled} of {len(woke) + unfilled} wakes could not "
+            f"be placed (woke {woke}); refusals: {[r.get('reason') for r in response['refusals']]}",
+            response=response,
+            first=response["refusals"][0] if response["refusals"] else None,
+        )
 
     def _physical_wake_capable(self) -> bool:
         """Physical wakes are possible (runtime + vLLM ops)."""
@@ -804,7 +828,7 @@ class ServiceManagerV2:
                 blockers = {b.serve_id: self._wake_blocker(b, planning, leases, journal) for b in sleeping}
                 feasible = [b for b in sleeping if blockers[b.serve_id] is None]
                 if not feasible:
-                    refusals.extend(blockers[b.serve_id] for b in sleeping[:1])
+                    refusals.extend(blockers[b.serve_id] for b in sleeping)  # every blocker left (reported)
                     break
                 preferred = [b for b in feasible if b.serve_id in hinted]
                 binding = _wake_pick(preferred or feasible, planning, topology, self._placement)
@@ -898,7 +922,7 @@ class ServiceManagerV2:
             except StateConflict:
                 current = self._store.load()
                 current_counts = self._model_counts(current.bindings).get(model, {"awake": 0})
-                if current_counts["awake"] != wake_replicas:
+                if current_counts["awake"] != len(plan["target_bindings"]):  # == wake_replicas unless partial
                     raise
                 version = current.version
         response["version"] = version
@@ -956,6 +980,7 @@ class ServiceManagerV2:
         existing_target = min(wake_replicas, len(model_bindings))
         leases = self._active_leases()
         journal = self._wake_journal.entries()
+        refusals: list[WakeConflict] = []
         while sleeping and len(target) < existing_target:
             blockers = {
                 binding.serve_id: self._wake_blocker(binding, list(planning.values()), leases, journal)
@@ -963,7 +988,14 @@ class ServiceManagerV2:
             }
             feasible = [binding for binding in sleeping if blockers[binding.serve_id] is None]
             if not feasible:
-                raise blockers[sleeping[0].serve_id]
+                # Best effort (v1 execute_scale_up, 2026-10-06): an infeasible
+                # sibling never blocks the feasible wakes; what cannot be placed
+                # is reported (``unfilled`` / ``refusals``). Nothing feasible at
+                # all: the first blocker, as before.
+                if not wakes:
+                    raise blockers[sleeping[0].serve_id]
+                refusals = [blockers[binding.serve_id] for binding in sleeping]
+                break
             binding = _wake_pick(feasible, planning.values(), topology, self._placement)
             sleeping.remove(binding)
             planning[binding.serve_id] = replace(
@@ -977,7 +1009,9 @@ class ServiceManagerV2:
         allocator = SlotAllocator(
             self._registry.topology(), list(planning.values()), policy=self._placement
         )
-        while len(target) + len(creates) < wake_replicas:
+        # A growth that could not wake every existing binding creates none (a
+        # partial fill reports the rest as unfilled).
+        while not refusals and len(target) + len(creates) < wake_replicas:
             slot = allocator.find_slot(tp_size, model)
             if slot is None:
                 raise ValueError(f"no free slot for {model} tp_size={tp_size}")
@@ -993,6 +1027,9 @@ class ServiceManagerV2:
             "wake": wakes,
             "create": creates,
             "target_bindings": target + creates,
+            # Wakes the plan could not place (best effort) and why.
+            "unfilled": max(0, wake_replicas - len(target) - len(creates)),
+            "refusals": refusals,
         }
 
     def put_binding_power(
@@ -6731,6 +6768,16 @@ class TransferFailed(WakeConflict):
 
     def body(self, *, retry_after_s: float | None = None) -> dict:
         return {**self.response, **super().body(retry_after_s=retry_after_s)}
+
+
+class TargetPartial(TransferFailed):
+    """An exact model target that woke some but not all of its wakes (HTTP 409
+    ``error: partial``, 2026-10-06): the structured WakeConflict body plus the
+    target response (``actions``, ``picked``, ``unfilled``, ``refusals``). What
+    woke stays awake; ``node`` / ``gpu_ids`` are those of the first refusal. Its
+    writer operation ends ``partial`` (not ``failed``): some wakes did happen."""
+
+    operation_status = "partial"
 
 
 def _error_code(exc: BaseException | None) -> str | None:
