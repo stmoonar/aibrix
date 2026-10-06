@@ -12,6 +12,7 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 TRE_ROOT = DEPLOY_ROOT.parent
 BL_DIR = DEPLOY_ROOT / "baselines" / "tre"
 POLICIES = ("chiron", "tokenscale", "preserve")
+BASELINE_SCALER_TAG = "20261006-87bd94b4"  # built from that commit (clean git archive of tre/)
 IP_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 
@@ -56,6 +57,10 @@ def test_deployment_ships_off_and_dry_run() -> None:
     assert names.index("TRE_BL_POLICY") < names.index("TRE_BL_POLICY_CONFIG")  # $(VAR) needs it first
     image = container["image"]
     assert image.startswith("tre-v2-baseline-scaler:") and not image.endswith(":latest")
+    # the deployed tag: bump it here, in baseline-scaler.yaml and in kustomization.yaml together
+    kustomization = yaml.safe_load((BL_DIR / "kustomization.yaml").read_text(encoding="utf-8"))
+    (img,) = [i for i in kustomization["images"] if i["name"] == "tre-v2-baseline-scaler"]
+    assert image == f"tre-v2-baseline-scaler:{BASELINE_SCALER_TAG}" and img["newTag"] == BASELINE_SCALER_TAG
     mounts = {m["name"]: m["mountPath"] for m in container["volumeMounts"]}
     assert mounts["registry"] == "/etc/tre" and mounts["policies"] == "/etc/tre-baselines"
     volumes = {v["name"]: v for v in pod["volumes"]}
