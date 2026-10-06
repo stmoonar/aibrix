@@ -366,6 +366,8 @@ class ActionQueue:
             "transfer_clamped_by_floor_total": 0,
             "transfer_unsupported_total": 0,
             "scale_clamped_by_floor_total": 0,
+            # 2026-10-06: a SafeScale receiver target the SM filled in part.
+            "receiver_short_total": 0,
         }
 
     # ------------------------------------------------------------------ submit
@@ -1566,7 +1568,7 @@ class ActionQueue:
         if isinstance(action, ReceiverTarget):
             # Absolute, grow-only target: re-sending it is a no-op (review 3 P2-1).
             response = await self._client.scale_model_to(action.model, int(action.target))
-            return _dispatch_result(model=action.model, action_kind="scale", response=response)
+            return self._receiver_result(action, response)
         if isinstance(action, TransferIntent):
             transfer = getattr(self._client, "transfer", None)
             if not callable(transfer):
@@ -1630,11 +1632,8 @@ class ActionQueue:
             # replicas DID wake - reported with them (``changed`` / ``picked``),
             # never as "nothing happened"; not retried (relative), the planner re-plans.
             body = response.get("response") or {}
-            woke = tuple(
-                str(item.get("serve_id")) for item in body.get("actions") or ()
-                if isinstance(item, dict) and item.get("action") == "wake" and item.get("serve_id")
-            )
-            return replace(result, retriable=False, changed=woke, picked=tuple(body.get("picked") or ()))
+            self._refusal_events(action.model, body)  # "partial" is no WAKE_ERROR_CODE
+            return replace(result, retriable=False, changed=_woke(body), picked=tuple(body.get("picked") or ()))
         if action.delta >= 0 or not result.ok:
             return result
         body = response.get("response") or {}
@@ -1760,16 +1759,44 @@ class ActionQueue:
             source = _binding_gpus(entry.get("hint_binding_id")) or "?"
             target = f"{entry.get('node')}/{','.join(str(g) for g in entry.get('gpu_ids') or ())}"
             self._events.append(f"placement_substituted:{action.model}:{source}->{target}")
-        for refusal in body.get("refusals") or ():
-            if isinstance(refusal, dict):
-                self._wake_refused_event(action.model, _refusal_conflict(refusal))
+        self._refusal_events(action.model, body)
         unfilled = int(body.get("unfilled") or 0)
         if unfilled > 0:
+            # What did wake is reported (``changed``): stamped and recorded as "up".
             return replace(
                 result, ok=False, error=f"partial: {unfilled} of {action.delta} wakes unfilled",
-                retriable=False, picked=picked,
+                retriable=False, picked=picked, changed=_woke(body),
             )
         return replace(result, picked=picked)
+
+    def _receiver_result(self, action: ReceiverTarget, response: dict) -> DispatchResult:
+        """A SafeScale receiver's absolute grow-only target. A 200 the SM filled in
+        part (``unfilled``, 2026-10-06) stays ok: the donor already slept (a commit
+        is not undone), the woken replicas are a real "up", and a re-send could not
+        place more now - the next tick re-plans from the view. The short fill is an
+        event (``receiver_short``) and every refusal a ``wake_refused`` event."""
+        result = _dispatch_result(model=action.model, action_kind="scale", response=response)
+        body = (response.get("response") or {}) if result.ok else {}
+        unfilled = int(body.get("unfilled") or 0) if isinstance(body, dict) else 0
+        if unfilled <= 0:
+            return result
+        self._stats["receiver_short_total"] += 1
+        self._events.append(f"receiver_short:{action.model}:unfilled={unfilled}:target={action.target}")
+        LOG.info(
+            json.dumps(
+                {"event": "receiver_short", "model": action.model, "target": action.target,
+                 "unfilled": unfilled, "woke": list(_woke(body))},
+                sort_keys=True,
+            )
+        )
+        self._refusal_events(action.model, body)
+        return replace(result, picked=tuple(body.get("picked") or ()))
+
+    def _refusal_events(self, model: str, body: dict) -> None:
+        """``refusals[]`` of a /target response: one ``wake_refused`` event each."""
+        for refusal in body.get("refusals") or ():
+            if isinstance(refusal, dict):
+                self._wake_refused_event(model, _refusal_conflict(refusal))
 
     async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
         # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: the
@@ -1968,6 +1995,14 @@ def _transfer_changed(result: DispatchResult) -> tuple[bool, bool]:
     donor = bool(summary.get("taken")) or bool(pairs)
     receiver = bool(summary.get("done")) or any(pair.get("status") == "receiver_wake_failed" for pair in pairs)
     return donor, receiver
+
+
+def _woke(body: dict) -> tuple[str, ...]:
+    """Serve ids a /target response woke (its ``wake`` actions)."""
+    return tuple(
+        str(item.get("serve_id")) for item in body.get("actions") or ()
+        if isinstance(item, dict) and item.get("action") == "wake" and item.get("serve_id")
+    )
 
 
 def _refusal_conflict(refusal: dict) -> dict:

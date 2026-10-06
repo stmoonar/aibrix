@@ -6774,7 +6774,10 @@ class TargetPartial(TransferFailed):
     """An exact model target that woke some but not all of its wakes (HTTP 409
     ``error: partial``, 2026-10-06): the structured WakeConflict body plus the
     target response (``actions``, ``picked``, ``unfilled``, ``refusals``). What
-    woke stays awake; ``node`` / ``gpu_ids`` are those of the first refusal."""
+    woke stays awake; ``node`` / ``gpu_ids`` are those of the first refusal. Its
+    writer operation ends ``partial`` (not ``failed``): some wakes did happen."""
+
+    operation_status = "partial"
 
 
 def _error_code(exc: BaseException | None) -> str | None:

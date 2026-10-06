@@ -247,15 +247,17 @@ def test_wake_failed_is_not_retried_at_once():
 def test_refusals_of_a_partial_hinted_wake_are_events_only():
     class PartialClient:
         async def scale_model_hinted(self, model, delta, *, hints):
-            return {"ok": True, "response": {"picked": [], "unfilled": 1, "refusals": [
+            return {"ok": True, "response": {"picked": [], "unfilled": 1,
+                                             "actions": [{"action": "wake", "serve_id": "8b-2"}], "refusals": [
                 {"error": "gpu_busy", "reason": "gpu_truth_used", "node": "node9", "gpu_ids": [1], "scope": "gpu"},
             ]}}
 
-    queue = ActionQueue(PartialClient(), now_ms=lambda: 0)
-    queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
+    queue = ActionQueue(PartialClient(), now_ms=lambda: 3)
+    queue.submit([ScaleAction("dsllama-8b", 2, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
     (result,) = asyncio.run(queue.drain_once())
 
     assert result.ok is False and result.error.startswith("partial")  # not a silent success
+    assert result.changed == ("8b-2",) and queue.last_actions() == {"dsllama-8b": (3, "up")}  # what woke counts
     assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]
 
 
@@ -300,3 +302,4 @@ def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
     assert result.ok is False and result.retriable is False and Transport.calls == 1
     assert result.changed == ("8b-2",) and len(result.picked) == 1
     assert queue.last_actions() == {"dsllama-8b": (5, "up")}
+    assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]  # its refusals

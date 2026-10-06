@@ -439,7 +439,7 @@ table.params td:last-child { font-family: var(--mono); text-align: right; }
   background: var(--idle-bg); color: var(--idle);
 }
 .j-status.succeeded { background: var(--healthy-bg); color: var(--healthy); }
-.j-status.running, .j-status.pending { background: var(--low-bg); color: var(--low); }
+.j-status.running, .j-status.pending, .j-status.partial { background: var(--low-bg); color: var(--low); }
 .j-status.failed, .j-status.error { background: var(--crit-bg); color: var(--crit); }
 .j-err { font-family: var(--mono); font-size: .74rem; color: var(--crit); word-break: break-all; }
 

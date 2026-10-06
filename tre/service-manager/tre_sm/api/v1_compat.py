@@ -7,6 +7,12 @@ from fastapi import APIRouter, HTTPException, Query
 def create_v1_compat_router(service) -> APIRouter:
     # v2 imports this module: its errors are imported here, once v2 is loaded.
     from tre_sm.api.v2 import TargetPartial, WakeConflict, WakeFailed
+    from tre_sm.state.gpu_leases import GpuLeaseConflict
+
+    def _wake_refusal(exc: BaseException) -> bool:
+        if isinstance(exc, GpuLeaseConflict):
+            return True  # a lease taken on the GPU (the prepare's _prepare_wake)
+        return not isinstance(exc, WakeFailed) and exc.reason != "routable_unknown"
 
     router = APIRouter()
 
@@ -35,7 +41,8 @@ def create_v1_compat_router(service) -> APIRouter:
         # retries stack: two "+1" from one base woke two.) Remaining race: two
         # DIFFERENT deltas computed from one base by different callers - only an
         # absolute desiredReplicas from APA removes it (deferred, design note).
-        current = _awake_count(service.get_state(), model_name)
+        state = service.get_state()
+        current = _awake_count(state, model_name)
         if scale_type == "up":
             target = current + scale_value
         elif scale_type == "down":
@@ -51,15 +58,18 @@ def create_v1_compat_router(service) -> APIRouter:
             # v1 contract (execute_scale_up, best effort): 200 with what woke; the
             # APA client warns on actual < requested.
             response = exc.response
-        except WakeConflict as exc:
-            if scale_type != "up" or isinstance(exc, WakeFailed):
-                # Unchanged: a shrink refusal or a wake that itself failed is a 400
-                # (WakeConflict is a ValueError).
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (WakeConflict, GpuLeaseConflict) as exc:
             # No sleeping binding could be placed (refused before any change): v1
             # answered 200 with actual 0, and so does this (the APA client warns and
-            # re-reconciles; an error only makes it requeue with backoff).
-            return {"requested": scale_value, "actual": 0}
+            # re-reconciles; an error only makes it requeue with backoff). Only for a
+            # wake refusal of a real growth (target above every awake binding,
+            # hidden ones included): a shrink-side refusal (``routable_unknown``) or
+            # a wake that itself failed keeps its old status.
+            if _wake_refusal(exc) and target > _awake_total(state, model_name):
+                return {"requested": scale_value, "actual": 0}
+            if isinstance(exc, GpuLeaseConflict):
+                raise  # the app's GpuLeaseConflict handler, as before
+            raise HTTPException(status_code=400, detail=str(exc)) from exc  # a ValueError
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"requested": scale_value, "actual": len(response["actions"])}
@@ -89,6 +99,11 @@ def create_v1_compat_router(service) -> APIRouter:
 
 def _split_models(models: str) -> list[str]:
     return [model.strip() for model in models.split(",") if model.strip()]
+
+
+def _awake_total(state: dict, model: str) -> int:
+    """Awake bindings of ``model``, hidden ones included."""
+    return sum(1 for binding in state["bindings"] if binding["model"] == model and binding["awake"])
 
 
 def _awake_count(state: dict, model: str) -> int:

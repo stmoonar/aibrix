@@ -444,7 +444,24 @@ def _proxy(client: ServiceManagerClient, method: str, path: str, payload: dict[s
     try:
         return {"ok": True, "response": client.request(method, path, payload)}
     except Exception as exc:  # noqa: BLE001
+        partial = _partial_body(exc)
+        if partial is not None:
+            # An exact target the SM filled in part (409 ``partial``, 2026-10-06):
+            # what woke stays awake - its answer (actions, unfilled, refusals) is
+            # passed through as a 409, not a 502.
+            raise HTTPException(status_code=409, detail=partial) from exc
         raise HTTPException(status_code=502, detail=f"service-manager {method} {path} failed: {exc}") from exc
+
+
+def _partial_body(exc: Exception) -> dict[str, Any] | None:
+    """The body of an SM 409 ``error: partial`` (urllib HTTPError), else None."""
+    if getattr(exc, "code", None) != 409 or not callable(getattr(exc, "read", None)):
+        return None
+    try:
+        body = json.loads(exc.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return body if isinstance(body, dict) and body.get("error") == "partial" else None
 
 
 def _hash(text: str) -> str:
