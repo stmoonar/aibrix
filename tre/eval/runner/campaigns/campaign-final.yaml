@@ -23,7 +23,7 @@ eta: {overhead_s: 300, report_s: 150}   # per arm: trace + overhead (idle 60 s, 
 env:                                # exported before runner.env; wins over runner.env and the caller
   # checkout of the release that runs on the cluster (deploy scripts, baselines arm tool, frozen
   # baseline parameters). Update together with the images.
-  RELEASE_TRE: /data/nfs_shared_data/xxy/aibrix-wt/integ-rules2-20261006/tre
+  RELEASE_TRE: ${TRE_REPO}   # one tree: scripts, baselines and client all come from the tree the runner runs from
   TRE_DIR: ${RELEASE_TRE}
   BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
   BL_CM_APPLY: "1"                  # live policy ConfigMap != frozen file -> apply the frozen file

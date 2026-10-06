@@ -16,7 +16,7 @@ max_attempts: 2
 eta: {overhead_s: 300, report_s: 60}
 
 env:
-  RELEASE_TRE: /data/nfs_shared_data/xxy/aibrix-wt/integ-rules2-20261006/tre
+  RELEASE_TRE: ${TRE_REPO}   # one tree: scripts, baselines and client all come from the tree the runner runs from
   TRE_DIR: ${RELEASE_TRE}
   BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
   BL_CM_APPLY: "1"
