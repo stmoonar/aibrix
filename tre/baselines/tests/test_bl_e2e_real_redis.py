@@ -520,9 +520,16 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     assert max(ln["awake"] for ln in mine) >= 2
     assert not any(ln["action"] == "up" for ln in other)          # the quiet model is left alone
     assert all(ln["owner"] and not ln["dry_run"] for ln in lines)
-    # every dispatched action reached the stub SM once, with the contract's body
+    # every dispatched action reached the stub SM with the contract's body. Scale-up is stepped
+    # (one PUT per +1), so one "up" decision may produce several PUTs: at least one PUT per
+    # decision, and every at_least PUT raises the target by exactly 1.
     dispatched = [ln for ln in lines if ln["action"] in ("up", "down")]
-    assert len(h.puts) == len(dispatched)
+    assert len(h.puts) >= len(dispatched)
+    prev = {A: MIN_R, B: MIN_R}
+    for model, body, _ in h.puts:
+        if body.get("at_least"):
+            assert body["wake_replicas"] == prev[model] + 1, (model, body, prev)
+        prev[model] = body["wake_replicas"]
     for model, body, status in h.puts:
         assert 1 <= body["wake_replicas"] <= MAX_R and status == 200
         assert body.get("at_least") is True or body == {"wake_replicas": body["wake_replicas"], "sleep_path": "urgent"}
