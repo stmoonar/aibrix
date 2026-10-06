@@ -1,3 +1,4 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
 # End-to-end smoke of run_campaign.sh before the final campaign: a 120 s slice of T7 Tight-pool
 # ([100, 220) s: base load + the start of the 8b surge at 120 s), two arms (TRE, TokenScale). Same
 # settings as campaign-final.yaml; same marker round, so one exclusive window covers both.

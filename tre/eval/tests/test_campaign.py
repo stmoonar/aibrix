@@ -401,3 +401,14 @@ def test_dry_run_prints_plan_and_flags_missing_inputs(tmp_path, monkeypatch):
     (tmp_path / "traces" / "Simul_spike" / "seed1" / "traces_tre.effective.json").unlink()
     probs, _ = C.validate_inputs(c, C.resolve_traces(c), C.build_plan(c))
     assert any("Simul_spike" in x and "missing trace" in x for x in probs)
+
+
+def test_paths_outside_tre_repo_are_a_problem(tmp_path):
+    repo = Path(C.TRE_REPO_DEFAULT)
+    ok = {"TRE_REPO": str(repo), "RELEASE_TRE": str(repo), "TRE_DIR": str(repo),
+          "LOADGEN_TRE_DIR": str(repo), "BL_CM_FILE": str(repo / "deploy/baselines/tre/policy-configmaps.yaml")}
+    assert C.paths_outside_repo(ok) == []
+    other = tmp_path / "other-tree"
+    other.mkdir()
+    bad = C.paths_outside_repo({**ok, "RELEASE_TRE": str(other), "TRE_DIR": str(other)})
+    assert len(bad) >= 2 and all("outside TRE_REPO" in x for x in bad)

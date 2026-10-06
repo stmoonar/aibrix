@@ -1,3 +1,4 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
 # TRE v2 final comparison (docs/trace-design-v2.md round 2; data per docs/eval-metrics-spec-20261007.md).
 # One seed (seed1) per trace. Every trace runs all five arms back to back before the next trace; the arm
 # order inside a trace is a Williams Latin-square row (rotated per trace, recorded per arm). PreServe's

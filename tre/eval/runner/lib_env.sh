@@ -2,6 +2,7 @@
 # Values already in the environment win (every line of the env file is VAR="${VAR:-default}").
 RUNNER_DIR="${RUNNER_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 RUNNER_ENV="${RUNNER_ENV:-$RUNNER_DIR/runner.env}"
+TRE_REPO="${TRE_REPO:-$(cd "$RUNNER_DIR/../.." && pwd)}"   # the tree the runner runs from (runner.env defaults refer to it)
 if [ -f "$RUNNER_ENV" ]; then
   # shellcheck disable=SC1090
   . "$RUNNER_ENV"

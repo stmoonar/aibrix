@@ -975,6 +975,22 @@ def precheck_until_ready(checks: Callable[[], list], reset: Callable[[bool], int
 
 
 # ------------------------------------------------------------------ input validation (offline)
+def paths_outside_repo(env: dict, repo: Optional[str] = None) -> list:
+    """One tree: every script/tree path the runner calls must resolve (realpath) inside TRE_REPO."""
+    root = Path(repo or env.get("TRE_REPO") or TRE_REPO_DEFAULT).resolve()
+    cand = {k: env.get(k) for k in ("RELEASE_TRE", "TRE_DIR", "LOADGEN_TRE_DIR", "BL_CM_FILE")}
+    for f in ("run_arm_pilot.sh", "reset_canonical.sh"):
+        cand[f"runner/{f}"] = str(HERE / f)
+    if env.get("TRE_DIR"):
+        for f in ("set_run_mode.sh", "toggle_tre_apa.sh"):
+            cand[f"TRE_DIR/deploy/scripts/{f}"] = str(Path(env["TRE_DIR"]) / "deploy/scripts" / f)
+    bad = []
+    for k, v in cand.items():
+        if v and not Path(v).resolve().is_relative_to(root):
+            bad.append(f"{k}={v} resolves outside TRE_REPO {root} (runner, scripts and client must come from one tree)")
+    return bad
+
+
 def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) -> tuple[list, list]:
     problems, warnings = [], []
     env = {**os.environ, **c["env"]}
@@ -1007,6 +1023,7 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
     for f in ("run_arm_pilot.sh", "reset_canonical.sh", "lib_env.sh", "sampler.py", "clock_probe.py", "components.py"):
         if not (HERE / f).is_file():
             problems.append(f"runner file missing: {HERE / f}")
+    problems.extend(paths_outside_repo(env))
     tre = env.get("TRE_DIR")
     if not tre:
         problems.append("TRE_DIR not set (campaign env / runner.env)")
