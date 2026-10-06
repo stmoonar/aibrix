@@ -10,4 +10,4 @@ resources:
 images:
   # Built locally from tre/ (docker build -f baselines/Dockerfile .); set the tag at deploy.
   - name: tre-v2-baseline-scaler
-    newTag: 20261006-87bd94b4
+    newTag: 20261006-43444853
