@@ -205,3 +205,125 @@ def test_report_end_to_end_with_missing_optional_inputs(arm_dir, tmp_path):
     assert os.path.exists(os.path.join(out, "arms", "chiron", "fig_gpu_map.png"))
     s = json.load(open(os.path.join(out, "arms", "chiron", "summary.json")))
     assert any("pod_gauges" in w for w in s["warnings"])  # absent input -> warning, not a crash
+    with open(os.path.join(out, "arms", "chiron", "timeseries_1s.csv")) as fh:
+        assert "kv_mean_all" not in fh.readline()  # no newer collector -> old columns only
+
+
+# ---------------------------------------------------------------- newer collectors
+def _utc(ts):
+    import time
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + f",{int(round(ts % 1 * 1000)):03d}"
+
+
+def _jl(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+
+
+def add_new_collectors(d):
+    """n2 runs 10 s ahead; SM and Redis run on n2; sidecar pod 'pod-b23' (no node in its name) on n2."""
+    with open(os.path.join(d, "clock_offsets.json"), "w") as fh:
+        json.dump({"ref_host": "runner", "method": "ssh-date", "offsets_s": {"n1": 0.0, "n2": 10.0},
+                   "start": {"ts": T0, "nodes": {"n2": {"offset_s": 10.0, "rtt_s": 0.01}}},
+                   "end": {"ts": T0 + 100, "nodes": {"n2": {"offset_s": 10.2, "rtt_s": 0.01}}}}, fh)
+    pods = [{"namespace": "tre-v2", "name": "sm-0", "component": "service-manager", "node": "n2", "phase": "Running",
+             "containers": [{"name": "sm", "image": "tre-v2-sm:x", "image_id": "docker://sha256:aa"}]},
+            {"namespace": "default", "name": "pod-b23", "component": "model", "node": "n2", "phase": "Running", "containers": []}]
+    with open(os.path.join(d, "components.json"), "w") as fh:
+        json.dump({"component_nodes": {"service-manager": "n2", "redis": "n2", "controller": "n2"},
+                   "image_ids_by_node": {"n2": {"tre-v2-sm:x": "sha256:aa"}, "n1": {"vllm:x": "sha256:bb"}},
+                   "start": {"ts": T0, "pods": pods}, "end": {"ts": T0 + 100, "pods": pods}}, fh)
+    # B23 hidden over [30, 35): still decoding, label routable=false
+    pm = []
+    for t in range(25, 40):
+        p = {"pod-b0": {"model": "m-b", "node": "n2", "routable_label": "true", "routable": True, "sm_awake": True,
+                        "sm_hidden": False, "kv_cache_usage_perc": 0.2, "num_requests_running": 2,
+                        "num_requests_waiting": 0, "generation_tokens_total": 100.0 * t, "num_preemptions_total": 0}}
+        if t >= 30:
+            p["pod-b23"] = {"model": "m-b", "node": "n2", "routable_label": "false" if t < 35 else "true",
+                            "routable": t >= 35, "sm_awake": True, "sm_hidden": t < 35, "kv_cache_usage_perc": 0.8,
+                            "num_requests_running": 5, "num_requests_waiting": 1, "generation_tokens_total": 0.0,
+                            "num_preemptions_total": 0}
+        pm.append({"ts": T0 + t, "pods": p})
+    _jl(os.path.join(d, "pod_metrics_1s.jsonl"), pm)
+    _jl(os.path.join(d, "sm.log"), [f'{_utc(T0 + 60)} INFO tre_sm.ops: wake_done {{"binding_id": "m-b/n2/0", "phases_ms": {{"wake_up": 1500}}}}'])
+    _jl(os.path.join(d, "sm.ts.log"), ['1970-01-12T13:47:40.500000000Z INFO:     10.0.0.1:5 - "PUT /v2/models/m-b/target HTTP/1.1" 200 OK',
+                                       '1970-01-12T13:47:41.000000000Z INFO:     10.0.0.1:5 - "GET /v2/state HTTP/1.1" 200 OK'])
+    _jl(os.path.join(d, "sidecar", "pod-b23.log"),
+        [{"event": "tre_reissue", "ts": T0 + 10 + 48.0, "abort_ts": T0 + 10 + 46.0, "request_id": "r250",
+          "kind": "continue", "reason": "sleep", "gap_ms": 700}])
+    _jl(os.path.join(d, "baseline", "bl_req_events.m-b.jsonl"),
+        [{"id": f"{int((T0 + 10 + 43.0) * 1000)}-0", "kind": "arr", "req_id": "r250", "pod": "pod-b0"},
+         {"id": f"{int((T0 + 10 + 44.0) * 1000)}-0", "kind": "done", "req_id": "r250", "pod": "pod-b0"},
+         {"id": f"{int((T0 + 10 + 44.0) * 1000)}-1", "kind": "arr", "req_id": "a-gateway-uuid", "pod": "pod-b0"}])
+    _jl(os.path.join(d, "gpu_map.jsonl"),  # t=50 agrees with the layout; t=60 claims m-a on n1/1 (asleep since 28)
+        [{"ts": T0 + 50, "map": {"n1/0": {"awake": [A0], "hidden": []}, "n2/0": {"awake": [B0], "hidden": []},
+                                 "n2/2": {"awake": [B23], "hidden": []}, "n2/3": {"awake": [B23], "hidden": []}}},
+         {"ts": T0 + 60, "map": {"n1/0": {"awake": [A0]}, "n1/1": {"awake": [A1]}, "n2/0": {"awake": [B0]},
+                                 "n2/2": {"awake": [B23]}, "n2/3": {"awake": [B23]}}}])
+    _jl(os.path.join(d, "gpu_truth.jsonl"),  # n1 gpu 3: 30 GB used, no binding there (gpu 0 holds m-a)
+        [{"ts": T0 + t, "nodes": {"n1": {"node": "n1", "gpus": [{"used_mib": 30000}, {"used_mib": 400}, {"used_mib": 400}, {"used_mib": 30000}]}}}
+         for t in range(40, 45)])
+
+
+def test_pod_metrics_hidden_pods_only_in_all_columns(arm_dir):
+    from tre_eval import timeseries as T
+    add_new_collectors(arm_dir)
+    arm = L.load_arm(arm_dir)
+    ts = T.build(arm, [])
+    j = list(ts["_t"]["t"]).index(32.0)
+    b = ts["m-b"]
+    assert (b["kv_mean"][j], b["running"][j], b["pods_sampled"][j]) == (0.2, 2, 1)   # routable pods only
+    assert b["kv_mean_all"][j] == pytest.approx(0.5) and b["running_all"][j] == 7   # + the hidden pod
+    assert b["pods_hidden_sampled"][j] == 1 and b["routable_label"][j] == 1
+    assert b["gen_tok_s_engine"][j] == pytest.approx(100.0)                     # counter delta / 1 s
+
+
+def test_components_v2_sets_node_offsets_and_image_ids(arm_dir):
+    from tre_eval import report
+    add_new_collectors(arm_dir)
+    arm = L.load_arm(arm_dir)
+    wake = next(e for e in arm.sm_events if e["kind"] == "wake_done")
+    assert wake["ts"] == pytest.approx(T0 + 50.0)                 # SM node n2 is 10 s ahead
+    assert arm.sm_access[0]["ts"] == pytest.approx(T0 + 50.5)     # kubelet stamp, same correction
+    assert arm.sidecar[0]["abort_ts"] == pytest.approx(T0 + 46.0)  # pod-b23 -> n2 via components.json pods
+    man = report.manifest(arm)
+    assert man["image_ids_by_node"]["n1"]["vllm:x"] == "sha256:bb"
+    assert man["clock"]["drift_s"]["n2"] == pytest.approx(0.2)
+
+
+def test_trs_now_ms_is_the_tre_decision_time(tmp_path):
+    from tre_eval import timeseries as T
+    d = str(tmp_path / "trace-y" / "tre")
+    write_arm(d, [(float(t), lay([A0], [B0])) for t in range(-5, 101)], [req(i, model="m-b", t=float(i)) for i in range(90)])
+    msg = {"event": "trs_calc_result", "ts_ms": str(int((T0 + 20) * 1000)), "now_ms": str(int((T0 + 22.4) * 1000)),
+           "loop": "rescue", "submitted": 1, "actions": json.dumps([{"model": "m-b", "delta": 1, "reason": "crit"}])}
+    _jl(os.path.join(d, "controller.log"), [{"message": json.dumps(msg)}])
+    arm = L.load_arm(d)
+    assert arm.ctrl_ticks[0]["ts"] == pytest.approx(T0 + 20)   # window boundary kept for signal columns
+    assert [x["ts"] for x in M.decisions(arm)] == [pytest.approx(T0 + 22.4)]
+    ev = [e for e in T.events(arm) if e["kind"] == "decision_up"]
+    assert ev[0]["t"] == pytest.approx(22.4)
+
+
+def test_report_joins_request_ids_from_sidecar_and_gateway(arm_dir, tmp_path):
+    pytest.importorskip("matplotlib")
+    import csv
+    from tre_eval import report
+    add_new_collectors(arm_dir)
+    out = str(tmp_path / "rep")
+    assert report.main([arm_dir, "--out", out, "--reps", "20"]) == 0
+    a = os.path.join(out, "arms", "chiron")
+    rows = {r["request_id"]: r for r in csv.DictReader(open(os.path.join(a, "requests.csv")))}
+    assert rows["r250"]["sidecar_continuations"] == "1" and rows["r251"]["sidecar_continuations"] == "0"
+    assert float(rows["r250"]["gw_arr_t"]) == pytest.approx(43.0)   # Redis on n2, 10 s ahead
+    v = json.load(open(os.path.join(out, "validation.json")))["chiron"]
+    assert v["gateway_join"]["joined"] == 1 and v["gateway_join"]["gw_unmatched"] == 1
+    assert v["gpu_truth_vs_layout"]["gpu_busy_without_awake_binding_s"] == {"n1/3": 5}
+    assert (v["gpu_map_vs_layout"]["snapshots_compared"], v["gpu_map_vs_layout"]["mismatched"]) == (2, 1)
+    s = json.load(open(os.path.join(a, "summary.json")))
+    assert s["interruption"]["added_latency_method"] == "exact_request_id_join"
+    ev = list(csv.DictReader(open(os.path.join(a, "events.csv"))))
+    assert [e["kind"] for e in ev if e["source"] == "sm_api"] == ["PUT /v2/models/{model}/target"]

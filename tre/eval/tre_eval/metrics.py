@@ -223,6 +223,11 @@ def step_value_at(series: list[tuple], idx: int, t: float):
 
 
 # ---------------------------------------------------------------- decisions (per decision source)
+def tick_time(tick: dict) -> float:
+    """Decision time of a controller tick: wall clock ``now_ms`` when logged, else the window boundary."""
+    return tick["now"] if tick.get("now") is not None else tick["ts"]
+
+
 def decision_source(arm: Arm) -> str:
     """Who actuates in this arm: baseline shell, AIBrix APA, or the TRE controller."""
     if arm.bl_decisions:
@@ -239,21 +244,24 @@ def decisions(arm: Arm) -> list[dict]:
     out: list[dict] = []
     if src == "tre":
         for t in arm.ctrl_ticks:
+            ts = tick_time(t)
             for a in t["actions"]:
                 if not isinstance(a, dict):
                     continue
                 det = {"loop": t["loop"], "submitted": t["submitted"], "reason": a.get("reason"),
                        "kind": a.get("kind"), "delta": a.get("delta")}
+                if "now" in t:
+                    det["window_ts"] = t["ts"]
                 donor, recv = a.get("donor"), a.get("receiver")
                 if donor and recv:
-                    out.append({"ts": t["ts"], "model": recv, "dir": 1, "source": "tre", "detail": det})
-                    out.append({"ts": t["ts"], "model": donor, "dir": -1, "source": "tre", "detail": det})
+                    out.append({"ts": ts, "model": recv, "dir": 1, "source": "tre", "detail": det})
+                    out.append({"ts": ts, "model": donor, "dir": -1, "source": "tre", "detail": det})
                     continue
                 delta = a.get("delta")
                 m = a.get("model") or recv or donor
                 if m is None or not delta:
                     continue
-                out.append({"ts": t["ts"], "model": m, "dir": 1 if delta > 0 else -1, "source": "tre", "detail": det})
+                out.append({"ts": ts, "model": m, "dir": 1 if delta > 0 else -1, "source": "tre", "detail": det})
     elif src == "baseline":
         for r in arm.bl_decisions:
             if r.get("action") in ("up", "down"):
@@ -494,15 +502,26 @@ def interruption(arm: Arm, recs: list[dict]) -> dict:
     res["client_continuations_total"] = sum(int(r.get("continued") or 0) for r in recs)
     res["client_interrupted"] = sum(1 for r in recs if r.get("interrupted"))
     res["client_failed"] = sum(1 for r in recs if r.get("ok") is False)
-    # added latency (scored requests only)
+    # added latency (scored requests only). Continued = joined to a sidecar continuation by request id
+    # when the sidecar logs carry request ids (exact), else the client's x-tre-continued header (approx.)
+    exact = any(e.get("request_id") for e in re_) and any("sidecar_continuations" in r for r in recs)
+    cont = ((lambda r: (r.get("sidecar_continuations") or 0) > 0 or bool(r.get("continued"))) if exact
+            else (lambda r: bool(r.get("continued"))))
+    res["added_latency_method"] = "exact_request_id_join" if exact else "approx_client_header"
+    if exact:
+        joined = [r for r in recs if (r.get("sidecar_continuations") or 0) > 0]
+        per = [r["sidecar_gap_ms_sum"] for r in joined if r.get("sidecar_gap_ms_sum") is not None]
+        res["sidecar_joined_requests"] = len(joined)
+        res["sidecar_gap_ms_per_request_p50"] = pct(per, 50)
+        res["sidecar_gap_ms_per_request_p95"] = pct(per, 95)
     sc = [r for r in recs if "viol" in r and r.get("ok") and r.get("t_send") is not None]
     by: dict[tuple, list] = defaultdict(list)
     for r in sc:
-        if not r.get("continued"):
+        if not cont(r):
             by[(r["model"], int(r["t_send"] // 30))].append(r)
     d_e2e, d_ttft = [], []
     for r in sc:
-        if r.get("continued"):
+        if cont(r):
             peers = by.get((r["model"], int(r["t_send"] // 30)))
             if peers:
                 d_e2e.append(r["e2e_ms"] - statistics.median(p["e2e_ms"] for p in peers))
@@ -511,10 +530,51 @@ def interruption(arm: Arm, recs: list[dict]) -> dict:
     res["added_e2e_ms_p95"] = pct(d_e2e, 95)
     res["added_ttft_ms_p50"] = pct(d_ttft, 50)
     res["continued_scored"] = len(d_e2e)
-    res["continued_viol_pct"] = (round(100 * sum(r["viol"] for r in sc if r.get("continued")) /
-                                       max(1, sum(1 for r in sc if r.get("continued"))), 3)
-                                 if any(r.get("continued") for r in sc) else None)
+    res["continued_viol_pct"] = (round(100 * sum(r["viol"] for r in sc if cont(r)) /
+                                       max(1, sum(1 for r in sc if cont(r))), 3)
+                                 if any(cont(r) for r in sc) else None)
     return res
+
+
+# ---------------------------------------------------------------- per-request joins (server-side sources)
+def join_requests(arm: Arm, recs: list[dict]) -> dict:
+    """Join gateway per-request events and sidecar continuations to the client records by request id
+    (the client sends x-request-id = trace request_id; older runs carry gateway uuids => no join).
+    Adds ``gw_arr_t / gw_ft_t / gw_done_t`` (reference s, t = 0 = load start) and ``gw_pod``, and
+    ``sidecar_continuations`` / ``sidecar_gap_ms_sum``. Returns join statistics (empty without sources)."""
+    out: dict[str, Any] = {}
+    t0 = arm.t_load or 0.0
+    ids = {r.get("request_id") for r in recs if r.get("request_id")}
+    if arm.gw_requests:
+        n = 0
+        for r in recs:
+            g = arm.gw_requests.get(r.get("request_id"))
+            if g is None:
+                continue
+            n += 1
+            for k in ("arr", "ft", "done"):
+                r[f"gw_{k}_t"] = None if g[k] is None else round(g[k] - t0, 3)
+            r["gw_pod"] = g["pod"]
+        out["gateway"] = {"gw_requests": len(arm.gw_requests), "client_requests": len(recs), "joined": n,
+                          "join_rate": round(n / len(recs), 5) if recs else None,
+                          "gw_unmatched": sum(1 for k in arm.gw_requests if k not in ids)}
+    re_ = [e for e in arm.sidecar if e.get("event") == "tre_reissue"]
+    with_id = [e for e in re_ if e.get("request_id")]
+    if with_id:
+        cnt: Counter = Counter()
+        gap: dict[str, float] = defaultdict(float)
+        for e in with_id:
+            cnt[e["request_id"]] += 1
+            if e.get("gap_ms") is not None:
+                gap[e["request_id"]] += float(e["gap_ms"])
+        for r in recs:
+            rid = r.get("request_id")
+            r["sidecar_continuations"] = cnt.get(rid, 0)
+            r["sidecar_gap_ms_sum"] = round(gap[rid], 1) if rid in cnt else None
+        out["sidecar"] = {"reissue_events": len(re_), "with_request_id": len(with_id),
+                          "joined_events": sum(n for k, n in cnt.items() if k in ids),
+                          "unmatched_request_ids": sorted(k for k in cnt if k not in ids)[:20]}
+    return out
 
 
 # ---------------------------------------------------------------- wake / sleep durations
@@ -559,22 +619,102 @@ def control_overhead(arm: Arm) -> dict:
                              **{f"tick_{k}_ms_p50": pct(v, 50) for k, v in tick.items()},
                              **{f"tick_{k}_ms_p99": pct(v, 99) for k, v in tick.items()},
                              "source": "controller_profile.csv"}
-    if arm.resource_rows:  # spec'd collector: one row per sample {ts, component, cpu_cores, rss_mib}
-        by = defaultdict(lambda: ([], []))
+    if arm.resource_rows:  # collector rows {ts, component, [pod, container,] cpu_cores, rss_mib[, working_set_mib]}
+        # containers / replicas of one component sampled at the same ts are summed (one value per sample)
+        per: dict[str, dict[float, list]] = defaultdict(lambda: defaultdict(lambda: [None, None, None, 0]))
         for r in arm.resource_rows:
-            ts = float(r.get("ts") or 0)
+            try:
+                ts = float(r.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
             if not (a / 1000 <= ts <= b / 1000):
                 continue
-            c = by[r.get("component")]
-            if r.get("cpu_cores") not in (None, ""):
-                c[0].append(float(r["cpu_cores"]))
-            if r.get("rss_mib") not in (None, ""):
-                c[1].append(float(r["rss_mib"]))
-        for comp, (cpu, rss) in by.items():
-            res[comp] = {"cpu_cores_p50": pct(cpu, 50), "cpu_cores_p95": pct(cpu, 95),
-                         "rss_mib_p50": pct(rss, 50), "rss_mib_max": max(rss) if rss else None,
-                         "source": "resource_usage"}
+            c = per[r.get("component")][ts]
+            c[3] += 1
+            for i, k in enumerate(("cpu_cores", "rss_mib", "working_set_mib")):
+                if r.get(k) not in (None, ""):
+                    c[i] = (c[i] or 0.0) + float(r[k])
+        for comp, samples in per.items():
+            cpu = [v[0] for v in samples.values() if v[0] is not None]
+            rss = [v[1] for v in samples.values() if v[1] is not None]
+            ws = [v[2] for v in samples.values() if v[2] is not None]
+            row = {"cpu_cores_p50": pct(cpu, 50), "cpu_cores_p95": pct(cpu, 95),
+                   "rss_mib_p50": pct(rss, 50), "rss_mib_max": max(rss) if rss else None,
+                   "source": "resource_usage"}
+            if cpu:
+                row["cpu_cores_max"] = round(max(cpu), 4)
+            if ws:
+                row["working_set_mib_max"] = round(max(ws), 1)
+            row["n_samples"] = len(samples)
+            res[comp] = row
     return res
+
+
+# ---------------------------------------------------------------- collector cross-checks
+def _layout_gpu_map(models: dict) -> dict[str, tuple]:
+    """``node/gpu`` -> (sorted awake binding ids, sorted hidden binding ids) from one layout sample."""
+    g: dict[str, tuple[set, set]] = defaultdict(lambda: (set(), set()))
+    for _, (awake, hidden) in models.items():
+        hs = set(hidden)
+        for b in awake:
+            _, node, gpus = parse_binding(b)
+            for x in gpus:
+                g[f"{node}/{x}"][0].add(b)
+                if b in hs:
+                    g[f"{node}/{x}"][1].add(b)
+    return {k: (sorted(a), sorted(h)) for k, (a, h) in g.items() if a}
+
+
+def gpu_map_check(arm: Arm, slack_s: float = 1.5) -> dict | None:
+    """SM gpu_map.jsonl snapshots vs the layout-derived per-GPU map. A snapshot mismatches when no
+    layout sample within ``slack_s`` seconds has the same awake bindings on every GPU."""
+    if not arm.gpu_map or not arm.layout:
+        return None
+    lts = [x[0] for x in arm.layout]
+    mism, n = [], 0
+    import bisect
+    for ts, mp in arm.gpu_map:
+        want = {k: sorted((v or {}).get("awake") or []) for k, v in mp.items() if (v or {}).get("awake")}
+        lo, hi = bisect.bisect_left(lts, ts - slack_s), bisect.bisect_right(lts, ts + slack_s)
+        cands = [_layout_gpu_map(arm.layout[i][1]) for i in range(lo, hi)]
+        if not cands:
+            continue
+        n += 1
+        if any({k: v[0] for k, v in c.items()} == want for c in cands):
+            continue
+        ref = cands[0]
+        diff = {g: {"gpu_map": want.get(g, []), "layout": (ref.get(g) or ([], []))[0]}
+                for g in sorted(set(want) | set(ref)) if want.get(g, []) != (ref.get(g) or ([], []))[0]}
+        mism.append({"t": round(ts - (arm.t_load or 0), 3), "gpus": diff})
+    return {"snapshots_compared": n, "mismatched": len(mism), "first_mismatches": mism[:20]}
+
+
+def gpu_truth_check(arm: Arm, used_mib_thr: float = 2000.0) -> dict | None:
+    """APPROXIMATE physical-vs-ledger check: seconds a GPU reports used_mib > thr while the layout shows
+    no awake binding on it. GPU index = position in the gpu-truth ``gpus`` list (assumed device order)."""
+    if not arm.gpu_truth or not arm.layout:
+        return None
+    import bisect
+    lts = [x[0] for x in arm.layout]
+    secs: Counter = Counter()
+    n = 0
+    for ts, nodes in arm.gpu_truth:
+        i = bisect.bisect_right(lts, ts) - 1
+        if i < 0:
+            continue
+        awake = _layout_gpu_map(arm.layout[i][1])
+        n += 1
+        for node, st in nodes.items():
+            if not isinstance(st, dict):
+                continue
+            for idx, g in enumerate(st.get("gpus") or []):
+                used = (g or {}).get("used_mib")
+                if used is not None and float(used) > used_mib_thr and f"{node}/{idx}" not in awake:
+                    secs[f"{node}/{idx}"] += 1
+    return {"samples": n, "used_mib_threshold": used_mib_thr,
+            "gpu_busy_without_awake_binding_s": dict(sorted(secs.items())),
+            "total_s": sum(secs.values()),
+            "note": "approximate: 1 sample = 1 s; gpu index = order of gpu-truth gpus list"}
 
 
 # ---------------------------------------------------------------- confidence intervals

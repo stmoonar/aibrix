@@ -96,7 +96,9 @@ def manifest(arm: L.Arm) -> dict:
         if len(p) >= 3:
             model_imgs[(p[1], p[2].replace("docker://", ""))] += 1
     meta = f.get("arm_meta.json") or {}
-    return {
+    if arm.component_meta.get("image_ids_by_node"):  # components.json (pod containerStatuses, every node)
+        ids = arm.component_meta["image_ids_by_node"]
+    out = {
         "arm": arm.name, "label": arm.label, "trace": arm.trace_name, "dir": arm.dir,
         "load_start_epoch": arm.t_load, "load_end_epoch": arm.t_end, "load_s": (arm.t_end - arm.t_load) if arm.t_end and arm.t_load else None,
         "controller_restart_epoch": arm.t_restart, "start_iso": (f.get("start_iso") or "").strip() or None,
@@ -120,6 +122,26 @@ def manifest(arm: L.Arm) -> dict:
                                                      ("image_ids_all_nodes", len(ids) >= 2),
                                                      ("trace_segments", bool(arm.trace_segments))) if not ok],
     }
+    # newer collectors: keys only when their source exists (old arms keep the old manifest)
+    runner = dict(re.findall(r"^(\w+)=(.*)$", f.get("runner_sha", ""), re.M))
+    if runner:
+        out["runner"] = runner
+    if arm.clock_meta:
+        out["clock"] = arm.clock_meta
+    if arm.component_meta.get("moved"):
+        out["component_moved"] = arm.component_meta["moved"]
+    tm = f.get("trace_manifest.json")
+    if isinstance(tm, dict):
+        out["trace_manifest"] = tm
+        out["trace_sha256_manifest"] = tm.get("trace_sha256")
+        out["trace_sha256_match"] = (tm.get("trace_sha256") == arm.traces_sha256
+                                     if tm.get("trace_sha256") and arm.traces_sha256 else None)
+    sm = f.get("trace_source_manifest.json")
+    if isinstance(sm, dict):
+        out["trace_source_manifest"] = {k: sm.get(k) for k in ("seed", "spec") if k in sm}
+    if f.get("trace_seed") is not None:
+        out["trace_seed"] = f["trace_seed"]
+    return out
 
 
 # ---------------------------------------------------------------- one arm
@@ -127,6 +149,7 @@ def analyse_arm(path: str, args, capacity: dict, dp_cfg: dict) -> dict:
     arm = L.load_arm(path, clock_offsets=args.clock_offset, trace_segments=args.trace_segments)
     max_tok = {t["request_id"]: t.get("max_output_tokens") for t in arm.traces}
     recs, summary = M.score_requests(arm.requests, arm.slo, trim_s=args.trim_s, max_tok=max_tok, t_ref=arm.t_load)
+    joins = M.join_requests(arm, recs)
     if not arm.slo:
         arm.warn("no SLO block: V_req / percentiles empty")
     gpu = M.gpu_accounting(arm, summary)
@@ -157,7 +180,7 @@ def analyse_arm(path: str, args, capacity: dict, dp_cfg: dict) -> dict:
             "records": recs, "summary": summary, "gpu": gpu, "onsets": onsets, "onset_rows": onset_rows,
             "decision_points": dps, "interruption": inter, "switch": sw, "overhead": over, "ts": ts,
             "gpu_intervals": giv, "events": ev, "decisions": dec, "ci": ci, "trs": arm.trs,
-            "client_counts": client_counts, "manifest": manifest(arm), "warnings": arm.warnings}
+            "client_counts": client_counts, "manifest": manifest(arm), "warnings": arm.warnings, "joins": joins}
 
 
 def validate(res: dict, compare_rows: list[dict] | None) -> dict:
@@ -203,6 +226,16 @@ def validate(res: dict, compare_rows: list[dict] | None) -> dict:
                 if not _num_eq(ours, row[k]):
                     out["mismatches"].append({"source": "compare_json", "model": "ALL", "key": k, "theirs": row[k], "ours": ours})
         out["compare_json"] = {"checked": n, "mismatched": sum(1 for x in out["mismatches"] if x["source"] == "compare_json")}
+    # newer collectors (keys only when the source exists)
+    arm = res["arm"]
+    for k, v in (("gpu_map_vs_layout", M.gpu_map_check(arm)), ("gpu_truth_vs_layout", M.gpu_truth_check(arm))):
+        if v is not None:
+            out[k] = v
+    j = res.get("joins") or {}
+    if "gateway" in j:
+        out["gateway_join"] = j["gateway"]
+    if "sidecar" in j:
+        out["sidecar_join"] = j["sidecar"]
     return out
 
 
@@ -215,8 +248,10 @@ def write_arm(res: dict, out: str, multi_trace: bool) -> dict:
     fields = ["request_id", "model", "t_send", "t_end", "trimmed", "ok", "ttft_ms", "tpot_ms", "tpot_v1_ms", "e2e_ms",
               "in", "out", "max_tokens", "ttft_thr_ms", "v_ttft", "v_tpot", "v_e2e", "censored", "viol", "continued",
               "interrupted", "http_status", "finish_reason", "target_pod", "send_lateness_ms"]
+    fields += [k for k in ("gw_arr_t", "gw_ft_t", "gw_done_t", "gw_pod", "sidecar_continuations", "sidecar_gap_ms_sum")
+               if any(k in r for r in res["records"])]  # joined server-side columns (newer collectors only)
     _write_csv(os.path.join(d, "requests.csv"), res["records"], fields)
-    _write_csv(os.path.join(d, "timeseries_1s.csv"), T.to_rows(res["ts"]), ["t", "model", *T.TS_FIELDS])
+    _write_csv(os.path.join(d, "timeseries_1s.csv"), T.to_rows(res["ts"]), ["t", "model", *T.fields(res["ts"])])
     _write_csv(os.path.join(d, "events.csv"), res["events"],
                ["t", "t_epoch", "source", "kind", "model", "target", "value", "detail"])
     giv_rows = []
@@ -288,15 +323,16 @@ def comparison_rows(results: list[dict]) -> list[dict]:
 def paired_rows(results: list[dict], ref_name: str, args) -> list[dict]:
     """Per (arm, seed) paired differences vs the reference arm on the same request plan; then the
     multi-seed summary (mean of per-seed differences, t-CI) per arm x model."""
-    by_key = defaultdict(dict)  # arm name -> seed -> res
+    by_key = defaultdict(dict)  # (arm name, trace without _s<seed>) -> seed -> res
     for r in results:
         seed = r["arm"].traces_sha256 or r["trace"]
-        by_key[r["name"]][seed] = r
-    ref = by_key.get(ref_name, {})
+        by_key[(r["name"], L.trace_base(r["trace"]))][seed] = r
+    groups = {k[1] for k in by_key}
     rows, multi = [], []
-    for name, seeds in by_key.items():
+    for (name, tb), seeds in by_key.items():
         if name == ref_name:
             continue
+        ref = by_key.get((ref_name, tb), {})
         diffs = defaultdict(list)
         for seed, r in seeds.items():
             rr = ref.get(seed)
@@ -304,11 +340,14 @@ def paired_rows(results: list[dict], ref_name: str, args) -> list[dict]:
                 continue
             for m in r["models"] + [M.ALL]:
                 p = M.paired_bootstrap(r["records"], rr["records"], m, block_s=args.block_s, reps=args.reps, seed=args.seed)
-                rows.append({"arm": name, "arm_label": _full_label(r), "ref": ref_name, "seed": seed[:12], "model": m, **p})
+                rows.append({"arm": name, "arm_label": _full_label(r), "ref": ref_name, "seed": seed[:12],
+                             **({"trace_seed": r["arm"].files["trace_seed"]} if r["arm"].files.get("trace_seed") is not None else {}),
+                             "model": m, **p})
                 if p.get("n_pairs"):
                     diffs[m].append(p["d_vreq_pp"])
         for m, v in diffs.items():
-            multi.append({"arm": name, "ref": ref_name, "model": m, "metric": "d_vreq_pp", **M.seed_ci(v)})
+            multi.append({"arm": name, "ref": ref_name, **({"trace": tb} if len(groups) > 1 else {}),
+                          "model": m, "metric": "d_vreq_pp", **M.seed_ci(v)})
     return rows, multi
 
 
