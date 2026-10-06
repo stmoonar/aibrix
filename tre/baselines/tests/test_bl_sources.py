@@ -336,6 +336,11 @@ def test_wakeable_slots_from_the_sm_gpu_view() -> None:
     assert wakeable_slots({"bindings": state["bindings"]}, "a") is None  # no gpus[]: unknown
     from tre_baselines.sources import wakeable_gpus
     assert wakeable_gpus(state) == ["n/1", "n/2"] and wakeable_gpus({}) is None
+    from tre_baselines.sources import awake_binding_ids, free_gpus
+    assert free_gpus(state, "a") == ["n/1", "n/2"] and free_gpus(state, "t") == ["n/1", "n/2"]
+    assert free_gpus({"bindings": state["bindings"]}, "a") is None
+    state["gpus"][0]["awake_binding_id"] = "a/n/0"
+    assert awake_binding_ids(state) == ["a/n/0"] and awake_binding_ids({}) is None
 
 
 def test_parse_event_stream_flag() -> None:

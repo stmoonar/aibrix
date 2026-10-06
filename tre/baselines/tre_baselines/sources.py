@@ -581,6 +581,35 @@ def wakeable_gpus(state: Mapping[str, Any]) -> Optional[list[str]]:
                   if isinstance(g, Mapping) and g.get("wakeable") and g.get("gpu") is not None)
 
 
+def awake_binding_ids(state: Mapping[str, Any]) -> Optional[list[str]]:
+    """Sorted binding ids ``gpus[]`` shows awake (None without ``gpus[]``): a refused
+    scale-up is retried once its blocking binding is no longer among them."""
+    gpus = state.get("gpus")
+    if not isinstance(gpus, list):
+        return None
+    return sorted({str(g["awake_binding_id"]) for g in gpus
+                   if isinstance(g, Mapping) and g.get("awake_binding_id")})
+
+
+def free_gpus(state: Mapping[str, Any], model: str) -> Optional[list[str]]:
+    """Sorted ``node/gpu`` of the sleeping bindings of ``model`` whose GPUs are all
+    ``wakeable`` (None without ``gpus[]``): a GPU new in this set retries a refused
+    scale-up."""
+    gpus = state.get("gpus")
+    if not isinstance(gpus, list):
+        return None
+    free = {(g.get("node"), int(g.get("gpu"))) for g in gpus
+            if isinstance(g, Mapping) and g.get("wakeable") and g.get("gpu") is not None}
+    out: set[str] = set()
+    for binding in state.get("bindings") or ():
+        if binding.get("model") != model or binding.get("awake"):
+            continue
+        slot = {(binding.get("node"), int(g)) for g in (binding.get("gpu_ids") or ())}
+        if slot and slot <= free:
+            out |= {f"{node}/{gpu}" for node, gpu in slot}
+    return sorted(out)
+
+
 def awake_counts(state: Mapping[str, Any], models: Iterable[str]) -> dict[str, int]:
     counts = state.get("models") or {}
     out: dict[str, int] = {}
@@ -702,5 +731,6 @@ class LiveSource:
             replay=replay,
             tick=tick,
             extra={"event_lag_s": lag, "scrape_failed": failed, "sm_state_version": state.get("version"),
-                   "sm_wakeable_gpus": wakeable_gpus(state)},
+                   "sm_wakeable_gpus": wakeable_gpus(state), "sm_awake_bindings": awake_binding_ids(state),
+                   "sm_free_gpus": {m: free_gpus(state, m) for m in self._models}},
         )

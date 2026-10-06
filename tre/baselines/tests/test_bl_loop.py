@@ -316,13 +316,13 @@ def test_decision_lines_are_mirrored_to_the_stream(tmp_path) -> None:
 # ------------------------------------------------------------------ SM refusal backoff
 
 
-def _refusing_put(cluster, state, refuse_until_tick, retry_after_s=None):
+def _refusing_put(cluster, state, refuse_until_tick, retry_after_s=None, reason=None):
     calls = []
 
     def put(model, body):
         calls.append(state["tick"])
         if state["tick"] < refuse_until_tick:
-            return SMResult(ok=False, code=409, error="gpu_busy", retry_after_s=retry_after_s)
+            return SMResult(ok=False, code=409, error="gpu_busy", reason=reason, retry_after_s=retry_after_s)
         return cluster.put_target(model, body)
 
     return put, calls
@@ -337,24 +337,23 @@ def _drive(shell, dispatcher, state, ticks):
     return lines
 
 
-def test_sm_refusals_back_off_exponentially(tmp_path) -> None:
+def test_failed_scale_downs_back_off_exponentially(tmp_path) -> None:
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
     put, calls = _refusing_put(cluster, state, refuse_until_tick=10)
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)  # = FakeSource 2 s step
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
-    shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 3} for t in range(30)}),
+    shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"a": 1} for t in range(30)}),
                           dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
     lines = _drive(shell, dispatcher, state, 30)
     # refused at ticks 0, 2, 5 (waits 2 s, 4 s, 8 s from the tick that saw the result), ok at 10
-    # (two stepped calls: 1 -> 2 -> 3)
-    assert calls == [0, 2, 5, 10, 10]
-    assert [lines[t]["b"]["action"] for t in range(11)] == [
-        "up", "backoff", "up", "backoff", "backoff", "up", "backoff", "backoff", "backoff", "backoff", "up"]
-    assert lines[6]["b"]["backoff_delay_s"] == 8.0 and lines[6]["b"]["backoff_s"] == 8.0
-    assert cluster.awake["b"] == 3 and all(lines[t]["b"]["action"] == "none" for t in range(12, 30))
-    assert shell.backoff.delay_s("b") is None                       # reset by the success
+    assert calls == [0, 2, 5, 10]
+    assert [lines[t]["a"]["action"] for t in range(11)] == [
+        "down", "backoff", "down", "backoff", "backoff", "down", "backoff", "backoff", "backoff", "backoff", "down"]
+    assert lines[6]["a"]["backoff_delay_s"] == 8.0 and lines[6]["a"]["backoff_s"] == 8.0
+    assert cluster.awake["a"] == 1 and all(lines[t]["a"]["action"] == "none" for t in range(12, 30))
+    assert shell.backoff.delay_s("a") is None                       # reset by the success
     assert 'tre_bl_backoff_skips_total{policy="scripted"} 7' in shell.metrics_text()
     dispatcher.close(join_s=1.0)
 
@@ -369,7 +368,9 @@ def test_backoff_honours_retry_after_and_resets_when_desired_is_awake(tmp_path) 
     shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 3} for t in range(8)}),
                           dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
     _drive(shell, dispatcher, state, 8)
-    assert calls == [0, 6, 6]   # the result is seen at tick 1 (t=2 s); 9 s later is tick 6 (t=12 s)
+    # a refusal /v2/state cannot explain (no reason, no blocking binding) follows the SM's
+    # hint: the result is seen at tick 1 (t=2 s); 9 s later is tick 6 (t=12 s)
+    assert calls == [0, 6, 6]
     # a model whose desired count goes back to awake forgets its backoff
     state2 = {"tick": 0}
     cluster2 = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
@@ -486,6 +487,7 @@ def test_owner_or_mode_change_between_decision_and_call_drops_the_call(tmp_path)
         assert result["error"] == "dropped" and result["reason"] == why
         assert shell.stats.sm_dropped == 1 and shell.stats.sm_failures == 0
         assert shell.backoff.delay_s("a") is None                           # a drop is not a refusal
+        assert shell.refusals.get("a") is None
 
 
 def test_donor_scale_down_is_answered_before_the_dependent_scale_up(tmp_path) -> None:
@@ -505,20 +507,21 @@ def test_donor_scale_down_is_answered_before_the_dependent_scale_up(tmp_path) ->
 def test_refusal_backoff_clears_when_the_sm_state_changes(tmp_path) -> None:
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put, calls = _refusing_put(cluster, state, refuse_until_tick=1)
+    put, calls = _refusing_put(cluster, state, refuse_until_tick=1, reason="slot_occupied")
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
     shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 3} for t in range(6)}),
                           dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
     lines = _drive(shell, dispatcher, state, 2)
-    assert calls == [0] and lines[1]["b"]["action"] == "backoff"       # refused, waiting
+    assert calls == [0] and lines[1]["b"]["action"] == "wait_refusal"  # refused, waiting
     with cluster.lock:
         cluster.version += 1                                            # e.g. another model went to sleep
     state["tick"] = 2
     line = {l["model"]: l for l in shell.tick_once()}["b"]
     assert wait_until(lambda: dispatcher.inflight_count() == 0)
     assert line["action"] == "up" and calls == [0, 2, 2]                # retried at once, not after the wait
+    assert line["retry_evidence"] == "state_changed"
     dispatcher.close(join_s=1.0)
 
 
@@ -530,7 +533,7 @@ def test_refusal_backoff_clears_when_a_gpu_becomes_wakeable(tmp_path) -> None:
 
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put, calls = _refusing_put(cluster, state, refuse_until_tick=2, retry_after_s=30.0)
+    put, calls = _refusing_put(cluster, state, refuse_until_tick=2, retry_after_s=30.0, reason="slot_occupied")
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
@@ -547,7 +550,7 @@ def test_refusal_backoff_clears_when_a_gpu_becomes_wakeable(tmp_path) -> None:
     shell = BaselineShell(config, source, ScriptedPolicy({t: {"b": 2} for t in range(6)}),
                           dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
     lines = _drive(shell, dispatcher, state, 2)
-    assert calls == [0] and lines[1]["b"]["action"] == "backoff"       # refused, waits 30 s
+    assert calls == [0] and lines[1]["b"]["action"] == "wait_refusal"  # refused, nothing changed
     wakeable["gpus"] = ["n/0", "n/3"]                                   # the donor's lease is gone
     state["tick"] = 2
     line = {l["model"]: l for l in shell.tick_once()}["b"]
@@ -583,10 +586,98 @@ def test_stepped_scale_up_keeps_what_the_sm_grants(tmp_path) -> None:
     assert (res["start"], res["reached"], res["target"], res["partial_fill"], res["code"]) == (1, 3, 4, True, 409)
     assert lines[1]["b"]["action"] == "up" and lines[1]["b"]["awake"] == 3   # asks again, no backoff
     assert lines[2]["b"]["sm_result"]["partial_fill"] is False             # nothing granted: plain refusal
-    assert lines[2]["b"]["action"] == "backoff"
+    assert lines[2]["b"]["action"] == "wait_refusal"                       # no change since: no call
     assert shell.stats.partial_fills == {"b": 1} and shell.stats.tick_failures == 0
     assert 'tre_bl_partial_fills_total{policy="scripted",model="b"} 1' in shell.metrics_text()
     dispatcher.close(join_s=1.0)
+
+
+class _GpuWorld:
+    """``/v2/state`` GPU view for the S4 swap tests: node ``n``, model ``a`` (donor) awake on
+    GPUs 0 and 3, model ``b`` sleeping on both. The SM refuses b on n/0 (a/n/0 awake)."""
+
+    def __init__(self) -> None:
+        self.version = 1
+        self.awake = {"a/n/0", "a/n/3"}
+
+    def extra(self) -> dict:
+        free = sorted(f"n/{g}" for g in (0, 3) if f"a/n/{g}" not in self.awake)
+        return {"sm_state_version": self.version, "sm_wakeable_gpus": free,
+                "sm_awake_bindings": sorted(self.awake), "sm_free_gpus": {"a": [], "b": free, "c": []}}
+
+
+def _s4_shell(tmp_path, world, state, refuse):
+    cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
+    calls = []
+
+    def put(model, body):
+        calls.append(state["tick"])
+        if refuse(model):
+            return SMResult(ok=False, code=409, error="gpu_busy", reason="slot_occupied", node="n", gpu_ids=(0,),
+                            scope="gpu", retry_after_s=30.0, blocking_binding_id="a/n/0")
+        return cluster.put_target(model, body)
+
+    config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
+    redis = FakeRedis()
+    source = FakeSource(config, cluster, redis)
+    gather = source.gather
+
+    def gather_with_gpus(tick=0):
+        from dataclasses import replace
+        snap = gather(tick)
+        return replace(snap, extra={**snap.extra, **world.extra()})
+
+    source.gather = gather_with_gpus
+    dispatcher = Dispatcher(put)
+    shell = BaselineShell(config, source, ScriptedPolicy({t: {"b": 2} for t in range(40)}), dispatcher, redis,
+                          lock=OwnerLock(redis, 30, token="me"))
+    return shell, dispatcher, cluster, calls
+
+
+def test_s4_swap_refused_scale_up_goes_on_the_tick_after_the_donor_frees_a_gpu(tmp_path) -> None:
+    """10-06 S4 swap: 409 slot_occupied (retry_after_s 30, scope gpu) at t0; the donor
+    releases another GPU at t1 < t0 + 30 s. The scale-up must go out on the first tick
+    after t1 (the SM's retry_after_s scopes THOSE GPUs, it is no model-wide pause)."""
+    state = {"tick": 0}
+    world = _GpuWorld()
+    shell, dispatcher, cluster, calls = _s4_shell(tmp_path, world, state, refuse=lambda m: m == "b" and
+                                                  "a/n/3" in world.awake)
+    lines = _drive(shell, dispatcher, state, 3)
+    assert calls == [0] and [lines[t]["b"]["action"] for t in (1, 2)] == ["wait_refusal", "wait_refusal"]
+    assert lines[1]["b"]["refusal"]["gpus"] == ["n/0"] and lines[1]["b"]["refusal"]["blocking_binding_id"] == "a/n/0"
+    world.awake.discard("a/n/3")              # t1 = t0 + 6 s: the donor sleeps on n/3
+    world.version += 1
+    lines += _drive_from(shell, dispatcher, state, 3, 1)
+    assert lines[3]["b"]["action"] == "up" and lines[3]["b"]["retry_evidence"] == "gpu_freed"
+    assert calls == [0, 3] and cluster.awake["b"] == 2
+    dispatcher.close(join_s=1.0)
+
+
+def test_refused_scale_up_is_not_resent_while_the_state_is_unchanged(tmp_path) -> None:
+    """No busy loop: an unchanged state is not re-sent - not every tick, and not after
+    the SM's retry_after_s (30 s) either; the blocking binding going to sleep is evidence."""
+    state = {"tick": 0}
+    world = _GpuWorld()
+    shell, dispatcher, cluster, calls = _s4_shell(tmp_path, world, state, refuse=lambda m: m == "b" and
+                                                  "a/n/0" in world.awake)
+    lines = _drive(shell, dispatcher, state, 25)                        # 50 s > retry_after_s
+    assert calls == [0]
+    assert all(lines[t]["b"]["action"] == "wait_refusal" for t in range(1, 25))
+    assert 'tre_bl_refusal_waits_total{policy="scripted"} 24' in shell.metrics_text()
+    world.awake.discard("a/n/0")                                        # the blocker sleeps
+    lines += _drive_from(shell, dispatcher, state, 25, 1)
+    assert lines[25]["b"]["action"] == "up" and lines[25]["b"]["retry_evidence"] == "blocker_asleep"
+    assert calls == [0, 25] and cluster.awake["b"] == 2
+    dispatcher.close(join_s=1.0)
+
+
+def _drive_from(shell, dispatcher, state, first, ticks):
+    lines = []
+    for t in range(first, first + ticks):
+        state["tick"] = t
+        lines.append({l["model"]: l for l in shell.tick_once()})
+        assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    return lines
 
 
 def test_scale_up_with_free_gpus_does_not_wait_for_a_donor(tmp_path) -> None:

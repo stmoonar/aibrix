@@ -166,3 +166,30 @@ def test_whole_lock_200_outcomes_are_logged() -> None:
                                          "refusals": [{"reason": "gpu_busy"}]}).as_dict()
     assert d["clamped_by_floor"] is True and d["unfilled"] == 1 and d["taken"] == 0
     assert d["refusals"] == [{"reason": "gpu_busy"}]
+
+
+def test_wakes_an_sm_partial_fill_reports_are_counted_as_done() -> None:
+    """The SM filling partially itself: a 200 with ``unfilled`` (grow-only) or a 409
+    ``partial`` that lists wakes done. The wakes it reports count; the rest is a refusal
+    located by the SM's first refusal."""
+    from tre_baselines.sm_client import SMResult
+
+    refusal = {"error": "gpu_busy", "reason": "slot_occupied", "node": "n", "gpu_ids": [0], "scope": "gpu",
+               "blocking_binding_id": "x/n/0", "retry_after_s": 30.0}
+    answers = {
+        "a": [SMResult(ok=True, code=200, raw={"actions": [{"action": "wake"}]}),
+              SMResult(ok=True, code=200, raw={"actions": [], "unfilled": 1, "refusals": [refusal]})],
+        "b": [SMResult(ok=False, code=409, error="partial", reason="partial", node="n", gpu_ids=(0,),
+                       raw={"actions": [{"action": "wake", "serve_id": "b1"}], "unfilled": 1})],
+    }
+    d = Dispatcher(lambda model, body: answers[model].pop(0))
+    assert d.submit("a", "up", 4, start=1) and d.submit("b", "up", 3, start=1)
+    assert wait_until(lambda: d.inflight_count() == 0)
+    done = {c.model: c for c in d.drain_results()}
+    a, b = done["a"], done["b"]
+    assert (a.reached, a.steps, a.partial_fill, a.result.ok) == (2, 2, True, False)   # step 3 woke nothing
+    assert (a.result.reason, a.result.node, a.result.gpu_ids, a.result.blocking_binding_id) == (
+        "slot_occupied", "n", (0,), "x/n/0")
+    assert a.as_dict()["unfilled"] == 1
+    assert (b.reached, b.steps, b.partial_fill) == (2, 1, True)                      # 1 + the wake done
+    d.close(join_s=1.0)

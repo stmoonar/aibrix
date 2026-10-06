@@ -64,17 +64,26 @@ curl -s localhost:8080/healthz ; curl -s localhost:8080/livez ; curl -s localhos
 `tre:v2:bl:owner` **and** the TRE controller is in observe mode: the shell reads
 `tre:v2:controller:mode` every tick (missing = observe) and otherwise logs
 `guard_controller_active` instead of calling the SM (metric `tre_bl_controller_guard`);
-the SM worker checks both again right before each call. After an SM refusal a model backs
-off (`max(retry_after_s, tick)`, doubling, capped at `TRE_BL_BACKOFF_MAX_S` = 10 s; action
-`backoff`); a refusal is retried at once when the SM state changes (store version or the
-wakeable GPU set in `/v2/state` `gpus[]`). A scale-up is sent one replica at a time
+the SM worker checks both again right before each call. A refused scale-up is not a
+model-wide pause (the SM's `retry_after_s` scopes the refused GPUs): the shell records the
+refused `node/gpu`, the blocking binding and the state the call was decided on, logs
+`wait_refusal` (metric `tre_bl_refusal_waits_total`) and sends nothing while that state is
+unchanged; the next scale-up goes on the first tick where the blocking binding is no
+longer awake, a GPU of a sleeping binding of the model became free, or the store version /
+wakeable GPU set of `/v2/state` changed (`retry_evidence` on the line). Only a cause
+`/v2/state` cannot show (writer lock, failed wake, text-only 409) is also retried after the
+SM's `retry_after_s` (none: next tick). A failed scale-down or an unanswered call backs off
+(`max(retry_after_s, tick)`, doubling, capped at `TRE_BL_BACKOFF_MAX_S` = 10 s; action
+`backoff`; a refused scale-down is retried at once when the SM state changes). A scale-up
+is sent one replica at a time
 (`awake+1`, `awake+2`, ... each grow-only) and stops at the first 409, because the SM
 refuses a whole multi-replica target when one wake is blocked; granted-then-refused is
 `sm_result.partial_fill` (metric `tre_bl_partial_fills_total`) and is asked again next
-tick. Remaining
+tick. An SM that fills partially itself (200 `unfilled`, or a 409 listing wakes done) is
+counted the same way. Remaining
 timers and what they guard: the owner-lock TTL (mutual exclusion after a crash), the SM
-call timeout and the backoff cap (liveness: retries whose cause `/v2/state` does not
-show), `/livez` stall (k8s probe); the policy windows (TokenScale `window_s`, PreServe
+call timeout, the SM's `retry_after_s` for refusals whose cause `/v2/state` does not show
+and the backoff cap (liveness), `/livez` stall (k8s probe); the policy windows (TokenScale `window_s`, PreServe
 `window_s` and its once-per-window scale-down) are the papers' mechanisms. Every decision line also goes
 to the Redis stream `tre:v2:bl:decisions` (`TRE_BL_DECISION_STREAM`, MAXLEN ~ 100000).
 `/healthz` (readiness) turns 503 after repeated failed ticks; `/livez` (liveness) only

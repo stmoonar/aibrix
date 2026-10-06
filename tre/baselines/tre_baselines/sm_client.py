@@ -30,11 +30,19 @@ first refusal: the SM refuses a whole target when any wake it needs is blocked
 (``tre_sm/api/v2.py`` ``_plan_target``), so one call for several replicas would leave a GPU
 that is free right now unused while another is still held. The answer reports how far it
 got (``Completed.reached``; ``partial_fill`` = some granted, then refused). This is a
-substrate adaptation for the baseline arms; the SM is unchanged. Right before each call the worker asks the dispatcher's
+substrate adaptation for the baseline arms (temporary, until the SM fills partially
+itself). It already accepts an SM that does: a 200 with ``unfilled`` > 0 counts
+``step - unfilled`` as reached and becomes a refusal located by its first ``refusals``
+entry; a 409 (e.g. ``reason="partial"``) that lists ``wake`` actions counts those wakes as
+done. Right before each call the worker asks the dispatcher's
 ``guard`` (set by the shell: still the owner-lock holder, controller still in observe);
 when the answer is a reason, the call is dropped (``SMResult.error = "dropped"``,
-``reason`` = why) and never reaches the SM. :class:`Backoff` spaces out retries after
-refusals.
+``reason`` = why) and never reaches the SM.
+
+After a scale-up refusal (an SM answer) :class:`RefusalGate` holds the next scale-up of
+that model until the SM state shows a change (no timer when ``/v2/state`` can show the
+cause); :class:`Backoff` spaces out retries of failed scale-downs and of calls the SM
+never answered.
 """
 from __future__ import annotations
 
@@ -70,6 +78,8 @@ class SMResult:
     detail: Optional[str] = None
     raw: Any = None
     elapsed_s: float = 0.0
+    #: The binding that holds the refused GPU (structured wake conflicts), if named.
+    blocking_binding_id: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         out = {
@@ -83,6 +93,8 @@ class SMResult:
                         "taken", "clamped_by_floor", "unfilled", "refusals"):
                 if key in self.raw:
                     out[key] = self.raw[key]
+        if self.blocking_binding_id is not None:
+            out.setdefault("blocking_binding_id", self.blocking_binding_id)
         return out
 
 
@@ -138,6 +150,32 @@ def parse_sm_error(code: Optional[int], body: bytes | str | None, elapsed_s: flo
         detail=None if detail_text is None else str(detail_text)[:2000],
         raw=parsed,
         elapsed_s=elapsed_s,
+        blocking_binding_id=(str(merged["blocking_binding_id"])
+                             if merged.get("blocking_binding_id") is not None else None),
+    )
+
+
+def _wakes_done(raw: Any) -> int:
+    """``wake`` actions an SM answer reports as done (0 when it lists none)."""
+    actions = raw.get("actions") if isinstance(raw, dict) else None
+    if not isinstance(actions, list):
+        return 0
+    return sum(1 for a in actions if isinstance(a, dict) and a.get("action") == "wake")
+
+
+def unfilled_refusal(result: SMResult) -> SMResult:
+    """A 200 grow-only answer with ``unfilled`` > 0 (the SM placed only some wakes) as a
+    refusal, located by its first ``refusals`` entry; ``raw`` keeps the whole answer."""
+    refusals = result.raw.get("refusals") if isinstance(result.raw, dict) else None
+    first = refusals[0] if isinstance(refusals, list) and refusals and isinstance(refusals[0], dict) else {}
+    located = parse_sm_error(result.code, json.dumps(first), result.elapsed_s) if first else None
+    return SMResult(
+        ok=False, code=result.code, error=(located.error if located else "unfilled"),
+        reason=located.reason if located else "unfilled", node=located.node if located else None,
+        gpu_ids=located.gpu_ids if located else None, scope=located.scope if located else None,
+        retry_after_s=located.retry_after_s if located else None,
+        detail=located.detail if located else None, raw=result.raw, elapsed_s=result.elapsed_s,
+        blocking_binding_id=located.blocking_binding_id if located else None,
     )
 
 
@@ -208,16 +246,16 @@ def target_body(direction: str, target: int, *, abort_sleep_path: str = DEFAULT_
     raise ValueError(f"unknown direction {direction!r}")
 
 
-#: Cap of the fallback wait. Not a hold: a refusal is retried as soon as the SM state
-#: changes (the shell clears it); this cap only bounds the wait when the cause of a
-#: refusal is not visible in ``/v2/state`` (writer lock busy, a gpu-truth sample not yet
-#: fresh) or the SM is unreachable - a few ticks, not the cold-start minute.
+#: Cap of the fallback wait of :class:`Backoff` (failed scale-downs, calls the SM never
+#: answered). Not a hold: a refused scale-down is retried as soon as the SM state changes
+#: (the shell clears it); this cap only bounds the wait when the SM is unreachable or the
+#: cause is not visible in ``/v2/state`` - a few ticks, not the cold-start minute.
 DEFAULT_BACKOFF_MAX_S = 10.0
 
 
 class Backoff:
-    """Per-model exponential backoff after a failed SM call (the MVP has no arbiter, so a
-    model the SM keeps refusing would otherwise be re-sent every tick).
+    """Per-model exponential backoff after a failed scale-down or a call the SM never
+    answered (transport error, timeout). Scale-up refusals use :class:`RefusalGate`.
 
     The first failure waits ``max(retry_after_s, tick_s)``; each further consecutive
     failure doubles the previous wait (capped at ``max_s``) but never waits less than the
@@ -254,6 +292,116 @@ class Backoff:
 
     def delay_s(self, model: str) -> Optional[float]:
         return self._delay_s.get(model)
+
+
+#: Refusal reasons whose cause ``/v2/state`` ``gpus[]`` shows (an awake binding, a load or
+#: wake in flight, unexplained memory use): a refused scale-up waits for a state change,
+#: never for a timer.
+STATE_VISIBLE_REASONS = frozenset({
+    "slot_occupied", "resident_awake", "gpu_truth_used", "lease_starting", "lease_waking",
+    "wake_in_progress", "lease_conflict",
+})
+
+
+@dataclass(frozen=True)
+class StateView:
+    """What a refused scale-up is re-checked against, from one tick's ``/v2/state``.
+
+    ``key`` = store version + wakeable GPU set (None = the source reports no SM state);
+    ``awake_bindings`` = binding ids awake on some GPU; ``free_gpus`` = per model, the
+    ``node/gpu`` of its sleeping bindings whose GPUs are all wakeable. None = unknown."""
+
+    key: Any = None
+    awake_bindings: Optional[frozenset] = None
+    free_gpus: Optional[Mapping[str, frozenset]] = None
+
+    def free(self, model: str) -> Optional[frozenset]:
+        if self.free_gpus is None or self.free_gpus.get(model) is None:
+            return None
+        return frozenset(self.free_gpus[model])
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """One refused scale-up: where (``node`` / ``gpus`` as ``node/gpu``), by whom
+    (``blocking``), and the state view the refused call was decided on."""
+
+    view: StateView
+    at_ms: int
+    reason: Optional[str]
+    node: Optional[str]
+    scope: Optional[str]
+    gpus: frozenset
+    blocking: Optional[str]
+    #: The cause shows in ``/v2/state``: retried on evidence only, no timer.
+    visible: bool
+    retry_after_s: Optional[float]
+
+    def as_dict(self, now_ms: int) -> dict[str, Any]:
+        return {"reason": self.reason, "node": self.node, "gpus": sorted(self.gpus),
+                "blocking_binding_id": self.blocking, "visible": self.visible,
+                "since_s": round((int(now_ms) - self.at_ms) / 1000.0, 3)}
+
+
+class RefusalGate:
+    """Per-model record of the last scale-up refusal; the next scale-up goes out on the
+    first tick with evidence that the state changed (:meth:`evidence`):
+
+    * ``blocker_asleep`` - the blocking binding is no longer awake;
+    * ``gpu_freed`` - a GPU where the model has a sleeping binding is free now that was
+      neither free nor refused when the refused call was decided;
+    * ``state_changed`` - the SM store version or the wakeable GPU set differs from the
+      view the refused call was decided on (also covers a change between the refusal and
+      the tick that collected it).
+
+    No timer when the cause is state-visible (:data:`STATE_VISIBLE_REASONS` or a named
+    blocking binding, and the source reports the state): an unchanged state is never
+    re-sent, so no busy loop. Otherwise (a cause ``/v2/state`` cannot show: writer lock,
+    a failed wake, a text-only 409) ``retry_after`` also opens it once the SM's
+    ``retry_after_s`` has passed (no hint: the next tick) - the SM's own word on when its
+    hidden cause may be gone, at most one call per tick. The record is cleared by a
+    successful call or the desired count back at awake."""
+
+    def __init__(self) -> None:
+        self._last: dict[str, Refusal] = {}
+
+    def refused(self, model: str, result: "SMResult", view: StateView, now_ms: int) -> Refusal:
+        node = result.node
+        gpus = frozenset(f"{node}/{g}" for g in (result.gpu_ids or ())) if node else frozenset()
+        blocking = result.blocking_binding_id
+        visible = view.key is not None and (blocking is not None or result.reason in STATE_VISIBLE_REASONS)
+        record = Refusal(view=view, at_ms=int(now_ms), reason=result.reason, node=node, scope=result.scope,
+                         gpus=gpus, blocking=blocking, visible=visible, retry_after_s=result.retry_after_s)
+        self._last[model] = record
+        return record
+
+    def get(self, model: str) -> Optional[Refusal]:
+        return self._last.get(model)
+
+    def clear(self, model: str) -> None:
+        self._last.pop(model, None)
+
+    def evidence(self, model: str, view: StateView, now_ms: int) -> Optional[str]:
+        """Why the next scale-up may go (None = keep waiting). No refusal = ``"none"``."""
+        rec = self._last.get(model)
+        if rec is None:
+            return "none"
+        if rec.blocking is not None and view.awake_bindings is not None and rec.blocking not in view.awake_bindings:
+            return "blocker_asleep"
+        free_now, free_then = view.free(model), rec.view.free(model)
+        if free_now is not None:
+            refused_node = rec.node if rec.scope == "node" else None
+            new = {g for g in free_now - (free_then or frozenset()) - rec.gpus
+                   if refused_node is None or not g.startswith(f"{refused_node}/")}
+            if new:
+                return "gpu_freed"
+        if view.key is not None and rec.view.key is not None and view.key != rec.view.key:
+            return "state_changed"
+        if not rec.visible:
+            wait_ms = int(round(max(0.0, rec.retry_after_s or 0.0) * 1000.0))
+            if int(now_ms) >= rec.at_ms + wait_ms:
+                return "retry_after"
+        return None
 
 
 @dataclass(frozen=True)
@@ -410,6 +558,17 @@ class Dispatcher:
             body = target_body(direction, step, abort_sleep_path=self._abort_sleep_path)
             result = self._call(model, body)
             calls += 1
+            base = reached if reached is not None else start
+            if result.ok and direction == "up":
+                unfilled = result.raw.get("unfilled") if isinstance(result.raw, dict) else None
+                if isinstance(unfilled, int) and unfilled > 0:
+                    # The SM filled partially itself: what it woke stays woken.
+                    got = step - unfilled
+                    if base is None or got > base:
+                        reached = got
+                    result = unfilled_refusal(result)
+            elif not result.ok and base is not None and _wakes_done(result.raw):
+                reached = base + _wakes_done(result.raw)  # e.g. 409 reason="partial" with wakes done
             if not result.ok:
                 if reached is not None:
                     LOG.info("SM partial fill %s: %s of %s->%s, then %s", model, reached, start, target,
