@@ -1,0 +1,4 @@
+# Offline evaluation report (tre/eval); not needed by any TRE service image.
+numpy>=1.24
+matplotlib>=3.7
+PyYAML>=6.0,<7.0
