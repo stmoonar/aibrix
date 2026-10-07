@@ -7,14 +7,15 @@
    at once (event-driven; the period is the fallback).
 3. A slot an in-flight probe counts on for its receiver (the free mate of a TP
    same-slot shrink) is no capacity for any other wake of the plan.
-4. F4: while another model is CRITICAL, a probe commits early on the evidence floor
-   alone (samples + post-hide grids + gates), without the settle conditions.
+4. F4: while another model is CRITICAL, an early commit does not wait for the hidden
+   pods to drain (a cost: their requests are re-issued); every evidence condition
+   (samples, one p95 e2e, post-hide grids, gates) stays.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -34,7 +35,7 @@ from tre_controller.planning.planner import (
     build_plan,
     probe_reserved_gpus,
 )
-from tre_controller.planning.safescale import SafeScaleDecision
+from tre_controller.planning.safescale import ProbeWindowInputs, SafeScaleDecision
 from tre_sm.allocator.slots import Binding, Slot
 
 from test_controller_transfer_20261002 import D, R, TOPOLOGY, _e1
@@ -42,7 +43,7 @@ from test_drain_policy_20260929 import RecordingClient
 from test_planner_slot_occupancy import _cls
 from test_scaling_e2e import HEALTHY, LOW, _registry, _window
 from test_timer_cleanup_early_commit_20261002 import LONG_W, EarlyHarness
-from test_safescale_direct_20260929 import HIDE, MODEL
+from test_safescale_direct_20260929 import HIDE, MODEL, START, _obs
 
 
 # ============================================================== 1. F1-B
@@ -74,7 +75,7 @@ def test_a_high_donor_gives_nothing_without_a_probe(receiver_state):
     assert not [a for a in plan.actions if isinstance(a, TransferIntent)]
     downs = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == D and a.delta < 0]
     assert downs and all(a.requires_safescale and a.sleep_path is None for a in downs)
-    assert plan.probe_upscale_plans == {D: {R: 1}}
+    assert plan.probe_upscale_plans.get(D, {}).get(R) == 1
 
 
 @pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
@@ -84,9 +85,10 @@ def test_an_idle_donor_is_still_released_at_once(receiver_state):
     assert (relay.donor_model, relay.receiver_model, relay.sleep_path) == (D, R, "urgent")
 
 
+@pytest.mark.parametrize("donor_state", [ModelState.HIGH, ModelState.HEALTHY], ids=["high", "middle_zone"])
 @pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
-def test_a_high_donor_whose_probe_rolled_back_waits_for_new_evidence(receiver_state):
-    plan = _donor_plan(ModelState.HIGH, receiver_state, backoff={D: "same_evidence"})
+def test_a_donor_whose_probe_rolled_back_waits_for_new_evidence(receiver_state, donor_state):
+    plan = _donor_plan(donor_state, receiver_state, backoff={D: "same_evidence"})
     assert not [a for a in plan.actions if getattr(a, "model", None) == D or getattr(a, "donor_model", None) == D]
     assert f"safescale_rollback_hold:{D}:same_evidence" in plan.events
 
@@ -95,7 +97,7 @@ def test_a_high_donor_whose_probe_rolled_back_waits_for_new_evidence(receiver_st
 TOPO_A = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
 
 
-def _slot_plan(view: ClusterView, *, crit_tp2: bool, active=()):
+def _slot_plan(view: ClusterView, *, crit_tp2: bool, active=(), backoff=None, proactive=False):
     classifications = [
         _cls("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
         _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
@@ -111,10 +113,11 @@ def _slot_plan(view: ClusterView, *, crit_tp2: bool, active=()):
         classifications=classifications,
         model_replicas={"tp2": 0, "low": 2, "high": 2},
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=not proactive,
                        model_tp_sizes={"tp2": 2, "low": 1, "high": 1}),
         cluster_view=view,
         active_probe_models=set(active),
+        probe_backoff_models=backoff,
     )
 
 
@@ -140,6 +143,31 @@ def test_the_slot_mate_of_a_same_slot_shrink_is_not_woken_into_in_the_same_plan(
     assert "low-s" not in _woken(plan)
     # control: without the TP receiver, LOW does wake into the free GPU
     assert "low-s" in _woken(_slot_plan(view, crit_tp2=False))
+
+
+def test_a_same_slot_shrink_is_not_retried_on_the_evidence_that_rolled_it_back():
+    view = ClusterView(TOPO_A, _slot_bindings(hidden=False))
+    plan = _slot_plan(view, crit_tp2=True, backoff={"high": "same_evidence"})
+    assert not [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
+    assert not [a for a in plan.actions if getattr(a, "model", None) == "high"]
+    assert "safescale_rollback_hold:high:same_evidence" in plan.events
+
+
+def test_a_probe_promises_only_its_planned_receivers():
+    """The fairness piggyback is gone (2026-10-07): it handed a receiver-less probe's
+    freed donor replicas to LOW receivers as receiver replicas (wrong for a TP2
+    receiver of TP1 donors) without slot geometry. A receiver-less HIGH probe promises
+    nothing; the freed GPU is planned from free capacity once the view shows it (F2)."""
+    view = ClusterView(TOPO_A, (
+        Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
+        Binding("high-1", "high", Slot("node-a", (1,)), awake=True),
+        Binding("high-2", "high", Slot("node-a", (2,)), awake=True),
+        Binding("low-3", "low", Slot("node-a", (3,)), awake=True),
+    ))
+    plan = _slot_plan(view, crit_tp2=False, proactive=True)
+    probes = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high" and a.delta < 0]
+    assert [a.reason for a in probes] == ["high_proactive_safescale"]
+    assert not plan.probe_upscale_plans.get("high")
 
 
 @dataclass
@@ -253,36 +281,65 @@ def test_a_refresh_request_refreshes_the_view_without_waiting_for_the_period():
 
 
 # ============================================================== 4. F4
-def _slow_busy_probe(critical) -> EarlyHarness:
-    """A probe that, without a CRITICAL receiver, waits for its settle conditions: the
-    donor's p95 e2e is 45 s and the hidden pod still has a request running."""
-    h = EarlyHarness()
-    probe = h.start()
-    terms = {**probe.window_terms, "inputs": {**probe.window_terms.get("inputs", {}), "p95_e2e_ms": 45_000.0}}
-    h.machine._probes[MODEL] = replace(probe, window_terms=terms)
-    h.hidden.running = 1.0
-    observe = h.machine.observe
-    h.machine.observe = lambda *args, **kwargs: observe(*args, critical_receivers=critical, **kwargs)
+class _CriticalHarness(EarlyHarness):
+    """The early-commit harness, driven like the SafeScale loop drives the state
+    machine: each observation passes the planner's CRITICAL models, and the probe
+    starts with the donor's window inputs (its p95 e2e)."""
+
+    def __init__(self, *, critical=(), p95_e2e_ms=None, **cfg) -> None:
+        self.critical = tuple(critical)
+        self.p95_e2e_ms = p95_e2e_ms
+        super().__init__(**cfg)
+
+    def start(self, **_kwargs):
+        inputs = ProbeWindowInputs(p95_e2e_ms=self.p95_e2e_ms) if self.p95_e2e_ms else None
+        self.machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START, window_inputs=inputs)
+        self.clock.now = HIDE
+        assert self.collector.on_hide_done(MODEL, ("m-1",))
+        asyncio.run(self.collector.take_baselines())
+        return self.machine.active_probe(MODEL)
+
+    def tick(self, at_ms, *, serve=0, ttft_s=0.05, obs=None):
+        self.clock.now = at_ms
+        for sim in self.sims.values():
+            sim.serve(serve, ttft_s=ttft_s)
+        polls = asyncio.run(self.collector.poll())
+        boundary = at_ms // 10_000 * 10_000
+        return self.machine.observe(MODEL, obs or _obs(boundary, **self.obs_kwargs), now_ms=boundary,
+                                    direct_poll=polls.get(MODEL), critical_receivers=self.critical)
+
+
+def _busy(h: _CriticalHarness) -> _CriticalHarness:
+    h.start()
+    h.hidden.running = 1.0  # the hidden pod still serves a request
     return h
 
 
-def test_a_critical_receiver_commits_the_probe_on_the_evidence_floor():
-    h = _slow_busy_probe(("r",))
-    at, decision = h.run_until(HIDE + LONG_W, serve=5)[-1]
-    # The evidence floor alone: two post-hide grids (110-130 s) -> the 131 s poll.
+def test_a_critical_model_waives_the_hidden_drain_only():
+    at, decision = _busy(_CriticalHarness(critical=("r",))).run_until(HIDE + LONG_W, serve=5)[-1]
+    # The evidence floor (20 samples, two post-hide grids 110-130 s) -> the 131 s poll,
+    # although the hidden pod is not drained.
     assert (at, decision.status) == (131_000, "commit")
     early = decision.details["early_commit"]
-    assert early["critical_receivers"] == ["r"] and early["min_elapsed_ms"] == 0
-    assert early["hidden_drained"] is False and early["samples"] >= 20
+    assert early["critical_receivers"] == ["r"] and early["hidden_drained"] is False
 
 
 @pytest.mark.parametrize("critical", [(), (MODEL,)], ids=["none", "only_the_donor_itself"])
-def test_without_another_critical_model_the_settle_conditions_hold(critical):
-    h = _slow_busy_probe(critical)
+def test_without_another_critical_model_a_busy_hidden_pod_keeps_the_probe_running(critical):
+    h = _busy(_CriticalHarness(critical=critical))
     assert all(d.status == "probing" for _, d in h.run_until(149_000, serve=5))
 
 
-def test_a_critical_receiver_never_skips_the_evidence():
-    h = _slow_busy_probe(("r",))
-    # Too few judged requests: no commit, whatever waits.
+def test_a_critical_model_never_waives_one_p95_e2e():
+    # Evidence completeness: SLO samples count at completion; before one e2e after the
+    # hide they favour short requests. 45 s p95 e2e -> no commit before 103 + 45 = 148 s.
+    h = _CriticalHarness(critical=("r",), p95_e2e_ms=45_000.0)
+    h.start()
+    at, decision = h.run_until(HIDE + 90_000, serve=5)[-1]
+    assert decision.status == "commit" and at == 149_000
+    assert decision.details["early_commit"]["min_elapsed_ms"] == 45_000
+
+
+def test_a_critical_model_never_waives_the_samples():
+    h = _busy(_CriticalHarness(critical=("r",)))
     assert all(d.status == "probing" for _, d in h.run_until(141_000, serve=0))

@@ -61,7 +61,7 @@ donor 策略不变：CRIT 的 IDLE / HIGH donor 立即释放；公平环的 IDLE
 `TransferIntent(donor_model, receiver_model, count, reason, source_loop, sleep_path="urgent", pairs, rescue)`，
 **不选 pod、不选卡**。`count` 是要交出的 donor 副本数（SM 的 `count`），`pairs` 是预期得到的 receiver 副本数
 （TP=2 receiver 吃两个单卡 donor 时 `count=2, pairs=1`）。数量逻辑不变：C1 目标、饱和急救有界翻倍、
-`planned_take`、`max_awake` 上限、`_donor_give`。
+`planned_take`、`max_awake` 上限、`_donor_give`（2026-10-07 起删除：立即接力只收 IDLE donor，IDLE 一次让到下限；HIGH donor 只走 SafeScale 探针，见 `donor-evidence-20261007.md`）。
 
 ### 4.2 `pairable_count`
 

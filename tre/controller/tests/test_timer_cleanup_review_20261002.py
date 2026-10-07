@@ -33,12 +33,11 @@ from tre_controller.loops.cluster_view_task import (
     state_time_lower_bound,
 )
 from tre_controller.loops.tick import _o1_view_pending, run_planner_tick
-from tre_controller.planning.planner import ClusterView, ScaleAction, UnhideAction
+from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
 from tre_controller.planning.safescale import CAPACITY_ROLLBACK_CODES, ProbeWindowInputs, SafeScaleStateMachine
 from tre_controller.config import SafeScaleConfig
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_sm.allocator.slots import Binding, Slot
-from relay_view import expand_relays  # 2026-10-02 relay intents
 
 from test_timer_cleanup_f4_o1_20261002 import BASE, LOW, _ActionQueue, _state
 from test_o1_breakpoint_window_20261001 import GRID, O1, _registry, _snap, _ups, _view, _window
@@ -276,26 +275,17 @@ def _two_tick(state, queue, *, end, awake_a, fetched, load_a, load_b):
         "a": _model_window("a", end, [load_a] * 3, awake_a),
         "b": _model_window("b", end, [load_b] * 3, 4 - awake_a),
     })
+    # F1-B (2026-10-07): a HIGH donor gives through a SafeScale probe - a state machine
+    # per tick starts it (its hide is the move this test follows).
     return run_planner_tick(snapshot, queue=queue, registry=_two_model_registry(), rescue_due=False,
                             fairness_due=True, cluster_view=_two_view(awake_a, fetched), signal_state=state,
-                            action_cooldown=True)
+                            action_cooldown=True, safescale=SafeScaleStateMachine(config=SafeScaleConfig()))
 
 
-def _transfers(result) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for action in expand_relays(result.actions):  # a relay intent = donor -n / receiver +n
-        if isinstance(action, ScaleAction):
-            out[action.model] = out.get(action.model, 0) + action.delta
-    # F1-B (2026-10-07): a HIGH donor gives through a SafeScale probe. Without a SafeScale
-    # controller here the planned probe is dropped with an event; it is counted as the
-    # move it plans (two models: the receiver is the other one).
-    for event in result.events:
-        if event.startswith("safescale_probe_skipped:") and event.endswith(":safescale_unavailable"):
-            donor = event.split(":")[1]
-            receiver = "a" if donor == "b" else "b"
-            out[donor] = out.get(donor, 0) - 1
-            out[receiver] = out.get(receiver, 0) + 1
-    return out
+def _probed(result) -> set[str]:
+    """Donors the tick starts a probe on (their pods hidden); a relay never happens."""
+    assert not [action for action in result.actions if isinstance(action, TransferIntent)]
+    return {action.model for action in result.actions if isinstance(action, HideAction)}
 
 
 def test_two_models_trading_a_pod_wait_for_evidence_at_every_hop():
@@ -305,7 +295,7 @@ def test_two_models_trading_a_pod_wait_for_evidence_at_every_hop():
     queue = _ActionQueue()
     # Hop 1: a LOW, b HIGH -> b gives a pod to a.
     first = _two_tick(state, queue, end=BASE, awake_a=2, fetched=BASE + 500, load_a=LOW, load_b=HIGH)
-    assert _transfers(first) == {"b": -1, "a": 1}, first.events
+    assert _probed(first) == {"b"}, first.events
     queue.last.update({"a": (BASE + 1_500, "up"), "b": (BASE + 1_500, "down")})
     # The load flips at once: a HIGH, b LOW. Every tick until a whole window follows a's
     # breakpoint (window end >= BASE + 40 s) a is no donor, so nothing moves back.
@@ -314,12 +304,12 @@ def test_two_models_trading_a_pod_wait_for_evidence_at_every_hop():
                                             (3, BASE + 3 * GRID + 500), (3, BASE + 4 * GRID + 500)], start=1):
         hops[k] = _two_tick(state, queue, end=BASE + k * GRID, awake_a=awake_a, fetched=fetched,
                             load_a=HIGH, load_b=LOW)
-    assert _transfers(hops[1]) == {}  # the view predates the hop; b's Z still mixed
+    assert _probed(hops[1]) == set()  # the view predates the hop; b's Z still mixed
     # Hop 2: b is a LOW receiver on post-change evidence too thin to act on; hop 3: b's
     # evidence is warm, but a (the only donor) still lacks a whole post-change window.
     assert "receiver_held_breakpoint_window:b:evidence_grids" in hops[2].events
     for k in (2, 3):
-        assert _transfers(hops[k]) == {}, (k, hops[k].events)
+        assert _probed(hops[k]) == set(), (k, hops[k].events)
         assert "donor_suppressed_breakpoint_window:a" in hops[k].events
     # b's receiver evidence was warm from BASE + 30 s; a's whole window from BASE + 40 s.
-    assert _transfers(hops[4]) == {"a": -1, "b": 1}, hops[4].events
+    assert _probed(hops[4]) == {"a"}, hops[4].events

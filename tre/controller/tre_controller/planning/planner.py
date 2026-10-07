@@ -638,19 +638,23 @@ def build_plan(
     # middle-zone path, HIGH donors first (cost order). Only an IDLE donor is released at
     # once: an idle window is evidence that does not depend on the replica count, while
     # "Z > tau_high now" says nothing about Z with one replica less (n = 2: half the
-    # capacity). A HIGH donor whose last probe rolled back waits for new evidence
-    # (``probe_backoff_models``), like its receiver-less probe.
+    # capacity).
     probe_donors = [item for item in paper_donors if item.state == ModelState.HIGH] + middle_zone
 
     def probe_held(donor: ModelClassification) -> bool:
         # One SafeScale probe per donor model (the state machine is keyed by model): a
-        # donor this plan already probes serves a further receiver only through the
-        # piggyback (its unclaimed replicas), never through a second probe.
+        # donor this plan already probes gives no other receiver anything - a second
+        # receiver (CRITICAL ones included) waits until that probe resolves.
         if donor.model_name in delayed_down_models:
             return True
-        if donor.state != ModelState.HIGH or donor.model_name not in probe_backoff_models:
+        # One rule for every donor probe (HIGH, middle zone, same-slot shrink): a model
+        # whose last probe rolled back is probed again only on new evidence.
+        return rollback_held(donor.model_name)
+
+    def rollback_held(model: str) -> bool:
+        if model not in probe_backoff_models:
             return False
-        _event_once(events, f"safescale_rollback_hold:{donor.model_name}:{probe_backoff_models[donor.model_name]}")
+        _event_once(events, f"safescale_rollback_hold:{model}:{probe_backoff_models[model]}")
         return True
 
     def low_need(recv: ModelClassification) -> tuple[int, int] | None:
@@ -877,9 +881,13 @@ def build_plan(
                         active_probe_models=active_probe_models,
                         # One SafeScale probe per donor model at a time (the state
                         # machine is keyed by model): a donor already shrunk for an earlier
-                        # receiver this tick cannot start a second probe - its extra
-                        # replicas stay available to the immediate donor loop below.
-                        inflight_models=inflight_models | cooldown.down_blocked() | slot_shrink_donors,
+                        # receiver this tick cannot start a second probe, and gives nothing
+                        # else this plan (the immediate loop below takes IDLE donors only).
+                        # A donor whose last probe rolled back waits for new evidence.
+                        inflight_models=(
+                            inflight_models | cooldown.down_blocked() | slot_shrink_donors
+                            | {item.model_name for item in high_models if rollback_held(item.model_name)}
+                        ),
                         planned_deltas=deltas,
                         taken_serve_ids=occupancy.released_donor_ids() if occupancy is not None else set(),
                         source_loop="rescue",
@@ -901,9 +909,9 @@ def build_plan(
                         # taken so no later action of this tick sleeps / hides the same pod.
                         deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
                         # Ledger (2026-10-02): the tick commits this probe with exactly
-                        # {beneficiary: 1} (_safescale_pending_upscales). Record it, or the
-                        # fairness piggyback sees unclaimed == 1 and promises the same
-                        # shrink to a LOW receiver whose upscale the tick then drops.
+                        # {beneficiary: 1} (_safescale_pending_upscales); the plan records the
+                        # same promise (the fairness piggyback that read it was removed on
+                        # 2026-10-07: a donor probed in this plan gives nothing else).
                         pending = probe_upscale_plans.setdefault(same_slot_shrink.donor, {})
                         pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
                         if occupancy is not None:
@@ -1328,12 +1336,7 @@ def build_plan(
             if cooldown.blocks(middle.model_name, "down"):
                 continue
             headroom = _donor_headroom(cfg, middle.model_name, model_contexts, model_replicas)
-            if headroom <= 0:
-                continue
-            needed = _piggyback_probe(
-                middle.model_name, recv.model_name, needed, deltas, delayed_down_models, probe_upscale_plans
-            )
-            if needed <= 0 or probe_held(middle):
+            if headroom <= 0 or probe_held(middle):
                 continue
             donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
             planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
@@ -1357,28 +1360,6 @@ def build_plan(
             )
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
-
-
-def _piggyback_probe(
-    donor: str,
-    receiver: str,
-    needed: int,
-    deltas: Mapping[str, int],
-    delayed_down_models: set[str],
-    probe_upscale_plans: dict[str, dict[str, int]],
-) -> int:
-    """A SafeScale probe this tick already plans on ``donor`` whose freed replicas no
-    receiver has claimed yet serves this receiver first (piggyback). Returns what is
-    still needed."""
-    existing_shrink = abs(min(deltas.get(donor, 0), 0))
-    existing_claimed = sum(probe_upscale_plans.get(donor, {}).values())
-    unclaimed = existing_shrink - existing_claimed
-    if unclaimed > 0 and donor in delayed_down_models:
-        piggyback = min(needed, unclaimed)
-        pending = probe_upscale_plans.setdefault(donor, {})
-        pending[receiver] = pending.get(receiver, 0) + piggyback
-        needed -= piggyback
-    return needed
 
 
 def _plan_transfer_intent(

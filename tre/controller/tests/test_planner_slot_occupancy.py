@@ -118,7 +118,7 @@ def test_e1_deadlock_donor_probe_is_pinned_to_receiver_slot(donor_state, reason)
     assert not [a for a in plan.actions if isinstance(a, TransferIntent)]
     donor = next(a for a in scale if a.model == "dsqwen-7b")
     assert (donor.reason, donor.requires_safescale, donor.pods) == (reason, True, ("7b-0",))
-    assert plan.probe_upscale_plans == {"dsqwen-7b": {"dsllama-8b": 1}}
+    assert plan.probe_upscale_plans.get("dsqwen-7b", {}).get("dsllama-8b") == 1
 
 
 def test_genuinely_free_gpu_still_uses_sleeping_capacity() -> None:

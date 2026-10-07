@@ -24,17 +24,27 @@ Changes (`planning/planner.py`):
   `critical_high_donor_safescale` / `low_fairness_high_donor_safescale` (labels only).
 - The immediate donor loops (`critical_donor_immediate` :1005, `low_fairness_donor_immediate`
   :1296) take IDLE donors only; IDLE still gives its whole surplus (Q3).
-- `probe_held` :644: (a) the existing rollback evidence hold (`probe_backoff_models`,
-  `SafeScaleStateMachine.rollback_retry_holds`, `same_evidence` / `no_new_window`) now
-  applies to every HIGH donor probe, not only the receiver-less one - this is what makes
-  "SafeScale's rollback gate constrains HIGH donors" true; no new gate. (b) one probe per
-  donor model per plan (the state machine is keyed by model): a donor already probed in
-  this plan serves another receiver only through the existing piggyback.
+- `probe_held` / `rollback_held` (review round 2026-10-07): (a) one rule for every
+  donor probe - the existing rollback evidence hold (`probe_backoff_models`,
+  `SafeScaleStateMachine.rollback_retry_holds`, `same_evidence` / `no_new_window`) holds
+  HIGH donors, middle-zone (HEALTHY / LOW) donors and the same-slot shrink (its call
+  site adds held models to `inflight_models`, event `safescale_rollback_hold`), not only
+  the receiver-less HIGH probe. No new gate: the existing one, applied everywhere.
+  (b) one probe per donor model per plan (the state machine is keyed by model): a donor
+  already probed in this plan gives no other receiver anything; a second receiver,
+  CRITICAL ones included, waits until that probe resolves (serialized).
+- The fairness piggyback (`_piggyback_probe`) is removed. It handed a probe's
+  unclaimed donor replicas to LOW receivers as receiver replicas (a TP2 receiver of two
+  TP1 donors left one phantom "unclaimed"), without slot geometry. In practice it only
+  served receiver-less HIGH probes; such a probe now promises nothing, and the GPU its
+  commit frees is planned from free capacity on the next tick (F2 makes it visible at
+  once) - with real geometry, at most one tick later.
 - Removed: `_donor_give`, `PlanConfig.donor_surplus_release`, the registry key
   (`tre_common/registry.py`; an old registry carrying it still loads with a warning),
   `deploy/registry.yaml`, `deploy/overlays/tre-v2/params.yaml`, `loops/tick.py`
   `_scaling_options`, and the tests of the switch.
-- Unchanged: `_try_plan_same_slot_high_shrink` (already SafeScale), HIGH proactive
+- Unchanged: `_try_plan_same_slot_high_shrink` (already SafeScale; now reads the
+  rollback hold, see above), HIGH proactive
   shrink (receiver-less SafeScale), IDLE proactive shrink, the SafeScale gates.
 
 Behaviour change / risk:
@@ -46,9 +56,11 @@ Behaviour change / risk:
   CRITICAL 110-130 s anyway.
 - A HIGH donor with an in-flight probe serves no second receiver until the probe
   resolves (before: an immediate relay on another pod in the same tick).
-- A HIGH donor whose probe rolled back for capacity is not probed for a receiver until
-  its routable count changes or Z rises by `rollback_retry_z_margin` (before: released
-  at once, ignoring the rollback).
+- A donor whose probe rolled back for capacity is not probed for a receiver until its
+  routable count changes or Z rises by `rollback_retry_z_margin` (before: a HIGH donor
+  was released at once, ignoring the rollback). When the only donors are HIGH and all of
+  them are held this way, the receiver waits until a donor's routable count changes or
+  its Z rises. This is the semantics the user accepted (evidence, not time).
 
 Invariant tests (`tests/test_donor_evidence_20261007.py`): a HIGH donor gets no relay
 and no `urgent` sleep, only a probe (rescue and fairness); an IDLE donor still relays;
@@ -95,54 +107,46 @@ Changes:
 - `_try_plan_same_slot_high_shrink` (:1980) treats a blocked GPU (SM not wakeable, or
   reserved) as no free mate.
 
-Risk: a probe for a TP2 receiver blocks one more GPU for the probe's duration. Only the
-controller's own plans honour it (the SM does not know it); in TRE mode nothing else
-wakes models. Tests: same-plan claim; cross-tick reservation (unit + tick wiring);
+Risk: a probe for a TP2 receiver blocks one more GPU for the probe's duration. The
+reservation is local to the controller: the SM does not know it, so the SM's floor
+repair or self-healing may still wake into a reserved GPU. It is best effort - it
+removes the controller's own conflicting wakes, not every possible 409. Tests: same-plan claim; cross-tick reservation (unit + tick wiring);
 control cases free again.
 
 ## 4. F4: a CRITICAL model is an early-commit trigger
 
-Finding: the existing early commit (`planning/safescale.py` `_try_early_commit` :1366)
-does not depend on receivers at all. It fires on the first poll where (a)
+Finding: the existing early commit (`planning/safescale.py` `_try_early_commit`) does
+not depend on receivers at all. It fires on the first poll where (a)
 `min_commit_samples` requests are judged, (b) the formal gates pass on the evidence so
 far, (c) the hidden pods have nothing in flight, (d) the newest snapshot window holds
 `early_commit_min_grids` (= `scaling.min_evidence_grids` = 2, 10 s grid) post-hide grids
 AND one donor p95 e2e has passed since the hide confirmation. In Alternating_s1 the
-7b probe (hide 944.3 s) committed at 978.9 s with `min_elapsed_ms` 30 000 (p95 e2e,
-a histogram bucket edge): the "22 s after 14b turned CRITICAL" were the evidence floor
-(two grids, ~973-975 s) plus ~4-6 s of the e2e settle term.
+7b probe (hide 944.3 s) committed at 978.9 s with `min_elapsed_ms` 30 000: the "22 s
+after 14b turned CRITICAL" were this evidence floor.
 
-Change: `observe(..., critical_receivers=)` (:749) and `_try_early_commit` (:1412): when
-a model other than the donor is CRITICAL in the latest planner tick, the settle
-conditions are waived - (c) the hidden pods' drain (their requests are aborted at the
-sleep and re-issued by the sidecar, as on an immediate release) and the p95 e2e part of
-(d). The evidence floor stays: (a), the post-hide grids of (d), and every gate of (b)
-(SLO on the evidence so far, KV, Z tail, completeness); immediate rollbacks are
-unchanged. Any CRITICAL model (not "a receiver of this donor's GPU") because the commit
-is still evidence-backed, the freed GPU goes to the planner's free pool (CRITICAL first,
-woken on the next tick via F2), and matching slot geometry in SafeScale would duplicate
-the planner. Source: `ModelStateBox` (`app.py` :173, `loops/safescale_task.py` :308);
-no new state, no "upgrade to preemption" state.
+Change (review round 2026-10-07): `observe(..., critical_receivers=)` and
+`_try_early_commit`: when a model other than the donor is CRITICAL in the latest planner
+tick, only (c) is waived. The hidden pods' in-flight requests are a cost, not evidence:
+the sleep aborts them and the sidecar re-issues them, as on an immediate release.
+(a), (b) and all of (d) stay. The p95 e2e term is evidence completeness: SLO samples
+count at completion, so less than one e2e after the hide they are biased towards short
+requests. Immediate rollbacks are unchanged. Any CRITICAL model (not "a receiver of this
+donor's GPU"): the commit is still fully evidence-backed, the freed GPU goes to the
+planner's free pool (CRITICAL first, next tick via F2), and slot matching in SafeScale
+would duplicate the planner. Source: `ModelStateBox` (`app.py`,
+`loops/safescale_task.py`); no new state, no "upgrade to preemption" state.
 
-Benefit (estimate): ~4-6 s on the Alternating case; more for long-e2e donors or busy
-hidden pods. Audit: `early_commit.critical_receivers`, `hidden_drained: false`,
-`min_elapsed_ms: 0`. Tests: commits on the evidence floor with a CRITICAL model; no
-other CRITICAL model (or only the donor) keeps the settle conditions; too few samples
-never commit.
+Benefit: only when the hidden pods still serve long requests at the evidence floor
+(about 0 s on the Alternating case, where they had drained by then). Audit:
+`early_commit.critical_receivers`, `hidden_drained: false`. Tests (driven through the
+state machine's public `observe`): a busy hidden pod does not block the commit with a
+CRITICAL model; it does without one (or when only the donor is CRITICAL); one p95 e2e
+and `min_commit_samples` are never waived.
 
 ## Points for the main session
 
-1. F4 waives the p95-e2e settle term for the CRITICAL case. It is not a fixed timer
-   (it is one donor p95 e2e, Review P2-3: the remaining pods' concurrency needs about
-   one e2e to settle), but it is a minimum observation time. If it must stay, revert the
-   `min_elapsed` line in `_try_early_commit`; F4 then only waives the drain and gains
-   ~0 s on Alternating. The 2-grid floor (O1 warm rule) is unchanged and is now the
-   dominant term (~20-30 s after the hide).
-2. F1-B: rescue latency from a HIGH donor rises from one transfer to one probe; one
-   probe per donor; rollback hold now applies to receiver-driven HIGH probes.
-3. Not changed: `_try_plan_same_slot_high_shrink` does not read the rollback hold (T7:
-   4 rolled-back same-slot probes 7b -> 14b at 266/316/386/476 s); HEALTHY/LOW middle
-   zone donors do not read it either.
-4. The live ConfigMap still carries `scaling.donor_surplus_release: false`: harmless
+1. F1-B: rescue latency from a HIGH donor rises from one transfer to one probe
+   (evidence floor ~20-30 s after the hide, up to W); one probe per donor at a time.
+2. The live ConfigMap still carries `scaling.donor_surplus_release: false`: harmless
    (warning). Remove it with `merge_live_registry.py` at the next structural update.
-5. `docs/donor-release-policy.md` (local workspace) must be rewritten (F1-B).
+3. `docs/donor-release-policy.md` (local workspace) must be rewritten (F1-B).

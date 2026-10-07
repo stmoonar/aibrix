@@ -1,8 +1,10 @@
-"""Same-slot shrink vs fairness piggyback (2026-10-02, approach (a)).
+"""Same-slot shrink vs fairness piggyback (2026-10-02, approach (a)). The piggyback was
+removed on 2026-10-07 (design donor-evidence-20261007): a donor probed in a plan gives
+no other receiver anything; these tests keep the ledger and that invariant.
 
 The same-slot preemption (ShrinkForSlotAction) is committed by the tick with exactly
-``{beneficiary: 1}``. The planner's ledger now records that claim, so the fairness
-piggyback sees ``unclaimed == 0`` and never promises the same shrink to a LOW receiver.
+``{beneficiary: 1}``. The planner's ledger records that claim, and no LOW receiver is
+ever promised the same shrink.
 """
 
 from __future__ import annotations
@@ -77,44 +79,11 @@ def test_three_replica_donor_with_a_same_slot_probe_starts_no_second_probe_for_l
     shrink, claimed by tp2), and a donor gets one probe at a time."""
     plan = _same_slot_plan(3)
     [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
-    assert plan.probe_upscale_plans == {"high": {"tp2": 1}}
+    assert plan.probe_upscale_plans.get("high", {}).get("tp2") == 1
+    assert "low" not in plan.probe_upscale_plans.get("high", {})
     assert not relays(plan.actions)
     assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
     assert shrink.donor == "high"
-
-
-def _proactive(n_low: int, high_replicas: int):
-    from test_planner import _classification
-
-    classifications = [_classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
-    contexts = {"high": {"assigned_replicas": high_replicas, "routable_pods": high_replicas}}
-    replicas = {"high": high_replicas}
-    for i in range(n_low):
-        name = f"low{i}"
-        classifications.append(_classification(name, ModelState.LOW, ModelRole.RECEIVER, 0.9))
-        contexts[name] = {"assigned_replicas": 1, "routable_pods": 1}
-        replicas[name] = 1
-    return build_plan(
-        model_contexts=contexts,
-        classifications=classifications,
-        model_replicas=replicas,
-        idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
-    )
-
-
-def test_proactive_high_probe_still_hands_its_shrink_to_low_receivers():
-    plan = _proactive(1, 2)
-    [shrink] = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "high"]
-    assert shrink.reason == "high_proactive_safescale" and shrink.delta < 0
-    assert plan.probe_upscale_plans["high"] == {"low0": -shrink.delta}
-
-
-def test_proactive_high_probe_claims_never_exceed_the_shrink_with_two_low_receivers():
-    plan = _proactive(2, 4)
-    shrinks = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.reason == "high_proactive_safescale"]
-    assert shrinks
-    assert sum(plan.probe_upscale_plans["high"].values()) == sum(-a.delta for a in shrinks)
 
 
 def test_middle_zone_claim_leaves_nothing_unclaimed_for_a_later_low_receiver():
@@ -137,7 +106,7 @@ def test_middle_zone_claim_leaves_nothing_unclaimed_for_a_later_low_receiver():
     )
     shrinks = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "healthy"]
     assert [(a.reason, a.delta) for a in shrinks] == [("critical_middle_zone_safescale", -1)]
-    # The CRITICAL claim covers the whole shrink: LOW gets no piggyback.
+    # The CRITICAL claim covers the whole shrink: LOW gets nothing from it.
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
 
 

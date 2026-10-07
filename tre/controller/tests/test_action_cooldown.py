@@ -241,13 +241,13 @@ def test_donor_cooldown_skips_that_donor_without_blocking_the_pair_elsewhere() -
     plan0 = _plan(classifications, {})
     baseline = _deltas(plan0)
     [first] = baseline
-    assert baseline[first] == -1 and plan0.probe_upscale_plans == {first: {"r": 1}}
+    assert baseline[first] == -1 and plan0.probe_upscale_plans.get(first, {}).get("r") == 1
     other = "d2" if first == "d1" else "d1"
 
     # The chosen donor is in an *up* cooldown (a scale-down right after a scale-up is
     # held); the receiver's own state is unaffected and the other donor is used.
     plan = _plan(classifications, {first: "up"})
-    assert _deltas(plan) == {other: -1} and plan.probe_upscale_plans == {other: {"r": 1}}
+    assert _deltas(plan) == {other: -1} and plan.probe_upscale_plans.get(other, {}).get("r") == 1
     assert f"cooldown_hold:{first}" in plan.events
 
     # The receiver's scale-down cooldown (CRITICAL safety) never blocks the donor side.

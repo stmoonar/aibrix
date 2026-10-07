@@ -1386,12 +1386,12 @@ class SafeScaleStateMachine:
         No fixed share of W and no separate minimum observation time.
 
         F4 (2026-10-07, design donor-evidence-20261007): while another model is CRITICAL
-        (``critical_receivers``), the probe commits as soon as the evidence is there -
-        (a), (b) and the post-hide grids of (d) - without the settle conditions: (c) the
-        hidden pods' drain (their in-flight requests are aborted at the sleep and
-        re-issued by the sidecar, as on an immediate release) and the p95 e2e part of
-        (d). A waiting CRITICAL model pays for every second of settle time; the freed
-        GPU reaches it through the event-driven view refresh (F2).
+        (``critical_receivers``), (c) is waived: the hidden pods' in-flight requests are
+        a cost, not evidence (the sleep aborts them and the sidecar re-issues them, as on
+        an immediate release). (a), (b) and all of (d) stay: the p95 e2e term is evidence
+        completeness - SLO samples count at completion, so less than one e2e after the
+        hide they are biased towards short requests. The freed GPU reaches the waiting
+        model through the event-driven view refresh (F2).
         None = keep probing (the deadline decides as before)."""
         cfg = self._config
         if not bool(getattr(cfg, "early_commit", False)) or poll is None:
@@ -1409,8 +1409,7 @@ class SafeScaleStateMachine:
         inputs = (probe.window_terms or {}).get("inputs") or {}
         p95_e2e = _optional_float(inputs.get("p95_e2e_ms")) if isinstance(inputs, dict) else None
         grids = max(1, int(getattr(cfg, "early_commit_min_grids", 2) or 1))
-        urgent = sorted({str(name) for name in critical_receivers or ()} - {probe.model})
-        min_elapsed = 0.0 if urgent else float(p95_e2e or 0.0)
+        min_elapsed = float(p95_e2e or 0.0)
         if elapsed < min_elapsed:
             return None
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
@@ -1423,9 +1422,11 @@ class SafeScaleStateMachine:
         if post_hide is None or latest is None or int(latest) < int(post_hide) + grids * _evidence_step_ms(cfg):
             return None
         drained = _hidden_drained(probe, poll)
+        urgent = sorted({str(name) for name in critical_receivers or ()} - {probe.model})
         if drained is None:
             if not urgent:
                 return None
+            # F4: a CRITICAL model waits - the hidden pods' requests are re-issued.
             drained = {"hidden_drained": False}
         if urgent:
             drained = {**drained, "critical_receivers": urgent}

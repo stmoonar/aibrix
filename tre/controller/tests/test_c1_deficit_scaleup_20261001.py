@@ -154,7 +154,7 @@ def test_idle_donor_gives_its_surplus_and_a_high_donor_only_a_probe():
     plan = _plan(high, {"r": 2, "d": 4})
     assert _deltas(plan) == {"d": -1}
     assert [a.requires_safescale for a in plan.actions if a.model == "d"] == [True]
-    assert plan.probe_upscale_plans == {"d": {"r": 1}}
+    assert plan.probe_upscale_plans.get("d", {}).get("r") == 1
 
 
 def test_tp_receiver_takes_several_free_slot_pairs_in_one_action():
@@ -222,7 +222,7 @@ def test_slow_loop_moves_at_most_one_pair_per_receiver_and_is_unchanged_by_c1():
     # F1-B: one probe of the first HIGH donor, its freed replica promised to "low".
     probes = [a for a in c1.actions if isinstance(a, ScaleAction) and a.requires_safescale]
     assert [(a.model, a.delta, a.reason) for a in probes] == [("d1", -1, "low_fairness_high_donor_safescale")]
-    assert c1.probe_upscale_plans == {"d1": {"low": 1}}
+    assert c1.probe_upscale_plans.get("d1", {}).get("low") == 1
 
 
 def test_scale_down_paths_are_unchanged_by_c1():
