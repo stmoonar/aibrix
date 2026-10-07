@@ -286,6 +286,15 @@ def _transfers(result) -> dict[str, int]:
     for action in expand_relays(result.actions):  # a relay intent = donor -n / receiver +n
         if isinstance(action, ScaleAction):
             out[action.model] = out.get(action.model, 0) + action.delta
+    # F1-B (2026-10-07): a HIGH donor gives through a SafeScale probe. Without a SafeScale
+    # controller here the planned probe is dropped with an event; it is counted as the
+    # move it plans (two models: the receiver is the other one).
+    for event in result.events:
+        if event.startswith("safescale_probe_skipped:") and event.endswith(":safescale_unavailable"):
+            donor = event.split(":")[1]
+            receiver = "a" if donor == "b" else "b"
+            out[donor] = out.get(donor, 0) - 1
+            out[receiver] = out.get(receiver, 0) + 1
     return out
 
 

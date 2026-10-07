@@ -104,9 +104,10 @@ def test_step_that_needs_a_donor_keeps_the_hold():
     assert _ups(plan) == 0
     assert "receiver_held_breakpoint_window:m:no_complete_grid" in plan.events
     assert not any(e.startswith("receiver_o1_exempt_free_gpu") for e in plan.events)
-    # control: the same receiver once warm does take from the donor
+    # control: the same receiver once warm does take from the donor (F1-B: through a
+    # SafeScale probe of the HIGH donor, m its promised receiver)
     warm = _plan({"m": _held(signal_warm=True), "d": dict(donor)}, states, idle_gpus=0)
-    assert [a for a in warm.actions if isinstance(a, TransferIntent) and a.receiver_model == "m"]
+    assert warm.probe_upscale_plans == {"d": {"m": 1}}
 
 
 def test_scale_down_and_low_receiver_after_a_breakpoint_stay_held():

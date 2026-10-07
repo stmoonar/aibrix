@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
@@ -67,7 +69,8 @@ def _cfg() -> PlanConfig:
 
 def _plan(bindings: tuple[Binding, ...], donor_state: ModelState, *, idle_gpus: int = 0):
     awake_7b = sum(1 for b in bindings if b.model == "dsqwen-7b" and b.awake)
-    donor_role = ModelRole.DONOR if donor_state == ModelState.HIGH else ModelRole.NEUTRAL
+    donor_role = ModelRole.DONOR if donor_state in (ModelState.HIGH, ModelState.IDLE) else ModelRole.NEUTRAL
+    donor_z = {ModelState.HIGH: 2.0, ModelState.IDLE: 10.0}.get(donor_state, 1.1)
     return build_plan(
         model_contexts={
             "dsqwen-7b": {"routable_pods": awake_7b, "assigned_replicas": 8},
@@ -75,7 +78,8 @@ def _plan(bindings: tuple[Binding, ...], donor_state: ModelState, *, idle_gpus: 
         },
         classifications=[
             _cls("dsllama-8b", ModelState.CRITICAL, ModelRole.RECEIVER, 0.4),
-            _cls("dsqwen-7b", donor_state, donor_role, 2.0 if donor_state == ModelState.HIGH else 1.1, "surplus"),
+            _cls("dsqwen-7b", donor_state, donor_role, donor_z,
+                 "idle" if donor_state == ModelState.IDLE else "surplus"),
         ],
         model_replicas={"dsqwen-7b": 8, "dsllama-8b": 8},
         idle_gpus=idle_gpus,
@@ -84,8 +88,8 @@ def _plan(bindings: tuple[Binding, ...], donor_state: ModelState, *, idle_gpus: 
     )
 
 
-def test_e1_deadlock_high_donor_frees_a_slot_where_receiver_sleeps() -> None:
-    plan = _plan(_e1_bindings(), ModelState.HIGH)
+def test_e1_deadlock_idle_donor_frees_a_slot_where_receiver_sleeps() -> None:
+    plan = _plan(_e1_bindings(), ModelState.IDLE)
 
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "critical_sleeping_capacity" for a in scale)
@@ -98,17 +102,22 @@ def test_e1_deadlock_high_donor_frees_a_slot_where_receiver_sleeps() -> None:
     assert not scale  # no binding-level donor sleep / receiver wake any more
 
 
-def test_e1_deadlock_healthy_donor_probe_is_pinned_to_receiver_slot() -> None:
-    plan = _plan(_e1_bindings(), ModelState.HEALTHY)
+@pytest.mark.parametrize(
+    ("donor_state", "reason"),
+    [
+        (ModelState.HEALTHY, "critical_middle_zone_safescale"),
+        # F1-B (2026-10-07): a HIGH donor takes the same probe path, never a relay.
+        (ModelState.HIGH, "critical_high_donor_safescale"),
+    ],
+)
+def test_e1_deadlock_donor_probe_is_pinned_to_receiver_slot(donor_state, reason) -> None:
+    plan = _plan(_e1_bindings(), donor_state)
 
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "critical_sleeping_capacity" for a in scale)
+    assert not [a for a in plan.actions if isinstance(a, TransferIntent)]
     donor = next(a for a in scale if a.model == "dsqwen-7b")
-    assert (donor.reason, donor.requires_safescale, donor.pods) == (
-        "critical_middle_zone_safescale",
-        True,
-        ("7b-0",),
-    )
+    assert (donor.reason, donor.requires_safescale, donor.pods) == (reason, True, ("7b-0",))
     assert plan.probe_upscale_plans == {"dsqwen-7b": {"dsllama-8b": 1}}
 
 
@@ -160,7 +169,7 @@ def test_low_fairness_sleeping_path_is_slot_aware() -> None:
         },
         classifications=[
             _cls("dsllama-8b", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-            _cls("dsqwen-7b", ModelState.HIGH, ModelRole.DONOR, 2.0, "surplus"),
+            _cls("dsqwen-7b", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
         ],
         model_replicas={"dsqwen-7b": 8, "dsllama-8b": 8},
         idle_gpus=0,
@@ -199,7 +208,7 @@ def test_e1_plan_executes_through_serial_queue_without_wake_conflict() -> None:
     service = ServiceManagerV2(_registry(), store)
     queue = ActionQueue(InProcessServiceManager(service))
 
-    plan = _plan(_e1_bindings(), ModelState.HIGH)
+    plan = _plan(_e1_bindings(), ModelState.IDLE)
     queue.submit(plan.actions)
     results = asyncio.run(queue.drain_once())
 

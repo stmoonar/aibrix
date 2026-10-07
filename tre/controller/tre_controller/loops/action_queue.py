@@ -257,6 +257,7 @@ class ActionQueue:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         fresh_view: Callable[[], object] | None = None,
         on_oneshot_done: Callable[[str, str, str], None] | None = None,
+        on_fleet_change: Callable[[], None] | None = None,
         commit_max_age_ms: float | None = None,
         is_observe_fresh: Callable[[], bool] | None = None,
         on_hide_failed: Callable[[str, tuple[str, ...], str], None] | None = None,
@@ -334,6 +335,9 @@ class ActionQueue:
         #: (request_id, "commit" | "rollback", reason) once a SafeScale one-shot
         #: action is finished for good (review 4 P2-4): the probe is resolved then.
         self._on_oneshot_done = on_oneshot_done
+        # F2 (2026-10-07): called after an SM call of ours changed the fleet (every
+        # O1 / view-pending stamp below) - the app asks for a cluster-view refresh.
+        self._on_fleet_change = on_fleet_change
         #: running dispatch task -> its queued action (updated as a commit progresses)
         self._running: dict[asyncio.Future, QueuedAction] = {}
         #: running dispatch task -> its one-shot action waiting out a retry backoff
@@ -1538,6 +1542,11 @@ class ActionQueue:
         def stamp(target: str, direction: int, hold: str) -> None:
             self._routable_change[target] = (now, direction)
             self._view_change[target] = (now, hold)
+            if self._on_fleet_change is not None:
+                try:
+                    self._on_fleet_change()
+                except Exception:  # noqa: BLE001 - the periodic refresh still runs
+                    LOG.exception("fleet-change callback failed")
 
         if isinstance(action, TransferIntent):
             donor_changed, receiver_changed = _transfer_changed(result)

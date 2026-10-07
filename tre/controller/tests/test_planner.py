@@ -236,8 +236,8 @@ def test_build_plan_low_fairness_receiver_needs_no_saturation() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_due=False, fairness_due=True),
     )
 
-    upscales = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta > 0]
-    assert any(a.model == "low" for a in upscales), "non-saturated LOW receiver must now receive"
+    # F1-B (2026-10-07): the HIGH donor gives through a probe; LOW is its promised receiver.
+    assert plan.probe_upscale_plans.get("high", {}).get("low"), "non-saturated LOW receiver must now receive"
     assert not any(e.startswith("fairness_blocked_unsaturated") for e in plan.events)
     assert {action.source_loop for action in plan.actions} == {"fairness"}
 

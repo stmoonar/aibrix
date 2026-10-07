@@ -45,11 +45,12 @@ class PlanConfig:
     # (TSS = throughput/queue spikes up), so the probe hid a serving pod exactly as load
     # climbed, deepening saturation (routable 4->3, then CRITICAL->rescale oscillation).
     # When enabled this suppresses that receiver-less proactive probe on hot
-    # (HIGH/CRITICAL) donors. Demand-driven preemption (idle/HIGH immediate donors and the
-    # TP critical_same_slot_high_shrink -> CRITICAL beneficiary) is a separate path and is
-    # intentionally NOT gated. Default OFF since the v1/paper alignment (A2): the path is
-    # v1's paper_high_proactive_shrink (rescue tick, HIGH, replicas > floor, no active
-    # probe, not moved by another path this tick -> SafeScale shrink by one step), now
+    # (HIGH/CRITICAL) donors. Demand-driven preemption (IDLE immediate donors, HIGH donor
+    # probes for a receiver and the TP critical_same_slot_high_shrink -> CRITICAL
+    # beneficiary) is a separate path and is intentionally NOT gated. Default OFF since
+    # the v1/paper alignment (A2): the path is v1's paper_high_proactive_shrink (rescue
+    # tick, HIGH, replicas > floor, no active probe, not moved by another path this
+    # tick -> SafeScale shrink by one step), now
     # protected by the SafeScale KV-cache / donor-health guards and the rollback evidence
     # hold (a rolled-back model is re-probed only on new evidence, timer cleanup 2026-10-02).
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
@@ -66,12 +67,6 @@ class PlanConfig:
     # C1 (registry scaling.rescue_max_step_pods): the rescue target may also reach
     # n + this many replicas (HPA-style "max(ratio x n, n + pods)"); 0 = ratio only.
     rescue_max_step_pods: int = 0
-    # C1 review P1 (registry scaling.donor_surplus_release): an immediate HIGH donor of
-    # a CRITICAL receiver gives its surplus above its tau_high level in one tick. Off
-    # (default): one step per tick - scale-down stays cautious. An IDLE donor always
-    # gives its whole surplus (Q3 2026-10-06, code rule): an idle window is evidence
-    # that does not depend on the replica count.
-    donor_surplus_release: bool = False
     #: O1 review P2-1 (evidence-gated): a C1 rescue decided on a partial
     #: (post-breakpoint) window - ``signal_full_window`` False - whose
     #: ``signal_evidence_requests`` is below ``partial_window_lowevidence_requests``
@@ -488,8 +483,9 @@ def build_plan(
 ) -> PlanResult:
     """One plan. Quantity only for the immediate relays (2026-10-02): a CRITICAL / LOW
     receiver's need is met first from free capacity (its sleeping bindings on free
-    GPUs, then free slot groups), then by :class:`TransferIntent` s from IMMEDIATE
-    donors (count only; the SM places them), then by middle-zone SafeScale probes. A
+    GPUs, then free slot groups), then by :class:`TransferIntent` s from IDLE donors
+    (count only; the SM places them), then by SafeScale probes of HIGH and middle-zone
+    donors (F1-B 2026-10-07: no HIGH donor is released without a probe). A
     donor gives at most its ``floor_headroom`` (SM count, ``_donor_headroom``) minus
     what this tick already took from it. Whatever the relays cannot cover is planned
     again on the next tick from a new view (free capacity first). ``relay_holds``
@@ -502,7 +498,8 @@ def build_plan(
     preemptible_models = preemptible_models or set()
     # Models whose last SafeScale probe rolled back and whose signal does not show new
     # evidence yet (timer cleanup 2026-10-02, replaces the A13 60 s backoff): model ->
-    # hold reason (a plain set = reason "evidence"). No new HIGH proactive probe.
+    # hold reason (a plain set = reason "evidence"). No new probe of a HIGH donor
+    # (receiver-less or for a receiver, F1-B).
     probe_backoff_models = (
         dict(probe_backoff_models)
         if isinstance(probe_backoff_models, Mapping)
@@ -636,6 +633,25 @@ def build_plan(
         if item.state in (ModelState.LOW, ModelState.HEALTHY) and item.role != ModelRole.RECEIVER
     ]
     middle_zone.sort(key=lambda item: (0 if item.state == ModelState.HEALTHY else 1, -(item.Z_m or 0.0)))
+    # F1-B (2026-10-07, design donor-evidence-20261007): a HIGH donor gives a receiver
+    # capacity only through a SafeScale probe (hide, observe, commit or roll back) - the
+    # middle-zone path, HIGH donors first (cost order). Only an IDLE donor is released at
+    # once: an idle window is evidence that does not depend on the replica count, while
+    # "Z > tau_high now" says nothing about Z with one replica less (n = 2: half the
+    # capacity). A HIGH donor whose last probe rolled back waits for new evidence
+    # (``probe_backoff_models``), like its receiver-less probe.
+    probe_donors = [item for item in paper_donors if item.state == ModelState.HIGH] + middle_zone
+
+    def probe_held(donor: ModelClassification) -> bool:
+        # One SafeScale probe per donor model (the state machine is keyed by model): a
+        # donor this plan already probes serves a further receiver only through the
+        # piggyback (its unclaimed replicas), never through a second probe.
+        if donor.model_name in delayed_down_models:
+            return True
+        if donor.state != ModelState.HIGH or donor.model_name not in probe_backoff_models:
+            return False
+        _event_once(events, f"safescale_rollback_hold:{donor.model_name}:{probe_backoff_models[donor.model_name]}")
+        return True
 
     def low_need(recv: ModelClassification) -> tuple[int, int] | None:
         """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
@@ -892,6 +908,16 @@ def build_plan(
                         pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
                         if occupancy is not None:
                             occupancy.count_released((same_slot_shrink.serve_id,))
+                            # Item 3: the free slot mate the commit's wake needs is no
+                            # capacity for the rest of this plan (later ticks: the view's
+                            # blocked GPUs, probe_reserved_gpus).
+                            occupancy.claim_gpus(
+                                _slots_around(
+                                    cluster_view.topology,
+                                    {(same_slot_shrink.slot.node, gpu) for gpu in same_slot_shrink.slot.gpu_ids},
+                                    tp_size,
+                                )
+                            )
                         events.append(
                             f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
                         )
@@ -977,7 +1003,7 @@ def build_plan(
                         donor.model_name == recv.model_name
                         or donor.model_name in active_probe_models
                         or donor.model_name in inflight_models
-                        or donor.state not in (ModelState.IDLE, ModelState.HIGH)
+                        or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
                     ):
                         continue
                     if cooldown.blocks(donor.model_name, "down"):
@@ -994,7 +1020,8 @@ def build_plan(
                         donor=donor.model_name,
                         receiver=recv.model_name,
                         need=still_needed,
-                        donor_limit=min(_donor_give(donor, donor_pods, cfg), headroom - planned_take),
+                        # Q3: an IDLE donor gives its whole surplus (floor headroom bounds it).
+                        donor_limit=min(max(1, donor_pods), headroom - planned_take),
                         reason="critical_donor_immediate",
                         source_loop="rescue",
                         events=events,
@@ -1003,7 +1030,7 @@ def build_plan(
                     )
                     still_needed -= gained
 
-                for middle in middle_zone:
+                for middle in probe_donors:
                     if still_needed <= 0:
                         break
                     if (
@@ -1015,7 +1042,7 @@ def build_plan(
                     if cooldown.blocks(middle.model_name, "down"):
                         continue
                     headroom = _donor_headroom(cfg, middle.model_name, model_contexts, model_replicas)
-                    if headroom <= 0:
+                    if headroom <= 0 or probe_held(middle):
                         continue
                     middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
                     planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
@@ -1027,7 +1054,11 @@ def build_plan(
                         receiver=recv.model_name,
                         need=still_needed,
                         donor_limit=min(_scale_step(middle_pods, cfg.scale_step_ratio), headroom - planned_take),
-                        reason="critical_middle_zone_safescale",
+                        reason=(
+                            "critical_high_donor_safescale"
+                            if middle.state == ModelState.HIGH
+                            else "critical_middle_zone_safescale"
+                        ),
                         source_loop="rescue",
                         events=events,
                         delayed_down_models=delayed_down_models,
@@ -1263,18 +1294,13 @@ def build_plan(
                 donor.model_name == recv.model_name
                 or donor.model_name in active_probe_models
                 or donor.model_name in inflight_models
-                or donor.state not in (ModelState.IDLE, ModelState.HIGH)
+                or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
             ):
                 continue
             if cooldown.blocks(donor.model_name, "down"):
                 continue
             headroom = _donor_headroom(cfg, donor.model_name, model_contexts, model_replicas)
             if headroom <= 0:
-                continue
-            needed = _piggyback_probe(
-                donor.model_name, recv.model_name, needed, deltas, delayed_down_models, probe_upscale_plans
-            )
-            if needed <= 0:
                 continue
             donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
             planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
@@ -1285,11 +1311,8 @@ def build_plan(
                 donor=donor.model_name,
                 receiver=recv.model_name,
                 need=needed,
-                # Q3: an IDLE donor gives its whole surplus, a HIGH donor one step.
-                donor_limit=min(
-                    donor_pods if donor.state == ModelState.IDLE else _scale_step(donor_pods, cfg.scale_step_ratio),
-                    headroom - planned_take,
-                ),
+                # Q3: an IDLE donor gives its whole surplus.
+                donor_limit=min(donor_pods, headroom - planned_take),
                 reason="low_fairness_donor_immediate",
                 source_loop="fairness",
                 events=events,
@@ -1297,7 +1320,7 @@ def build_plan(
                 relay_holds=relay_holds,
             )
 
-        for middle in middle_zone:
+        for middle in probe_donors:
             if needed <= 0:
                 break
             if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
@@ -1310,7 +1333,7 @@ def build_plan(
             needed = _piggyback_probe(
                 middle.model_name, recv.model_name, needed, deltas, delayed_down_models, probe_upscale_plans
             )
-            if needed <= 0:
+            if needed <= 0 or probe_held(middle):
                 continue
             donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
             planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
@@ -1322,7 +1345,11 @@ def build_plan(
                 receiver=recv.model_name,
                 need=needed,
                 donor_limit=min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take),
-                reason="low_fairness_middle_zone_safescale",
+                reason=(
+                    "low_fairness_high_donor_safescale"
+                    if middle.state == ModelState.HIGH
+                    else "low_fairness_middle_zone_safescale"
+                ),
                 source_loop="fairness",
                 events=events,
                 delayed_down_models=delayed_down_models,
@@ -1947,8 +1974,13 @@ def _try_plan_same_slot_high_shrink(
     high_by_model = {item.model_name: item for item in classifications if item.state == ModelState.HIGH}
     candidates: list[tuple[float, Binding]] = []
     # Only AWAKE bindings hold a GPU: a sleeping resident (multi-model residency)
-    # neither occupies the slot mate nor frees anything when "shrunk".
-    occupied = awake_gpus(cluster_view.bindings)
+    # neither occupies the slot mate nor frees anything when "shrunk". A GPU the SM
+    # reports not wakeable, or one an in-flight probe reserves for its receiver
+    # (``blocked_gpus``, :func:`probe_reserved_gpus`), is no free mate either: the
+    # commit's wake would conflict there.
+    occupied = awake_gpus(cluster_view.bindings) | {
+        (str(node), int(gpu)) for node, gpu in cluster_view.blocked_gpus
+    }
 
     for binding in cluster_view.bindings:
         if not binding.awake or binding.hidden:
@@ -2022,6 +2054,47 @@ def _slot_mate_is_free(
             mate = next(item for item in pair if item != gpu)
             return (slot.node, mate) not in occupied
     return False
+
+
+def probe_reserved_gpus(
+    cluster_view: ClusterView, probes, tp_sizes: Mapping[str, int]
+) -> frozenset:
+    """GPUs unresolved SafeScale probes (probing or committing) count on for their
+    receivers (design donor-evidence-20261007, item 3): for every receiver a probe
+    promises replicas to (``pending_upscales``), the aligned ``tp_size`` slot around
+    each GPU of the probe pods. While a donor pod is hidden its own GPU is occupied
+    anyway; what this adds is the free slot mate a TP receiver's wake needs at commit
+    (``critical_same_slot_high_shrink``), and, between the donor's sleep and the
+    receiver's wake of a commit, the freed GPU itself. The tick adds them to the view's
+    ``blocked_gpus``, so no other wake / create / relay of the plan takes them; they are
+    free again once the probe is resolved (state, not time)."""
+    bindings = {binding.serve_id: binding for binding in cluster_view.bindings}
+    reserved: set[tuple[str, int]] = set()
+    for probe in probes:
+        receivers = [
+            model for model, count in (getattr(probe, "pending_upscales", None) or {}).items() if int(count) > 0
+        ]
+        if not receivers:
+            continue
+        probe_gpus = {
+            (binding.slot.node, gpu)
+            for pod in getattr(probe, "pods", ()) or ()
+            if (binding := bindings.get(pod)) is not None
+            for gpu in binding.slot.gpu_ids
+        }
+        for receiver in receivers:
+            reserved |= _slots_around(cluster_view.topology, probe_gpus, int(tp_sizes.get(receiver, 1) or 1))
+    return frozenset(reserved)
+
+
+def _slots_around(topology: ClusterTopology, gpus: set, tp_size: int) -> set[tuple[str, int]]:
+    """The GPUs of every aligned ``tp_size`` slot that contains one of ``gpus``."""
+    out: set[tuple[str, int]] = set()
+    for slot in gpu_slot_candidates(topology, tp_size):
+        block = {(slot.node, gpu) for gpu in slot.gpu_ids}
+        if block & gpus:
+            out |= block
+    return out
 
 
 def _try_plan_tp_capacity(
@@ -2199,28 +2272,6 @@ def rescue_desired(
         return floor_target
     want = math.ceil(n * float(tau_crit) / float(z_m) - 1e-9)
     return min(max(want, floor_target), cap)
-
-
-def _donor_give(donor: ModelClassification, donor_pods: int, cfg: PlanConfig) -> int:
-    """Replicas an immediate (IDLE / HIGH) donor may give one CRITICAL receiver in one
-    tick, before its floor. An IDLE donor: all of it (Q3 2026-10-06, code rule - an
-    idle window is evidence that does not depend on the replica count). A HIGH donor,
-    default (and legacy): one step - the paper's bounded pairwise transfer moves at
-    most one step per pair per tick, the donor side included;
-    ``donor_surplus_release`` (opt-in): the replicas above ``ceil(n * tau_high / Z)``
-    (its projected Z stays >= tau_high), never less than one step. The relay is capped
-    by what the receiver still needs and the donor's floor headroom either way (caller)."""
-    step = _scale_step(donor_pods, cfg.scale_step_ratio)
-    if donor.state == ModelState.IDLE:
-        return max(step, donor_pods)
-    if cfg.rescue_max_step_ratio <= 0 or not cfg.donor_surplus_release:
-        return step
-    z_m = donor.Z_m
-    tau_high = donor.tau.tau_high
-    if z_m is None or not math.isfinite(z_m) or z_m <= 0 or tau_high <= 0:
-        return step
-    keep = math.ceil(donor_pods * float(tau_high) / float(z_m) - 1e-9)
-    return max(step, donor_pods - keep)
 
 
 def _tag_rescue_actions(

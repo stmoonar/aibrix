@@ -80,7 +80,7 @@ def _plan(bindings, *, receiver_state=ModelState.CRITICAL, donor_state=ModelStat
         # Legacy step rescue with ratio 1.0: the receiver needs exactly ``need`` replicas.
         cfg=cfg or PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=8, suppress_hot_proactive_probe=True,
-            rescue_max_step_ratio=2.0, donor_surplus_release=True, scale_step_ratio=1.0,
+            rescue_max_step_ratio=2.0, scale_step_ratio=1.0,
         ),
         cluster_view=ClusterView(TOPOLOGY, bindings),
     )
@@ -397,7 +397,7 @@ def test_tick_contexts_take_routable_and_headroom_from_the_sm():
 
 
 def test_offline_replay_plans_an_intent_and_the_fake_sm_names_the_pods():
-    from test_scaling_e2e import CRITICAL, HIGH, REG_7B_8B, _registry, _window as _e2e_window
+    from test_scaling_e2e import CRITICAL, IDLE_LOAD, REG_7B_8B, _registry, _window as _e2e_window
 
     registry = _registry(*REG_7B_8B)
     bindings = list(_e1())
@@ -406,7 +406,8 @@ def test_offline_replay_plans_an_intent_and_the_fake_sm_names_the_pods():
     service = ServiceManagerV2(registry, store)
     view = cluster_view_from_state(service.get_state(), registry.topology())
     snapshot = MetricsSnapshot(ts_ms=60_000, stale=False, models={
-        R: _e2e_window(R, per_q=CRITICAL, running=1.0), D: _e2e_window(D, per_q=HIGH, running=8.0),
+        R: _e2e_window(R, per_q=CRITICAL, running=1.0),
+        D: _e2e_window(D, per_q=IDLE_LOAD[0], running=IDLE_LOAD[1]),  # F1-B: an IDLE donor relays
     })
     replay = run_tick_replay(
         [TickReplayStep(snapshot, rescue_due=True, fairness_due=False, cluster_view=view)],

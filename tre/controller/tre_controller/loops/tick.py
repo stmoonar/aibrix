@@ -30,6 +30,7 @@ from tre_controller.planning.planner import (
     TransferIntent,
     UnhideAction,
     build_plan,
+    probe_reserved_gpus,
     upscale_of,
 )
 from tre_controller.planning.safescale import (
@@ -183,6 +184,19 @@ def run_planner_tick(
         # Every placement decision of this tick (wakes, creates, donor slots, probe /
         # shrink order) ranks by the registry placement policy.
         cluster_view = replace(cluster_view, placement=placement_policy_from_registry(registry))
+    reserve_events: tuple[str, ...] = ()
+    if cluster_view is not None:
+        # Design donor-evidence-20261007 item 3: the GPUs in-flight probes count on for
+        # their receivers are no capacity for anything else of this tick.
+        reserved = probe_reserved_gpus(
+            cluster_view, _unresolved_probes(safescale), {spec.name: spec.tp_size for spec in registry.models()}
+        )
+        extra = reserved - {(str(node), int(gpu)) for node, gpu in cluster_view.blocked_gpus}
+        if extra:
+            cluster_view = replace(cluster_view, blocked_gpus=frozenset(cluster_view.blocked_gpus) | extra)
+            reserve_events = (
+                "probe_slot_reserved:" + ",".join(f"{node}/{gpu}" for node, gpu in sorted(extra)),
+            )
 
     _prof_on = prof is not None
     if _prof_on:
@@ -322,7 +336,7 @@ def run_planner_tick(
         submitted=len(actions),
         actions=actions,
         events=(
-            paper_events + tuple(saturation_events) + tuple(plan.events)
+            paper_events + reserve_events + tuple(saturation_events) + tuple(plan.events)
             + safescale_events + queue_events
         ),
         model_contexts=contexts,
@@ -345,7 +359,6 @@ def _scaling_options(registry: Registry) -> dict:
     return {
         "rescue_max_step_ratio": float(config.rescue_max_step_ratio),
         "rescue_max_step_pods": int(getattr(config, "rescue_max_step_pods", 0)),
-        "donor_surplus_release": bool(getattr(config, "donor_surplus_release", False)),
         "partial_window_max_step": int(getattr(config, "breakpoint_partial_max_step", 0) or 0)
         if bool(getattr(config, "breakpoint_window", False))
         else 0,
@@ -609,6 +622,12 @@ def _preemptible_models(queue: PlannerQueue) -> set[str]:
     """Models a rescue action may preempt in the queue (review 3 P2-3)."""
     preemptible = getattr(queue, "preemptible_models", None)
     return set(preemptible()) if callable(preemptible) else set()
+
+
+def _unresolved_probes(safescale: SafeScaleController | None) -> tuple:
+    """Every unresolved SafeScale probe, probing or committing (none without SafeScale)."""
+    reader = getattr(safescale, "all_probes", None)
+    return tuple(reader()) if callable(reader) else ()
 
 
 def _probe_backoff_models(

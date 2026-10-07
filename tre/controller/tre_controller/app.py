@@ -168,6 +168,9 @@ def build_controller_task_specs(
                     is_observe=_observe_reader(deps),
                     maintenance=deps.maintenance_watch,
                     direct=deps.direct_evidence,
+                    # F4 (design donor-evidence-20261007): CRITICAL models of the latest
+                    # planner tick - an early-commit trigger.
+                    critical_models=lambda: _critical_models(deps.model_state_box),
                 ),
             )
         )
@@ -220,6 +223,12 @@ def _sleeping_pods(view: Any, model: str) -> set[str]:
         for binding in getattr(view, "bindings", ()) or ()
         if binding.model == model and not binding.awake
     }
+
+
+def _critical_models(box: "ModelStateBox | None") -> set[str]:
+    if box is None:
+        return set()
+    return {model for model, state in box.get().items() if state == "critical"}
 
 
 def _observe_reader(deps: ControllerDependencies) -> Callable[[], bool] | None:
@@ -413,6 +422,8 @@ def create_controller_dependencies(
             on_oneshot_done=lambda request_id, status, reason: safescale.resolve_request(
                 request_id, status=status, reason=reason, now_ms=int(time.time() * 1000)
             ),
+            # F2 (2026-10-07): an SM call of ours changed the fleet - refresh the view now.
+            on_fleet_change=cluster_view_box.request_refresh,
             # B8: a commit held (observe mode) or recovered past this age is
             # turned into the donor unhide instead of acting on stale evidence.
             commit_max_age_ms=cfg.safescale.commit_max_age_ms,

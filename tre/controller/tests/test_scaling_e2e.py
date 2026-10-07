@@ -97,21 +97,24 @@ def _relay_moved(before: list[Binding], awake: set[str], donor: str, receiver: s
 
 
 REG_7B_8B = (("dsqwen-7b", 1, 1, 8), ("dsllama-8b", 1, 1, 8))
+#: An idle window (no token, nothing running): the donor is IDLE - the only donor still
+#: released at once (relay) since F1-B (2026-10-07); a HIGH donor is probed.
+IDLE_LOAD = (0.0, 0.0)
 
 
-def test_e1_receiver_gets_the_slot_the_donor_frees() -> None:
+def test_e1_receiver_gets_the_slot_the_idle_donor_frees() -> None:
     bindings = [Binding("8b-0", "dsllama-8b", Slot("node9", (0,)), awake=True)]
     for index, (node, gpu) in enumerate(SLOTS[1:], start=1):
         bindings.append(Binding(f"7b-{index}", "dsqwen-7b", Slot(node, (gpu,)), awake=True))
         bindings.append(Binding(f"8b-{index}", "dsllama-8b", Slot(node, (gpu,)), awake=False))
 
     result, calls, awake, idle = _run(
-        _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": (HIGH, 7.0)}
+        _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": IDLE_LOAD}
     )
 
     assert idle == 0
     assert result.classifications["dsllama-8b"].state == ModelState.CRITICAL
-    assert result.classifications["dsqwen-7b"].state == ModelState.HIGH
+    assert result.classifications["dsqwen-7b"].state == ModelState.IDLE
     # 2026-10-02: one relay intent (a count); which 7b / 8b pair moves is the SM's
     # choice (its placement policy), here the fake SM's pair rule.
     assert _scale(result) == []
@@ -133,7 +136,7 @@ def test_repro_a_gpu_with_only_a_foreign_sleeping_binding_is_not_receiver_idle_c
         bindings.append(Binding(f"8b-{index}", "dsllama-8b", Slot(node, (gpu,)), awake=False))
 
     result, calls, awake, idle = _run(
-        _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": (HIGH, 7.0)}
+        _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": IDLE_LOAD}
     )
 
     assert idle == 1  # the raw free-GPU count is still reported ...
@@ -152,7 +155,7 @@ def test_repro_a_fully_empty_gpu_is_not_receiver_idle_capacity_while_it_has_bloc
         bindings.append(Binding(f"8b-{index}", "dsllama-8b", Slot(node, (gpu,)), awake=False))
 
     result, _, awake, idle = _run(
-        _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": (HIGH, 7.0)}
+        _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": IDLE_LOAD}
     )
 
     assert idle == 1

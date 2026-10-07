@@ -369,11 +369,13 @@ def test_capacity_order_free_capacity_before_any_donor():
                    for a in expand_relays(plan.actions) if isinstance(a, ScaleAction))
 
 
-def test_without_free_capacity_a_high_donor_is_released_immediately():
+def test_without_free_capacity_a_high_donor_is_probed_for_the_receiver():
+    # F1-B (2026-10-07): a HIGH donor is never released at once; it is probed, the
+    # saturation receiver its promised follow-up upscale.
     plan = _two_model_plan(idle_gpus=0)
     donor = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "d"]
-    assert donor and donor[0].delta == -1 and donor[0].reason == "critical_donor_immediate"
-    assert _ups(plan.actions)[0].model == "r"
+    assert donor and donor[0].delta == -1 and donor[0].reason == "critical_high_donor_safescale"
+    assert donor[0].requires_safescale and plan.probe_upscale_plans == {"d": {"r": 1}}
 
 
 def test_a_saturation_receiver_is_not_dropped_as_incomplete():

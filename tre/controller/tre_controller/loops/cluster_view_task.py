@@ -53,6 +53,7 @@ class ClusterViewBox:
         self.max_age_s = float(max_age_s)
         self._cluster_view = cluster_view
         self._updated_at = monotonic() if cluster_view is not None else None
+        self._refresh: asyncio.Event | None = None
 
     def get(self) -> ClusterView | None:
         return self._cluster_view
@@ -71,6 +72,20 @@ class ClusterViewBox:
     def set(self, cluster_view: ClusterView) -> None:
         self._cluster_view = cluster_view
         self._updated_at = self._monotonic()
+
+    def request_refresh(self) -> None:
+        """F2 (2026-10-07, design donor-evidence-20261007): an SM call of this controller
+        changed the fleet (a SafeScale commit's sleep, a relay, a scale, a hide): the
+        cluster-view task refreshes now instead of at its next period, so the next
+        planner tick plans on the new state (e.g. wakes a receiver into the GPU a
+        committed scale-down freed). Event-driven; the period stays the fallback."""
+        self.refresh_event().set()
+
+    def refresh_event(self) -> asyncio.Event:
+        # Created on first use, inside the running event loop.
+        if self._refresh is None:
+            self._refresh = asyncio.Event()
+        return self._refresh
 
 
 @dataclass(frozen=True)
@@ -256,10 +271,38 @@ async def cluster_view_task(
         float(getattr(cfg, "view_stale_periods", 3) or 0) * float(cfg.fairness_interval_s) * 1000.0
     )
     clock = clock_ms or wall_clock_ms
+    requested = getattr(cluster_view_box, "refresh_event", None)
     while True:
+        if callable(requested):
+            # F2: a request made from here on (even during the GET below, whose answer
+            # may predate the change) triggers one more refresh.
+            requested().clear()
         result = await refresh_cluster_view_once(client, topology, cluster_view_box)
         event = alert.check(result.cluster_view, clock(), result.error)
         if event is not None:
             log = LOG.warning if event["event"] == "cluster_view_stale" else LOG.info
             log(json.dumps(event, sort_keys=True))
-        await sleep(cfg.fairness_interval_s)
+        if callable(requested):
+            await wait_next_refresh(requested(), cfg.fairness_interval_s, sleep)
+        else:
+            await sleep(cfg.fairness_interval_s)
+
+
+async def wait_next_refresh(
+    requested: asyncio.Event, interval_s: float, sleep: Callable[[float], Awaitable[None]]
+) -> bool:
+    """F2: return when a refresh is requested (True) or the period ends (False),
+    whichever comes first. The period is the fallback, not a delay: no extra wait."""
+    if requested.is_set():
+        return True
+    timer = asyncio.ensure_future(sleep(interval_s))
+    waiter = asyncio.ensure_future(requested.wait())
+    try:
+        done, _ = await asyncio.wait({timer, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (timer, waiter):
+            if not task.done():
+                task.cancel()
+    if timer in done:
+        timer.result()  # an injected sleep that raises (tests, cancellation) propagates
+    return waiter in done

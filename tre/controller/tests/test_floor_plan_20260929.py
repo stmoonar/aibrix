@@ -141,12 +141,12 @@ def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor()
     )
     assert _taken(alone, "high") == 1
     assert [a.reason for a in expand_relays(alone.actions) if isinstance(a, ScaleAction) and a.model == "high"] == [
-        "critical_donor_immediate"
+        "critical_high_donor_safescale"  # F1-B (2026-10-07): a HIGH donor is probed
     ]
 
 
 def test_same_slot_shrink_counts_takes_planned_by_an_earlier_receiver():
-    # crit1 first takes one replica of "high" (critical_donor_immediate); the TP=2
+    # crit1 first takes one replica of "high" (a HIGH donor probe since F1-B); the TP=2
     # receiver after it must not shrink "high" again (2 replicas, floor 1).
     classifications = [
         _cls("crit1", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),

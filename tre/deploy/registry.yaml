@@ -663,11 +663,9 @@ scaling:
   # (the built-in default); 4 = user decision 2026-10-01 (n = 1 can reach the
   # scaling cap 4 in one decision).
   rescue_max_step_pods: 4
-  # An immediate HIGH donor of a CRITICAL receiver gives its surplus (down to its
-  # tau_high level) in one tick. false = one step per tick (scale-down stays
-  # cautious). IDLE donors always release their whole surplus to the floor in one
-  # decision (code rule since 2026-10-06, Q3), whatever this says.
-  donor_surplus_release: false
+  # donor_surplus_release: retired 2026-10-07 (F1-B): a HIGH donor gives capacity
+  # only through a SafeScale probe; IDLE donors release their whole surplus to the
+  # floor at once (code rule since 2026-10-06, Q3). An old key is ignored (warning).
   # Fallback only (2026-10-06): while O1 tracks the model, a rescue target this
   # controller dispatched counts as reflected once the decision window starts
   # after it completed (the breakpoint restarts the EMA, the evidence gate holds

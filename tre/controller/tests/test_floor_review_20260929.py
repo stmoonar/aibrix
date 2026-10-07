@@ -326,17 +326,16 @@ def _two_receiver_plan(high_replicas: int):
     )
 
 
-def test_three_replica_donor_with_floor_one_serves_two_receivers_in_one_tick() -> None:
+def test_three_replica_donor_with_a_same_slot_probe_gives_nothing_else_this_tick() -> None:
+    # F1-B (2026-10-07): before, the 3-replica HIGH donor also fed crit1 through an
+    # immediate relay in the same tick. A HIGH donor now gives only through a SafeScale
+    # probe, and it has one already (tp2's same-slot shrink): crit1 waits for it.
     plan = _two_receiver_plan(3)
     shrinks = [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
     assert shrinks == [("high", "tp2")]
-    # 2026-10-02: the relay is a count (the SM picks the pod: only high-b1 pairs with
-    # crit1's sleeping binding); the same-slot shrink took a node-a replica.
-    [relay] = [r for r in relays(plan.actions) if r.donor_model == "high"]
-    assert (relay.receiver_model, relay.count, relay.reason) == ("crit1", 1, "critical_donor_immediate")
-    [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
-    assert shrink.serve_id != "high-b1"
-    assert len(_taken(plan, "high")) + relay.count == 2  # 1 left = floor
+    assert not [r for r in relays(plan.actions) if r.donor_model == "high"]
+    assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high"]
+    assert len(_taken(plan, "high")) == 1
 
 
 def test_two_replica_donor_with_floor_one_is_taken_once() -> None:

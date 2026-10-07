@@ -78,7 +78,8 @@ gives its **whole surplus** in one decision: an `idle_proactive_immediate` shrin
 straight to the floor (bounded by the SM `floor_headroom`), a relay to a CRITICAL or LOW
 receiver may take all of it (bounded by the receiver's need and the headroom). This is a
 code rule for IDLE only; `scaling.donor_surplus_release` keeps its value (false) and now
-only affects HIGH donors. HIGH donors keep the O1 hold and one step per tick (their
+only affects HIGH donors (retired 2026-10-07: HIGH donors only give through a SafeScale
+probe, `donor-evidence-20261007.md`). HIGH donors keep the O1 hold and one step per tick (their
 evidence - a throughput level - does depend on the replica count). `window_idle` is
 current-window evidence only (I4): the tick sets it from this tick's serving window with
 tokens known and every serving pod scraped; a held context (`tokens_missing`), a

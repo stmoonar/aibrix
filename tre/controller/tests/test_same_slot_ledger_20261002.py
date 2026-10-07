@@ -71,18 +71,16 @@ def test_same_slot_shrink_is_claimed_in_the_ledger_and_not_piggybacked_by_low():
     assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
 
 
-def test_three_replica_donor_still_feeds_low_through_an_immediate_pair_on_another_pod():
+def test_three_replica_donor_with_a_same_slot_probe_starts_no_second_probe_for_low():
+    """F1-B (2026-10-07): a HIGH donor gives LOW nothing at once any more (before: an
+    immediate pair on another pod). It already has this tick's probe (the same-slot
+    shrink, claimed by tp2), and a donor gets one probe at a time."""
     plan = _same_slot_plan(3)
     [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
     assert plan.probe_upscale_plans == {"high": {"tp2": 1}}
-    scales = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction)]
-    pair = [a for a in scales if a.reason == "low_fairness_donor_immediate"]
-    assert sorted((a.model, a.delta) for a in pair) == [("high", -1), ("low", 1)]
-    # 2026-10-02: the relay names no pod (the SM picks it); the only donor pod that pairs
-    # with low's sleeping binding is high-2, which the same-slot shrink did not take.
-    [relay] = relays(plan.actions)
-    assert (relay.donor_model, relay.receiver_model, relay.count) == ("high", "low", 1)
-    assert shrink.serve_id != "high-2"
+    assert not relays(plan.actions)
+    assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
+    assert shrink.donor == "high"
 
 
 def _proactive(n_low: int, high_replicas: int):

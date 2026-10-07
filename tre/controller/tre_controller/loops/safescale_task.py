@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Mapping, Protocol
+from typing import Awaitable, Callable, Collection, Mapping, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
@@ -90,6 +90,7 @@ def run_safescale_observation_tick(
     observe_mode: bool = False,
     maintenance: MaintenanceReader | None = None,
     direct_polls: Mapping[str, DirectPoll] | None = None,
+    critical_receivers: Collection[str] = (),
 ) -> SafeScaleObservationResult:
     """One SafeScale observation tick. ``fresh_cluster_view`` is the SM view only
     while fresh (``ClusterViewBox.fresh``): with it, probes whose pods are all
@@ -165,6 +166,9 @@ def run_safescale_observation_tick(
         poll = (direct_polls or {}).get(probe.model)
         # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
         extra = {"direct_poll": poll} if poll is not None else {}
+        if critical_receivers:
+            # F4 (design donor-evidence-20261007): an early-commit trigger.
+            extra["critical_receivers"] = tuple(critical_receivers)
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms, **extra)
         events.append(f"safescale_{decision.reason}:{probe.model}")
         early = (getattr(decision, "details", None) or {}).get("early_commit")
@@ -256,6 +260,7 @@ async def safescale_task(
     is_observe: Callable[[], bool] | None = None,
     maintenance: MaintenanceReader | None = None,
     direct: DirectEvidenceCollector | None = None,
+    critical_models: Callable[[], Collection[str]] | None = None,
 ) -> None:
     """The SafeScale loop (one coroutine on the controller's event loop). With
     ``direct`` (safescale.evidence_source: direct) each tick first scrapes the probes'
@@ -294,9 +299,21 @@ async def safescale_task(
                 observe_mode=observe_mode,
                 maintenance=maintenance,
                 direct_polls=direct_polls,
+                critical_receivers=_critical_models(critical_models),
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         await sleep(interval)
+
+
+def _critical_models(reader: Callable[[], Collection[str]] | None) -> tuple[str, ...]:
+    """F4: the models the latest planner tick classified CRITICAL (none on error)."""
+    if reader is None:
+        return ()
+    try:
+        return tuple(sorted(reader()))
+    except Exception:  # noqa: BLE001 - no trigger this tick; the normal rules apply
+        LOG.exception("critical model reader failed")
+        return ()
 
 
 def _fresh_view(cluster_view_box) -> ClusterView | None:

@@ -55,7 +55,7 @@ def _cls(model, state, z, role=None, tier=None):
 
 def _plan(classifications, pods, *, idle_gpus=0, max_replicas=8, ratio=2.0, bases=None,
           inflight=None, rescue_due=True, fairness_due=True, cluster_view=None, tp=None,
-          surplus=False, step_pods=0):
+          step_pods=0):
     contexts = {model: {"routable_pods": n, "assigned_replicas": n} for model, n in pods.items()}
     return build_plan(
         model_contexts=contexts,
@@ -70,7 +70,6 @@ def _plan(classifications, pods, *, idle_gpus=0, max_replicas=8, ratio=2.0, base
             suppress_hot_proactive_probe=True,
             rescue_max_step_ratio=ratio,
             model_tp_sizes=tp or {},
-            donor_surplus_release=surplus,
             rescue_max_step_pods=step_pods,
         ),
         rescue_bases=bases,
@@ -145,47 +144,17 @@ def test_capacity_short_plans_what_exists_and_records_the_partial_target():
     assert ups[0].rescue == RescuePlan(target=3, desired=4, base=2, covered=2)
 
 
-def test_immediate_donor_gives_one_step_per_tick_by_default():
-    """Review P1: scale-down stays cautious - the relay is the receiver's need, a HIGH
-    donor gives one step per pair per tick (paper section 4). An IDLE donor gives its
-    whole surplus (Q3 2026-10-06: an idle window is evidence at any replica count)."""
-    classifications = [
-        _cls("r", ModelState.CRITICAL, 0.4),
-        _cls("d", ModelState.HIGH, 2.5, tier="surplus"),
-    ]
-    assert _deltas(_plan(classifications, {"r": 2, "d": 4})) == {"r": 1, "d": -1}
+def test_idle_donor_gives_its_surplus_and_a_high_donor_only_a_probe():
+    """F1-B (2026-10-07): an IDLE donor gives its whole surplus at once (Q3 2026-10-06:
+    an idle window is evidence at any replica count); a HIGH donor gives one step, and
+    only through a SafeScale probe (the receiver's replica comes with the commit)."""
     idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
     assert _deltas(_plan(idle, {"r": 3, "i": 4})) == {"r": 3, "i": -3}  # floor 1
-    # Same as the legacy rescue on the donor side.
-    assert _deltas(_plan(classifications, {"r": 2, "d": 4}, ratio=0)) == {"r": 1, "d": -1}
-
-
-def test_donor_surplus_release_switch_gives_the_surplus():
-    classifications = [
-        _cls("r", ModelState.CRITICAL, 0.4),
-        # keep ceil(4 * 1.25 / 2.5) = 2 -> gives 2
-        _cls("d", ModelState.HIGH, 2.5, tier="surplus"),
-    ]
-    assert _deltas(_plan(classifications, {"r": 2, "d": 4}, surplus=True)) == {"r": 2, "d": -2}
-    # A barely-HIGH donor (keep ceil(4 * 1.25 / 1.3) = 4) still gives one step.
-    barely = [classifications[0], _cls("d", ModelState.HIGH, 1.3, tier="surplus")]
-    assert _deltas(_plan(barely, {"r": 2, "d": 4}, surplus=True)) == {"r": 1, "d": -1}
-    idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
-    assert _deltas(_plan(idle, {"r": 3, "i": 4}, surplus=True)) == {"r": 3, "i": -3}  # floor 1
-    # The relay never exceeds what the receiver still needs (desired 4 -> needs 2).
-    rich = [_cls("r", ModelState.CRITICAL, 0.4), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
-    assert _deltas(_plan(rich, {"r": 2, "i": 8}, surplus=True)) == {"r": 2, "i": -2}
-
-
-def test_high_donor_is_not_pushed_to_its_tau_high_edge_without_the_switch():
-    """Review P3 (ping-pong): only the opt-in surplus release takes a HIGH donor down
-    to exactly tau_high (its next window HEALTHY, then LOW on a small rise). By
-    default it gives one step, so 8 -> 7 at Z 2.5 keeps it well above tau_high."""
-    classifications = [_cls("r", ModelState.CRITICAL, 0.1), _cls("d", ModelState.HIGH, 2.5, tier="surplus")]
-    default = _deltas(_plan(classifications, {"r": 4, "d": 8}))
-    assert default["d"] == -1
-    released = _deltas(_plan(classifications, {"r": 4, "d": 8}, surplus=True))
-    assert released["d"] == -4  # keep ceil(8 * 1.25 / 2.5) = 4: Z -> exactly tau_high
+    high = [_cls("r", ModelState.CRITICAL, 0.4), _cls("d", ModelState.HIGH, 2.5, tier="surplus")]
+    plan = _plan(high, {"r": 2, "d": 4})
+    assert _deltas(plan) == {"d": -1}
+    assert [a.requires_safescale for a in plan.actions if a.model == "d"] == [True]
+    assert plan.probe_upscale_plans == {"d": {"r": 1}}
 
 
 def test_tp_receiver_takes_several_free_slot_pairs_in_one_action():
@@ -250,8 +219,10 @@ def test_slow_loop_moves_at_most_one_pair_per_receiver_and_is_unchanged_by_c1():
     c1 = _plan(classifications, pods, rescue_due=False)
     legacy = _plan(classifications, pods, rescue_due=False, ratio=0)
     assert c1.actions == legacy.actions and c1.events == legacy.events
-    transfers = [a for a in expand_relays(c1.actions) if isinstance(a, ScaleAction) and a.delta > 0]
-    assert [(a.model, a.delta, a.reason) for a in transfers] == [("low", 1, "low_fairness_donor_immediate")]
+    # F1-B: one probe of the first HIGH donor, its freed replica promised to "low".
+    probes = [a for a in c1.actions if isinstance(a, ScaleAction) and a.requires_safescale]
+    assert [(a.model, a.delta, a.reason) for a in probes] == [("d1", -1, "low_fairness_high_donor_safescale")]
+    assert c1.probe_upscale_plans == {"d1": {"low": 1}}
 
 
 def test_scale_down_paths_are_unchanged_by_c1():
@@ -413,7 +384,7 @@ def test_shipped_registry_scaling_section():
                               encoding="utf-8"))
     assert set(raw["scaling"]) == {
         "rescue_max_step_ratio", "rescue_max_step_pods",
-        "donor_surplus_release", "rescue_settle_ema_k",
+        "rescue_settle_ema_k",
         # O1 (2026-10-01): the breakpoint window, at its built-in defaults.
         "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
         "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
@@ -423,7 +394,7 @@ def test_shipped_registry_scaling_section():
         "saturation_rescue", "saturation_kv_threshold", "saturation_consecutive_ticks",
         "saturation_max_step_factor",
     }
-    assert registry.scaling().donor_surplus_release is False
+    assert not hasattr(registry.scaling(), "donor_surplus_release")  # retired 2026-10-07 (F1-B)
     assert registry.scaling().rescue_max_step_pods == 4
     assert ScalingRegistryConfig().rescue_max_step_pods == 0  # code default unchanged
     # With the shipped registry a single replica reaches the scaling cap (4) at once.

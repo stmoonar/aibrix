@@ -334,11 +334,9 @@ def _run_rescue_once(*, probed: bool) -> list:
 
 def test_rescue_task_excludes_actively_probed_model_from_immediate_donors() -> None:
     control = _run_rescue_once(probed=False)
-    # 2026-10-02: the immediate relay is one TransferIntent (donor -> receiver, a count).
-    assert any(
-        isinstance(action, TransferIntent) and action.donor_model == "donor" and action.count >= 1
-        for action in control
-    )
+    # F1-B (2026-10-07): the HIGH donor is taken through a SafeScale probe (its hide).
+    assert any(getattr(action, "model", None) == "donor" for action in control)
+    assert not any(isinstance(action, TransferIntent) for action in control)
 
     probed = _run_rescue_once(probed=True)
     assert not any(

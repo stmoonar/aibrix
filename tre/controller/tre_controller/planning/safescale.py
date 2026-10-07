@@ -740,7 +740,13 @@ class SafeScaleStateMachine:
         return {"evidence_source_used": SOURCE_DIRECT}
 
     def observe(
-        self, model: str, observation: ProbeObservation, *, now_ms: int, direct_poll: DirectPoll | None = None
+        self,
+        model: str,
+        observation: ProbeObservation,
+        *,
+        now_ms: int,
+        direct_poll: DirectPoll | None = None,
+        critical_receivers: Collection[str] = (),
     ) -> SafeScaleDecision:
         """One SafeScale tick (every ``probe_poll_seconds``) for ``model``'s probe.
 
@@ -757,7 +763,10 @@ class SafeScaleStateMachine:
         immediate rollback is not used; the deadline is compared with the poll's wall
         clock (the controller's own). The Redis evidence never decides a direct-mode
         probe; before its hide is confirmed it is only extended / rolled back
-        (``hide_unconfirmed``)."""
+        (``hide_unconfirmed``).
+
+        ``critical_receivers`` (F4, design donor-evidence-20261007): models the latest
+        planner tick classified CRITICAL - an early-commit trigger (:meth:`_try_early_commit`)."""
         probe = self._probes.get(model)
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
@@ -839,7 +848,7 @@ class SafeScaleStateMachine:
                 # Timer cleanup (2026-10-02): commit before the deadline when the evidence
                 # is already complete (every rollback check above ran first, unchanged).
                 early = self._try_early_commit(updated, health, now_ms=now_ms, wall_now_ms=clock,
-                                               poll=direct_poll)
+                                               poll=direct_poll, critical_receivers=critical_receivers)
                 if early is not None:
                     return early
                 if updated is not probe:
@@ -1362,6 +1371,7 @@ class SafeScaleStateMachine:
         now_ms: int,
         wall_now_ms: int,
         poll: DirectPoll | None,
+        critical_receivers: Collection[str] = (),
     ) -> SafeScaleDecision | None:
         """Timer cleanup (2026-10-02, simplified 2026-10-06 Q4): commit a direct-evidence
         probe before its deadline when (a) ``min_commit_samples`` requests of the
@@ -1374,6 +1384,14 @@ class SafeScaleStateMachine:
         grids AND at least the donor's p95 end-to-end latency passed since the hide
         confirmation (the remaining pods' concurrency needs about one e2e to settle).
         No fixed share of W and no separate minimum observation time.
+
+        F4 (2026-10-07, design donor-evidence-20261007): while another model is CRITICAL
+        (``critical_receivers``), the probe commits as soon as the evidence is there -
+        (a), (b) and the post-hide grids of (d) - without the settle conditions: (c) the
+        hidden pods' drain (their in-flight requests are aborted at the sleep and
+        re-issued by the sidecar, as on an immediate release) and the p95 e2e part of
+        (d). A waiting CRITICAL model pays for every second of settle time; the freed
+        GPU reaches it through the event-driven view refresh (F2).
         None = keep probing (the deadline decides as before)."""
         cfg = self._config
         if not bool(getattr(cfg, "early_commit", False)) or poll is None:
@@ -1391,7 +1409,8 @@ class SafeScaleStateMachine:
         inputs = (probe.window_terms or {}).get("inputs") or {}
         p95_e2e = _optional_float(inputs.get("p95_e2e_ms")) if isinstance(inputs, dict) else None
         grids = max(1, int(getattr(cfg, "early_commit_min_grids", 2) or 1))
-        min_elapsed = float(p95_e2e or 0.0)
+        urgent = sorted({str(name) for name in critical_receivers or ()} - {probe.model})
+        min_elapsed = 0.0 if urgent else float(p95_e2e or 0.0)
         if elapsed < min_elapsed:
             return None
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
@@ -1405,7 +1424,11 @@ class SafeScaleStateMachine:
             return None
         drained = _hidden_drained(probe, poll)
         if drained is None:
-            return None
+            if not urgent:
+                return None
+            drained = {"hidden_drained": False}
+        if urgent:
+            drained = {**drained, "critical_receivers": urgent}
         return self._judge(
             probe, health, now_ms=now_ms, wall_now_ms=wall_now_ms,
             early={

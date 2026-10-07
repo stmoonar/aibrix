@@ -264,8 +264,11 @@ def test_a_stale_serving_pod_makes_no_donor(stale):
                               cluster_view=view)
     assert result.classifications["m"].state == ModelState.HIGH
     assert result.classifications["r"].state == ModelState.CRITICAL
+    # F1-B (2026-10-07): the HIGH donor is taken through a SafeScale probe; without a
+    # SafeScale controller here the planned probe is dropped with an event.
     released = any(isinstance(a, ScaleAction) and a.model == "m" and a.delta < 0
-                   for a in expand_relays(result.actions))
+                   for a in expand_relays(result.actions)) or any(
+        e.startswith("safescale_probe_skipped:m:") for e in result.events)
     assert released is not stale
     if stale:
         assert result.model_contexts["m"]["signal_hold_reason"] == "scrape_stale"

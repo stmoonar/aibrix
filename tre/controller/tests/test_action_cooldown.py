@@ -236,15 +236,18 @@ def test_donor_cooldown_skips_that_donor_without_blocking_the_pair_elsewhere() -
         _cls("d2", ModelState.HIGH, ModelRole.DONOR, 1.9, "surplus"),
     ]
 
-    baseline = _deltas(_plan(classifications, {}))
-    assert baseline["r"] == 1 and baseline.get("d1", 0) + baseline.get("d2", 0) == -1
-    first = "d1" if baseline.get("d1") else "d2"
+    # F1-B (2026-10-07): a HIGH donor gives through a SafeScale probe; the receiver's
+    # replica is the probe's promised follow-up upscale.
+    plan0 = _plan(classifications, {})
+    baseline = _deltas(plan0)
+    [first] = baseline
+    assert baseline[first] == -1 and plan0.probe_upscale_plans == {first: {"r": 1}}
     other = "d2" if first == "d1" else "d1"
 
     # The chosen donor is in an *up* cooldown (a scale-down right after a scale-up is
     # held); the receiver's own state is unaffected and the other donor is used.
     plan = _plan(classifications, {first: "up"})
-    assert _deltas(plan) == {"r": 1, other: -1}
+    assert _deltas(plan) == {other: -1} and plan.probe_upscale_plans == {other: {"r": 1}}
     assert f"cooldown_hold:{first}" in plan.events
 
     # The receiver's scale-down cooldown (CRITICAL safety) never blocks the donor side.

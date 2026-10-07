@@ -488,11 +488,9 @@ class ScalingRegistryConfig:
     #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
     #: floor(ratio * n), n + pods). 0 = the ratio alone.
     rescue_max_step_pods: int = 0
-    #: An immediate HIGH donor of a CRITICAL receiver gives its surplus in one tick
-    #: (down to its tau_high level). Off: one step per tick, as before C1 (scale-down
-    #: stays cautious). IDLE donors always give their whole surplus (down to the floor)
-    #: whatever this says - a code rule since 2026-10-06 (Q3).
-    donor_surplus_release: bool = False
+    # ``donor_surplus_release`` was retired on 2026-10-07 (F1-B, design
+    # donor-evidence-20261007): no HIGH donor is released without a SafeScale probe any
+    # more. An old registry carrying the key still loads (unknown keys are only warned about).
     #: A rescue target counts as reflected once the model's decision window starts
     #: ``k * trs.ema_tau_ms`` after the scale-up completed (the EMA'd Z lags the raw
     #: window by about its time constant). 0 = the window start alone (F4 rule).
@@ -550,7 +548,7 @@ class ScalingRegistryConfig:
 
 SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "rescue_max_step_pods",
-    "donor_surplus_release", "rescue_settle_ema_k",
+    "rescue_settle_ema_k",
     "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
     "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
     "breakpoint_hold_max_windows",
@@ -639,7 +637,6 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
     return ScalingRegistryConfig(
         rescue_max_step_ratio=ratio,
         rescue_max_step_pods=int(float(pods)),
-        donor_surplus_release=_scaling_bool(raw, "donor_surplus_release", defaults.donor_surplus_release),
         rescue_settle_ema_k=settle_k,
         breakpoint_window=_scaling_bool(raw, "breakpoint_window", defaults.breakpoint_window),
         onset_warmup_guard=_scaling_bool(raw, "onset_warmup_guard", defaults.onset_warmup_guard),
