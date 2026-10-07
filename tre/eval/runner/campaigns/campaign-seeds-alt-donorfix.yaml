@@ -1,0 +1,74 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
+# Extra seeds after the donor-evidence fix (docs/design donor evidence fixes: F1-B HIGH donors only via SafeScale,
+# F2 event-driven view refresh, probe slot reservation, F4 CRITICAL early-commit trigger). Alternating seed2 and
+# seed3, TRE (new controller) and TokenScale only. Every other setting (trace set, report capacity, validity,
+# precheck, env) is the same as campaign-final-vslo.yaml. These TRE rows are the "post-fix version" and are
+# reported separately from the frozen-code (ac006c02) rows of the final campaign.
+# Arm order: williams over two arms = the two seeds alternate which arm runs first (seed2: tre first,
+# seed3: tokenscale first).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-seeds-alt-donorfix.yaml --dry-run
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-seeds-alt-donorfix.yaml > /data/nfs_shared_data/xxy/e1-seeds-alt-donorfix-20261008.out 2>&1 &
+name: e1-seeds-alt-donorfix-20261008
+round: e1-final-vslo-20261008       # same exclusive-window marker round as the final campaign (one window covers both)
+results_root: /data/nfs_shared_data/xxy/e1-seeds-alt-donorfix-20261008
+trace_root: /data/nfs_shared_data/xxy/traces-v2-vslo-20261007    # <trace>/seed<k>/{traces_tre.effective.json,manifest.json}
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v2
+seed: 1
+arms: [tre, tokenscale]
+order: williams                     # williams | cyclic | fixed
+max_attempts: 2                     # a failed / invalid arm gets one retry after a full reset
+gap_s: 0                            # the post-arm reset + reports already separate the arms
+eta: {overhead_s: 300, report_s: 150}   # per arm: trace + overhead (idle 60 s, post 30 s, resets, collect); refined from observed arms
+
+env:                                # exported before runner.env; wins over runner.env and the caller
+  # checkout of the release that runs on the cluster (deploy scripts, baselines arm tool, frozen
+  # baseline parameters). Update together with the images.
+  RELEASE_TRE: ${TRE_REPO}   # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"                  # live policy ConfigMap != frozen file -> apply the frozen file
+  LOADGEN_TRE_DIR: ${TRE_REPO}      # client: x-tre-request-id (G4) + per-request max_tokens
+  GW_PARITY: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
+  trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
+  match_parts: 3                    # oracle copy ends in <trace>/seed<k>/<file>, like the replayed trace
+
+report:
+  enabled: true
+  per_arm: true                     # report.py <arm> after every arm, then the cross-arm report of its trace
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${TRE_REPO}/eval/configs/t7-decision-points.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30           # tre:gpu_truth:<node> timestamp (clock-offset corrected)
+  breakpoint_lookback_s: 60         # no breakpoint_window_suspended in the controller log
+  wait_s: 300                       # how long transient checks (gpu-truth, O1 window) may take
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50                         # results file system
+    nodes: {nscc-ds-4a100-node9: 8} # root file system (07-13 / 10-06 disk-pressure evictions)
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Alternating
+    seed: 2
+  - trace: Alternating
+    seed: 3
