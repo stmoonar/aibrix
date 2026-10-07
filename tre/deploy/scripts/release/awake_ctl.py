@@ -107,7 +107,11 @@ def restore(want, dry):
     """Four passes, so a wanted binding whose GPUs hold an unwanted awake one still
     comes up and no model drops to zero awake replicas: (1) wake wanted bindings on free
     GPUs; (2) sleep unwanted awake bindings whose model has another awake replica;
-    (3) wake the remaining wanted; (4) sleep the remaining unwanted."""
+    (3) wake the remaining wanted: an occupant of its GPUs is slept first, and an occupant
+    that is its model's last awake replica is first moved to a free slot (a sleeping binding
+    of that model on GPUs that are free and in no wanted binding), so a swap (A on B's
+    slot, B on A's) resolves; no such slot = exit 3 before that step; (4) sleep the
+    remaining unwanted. Never two awake on one GPU, never a model at zero awake."""
     bs = state()
     unknown = sorted(want - {b["binding_id"] for b in bs})
     if unknown:
@@ -134,9 +138,29 @@ def restore(want, dry):
             others = [c for c in state() if c["model"] == b["model"] and c["awake"] and c["binding_id"] != b["binding_id"]]
             if others:
                 power(b["serve_id"], False, dry)
-    for b in state():  # 3
-        if b["binding_id"] in want and not b["awake"]:
-            power(b["serve_id"], True, dry)
+    def gpus(b):
+        return {(b["node"], g) for g in b["gpu_ids"]}
+
+    targets = set().union(*(gpus(b) for b in bs if b["binding_id"] in want))
+    for w in [b for b in state() if b["binding_id"] in want and not b["awake"]]:  # 3
+        cur = state()
+        for o in [c for c in cur if c["awake"] and gpus(c) & gpus(w)]:
+            if o["binding_id"] in want:
+                print(f"wanted bindings overlap: {o['binding_id']} and {w['binding_id']}", file=sys.stderr)
+                raise SystemExit(3)
+            cur = state()
+            if not any(c["model"] == o["model"] and c["awake"] and c["binding_id"] != o["binding_id"] for c in cur):
+                free = [c for c in cur if c["model"] == o["model"] and not c["awake"]
+                        and not gpus(c) & (busy(cur) | targets)]
+                if not free:
+                    print(f"cannot wake {w['binding_id']}: its GPUs hold {o['binding_id']}, the last awake "
+                          f"{o['model']}, and no free non-target slot of {o['model']} exists", file=sys.stderr)
+                    raise SystemExit(3)
+                free.sort(key=lambda c: (c["node"], c["gpu_ids"]))
+                print(f"relocate: wake {free[0]['binding_id']} (free slot) before sleeping {o['binding_id']}")
+                power(free[0]["serve_id"], True, dry)
+            power(o["serve_id"], False, dry)
+        power(w["serve_id"], True, dry)
     for b in state():  # 4
         if b["awake"] and b["binding_id"] not in want:
             power(b["serve_id"], False, dry)
