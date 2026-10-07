@@ -349,3 +349,24 @@ def test_open_loop_dry_run_writes_mu_and_knee_velocities(tmp_path, capsys):
     doc = yaml.safe_load((tmp_path / "p" / "profile.yaml").read_text(encoding="utf-8"))
     assert doc["mu"]["a"] is None and doc["knee"]["a"]["v_p"]["rate_rps"] == 15.0
     assert tp.main(["--models", "a", "--out-dir", str(out), "--dry-run", "--open-loop"], slo_for=lambda m: SLO) == 2
+
+
+def test_trace_lengths_draw_the_generators_distribution_per_request(tmp_path, monkeypatch):
+    """--trace-lengths: each open-loop request carries its own (in, out) from tracegen's
+    length models (same mean, the route-timeout output cap), not the fixed shape."""
+    from pathlib import Path as _P
+    import random
+
+    from tre_replayer.engine.schedule import RpsSegment, build_poisson_schedule
+    import tre_replayer.tracegen as tg
+
+    spec = _P(tg.__file__).resolve().parent / "specs" / "Steady.json"
+    lin, lout, info = tp.trace_length_samplers(str(spec), "dsqwen-7b")
+    assert info["mean_in"] == pytest.approx(492, abs=1) and info["mean_out"] == pytest.approx(400, abs=1)
+    seg = RpsSegment(model="dsqwen-7b", start_s=0.0, end_s=4000.0, rps=5.0, input_tokens=492,
+                     max_output_tokens=400, input_tokens_range=lin, max_output_tokens_range=lout)
+    ev = build_poisson_schedule([seg], seed=7)
+    ins, outs = [e.prompt_tokens for e in ev], [e.max_output_tokens for e in ev]
+    assert len(set(outs)) > 100 and max(outs) <= info["out_max"] and min(ins) >= 32
+    assert sum(ins) / len(ins) == pytest.approx(492, rel=0.05)
+    assert sum(outs) / len(outs) == pytest.approx(400, rel=0.05)

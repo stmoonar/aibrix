@@ -69,6 +69,13 @@ the knee of the mixed ladder; V_P = prefill tok/s at the knee of an out=1 ladder
 (``--prefill-base-rps`` x ``--prefill-rate-factors``). ``--model-rate-factors`` overrides the
 mixed factors per model (``model=`` = none). The closed-loop maxima are a sensitivity row.
 
+Trace lengths (``--trace-lengths <tracegen spec>``, decision 2026-10-07 "V_slo"): instead of
+the fixed ``--in-tokens`` / ``--out-tokens`` shape, every open-loop request draws its own input
+and output length from the spec's default length distribution exactly as
+:mod:`tre_replayer.tracegen` draws them (its ``ModelPlan`` length models: truncated lognormal
+with the fitted sigma, the route-timeout output cap of ``--capacity``). ``--in-tokens`` /
+``--out-tokens`` then only name the cell and give the TTFT SLO's length (use the means).
+
 Cost: (len(ladder) x 2) x step_s per model, models in parallel (default ~20 min).
 Sending needs ``--i-have-user-approval``; ``--dry-run`` uses a synthetic stub.
 """
@@ -366,6 +373,42 @@ def knee(steps: Sequence[StepMeasure], rate: str = "tok_s", slope_frac: float = 
 OpenMeasure = Callable[[str, int, int, float, float, float], StepMeasure]
 
 
+class TraceLengthSampler:
+    """One side (in / out) of a tracegen length model, shaped like
+    ``schedule.TokenRange`` (``sample(rng)``, ``mean``) so an ``RpsSegment`` can carry it:
+    every request of the segment draws its own length from the trace's distribution."""
+
+    def __init__(self, model: Any):
+        self.model = model
+
+    def sample(self, rng: Any) -> int:
+        return int(self.model.draw(0.0, rng))
+
+    @property
+    def mean(self) -> float:
+        return float(self.model.mean(0.0))
+
+
+def trace_length_samplers(spec_path: str, model: str, capacity_path: Optional[str] = None,
+                          fits_path: Optional[str] = None) -> tuple[TraceLengthSampler, TraceLengthSampler, dict]:
+    """(in, out, info) samplers for ``model`` from a tracegen spec's DEFAULT lengths
+    (per-model overrides are not applied), built by tracegen's own ``ModelPlan`` so the
+    route-timeout output cap of the capacity file is the one the traces use."""
+    from tre_replayer.tracegen.capacity import load_capacity, load_fits
+    from tre_replayer.tracegen.generate import ModelPlan
+
+    raw = Path(spec_path).read_bytes()
+    spec = json.loads(raw)
+    cap = load_capacity(capacity_path)
+    plan = ModelPlan(model, {"rate": {"unit": "rps", "fn": 0.0}}, spec, 0, cap, load_fits(fits_path))
+    lin, lout = TraceLengthSampler(plan.lengths["in"]), TraceLengthSampler(plan.lengths["out"])
+    import hashlib
+    info = {"spec": str(spec_path), "spec_sha256": hashlib.sha256(raw).hexdigest(),
+            "lengths": spec.get("defaults", {}).get("lengths"), "capacity": cap.name,
+            "out_max": cap.models[model].out_max, "mean_in": round(lin.mean, 2), "mean_out": round(lout.mean, 2)}
+    return lin, lout, info
+
+
 def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequence[str]], *,
                           api: str = "chat", prompt_mode: str = "natural", routing_strategy: Optional[str] = None,
                           run_key: str = "bl-profile-ol", seed: int = 1234, stream_call: Optional[Callable] = None,
@@ -374,7 +417,8 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
                           fleet_view: Optional[Callable[[str], Any]] = None,
                           expected: Optional[dict[str, Any]] = None, sample_s: float = 1.0,
                           drain_poll_s: float = 0.5, drain_cap_s: float = DEFAULT_DRAIN_CAP_S,
-                          sleep: Callable[[float], None] = time.sleep) -> OpenMeasure:
+                          sleep: Callable[[float], None] = time.sleep,
+                          lengths: Optional[dict[str, tuple[Any, Any]]] = None) -> OpenMeasure:
     """One step = Poisson arrivals at ``rate_rps`` for ``step_s`` through the calibration's
     open-loop sender (``openloop.drive_cell_schedule``: one ``RpsSegment``, prompts
     materialised before the step, chat, ``ignore_eos``, temperature 0). The replica's
@@ -422,8 +466,11 @@ def make_openloop_measure(gateway_url: str, metrics_urls: Callable[[str], Sequen
                     "generation_tokens_total": counter_sum(text, GEN_COUNTER),
                     "preemptions_total": counter_sum(text, PREEMPT_COUNTER)}
 
+        sampled = (lengths or {}).get(model)
         seg = RpsSegment(model=model, start_s=0.0, end_s=float(step_s), rps=float(rate_rps),
-                         input_tokens=int(in_tokens), max_output_tokens=int(out_tokens))
+                         input_tokens=int(in_tokens), max_output_tokens=int(out_tokens),
+                         input_tokens_range=sampled[0] if sampled else None,
+                         max_output_tokens_range=sampled[1] if sampled and out_tokens > 1 else None)
         view_a = view(model)
         with tempfile.TemporaryDirectory(prefix="bl-profile-ol-") as tmp:
             base = Path(raw_dir) if raw_dir is not None else Path(tmp)
@@ -864,6 +911,10 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     ap.add_argument("--min-completed", type=int, default=DEFAULT_OPEN_MIN_COMPLETED,
                     help="open loop: completed steady-state requests a step needs to count for mu")
     ap.add_argument("--schedule-seed", type=int, default=1234, help="open loop: Poisson arrival seed")
+    ap.add_argument("--trace-lengths", default=None,
+                    help="open loop: tracegen spec JSON; every request draws its in/out lengths from the spec's "
+                         "default length distribution (tracegen's own sampler and output cap)")
+    ap.add_argument("--capacity", default=None, help="tracegen capacity file for --trace-lengths (default: tracegen's)")
     args = ap.parse_args(argv)
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     if args.step_s is None:
@@ -888,6 +939,15 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     if args.warmup_s >= args.step_s:
         print("error: --warmup-s must be < --step-s", file=sys.stderr)
         return 2
+    lengths, lengths_info = None, None
+    if args.trace_lengths:
+        if not args.open_loop:
+            print("error: --trace-lengths needs --open-loop", file=sys.stderr)
+            return 2
+        lengths, lengths_info = {}, {}
+        for m in models:
+            lin, lout, info = trace_length_samplers(args.trace_lengths, m, args.capacity)
+            lengths[m], lengths_info[m] = (lin, lout), info
     real = measure is None and not args.dry_run
     if real and not args.i_have_user_approval:
         print("refusing to send requests without --i-have-user-approval (use --dry-run)", file=sys.stderr)
@@ -957,7 +1017,8 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
                 measure = make_openloop_measure(args.gateway_url, lambda m: urls[m],
                                                 routing_strategy=args.routing_strategy, seed=args.schedule_seed,
                                                 raw_dir=Path(args.raw_dir) if args.raw_dir else None,
-                                                fleet_view=fleet_view, expected=expected, drain_cap_s=args.drain_cap_s)
+                                                fleet_view=fleet_view, expected=expected, drain_cap_s=args.drain_cap_s,
+                                                lengths=lengths)
             else:
                 measure = make_http_measure(args.gateway_url, lambda m: urls[m], routing_strategy=args.routing_strategy,
                                             raw_dir=Path(args.raw_dir) if args.raw_dir else None,
@@ -979,7 +1040,11 @@ def main(argv: Optional[list[str]] = None, *, measure: Optional[Measure] = None,
     results = {m: p for m, (st, p) in outcomes.items() if st == "ok"}
     doc = {
         "shape": {"in_tokens": args.in_tokens, "out_tokens": args.out_tokens,
-                  "note": "TokenScale buckets degenerate to one cell (all nine = V_b); disclose"},
+                  "note": "TokenScale buckets degenerate to one cell (all nine = V_b); disclose"}
+        if lengths_info is None else
+        {"in_tokens": args.in_tokens, "out_tokens": args.out_tokens,
+         "note": "per-request lengths drawn from the trace spec (trace_lengths); in/out above = cell name and "
+                 "the TTFT SLO's length", "trace_lengths": lengths_info},
         "registry": registry_source,
         "mode": "open_loop" if args.open_loop else "closed_loop",
         "step_s": args.step_s, "warmup_s": args.warmup_s,
