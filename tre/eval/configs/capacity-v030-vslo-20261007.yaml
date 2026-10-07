@@ -1,0 +1,8 @@
+# Per-replica request rate at offered load rho = 1 (req/s) for the 492-in / 400-out shape on the
+# vLLM 0.30 engine after the 2026-10-07 V_slo re-calibration (docs/trace-design-v2.md, "10-07 13:00
+# 标定错误"): rho = 1 at V_slo = 0.90 x V_b for every model (tracegen capacity_20261007_vslo.json,
+# req/s = rho * 0.90 * V_b / 892). Used only to draw rho next to the awake / routable replica counts.
+capacity_rps_per_replica:
+  dsqwen-7b: 9.4
+  dsllama-8b: 7.0
+  dsqwen-14b: 6.7

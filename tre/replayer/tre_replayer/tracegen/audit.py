@@ -1,7 +1,8 @@
 """Offline audit of a generated plan against the design rules (docs/trace-design-v2.md).
 
-Load model (as in trace-audit-20261007): a request costs ``in/v_p + out/v_d`` replica-seconds
-at the knee; ``rho_m`` = cost per 10 s bin / 10; ``G = sum rho_m * gpus_m``; replicas needed
+Load model (as in trace-audit-20261007): a request costs ``capacity.ModelCap.cost`` replica-seconds
+at rho = 1 (the knee, or V_slo with a calibrated capacity file); ``rho_m`` = cost per 10 s bin / 10;
+``G = sum rho_m * gpus_m``; replicas needed
 at the SLO margin = ``max(floor, ceil(rho / u))``, ``u`` = 0.85, capped at ``max_awake``.
 
 * **R1** contention, judged on the *design* load of a synthetic plan (rho(t) on a 1 s grid:

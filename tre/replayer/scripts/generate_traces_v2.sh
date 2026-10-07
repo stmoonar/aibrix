@@ -4,6 +4,7 @@
 # (Real-*: the v1 traces_v9 per-model files, named by sha256 in the specs; no spec args = all specs)
 # Writes <out root>/<trace>/seed<k>/{design.json,manifest.json,traces_tre.effective.json},
 # <out root>/by-name/<trace>_s<k> links (runner ICSE root), audit.{md,json}.
+# CAPACITY=<capacity json> overrides tracegen's default capacity file (e.g. the 2026-10-06 knee file).
 set -euo pipefail
 TRE="$1"; AZ="$2"; OUT="$3"; V1="$4"; shift 4
 cd "$TRE/replayer"
@@ -12,7 +13,7 @@ test -z "$(git status --porcelain -- . ../loadgen_v1/configs/traces_v2)" || { ec
 G="nice -n 19 python3 -m tre_replayer.tracegen"
 CSV="--azure-csv conv2024=$AZ/AzureLLMInferenceTrace_conv_1week.csv --azure-csv code2024=$AZ/AzureLLMInferenceTrace_code_1week.csv --source v1_traces_v9=$V1"
 SPECS=("$@"); [ ${#SPECS[@]} -gt 0 ] || SPECS=(tre_replayer/tracegen/specs/*.json)
-for spec in "${SPECS[@]}"; do $G generate --spec "$spec" --out-root "$OUT" $CSV; done
+for spec in "${SPECS[@]}"; do $G generate --spec "$spec" --out-root "$OUT" $CSV ${CAPACITY:+--capacity "$CAPACITY"}; done
 RUNS=(); for spec in "${SPECS[@]}"; do t=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['trace'])" "$spec"); RUNS+=("$OUT/$t"/seed*); done
 $G link-names "$OUT"
 $G materialize "${RUNS[@]}" --processes 4

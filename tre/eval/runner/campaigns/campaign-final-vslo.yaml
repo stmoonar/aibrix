@@ -1,0 +1,103 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
+# TRE v2 final comparison (docs/trace-design-v2.md round 2; data per docs/eval-metrics-spec-20261007.md).
+# V_slo re-calibration (docs/trace-design-v2.md, "10-07 13:00 标定错误", frozen rule): same arms, order and
+# traces as campaign-final.yaml; only the trace set changes (traces-v2-vslo-20261007: req/s x V_slo/V_b per
+# model, rho shapes unchanged) and the report capacity (rho = 1 at V_slo). PreServe windows depend on the
+# trace periods only and are unchanged.
+# One seed (seed1) per trace. Every trace runs all five arms back to back before the next trace; the arm
+# order inside a trace is a Williams Latin-square row (rotated per trace, recorded per arm). PreServe's
+# three non-oracle variants run last, on Alternating, into the same trace directory (one cross-arm report).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-final-vslo.yaml --dry-run
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-final-vslo.yaml > /data/nfs_shared_data/xxy/e1-final-vslo-20261008.out 2>&1 &
+#
+# Before the real run (AGENTS.md "部署与合并流程" rule 6): the images on the cluster, this runner and
+# the client must be at shas that are in main and pushed; the dry-run warns when they are not.
+name: e1-final-vslo-20261008
+round: e1-final-vslo-20261008       # exclusive-window marker: "validation <start> <end> round=e1-final-vslo-20261008 ..."
+results_root: /data/nfs_shared_data/xxy/e1-final-vslo-20261008
+trace_root: /data/nfs_shared_data/xxy/traces-v2-vslo-20261007    # <trace>/seed<k>/{traces_tre.effective.json,manifest.json}
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v2
+seed: 1
+arms: [tre, apa, chiron, tokenscale, preserve]
+order: williams                     # williams | cyclic | fixed
+max_attempts: 2                     # a failed / invalid arm gets one retry after a full reset
+gap_s: 0                            # the post-arm reset + reports already separate the arms
+eta: {overhead_s: 300, report_s: 150}   # per arm: trace + overhead (idle 60 s, post 30 s, resets, collect); refined from observed arms
+
+env:                                # exported before runner.env; wins over runner.env and the caller
+  # checkout of the release that runs on the cluster (deploy scripts, baselines arm tool, frozen
+  # baseline parameters). Update together with the images.
+  RELEASE_TRE: ${TRE_REPO}   # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"                  # live policy ConfigMap != frozen file -> apply the frozen file
+  LOADGEN_TRE_DIR: ${TRE_REPO}      # client: x-tre-request-id (G4) + per-request max_tokens
+  GW_PARITY: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+
+arm_defs:                           # PreServe non-oracle rows (trace-design-v2 "正当性边界" (5))
+  preserve-noisy30:
+    base: preserve
+    label: PreServe-noisy-0.30
+    policy: {tier1: oracle_noisy, noise_sigma: 0.30}
+  preserve-phase:
+    base: preserve
+    label: PreServe-phase-shift
+    policy: {tier1: oracle}
+    # oracle trace shifted by delta ~ U(-T/4, T/4), T = same-model hot period of Alternating
+    # (8b -> 7b -> 14b, 180 s each = 540 s); delta is drawn from (campaign, trace, seed, shift seed), recorded
+    oracle_shift: {period_s: 540, frac: 0.25, seed: 1}
+  preserve-naive:
+    base: preserve
+    label: PreServe-last-window
+    policy: {tier1: last_window}
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
+  trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
+  match_parts: 3                    # oracle copy ends in <trace>/seed<k>/<file>, like the replayed trace
+
+report:
+  enabled: true
+  per_arm: true                     # report.py <arm> after every arm, then the cross-arm report of its trace
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${TRE_REPO}/eval/configs/t7-decision-points.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30           # tre:gpu_truth:<node> timestamp (clock-offset corrected)
+  breakpoint_lookback_s: 60         # no breakpoint_window_suspended in the controller log
+  wait_s: 300                       # how long transient checks (gpu-truth, O1 window) may take
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50                         # results file system
+    nodes: {nscc-ds-4a100-node9: 8} # root file system (07-13 / 10-06 disk-pressure evictions)
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: T7_tight_pool
+  - trace: Alternating              # 180 s segments (the 72 s row is Alternating_72s, not in this campaign)
+  - trace: Simul_spike
+  - trace: Sinusoidal
+  - trace: Decode_burst
+  - trace: Prefill_mix
+  - trace: Real_code
+  - trace: Real_conv
+  - trace: Steady
+  - trace: Alternating
+    arms: [preserve-noisy30, preserve-phase, preserve-naive]
+    note: PreServe variants (noisy sigma 0.30, phase-shifted, naive last window)

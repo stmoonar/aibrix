@@ -207,9 +207,9 @@ def test_every_spec_can_be_replayed_by_name(tmp_path):
 
 
 def test_real_slices_scale_v1_seconds_by_one_factor_and_cap_outputs(tmp_path):
-    """v1 method: each second keeps its base requests and gets round(n * k * v1_factor) in all;
-    added ones are jittered copies of that second's requests; outputs above out_max are capped;
-    a source file with another sha256 is refused."""
+    """v1 method: each second keeps its base requests and gets round(n * k * v1_factor *
+    rho_factor) in all; added ones are jittered copies of that second's requests; outputs above
+    out_max are capped; a source file with another sha256 is refused."""
     from collections import Counter
     from tre_replayer.tracegen import azure
     from tre_replayer.tracegen.capacity import load_capacity
@@ -230,6 +230,7 @@ def test_real_slices_scale_v1_seconds_by_one_factor_and_cap_outputs(tmp_path):
     generate.generate(_write(tmp_path, spec), 1, tmp_path / "run", azure_csv={"v1": str(tmp_path / "v9")})
     rows = json.loads((tmp_path / "run/design.json").read_text())
     for m, f in (("dsqwen-7b", 6.0), ("dsqwen-14b", 3.0)):
+        f *= cap.models[m].rho_factor                    # calibrated capacity: x V_slo / V_b
         got = Counter(int(r["timestamp"]) for r in rows if r["model_name"] == m)
         assert all(got[s] == round((1 + s % 3) * f) for s in range(60))
         ins = [r["prompt_length"] for r in rows if r["model_name"] == m and int(r["timestamp"]) == 2]
@@ -238,3 +239,24 @@ def test_real_slices_scale_v1_seconds_by_one_factor_and_cap_outputs(tmp_path):
     files["S/dsqwen-7b.json"] = "0" * 64
     with pytest.raises(ValueError, match="sha256"):
         generate.generate(_write(tmp_path, spec), 1, tmp_path / "run2", azure_csv={"v1": str(tmp_path / "v9")})
+
+
+def test_vslo_calibration_scales_req_per_s_and_keeps_rho(tmp_path):
+    """calibration.factor f (rho = 1 at V_slo = f x V_b): the same rho spec gives f x the
+    knee-calibrated req/s, the audit still sees the design rho, and the manifest says so."""
+    from tre_replayer.tracegen.capacity import DATA_DIR
+    base = json.loads((DATA_DIR / "capacity_20261006.json").read_text())
+    assert "calibration" not in base
+    f = 0.5
+    cal = dict(base, name="unit_vslo", calibration={"factor": {m: f for m in base["models"]}, "source": "unit"})
+    (tmp_path / "cal.json").write_text(json.dumps(cal))
+    spec = _spec(**{"dsqwen-7b": {"rate": {"unit": "rho", "fn": 1.5}}})
+    spec["duration_s"] = 2000
+    p = _write(tmp_path, spec)
+    n = {}
+    for tag, capfile in (("knee", DATA_DIR / "capacity_20261006.json"), ("vslo", tmp_path / "cal.json")):
+        man = generate.generate(p, 1, tmp_path / tag, capacity_path=capfile)
+        n[tag] = man["design"]["requests"]
+        assert audit.audit_run(tmp_path / tag)["models"]["dsqwen-7b"]["mean_rho"] == pytest.approx(1.5, rel=0.05)
+    assert n["vslo"] / n["knee"] == pytest.approx(f, rel=0.05)
+    assert man["calibration"]["rho_factor"]["dsqwen-7b"] == f and man["calibration"]["source"] == "unit"

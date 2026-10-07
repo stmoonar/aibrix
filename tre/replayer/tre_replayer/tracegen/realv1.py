@@ -20,7 +20,10 @@ This module starts from the v9 files (step 3 output; v1's own requests, lengths 
 applies step 4 with ``factor_m = k * v1_factor_m``. ``k = 1`` is v1. ``k`` is the one
 documented deviation: v1 chose its factors after seeing results; here ``k`` is solved so that
 the expected mean GPU demand over the trace's slices is ``target_mean_g`` (:func:`solve_k`).
-Outputs are capped at the model's route-timeout ``out_max``.
+Outputs are capped at the model's route-timeout ``out_max``. With a calibrated capacity file
+(``calibration.factor``, rho = 1 at V_slo) the count factor is also multiplied by the model's
+``rho_factor`` (:func:`factors`): the v1 x k load scaled to the SLO capacity like every other
+trace, so the solved k and the G it gives (rho units) are unchanged.
 """
 from __future__ import annotations
 
@@ -46,15 +49,17 @@ def _load(real: dict, slice_name: str, model: str, sources: dict) -> list:
     return json.loads(path.read_text())
 
 
-def factors(real: dict, k: float) -> dict:
-    return {m: k * float(f) for m, f in real["v1_factor"].items()}
+def factors(real: dict, k: float, cap=None) -> dict:
+    """factor_m = k * v1_factor_m * rho_factor_m (rho_factor 1 without a calibrated ``cap``)."""
+    return {m: k * float(f) * (cap.models[m].rho_factor if cap is not None else 1.0)
+            for m, f in real["v1_factor"].items()}
 
 
 def expected_mean_g(real: dict, slice_name: str, k: float, cap, sources: dict, duration_s: float) -> float:
     """Mean GPU demand of one slice at factor k (each second: round(n f) requests at the mean
     cost of its base requests; the jitter has mean 1)."""
     total = 0.0
-    for m, f in factors(real, k).items():
+    for m, f in factors(real, k, cap).items():
         mc = cap.models[m]
         for b in _load(real, slice_name, m, sources):
             reqs = b["requests"]
@@ -93,7 +98,7 @@ def rows(spec: dict, seed: int, cap, sources: dict, rng_for) -> tuple[list, dict
     lo_j, hi_j = (float(x) for x in real.get("dup_jitter", (0.85, 1.15)))
     out = []
     capped = {}
-    for m, f in factors(real, k).items():
+    for m, f in factors(real, k, cap).items():
         mc = cap.models[m]
         rng = rng_for(seed, spec["trace"], m, "v1-scale")
         n_cap = 0
@@ -118,6 +123,7 @@ def rows(spec: dict, seed: int, cap, sources: dict, rng_for) -> tuple[list, dict
                     n_cap += 1
                 out.append((t0 + rng.random() * (t1 - t0) * (1 - 1e-9), m, max(1, i), o))
         capped[m] = n_cap
-    info = {"method": "v1", "slice": slice_name, "k": k, "factors": factors(real, k),
-            "v1_factor": real["v1_factor"], "route_cap_clamped": capped}
+    info = {"method": "v1", "slice": slice_name, "k": k, "factors": factors(real, k, cap),
+            "v1_factor": real["v1_factor"], "rho_factor": {m: cap.models[m].rho_factor for m in real["v1_factor"]},
+            "route_cap_clamped": capped}
     return out, info
