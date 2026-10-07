@@ -84,7 +84,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     sm = _load_yaml(overlay / "service-manager.yaml")
     ui = _load_yaml(overlay / "ui.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20261007-ac006c02"
+    assert _image(controller) == "tre-v2-controller:20261007-f7091cf3"
     assert _image(sm) == "tre-v2-service-manager:20261006-aaeef851"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     # Review P1-2: single writer across rollouts, and a grace period derived from
