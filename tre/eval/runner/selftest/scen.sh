@@ -67,3 +67,11 @@ echo "== 2026-10-08: reset_canonical.sh puts a switch left true back to false"; 
 run env CONTROLLER_DEPLOY=tre-v2-controller bash $H/tools/reset_canonical.sh --check >/dev/null 2>&1; echo "check rc=$? (want 1)"
 run env CONTROLLER_DEPLOY=tre-v2-controller bash $H/tools/reset_canonical.sh 2>&1 | grep -E "switch|canonical" | cut -c1-140
 [ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] && echo "PASS: switch false after reset" || echo "FAIL: switch $(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)"
+echo "== 2026-10-08: real log format (event JSON escaped in message) parsed; mismatch -> exit 4, switch back to false"; reset
+run nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+python3 -c "import json;a=json.load(open('$H/pilot/Alt/tre/ablation_switches.json'));print('PASS' if a['match'] and a['logged'] else 'FAIL', a['logged'], a['raw'][:60])"
+reset; echo -n false > $H/state/switch_line_safescale
+run env ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SAFESCALE=true" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo "rc=$? (want 4)"
+grep -E "ERROR ablation" $H/pilot/Alt/tre/runner.log | cut -c1-120
+python3 -c "import json;a=json.load(open('$H/pilot/Alt/tre/ablation_switches.json'));print('PASS' if (not a['match'] and a['logged']) else 'FAIL', 'mismatch logged', a['logged'])"
+[ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] && echo "PASS: switch back to false" || echo "FAIL: switch left $(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)"

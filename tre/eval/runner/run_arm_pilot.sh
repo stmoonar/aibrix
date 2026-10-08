@@ -264,20 +264,34 @@ probe_gate() {
   [ "$n" = 0 ] || { log "ERROR $n unresolved SafeScale probe record(s) in Redis after ${PROBE_WAIT_S} s; refusing to start"; exit 4; }
   log "probe gate: no unresolved SafeScale probe in Redis ($r resolved record(s))"
 }
-# the effective switches: the controller's startup line {"event": "ablation_switches", ...}
+# the effective switches: the controller's startup line. Real format (JSON log formatter, the event
+# JSON escaped inside "message"):
+#   {"level": "INFO", "logger": "tre_controller", "message": "{\"disable_safescale\": false, ..., \"event\": \"ablation_switches\"}", "time": "..."}
+# A plain line with the event object itself is accepted too.
 record_ablation_switches() {   # prints match | mismatch | missing; writes ablation_switches.json
   local i line=""
   for i in $(seq 1 30); do
-    line=$(kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" 2>/dev/null | grep -m1 '"ablation_switches"' || true)
+    line=$(kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" 2>/dev/null | grep -m1 'ablation_switches' || true)
     [ -n "$line" ] && break; sleep 2
   done
   python3 - "$D/ablation_switches.json" "$line" "$(ctl_want TRE_ABLATION_DISABLE_SAFESCALE)" "$(ctl_want TRE_ABLATION_DISABLE_SLOW_LOOP)" "$(ctl_env_now)" <<'PY'
 import json, sys
 out, line, want_ss, want_sl, env_now = sys.argv[1:6]
+def event_of(obj):
+    if isinstance(obj, dict) and obj.get("event") == "ablation_switches":
+        return obj
+    if isinstance(obj, dict) and isinstance(obj.get("message"), str):
+        try:
+            return event_of(json.loads(obj["message"]))
+        except ValueError:
+            return None
+    return None
+
+
 rec = None
 if "{" in line:
     try:
-        rec = json.loads(line[line.index("{"):line.rindex("}") + 1])
+        rec = event_of(json.loads(line[line.index("{"):line.rindex("}") + 1]))
     except ValueError:
         rec = None
 want = {"disable_safescale": want_ss == "true", "disable_slow_loop": want_sl == "true"}
