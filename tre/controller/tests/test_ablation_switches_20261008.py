@@ -3,6 +3,9 @@
 TRE_ABLATION_DISABLE_SAFESCALE: SafeScale off = immediate release (as before 05f489f1 /
 v1). The planner loops get no SafeScale, every shrink that would run as a probe takes
 the urgent donor path, and probes an earlier run left in Redis are rolled back once.
+
+TRE_ABLATION_DISABLE_SLOW_LOOP: every decision runs in the fast (snapshot-aligned)
+loop; no fairness task, so CRITICAL and LOW receivers are both planned there.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from tre_controller.store.state_store import ControllerStateStore
 
 from test_b8_observe_probes import _probe_snapshot
 from test_controller_app import _cfg, _deps
-from test_loop_ticks import FakeQueue, _metrics_with_pods, _registry_with_models
+from test_loop_ticks import FakeQueue, _metrics, _metrics_with_pods, _registry_with_models
 from test_safescale_commit import FakeRedis
 
 
@@ -117,3 +120,34 @@ def test_startup_rolls_back_a_probe_left_in_redis():
     assert queue.submitted == [(UnhideAction("donor", ("donor-a",), "safescale_disabled", "safescale"),)]
     assert restarted.all_probes() == ()
     assert SafeScaleStateMachine(config=SafeScaleConfig(), store=store).restore() == 0
+
+
+# ------------------------------------------------------------- slow loop off
+def test_slow_loop_off_runs_one_loop_that_also_plans_fairness(monkeypatch):
+    seen = _capture_planner_tasks(monkeypatch)
+    specs = {spec.name: spec for spec in build_controller_task_specs(_deps(), _cfg(ablation_disable_slow_loop=True))}
+
+    assert "fairness" not in specs and "rescue" in specs
+    specs["rescue"].factory()
+    assert seen["rescue"]["fairness_due"] is True
+
+
+def test_single_loop_tick_scales_up_critical_and_low():
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={
+            "critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1),
+            "low": _metrics("low", generation=90.0, waiting=0.0, running=1.0, assigned=1),
+        },
+    )
+
+    result = run_rescue_tick(
+        snapshot, queue=FakeQueue(), registry=_registry_with_models("critical", "low"), fairness_due=True
+    )
+
+    assert {model: state.state.value for model, state in result.classifications.items()} == {
+        "critical": "critical", "low": "low",
+    }
+    ups = {action.model for action in result.actions if action.delta > 0}
+    assert ups == {"critical", "low"}

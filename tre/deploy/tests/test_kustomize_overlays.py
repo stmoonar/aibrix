@@ -220,7 +220,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
 
 def test_ablation_overlays_patch_only_controller_env() -> None:
     expected = {
-        "ablation-no-fastloop": ("TRE_ABLATION_DISABLE_FAST_LOOP", "true"),
+        "ablation-no-slowloop": ("TRE_ABLATION_DISABLE_SLOW_LOOP", "true"),
         "ablation-no-safescale": ("TRE_ABLATION_DISABLE_SAFESCALE", "true"),
         "ablation-bucket-upper": ("TRE_PERCENTILE_MODE", "bucket_upper"),
         "ablation-interpolated": ("TRE_PERCENTILE_MODE", "interpolated"),

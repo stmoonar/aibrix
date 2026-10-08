@@ -37,7 +37,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.sm_slow_timeout_s is None  # -> registry service_manager.api_call_timeout_s
     assert config.paper_stale_max_windows == 3
     assert config.incomplete_policy == "drop_model"
-    assert config.ablation_disable_fast_loop is False
+    assert config.ablation_disable_slow_loop is False
     assert config.ablation_disable_safescale is False
     assert config.disable_eta_gate is False
     # v1/paper alignment A2: the receiver-less HIGH proactive SafeScale shrink is live.
@@ -97,7 +97,7 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_SIGNAL_SOURCE": "latency_p95",
             "TRE_PAPER_STALE_MAX_WINDOWS": "5",
             "TRE_INCOMPLETE_POLICY": "drop_all",
-            "TRE_ABLATION_DISABLE_FAST_LOOP": "1",
+            "TRE_ABLATION_DISABLE_SLOW_LOOP": "1",
             "TRE_ABLATION_DISABLE_SAFESCALE": "yes",
             "TRE_DISABLE_ETA_GATE": "true",
         }
@@ -118,7 +118,7 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.signal_source == "latency_p95"
     assert config.paper_stale_max_windows == 5
     assert config.incomplete_policy == "drop_all"
-    assert config.ablation_disable_fast_loop is True
+    assert config.ablation_disable_slow_loop is True
     assert config.ablation_disable_safescale is True
     assert config.disable_eta_gate is True
 
@@ -244,8 +244,8 @@ def test_config_rejects_invalid_signal_source() -> None:
 
 
 def test_config_rejects_invalid_bool() -> None:
-    with pytest.raises(ValueError, match="TRE_ABLATION_DISABLE_FAST_LOOP"):
-        ControllerConfig.from_env({"TRE_ABLATION_DISABLE_FAST_LOOP": "maybe"})
+    with pytest.raises(ValueError, match="TRE_ABLATION_DISABLE_SLOW_LOOP"):
+        ControllerConfig.from_env({"TRE_ABLATION_DISABLE_SLOW_LOOP": "maybe"})
 
 
 def test_config_ignores_removed_enable_tre_scaling_with_one_warning(caplog) -> None:

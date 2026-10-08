@@ -117,11 +117,38 @@ def build_controller_task_specs(
     # still no donor (active_probe_models), afterwards that set is empty.
     safescale_off = bool(getattr(cfg, "ablation_disable_safescale", False))
     planner_safescale = None if safescale_off else deps.safescale
-    if not bool(getattr(cfg, "ablation_disable_fast_loop", False)):
+    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-08): every decision runs in the fast loop -
+    # its snapshot-aligned ticks plan the fairness section too, no fairness task runs.
+    # The fast loop does all the fairness task did besides planning (model state box,
+    # decision snapshot); the queue's rescue-over-fairness replacement follows each
+    # action's source_loop, which the planner sets per section.
+    slow_off = bool(getattr(cfg, "ablation_disable_slow_loop", False))
+    specs.append(
+        ControllerTaskSpec(
+            "rescue",
+            lambda: rescue_task(
+                deps.snapshot_box,
+                queue=deps.queue,
+                registry=deps.registry,
+                cfg=cfg,
+                cluster_view_box=deps.cluster_view_box,
+                active_probe_models=lambda: _active_probe_models(deps.safescale),
+                decision_writer=deps.decision_writer,
+                safescale=planner_safescale,
+                signal_state=deps.signal_state,
+                prof=deps.profiler,
+                model_state_box=deps.model_state_box,
+                is_observe=_observe_reader(deps),
+                maintenance=deps.maintenance_watch,
+                fairness_due=slow_off,
+            ),
+        )
+    )
+    if not slow_off:
         specs.append(
             ControllerTaskSpec(
-                "rescue",
-                lambda: rescue_task(
+                "fairness",
+                lambda: fairness_task(
                     deps.snapshot_box,
                     queue=deps.queue,
                     registry=deps.registry,
@@ -138,26 +165,6 @@ def build_controller_task_specs(
                 ),
             )
         )
-    specs.append(
-        ControllerTaskSpec(
-            "fairness",
-            lambda: fairness_task(
-                deps.snapshot_box,
-                queue=deps.queue,
-                registry=deps.registry,
-                cfg=cfg,
-                cluster_view_box=deps.cluster_view_box,
-                active_probe_models=lambda: _active_probe_models(deps.safescale),
-                decision_writer=deps.decision_writer,
-                safescale=planner_safescale,
-                signal_state=deps.signal_state,
-                prof=deps.profiler,
-                model_state_box=deps.model_state_box,
-                is_observe=_observe_reader(deps),
-                maintenance=deps.maintenance_watch,
-            ),
-        )
-    )
     if safescale_off:
         specs.append(
             ControllerTaskSpec(

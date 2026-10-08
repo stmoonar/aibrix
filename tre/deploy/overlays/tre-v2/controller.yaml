@@ -151,7 +151,9 @@ spec:
             # --- Ablation switches (D4); production defaults ---
             # (The scaling on/off env switch was removed 2026-10-07: actuation follows the
             # run mode tre:v2:controller:mode only.)
-            - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            # SLOW_LOOP: one snapshot-aligned loop runs every decision (no fairness loop).
+            # SAFESCALE: no probes - every probe shrink is released immediately (urgent).
+            - name: TRE_ABLATION_DISABLE_SLOW_LOOP
               value: "false"
             - name: TRE_ABLATION_DISABLE_SAFESCALE
               value: "false"

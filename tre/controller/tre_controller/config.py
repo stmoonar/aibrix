@@ -167,7 +167,8 @@ class ControllerConfig:
     signal_warmup_ms: int
     paper_stale_max_windows: int
     incomplete_policy: str
-    ablation_disable_fast_loop: bool
+    # 2026-10-08: one snapshot-aligned loop runs every decision (no fairness loop).
+    ablation_disable_slow_loop: bool
     ablation_disable_safescale: bool
     disable_eta_gate: bool
     orphan_scan_enabled: bool
@@ -402,7 +403,7 @@ class ControllerConfig:
             signal_warmup_ms=signal_warmup_ms,
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
             incomplete_policy=incomplete_policy,
-            ablation_disable_fast_loop=_get_bool(values, "TRE_ABLATION_DISABLE_FAST_LOOP", False),
+            ablation_disable_slow_loop=_get_bool(values, "TRE_ABLATION_DISABLE_SLOW_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),
             disable_eta_gate=_get_bool(values, "TRE_DISABLE_ETA_GATE", False),
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),

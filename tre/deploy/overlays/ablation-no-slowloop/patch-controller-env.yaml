@@ -9,5 +9,5 @@ spec:
       containers:
         - name: controller
           env:
-            - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            - name: TRE_ABLATION_DISABLE_SLOW_LOOP
               value: "true"
