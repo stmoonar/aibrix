@@ -68,6 +68,7 @@ def run_rescue_tick(
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     fairness_due: bool = False,
+    leftover_probes: SafeScaleController | None = None,
 ) -> LoopTickResult:
     """``fairness_due`` (TRE_ABLATION_DISABLE_SLOW_LOOP): this tick plans the fairness
     section too - the single loop then runs every decision."""
@@ -77,6 +78,7 @@ def run_rescue_tick(
         registry=registry,
         rescue_due=True,
         fairness_due=fairness_due,
+        leftover_probes=leftover_probes,
         cluster_view=cluster_view,
         active_probe_models=active_probe_models,
         signal_source=signal_source,
@@ -113,6 +115,7 @@ async def rescue_task(
     is_observe: Callable[[], bool] | None = None,
     maintenance: "MaintenanceWatch | None" = None,
     fairness_due: bool = False,
+    leftover_probes: SafeScaleController | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     wait_newer = getattr(snapshot_box, "wait_newer", None)
@@ -147,6 +150,7 @@ async def rescue_task(
                         maintenance.probe_block_reason() if maintenance is not None else None
                     ),
                     fairness_due=fairness_due,
+                    leftover_probes=leftover_probes,
                 )
             if model_state_box is not None and result.classifications:
                 # Review 3: the latest signal state, for the queue's commit revalidation.

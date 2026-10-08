@@ -56,6 +56,11 @@ class PlanConfig:
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
     suppress_hot_proactive_probe: bool = False
     disable_eta_gate: bool = False
+    # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE, 2026-10-08; set by the tick when it has
+    # no SafeScale controller): a middle-zone / HIGH donor for a receiver is planned as
+    # an immediate relay (reason suffix ``_nosafescale``) through the same gates as an
+    # IDLE donor's (relay holds, routable view, C1 tagging), instead of a probe.
+    release_without_safescale: bool = False
     # Registry placement.defrag.enabled: gates the critical_tp_defrag migration plan.
     # Off by default, as in v1 (design 20260928-placement-node-balance).
     defrag_enabled: bool = False
@@ -196,6 +201,9 @@ class ScaleAction:
 #: low-fairness donor). The SM never drains (no sleep path does since 2026-10-02):
 #: hide -> ack -> /sleep mode=abort, the reissue sidecar continues the cut-off requests.
 IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
+#: Reason suffix of a shrink that would have run as a SafeScale probe and is released
+#: immediately because SafeScale is off (TRE_ABLATION_DISABLE_SAFESCALE, 2026-10-08).
+NO_SAFESCALE_REASON_SUFFIX = "_nosafescale"
 
 
 @dataclass(frozen=True)
@@ -1054,24 +1062,42 @@ def build_plan(
                         continue
                     middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
                     planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
-                    gained = _plan_middle_zone_probe(
-                        actions,
-                        deltas,
-                        occupancy,
-                        donor=middle.model_name,
-                        receiver=recv.model_name,
-                        need=still_needed,
-                        donor_limit=min(_scale_step(middle_pods, cfg.scale_step_ratio), headroom - planned_take),
-                        reason=(
-                            "critical_high_donor_safescale"
-                            if middle.state == ModelState.HIGH
-                            else "critical_middle_zone_safescale"
-                        ),
-                        source_loop="rescue",
-                        events=events,
-                        delayed_down_models=delayed_down_models,
-                        probe_upscale_plans=probe_upscale_plans,
+                    middle_limit = min(_scale_step(middle_pods, cfg.scale_step_ratio), headroom - planned_take)
+                    middle_reason = (
+                        "critical_high_donor_safescale"
+                        if middle.state == ModelState.HIGH
+                        else "critical_middle_zone_safescale"
                     )
+                    if cfg.release_without_safescale:
+                        gained = _plan_transfer_intent(
+                            actions,
+                            deltas,
+                            occupancy,
+                            donor=middle.model_name,
+                            receiver=recv.model_name,
+                            need=still_needed,
+                            donor_limit=middle_limit,
+                            reason=f"{middle_reason}{NO_SAFESCALE_REASON_SUFFIX}",
+                            source_loop="rescue",
+                            events=events,
+                            view=cluster_view,
+                            relay_holds=relay_holds,
+                        )
+                    else:
+                        gained = _plan_middle_zone_probe(
+                            actions,
+                            deltas,
+                            occupancy,
+                            donor=middle.model_name,
+                            receiver=recv.model_name,
+                            need=still_needed,
+                            donor_limit=middle_limit,
+                            reason=middle_reason,
+                            source_loop="rescue",
+                            events=events,
+                            delayed_down_models=delayed_down_models,
+                            probe_upscale_plans=probe_upscale_plans,
+                        )
                     still_needed -= gained
             finally:
                 if recv.model_name in rescue_ctx:
@@ -1340,6 +1366,28 @@ def build_plan(
                 continue
             donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
             planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
+            middle_limit = min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take)
+            middle_reason = (
+                "low_fairness_high_donor_safescale"
+                if middle.state == ModelState.HIGH
+                else "low_fairness_middle_zone_safescale"
+            )
+            if cfg.release_without_safescale:
+                needed -= _plan_transfer_intent(
+                    actions,
+                    deltas,
+                    occupancy,
+                    donor=middle.model_name,
+                    receiver=recv.model_name,
+                    need=needed,
+                    donor_limit=middle_limit,
+                    reason=f"{middle_reason}{NO_SAFESCALE_REASON_SUFFIX}",
+                    source_loop="fairness",
+                    events=events,
+                    view=cluster_view,
+                    relay_holds=relay_holds,
+                )
+                continue
             needed -= _plan_middle_zone_probe(
                 actions,
                 deltas,
@@ -1347,12 +1395,8 @@ def build_plan(
                 donor=middle.model_name,
                 receiver=recv.model_name,
                 need=needed,
-                donor_limit=min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take),
-                reason=(
-                    "low_fairness_high_donor_safescale"
-                    if middle.state == ModelState.HIGH
-                    else "low_fairness_middle_zone_safescale"
-                ),
+                donor_limit=middle_limit,
+                reason=middle_reason,
                 source_loop="fairness",
                 events=events,
                 delayed_down_models=delayed_down_models,

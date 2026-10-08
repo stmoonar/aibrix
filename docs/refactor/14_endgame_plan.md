@@ -527,6 +527,7 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 - arm 列表：`no-fastloop`、`no-safescale`（现有 overlay）、`signal=queue_len`
   （env TRE_SIGNAL_SOURCE，D9 保留的消融用途）、（percentile 两口径已由 R2/R4 覆盖，
   不重复）。
+  - 2026-10-08 注：`no-fastloop` 已由 `no-slowloop` 取代（overlay `ablation-no-slowloop`，`TRE_ABLATION_DISABLE_SLOW_LOOP`：所有决策都在快环里跑）；`no-safescale` 现在表示立即释放（不做 probe）。
 - 每 arm 跑 7 条 trace 里**预注册**的 3 条代表 trace（在跑之前于 13 号文档写死选哪
   3 条及理由，防止事后挑数据）：默认选 ρ 最低/中/最高各一条。
 - 每 arm 跑完恢复默认 overlay 并冒烟，再进下一 arm。

@@ -138,8 +138,6 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
     )
 
 
-
-
 def test_removed_enable_tre_scaling_no_longer_stops_the_decision_tasks() -> None:
     """2026-10-07: ENABLE_TRE_SCALING is gone; a stale ``false`` (live Deployment not yet
     cleaned up) must not drop the decision pipeline - run mode alone gates actuation."""

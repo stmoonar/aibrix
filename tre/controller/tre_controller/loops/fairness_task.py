@@ -61,6 +61,7 @@ def run_fairness_tick(
     action_cooldown: bool = False,
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
+    leftover_probes: SafeScaleController | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -83,6 +84,7 @@ def run_fairness_tick(
         action_cooldown=action_cooldown,
         observe_mode=observe_mode,
         probe_block_reason=probe_block_reason,
+        leftover_probes=leftover_probes,
     )
 
 
@@ -103,6 +105,7 @@ async def fairness_task(
     model_state_box: "ModelStateBox | None" = None,
     is_observe: Callable[[], bool] | None = None,
     maintenance: "MaintenanceWatch | None" = None,
+    leftover_probes: SafeScaleController | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -134,6 +137,7 @@ async def fairness_task(
                     probe_block_reason=(
                         maintenance.probe_block_reason() if maintenance is not None else None
                     ),
+                    leftover_probes=leftover_probes,
                 )
             if model_state_box is not None and result.classifications:
                 # Review 3: the latest signal state, for the queue's commit revalidation.

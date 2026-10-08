@@ -114,9 +114,11 @@ def build_controller_task_specs(
     # every shrink that would run as a probe is released immediately (tick
     # _release_without_safescale). The state machine only finishes probes an earlier
     # run left in Redis (rollback_left_probes_task); while one is left, its model is
-    # still no donor (active_probe_models), afterwards that set is empty.
+    # still no donor (active_probe_models) and its GPUs stay reserved (leftover_probes);
+    # afterwards both are empty.
     safescale_off = bool(getattr(cfg, "ablation_disable_safescale", False))
     planner_safescale = None if safescale_off else deps.safescale
+    leftover_probes = deps.safescale if safescale_off else None
     # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-08): every decision runs in the fast loop -
     # its snapshot-aligned ticks plan the fairness section too, no fairness task runs.
     # The fast loop does all the fairness task did besides planning (model state box,
@@ -141,6 +143,7 @@ def build_controller_task_specs(
                 is_observe=_observe_reader(deps),
                 maintenance=deps.maintenance_watch,
                 fairness_due=slow_off,
+                leftover_probes=leftover_probes,
             ),
         )
     )
@@ -162,6 +165,7 @@ def build_controller_task_specs(
                     model_state_box=deps.model_state_box,
                     is_observe=_observe_reader(deps),
                     maintenance=deps.maintenance_watch,
+                    leftover_probes=leftover_probes,
                 ),
             )
         )
@@ -414,6 +418,12 @@ def create_controller_dependencies(
         "early_commit": cfg.safescale.early_commit,
         "early_commit_min_grids": cfg.safescale.early_commit_min_grids,
         "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
+    }, sort_keys=True))
+    # The effective ablation switches (production: both false).
+    logging.getLogger("tre_controller").info(json.dumps({
+        "event": "ablation_switches",
+        "disable_safescale": bool(getattr(cfg, "ablation_disable_safescale", False)),
+        "disable_slow_loop": bool(getattr(cfg, "ablation_disable_slow_loop", False)),
     }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)

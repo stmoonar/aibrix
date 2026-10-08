@@ -40,6 +40,9 @@ async def run_offline_integration_step(
     signal_source: str = "zm",
     safescale: SafeScaleController | None = None,
 ) -> OfflineIntegrationStepResult:
+    """``safescale`` None = no SafeScale: every shrink that would start a probe is
+    released immediately (urgent donor path, reason suffix ``_nosafescale``; since
+    2026-10-08, before it was dropped)."""
     snapshot_box = SnapshotBox()
     metrics = refresh_metrics_once(store, snapshot_box, now_ms=now_ms, window_ms=window_ms)
     decision = run_rescue_tick(

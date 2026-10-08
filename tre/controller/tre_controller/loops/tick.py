@@ -20,6 +20,7 @@ from tre_controller.planning.classify import (
 )
 from tre_controller.planning.planner import (
     IMMEDIATE_DONOR_SLEEP_PATH,
+    NO_SAFESCALE_REASON_SUFFIX,
     Action,
     ClusterView,
     HideAction,
@@ -32,7 +33,6 @@ from tre_controller.planning.planner import (
     UnhideAction,
     build_plan,
     probe_reserved_gpus,
-    relay_basis,
     upscale_of,
 )
 from tre_controller.planning.safescale import (
@@ -168,6 +168,7 @@ def run_planner_tick(
     action_cooldown: bool = False,
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
+    leftover_probes: SafeScaleController | None = None,
 ) -> LoopTickResult:
     """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
@@ -179,7 +180,12 @@ def run_planner_tick(
     (``sm_maintenance``: the SM maintenance lock is held;
     ``sm_maintenance_unreadable``: it could not be read - fail-closed). The
     planned probe-only scale-downs are dropped with the event
-    ``safescale_probe_skipped:<model>:<reason>``; every other action is kept."""
+    ``safescale_probe_skipped:<model>:<reason>``; every other action is kept.
+
+    ``safescale`` None (TRE_ABLATION_DISABLE_SAFESCALE): no probe; every shrink that
+    would start one is released immediately (``PlanConfig.release_without_safescale``,
+    :func:`_release_without_safescale`). ``leftover_probes``: the state machine that
+    only finishes probes an earlier run left - their GPUs stay reserved meanwhile."""
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
     if cluster_view is not None and cluster_view.placement is None:
@@ -191,7 +197,9 @@ def run_planner_tick(
         # Design donor-evidence-20261007 item 3: the GPUs in-flight probes count on for
         # their receivers are no capacity for anything else of this tick.
         reserved = probe_reserved_gpus(
-            cluster_view, _unresolved_probes(safescale), {spec.name: spec.tp_size for spec in registry.models()}
+            cluster_view,
+            _unresolved_probes(safescale if safescale is not None else leftover_probes),
+            {spec.name: spec.tp_size for spec in registry.models()}
         )
         extra = reserved - {(str(node), int(gpu)) for node, gpu in cluster_view.blocked_gpus}
         if extra:
@@ -248,6 +256,7 @@ def run_planner_tick(
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
+        release_without_safescale=safescale is None,
         defrag_enabled=_defrag_enabled(registry),
         **_scaling_options(registry),
     )
@@ -748,7 +757,7 @@ def _apply_safescale(
     if safescale is None:
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
-        return _release_without_safescale(actions, probe_upscale_plans, cluster_view)
+        return _release_without_safescale(actions)
 
     converted: list[Action] = []
     events: list[str] = []
@@ -863,61 +872,33 @@ def _apply_safescale(
     return tuple(converted), tuple(events)
 
 
-#: Reason suffix of a shrink that would have run as a SafeScale probe and was released
-#: immediately because SafeScale is off (TRE_ABLATION_DISABLE_SAFESCALE).
-NO_SAFESCALE_REASON_SUFFIX = "_nosafescale"
+def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Action, ...], tuple[str, ...]]:
+    """Without SafeScale the probe shrinks the planner still emits take the immediate
+    donor path (sleep path ``urgent``, reason suffix ``_nosafescale``); a middle-zone /
+    HIGH donor for a receiver is already planned as a relay
+    (``PlanConfig.release_without_safescale``). Everything else is unchanged:
 
-
-def _release_without_safescale(
-    actions: tuple[Action, ...],
-    probe_upscale_plans: dict[str, dict[str, int]],
-    cluster_view: ClusterView | None,
-) -> tuple[tuple[Action, ...], tuple[str, ...]]:
-    """Without SafeScale every action that would start a probe takes the planner's
-    immediate donor path (sleep path ``urgent``); everything else is unchanged:
-
-    * a shrink with a receiver -> a :class:`TransferIntent` donor -> receiver (the
-      receiver pairs the probe would have promised its commit), like an IDLE donor;
     * a receiver-less shrink (HIGH proactive) -> a model-level urgent scale-down (the
       SM keeps the replica floor);
-    * a TP same-slot preemption -> the urgent sleep of exactly that donor pod plus the
-      beneficiary's +1 (a wake that runs before the sleep is refused and re-planned).
-
-    At most one per donor model per tick, as the state machine allows one probe per
-    model (``safescale_probe_skipped:<donor>:released_this_tick``)."""
+    * a TP same-slot preemption -> only the urgent sleep of exactly that donor pod; the
+      next tick wakes the receiver on the freed slot through the planner's normal
+      free-capacity path (C1 target, O1 evidence gate)."""
     out: list[Action] = []
-    events: list[str] = []
-    released: set[str] = set()
     for action in actions:
         if not _requires_safescale_probe(action):
             out.append(action)
             continue
-        donor = _safescale_probe_model(action)
-        if donor in released:
-            events.append(f"safescale_probe_skipped:{donor}:released_this_tick")
-            continue
-        released.add(donor)
         reason = f"{action.reason}{NO_SAFESCALE_REASON_SUFFIX}"
         if isinstance(action, ShrinkForSlotAction):
             out.append(ScaleAction(
-                donor, -1, reason, action.source_loop, donor=donor, receiver=action.beneficiary,
+                action.donor, -1, reason, action.source_loop, donor=action.donor,
                 pods=(action.serve_id,), sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-            ))
-            out.append(ScaleAction(action.beneficiary, 1, reason, action.source_loop, receiver=action.beneficiary))
-        elif action.receiver:
-            count = -int(action.delta)
-            pairs = int((probe_upscale_plans.get(donor) or {}).get(action.receiver, 0) or count)
-            out.append(TransferIntent(
-                donor_model=donor, receiver_model=action.receiver, count=count, pairs=pairs,
-                reason=reason, source_loop=action.source_loop,
-                sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-                basis=relay_basis(cluster_view, donor, action.receiver),
             ))
         else:
             out.append(replace(
                 action, reason=reason, requires_safescale=False, sleep_path=IMMEDIATE_DONOR_SLEEP_PATH
             ))
-    return tuple(out), tuple(events)
+    return tuple(out), ()
 
 
 def probe_window_inputs(

@@ -50,6 +50,9 @@ def run_tick_replay(
     signal_source: str = "zm",
     suppress_hot_proactive_probe: bool = False,
 ) -> TickReplayResult:
+    """``safescale`` None = no SafeScale: every shrink that would start a probe is
+    released immediately (urgent donor path, reason suffix ``_nosafescale``; since
+    2026-10-08, before it was dropped)."""
     queue = ReplayQueue()
     results: list[LoopTickResult] = []
     actions: list[Action] = []

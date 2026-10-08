@@ -243,6 +243,13 @@ class ControllerConfig:
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
         values = os.environ if env is None else env
         _warn_removed_env(values)
+        # 2026-10-08: the renamed ablation fails closed - a stale "true" would otherwise
+        # silently run the full controller in an ablation arm.
+        if str(values.get("TRE_ABLATION_DISABLE_FAST_LOOP", "")).strip().lower() in _TRUE_VALUES:
+            raise ValueError(
+                "TRE_ABLATION_DISABLE_FAST_LOOP was removed (2026-10-08); "
+                "use TRE_ABLATION_DISABLE_SLOW_LOOP (all decisions in the fast loop)"
+            )
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"
         default_state_dir = repo_tre_dir / ".runtime"
