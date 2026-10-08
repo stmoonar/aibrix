@@ -19,10 +19,12 @@ directly (redis-py, `--redis host[:port]`, the TRE Redis ClusterIP from the clie
                                                     from PATH; prints a JSON record
   client-header   --meta loadgen_run_meta.json      print the x-tre-bl-in-tokens precount summary
                                                     (exit 1 when any request was sent without the header)
-  open-probes     --redis H [--any]                 print the number of open (probing / committing)
-                                                    SafeScale probes of the TRE controller; --any: every
-                                                    record left in the probes hash (a finished probe is
-                                                    deleted from it, so any record = a leftover probe)
+  open-probes     --redis H [--unresolved]          print the number of open (probing / committing)
+                                                    SafeScale probes of the TRE controller; --unresolved:
+                                                    print "unresolved=N resolved=M" over the probes hash -
+                                                    a finished probe stays there as status "resolved" for
+                                                    an hour (gc_resolved_probes); every other record,
+                                                    unparsable ones too, counts as unresolved (fail closed)
   trace-manifest  --out F --name N --trace T --config C [--segments S] [--source-manifest M] [--seed K]
                                                     trace_manifest.json {trace/config/segments sha256, seed}
 Sanity (baseline_sanity.sh):
@@ -127,8 +129,14 @@ PROBES_KEY = "tre:v2:controller:safescale:probes"  # = tre_common.rediskeys.CONT
 def cmd_open_probes(a) -> int:
     n = 0
     recs = _redis(a.redis).hgetall(PROBES_KEY) or {}
-    if getattr(a, "any", False):
-        print(len(recs))
+    if getattr(a, "unresolved", False):
+        resolved = 0
+        for raw in recs.values():
+            try:
+                resolved += json.loads(raw).get("status") == "resolved"
+            except (ValueError, AttributeError):
+                continue
+        print(f"unresolved={len(recs) - resolved} resolved={resolved}")
         return 0
     for raw in recs.values():
         try:
@@ -673,7 +681,7 @@ def main(argv=None) -> int:
     p.add_argument("--live", required=True); p.add_argument("--registry", required=True)
     p.add_argument("--frozen"); p.add_argument("--trace"); p.set_defaults(fn=cmd_check_policy)
     p = sub.add_parser("client-header"); p.add_argument("--meta", required=True); p.set_defaults(fn=cmd_client_header)
-    p = sub.add_parser("open-probes"); p.add_argument("--redis", required=True); p.add_argument("--any", action="store_true")
+    p = sub.add_parser("open-probes"); p.add_argument("--redis", required=True); p.add_argument("--unresolved", action="store_true")
     p.set_defaults(fn=cmd_open_probes)
     p = sub.add_parser("trace-manifest"); p.add_argument("--out", required=True); p.add_argument("--name", required=True)
     p.add_argument("--trace", required=True); p.add_argument("--config", required=True); p.add_argument("--segments")

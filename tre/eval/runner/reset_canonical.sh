@@ -2,18 +2,20 @@
 # Put the cluster back in the campaign's canonical idle state (run_campaign.sh calls it after
 # every arm, and with --force before a retry and when a pre-check needs it):
 #   run mode observe/active; decision source NONE (0 APA CRs, baseline scaler at 0 replicas, no
-#   baseline owner lock); no hidden binding; awake set == $BASELINE (runner.env); engines idle.
+#   baseline owner lock); no hidden binding; awake set == $BASELINE (runner.env); engines idle;
+#   (2026-10-08) controller ablation switches false (unset counts as false).
 # Usage: reset_canonical.sh [--check | --force]
 #   --check  report only: exit 0 when canonical, 1 when not (read-only)
 #   (none)   reset only when not canonical
 #   --force  always run the full sequence
 # Exit 0 = canonical afterwards, 3 = could not reach it (see the output).
-# CHANGES CLUSTER STATE (except --check): run mode, APA CRs, baseline scaler, SM awake set.
+# CHANGES CLUSTER STATE (except --check): run mode, APA CRs, baseline scaler, SM awake set,
+# controller ablation switches (set env + rollout).
 set -euo pipefail
 # shellcheck source=lib_env.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_env.sh"
 need_env TRE_DIR BASELINE TRE_NS SM_SVC SM_PORT APA_NS BL_NS BL_DEPLOY MODEL_NS MODEL_SELECTOR ENGINE_PORT \
-  REDIS_SVC REDIS_PORT GW_NS GW_SELECTOR
+  REDIS_SVC REDIS_PORT GW_NS GW_SELECTOR CONTROLLER_DEPLOY
 MODE="${1:-auto}"
 case "$MODE" in --check|--force|auto) ;; *) echo "usage: $0 [--check|--force]" >&2; exit 2;; esac
 TRE="$TRE_DIR"
@@ -34,17 +36,21 @@ mode_set() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; lo
 n_apa() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true; }
 bl_replicas() { kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0; }
 bl_owner() { kubectl -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP"   # = run_arm_pilot.sh note 14
+ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
+ctl_not_false() { local k v; for k in $CTL_ENV_KEYS; do v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-false}" = false ] || echo "$k=$v"; done; }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \
                --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "$REDIS_URL" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
 
 problems() {   # prints one line per deviation from the canonical state
-  local rm got h a r o
+  local rm got h a r o c
   rm=$(run_mode); case "$rm" in *"controller_mode=observe"*"sm_actuation=active"*) ;; *) echo "run mode: $rm";; esac
   got=$(awake_ids || echo "?"); [ "$got" = "$WANT" ] || echo "awake [$got] != canonical [$WANT]"
   h=$(hidden_n || echo "?"); [ "$h" = 0 ] || echo "hidden bindings: $h"
   a=$(n_apa); [ "$a" = 0 ] || echo "APA CRs live: $a"
   r=$(bl_replicas); [ "${r:-0}" = 0 ] || echo "baseline scaler replicas: $r"
   o=$(bl_owner); [ -z "$o" ] || echo "baseline owner lock: $o"
+  c=$(ctl_not_false | tr '\n' ' '); [ -z "$c" ] || echo "controller ablation switches not false: $c"
 }
 
 P=$(problems)
@@ -53,6 +59,16 @@ if [ -z "$P" ] && [ "$MODE" != --force ]; then log "canonical: $(run_mode); awak
 [ "$MODE" = --check ] && exit 1
 
 mode_set observe observe
+# controller ablation switches back to production (false) - after observe/observe, before anything else
+CF=$(ctl_not_false | sed 's/=.*/=false/' | tr '\n' ' ')
+if [ -n "$CF" ]; then
+  # shellcheck disable=SC2086
+  if kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" $CF && kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s; then
+    log "controller switches -> $CF"
+  else
+    log "ERROR controller switch reset failed ($CF)"
+  fi
+fi
 # baseline shell: disable through the arm tool (releases the owner lock), then make sure it is at 0
 if [ "$(bl_replicas)" != 0 ] || [ -n "$(bl_owner)" ]; then
   ARM_TOOL disable --skip-collect --execute 2>&1 | tail -5 || log "WARN arm disable failed"

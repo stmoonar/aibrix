@@ -55,12 +55,16 @@
 #      restore to $BASELINE, as reset_canonical.sh (APA scaled the restored replica down again: 409).
 #  14. (2026-10-08) controller ablation switches (TRE_ABLATION_DISABLE_SAFESCALE / _SLOW_LOOP):
 #      ARM_CONTROLLER_ENV="K=true|false ..." (campaign arm_defs.<id>.controller_env, tre arms only;
-#      unset = every switch false = production). Before the controller restart: (a) hygiene gate - no
-#      SafeScale probe record left in Redis (probe_gate.json; exit 4 otherwise), (b) one `set env` on
-#      the controller Deployment for the switches that differ (unset counts as false). After the
+#      unset = every switch false = production). Before the controller restart of EVERY arm (all arm
+#      types): (a) hygiene gate - no unresolved SafeScale probe record in Redis (status other than
+#      "resolved", or unparsable; resolved records stay an hour until gc_resolved_probes), polled up
+#      to PROBE_WAIT_S, counts in probe_gate.json, exit 4 otherwise; (b) one `set env` on the
+#      controller Deployment for the switches that differ (unset counts as false). After the
 #      restart the controller's startup line `ablation_switches` is checked against the wanted values
 #      and kept in ablation_switches.json (an explicit ARM_CONTROLLER_ENV must match, else exit 4).
-#      At the end of the arm (and in the exit trap) every switch is put back to false.
+#      At the end of the arm (and in the exit trap, after run mode observe/observe) every switch is
+#      put back to false; reset_canonical.sh does the same. safescale.json holds only the probes
+#      of this arm (started >= controller restart - 60 s); the unfiltered hash is probes_all.
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
@@ -242,21 +246,23 @@ ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the
     [ "$cur" = "$want" ] || args+=("$k=$want")
   done
   [ ${#args[@]} = 0 ] && return 0
-  kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "${args[@]}" >> "$D/runner.log" 2>&1
-  kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >> "$D/runner.log" 2>&1
+  kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "${args[@]}" >> "$D/runner.log" 2>&1 || return 1
+  kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >> "$D/runner.log" 2>&1 || return 1
   log "controller env set: ${args[*]}"
 }
 ctl_env_now() { local k; for k in $CTL_ENV_KEYS; do printf '%s=%s ' "$k" "$(ctl_env_get "$k")"; done; }
-# hygiene gate: a probe record left in Redis would be finished by the new controller during the arm
+# hygiene gate: an unresolved probe left in Redis would be finished by the new controller during the arm
+# (resolved records stay in the hash for an hour and do not count)
 probe_gate() {
-  local i n="?"
+  local i out="" n="?" r="?"
   for i in $(seq 1 $(( (PROBE_WAIT_S + 4) / 5 ))); do
-    n=$(BLT open-probes --redis "$REDIS_HOST" --any 2>/dev/null || echo "?")
+    out=$(BLT open-probes --redis "$REDIS_HOST" --unresolved 2>/dev/null || true)
+    case "$out" in unresolved=*" resolved="*) n=${out#unresolved=}; n=${n%% *}; r=${out##*resolved=} ;; *) n="?"; r="?" ;; esac
     [ "$n" = 0 ] && break; sleep 5
   done
-  printf '{"probe_records": "%s", "epoch": %s}\n' "$n" "$(date +%s)" > "$D/probe_gate.json"
-  [ "$n" = 0 ] || { log "ERROR $n SafeScale probe record(s) left in Redis after ${PROBE_WAIT_S} s; refusing to start"; exit 4; }
-  log "probe gate: no SafeScale probe record in Redis"
+  printf '{"unresolved": "%s", "resolved": "%s", "wait_max_s": %s, "epoch": %s}\n' "$n" "$r" "$PROBE_WAIT_S" "$(date +%s)" > "$D/probe_gate.json"
+  [ "$n" = 0 ] || { log "ERROR $n unresolved SafeScale probe record(s) in Redis after ${PROBE_WAIT_S} s; refusing to start"; exit 4; }
+  log "probe gate: no unresolved SafeScale probe in Redis ($r resolved record(s))"
 }
 # the effective switches: the controller's startup line {"event": "ablation_switches", ...}
 record_ablation_switches() {   # prints match | mismatch | missing; writes ablation_switches.json
@@ -308,7 +314,8 @@ on_exit() {   # safety net: never leave a baseline shell actuating or the stream
     log "TRAP rc=$rc: gateway event stream back to '$EV_BEFORE'"; events_set "$EV_BEFORE" || log "TRAP ERROR: event stream restore failed"
   fi
   if [ "$CTL_ENV_TOUCHED" = 1 ]; then
-    log "TRAP rc=$rc: controller ablation switches back to false"; ctl_env_set false || log "TRAP ERROR: controller env restore failed"
+    log "TRAP rc=$rc: run mode -> $(mode observe observe || echo FAILED) before the switches"
+    log "TRAP rc=$rc: controller ablation switches back to false"; ctl_env_set false || log "TRAP ERROR: controller env restore failed (set them to false by hand)"
   fi
   [ "$rc" = 0 ] || log "TRAP: runner exited rc=$rc mid-arm; cluster NOT reset (see RUN.md 'stop')"
 }
@@ -496,17 +503,33 @@ python3 - "$D" "$T_RESTART" "$REDIS_URL" <<'PY'
 import json, sys, redis
 d, t0 = sys.argv[1], int(sys.argv[2]) * 1000
 r = redis.Redis.from_url(sys.argv[3], decode_responses=True)
-probes = dict(r.hgetall("tre:v2:controller:safescale:probes"))
+probes_all = dict(r.hgetall("tre:v2:controller:safescale:probes"))
+
+
+def start_ms(rid, raw):
+    try:
+        return int(rid.rsplit("-", 1)[-1])          # request_id = <model>-<start ms>
+    except ValueError:
+        pass
+    try:
+        return int(json.loads(raw).get("start_ms"))
+    except (ValueError, TypeError, AttributeError):
+        return None                                 # unknown: kept, as for the journals below
+
+
+# this arm's probes only: resolved records of an earlier arm stay in the hash for an hour
+probes = {k: v for k, v in probes_all.items() if (start_ms(k, v) or t0) >= t0 - 60000}
 journals = {}
 for k in r.scan_iter(match="tre:v2:controller:safescale:probe:*:journal", count=1000):
     try: ts = int(k.split(":")[-2].rsplit("-", 1)[-1])
     except ValueError: ts = t0
     if ts >= t0 - 60000: journals[k] = r.lrange(k, 0, -1)
-json.dump({"probes": probes, "journals": journals}, open(f"{d}/safescale.json", "w"), indent=1)
+json.dump({"probes": probes, "probes_all": probes_all, "probes_filter": {"start_ms_min": t0 - 60000},
+           "journals": journals}, open(f"{d}/safescale.json", "w"), indent=1)
 with open(f"{d}/signal_log.jsonl", "w") as f:
     for eid, fields in r.xrange("tre:v2:controller:signal_log", min=f"{t0}-0"):
         f.write(json.dumps({"id": eid, **fields}) + "\n")
-print("probes", len(probes), "journals", len(journals))
+print("probes", len(probes), "of", len(probes_all), "journals", len(journals))
 PY
 if [ "$IS_BL" = 1 ]; then
   log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models "$MODELS" 2>&1)"

@@ -63,8 +63,13 @@ class Redis:
     def get(self, k): return None
     def set(self, k, v, **kw): return True
     def hgetall(self, k):
+        # $FAKE_STATE/probes holds a real status (probing | committing | resolved): one probe of an
+        # earlier arm (start ms 1000) and one started now, both with that status
         if k.endswith("safescale:probes") and os.path.exists(_S + "/probes"):
-            return {"probe-x": json.dumps({"status": "rolled_back"})}
+            st = open(_S + "/probes").read().strip()
+            now = int(time.time() * 1000)
+            return {"dsqwen-7b-1000": json.dumps({"status": st, "start_ms": 1000}),
+                    f"dsqwen-7b-{now}": json.dumps({"status": st, "start_ms": now})}
         return {}
     def scan_iter(self, **k): return iter(())
     def lrange(self, *a): return []
@@ -158,7 +163,7 @@ ids = ["dsqwen-7b/nscc-ds-4a100-node9/0", "dsllama-8b/nscc-ds-4a100-node9/1", "d
 json.dump({"version": 1, "models": {}, "bindings": [{"binding_id": i, "awake": True, "hidden": False} for i in ids]}, open(sys.argv[1], "w"))
 EOF
 # ---------- tools
-cp $SRC/run_arm_pilot.sh $SRC/run_pilot.sh $SRC/baseline_sanity.sh $SRC/bl_tools.py $SRC/score_pilot.py \
+cp $SRC/run_arm_pilot.sh $SRC/reset_canonical.sh $SRC/run_pilot.sh $SRC/baseline_sanity.sh $SRC/bl_tools.py $SRC/score_pilot.py \
    $SRC/lib_env.sh $SRC/runner.env.example $SRC/clock_probe.py $SRC/components.py $SRC/k8s_names.py $H/tools/
 printf 'import os,sys,time\nd=sys.argv[1]\nfor _ in range(600):\n    if os.path.exists(d+"/STOP"): break\n    time.sleep(0.05)\n' > $H/tools/sampler.py
 printf 'import json,sys\njson.dump({}, open(sys.argv[1],"w"))\n' > $H/tools/snap.py
