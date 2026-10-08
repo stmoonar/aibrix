@@ -412,3 +412,52 @@ def test_paths_outside_tre_repo_are_a_problem(tmp_path):
     other.mkdir()
     bad = C.paths_outside_repo({**ok, "RELEASE_TRE": str(other), "TRE_DIR": str(other)})
     assert len(bad) >= 2 and all("outside TRE_REPO" in x for x in bad)
+
+
+# ------------------------------------------------------------------ controller ablation switches (2026-10-08)
+class EnvDeps(FakeDeps):
+    def __init__(self):
+        super().__init__()
+        self.envs: dict = {}
+
+    def run_arm(self, item, env, attempt):
+        self.envs[item.key] = env.get("ARM_CONTROLLER_ENV")
+        return super().run_arm(item, env, attempt)
+
+
+def test_ablation_arm_passes_its_controller_switch_and_other_arms_pass_none(tmp_path):
+    """An arm's controller_env reaches run_arm_pilot.sh as ARM_CONTROLLER_ENV and is recorded in the
+    manifest; an arm without one gets an empty value (= every switch false, production)."""
+    extra = {"arm_defs": {"tre-nosafescale": {"base": "tre", "label": "TRE-noSafeScale",
+                                              "controller_env": {"TRE_ABLATION_DISABLE_SAFESCALE": True}}}}
+    deps = EnvDeps()
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("tre-nosafescale", "tre", "apa"), "extra": extra})
+    assert camp.run() == 0
+    k = "Alternating_s1/"
+    assert deps.envs == {k + "tre-nosafescale": "TRE_ABLATION_DISABLE_SAFESCALE=true", k + "tre": "", k + "apa": ""}
+    item = next(i for i in camp.plan if i.arm == "tre-nosafescale")
+    man = json.loads((Path(item.arm_dir) / "campaign_manifest.json").read_text())
+    assert man["base_arm"] == "tre" and man["controller_env"] == {"TRE_ABLATION_DISABLE_SAFESCALE": "true"}
+
+
+@pytest.mark.parametrize("bad, match", [
+    ({"base": "apa", "controller_env": {"TRE_ABLATION_DISABLE_SAFESCALE": True}}, "only supported for base tre"),
+    ({"base": "tre", "controller_env": {"TRE_ABLATION_DISABLE_FAST_LOOP": True}}, "unknown keys"),
+    ({"base": "tre", "controller_env": {"TRE_ABLATION_DISABLE_SAFESCALE": "yes"}}, "true or false"),
+])
+def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, bad, match):
+    c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {"x": bad}}))
+    with pytest.raises(C.CampaignError, match=match):
+        C.build_plan(c)
+
+
+def test_ablation_safescale_campaign_plan(tmp_path):
+    """The shipped campaign: Alternating seed2 then seed1, both arms set the switch explicitly,
+    seed2 starts with the ablation arm, seed1 with tre (williams over two arms)."""
+    c = C.load_campaign(RUNNER / "campaigns" / "campaign-ablation-safescale.yaml", environ={"TRE_REPO": str(tmp_path)})
+    plan = C.build_plan(c)
+    assert [i.key for i in plan] == ["Alternating_s2/tre-nosafescale", "Alternating_s2/tre",
+                                     "Alternating_s1/tre", "Alternating_s1/tre-nosafescale"]
+    assert {i.arm: C.arm_def(c, i.arm).controller_env for i in plan} == {
+        "tre": {"TRE_ABLATION_DISABLE_SAFESCALE": "false"}, "tre-nosafescale": {"TRE_ABLATION_DISABLE_SAFESCALE": "true"}}
+    assert all(i.base_arm == "tre" for i in plan) and c["env"]["GW_PARITY"] == "1"

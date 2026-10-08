@@ -1,0 +1,93 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
+# SafeScale ablation (preregistered before the run: docs/ablation-safescale-20261008.md in the local workspace).
+# Controller tre-v2-controller:20261008-f23cb04d (fix/ablation-switches-20261008); SM / plugins / UI unchanged;
+# Envoy 4 cores. Two arms, both the TRE controller in run mode active:
+#   tre              TRE_ABLATION_DISABLE_SAFESCALE=false  production (HIGH / middle-zone donors via SafeScale probes)
+#   tre-nosafescale  TRE_ABLATION_DISABLE_SAFESCALE=true   every probe-requiring release immediate (sleep_path urgent) = v1
+# run_arm_pilot.sh (note 14) sets the switch on the controller Deployment before each arm, refuses to start when a
+# SafeScale probe record is left in Redis (probe_gate.json), checks the controller's startup line
+# `ablation_switches` (ablation_switches.json; mismatch -> exit 4) and puts the switch back to false at the end
+# of every arm (and in its exit trap). Both arms declare the switch explicitly, so both are checked.
+# Traces: Alternating seed2 and seed1 of the V_slo trace set (the same files as e1-seeds-alt-donorfix-20261008
+# and e1-final-vslo-20261008: sha256 8112ee04... / e2746afa...), GW_PARITY=1 as every E1 run.
+# Order: williams over two arms = seed2: tre-nosafescale, tre; seed1: tre, tre-nosafescale. The new code path
+# still runs first (an ablation bug shows up in the first 25 min), and each arm is once first and once second
+# (position balanced over the two traces; a fixed order would put the ablation arm first in both).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-ablation-safescale.yaml --dry-run --probe
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-ablation-safescale.yaml > /data/nfs_shared_data/xxy/ablation-safescale-20261008.out 2>&1 &
+#
+# Before the real run (AGENTS.md "部署与合并流程" rule 6): the controller image sha, this runner and the client
+# must be in main and pushed; the dry-run warns when they are not.
+name: ablation-safescale-20261008
+round: ablation-safescale-20261008  # exclusive-window marker: "validation <start> <end> round=ablation-safescale-20261008"
+results_root: /data/nfs_shared_data/xxy/ablation-safescale-20261008
+trace_root: /data/nfs_shared_data/xxy/traces-v2-vslo-20261007    # <trace>/seed<k>/{traces_tre.effective.json,manifest.json}
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v2
+seed: 1
+arms: [tre-nosafescale, tre]
+order: williams                     # williams | cyclic | fixed
+max_attempts: 2                     # a failed / invalid arm gets one retry after a full reset
+gap_s: 0
+eta: {overhead_s: 330, report_s: 150}   # per arm: trace 1080 s + overhead (observed 300 s + one extra controller rollout)
+
+env:
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"               # probe gate (run_arm_pilot note 14): the previous arm's probes may still be resolving
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: false}
+  tre-nosafescale:
+    base: tre
+    label: TRE-noSafeScale
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: true}
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${TRE_REPO}/eval/configs/t7-decision-points.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Alternating
+    seed: 2
+  - trace: Alternating
+    seed: 1

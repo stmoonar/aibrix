@@ -33,3 +33,23 @@ if ! grep -q "^awake_ctl restore-ids" $H/state/calls.log; then echo "FAIL: no re
 elif grep -q "^awake_ctl restore-ids apa_crs_live=1" $H/state/calls.log; then echo "FAIL: restore-ids ran with APA CRs live"
 elif [ "$(grep -c '^awake_ctl restore-ids' $H/state/calls.log)" != 2 ]; then echo "FAIL: want 2 restores (arm start + end)"
 else echo "PASS: both restores with 0 APA CRs"; fi
+echo "== 2026-10-08: ablation arm (ARM_CONTROLLER_ENV) sets the switch, checks the startup line, puts it back to false"; reset
+run env ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SAFESCALE=true" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+grep "set env deploy/tre-v2-controller" $H/state/calls.log | sed 's/.*set env/set env/'
+python3 -c "import json;a=json.load(open('$H/pilot/Alt/tre/ablation_switches.json'));m=json.load(open('$H/pilot/Alt/tre/arm_meta.json'));print(a['match'], a['logged'], m['controller_env'])"
+[ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] && [ -s $H/pilot/Alt/tre/probe_gate.json ] && echo "PASS: switch back to false, probe gate recorded" || echo "FAIL: switch=$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE) gate=$(cat $H/pilot/Alt/tre/probe_gate.json 2>/dev/null)"
+echo "== 2026-10-08: leftover probe record in Redis -> exit 4 before any controller change"; reset; touch $H/state/probes
+run env FAKE_STATE=$H/state ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SAFESCALE=true" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+N=$(grep -c "set env deploy/tre-v2-controller" $H/state/calls.log); grep -E "ERROR" $H/pilot/Alt/tre/runner.log | cut -c1-140
+[ "$N" = 0 ] && echo "PASS: no controller env change" || echo "FAIL: $N controller set env"
+echo "== 2026-10-08: startup line missing with an explicit switch -> exit 4, trap puts the switch back"; reset; touch $H/state/no_switch_line
+run env ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SAFESCALE=true" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+grep -E "ERROR|TRAP" $H/pilot/Alt/tre/runner.log | cut -c1-140
+[ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] && echo "PASS: switch back to false" || echo "FAIL: switch left $(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)"
+echo "== 2026-10-08: ARM_CONTROLLER_ENV on a non-tre arm / unknown key -> exit 2"; reset
+run env ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SAFESCALE=true" nice bash $H/tools/run_arm_pilot.sh apa Alt >/dev/null 2>&1; echo rc=$?
+run env ARM_CONTROLLER_ENV="TRE_FOO=true" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+echo "== 2026-10-08: plain tre arm, switch left true by a crash -> set back to false before the arm"; reset; echo -n true > $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE
+run nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+grep "set env deploy/tre-v2-controller" $H/state/calls.log | sed 's/.*set env/set env/'
+python3 -c "import json;a=json.load(open('$H/pilot/Alt/tre/ablation_switches.json'));print(a['match'], a['logged'])"

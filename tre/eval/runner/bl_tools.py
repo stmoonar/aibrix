@@ -19,8 +19,10 @@ directly (redis-py, `--redis host[:port]`, the TRE Redis ClusterIP from the clie
                                                     from PATH; prints a JSON record
   client-header   --meta loadgen_run_meta.json      print the x-tre-bl-in-tokens precount summary
                                                     (exit 1 when any request was sent without the header)
-  open-probes     --redis H                         print the number of open (probing / committing)
-                                                    SafeScale probes of the TRE controller
+  open-probes     --redis H [--any]                 print the number of open (probing / committing)
+                                                    SafeScale probes of the TRE controller; --any: every
+                                                    record left in the probes hash (a finished probe is
+                                                    deleted from it, so any record = a leftover probe)
   trace-manifest  --out F --name N --trace T --config C [--segments S] [--source-manifest M] [--seed K]
                                                     trace_manifest.json {trace/config/segments sha256, seed}
 Sanity (baseline_sanity.sh):
@@ -124,7 +126,11 @@ PROBES_KEY = "tre:v2:controller:safescale:probes"  # = tre_common.rediskeys.CONT
 
 def cmd_open_probes(a) -> int:
     n = 0
-    for raw in (_redis(a.redis).hgetall(PROBES_KEY) or {}).values():
+    recs = _redis(a.redis).hgetall(PROBES_KEY) or {}
+    if getattr(a, "any", False):
+        print(len(recs))
+        return 0
+    for raw in recs.values():
         try:
             n += json.loads(raw).get("status") in ("probing", "committing")
         except (ValueError, AttributeError):
@@ -667,7 +673,8 @@ def main(argv=None) -> int:
     p.add_argument("--live", required=True); p.add_argument("--registry", required=True)
     p.add_argument("--frozen"); p.add_argument("--trace"); p.set_defaults(fn=cmd_check_policy)
     p = sub.add_parser("client-header"); p.add_argument("--meta", required=True); p.set_defaults(fn=cmd_client_header)
-    p = sub.add_parser("open-probes"); p.add_argument("--redis", required=True); p.set_defaults(fn=cmd_open_probes)
+    p = sub.add_parser("open-probes"); p.add_argument("--redis", required=True); p.add_argument("--any", action="store_true")
+    p.set_defaults(fn=cmd_open_probes)
     p = sub.add_parser("trace-manifest"); p.add_argument("--out", required=True); p.add_argument("--name", required=True)
     p.add_argument("--trace", required=True); p.add_argument("--config", required=True); p.add_argument("--segments")
     p.add_argument("--source-manifest"); p.add_argument("--seed"); p.set_defaults(fn=cmd_trace_manifest)

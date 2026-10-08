@@ -1,0 +1,82 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
+# Smoke before campaign-ablation-safescale.yaml (controller tre-v2-controller:20261008-f23cb04d): T7 Tight-pool seed1
+# [100, 220) s, the slice of the earlier controller smokes (base load + the start of the 8b surge; it produced SafeScale
+# probes with every recent controller). Order fixed: tre-nosafescale first, then tre (also checks that the switch is back
+# to false and production behaviour returns after an ablation arm).
+# Acceptance, tre-nosafescale: valid; ablation_switches.json match (disable_safescale true); probe_gate.json 0; no probe
+#   record in Redis during or after the arm; donor releases with reason suffix _nosafescale and sleep_path urgent; no hidden
+#   binding left at the end; no SM 409 slot_occupied.
+# Acceptance, tre: valid; ablation_switches.json match (false); SafeScale probes appear (probe_slot_reserved / commit /
+#   rollback lines, safescale.json journals); no _nosafescale reason.
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-ablation-safescale.yaml --dry-run --probe
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-ablation-safescale.yaml > /data/nfs_shared_data/xxy/smoke-ablation-safescale-20261008.out 2>&1 &
+name: smoke-ablation-safescale-20261008
+round: ablation-safescale-20261008  # same exclusive-window marker round as the campaign (one window covers both)
+results_root: /data/nfs_shared_data/xxy/smoke-ablation-safescale-20261008
+trace_root: /data/nfs_shared_data/xxy/traces-v2-vslo-20261007
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v2
+seed: 1
+arms: [tre-nosafescale, tre]
+order: fixed
+max_attempts: 1                     # a smoke failure is looked at, not retried
+eta: {overhead_s: 330, report_s: 60}
+
+env:
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"               # probe gate (run_arm_pilot note 14): the previous arm's probes may still be resolving
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: false}
+  tre-nosafescale:
+    base: tre
+    label: TRE-noSafeScale
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: true}
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${TRE_REPO}/eval/configs/t7-decision-points.yaml
+  ref: tre
+  reps: 200
+  timeout_s: 600
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: T7_tight_pool
+    slice: {start_s: 100, duration_s: 120}   # base load + the start of the 8b surge at 120 s

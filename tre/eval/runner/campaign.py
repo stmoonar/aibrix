@@ -59,6 +59,10 @@ PRESERVE_KEYS = {"trace_path", "trace_seed", "trace_schedule", "trace_match_part
                  "kv_high", "overload_frac", "t_f", "ext_frac", "out_len_is_upper_bound", "kv_capacity_tokens",
                  "kv_agree_tol", "hold_mode", "req_ttl_s"}
 TIER1_MODES = ("oracle_noisy", "oracle", "last_window")
+# controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
+# sets them on the controller Deployment before the arm, checks the controller's startup log line
+# `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
+CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP")
 # collectors of docs/eval-metrics-spec §7 that every arm directory should hold (missing -> suspect)
 COLLECTOR_FILES = ("layout.jsonl", "pod_metrics_1s.jsonl", "pod_gauges.jsonl", "gpu_map.jsonl", "gpu_truth.jsonl",
                    "resource_usage.jsonl", "apa_status.jsonl", "signal_log.jsonl", "clock_offsets.json",
@@ -204,6 +208,26 @@ class ArmDef:
     label: str
     policy: dict = field(default_factory=dict)
     oracle_shift: Optional[dict] = None
+    controller_env: dict = field(default_factory=dict)
+
+
+def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
+    if not raw:
+        return {}
+    if base != "tre":
+        raise CampaignError(f"arm_defs.{arm_id}.controller_env is only supported for base tre (the controller actuates)")
+    if not isinstance(raw, dict):
+        raise CampaignError(f"arm_defs.{arm_id}.controller_env must be a mapping")
+    bad = sorted(set(raw) - set(CONTROLLER_ENV_KEYS))
+    if bad:
+        raise CampaignError(f"arm_defs.{arm_id}.controller_env: unknown keys {bad} (allowed {list(CONTROLLER_ENV_KEYS)})")
+    out = {}
+    for k, v in raw.items():
+        v = str(v).strip().lower()
+        if v not in ("true", "false"):
+            raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be true or false")
+        out[k] = v
+    return out
 
 
 def arm_def(c: dict, arm_id: str) -> ArmDef:
@@ -229,7 +253,8 @@ def arm_def(c: dict, arm_id: str) -> ArmDef:
     if shift is not None:
         if float(shift.get("period_s", 0)) <= 0 or not (0 < float(shift.get("frac", 0.25)) <= 0.5):
             raise CampaignError(f"arm_defs.{arm_id}.oracle_shift needs period_s > 0 and 0 < frac <= 0.5")
-    return ArmDef(arm_id, base, str(d.get("label") or DEFAULT_LABELS[base]), pol, shift)
+    return ArmDef(arm_id, base, str(d.get("label") or DEFAULT_LABELS[base]), pol, shift,
+                  _controller_env(arm_id, base, d.get("controller_env")))
 
 
 # ------------------------------------------------------------------ arm order
@@ -771,6 +796,8 @@ def arm_manifest(c: dict, item: PlanItem, e: TraceEntry, attempt: int, t0: float
         "trace_slice": src_man.get("slice"), "expected_requests": e.requests,
         "clock_offsets_s": clock.get("offsets_s"),
         "env": {k: c["env"][k] for k in sorted(c["env"])},
+        "controller_env": arm_def(c, item.arm).controller_env or None,
+        "ablation_switches": read_json(d / "ablation_switches.json"),
         "validity": verdict, **extra,
     }
 
@@ -1311,6 +1338,9 @@ class Campaign:
                     "ARM_TRACE_DIR": e.client_dir, "ARM_LOADGEN_CONFIG": e.client_config, "TRACE_FILE": e.trace_file,
                     "ARM_OUT_DIR": item.arm_dir, "ARM_LABEL_OVERRIDE": item.label, "ARM_VARIANT": item.arm,
                     "TRACE_SEED": str(e.seed)})
+        ce = arm_def(self.c, item.arm).controller_env
+        # ARM_CONTROLLER_ENV: "K=v ..." the arm wants; unset = every switch false (production)
+        env["ARM_CONTROLLER_ENV"] = " ".join(f"{k}={v}" for k, v in sorted(ce.items()))
         env.update(prep.get("env") or {})
         return env
 

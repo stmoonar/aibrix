@@ -11,6 +11,11 @@ S=__H__/state; echo "kubectl $*" >> $S/calls.log
 a="$*"
 case "$a" in
   *"get svc"*clusterIP*) echo 127.0.0.1 ;;
+  *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SAFESCALE*) cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || true ;;
+  *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SLOW_LOOP*) cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || true ;;
+  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; esac; done ;;
+  *"logs deploy/tre-v2-controller"*) [ -e $S/no_switch_line ] || printf '2026 INFO tre_controller {"disable_safescale": %s, "disable_slow_loop": %s, "event": "ablation_switches"}\n' \
+      "$(cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || echo false)" "$(cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || echo false)" ;;
   *"get deploy tre-v2-baseline-scaler"*replicas*) cat $S/scaler_replicas 2>/dev/null || echo 0 ;;
   *"get deploy tre-gateway-plugins"*TRE_BL_REQ_EVENTS*) cat $S/events 2>/dev/null || true ;;
   *"set env deploy/tre-gateway-plugins TRE_BL_REQ_EVENTS-"*) rm -f $S/events ;;
@@ -57,7 +62,10 @@ class Redis:
     def delete(self, k): return 1
     def get(self, k): return None
     def set(self, k, v, **kw): return True
-    def hgetall(self, k): return {}
+    def hgetall(self, k):
+        if k.endswith("safescale:probes") and os.path.exists(_S + "/probes"):
+            return {"probe-x": json.dumps({"status": "rolled_back"})}
+        return {}
     def scan_iter(self, **k): return iter(())
     def lrange(self, *a): return []
     def xrange(self, key, min="-", max="+", count=None):

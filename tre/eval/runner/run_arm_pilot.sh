@@ -53,6 +53,14 @@
 #      variant) and ARM_VARIANT (the campaign arm id, recorded in arm_meta.json).
 #  13. (2026-10-07) post-arm cleanup: decision source off (toggle tre, 0 APA CRs verified) BEFORE the
 #      restore to $BASELINE, as reset_canonical.sh (APA scaled the restored replica down again: 409).
+#  14. (2026-10-08) controller ablation switches (TRE_ABLATION_DISABLE_SAFESCALE / _SLOW_LOOP):
+#      ARM_CONTROLLER_ENV="K=true|false ..." (campaign arm_defs.<id>.controller_env, tre arms only;
+#      unset = every switch false = production). Before the controller restart: (a) hygiene gate - no
+#      SafeScale probe record left in Redis (probe_gate.json; exit 4 otherwise), (b) one `set env` on
+#      the controller Deployment for the switches that differ (unset counts as false). After the
+#      restart the controller's startup line `ablation_switches` is checked against the wanted values
+#      and kept in ablation_switches.json (an explicit ARM_CONTROLLER_ENV must match, else exit 4).
+#      At the end of the arm (and in the exit trap) every switch is put back to false.
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
@@ -93,6 +101,9 @@ REQUIRE_MARKER="${REQUIRE_MARKER:-1}"
 IDLE_S="${IDLE_S:-60}"; POST_S="${POST_S:-30}"
 SCORE_REGISTRY="${SCORE_REGISTRY:-$D/live-registry.yaml}"   # default: the live registry recorded at arm start
 PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for open SafeScale probes to resolve
+# ---- controller ablation switches (2026-10-08, note 14)
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP"
+ARM_CONTROLLER_ENV="${ARM_CONTROLLER_ENV:-}"
 # ---- gateway parity + baseline arms (2026-10-06)
 GW_PARITY="${GW_PARITY:-1}"                      # 1: every arm gets event stream on + x-tre-bl-in-tokens
 BL_CM_FILE="${BL_CM_FILE:-}"                     # frozen policy-configmaps.yaml (feat/baseline-params-20261006); empty = check live only
@@ -123,6 +134,11 @@ if [ "$SEND_IN_TOKENS" = 1 ]; then
     || { echo "--send-in-tokens needed (arm=$ARM GW_PARITY=$GW_PARITY) but $LG has no loadgen_v1 --send-in-tokens" >&2; exit 2; }
   LG_FLAGS+=(--send-in-tokens)
 fi
+for kv in $ARM_CONTROLLER_ENV; do
+  case " $CTL_ENV_KEYS " in *" ${kv%%=*} "*) ;; *) echo "ARM_CONTROLLER_ENV: unknown switch '${kv%%=*}' (allowed: $CTL_ENV_KEYS)" >&2; exit 2;; esac
+  case "${kv#*=}" in true|false) ;; *) echo "ARM_CONTROLLER_ENV: '$kv' must be true or false" >&2; exit 2;; esac
+  [ "$ARM" = tre ] || { echo "ARM_CONTROLLER_ENV is for tre arms only (arm=$ARM)" >&2; exit 2; }
+done
 if [ -e "$D/client/performance_metrics.json" ]; then
   echo "$D already has client results; set RUN_TAG for a repeat (never overwritten)" >&2; exit 2
 fi
@@ -215,6 +231,56 @@ events_set() {   # events_set <value> | events_set UNSET ; rollout only when it 
 }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \
                --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "$REDIS_URL" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
+# ---- controller ablation switches (note 14)
+ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
+ctl_want() { local kv; for kv in $ARM_CONTROLLER_ENV; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return 0; }; done; echo false; }
+ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the switches that differ; unset == false
+  local k cur want args=()
+  for k in $CTL_ENV_KEYS; do
+    cur=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); cur=${cur:-false}
+    if [ "$1" = want ]; then want=$(ctl_want "$k"); else want=false; fi
+    [ "$cur" = "$want" ] || args+=("$k=$want")
+  done
+  [ ${#args[@]} = 0 ] && return 0
+  kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "${args[@]}" >> "$D/runner.log" 2>&1
+  kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >> "$D/runner.log" 2>&1
+  log "controller env set: ${args[*]}"
+}
+ctl_env_now() { local k; for k in $CTL_ENV_KEYS; do printf '%s=%s ' "$k" "$(ctl_env_get "$k")"; done; }
+# hygiene gate: a probe record left in Redis would be finished by the new controller during the arm
+probe_gate() {
+  local i n="?"
+  for i in $(seq 1 $(( (PROBE_WAIT_S + 4) / 5 ))); do
+    n=$(BLT open-probes --redis "$REDIS_HOST" --any 2>/dev/null || echo "?")
+    [ "$n" = 0 ] && break; sleep 5
+  done
+  printf '{"probe_records": "%s", "epoch": %s}\n' "$n" "$(date +%s)" > "$D/probe_gate.json"
+  [ "$n" = 0 ] || { log "ERROR $n SafeScale probe record(s) left in Redis after ${PROBE_WAIT_S} s; refusing to start"; exit 4; }
+  log "probe gate: no SafeScale probe record in Redis"
+}
+# the effective switches: the controller's startup line {"event": "ablation_switches", ...}
+record_ablation_switches() {   # prints match | mismatch | missing; writes ablation_switches.json
+  local i line=""
+  for i in $(seq 1 30); do
+    line=$(kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" 2>/dev/null | grep -m1 '"ablation_switches"' || true)
+    [ -n "$line" ] && break; sleep 2
+  done
+  python3 - "$D/ablation_switches.json" "$line" "$(ctl_want TRE_ABLATION_DISABLE_SAFESCALE)" "$(ctl_want TRE_ABLATION_DISABLE_SLOW_LOOP)" "$(ctl_env_now)" <<'PY'
+import json, sys
+out, line, want_ss, want_sl, env_now = sys.argv[1:6]
+rec = None
+if "{" in line:
+    try:
+        rec = json.loads(line[line.index("{"):line.rindex("}") + 1])
+    except ValueError:
+        rec = None
+want = {"disable_safescale": want_ss == "true", "disable_slow_loop": want_sl == "true"}
+ok = rec is not None and all(rec.get(k) == v for k, v in want.items())
+json.dump({"logged": rec, "wanted": want, "match": ok, "deployment_env": env_now.strip(), "raw": line[:500] or None},
+          open(out, "w"), indent=1)
+print("match" if ok else ("missing" if rec is None else "mismatch"))
+PY
+}
 # G1: a baseline shell starts only when the observe controller has no open SafeScale probe. The
 # observe controller's single SM write is the rollback unhide of its OWN open probes, and that
 # PUT .../routable replaces the model's hidden set; with none open it never writes to the SM.
@@ -230,7 +296,7 @@ wait_no_open_probes() {
 probe_clocks() { python3 "$TOOLS/clock_probe.py" "$D/clock_offsets.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN clock probe ($1) failed"; }
 record_components() { python3 "$TOOLS/components.py" "$D/components.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN components ($1) failed"; }
 BLT() { python3 "$TOOLS/bl_tools.py" "$@"; }
-BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET
+BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET; CTL_ENV_TOUCHED=0
 on_exit() {   # safety net: never leave a baseline shell actuating or the stream flipped after a crash
   local rc=$?
   if [ "$BL_ENABLED" = 1 ]; then
@@ -240,6 +306,9 @@ on_exit() {   # safety net: never leave a baseline shell actuating or the stream
   fi
   if [ "$EVENTS_CHANGED" = 1 ]; then
     log "TRAP rc=$rc: gateway event stream back to '$EV_BEFORE'"; events_set "$EV_BEFORE" || log "TRAP ERROR: event stream restore failed"
+  fi
+  if [ "$CTL_ENV_TOUCHED" = 1 ]; then
+    log "TRAP rc=$rc: controller ablation switches back to false"; ctl_env_set false || log "TRAP ERROR: controller env restore failed"
   fi
   [ "$rc" = 0 ] || log "TRAP: runner exited rc=$rc mid-arm; cluster NOT reset (see RUN.md 'stop')"
 }
@@ -269,8 +338,9 @@ kubectl -n "$TRE_NS" get cm tre-v2-registry -o jsonpath='{.data.registry\.yaml}'
 EV_BEFORE=$(events_get); EV_BEFORE=${EV_BEFORE:-UNSET}
 python3 -c 'import json,sys; json.dump(dict(arm=sys.argv[1], label=sys.argv[2], gw_parity=int(sys.argv[3]), events_wanted=int(sys.argv[4]),
   send_in_tokens=int(sys.argv[5]), events_before=sys.argv[6], bl_seed=int(sys.argv[7]), mark_at=sys.argv[8], bl_cm_file=sys.argv[9] or None,
-  trace_seed=sys.argv[11] or None, controller_mode="active" if sys.argv[1] == "tre" else "observe", variant=sys.argv[12] or None),
-  open(sys.argv[10], "w"), indent=1)' "$ARM" "$ARM_LABEL" "$GW_PARITY" "$WANT_EVENTS" "$SEND_IN_TOKENS" "$EV_BEFORE" "$BL_SEED" "$MARK_AT" "$BL_CM_FILE" "$D/arm_meta.json" "$TRACE_SEED" "${ARM_VARIANT:-}"
+  trace_seed=sys.argv[11] or None, controller_mode="active" if sys.argv[1] == "tre" else "observe", variant=sys.argv[12] or None,
+  controller_env=sys.argv[13] or None),
+  open(sys.argv[10], "w"), indent=1)' "$ARM" "$ARM_LABEL" "$GW_PARITY" "$WANT_EVENTS" "$SEND_IN_TOKENS" "$EV_BEFORE" "$BL_SEED" "$MARK_AT" "$BL_CM_FILE" "$D/arm_meta.json" "$TRACE_SEED" "${ARM_VARIANT:-}" "$ARM_CONTROLLER_ENV"
 log "gateway parity: GW_PARITY=$GW_PARITY events_wanted=$WANT_EVENTS send_in_tokens=$SEND_IN_TOKENS (stream before: $EV_BEFORE)"
 if [ "$IS_BL" = 1 ]; then
   # policy ConfigMap: live content must be the frozen parameters (BL_CM_FILE) and no placeholder
@@ -322,8 +392,18 @@ fi
 kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_before.yaml" 2>&1 || true
 python3 "$TOOLS/snap.py" "$D/snap_before.json" "$SM" >> "$D/runner.log" 2>&1
 log "awake at start: $(awake_set)"
+probe_gate
+CTL_ENV_TOUCHED=1; ctl_env_set want
 if [ "$ARM" = tre ]; then log "run mode -> $(mode active active)"; else log "run mode -> $(mode observe active)"; fi
 restart_controller
+SW=$(record_ablation_switches)
+if [ "$SW" = match ]; then
+  log "ablation switches (controller startup line): $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["logged"])' "$D/ablation_switches.json")"
+elif [ -n "$ARM_CONTROLLER_ENV" ]; then
+  log "ERROR ablation switches $SW vs wanted '$ARM_CONTROLLER_ENV' (see ablation_switches.json); run mode -> $(mode observe observe)"; exit 4
+else
+  log "WARN ablation switches $SW (no switch requested; controller image without the startup line?)"
+fi
 T_RESTART=$(cat "$D/controller_restart_epoch"); START_ISO=$(date -u -d @"$T_RESTART" +%FT%TZ); echo "$START_ISO" > "$D/start_iso"
 T_IDLE0=$T_RESTART
 probe_clocks start
@@ -442,6 +522,8 @@ log "collected; awake at end: $(awake_set); EMFILE pods: $(wc -l < "$D/EMFILE_PO
 # INVALID after load and collection). observe/observe first: the controller restart inside
 # toggle tre comes up observing. Everything measured is collected above.
 log "restore: observe/observe -> $(mode observe observe)"
+ctl_env_set false; CTL_ENV_TOUCHED=0
+log "restore: controller switches: $(ctl_env_now)"
 bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode >> "$D/runner.log" 2>&1
 N_APA=$(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
 log "restore: APA CRs live: $N_APA"
