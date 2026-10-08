@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Collection, Mapping, Protocol
 
@@ -303,6 +304,37 @@ async def safescale_task(
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         await sleep(interval)
+
+
+async def rollback_left_probes_task(
+    *,
+    queue: PlannerQueue,
+    safescale,
+    interval_s: float,
+    cluster_view_box: ClusterViewReader | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+) -> None:
+    """SafeScale off (TRE_ABLATION_DISABLE_SAFESCALE): no probe is ever judged, so the
+    probes an earlier run left in Redis are finished once with the existing paths -
+    pods gone from a fresh view -> resolved; ``probing`` -> rolled back (unhide, reason
+    ``safescale_disabled``); ``committing`` -> its recorded decision re-submitted (the
+    restart recovery, with a fresh view only). Returns when no probe is left."""
+    while safescale.all_probes():
+        events: list[str] = []
+        now = now_ms()
+        view = _fresh_view(cluster_view_box)
+        _resolve_probes_with_gone_pods(queue, safescale, view, now_ms=now, events=events)
+        rollback_probes(
+            queue, safescale, safescale.active_probes(),
+            reason="safescale_disabled", event="safescale_disabled_rollback", now_ms=now, events=events,
+        )
+        if view is not None:
+            _recover_committing(queue, safescale, now_ms=now, events=events)
+        if events:
+            LOG.info(json.dumps({"event": "safescale_leftover_probes", "events": events}, sort_keys=True))
+        await sleep(interval_s)
+    LOG.info(json.dumps({"event": "safescale_leftover_probes_done"}))
 
 
 def _critical_models(reader: Callable[[], Collection[str]] | None) -> tuple[str, ...]:

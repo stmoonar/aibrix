@@ -14,6 +14,7 @@ Centralized values:
 - Loop cadence: `TRE_MONITOR_INTERVAL_SECONDS`, `TRE_RESCUE_INTERVAL_SECONDS`, `TRE_FAIRNESS_INTERVAL_SECONDS`.
 - Metrics windowing: `TRE_METRICS_WINDOW_MS`, `TRE_INSTANT_SAMPLE_INTERVAL_MS`, `TRE_PERCENTILE_MODE`.
 - P5 ablation switches: `TRE_ABLATION_DISABLE_FAST_LOOP`, `TRE_ABLATION_DISABLE_SAFESCALE` (`ENABLE_TRE_SCALING` removed 2026-10-07: actuation follows the run mode only).
+  - `TRE_ABLATION_DISABLE_SAFESCALE` (semantics 2026-10-08): SafeScale off = immediate release, as before 05f489f1 / v1. No SafeScale loop and no probe; the planner loops run with `safescale=None`, and every shrink that would start a probe takes the urgent donor path (reason suffix `_nosafescale`, one per donor model per tick): with a receiver a `TransferIntent`, without one (HIGH proactive) a model-level urgent scale-down, a TP same-slot preemption the urgent sleep of that pod plus the receiver's +1. Probes an earlier run left in Redis are rolled back once at startup (`rollback_left_probes_task`).
 - Signal source switch: `TRE_SIGNAL_SOURCE=zm|latency_p95|queue_len|kv_cache`.
 - Legacy controller constants found in the frozen upstream controller: `PROACTIVE_RELEASE_MIN_TRS` and all `SAFE_SCALE_*` knobs.
 

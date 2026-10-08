@@ -19,6 +19,7 @@ from tre_controller.planning.classify import (
     model_control_configs_from_registry,
 )
 from tre_controller.planning.planner import (
+    IMMEDIATE_DONOR_SLEEP_PATH,
     Action,
     ClusterView,
     HideAction,
@@ -31,6 +32,7 @@ from tre_controller.planning.planner import (
     UnhideAction,
     build_plan,
     probe_reserved_gpus,
+    relay_basis,
     upscale_of,
 )
 from tre_controller.planning.safescale import (
@@ -744,20 +746,9 @@ def _apply_safescale(
     """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
     preemption gives back cover every planned scale-up part (none is submitted)."""
     if safescale is None:
-        # No SafeScale: a shrink that needs a probe has no sleep_path and must not be
-        # dispatched (the controller's SafeScale alone owns draining; the queue would
-        # now refuse it anyway). Drop it with a ``safescale_probe_skipped`` event, like
-        # the observe / probe-block skips; keep scale-ups and `urgent` donors.
-        kept: list[Action] = []
-        none_events: list[str] = []
-        for action in actions:
-            if _requires_safescale_probe(action):
-                none_events.append(
-                    f"safescale_probe_skipped:{_safescale_probe_model(action)}:safescale_unavailable"
-                )
-                continue
-            kept.append(action)
-        return tuple(kept), tuple(none_events)
+        # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
+        # 05f489f1 / v1 (2026-10-08).
+        return _release_without_safescale(actions, probe_upscale_plans, cluster_view)
 
     converted: list[Action] = []
     events: list[str] = []
@@ -870,6 +861,63 @@ def _apply_safescale(
             if model not in survived:
                 covered_targets[model] = rescue
     return tuple(converted), tuple(events)
+
+
+#: Reason suffix of a shrink that would have run as a SafeScale probe and was released
+#: immediately because SafeScale is off (TRE_ABLATION_DISABLE_SAFESCALE).
+NO_SAFESCALE_REASON_SUFFIX = "_nosafescale"
+
+
+def _release_without_safescale(
+    actions: tuple[Action, ...],
+    probe_upscale_plans: dict[str, dict[str, int]],
+    cluster_view: ClusterView | None,
+) -> tuple[tuple[Action, ...], tuple[str, ...]]:
+    """Without SafeScale every action that would start a probe takes the planner's
+    immediate donor path (sleep path ``urgent``); everything else is unchanged:
+
+    * a shrink with a receiver -> a :class:`TransferIntent` donor -> receiver (the
+      receiver pairs the probe would have promised its commit), like an IDLE donor;
+    * a receiver-less shrink (HIGH proactive) -> a model-level urgent scale-down (the
+      SM keeps the replica floor);
+    * a TP same-slot preemption -> the urgent sleep of exactly that donor pod plus the
+      beneficiary's +1 (a wake that runs before the sleep is refused and re-planned).
+
+    At most one per donor model per tick, as the state machine allows one probe per
+    model (``safescale_probe_skipped:<donor>:released_this_tick``)."""
+    out: list[Action] = []
+    events: list[str] = []
+    released: set[str] = set()
+    for action in actions:
+        if not _requires_safescale_probe(action):
+            out.append(action)
+            continue
+        donor = _safescale_probe_model(action)
+        if donor in released:
+            events.append(f"safescale_probe_skipped:{donor}:released_this_tick")
+            continue
+        released.add(donor)
+        reason = f"{action.reason}{NO_SAFESCALE_REASON_SUFFIX}"
+        if isinstance(action, ShrinkForSlotAction):
+            out.append(ScaleAction(
+                donor, -1, reason, action.source_loop, donor=donor, receiver=action.beneficiary,
+                pods=(action.serve_id,), sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+            ))
+            out.append(ScaleAction(action.beneficiary, 1, reason, action.source_loop, receiver=action.beneficiary))
+        elif action.receiver:
+            count = -int(action.delta)
+            pairs = int((probe_upscale_plans.get(donor) or {}).get(action.receiver, 0) or count)
+            out.append(TransferIntent(
+                donor_model=donor, receiver_model=action.receiver, count=count, pairs=pairs,
+                reason=reason, source_loop=action.source_loop,
+                sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+                basis=relay_basis(cluster_view, donor, action.receiver),
+            ))
+        else:
+            out.append(replace(
+                action, reason=reason, requires_safescale=False, sleep_path=IMMEDIATE_DONOR_SLEEP_PATH
+            ))
+    return tuple(out), tuple(events)
 
 
 def probe_window_inputs(

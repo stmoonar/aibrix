@@ -30,7 +30,7 @@ from tre_controller.loops.fairness_task import fairness_task
 from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
-from tre_controller.loops.safescale_task import safescale_task
+from tre_controller.loops.safescale_task import rollback_left_probes_task, safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
     DirectEvidenceCollector,
@@ -110,6 +110,13 @@ def build_controller_task_specs(
         )
     )
 
+    # TRE_ABLATION_DISABLE_SAFESCALE (2026-10-08): the planner loops get no SafeScale, so
+    # every shrink that would run as a probe is released immediately (tick
+    # _release_without_safescale). The state machine only finishes probes an earlier
+    # run left in Redis (rollback_left_probes_task); while one is left, its model is
+    # still no donor (active_probe_models), afterwards that set is empty.
+    safescale_off = bool(getattr(cfg, "ablation_disable_safescale", False))
+    planner_safescale = None if safescale_off else deps.safescale
     if not bool(getattr(cfg, "ablation_disable_fast_loop", False)):
         specs.append(
             ControllerTaskSpec(
@@ -122,7 +129,7 @@ def build_controller_task_specs(
                     cluster_view_box=deps.cluster_view_box,
                     active_probe_models=lambda: _active_probe_models(deps.safescale),
                     decision_writer=deps.decision_writer,
-                    safescale=deps.safescale,
+                    safescale=planner_safescale,
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
                     model_state_box=deps.model_state_box,
@@ -142,7 +149,7 @@ def build_controller_task_specs(
                 cluster_view_box=deps.cluster_view_box,
                 active_probe_models=lambda: _active_probe_models(deps.safescale),
                 decision_writer=deps.decision_writer,
-                safescale=deps.safescale,
+                safescale=planner_safescale,
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
                 model_state_box=deps.model_state_box,
@@ -151,7 +158,19 @@ def build_controller_task_specs(
             ),
         )
     )
-    if not bool(getattr(cfg, "ablation_disable_safescale", False)):
+    if safescale_off:
+        specs.append(
+            ControllerTaskSpec(
+                "safescale_leftover_rollback",
+                lambda: rollback_left_probes_task(
+                    queue=deps.queue,
+                    safescale=deps.safescale,
+                    cluster_view_box=deps.cluster_view_box,
+                    interval_s=float(cfg.safescale.probe_poll_seconds),
+                ),
+            )
+        )
+    else:
         specs.append(
             ControllerTaskSpec(
                 "safescale",
@@ -353,8 +372,9 @@ def create_controller_dependencies(
     safescale.restore()
     # 2026-09-29 B+D: the controller scrapes the probe's remaining pods itself
     # (pod IP from the SM fleet state, port = registry safescale.metrics_port).
+    # Not with SafeScale off (TRE_ABLATION_DISABLE_SAFESCALE): no probe is judged.
     direct_evidence = None
-    if safescale.direct_mode():
+    if safescale.direct_mode() and not bool(getattr(cfg, "ablation_disable_safescale", False)):
         direct_evidence = DirectEvidenceCollector(
             safescale,
             PodMetricsScraper(timeout_s=cfg.safescale.scrape_timeout_s),

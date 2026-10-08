@@ -339,8 +339,7 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
     # (good latency) and the proactive scale-down is the observable proving the signal was
     # applied. The t1 suppress-hot-proactive guard is disabled here so that observable remains;
     # the guard's own behaviour is covered in test_planner.py.
-    # 2026-10-02: with no SafeScale the probe-requiring shrink is dropped (never sent
-    # as a path-less scale-down), so the observable is the skipped-probe event.
+    # 2026-10-08: with no SafeScale the probe-requiring shrink is released immediately.
     result = run_rescue_tick(
         snapshot,
         queue=queue,
@@ -349,8 +348,8 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
         suppress_hot_proactive_probe=False,
     )
 
-    assert result.submitted == 0 and not queue.submitted
-    assert "safescale_probe_skipped:critical:safescale_unavailable" in result.events
+    [action] = result.actions
+    assert (action.model, action.reason) == ("critical", "high_proactive_safescale_nosafescale")
 
 
 def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:
