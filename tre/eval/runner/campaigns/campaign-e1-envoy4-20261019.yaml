@@ -1,0 +1,91 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
+# End-to-end comparison under the 4-core Envoy (10-08 change: EnvoyProxy cpu 4 + concurrency 4; the earlier E1 data
+# was produced under the 1-core Envoy, so every baseline is rerun). Controller tre-v2-controller:20261008-f23cb04d,
+# SM / gateway plugins / UI 20261006-aaeef851.
+# Arms: tre (production), tre-nosafescale (TRE_ABLATION_DISABLE_SAFESCALE=true, v1 immediate release), tokenscale, apa.
+# run_arm_pilot.sh sets the controller switch for every arm (arms without controller_env get all switches false) and
+# restores false at the end of the arm. Nine traces of the V_slo set, seed1; the arm order inside a trace is a
+# Williams Latin-square row (rotated per trace, recorded per arm).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-e1-envoy4-20261019.yaml --dry-run
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-e1-envoy4-20261019.yaml > /data/nfs_shared_data/xxy/e1-envoy4-20261019.out 2>&1 &
+#
+# Before the real run (AGENTS.md "部署与合并流程" rule 6): the images on the cluster, this runner and
+# the client must be at shas that are in main and pushed; the dry-run warns when they are not.
+name: e1-envoy4-20261019
+round: e1-envoy4-20261019       # exclusive-window marker: "validation <start> <end> round=e1-envoy4-20261019"
+results_root: /data/nfs_shared_data/xxy/e1-envoy4-20261019
+trace_root: /data/nfs_shared_data/xxy/traces-v2-vslo-20261007    # <trace>/seed<k>/{traces_tre.effective.json,manifest.json}
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v2
+seed: 1
+arms: [tre, tre-nosafescale, tokenscale, apa]
+order: williams                     # williams | cyclic | fixed
+max_attempts: 2                     # a failed / invalid arm gets one retry after a full reset
+gap_s: 0
+eta: {overhead_s: 330, report_s: 150}   # per arm: trace 1080 s + overhead (observed 300 s + one extra controller rollout)
+
+env:
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"               # probe gate (run_arm_pilot note 14): the previous arm's probes may still be resolving
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: false}
+  tre-nosafescale:
+    base: tre
+    label: TRE-noSafeScale
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: true}
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
+  trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
+  match_parts: 3                    # oracle copy ends in <trace>/seed<k>/<file>, like the replayed trace
+
+report:
+  enabled: true
+  per_arm: true                     # report.py <arm> after every arm, then the cross-arm report of its trace
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${TRE_REPO}/eval/configs/t7-decision-points.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30           # tre:gpu_truth:<node> timestamp (clock-offset corrected)
+  breakpoint_lookback_s: 60         # no breakpoint_window_suspended in the controller log
+  wait_s: 300                       # how long transient checks (gpu-truth, O1 window) may take
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50                         # results file system
+    nodes: {nscc-ds-4a100-node9: 8} # root file system (07-13 / 10-06 disk-pressure evictions)
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Alternating
+  - trace: T7_tight_pool
+  - trace: Simul_spike
+  - trace: Real_code
+  - trace: Real_conv
+  - trace: Prefill_mix
+  - trace: Decode_burst
+  - trace: Sinusoidal
+  - trace: Steady
