@@ -388,6 +388,47 @@ def test_assess_arm_verdicts(tmp_path):
     assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "invalid"      # no run_validity.json
 
 
+def test_assess_arm_baseline_refusals_and_route_timeout_cuts(tmp_path):
+    thr = C.DEFAULTS["validity"]
+    d = tmp_path / "arm"
+    (d / "client").mkdir(parents=True)
+    (d / "baseline").mkdir()
+    (d / "client" / "performance_metrics.json").write_text("[]")
+    for f in C.COLLECTOR_FILES:
+        (d / f).write_text("x")
+
+    def score(**kw):
+        (d / "score.json").write_text(json.dumps({"models": {"ALL": {"n": 90, "trimmed": 10, "fail": 0, **kw}}}))
+
+    def validity(failures):
+        (d / "baseline" / "run_validity.json").write_text(json.dumps(
+            {"events_valid": True, "sm": {"tre_bl_sm_failures_total": failures}}))
+
+    def refused(code, reason):
+        return ("2026-10-18 18:18:13,044 WARNING tre_baselines.loop SM refused m up->2: "
+                f"{{'ok': False, 'code': {code}, 'error': 'x', 'reason': '{reason}'}}\n")
+    # placement refusals (SM enforcing one awake per GPU) are reported, not suspect
+    score(max_tokens_hit_frac=1.0)
+    validity(2)
+    (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") * 2)
+    v = C.assess_arm(d, 0, 100, thr, baseline=True)
+    assert v["verdict"] == "valid" and "slot_occupied x2" in v["info"][0]
+    # any failure the log does not explain stays suspect (fail closed): other reason, other code, no log
+    (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(503, "slot_occupied"))
+    assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
+    (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(409, "no_such_reason"))
+    assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
+    (d / "baseline-scaler.log").unlink()
+    assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
+    # max_tokens: route-timeout cuts do not count; misses among the others do
+    score(max_tokens_hit_frac=0.9, max_tokens_hit_frac_uncensored=1.0, censored_ge_149s=9)
+    assert C.assess_arm(d, 0, 100, thr)["verdict"] == "valid"
+    score(max_tokens_hit_frac=0.9, max_tokens_hit_frac_uncensored=0.95, censored_ge_149s=9)
+    assert C.assess_arm(d, 0, 100, thr)["verdict"] == "suspect"
+    score(max_tokens_hit_frac=0.9)                                   # old score.json: fail closed
+    assert C.assess_arm(d, 0, 100, thr)["verdict"] == "suspect"
+
+
 def test_dry_run_prints_plan_and_flags_missing_inputs(tmp_path, monkeypatch):
     p = write_campaign(tmp_path)
     c = C.load_campaign(p)

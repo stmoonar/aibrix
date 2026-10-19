@@ -87,6 +87,11 @@ for r in rows:
         if ok:
             c["max_tokens_unknown"] += mt is None
             c["max_tokens_hit"] += (mt is not None and out == mt)
+            if censored:
+                c["max_tokens_censored_ok"] += 1        # cut by the route timeout: cannot reach max_tokens
+            elif mt is not None:
+                c["max_tokens_known_uncens"] += 1
+                c["max_tokens_hit_uncens"] += (out == mt)
         if ok:
             lat[key]["ttft"].append(ttft); lat[key]["tpot"].append(tpot); lat[key]["e2e"].append(e2e)
 res = {"source": os.path.abspath(src), "registry": a.registry, "trim_s": a.trim_s,
@@ -96,6 +101,8 @@ for key in sorted(acc, key=lambda k: (k != "ALL", k)):
     ok_known = c["n"] - c["fail"] - c["max_tokens_unknown"]
     res["models"][key] = {**c, "V_req_pct": round(100 * c["viol"] / n, 3),
                           "max_tokens_hit_frac": round(c["max_tokens_hit"] / ok_known, 5) if ok_known > 0 else None,
+                          "max_tokens_hit_frac_uncensored": round(c["max_tokens_hit_uncens"] / c["max_tokens_known_uncens"], 5)
+                          if c["max_tokens_known_uncens"] > 0 else None,
                           "V_req_with_e2e_pct": round(100 * c["viol_with_e2e"] / n, 3),
                           **{f"{m}_p{p}_ms": pct(lat[key][m], p) for m in ("ttft", "tpot", "e2e") for p in (50, 95, 99)}}
 if a.validity:

@@ -678,6 +678,36 @@ _HTTP_409 = re.compile(r'HTTP/1\.[01]" 409\b')
 _HTTP_5XX = re.compile(r'HTTP/1\.[01]" 5\d\d\b')
 
 
+# SM 409 refusals that are the SM correctly enforcing one-awake-per-GPU (refusal table in
+# service-manager api/v2.py); a baseline without cross-model arbitration meets them by design.
+_PLACEMENT_REFUSALS = frozenset({"slot_occupied", "gpu_truth_used", "lease_starting", "lease_waking",
+                                 "wake_in_progress", "resident_awake"})
+_BL_REFUSED = re.compile(r"SM refused \S+ \S+: (\{.*\})")
+
+
+def _classify_bl_sm_failures(log: Path, total: int) -> tuple[dict, int]:
+    """(placement refusals by reason, count of failures they do not explain). The baseline shell logs
+    each failed SM call once as ``SM refused ...: {result dict}``; anything unlogged, not 409, or with
+    another reason stays unexplained (fail closed)."""
+    import ast
+    refusals: dict = {}
+    try:
+        with open(log, errors="replace") as f:
+            for line in f:
+                mt = _BL_REFUSED.search(line)
+                if not mt:
+                    continue
+                try:
+                    r = ast.literal_eval(mt.group(1))
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(r, dict) and r.get("code") == 409 and r.get("reason") in _PLACEMENT_REFUSALS:
+                    refusals[r["reason"]] = refusals.get(r["reason"], 0) + 1
+    except OSError:
+        pass
+    return refusals, max(0, total - sum(refusals.values()))
+
+
 def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Optional[int], thr: dict,
                baseline: bool = False) -> dict:
     """Verdict of one finished arm: ``valid`` | ``suspect`` (recorded, kept) | ``invalid``
@@ -685,7 +715,7 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
     results, not invalidity; invalid means the run itself broke (rc, client gone, sidecar
     EMFILE, baseline event loss, gross client failure)."""
     d = Path(arm_dir)
-    inv, sus, m = [], [], {}
+    inv, sus, info, m = [], [], [], {}
     m["rc"] = rc
     if rc != 0:
         inv.append(f"run_arm_pilot rc={rc}")
@@ -709,7 +739,11 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
                 inv.append(f"client failures {fail}/{n} ({ff:.1%}) > {thr['fail_frac_invalid']:.0%}")
             elif ff > float(thr["fail_frac_suspect"]):
                 sus.append(f"client failures {fail}/{n} ({ff:.2%})")
-        mth = a.get("max_tokens_hit_frac")
+        # Requests cut by the 150 s route timeout (censored, already SLO violations) cannot reach
+        # max_tokens; judge ignore_eos on the others. Old score.json without the split: fail closed.
+        mth = a.get("max_tokens_hit_frac_uncensored", a.get("max_tokens_hit_frac"))
+        m["max_tokens_hit_frac_uncensored"] = a.get("max_tokens_hit_frac_uncensored")
+        m["censored_ge_149s"] = a.get("censored_ge_149s")
         if mth is not None and float(mth) < float(thr["max_tokens_hit_min"]):
             sus.append(f"max_tokens_hit_frac {mth} < {thr['max_tokens_hit_min']} (ignore_eos not effective?)")
         if score.get("valid") is False:
@@ -737,7 +771,14 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
             smf = float(((rv.get("sm") or {}).get("tre_bl_sm_failures_total")) or 0)
             m["bl_sm_failures"] = smf
             if smf:
-                sus.append(f"baseline shell: {int(smf)} SM call failures")
+                refusals, unknown = _classify_bl_sm_failures(d / "baseline-scaler.log", int(smf))
+                m["bl_sm_refusals"] = refusals
+                m["bl_sm_unclassified"] = unknown
+                if refusals:
+                    info.append("baseline SM placement refusals (not failures): " + ", ".join(
+                        f"409 {k} x{v}" for k, v in sorted(refusals.items())))
+                if unknown:
+                    sus.append(f"baseline shell: {unknown} SM call failures not explained by placement refusals")
     co = read_json(d / "clock_offsets.json")
     if isinstance(co, dict):
         for node in (co.get("offsets_s") or {}):
@@ -749,7 +790,7 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
         m["missing_collectors"] = missing
         sus.append(f"missing / empty collector files: {missing}")
     verdict = "invalid" if inv else ("suspect" if sus else "valid")
-    return {"verdict": verdict, "invalid": inv, "suspect": sus, "metrics": m}
+    return {"verdict": verdict, "invalid": inv, "suspect": sus, "info": info, "metrics": m}
 
 
 # ------------------------------------------------------------------ per-arm manifest
@@ -1405,7 +1446,7 @@ class Campaign:
             met = verdict["metrics"]
             self.rec.line(f"[{item.n}/{len(self.plan)}] {'DONE' if verdict['verdict'] != 'invalid' else 'INVALID'} {key} "
                           f"verdict={verdict['verdict']} rc={rc} V_req={met.get('V_req_pct')}% fail={met.get('fail')} "
-                          f"wall={hms(t1 - t0)} reasons={'; '.join(verdict['invalid'] + verdict['suspect']) or '-'}")
+                          f"wall={hms(t1 - t0)} reasons={'; '.join(verdict['invalid'] + verdict['suspect'] + verdict.get('info', [])) or '-'}")
             if verdict["verdict"] != "invalid":
                 write_json_atomic(Path(item.arm_dir) / DONE_MARKER, man)
                 self.state["observed_overhead_s"].append(round(t1 - t0 - item.duration_s, 1))
