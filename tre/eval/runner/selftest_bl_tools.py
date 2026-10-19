@@ -211,5 +211,20 @@ json.dump({"events_valid": True, "invalid_because": []}, open(vf, "w"))
 v = json.loads(subprocess.run([sys.executable, sp, cdir, "--registry", sreg, "--validity", vf], capture_output=True, text=True).stdout)
 expect("score_pilot valid run", v["valid"] is True and v["models"] == b["models"])
 
+# route-timeout cut (e2e >= 149 s) cannot reach max_tokens; it must not lower the uncensored fraction
+cdir2 = os.path.join(tmp, "client2")
+os.makedirs(cdir2)
+rows2 = [{"request_id": f"r{i}", "model_name": "a", "start_time": 100.0 + i, "success": True, "ttft": 0.1,
+          "e2e_latency": 10.0, "output_tokens": 400, "input_tokens": 492} for i in range(50)]
+rows2.append({"request_id": "cut", "model_name": "a", "start_time": 200.0, "success": True, "ttft": 0.1,
+              "e2e_latency": 150.0, "output_tokens": 300, "input_tokens": 492})
+with open(os.path.join(cdir2, "performance_metrics.json"), "w") as fh:
+    for r_ in rows2:
+        fh.write(json.dumps(r_) + "\n")
+json.dump([{"request_id": r_["request_id"], "max_output_tokens": 400} for r_ in rows2], open(os.path.join(cdir2, "traces.json"), "w"))
+m2 = json.loads(subprocess.run([sys.executable, sp, cdir2, "--registry", sreg], capture_output=True, text=True).stdout)["models"]["ALL"]
+expect("score_pilot max_tokens_hit_frac_uncensored ignores route-timeout cuts",
+       m2["max_tokens_hit_frac_uncensored"] == 1.0 and m2["max_tokens_hit_frac"] < 1.0 and m2["max_tokens_censored_ok"] == 1)
+
 print(f"\n{len(fails)} failure(s)")
 sys.exit(1 if fails else 0)

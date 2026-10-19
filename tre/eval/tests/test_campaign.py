@@ -412,12 +412,13 @@ def test_assess_arm_baseline_refusals_and_route_timeout_cuts(tmp_path):
     validity(2)
     (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") * 2)
     v = C.assess_arm(d, 0, 100, thr, baseline=True)
-    assert v["verdict"] == "valid" and "slot_occupied x2" in v["info"][0]
+    assert v["verdict"] == "valid" and v["metrics"]["bl_sm_refusals"] == {"slot_occupied": 2}
     # any failure the log does not explain stays suspect (fail closed): other reason, other code, no log
     (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(503, "slot_occupied"))
     assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
-    (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(409, "no_such_reason"))
-    assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
+    for other in ("no_such_reason", "wake_in_progress", "lease_starting", "gpu_truth_used"):
+        (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(409, other))
+        assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
     (d / "baseline-scaler.log").unlink()
     assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"
     # max_tokens: route-timeout cuts do not count; misses among the others do

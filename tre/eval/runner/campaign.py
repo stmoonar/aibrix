@@ -680,8 +680,9 @@ _HTTP_5XX = re.compile(r'HTTP/1\.[01]" 5\d\d\b')
 
 # SM 409 refusals that are the SM correctly enforcing one-awake-per-GPU (refusal table in
 # service-manager api/v2.py); a baseline without cross-model arbitration meets them by design.
-_PLACEMENT_REFUSALS = frozenset({"slot_occupied", "gpu_truth_used", "lease_starting", "lease_waking",
-                                 "wake_in_progress", "resident_awake"})
+# Only slot_occupied: the other reasons (stuck wake journal, pod restart, ledger/physical mismatch,
+# foreign GPU use) can signal real faults and must stay suspect.
+_PLACEMENT_REFUSALS = frozenset({"slot_occupied"})
 _BL_REFUSED = re.compile(r"SM refused \S+ \S+: (\{.*\})")
 
 
@@ -741,7 +742,8 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
                 sus.append(f"client failures {fail}/{n} ({ff:.2%})")
         # Requests cut by the 150 s route timeout (censored, already SLO violations) cannot reach
         # max_tokens; judge ignore_eos on the others. Old score.json without the split: fail closed.
-        mth = a.get("max_tokens_hit_frac_uncensored", a.get("max_tokens_hit_frac"))
+        u = a.get("max_tokens_hit_frac_uncensored")
+        mth = u if u is not None else a.get("max_tokens_hit_frac")
         m["max_tokens_hit_frac_uncensored"] = a.get("max_tokens_hit_frac_uncensored")
         m["censored_ge_149s"] = a.get("censored_ge_149s")
         if mth is not None and float(mth) < float(thr["max_tokens_hit_min"]):

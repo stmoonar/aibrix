@@ -75,7 +75,7 @@ for r in rows:
     v_e2e = e2e is not None and e2e > s["e2e_p95_ms"]
     # route-timeout censoring: loadgen_v1 records a stream cut by the 150 s route timeout as
     # success (memory tre-client-diff-v1-v2-20260930); count it as a violation.
-    censored = e2e is not None and e2e >= 149000
+    censored = e2e is not None and e2e >= 149000   # keep equal to tre_eval.metrics.E2E_CENSOR_MS (standalone copy)
     v = (not ok) or v_tt or v_tp or censored
     mt = max_tok.get(r.get("request_id"))
     for key in (r["model_name"], "ALL"):
