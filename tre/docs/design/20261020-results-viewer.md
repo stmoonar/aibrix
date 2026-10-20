@@ -85,11 +85,13 @@ series. The page shows a warning for that arm.
          events: [{id, t, t_end, kind, model, binding, src, label, reason, detail, log}],
          probes: [{id, model, t0, t_hide, t1, outcome, reason, binding, detail}],
          gpus: {"node/gpu": [[t0, t1, model, binding, [[h0, h1], ...], open_end], ...]},
-         frag: [{tp, t0, t1, free}]}]}
+         frag: [{tp, t0, t1, free}],
+         apa_kv: {source, label, decisions: {n, at_crossing},           # APA arms only, else null
+                  models: {m: {target, up_tol, down_tol, window_s, from, evals}}}}]}
 ```
 
 - `ts` fields: `awake routable hidden target offered_rps rho viol_pct ttft_p95_ms tpot_p95_ms
-  running waiting kv_mean z gpus_awake reissues`. Replica columns are copied unchanged from
+  running waiting kv_mean z gpus_awake reissues` (+ `apa_kv` on APA arms). Replica columns are copied unchanged from
   `timeseries_1s.csv` (sample-and-hold); `tpot_p95_ms` is computed here on the same 10 s
   send-time bins and percentile rule as the report's `ttft_p95_10s_ms`; `reissues` counts sidecar
   continuations per second (from `events.csv`, not drawn as markers).
@@ -125,6 +127,37 @@ series. The page shows a warning for that arm.
 
 Size: about 2–4 MB for a 20-minute trace × 4 arms (series rounded to 4 significant digits,
 `null` for empty). Nothing is downsampled.
+
+## APA window value on the KV panel
+
+APA does not act on the 1 s KV line. At each evaluation it takes the mean of
+`kv_cache_usage_perc` over the pods its anchor selects (`model.aibrix.ai/name=<m>` and
+`tre.aibrix.io/routable=true`), then averages the samples in its stable window (20 s). It
+scales up when value / target > 1 + up tolerance and down when value / target < 1 − down
+tolerance. Evaluations run every 10 s and also on events (status write-back, each scaling
+step), so they are irregular: about every 3 s in the E1 runs.
+
+For arms with `decision_source == apa` the KV panel adds:
+
+- **APA window avg (logged)**: the `stableAvg` of every "Metrics window aggregation" line in
+  `aibrix-controller-manager.log` (the same number as `current_value` of the recommendation),
+  held until the next evaluation. The log stamps (klog, no year) are shifted by the
+  controller-manager node offset.
+- **APA window avg (approx.)**, only when that log is missing: the trailing window mean of the
+  1 s `kv_mean` (routable pods, the same pods APA selects). It ignores the sparse evaluation
+  times. Against the logged value (E1 10-19, T7 and Alternating, about 1400 evaluations each)
+  the median |difference| is 0.01 (1 point of KV %) and the 90th percentile is 0.05–0.075, so
+  the approximation shows the trend but cannot place single crossings of the trigger lines,
+  which are 15 points apart.
+- Trigger lines at target·(1 + up) and target·(1 − down), from the recorded CR
+  (`apa_crs_before.yaml`: `targetValue`, tolerance and window annotations), else from the
+  controller's "Effective autoscaling config" line, else the defaults target 0.5, up 0.1,
+  down 0.2, window 20 s with a warning. The panel unit names the source.
+- Each APA decision gets the window value it was taken on (logged path: the evaluation where
+  the recommendation turned to the new desired scale) and its zone (above up / band / below
+  down) in the tooltip and detail. In E1 10-19, 126 of 139 (T7) and 64 of 67 (Alternating)
+  decisions match their zone. Every mismatch is a scale-down of the desired value right after
+  failed SM scale-ups ("requested 1 but only 0 succeeded"), not a window crossing.
 
 ## Views
 
@@ -176,4 +209,5 @@ with the same layout and different targets get the same stranded seconds; probes
 arms, inside the arm's window, starting at their decision when the controller node has a
 clock offset (with the warning); the embedded JSON cannot close the script element; missing
 optional inputs give a page with a warning instead of an error; the page JS parses and its
-DOM-free core (hash state, alignment) runs under `node` when available.
+DOM-free core (hash state, alignment) runs under `node` when available; the APA window value equals the logged evaluations (held) or, without the log, the trailing
+window mean of the routable KV series, with trigger lines from the recorded CR.

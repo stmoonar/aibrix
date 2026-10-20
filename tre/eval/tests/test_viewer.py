@@ -195,3 +195,37 @@ def test_scaler_refusals_trust_an_inferred_clock_shift_only_with_a_clear_margin(
     ref = [e for e in ev if e["src"] == "baseline"]
     assert len(ref) == 2 and all(e.get("uncertain") for e in ref)
     assert sorted(e["t"] for e in ev if e["src"] == "sm_api") == [20, 40]  # the SM 409 lines are the markers
+
+
+def test_apa_window_value_follows_the_log_else_the_trailing_mean_and_cr_thresholds(tmp_path):
+    import time
+    with open(tmp_path / "apa_crs_before.yaml", "w") as fh:  # recorded CR: not the defaults
+        fh.write("items:\n- kind: PodAutoscaler\n  metadata:\n    name: m-a-apa\n    labels: {model.aibrix.ai/name: m-a}\n"
+                 "    annotations: {apa.autoscaling.aibrix.ai/window: 10s, autoscaling.aibrix.ai/scale-up-tolerance: '0.2',\n"
+                 "                  autoscaling.aibrix.ai/scale-down-tolerance: '0.3'}\n"
+                 "  spec:\n    metricsSources: [{targetMetric: kv_cache_usage_perc, targetValue: '0.6'}]\n")
+    evals = [(10.2, 0.7), (25.5, 0.3), (40.0, 0.5)]
+    with open(tmp_path / "aibrix-controller-manager.log", "w") as fh:
+        for t, v in evals:
+            e = T0 + t
+            fh.write(time.strftime("I%m%d %H:%M:%S", time.gmtime(e)) + f".{int(e % 1 * 1e6):06d}       1 client.go:217] "
+                     f'"Metrics window aggregation" metricKey="default/m-a-apa/kv_cache_usage_perc" stableAvg={v} panicAvg=0\n')
+    kv = [None if i % 7 == 0 else (i % 10) / 10 for i in range(60)]
+
+    def run():
+        ts = {"t0": 0, "n": 60, "models": {"m-a": {"kv_mean": list(kv)}}}
+        warns = []
+        out = V.build_apa_kv(str(tmp_path), V._Clock({"load_start_epoch": T0}), ts, [], warns.append)
+        return out, ts["models"]["m-a"]["apa_kv"], warns
+    out, series, warns = run()
+    c = out["models"]["m-a"]
+    assert (out["source"], c["target"], c["up_tol"], c["down_tol"], c["window_s"], c["from"]) == ("logged", 0.6, 0.2, 0.3, 10.0, "CR")
+    assert not warns
+    held = [None] * 10 + [0.7] * 15 + [0.3] * 15 + [0.5] * 20  # each evaluation held until the next
+    assert series == held
+    os.remove(tmp_path / "aibrix-controller-manager.log")
+    out, series, warns = run()
+    assert out["source"] == "approx" and any("approximated" in w for w in warns)
+    for i in range(60):  # trailing 10 s mean of the routable cross-pod series
+        xs = [x for x in kv[max(0, i - 9):i + 1] if x is not None]
+        assert series[i] == (pytest.approx(sum(xs) / len(xs), rel=1e-3) if xs else None)
