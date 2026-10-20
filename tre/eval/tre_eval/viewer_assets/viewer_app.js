@@ -474,27 +474,36 @@
       // APA arms: the window value APA decided on (logged per evaluation, else approximated) + its trigger lines
       const ov = visArms().filter((a) => a.decision_source === 'apa' && a.apa_kv && a.apa_kv.models[m]).map((a) => {
         const c = a.apa_kv.models[m];
-        return { arm: a, c: c, label: a.label + ' · ' + a.apa_kv.label, color: armColor(a), width: 2.5, step: true,
-          values: C.aligned(a, m, 'apa_kv', G).map((v) => (v == null ? null : v * 100)),
-          up: c.target * (1 + c.up_tol) * 100, dn: c.target * (1 - c.down_tol) * 100 };
+        const raw = C.aligned(a, m, 'apa_kv', G);
+        const full = c.target != null && c.up_tol != null && c.down_tol != null;  // else no lines, no zones
+        return { arm: a, c: c, raw: raw, full: full, label: a.label + ' · ' + c.label, color: armColor(a), width: 2.5, step: true,
+          values: raw.map((v) => (v == null ? null : v * 100)),
+          up: full ? c.target * (1 + c.up_tol) * 100 : null, dn: full ? c.target * (1 - c.down_tol) * 100 : null };
       });
       list.forEach((x) => { if (ov.some((o) => o.arm === x.arm)) { x.color = alpha(x.color, 0.45); x.label += ' (1 s)'; } });
       const refs = [];
-      ov.forEach((o) => {
+      ov.filter((o) => o.full).forEach((o) => {
         const pre = ov.length > 1 ? o.arm.label + ' ' : '';
         refs.push({ y: o.up, label: pre + 'APA up ' + C.fmtNum(o.up, 1) + '%', color: css('--critical') });
         refs.push({ y: o.dn, label: pre + 'APA down ' + C.fmtNum(o.dn, 1) + '%', below: true });
       });
-      const zone = (v, o) => (v == null ? '' : v > o.up ? 'above up' : v < o.dn ? 'below down' : 'band');
+      // APA's own ratio test on the unscaled value (apa.go): value / target > 1 + up, < 1 - down
+      const zone = (i, o) => {
+        const v = o.raw[i];
+        if (v == null || !o.full) return '';
+        const r = v / o.c.target;
+        return r > 1 + o.c.up_tol ? 'above up' : r < 1 - o.c.down_tol ? 'below down' : 'band';
+      };
+      const desc = (o) => (ov.length > 1 ? o.arm.label + ': ' : '') + o.c.label + ', window ' +
+        (o.c.window_s != null ? C.fmtNum(o.c.window_s, 0) + ' s' : 'unknown') + ' (' + o.c.from + ')' + (o.full ? '' : ', no trigger lines');
       spec.title = 'KV cache';
-      spec.unit = '% used, mean over routable pods' + (ov.length ? '; thick step = ' + ov[0].arm.apa_kv.label +
-        ' (window ' + C.fmtNum(ov[0].c.window_s, 0) + ' s), dashed = APA up / down triggers (' + ov[0].c.from + ')' : '');
+      spec.unit = '% used, mean over routable pods' + (ov.length ? '; thick step = ' + ov.map(desc).join('; ') + '; dashed = APA up / down triggers' : '');
       const all = list.concat(ov);
       spec.cfg = Object.assign(base, {
         series: all, refs: refs, yRange: () => [0, 100],
         tip: (i, t) => {
           let s = seriesTip('KV cache', '%', list, (v) => C.fmtNum(v, 1))(i, t);
-          ov.forEach((o) => { const v = o.values[i]; s += tipRow(o.color, null, o.label, v == null ? '–' : C.fmtNum(v, 1) + ' %', zone(v, o)); });
+          ov.forEach((o) => { const v = o.values[i]; s += tipRow(o.color, null, o.label, v == null ? '–' : C.fmtNum(v, 1) + ' %', zone(i, o)); });
           return s;
         },
       });
@@ -719,8 +728,9 @@
       return tipHead(k.label + ' · ' + a.label, e.t) +
         tipRow(modelColor(e.model), null, e.model || '', esc(e.reason == null ? '' : e.reason), e.binding ? esc(shortBinding(e.binding)) : '') +
         (e.t_end != null ? '<div class="tr">done after<span class="v">' + C.fmtNum(e.t_end - e.t, 2) + ' s</span></div>' : '') +
-        (e.detail && e.detail.apa_window_value != null ? '<div class="tr">APA window value<span class="v">' + C.fmtNum(e.detail.apa_window_value * 100, 1) +
-          ' %</span><span class="x">' + esc(e.detail.apa_zone || '') + '</span></div>' : '');
+        (e.detail && e.detail.apa_zone !== undefined ? '<div class="tr">APA window value<span class="v">' +
+          (e.detail.apa_window_value != null ? C.fmtNum(e.detail.apa_window_value * 100, 1) + ' %' : '–') +
+          '</span><span class="x">' + esc(e.detail.apa_zone || 'no config') + '</span></div>' : '');
     }
     if (it.type === 'bar') {
       const b = it.obj;

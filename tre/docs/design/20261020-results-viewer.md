@@ -86,8 +86,8 @@ series. The page shows a warning for that arm.
          probes: [{id, model, t0, t_hide, t1, outcome, reason, binding, detail}],
          gpus: {"node/gpu": [[t0, t1, model, binding, [[h0, h1], ...], open_end], ...]},
          frag: [{tp, t0, t1, free}],
-         apa_kv: {source, label, decisions: {n, at_crossing},           # APA arms only, else null
-                  models: {m: {target, up_tol, down_tol, window_s, from, evals}}}}]}
+         apa_kv: {decisions: {n, at_crossing, unmatched},               # APA arms only, else null
+                  models: {m: {source, label, target, up_tol, down_tol, window_s, from, evals}}}}]}
 ```
 
 - `ts` fields: `awake routable hidden target offered_rps rho viol_pct ttft_p95_ms tpot_p95_ms
@@ -137,27 +137,40 @@ scales up when value / target > 1 + up tolerance and down when value / target < 
 tolerance. Evaluations run every 10 s and also on events (status write-back, each scaling
 step), so they are irregular: about every 3 s in the E1 runs.
 
-For arms with `decision_source == apa` the KV panel adds:
+For arms with `decision_source == apa` the KV panel adds, per model:
 
 - **APA window avg (logged)**: the `stableAvg` of every "Metrics window aggregation" line in
   `aibrix-controller-manager.log` (the same number as `current_value` of the recommendation),
   held until the next evaluation. The log stamps (klog, no year) are shifted by the
-  controller-manager node offset.
-- **APA window avg (approx.)**, only when that log is missing: the trailing window mean of the
-  1 s `kv_mean` (routable pods, the same pods APA selects). It ignores the sparse evaluation
-  times. Against the logged value (E1 10-19, T7 and Alternating, about 1400 evaluations each)
-  the median |difference| is 0.01 (1 point of KV %) and the 90th percentile is 0.05–0.075, so
-  the approximation shows the trend but cannot place single crossings of the trigger lines,
-  which are 15 points apart.
-- Trigger lines at target·(1 + up) and target·(1 − down), from the recorded CR
-  (`apa_crs_before.yaml`: `targetValue`, tolerance and window annotations), else from the
-  controller's "Effective autoscaling config" line, else the defaults target 0.5, up 0.1,
-  down 0.2, window 20 s with a warning. The panel unit names the source.
-- Each APA decision gets the window value it was taken on (logged path: the evaluation where
-  the recommendation turned to the new desired scale) and its zone (above up / band / below
-  down) in the tooltip and detail. In E1 10-19, 126 of 139 (T7) and 64 of 67 (Alternating)
-  decisions match their zone. Every mismatch is a scale-down of the desired value right after
-  failed SM scale-ups ("requested 1 but only 0 succeeded"), not a window crossing.
+  controller-manager node offset; an unknown node with non-zero offsets gives a warning.
+  Lines with an APA marker that do not parse are counted in a warning, and so is an
+  autoscaler that maps to no model.
+- **APA window avg (approx.)**, only for a model with no logged evaluation: the trailing window
+  mean of the 1 s `kv_mean` (routable pods, the same pods APA selects). It ignores the sparse
+  evaluation times. Against the logged value (E1 10-19, T7 and Alternating, about 1400
+  evaluations each) the median |difference| is 0.01 (1 point of KV %) and the 90th percentile
+  is 0.05–0.075, so the approximation shows the trend but cannot place single crossings of the
+  trigger lines, which are 15 points apart.
+- Trigger lines at target·(1 + up) and target·(1 − down). Window and tolerances come from the
+  controller's "Effective autoscaling config" lines (what it used; every line is kept, and a
+  change during the run gives a warning), else from the recorded CR annotations
+  (`apa_crs_before.yaml`, else `apa_crs_after.yaml`). The target comes from the CR
+  `targetValue` only. A CR that disagrees with the log gives a warning. A value found in
+  neither source stays unset: no trigger lines and no zones for that model, with a warning.
+  The panel unit names the window and the sources (per APA arm when there are several).
+- Zones use APA's own ratio test: value / target > 1 + up is "above up", < 1 − down is
+  "below down", else "band" (the page tooltip uses the same test on the unscaled value).
+- Each APA decision gets the window value it was taken on and its zone (tooltip, detail).
+  Logged path: the evaluation where the recommendation turned to the new desired scale, within
+  [t − 10 s, t + 2 s] of the decision; none gives value `null`, zone "no matching evaluation",
+  and a counted warning. Approx path: the trailing mean at the latest 1 s sample at or before
+  t − 2 s, which is approximate.
+- A `decision_down` is a drop of the desired scale from its previous value, not a down
+  crossing. After a failed SM scale-up APA recomputes ceil(actual pods × value / target), so
+  the desired scale can drop while the value is above the up line (T7 at 752.8 s: 4 → 3 at
+  0.731). In E1 10-19, 126 of 139 (T7) and 64 of 67 (Alternating) decisions match their zone;
+  every mismatch is such a drop right after failed SM scale-ups ("requested 1 but only 0
+  succeeded").
 
 ## Views
 

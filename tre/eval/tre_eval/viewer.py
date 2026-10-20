@@ -172,14 +172,16 @@ class _Clock:
         off = self.off.get(self.nodes.get(correct_for, ""), 0.0) if correct_for else 0.0
         return epoch - off - self.t_load
 
-    WHAT = {"controller": "decisions and SafeScale probes", "baseline-scaler": "decisions"}
+    WHAT = {"controller": "decisions and SafeScale probes", "baseline-scaler": "decisions",
+            "aibrix-controller-manager": "APA evaluation stamps (KV panel)"}
+    CORRECTED = {"aibrix-controller-manager"}  # the viewer shifts this log by its node offset when the node is known
 
     def skew_warnings(self, components: list[str]) -> list[str]:
         out = []
         any_off = any(abs(v) > 0.5 for v in self.off.values())
         for c in components:
             node, what = self.nodes.get(c), self.WHAT.get(c, "timestamps")
-            if node is not None and abs(self.off.get(node, 0.0)) > 0.5:
+            if node is not None and abs(self.off.get(node, 0.0)) > 0.5 and c not in self.CORRECTED:
                 out.append(f"{c} runs on {node}, {self.off[node]:+.1f} s from the reference clock; its {what} are "
                            "not corrected (load.py rule) and may be shifted against the replica / latency series")
             elif node is None and any_off:
@@ -632,14 +634,16 @@ def fragmentation(t0: int, n: int, gpus: dict[str, list], nodes: list[dict], tps
 # ---------------------------------------------------------------- APA window value (KV panel)
 # What APA decides on: per evaluation the cross-pod mean of kv_cache_usage_perc over the routable pods,
 # averaged over the samples in its stable window; scale up when value / target > 1 + up_tol, down when
-# value / target < 1 - down_tol (pkg/controller/podautoscaler). Defaults below are the deployed values;
-# using them always adds a warning.
-APA_DEFAULTS = {"target": 0.5, "up_tol": 0.1, "down_tol": 0.2, "window_s": 20.0}
+# value / target < 1 - down_tol (pkg/controller/podautoscaler/algorithm/apa.go). Window and tolerances come
+# from the controller's "Effective autoscaling config" log line (what it actually used), else the recorded
+# CR; the target from the CR only. A value found in neither source is left unset: no trigger line, no zone.
+APA_KEYS = ("window_s", "up_tol", "down_tol")
 _KLOG = re.compile(r"^[IWE](\d\d)(\d\d) (\d\d):(\d\d):(\d\d)\.(\d+)\s")
 _APA_AGG = re.compile(r'"Metrics window aggregation" metricKey="[^/"]*/([^/"]+)/kv_cache_usage_perc" stableAvg=([-\d.eE+]+|NaN)')
 _APA_REC = re.compile(r'"Scaling recommendation computed" source="[^/"]*/([^"]+)".*?"DesiredReplicas":(\d+)')
 _APA_CFG = re.compile(r'"Effective autoscaling config" podAutoscaler="[^/"]*/([^"]+)".*?stableWindow="([\d.]+)s" '
                       r'upTolerance=([\d.]+) downTolerance=([\d.]+)')
+_APA_MARKS = ("Metrics window aggregation", "Scaling recommendation computed", "Effective autoscaling config")
 
 
 def _klog_epoch(mo: str, day: str, hh: str, mm: str, ss: str, frac: str, near: float) -> float | None:
@@ -664,61 +668,84 @@ def _seconds(v: Any) -> float | None:
     return float(mt.group(1)) * {"ms": 0.001, "s": 1.0, "m": 60.0, None: 1.0}[mt.group(2)]
 
 
-def _pa_model(name: str, models: list[str], by_cr: dict[str, str]) -> str:
-    return by_cr.get(name) or next((m for m in sorted(models, key=len, reverse=True) if name.startswith(m)), name)
+def _pa_model(name: str, models: list[str], by_cr: dict[str, str]) -> str | None:
+    if name in by_cr:
+        return by_cr[name]
+    return next((m for m in sorted(models, key=len, reverse=True) if name.startswith(m)), None)
 
 
-def apa_config(raw: str | None, models: list[str], log_cfg: dict[str, dict], warn) -> tuple[dict, dict]:
-    """Per model {target, up_tol, down_tol, window_s, from}: the recorded CR (apa_crs_before.yaml: spec
-    targetValue, annotations) first, then the controller's 'Effective autoscaling config' log line, then
-    APA_DEFAULTS (with a warning). Second value: PA name -> model, from the CRs."""
+def _apa_crs(raw: str | None, fname: str) -> tuple[dict[str, dict], dict[str, str]]:
+    """apa_crs_{before,after}.yaml -> ({model: {target, window_s, up_tol, down_tol}}, {PA name: model})."""
     crs: dict[str, dict] = {}
     by_cr: dict[str, str] = {}
-    p = os.path.join(raw, "apa_crs_before.yaml") if raw else None
-    if p and yaml is not None and os.path.exists(p):
-        try:
-            with open(p) as fh:
-                doc = yaml.safe_load(fh) or {}
-        except (OSError, yaml.YAMLError):
-            doc = {}
-        for it in (doc.get("items") or [doc]) if isinstance(doc, dict) else []:
-            if not isinstance(it, dict) or it.get("kind") != "PodAutoscaler":
-                continue
-            md, spec = it.get("metadata") or {}, it.get("spec") or {}
-            name = md.get("name")
-            m = (md.get("labels") or {}).get("model.aibrix.ai/name") or (spec.get("scaleTargetRef") or {}).get("name")
-            if not name or not m:
-                continue
-            by_cr[name] = m
-            ann = md.get("annotations") or {}
-            src = next((x for x in spec.get("metricsSources") or [] if x.get("targetMetric") == "kv_cache_usage_perc"), {})
-            crs[m] = {"target": _f(src.get("targetValue")), "up_tol": _f(ann.get("autoscaling.aibrix.ai/scale-up-tolerance")),
-                      "down_tol": _f(ann.get("autoscaling.aibrix.ai/scale-down-tolerance")),
-                      "window_s": _seconds(ann.get("apa.autoscaling.aibrix.ai/window"))}
-    logs = {_pa_model(k, models, by_cr): v for k, v in log_cfg.items()}
-    out, defaulted = {}, set()
+    p = os.path.join(raw, fname) if raw else None
+    if not p or yaml is None or not os.path.exists(p):
+        return crs, by_cr
+    try:
+        with open(p) as fh:
+            doc = yaml.safe_load(fh) or {}
+    except (OSError, yaml.YAMLError):
+        return crs, by_cr
+    for it in (doc.get("items") or [doc]) if isinstance(doc, dict) else []:
+        if not isinstance(it, dict) or it.get("kind") != "PodAutoscaler":
+            continue
+        md, spec = it.get("metadata") or {}, it.get("spec") or {}
+        name = md.get("name")
+        m = (md.get("labels") or {}).get("model.aibrix.ai/name") or (spec.get("scaleTargetRef") or {}).get("name")
+        if not name or not m:
+            continue
+        by_cr[name] = m
+        ann = md.get("annotations") or {}
+        src = next((x for x in spec.get("metricsSources") or [] if x.get("targetMetric") == "kv_cache_usage_perc"), {})
+        crs[m] = {"target": _f(src.get("targetValue")), "up_tol": _f(ann.get("autoscaling.aibrix.ai/scale-up-tolerance")),
+                  "down_tol": _f(ann.get("autoscaling.aibrix.ai/scale-down-tolerance")),
+                  "window_s": _seconds(ann.get("apa.autoscaling.aibrix.ai/window"))}
+    return crs, by_cr
+
+
+def apa_config(raw: str | None, models: list[str], log_cfgs: dict[str, list], warn) -> tuple[dict, dict]:
+    """Per model {target, window_s, up_tol, down_tol, from}; ``log_cfgs``: model -> [(t, {window_s, up_tol,
+    down_tol})] in log order. Second value: PA name -> model, from the CRs."""
+    before, by_cr = _apa_crs(raw, "apa_crs_before.yaml")
+    after, by_after = _apa_crs(raw, "apa_crs_after.yaml")
+    by_cr = {**by_after, **by_cr}
+    out, missing = {}, defaultdict(list)
     for m in models:
-        c, froms = {}, set()
-        for k, dflt in APA_DEFAULTS.items():
-            for name, srcd in (("CR", crs.get(m) or {}), ("controller log", logs.get(m) or {})):
-                if srcd.get(k) is not None:
-                    c[k] = srcd[k]
-                    froms.add(name)
-                    break
+        logged = log_cfgs.get(m) or []
+        distinct = list(dict.fromkeys(tuple(c[k] for k in APA_KEYS) for _, c in logged))
+        if len(distinct) > 1:
+            warn(f"APA config of {m} changed during the run (window, up, down: "
+                 + " -> ".join(", ".join(f"{x:g}" for x in d) for d in distinct) + "); the first one is drawn")
+        lc = dict(zip(APA_KEYS, distinct[0])) if distinct else {}
+        cr = before.get(m) or after.get(m) or {}
+        c, froms = {}, []
+        for k in APA_KEYS:
+            if lc.get(k) is not None:
+                c[k] = lc[k]
+            elif cr.get(k) is not None:
+                c[k] = cr[k]
             else:
-                c[k] = dflt
-                defaulted.add(k)
-                froms.add("default")
-        c["from"] = " + ".join(sorted(froms))
+                c[k] = None
+                missing[m].append(k)
+            for name, crd in (("before", before.get(m)), ("after", after.get(m))):
+                if lc.get(k) is not None and crd and crd.get(k) is not None and abs(crd[k] - lc[k]) > 1e-9:
+                    warn(f"APA {k} of {m}: CR ({name}) says {crd[k]:g}, the controller log says {lc[k]:g}; the log value is drawn")
+        c["target"] = cr.get("target")
+        if c["target"] is None:
+            missing[m].append("target")
+        froms.append("window/tolerances: " + ("controller log" if lc else "CR" if cr else "none"))
+        froms.append("target: " + ("CR" if c["target"] is not None else "none"))
+        c["from"] = "; ".join(froms)
         out[m] = c
-    if defaulted:
-        warn("APA " + ", ".join(sorted(defaulted)) + " not recorded (no apa_crs_before.yaml / controller log value): "
-             "defaults " + ", ".join(f"{k}={APA_DEFAULTS[k]:g}" for k in sorted(defaulted)) + " used for the KV trigger lines")
+    if missing:
+        warn("APA config not recorded (" + "; ".join(f"{m}: {', '.join(ks)}" for m, ks in missing.items())
+             + "): no trigger lines or zones for " + ", ".join(missing))
     return out, by_cr
 
 
 def apa_zone(v: float | None, c: dict) -> str | None:
-    if v is None or not c.get("target"):
+    """The zone of a window value, by APA's own ratio test (None when the config is incomplete)."""
+    if v is None or not c.get("target") or c.get("up_tol") is None or c.get("down_tol") is None:
         return None
     r = v / c["target"]
     return "above up" if r > 1 + c["up_tol"] else "below down" if r < 1 - c["down_tol"] else "band"
@@ -726,106 +753,119 @@ def apa_zone(v: float | None, c: dict) -> str | None:
 
 def _apa_log(raw: str | None, clock: _Clock):
     """aibrix-controller-manager.log -> (evals {pa: [(t, value)]}, recs {pa: [(t, desired, value)]},
-    cfg {pa: {window_s, up_tol, down_tol}}); None when the log is absent. Stamps are the controller-manager
-    host's clock, shifted by its node offset."""
+    cfgs {pa: [(t, {window_s, up_tol, down_tol})]}, bad); None when the log is absent. ``bad`` counts lines
+    that carry one of the three markers but do not parse. Stamps are the controller-manager host's clock,
+    shifted by its node offset."""
     p = os.path.join(raw, "aibrix-controller-manager.log") if raw else None
     if not p or not os.path.exists(p) or clock.t_load is None:
         return None
-    evals, recs, cfg = defaultdict(list), defaultdict(list), {}
+    evals, recs, cfgs = defaultdict(list), defaultdict(list), defaultdict(list)
     last: dict[str, float] = {}
+    bad = 0
     with open(p, errors="replace") as fh:
         for line in fh:
-            if "Metrics window aggregation" not in line and "Scaling recommendation" not in line \
-                    and "Effective autoscaling config" not in line:
+            if not any(k in line for k in _APA_MARKS):
                 continue
             mk = _KLOG.match(line)
-            if not mk:
+            t = clock.rel(_klog_epoch(*mk.groups(), near=clock.t_load), "aibrix-controller-manager") if mk else None
+            ma, mr, mc = _APA_AGG.search(line), _APA_REC.search(line), _APA_CFG.search(line)
+            v = _f(ma.group(2)) if ma else None
+            if t is None or not (ma or mr or mc) or (ma and v is None):
+                bad += 1
                 continue
-            t = clock.rel(_klog_epoch(*mk.groups(), near=clock.t_load), "aibrix-controller-manager")
-            ma = _APA_AGG.search(line)
             if ma:
-                v = _f(ma.group(2))
-                if v is not None:
-                    evals[ma.group(1)].append((t, v))
-                    last[ma.group(1)] = v
-                continue
-            mr = _APA_REC.search(line)
-            if mr:
+                evals[ma.group(1)].append((t, v))
+                last[ma.group(1)] = v
+            elif mr:
                 recs[mr.group(1)].append((t, int(mr.group(2)), last.get(mr.group(1))))
-                continue
-            mc = _APA_CFG.search(line)
-            if mc and mc.group(1) not in cfg:
-                cfg[mc.group(1)] = {"window_s": float(mc.group(2)), "up_tol": float(mc.group(3)), "down_tol": float(mc.group(4))}
-    return evals, recs, cfg
+            else:
+                cfgs[mc.group(1)].append((t, {"window_s": float(mc.group(2)), "up_tol": float(mc.group(3)),
+                                              "down_tol": float(mc.group(4))}))
+    return evals, recs, cfgs, bad
 
 
 def build_apa_kv(raw: str | None, clock: _Clock, ts: dict, events: list[dict], warn) -> dict | None:
-    """APA arms: the KV value APA decided on, as ts field 'apa_kv' (0..1) per model, plus its config.
-    Logged path: every evaluation's stable-window average from the controller log, held until the next
-    evaluation. Approx path (no log): trailing window_s mean of the 1 s routable cross-pod kv_mean.
-    Each APA decision event gets the window value it was taken on and its zone."""
+    """APA arms: the KV value APA decided on, as ts field 'apa_kv' (0..1, full precision) per model, plus
+    its config. Logged (per model): every evaluation's stable-window average from the controller log, held
+    until the next evaluation. Approx (no evaluation of that model in the log): trailing window_s mean of the
+    1 s routable cross-pod kv_mean. Each APA decision gets the window value it was taken on and its zone."""
     models = list(ts["models"])
     if not models:
         return None
     log = _apa_log(raw, clock)
-    evals, recs, lcfg = log if log else ({}, {}, {})
-    cfg, by_cr = apa_config(raw, models, lcfg, warn)
-    ev_m: dict[str, list] = defaultdict(list)
-    rec_m: dict[str, list] = defaultdict(list)
-    for pa, xs in evals.items():
-        ev_m[_pa_model(pa, models, by_cr)] += xs
-    for pa, xs in recs.items():
-        rec_m[_pa_model(pa, models, by_cr)] += xs
+    evals, recs, lcfg, bad = log if log else ({}, {}, {}, 0)
+    if bad:
+        warn(f"aibrix-controller-manager.log: {bad} APA line(s) that do not parse (skipped)")
+    by_cr = {**_apa_crs(raw, "apa_crs_after.yaml")[1], **_apa_crs(raw, "apa_crs_before.yaml")[1]}
+    to_m: dict[str, str | None] = {pa: _pa_model(pa, models, by_cr) for pa in set(evals) | set(recs) | set(lcfg)}
+    lost = sorted(pa for pa, m in to_m.items() if m is None)
+    if lost:
+        warn("APA autoscaler(s) in the controller log that map to no model of this arm (ignored): " + ", ".join(lost))
+    ev_m, rec_m, cfg_m = defaultdict(list), defaultdict(list), defaultdict(list)
+    for src_d, dst in ((evals, ev_m), (recs, rec_m), (lcfg, cfg_m)):
+        for pa, xs in src_d.items():
+            if to_m.get(pa):
+                dst[to_m[pa]] += xs
+    cfg, _ = apa_config(raw, models, {m: sorted(xs, key=lambda x: x[0]) for m, xs in cfg_m.items()}, warn)
     t0, n = ts["t0"], ts["n"]
-    logged = any(ev_m.get(m) for m in models)
-    if not logged:
-        warn("no APA evaluation log (aibrix-controller-manager.log 'Metrics window aggregation'): the APA window "
-             "average is approximated from the 1 s routable KV mean")
-    out = {"source": "logged" if logged else "approx",
-           "label": "APA window avg (" + ("logged" if logged else "approx.") + ")", "models": {}}
+    approx = [m for m in models if not ev_m.get(m)]
+    if approx:
+        warn("no APA evaluation logged (aibrix-controller-manager.log 'Metrics window aggregation') for "
+             + ", ".join(approx) + ": its APA window average is approximated from the 1 s routable KV mean")
+    out = {"models": {}}
     for m in models:
         f, c = ts["models"][m], cfg[m]
-        series = [None] * n
-        pts = sorted((t, v) for t, v in ev_m.get(m, []) if t is not None and t0 <= t < t0 + n)
+        series: list = [None] * n
+        logged = m not in approx
         if logged:
+            pts = sorted((t, v) for t, v in ev_m[m] if t0 <= t < t0 + n)
             for k, (t, v) in enumerate(pts):  # hold each evaluation until the next one
                 a = int(math.floor(t)) - t0
                 b = int(math.floor(pts[k + 1][0])) - t0 if k + 1 < len(pts) else n
                 for i in range(a, max(a + 1, b)):
-                    series[i] = _r(v)
+                    series[i] = v
         else:
-            w = max(1, int(round(c["window_s"])))
+            pts = []
+            w = max(1, int(round(c["window_s"] or 20)))  # unknown window: 20 s only to draw the approximation
             kv = f.get("kv_mean") or [None] * n
             for i in range(n):
                 xs = [x for x in kv[max(0, i - w + 1):i + 1] if x is not None]
-                series[i] = _r(sum(xs) / len(xs)) if xs else None
+                series[i] = sum(xs) / len(xs) if xs else None
         f["apa_kv"] = series
-        out["models"][m] = {**c, "evals": len(pts) if logged else None}
+        out["models"][m] = {**c, "source": "logged" if logged else "approx",
+                            "label": "APA window avg (" + ("logged" if logged else "approx.") + ")",
+                            "evals": len(pts) if logged else None}
     flips: dict[str, list] = defaultdict(list)  # recommendations whose desired scale differs from the previous one
     for m, xs in rec_m.items():
         prev = None
-        for t, d, v in sorted((x for x in xs if x[0] is not None), key=lambda x: x[0]):
+        for t, d, v in sorted(xs, key=lambda x: x[0]):
             if d != prev:
                 flips[m].append((t, d, v))
             prev = d
-    n_dec = n_ok = 0
+    n_dec = n_ok = n_none = 0
     for e in events:
         if e["kind"] not in ("decision_up", "decision_down") or e.get("model") not in out["models"]:
             continue
         m, c = e["model"], cfg[e["model"]]
-        v = None
         want = (e.get("detail") or {}).get("desired")
-        if logged:  # the evaluation where the recommendation turned to the new desired scale, up to 2 s after (poll lag)
-            cand = [x for x in flips.get(m, []) if x[0] <= e["t"] + 2.0 and (want is None or x[1] == want)]
+        if out["models"][m]["source"] == "logged":
+            # the evaluation where the recommendation turned to the new desired scale: at most 10 s before the
+            # status change was polled, at most 2 s after it (poll lag)
+            cand = [x for x in flips.get(m, []) if e["t"] - 10.0 <= x[0] <= e["t"] + 2.0 and (want is None or x[1] == want)]
             v = cand[-1][2] if cand else None
         else:
-            i = int(math.floor(e["t"])) - t0
+            # approximate: the trailing mean at the latest 1 s sample at or before e.t - 2 s (the status poll lags
+            # the evaluation by up to ~2 s); real evaluations are sparse, so this is not the value APA used
+            i = int(math.floor(e["t"] - 2.0)) - t0
             v = ts["models"][m]["apa_kv"][i] if 0 <= i < n else None
-        z = apa_zone(v, c)
-        e["detail"] = {**(e.get("detail") or {}), "apa_window_value": _r(v), "apa_zone": z}
+        z = apa_zone(v, c) if v is not None else "no matching evaluation"
+        n_none += v is None
+        e["detail"] = {**(e.get("detail") or {}), "apa_window_value": v, "apa_zone": z}
         n_dec += 1
         n_ok += (e["kind"] == "decision_up" and z == "above up") or (e["kind"] == "decision_down" and z == "below down")
-    out["decisions"] = {"n": n_dec, "at_crossing": n_ok}
+    if n_none:
+        warn(f"{n_none} APA decision(s) without a matching evaluation in [t - 10 s, t + 2 s] (no window value)")
+    out["decisions"] = {"n": n_dec, "at_crossing": n_ok, "unmatched": n_none}
     return out
 
 
@@ -917,7 +957,8 @@ def build(report_dir: str, trace: str | None = None, raw_root: str | None = None
         add_reissues(ts, ev_rows or [])
         clock = _Clock(man)
         src = man.get("decision_source")
-        aw.extend(clock.skew_warnings(["controller"] + (["baseline-scaler"] if src == "baseline" else [])))
+        aw.extend(clock.skew_warnings(["controller"] + (["baseline-scaler"] if src == "baseline" else [])
+                                      + (["aibrix-controller-manager"] if src == "apa" else [])))
         if raw is None:
             warn("raw arm directory not found: no SafeScale probes, refusal reasons or raw log lines")
         gpus = build_gpus(_csv(os.path.join(d, "gpu_intervals.csv")))
