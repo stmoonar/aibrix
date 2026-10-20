@@ -351,10 +351,10 @@ reissue:
   max_depth: 3
   retry_attempts: 4
   # Optional keys of the 2026-09-30 keep-alive fixes (defaults shown, deliberately left as
-  # comments): controller, service-manager and UI of 20260930-f8ccb0ca and older REJECT
-  # unknown reissue keys (parse_reissue_config raises; a controller would crashloop and
-  # the UI's PUT /api/params would fail). Write them into the LIVE registry only after
-  # controller, SM and UI are ALL upgraded to an image that knows them. A guard test
+  # comments): controller and service-manager of 20260930-f8ccb0ca and older REJECT
+  # unknown reissue keys (parse_reissue_config raises; a controller would crashloop).
+  # Write them into the LIVE registry only after controller and SM are both upgraded
+  # to an image that knows them. A guard test
   # (deploy/tests/test_reissue_manifests.py) keeps this section within the old key set.
   #   upstream_keepalive_s: 2        # loopback sidecar -> vLLM pool idle; <= every model's
   #                                  # VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1 (registry-validated)
@@ -372,8 +372,9 @@ reissue:
   memory_limit: 1Gi
 # Service-manager behaviour (plan 2026-09-27). Every key is optional; the values
 # below are the built-in defaults. Changes to the LIVE registry (ConfigMap
-# tre-v2-registry) go through the console (PUT /api/params), never a kubectl apply
-# of overlays/tre-v2/params.yaml; the service-manager reads this section at start,
+# tre-v2-registry) go through deploy/scripts/merge_live_registry.py / release/registry_set.py
+# (tunables: release/params_set.py), never a kubectl apply of
+# overlays/tre-v2/params.yaml; the service-manager reads this section at start,
 # so restart it afterwards (kubectl -n tre-v2 rollout restart
 # deploy/tre-v2-service-manager).
 service_manager:

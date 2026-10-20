@@ -39,7 +39,7 @@ spec:
             - name: TRE_SERVICE_MANAGER_URL
               value: http://tre-v2-service-manager:8000
             # Per-model params load from the tre-v2-registry ConfigMap mounted below, so
-            # the console can edit theta_m/tau_*/SLOs and restart-to-apply without an image
+            # params_set.py can edit theta_m/tau_*/SLOs and restart-to-apply without an image
             # rebuild. The baked /app/tre/deploy/registry.yaml stays as an escape-hatch
             # fallback (flip this value back to it via `kubectl set env`).
             - name: TRE_REGISTRY_PATH

@@ -25,11 +25,6 @@ def test_n2_component_dockerfiles_have_shared_build_contract() -> None:
             "copies": ("COPY common", "COPY deploy", "COPY service-manager"),
             "cmd": '"uvicorn", "tre_sm.server:create_app", "--factory"',
         },
-        "ui": {
-            "path": TRE_ROOT / "ui" / "Dockerfile",
-            "copies": ("COPY common", "COPY deploy", "COPY ui"),
-            "cmd": '"uvicorn", "tre_ui.server:create_app", "--factory"',
-        },
     }
 
     for component, spec in expected.items():

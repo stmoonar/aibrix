@@ -213,8 +213,6 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
 - **T1 schema.** The service manager's structured 409 body and the new `/v2/state` fields
   are provisional (the T1 line is not merged); the shell parses both plain and structured
   refusals (and honours `retry_after_s` when present).
-- **Campaign.** `campaign_queue.py` does not have the three baseline arms yet (it should
-  call the arm tool: `enable`, `mark-replay` at replay start, `disable --collect-dir`).
 - **Frozen parameters.** Chiron theta_trace, TokenScale V_b / V_P and PreServe mu were
   measured on the 20261006 engine and are frozen in `deploy/baselines/tre/policy-configmaps.yaml`
   (the example files keep placeholders; the policies refuse to start on them); the TokenScale

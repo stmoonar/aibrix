@@ -44,7 +44,6 @@ GUARDED_TREES = [
     TRE_ROOT / "calibration",
     TRE_ROOT / "replayer",
     TRE_ROOT / "loadgen_v1",
-    TRE_ROOT / "ui",
 ]
 #: The only code allowed to put a vLLM engine to sleep directly (plan D2):
 #: (file relative to tre/, enclosing function or None for the whole file, reason).

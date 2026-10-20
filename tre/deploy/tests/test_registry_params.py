@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from tre_ui.params import ParamValidationError, apply_and_validate, build_view
+from scripts.registry_params import ParamValidationError, apply_and_validate, build_view
 
 _REGISTRY = """
 cluster:

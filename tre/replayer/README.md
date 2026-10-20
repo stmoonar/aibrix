@@ -2,8 +2,7 @@
 
 Since 2026-09-30 every request the tree puts on a gateway goes through one client, the
 sending core in `tre_replayer/engine/`. The calibration drivers (`deploy/scripts/openloop.py`,
-`r3_grid.py`, `calibration_campaign.py`), the trace replays (`tre_replayer.run_trace`,
-`campaign_queue`) and the E1 client (`python3 -m tre_loadgen_v1`, now a shell) differ only
+`r3_grid.py`, `calibration_campaign.py`), the trace replays (`tre_replayer.run_trace`) and the E1 client (`python3 -m tre_loadgen_v1`, now a shell) differ only
 in their **profile**.
 
 | module | role |
@@ -30,7 +29,7 @@ in their **profile**.
 | timeout | `max(30, max_tokens/4)` s per connect / read / write | same | config `timeout` (300 s) |
 | record | calibration row (unchanged; `dual_metrics=True` adds both bases) | same | v1's `performance_metrics.json` line + audit + strict + lateness |
 | processes | `--sender-processes` (default `DEFAULT_SENDER_PROCESSES` = 4) | 1 (in-process) | config `process_count` (v14 configs: 8); `run_trace` 8 |
-| used by | `r3_grid` / `calibration_campaign` (openloop cells) | `run_trace --client-profile replay`, a campaign manifest with `"client_profile": "replay"` | `python3 -m tre_loadgen_v1` (run_arm.sh), and the campaign's E1 / TRE / APA arms by default (`campaign_queue` -> `run_trace --client-profile e1_v1`, recorded in `command.json` and `run_trace_summary.json`) |
+| used by | `r3_grid` / `calibration_campaign` (openloop cells) | `run_trace --client-profile replay` | `python3 -m tre_loadgen_v1` (run_arm.sh), and `run_trace --client-profile e1_v1` (recorded in `run_trace_summary.json`) |
 
 **`x-tre-bl-in-tokens`** (opt-in, default off; `tre_replayer.engine.in_tokens`): the request's exact
 `usage.prompt_tokens` for the baseline policies' gateway hook (which otherwise estimates from characters).

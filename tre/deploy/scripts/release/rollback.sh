@@ -5,7 +5,7 @@
 #   live-registry.yaml, control-plane-deploys.yaml, tre-v2-envoy-policies.yaml,
 #   tre-reissue-sidecar-cm.yaml, default-models.yaml, sm-state.json, redis-state.json.
 #
-# Order: both switches observe -> registry ConfigMap -> controller -> SM -> plugin -> UI
+# Order: both switches observe -> registry ConfigMap -> controller -> SM -> plugin
 #        -> drop the release's Redis keys (once the old SM runs) -> [Redis state]
 #        -> Envoy policies (tre-v2 only) -> models (per node) -> awake set.
 # Usage: ./rollback.sh                    everything
@@ -57,8 +57,8 @@ if [ "${ONLY_MODELS:-0}" != 1 ]; then
       --dry-run=client -o yaml > "$W/registry-cm.yaml"
   run kubectl replace -f "$W/registry-cm.yaml" $SRV
 
-  echo "== 2. control plane: whole Deployment objects (image AND env AND strategy): controller -> SM -> plugin -> UI"
-  for D in tre-v2-controller tre-v2-service-manager tre-gateway-plugins tre-v2-ui; do
+  echo "== 2. control plane: whole Deployment objects (image AND env AND strategy): controller -> SM -> plugin"
+  for D in tre-v2-controller tre-v2-service-manager tre-gateway-plugins; do
     python3 "$B/strip_obj.py" Deployment "$TRE_NS" "$D" "$B/control-plane-deploys.yaml" > "$W/$D.yaml"
     echo "   $D -> $(grep -m1 'image:' "$W/$D.yaml" | awk '{print $NF}')"
     BEFORE=$(podset "$D")

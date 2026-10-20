@@ -16,7 +16,6 @@
 # usage: set_run_mode.sh <controller_mode|-> <sm_actuation|->   ("-" = leave unchanged)
 #        set_run_mode.sh status
 # Both given -> one MSET (atomic). The values are read back and verified.
-# Equivalent console API: POST /api/ops/run-mode {"controller": ..., "sm_actuation": ...}.
 set -euo pipefail
 
 TRE_NS="${TRE_NS:-tre-v2}"

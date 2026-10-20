@@ -12,22 +12,38 @@ optional; the shipped file spells out the built-in defaults with comments.
 The live registry is the `tre-v2-registry` ConfigMap (mounted at `/etc/tre`
 by the controller and the service-manager).
 
-- Change it **only through the console**: `PUT /api/params`.
+- **Tunables** (per model: `trs.*` except `ema_tau_ms`, `slo.*`,
+  `alt_thresholds.*`, `min_replicas` / `max_replicas` / `max_awake_replicas`):
+  `deploy/scripts/release/params_set.py` (bounds and cross-field checks of
+  `deploy/scripts/registry_params.py`, then the controller's own parser). Run on a
+  host with `kubectl` access to the cluster:
+
+  ```bash
+  cd tre
+  python3 deploy/scripts/release/params_set.py --show dsqwen-7b          # values + bounds
+  python3 deploy/scripts/release/params_set.py \
+      --set dsqwen-7b.trs.theta_m=800 --set dsqwen-7b.slo.ttft_p95_ms=600  # dry run: diff only
+  python3 deploy/scripts/release/params_set.py --set ... --apply --restart --reason "theta R3"
+  python3 deploy/scripts/release/params_set.py --status                  # pending restart?
+  ```
+
+  `--apply` replaces the ConfigMap with the `resourceVersion` it read (a concurrent
+  change gives a conflict, nothing is written). `--restart` is restart-to-apply:
+  it restarts the service-manager, then the controller, stamping the pod template with
+  `tre.dev/params-hash` (sha256 of `registry.yaml`, first 16 hex), and waits for each
+  rollout. Names come from `TRE_NS`, `REGISTRY_CM`, `CONTROLLER_DEPLOY`, `SM_DEPLOY`.
+- **Structural keys** (images, engine args, `placement:` / `gateway:` /
+  `service_manager:` / `reissue:`): `deploy/scripts/merge_live_registry.py` (release
+  registry merged with the live tunables) or `deploy/scripts/release/registry_set.py`
+  (one key), then `kubectl replace` of the ConfigMap.
 - **Never** `kubectl apply` `overlays/tre-v2/params.yaml`: it is a bootstrap
   copy for a fresh install and would overwrite the live values (for example
   calibrated `theta_m`).
 - The service-manager reads the registry (`placement:`, `service_manager:`,
   `gateway:`, the models) once, at start. **A placement change (or any other
   registry change) needs a service-manager restart**, not only a controller
-  restart. The console's restart-to-apply (`POST /api/ops/controller/restart`,
-  button "重启 controller + SM") restarts both Deployments;
-  `GET /api/ops/controller/rollout` reports both (`controller`,
-  `service_manager`, combined `state`). By hand:
-  `kubectl -n tre-v2 rollout restart deploy/tre-v2-controller deploy/tre-v2-service-manager`.
-- The console's ServiceAccount (`tre-v2-ui`) may `get` / `patch` exactly the
-  Deployments `tre-v2-controller` and `tre-v2-service-manager` (Role
-  `tre-v2-ui-params` in `overlays/tre-v2/rbac.yaml`, namespace `tre-v2` only);
-  apply `rbac.yaml` before a console that restarts the SM.
+  restart: `params_set.py --restart` restarts both. By hand:
+  `kubectl -n tre-v2 rollout restart deploy/tre-v2-service-manager deploy/tre-v2-controller`.
 
 ### Checked at start
 
@@ -116,12 +132,8 @@ controller mode), so **every deploy sets both explicitly**:
 - Scripts: `deploy/scripts/set_run_mode.sh <controller> <sm>` (or `status`);
   `deploy_models.sh --run-mode CONTROLLER:SM` (the staggered bring-up sets
   `observe:observe` first); `toggle_tre_apa.sh tre|apa` sets the arm's values
-  (`--keep-run-mode` to skip); `campaign_queue.py` sets them per arm and records
-  the read-back values in each run's evidence.
-- Console: `POST /api/ops/controller/mode {"mode"}` (controller only),
-  `POST /api/ops/sm/actuation {"mode"}` (SM only),
-  `POST /api/ops/run-mode {"controller", "sm_actuation"}` (both, one MULTI);
-  `GET /api/ops/run-mode` returns both plus `warnings` for missing keys.
+  (`--keep-run-mode` to skip); the experiment runner (`tre/eval/runner/`) sets
+  them per arm and checks them before each arm.
 - Redis directly:
   `kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli MSET tre:v2:controller:mode observe tre:v2:sm:actuation active`.
 - Before a controller / SM rollout nothing needs to change (both read the keys
@@ -135,11 +147,9 @@ With the SM actuation in observe, a pod nobody requested (k8s restarted it, a
 Deployment applied or scaled by hand) is not admitted while an awake resident
 shares its GPUs (409, the gate retries; recorded as `startup_admission_sleep`).
 
-The console shows the planner events `capacity_blocked:<model>` and
+The planner records the events `capacity_blocked:<model>` and
 `defrag_disabled:<model>` (a CRITICAL model that got no capacity / whose TP
-defrag the placement policy disables) as an alert strip under the top bar
-(snapshot field `planner_alerts`: kind, model, occurrences in the last 15 min,
-last time, whether the latest decision still carries it).
+defrag the placement policy disables) in its decision events (controller log).
 
 ### Startup admission
 

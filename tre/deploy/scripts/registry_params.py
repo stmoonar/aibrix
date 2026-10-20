@@ -1,13 +1,17 @@
 """Registry-parameter edit surface: whitelist, bounds, cross-field checks, safe render.
 
-The console may edit only per-model TRS/SLO/replica params (the surface R3 recalibration
-writes). Everything else -- names, weights, images, tp_size, and the window-coupled
-ema_tau_ms -- is locked. Every candidate edit is re-parsed with the controller's OWN
-load_registry before it is allowed to reach the ConfigMap, so a bad edit is rejected here
-rather than crashlooping the controller on restart.
+Used by deploy/scripts/release/params_set.py (moved here from the removed console,
+tre/ui/tre_ui/params.py, 2026-10-20). Only per-model TRS/SLO/alt-threshold/replica params
+(the surface R3 recalibration writes) are editable. Everything else -- names, weights,
+images, tp_size, and the window-coupled ema_tau_ms -- is locked. Every candidate edit is
+re-parsed with the controller's OWN load_registry before it is allowed to reach the
+ConfigMap, so a bad edit is rejected here rather than crashlooping the controller on
+restart.
 """
 from __future__ import annotations
 
+import difflib
+import hashlib
 import math
 import tempfile
 from pathlib import Path
@@ -229,6 +233,9 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
 
 def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
     lo, hi, kind, lo_ex, hi_ex = spec
+    if kind == "int" and isinstance(raw, float) and not raw.is_integer():
+        errors.append({"model": model, "field": key, "error": "not_a_int"})  # int() would truncate
+        return None
     try:
         value = int(raw) if kind == "int" else float(raw)
     except (TypeError, ValueError):
@@ -277,3 +284,95 @@ def _cross_field(model: dict, name: str, errors: list) -> None:
 
 def render(data: dict) -> str:
     return yaml.safe_dump(data, sort_keys=False, default_flow_style=False, allow_unicode=True)
+
+
+# ---- command-line surface (params_set.py) ----
+
+_SECTIONS = ("trs", "slo")
+
+
+def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
+    """``["<model>.<path>=<value>", ...]`` -> the ``edits`` mapping of apply_and_validate.
+
+    <path> is ``trs.<f>``, ``slo.<f>``, ``alt_thresholds.<signal>.<f>`` or a top-level
+    replica bound. The model is matched by the longest registry name that prefixes the
+    key (names may contain dots). VALUE is parsed as YAML. Raises ParamValidationError
+    for a malformed item, an unknown model or a path outside the editable shapes (locked
+    keys pass through so apply_and_validate reports them as locked)."""
+    edits: dict[str, Any] = {}
+    errors: list[dict] = []
+    for item in sets:
+        key, sep, raw = item.partition("=")
+        if not sep:
+            errors.append({"model": "", "field": item, "error": "expected_MODEL.PATH=VALUE"})
+            continue
+        model = max((m for m in model_names if key.startswith(f"{m}.")), key=len, default=None)
+        if model is None:
+            errors.append({"model": key.split(".", 1)[0], "field": key, "error": "unknown_model"})
+            continue
+        path = key[len(model) + 1:].split(".")
+        value = yaml.safe_load(raw)
+        changes = edits.setdefault(model, {})
+        if len(path) == 2 and path[0] in _SECTIONS:
+            changes.setdefault(path[0], {})[path[1]] = value
+        elif len(path) == 3 and path[0] == "alt_thresholds":
+            changes.setdefault("alt_thresholds", {}).setdefault(path[1], {})[path[2]] = value
+        elif len(path) == 1 and (path[0] in _TOP_BOUNDS or path[0] in _LOCKED):
+            changes[path[0]] = value
+        else:
+            errors.append({"model": model, "field": ".".join(path), "error": "unknown_field"})
+    if errors:
+        raise ParamValidationError(errors)
+    return edits
+
+
+def params_hash(registry_yaml: str) -> str:
+    """The ``tre.dev/params-hash`` annotation of a restart-to-apply (same as the console's)."""
+    return hashlib.sha256((registry_yaml or "").encode("utf-8")).hexdigest()[:16]
+
+
+def changed_fields(old_yaml: str, new_yaml: str) -> list[tuple[str, str, Any, Any]]:
+    """(model, dotted field, old, new) for every per-model leaf that differs."""
+    old = {m.get("name"): m for m in load_models(old_yaml)}
+    out: list[tuple[str, str, Any, Any]] = []
+    for model in load_models(new_yaml):
+        name = model.get("name")
+        before, after = _leaves(old.get(name) or {}), _leaves(model)
+        for field in sorted(set(before) | set(after)):
+            if before.get(field) != after.get(field):
+                out.append((name, field, before.get(field), after.get(field)))
+    return out
+
+
+def _leaves(node: Any, prefix: str = "") -> dict[str, Any]:
+    if not isinstance(node, dict):
+        return {prefix: node}
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        out.update(_leaves(value, f"{prefix}{key}." if isinstance(value, dict) else f"{prefix}{key}"))
+    return out
+
+
+def unified_diff(old_yaml: str, new_yaml: str) -> str:
+    """Diff of the two registries rendered the same way (comments / key quoting of the
+    live text do not show up; only value changes do)."""
+    a = render(yaml.safe_load(old_yaml) or {}).splitlines(keepends=True)
+    b = render(yaml.safe_load(new_yaml) or {}).splitlines(keepends=True)
+    return "".join(difflib.unified_diff(a, b, "live", "edited"))
+
+
+def new_validation_errors(old_yaml: str, new_yaml: str, *, loader: Callable[[str], Any] = load_registry) -> list[str]:
+    """Registry.validate() errors of the edited registry that the live one does not have
+    (a pre-existing error must not block an unrelated edit)."""
+    before = set(_validate(old_yaml, loader))
+    return [e for e in _validate(new_yaml, loader) if e not in before]
+
+
+def _validate(text: str, loader: Callable[[str], Any]) -> list[str]:
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as handle:
+        handle.write(text)
+        tmp = handle.name
+    try:
+        return [str(e) for e in loader(tmp).validate()]
+    finally:
+        Path(tmp).unlink()

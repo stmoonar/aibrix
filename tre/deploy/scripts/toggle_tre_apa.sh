@@ -24,7 +24,7 @@
 # independent switches, and BOTH arms run the SM actuation active (symmetric self-heal):
 #   tre -> controller active  + SM active   (set once TRE is the only decision source)
 #   apa -> controller observe + SM active   (set FIRST: the controller stops actuating before the APA CRs go live)
-# --keep-run-mode leaves both keys alone (campaign_queue.py sets them itself per arm).
+# --keep-run-mode leaves both keys alone (the runner, tre/eval/runner, sets them itself per arm).
 #
 # Both the TRE controller (tre-v2 ns) and the patched aibrix podautoscaler controller
 # (aibrix-system) route scaling through service-manager, so leaving both live would let them

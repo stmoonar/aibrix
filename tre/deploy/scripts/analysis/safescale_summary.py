@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarise the SafeScale probes of one run: rollback rate and rollback reasons.
 
-Input: the ``safescale.json`` a campaign run writes (``campaign_queue.safescale_snapshot``:
+Input: the ``safescale.json`` a runner arm writes (``tre/eval/runner/run_arm_pilot.sh``:
 ``{"probes": {request_id: <json record>}, "journals": {...}}``), or a JSON object / list
 of probe records. A probe record is what the controller keeps in
 ``tre:v2:controller:safescale:probes`` (``planning.safescale._probe_record``); the

@@ -21,7 +21,7 @@ tokenizer path - is the one the experiments put on the engine. The only differen
 is the output: calibration pins it with ``ignore_eos`` + ``max_tokens``.
 
 The replayer's own default stays ``completions`` (:data:`DEFAULT_API`): the trace runs
-(``run_trace`` / ``campaign_queue``) keep sending exactly what they sent before; a caller
+(``run_trace``) keep sending exactly what they sent before; a caller
 that wants ``chat`` asks for it.
 
 Exact length under ``chat``: the natural-prompt fitter counts the *templated* prompt

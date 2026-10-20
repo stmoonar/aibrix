@@ -40,7 +40,7 @@ ceiling, not a steady target; it only stops the runaway pile-up.
 ### The two arms must carry identical values
 
 Since 2026-09-24 both arms, TRE and APA, are served by the **same** tre-v2 gateway
-(NodePort 31094; `deploy/scripts/campaign_queue.py` GATEWAYS), routed as in v1
+(NodePort 31094; `GW` of `tre/eval/runner/runner.env`), routed as in v1
 (`routing-strategy: least-gpu-cache`, ext_proc, per-model ORIGINAL_DST clusters
 whose limits `deploy/tests/test_gateway_extproc.py` pins to
 `backendtrafficpolicy-tre-v2.yaml`). The arms therefore admit traffic under

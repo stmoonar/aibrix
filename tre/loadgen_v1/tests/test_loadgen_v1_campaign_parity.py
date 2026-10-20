@@ -1,6 +1,6 @@
-"""The campaign's E1 arms and smoke-E1's run_arm.sh send the same request (2026-10-01).
+"""The replayer's e1_v1 profile and smoke-E1's run_arm.sh send the same request (2026-10-01).
 
-campaign_queue runs ``tre_replayer.run_trace --client-profile e1_v1``; run_arm.sh runs
+``tre_replayer.run_trace --client-profile e1_v1`` (the removed campaign_queue's E1 client); run_arm.sh runs
 ``python3 -m tre_loadgen_v1`` (this package). Both must put v1's request on the wire:
 here the same requests go through both against the local fake server and the server's
 view - method, path, every header, the body and its key order - must be identical.

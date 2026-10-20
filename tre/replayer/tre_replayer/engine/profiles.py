@@ -14,8 +14,7 @@ record:
     ``max(30, max_tokens / 4)`` s per socket operation. Record: the calibration row
     (``result_fields`` + lateness), unchanged.
 ``replay``
-    The same body on ``/v1/completions`` (the replayer's default, ``run_trace`` /
-    ``campaign_queue``) - request bytes unchanged.
+    The same body on ``/v1/completions`` (the replayer's default, ``run_trace``) - request bytes unchanged.
 ``e1_v1``
     The paper's client (v1 ``CustomTraceGenerator``, ported as ``tre/loadgen_v1``):
     ``chat.completions.create`` through the OpenAI SDK with v1's options - ``messages``

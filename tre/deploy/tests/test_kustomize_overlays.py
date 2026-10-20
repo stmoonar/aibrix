@@ -27,7 +27,6 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "service-manager.yaml",
         "controller.yaml",
         "params.yaml",
-        "ui.yaml",
         "gpu-truth.yaml",
         "gateway.yaml",
         "gateway-plugins.yaml",
@@ -82,7 +81,6 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
 
     controller = _load_yaml(overlay / "controller.yaml")
     sm = _load_yaml(overlay / "service-manager.yaml")
-    ui = _load_yaml(overlay / "ui.yaml")
 
     assert _image(controller) == "tre-v2-controller:20261020-db24f36b"
     assert _image(sm) == "tre-v2-service-manager:20261020-db24f36b"
@@ -98,8 +96,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "path": "/healthz",
         "port": "http",
     }
-    assert _image(ui) == "tre-v2-ui:20261006-aaeef851"
-    assert "latest" not in "\n".join([_image(controller), _image(sm), _image(ui)]).lower()
+    assert "latest" not in "\n".join([_image(controller), _image(sm)]).lower()
     gateway_plugins = next(
         d
         for d in yaml.safe_load_all((overlay / "gateway-plugins.yaml").read_text(encoding="utf-8"))
@@ -111,7 +108,6 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
     assert _env(sm)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
-    assert _env(ui)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
     # F1/F2/D8/D10 switches must be explicit for reproducible redeploy (F4.0.3).
     assert _env(controller)["TRE_SIGNAL_SOURCE"] == "zm"
     assert _env(controller)["TRE_PERCENTILE_MODE"] == "bucket_upper"
@@ -178,9 +174,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(sm)["TRE_SM_LOG_LEVEL"] == "INFO"
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
-    assert _node_selector(ui) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
 
-    # P0-4A: per-model params load from a mounted ConfigMap so the console can edit +
+    # P0-4A: per-model params load from a mounted ConfigMap so params_set.py can edit +
     # restart-to-apply. W stays frozen as an explicit env value (not in the CM).
     assert _env(controller)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
     assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "30000"  # W freeze artifact (explicit env lock)
@@ -203,19 +198,6 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert params["metadata"]["namespace"] == "tre-v2"
     assert "registry.yaml" in params["data"]
     assert yaml.safe_load(params["data"]["registry.yaml"]) == _load_yaml(DEPLOY_ROOT / "registry.yaml")
-
-    # UI param-edit RBAC: namespace-scoped Role, resourceName-bound, no cluster scope.
-    ui_role = next(d for d in rbac_docs if d["kind"] == "Role" and d["metadata"]["name"] == "tre-v2-ui-params")
-    assert ui_role["metadata"]["namespace"] == "tre-v2"
-    cm_rule = next(r for r in ui_role["rules"] if r["resources"] == ["configmaps"])
-    assert cm_rule["resourceNames"] == ["tre-v2-registry"]
-    assert sorted(cm_rule["verbs"]) == ["get", "patch", "update"]
-    dep_rule = next(r for r in ui_role["rules"] if r["resources"] == ["deployments"])
-    # restart-to-apply rolls the controller AND the service-manager (P3, 2026-09-28)
-    assert dep_rule["resourceNames"] == ["tre-v2-controller", "tre-v2-service-manager"]
-    assert sorted(dep_rule["verbs"]) == ["get", "patch"]
-    ui_binding = next(d for d in rbac_docs if d["kind"] == "RoleBinding" and d["metadata"]["name"] == "tre-v2-ui-params")
-    assert ui_binding["subjects"] == [{"kind": "ServiceAccount", "name": "tre-v2-ui", "namespace": "tre-v2"}]
 
 
 def test_ablation_overlays_patch_only_controller_env() -> None:

@@ -5,8 +5,8 @@ the release's own parser (tre_common.registry) before it may reach the ConfigMap
   registry_set.py --in live.yaml --out new.yaml --set service_manager.test_hooks=true
   registry_set.py --in live.yaml --out new.yaml --unset service_manager.test_hooks
 
-For keys without a console path (e.g. service_manager.test_hooks). Tunables
-(trs / slo / alt_thresholds / replica bounds) go through console PUT /api/params.
+For keys params_set.py does not edit (e.g. service_manager.test_hooks). Tunables
+(trs / slo / alt_thresholds / replica bounds) go through params_set.py (bounds-checked).
 The value is parsed as YAML (true, 30, [a, b], ...). Run with
 PYTHONPATH=<tre>/common:<tre>/deploy of the release that will read the file.
 Exit 1 (nothing written) when the parser rejects the result.

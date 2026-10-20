@@ -1,9 +1,9 @@
 """Merge a release registry with the LIVE registry (ConfigMap tre-v2-registry).
 
-The console (PUT /api/params) edits only the per-model tunables: trs.*, slo.*,
+params_set.py (deploy/scripts/release) edits only the per-model tunables: trs.*, slo.*,
 alt_thresholds.*, min_replicas / max_replicas / max_awake_replicas. Everything else
 (images, engine args, vllm / gateway / reissue / service_manager / placement sections) changes only
-with a release and has no console path. This script takes the release registry and
+with a release and has no params_set.py path. This script takes the release registry and
 lays the live tunables over it, key by key, so a release never resets calibrated values
 (e.g. theta_m) and never drops a key the release added.
 
@@ -29,7 +29,7 @@ from typing import Any
 
 import yaml
 
-#: Per-model keys the console may edit (tre/ui/tre_ui/params.py).
+#: Per-model keys params_set.py may edit (deploy/scripts/registry_params.py).
 TUNABLE_SECTIONS = ("trs", "slo")
 TUNABLE_KEYS = ("min_replicas", "max_replicas", "max_awake_replicas")
 
