@@ -46,11 +46,14 @@ _SLO_BOUNDS: dict[str, tuple] = {
     "ttft_p95_ms": (50, 5000, "float", False, False),
     "tpot_p95_ms": (10, 500, "float", False, False),
     "e2e_p95_ms": (1000, 120000, "float", False, False),
+    # Idle-TTFT intercept / slope (c, b): live with safescale.slo_mode labels (TTFT threshold
+    # max(500, k*(c + b*L))), so they are published together with theta in one --apply.
+    "ttft_idle_c_ms": (0, 2000, "float", True, False),
+    "ttft_idle_b_ms_per_token": (0, 1, "float", False, False),
 }
 _TOP_BOUNDS: dict[str, tuple] = {
     "min_replicas": (0, 4, "int", False, False),
-    "max_replicas": (1, 8, "int", False, False),
-    # Scaling cap (v1/paper alignment A1); max_replicas is the GPU layout size.
+    # Scaling cap (v1/paper alignment A1); max_replicas is the GPU layout size (locked).
     "max_awake_replicas": (1, 8, "int", False, False),
 }
 _LOCKED = {
@@ -58,6 +61,8 @@ _LOCKED = {
     "weights_path": "placement/structural; git redeploy",
     "vllm_image": "placement/structural; git redeploy",
     "tp_size": "placement/structural; git redeploy",
+    "max_replicas": "GPU layout (binding count) = structural; release registry + "
+                    "merge_live_registry.py (or release/registry_set.py) and the rendered manifests",
     "trs.ema_tau_ms": "window-coupled; frozen with W",
 }
 
@@ -104,6 +109,7 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
             "weights_path": {"value": model.get("weights_path"), "reason": _LOCKED["weights_path"]},
             "vllm_image": {"value": model.get("vllm_image"), "reason": _LOCKED["vllm_image"]},
             "tp_size": {"value": model.get("tp_size"), "reason": _LOCKED["tp_size"]},
+            "max_replicas": {"value": model.get("max_replicas"), "reason": _LOCKED["max_replicas"]},
             "trs.ema_tau_ms": {"value": trs.get("ema_tau_ms"), "reason": _LOCKED["trs.ema_tau_ms"]},
         }
         out[name] = {
@@ -127,8 +133,8 @@ def apply_and_validate(
 ) -> str:
     """Return a new registry.yaml with `edits` applied, or raise ParamValidationError.
 
-    edits: {model_name: {"trs": {f: v}, "slo": {f: v}, "min_replicas": v, "max_replicas": v,
-            "max_awake_replicas": v}}
+    edits: {model_name: {"trs": {f: v}, "slo": {f: v}, "alt_thresholds": {signal: {f: v}},
+            "min_replicas": v, "max_awake_replicas": v}}
     """
     data = yaml.safe_load(registry_yaml) or {}
     models = {m.get("name"): m for m in (data.get("models") or [])}
@@ -233,6 +239,9 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
 
 def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
     lo, hi, kind, lo_ex, hi_ex = spec
+    if isinstance(raw, bool):  # YAML true/false would coerce to 1/0
+        errors.append({"model": model, "field": key, "error": f"not_a_{kind}"})
+        return None
     if kind == "int" and isinstance(raw, float) and not raw.is_integer():
         errors.append({"model": model, "field": key, "error": "not_a_int"})  # int() would truncate
         return None
@@ -251,7 +260,7 @@ def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
 
 
 def _reject_locked(changes: dict, model: str, errors: list) -> None:
-    for locked_key in ("name", "weights_path", "vllm_image", "tp_size"):
+    for locked_key in ("name", "weights_path", "vllm_image", "tp_size", "max_replicas"):
         if locked_key in changes:
             errors.append({"model": model, "field": locked_key, "error": "locked", "reason": _LOCKED[locked_key]})
     if "ema_tau_ms" in changes.get("trs", {}):

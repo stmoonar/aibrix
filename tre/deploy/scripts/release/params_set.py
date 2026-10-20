@@ -14,11 +14,17 @@ POST /api/ops/controller/restart (2026-10-20).
   params_set.py --registry-file F --set ...        validate against a local file (no cluster)
 
 Editable (deploy/scripts/registry_params.py): <model>.trs.<f> (not ema_tau_ms),
-<model>.slo.<f>, <model>.alt_thresholds.<signal>.{theta,direction,delta_crit,delta_high},
-<model>.{min_replicas,max_replicas,max_awake_replicas}. VALUE is parsed as YAML. The edit
+<model>.slo.{ttft_p95_ms,tpot_p95_ms,e2e_p95_ms,ttft_idle_c_ms,ttft_idle_b_ms_per_token},
+<model>.alt_thresholds.<signal>.{theta,direction,delta_crit,delta_high},
+<model>.{min_replicas,max_awake_replicas}. Several --set go out in ONE ConfigMap write, so a
+recalibration (theta, lambda, tau, w_p and c/b) is published atomically. max_replicas (the
+GPU layout) is structural. VALUE is parsed as YAML. The edit
 is checked against the bounds and cross-field rules, re-parsed with tre_common.registry,
 and rejected if Registry.validate() reports an error the live registry does not have.
 The ConfigMap is re-rendered (yaml.safe_dump): comments of the live text are not kept.
+--apply first saves the live ConfigMap (YAML, as read) under --backup-dir.
+Run it from a checkout at the same sha as the live images (its parser and bounds are
+the ones the controller / SM will load).
 
 Structural keys (images, engine args, placement / gateway / service_manager): use
 merge_live_registry.py or registry_set.py instead. Restart-to-apply restarts the
@@ -28,7 +34,8 @@ the pod template with kubectl.kubernetes.io/restartedAt and tre.dev/params-hash
 
 Environment: TRE_NS (tre-v2), REGISTRY_CM (tre-v2-registry), CONTROLLER_DEPLOY
 (tre-v2-controller), SM_DEPLOY (tre-v2-service-manager), KUBECTL (kubectl),
-ROLLOUT_TIMEOUT (300s). Exit 0 ok / dry run, 1 rejected, 2 cluster error or conflict.
+ROLLOUT_TIMEOUT (300s), TRE_BACKUP_ROOT (default --backup-dir = $TRE_BACKUP_ROOT/params-set;
+without it --apply needs --backup-dir). Exit 0 ok / dry run, 1 rejected, 2 cluster error or conflict.
 """
 from __future__ import annotations
 
@@ -39,6 +46,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 _TRE = Path(__file__).resolve().parents[3]
 for _p in (_TRE / "common", _TRE / "deploy"):  # after PYTHONPATH: an explicit release wins
@@ -71,17 +80,30 @@ def read_configmap() -> dict:
     return json.loads(kubectl(["get", "configmap", _env("REGISTRY_CM", "tre-v2-registry"), "-o", "json"]))
 
 
+#: Server-owned metadata dropped from the PUT body; everything else (labels, annotations,
+#: ownerReferences, finalizers, resourceVersion, ...) is sent back unchanged.
+_SERVER_METADATA = ("uid", "managedFields", "creationTimestamp")
+
+
 def replacement(cm: dict, new_text: str) -> dict:
-    """The ConfigMap object to PUT: same identity and other data keys, the edited
-    registry.yaml, and the resourceVersion that was read (the API server answers 409
-    Conflict if the ConfigMap changed since)."""
-    meta = cm.get("metadata") or {}
-    keep = {k: meta[k] for k in ("name", "namespace", "labels", "annotations", "resourceVersion") if k in meta}
-    out = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": keep,
-           "data": {**(cm.get("data") or {}), DATA_KEY: new_text}}
-    if cm.get("binaryData"):
-        out["binaryData"] = cm["binaryData"]
+    """The ConfigMap object to PUT: the metadata that was read (minus server-owned fields),
+    the other data keys, the edited registry.yaml, and the resourceVersion that was read
+    (the API server answers 409 Conflict if the ConfigMap changed since)."""
+    meta = {k: v for k, v in (cm.get("metadata") or {}).items() if k not in _SERVER_METADATA}
+    out = {k: v for k, v in cm.items() if k not in ("metadata", "data")}
+    out.update({"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta,
+                "data": {**(cm.get("data") or {}), DATA_KEY: new_text}})
     return out
+
+
+def backup(cm: dict, backup_dir: str) -> Path:
+    """Save the live ConfigMap (as read) before it is replaced; returns the file."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rv = (cm.get("metadata") or {}).get("resourceVersion", "unknown")
+    path = Path(backup_dir) / f"{cm['metadata']['name']}-{stamp}-rv{rv}.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(cm, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return path
 
 
 def deployments() -> list[str]:
@@ -122,10 +144,20 @@ def restart(reason: str) -> int:
         HASH_ANNOTATION: rp.params_hash(text),
     }}}}}
     timeout = _env("ROLLOUT_TIMEOUT", "300s")
-    for name in deployments():
+    names = deployments()
+    done: list[str] = []
+    for name in names:
         print(f"restart {name} (params-hash {rp.params_hash(text)})")
-        kubectl(["patch", "deployment", name, "--type", "strategic", "-p", json.dumps(patch)])
-        print(kubectl(["rollout", "status", f"deployment/{name}", f"--timeout={timeout}"]).rstrip())
+        try:
+            kubectl(["patch", "deployment", name, "--type", "strategic", "-p", json.dumps(patch)])
+            print(kubectl(["rollout", "status", f"deployment/{name}", f"--timeout={timeout}"]).rstrip())
+        except ClusterError as exc:
+            print(f"ERROR: restart of {name} failed: {exc}", file=sys.stderr)
+            print(f"  restarted and rolled out: {', '.join(done) or 'none'}", file=sys.stderr)
+            print(f"  failed or not restarted:  {', '.join(names[len(done):])}", file=sys.stderr)
+            print("  fix the cause, then rerun: params_set.py --restart", file=sys.stderr)
+            return 2
+        done.append(name)
     return status()
 
 
@@ -154,12 +186,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--show", nargs="?", const="", metavar="MODEL")
     parser.add_argument("--registry-file", help="validate against this file; no cluster access")
+    root = os.environ.get("TRE_BACKUP_ROOT")
+    parser.add_argument("--backup-dir", default=str(Path(root) / "params-set") if root else None,
+                        help="--apply saves the live ConfigMap here first (default $TRE_BACKUP_ROOT/params-set)")
     args = parser.parse_args(argv)
 
     if args.registry_file and (args.apply or args.restart or args.status):
         parser.error("--registry-file is offline: no --apply / --restart / --status")
     if args.set and args.restart and not args.apply:
         parser.error("--set with --restart needs --apply")
+    if args.apply and not args.backup_dir:
+        parser.error("--apply needs --backup-dir (or TRE_BACKUP_ROOT)")
     if not (args.set or args.restart or args.status or args.show is not None):
         parser.error("nothing to do: --set, --show, --status or --restart")
 
@@ -199,6 +236,7 @@ def main(argv: list[str]) -> int:
                 return 0
             if changes:
                 rv = cm["metadata"].get("resourceVersion")
+                print(f"backup of the live ConfigMap: {backup(cm, args.backup_dir)}")
                 try:
                     kubectl(["replace", "-f", "-"], stdin=json.dumps(replacement(cm, new_text)))
                 except ClusterError as exc:

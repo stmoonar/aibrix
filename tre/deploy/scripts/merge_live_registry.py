@@ -1,8 +1,9 @@
 """Merge a release registry with the LIVE registry (ConfigMap tre-v2-registry).
 
 params_set.py (deploy/scripts/release) edits only the per-model tunables: trs.*, slo.*,
-alt_thresholds.*, min_replicas / max_replicas / max_awake_replicas. Everything else
-(images, engine args, vllm / gateway / reissue / service_manager / placement sections) changes only
+alt_thresholds.*, min_replicas / max_awake_replicas. Everything else
+(max_replicas = the GPU layout, images, engine args, vllm / gateway / reissue / service_manager /
+placement sections) changes only
 with a release and has no params_set.py path. This script takes the release registry and
 lays the live tunables over it, key by key, so a release never resets calibrated values
 (e.g. theta_m) and never drops a key the release added.
@@ -16,7 +17,7 @@ lays the live tunables over it, key by key, so a release never resets calibrated
 The output is validated with tre_common.registry (the service-manager / controller
 parser). Exit 1 on validation errors; the report lists every live tunable that differs
 from the release file and warns when max_replicas (the GPU layout the release manifests
-were rendered from) differs.
+were rendered from) differs; the release value is used.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ import yaml
 
 #: Per-model keys params_set.py may edit (deploy/scripts/registry_params.py).
 TUNABLE_SECTIONS = ("trs", "slo")
-TUNABLE_KEYS = ("min_replicas", "max_replicas", "max_awake_replicas")
+TUNABLE_KEYS = ("min_replicas", "max_awake_replicas")
 
 
 def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -62,12 +63,12 @@ def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any]
             if key in src:
                 if model.get(key) != src[key]:
                     report.append(f"{name}: {key} live {src[key]!r} kept (release {model.get(key)!r})")
-                    if key == "max_replicas":
-                        report.append(
-                            f"WARN {name}: max_replicas is the GPU layout; the release manifests were "
-                            f"rendered with {model.get(key)!r}"
-                        )
                 model[key] = src[key]
+        if "max_replicas" in src and src["max_replicas"] != model.get("max_replicas"):
+            report.append(
+                f"WARN {name}: max_replicas live {src['max_replicas']!r} replaced by the release "
+                f"{model.get('max_replicas')!r} (the GPU layout the release manifests were rendered with)"
+            )
     for name in sorted(set(live_models) - {m.get("name") for m in merged.get("models") or []}):
         report.append(f"WARN {name}: in the live registry only (dropped by the release)")
     return merged, report

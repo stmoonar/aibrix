@@ -64,14 +64,14 @@ def test_apply_valid_edit_roundtrips_through_loader() -> None:
                         "direction": "lower_is_healthier",
                     }
                 },
-                "max_replicas": 3,
+                "max_awake_replicas": 3,
             }
         },
     )
     m = yaml.safe_load(new_yaml)["models"][0]
     assert m["trs"]["theta_m"] == 800.0
     assert m["trs"]["tau_high"] == 1.7
-    assert m["max_replicas"] == 3
+    assert m["max_awake_replicas"] == 3
     assert m["alt_thresholds"]["queue_len"] == {
         "theta": 7.25,
         "direction": "lower_is_healthier",
@@ -136,9 +136,9 @@ def test_cross_field_constraints() -> None:
     with pytest.raises(ParamValidationError) as ei:
         apply_and_validate(_REGISTRY, {"m1": {"trs": {"tau_low": 2.0}}})  # tau_high is 1.63
     assert any(e["error"] == "constraint" for e in ei.value.errors)
-    # min_replicas must be <= max_replicas
+    # max_awake_replicas must stay within [min_replicas, max_replicas]
     with pytest.raises(ParamValidationError):
-        apply_and_validate(_REGISTRY, {"m1": {"min_replicas": 4, "max_replicas": 1}})
+        apply_and_validate(_REGISTRY, {"m1": {"min_replicas": 4, "max_awake_replicas": 2}})
 
 
 def test_max_awake_replicas_is_editable_and_bounded_by_the_layout() -> None:

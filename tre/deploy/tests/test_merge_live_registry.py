@@ -44,8 +44,10 @@ def test_max_replicas_drift_is_warned():
     release = _release()
     live = copy.deepcopy(release)
     live["models"][0]["max_replicas"] = 6
-    _, report = mlr.merge(live, release)
+    merged, report = mlr.merge(live, release)
     assert any(line.startswith("WARN") and "max_replicas" in line for line in report)
+    # structural (params_set.py cannot edit it): the release layout wins
+    assert merged["models"][0]["max_replicas"] == release["models"][0]["max_replicas"]
 
 
 def test_cli_writes_a_valid_registry(tmp_path):

@@ -39,6 +39,17 @@ def test_dry_run_changes_exactly_the_set_fields() -> None:
     assert rp.new_validation_errors(REGISTRY, new) == []
 
 
+def test_recalibration_with_c_b_is_one_atomic_edit() -> None:
+    # AGENTS.md: theta and the idle-TTFT c/b go live together -> one --apply, one diff
+    model = NAMES[0]
+    new = _edit(f"{model}.trs.theta_m=812.5", f"{model}.trs.tau_high=1.9",
+                f"{model}.slo.ttft_idle_c_ms=45.5", f"{model}.slo.ttft_idle_b_ms_per_token=0.071")
+    changed = {f for m, f, _, _ in rp.changed_fields(REGISTRY, new)}
+    assert changed == {"trs.theta_m", "trs.tau_high", "slo.ttft_idle_c_ms", "slo.ttft_idle_b_ms_per_token"}
+    slo = next(m for m in rp.load_models(new) if m["name"] == model)["slo"]
+    assert (slo["ttft_idle_c_ms"], slo["ttft_idle_b_ms_per_token"]) == (45.5, 0.071)
+
+
 def test_setting_the_live_value_is_no_change() -> None:
     model = rp.load_models(REGISTRY)[0]
     new = _edit(f"{model['name']}.trs.theta_m={model['trs']['theta_m']}")
@@ -52,6 +63,10 @@ def test_setting_the_live_value_is_no_change() -> None:
     ("{m}.trs.theta_m", "expected_MODEL.PATH=VALUE"),
     ("{m}.max_awake_replicas=2.5", "not_a_int"),
     ("{m}.tp_size=2", "locked"),
+    ("{m}.max_replicas=4", "locked"),            # GPU layout: structural (registry_set / merge)
+    ("{m}.trs.theta_m=true", "not_a_float"),     # a YAML bool is not 1.0
+    ("{m}.min_replicas=false", "not_a_int"),
+    ("{m}.slo.ttft_idle_c_ms=0", "out_of_bounds"),
     ("{m}.trs.ema_tau_ms=1000", "locked"),
 ])
 def test_rejected_edits(item: str, error: str) -> None:
@@ -78,12 +93,12 @@ def test_only_new_validate_errors_block() -> None:
 
 
 def test_put_keeps_identity_and_the_resource_version_lock() -> None:
-    cm = {"metadata": {"name": "tre-v2-registry", "namespace": "tre-v2", "resourceVersion": "42",
-                       "uid": "u", "managedFields": [{}], "labels": {"a": "b"}},
+    kept = {"name": "tre-v2-registry", "namespace": "tre-v2", "resourceVersion": "42", "labels": {"a": "b"},
+            "annotations": {"c": "d"}, "ownerReferences": [{"name": "o"}], "finalizers": ["f"]}
+    cm = {"metadata": {**kept, "uid": "u", "managedFields": [{}], "creationTimestamp": "t"},
           "data": {"registry.yaml": "old", "other": "x"}}
     obj = params_set.replacement(cm, "new")
-    assert obj["metadata"] == {"name": "tre-v2-registry", "namespace": "tre-v2", "labels": {"a": "b"},
-                               "resourceVersion": "42"}
+    assert obj["metadata"] == kept
     assert obj["data"] == {"registry.yaml": "new", "other": "x"}
 
 

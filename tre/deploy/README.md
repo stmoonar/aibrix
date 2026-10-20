@@ -12,28 +12,37 @@ optional; the shipped file spells out the built-in defaults with comments.
 The live registry is the `tre-v2-registry` ConfigMap (mounted at `/etc/tre`
 by the controller and the service-manager).
 
-- **Tunables** (per model: `trs.*` except `ema_tau_ms`, `slo.*`,
-  `alt_thresholds.*`, `min_replicas` / `max_replicas` / `max_awake_replicas`):
-  `deploy/scripts/release/params_set.py` (bounds and cross-field checks of
-  `deploy/scripts/registry_params.py`, then the controller's own parser). Run on a
-  host with `kubectl` access to the cluster:
+- **Tunables** (per model: `trs.*` except `ema_tau_ms`, `slo.*` incl. the idle-TTFT
+  `ttft_idle_c_ms` / `ttft_idle_b_ms_per_token`, `alt_thresholds.*`, `min_replicas` /
+  `max_awake_replicas`): `deploy/scripts/release/params_set.py` (bounds and cross-field
+  checks of `deploy/scripts/registry_params.py`, then the controller's own parser). All
+  `--set` of one call go out in one ConfigMap write, so a recalibration (theta, lambda,
+  tau, w_p together with c/b) is published atomically. Run it on a host with `kubectl`
+  access, **from a checkout at the same sha as the live images** (its parser and bounds
+  are the ones the controller / SM load):
 
   ```bash
   cd tre
   python3 deploy/scripts/release/params_set.py --show dsqwen-7b          # values + bounds
   python3 deploy/scripts/release/params_set.py \
       --set dsqwen-7b.trs.theta_m=800 --set dsqwen-7b.slo.ttft_p95_ms=600  # dry run: diff only
-  python3 deploy/scripts/release/params_set.py --set ... --apply --restart --reason "theta R3"
+  python3 deploy/scripts/release/params_set.py --set ... --apply --restart --reason "theta R3" \
+      --backup-dir <dir>          # or TRE_BACKUP_ROOT (default <root>/params-set)
   python3 deploy/scripts/release/params_set.py --status                  # pending restart?
   ```
 
   `--apply` replaces the ConfigMap with the `resourceVersion` it read (a concurrent
-  change gives a conflict, nothing is written). `--restart` is restart-to-apply:
-  it restarts the service-manager, then the controller, stamping the pod template with
+  change gives a conflict, nothing is written); it first saves the live ConfigMap
+  under the backup dir and prints the path. `--restart` is restart-to-apply: it restarts
+  the service-manager, then the controller, stamping the pod template with
   `tre.dev/params-hash` (sha256 of `registry.yaml`, first 16 hex), and waits for each
-  rollout. Names come from `TRE_NS`, `REGISTRY_CM`, `CONTROLLER_DEPLOY`, `SM_DEPLOY`.
-- **Structural keys** (images, engine args, `placement:` / `gateway:` /
-  `service_manager:` / `reissue:`): `deploy/scripts/merge_live_registry.py` (release
+  rollout; if one fails it prints which were restarted and exits non-zero (rerun
+  `--restart`). `--status` compares that annotation with the live ConfigMap: after a
+  release or a `kubectl rollout restart` (no hash stamped) it shows PENDING until one
+  `params_set.py --restart`. Names come from `TRE_NS`, `REGISTRY_CM`,
+  `CONTROLLER_DEPLOY`, `SM_DEPLOY`.
+- **Structural keys** (`max_replicas` = the GPU layout / binding count, images,
+  engine args, `placement:` / `gateway:` / `service_manager:` / `reissue:`): `deploy/scripts/merge_live_registry.py` (release
   registry merged with the live tunables) or `deploy/scripts/release/registry_set.py`
   (one key), then `kubectl replace` of the ConfigMap.
 - **Never** `kubectl apply` `overlays/tre-v2/params.yaml`: it is a bootstrap
