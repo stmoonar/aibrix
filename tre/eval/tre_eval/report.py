@@ -2,6 +2,7 @@
 
 Read-only over the arm directories. Writes under ``--out``:
   index.html                     self-contained (figures embedded), links to every file below
+  viewer.html                    interactive time-axis viewer (tre_eval.viewer; viewer-<trace>.html per trace)
   comparison.csv / .json         one row per arm x model (+ ALL): V_req, percentiles, goodput, GPU-s, ...
   paired.csv                     A - ref on the same request plan, block-bootstrap CIs; multi-seed t-CIs
   onsets.csv, decision_points.csv
@@ -402,13 +403,16 @@ details{margin:6px 0}
 
 
 def write_html(out: str, results: list[dict], comp: list[dict], paired: list[dict], multi: list[dict],
-               cross_figs: dict, validation: dict, args) -> str:
+               cross_figs: dict, validation: dict, args, viewers: list[str] | None = None) -> str:
     now = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     p = [f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
          f"<title>TRE eval report</title><style>{CSS}</style></head><body>",
          f"<h1>TRE evaluation report</h1><p class=muted>generated {now} by tre_eval.report · {len(results)} arm(s) · "
          f"trim {args.trim_s} s · bootstrap {args.reps} reps, {args.block_s} s blocks · ref arm <code>{html.escape(args.ref or '')}</code></p>",
          "<nav>" + "".join(f"<a href='#arm-{html.escape(r['subdir'])}'>{html.escape(_full_label(r))}</a>" for r in results) + "</nav>"]
+    if viewers:
+        p.append("<p>Interactive viewer: " + " · ".join(f"<a href='{html.escape(os.path.basename(v))}'>{html.escape(os.path.basename(v))}</a>"
+                                                       for v in viewers) + "</p>")
     bad = [m for v in validation.values() for m in v.get("mismatches", [])]
     p.append("<h2>Validation against existing scores</h2>")
     p.append(_table([{"arm": k, "score.json checked": (v.get("score_json") or {}).get("checked"),
@@ -492,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--block-s", type=float, default=30.0, help="bootstrap block length (s)")
     ap.add_argument("--reps", type=int, default=1000, help="bootstrap replicates")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-viewer", action="store_true", help="do not write the interactive viewer.html")
     args = ap.parse_args(argv)
     args.clock_offset = dict(args.clock_offset)
     cap = _load_yaml(args.capacity).get("capacity_rps_per_replica") or {}
@@ -545,7 +550,16 @@ def main(argv: list[str] | None = None) -> int:
         cross["paired"] = P.cross_paired(paired, styles, _full_label(ref_res), os.path.join(args.out, "cross_paired"))
     except Exception as e:  # noqa: BLE001
         print(f"WARN cross figure paired failed: {type(e).__name__}: {e}", file=sys.stderr)
-    idx = write_html(args.out, results, comp, paired, multi, cross, validation, args)
+    viewers: list[str] = []
+    if not args.no_viewer:
+        try:
+            from . import viewer as V
+            viewers = V.write_for_report(args.out, subs=[os.path.basename(r["subdir"]) for r in results])
+            for p in viewers:
+                print(f"viewer: {p}")
+        except Exception as e:  # noqa: BLE001 - the viewer is optional; the report stands without it
+            print(f"WARN viewer failed: {type(e).__name__}: {e}", file=sys.stderr)
+    idx = write_html(args.out, results, comp, paired, multi, cross, validation, args, viewers)
     n_bad = sum(len(v["mismatches"]) for v in validation.values())
     print(f"report: {idx}  (validation mismatches: {n_bad})")
     return 0

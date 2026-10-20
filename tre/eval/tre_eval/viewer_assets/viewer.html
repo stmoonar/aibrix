@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>/*__UPLOT_CSS__*/</style>
+<style>/*__VIEWER_CSS__*/</style>
+</head>
+<body>
+<div id="app">
+  <header id="hdr">
+    <div class="hdr-top">
+      <div class="hdr-title">
+        <h1 id="trace-name"></h1>
+        <p id="trace-meta" class="meta"></p>
+      </div>
+      <div class="hdr-actions">
+        <button type="button" id="btn-theme" class="btn ghost" title="Switch theme (t)">Theme: auto</button>
+        <button type="button" id="btn-help" class="btn ghost" aria-expanded="false" title="Keyboard shortcuts (?)">Shortcuts</button>
+      </div>
+    </div>
+    <div class="hdr-body">
+      <div id="scorecard" class="scorecard"></div>
+      <div id="hdr-side" class="hdr-side"></div>
+    </div>
+    <div id="help" class="help" hidden>
+      <dl>
+        <dt>Drag on a plot</dt><dd>zoom to the selected time range</dd>
+        <dt>Double-click, <kbd>r</kbd></dt><dd>show the whole run</dd>
+        <dt><kbd>&larr;</kbd> <kbd>&rarr;</kbd></dt><dd>pan</dd>
+        <dt><kbd>+</kbd> <kbd>&minus;</kbd>, <kbd>Ctrl</kbd>+wheel</dt><dd>zoom in / out</dd>
+        <dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>timeline / events / GPUs</dd>
+        <dt><kbd>l</kbd></dt><dd>log scale for latency</dd>
+        <dt><kbd>t</kbd></dt><dd>theme</dd>
+        <dt><kbd>Esc</kbd></dt><dd>close the detail panel</dd>
+        <dt>Shift-click an arm</dt><dd>show only that arm</dd>
+      </dl>
+    </div>
+  </header>
+
+  <div id="bar">
+    <div class="bar-row">
+      <nav class="seg" id="views" aria-label="View">
+        <button type="button" data-v="1">Timeline <kbd>1</kbd></button>
+        <button type="button" data-v="2">Events <kbd>2</kbd></button>
+        <button type="button" data-v="3">GPUs <kbd>3</kbd></button>
+      </nav>
+      <div class="ctl"><span class="ctl-label">Model</span><div class="seg" id="models"></div></div>
+      <div class="ctl"><span class="ctl-label">Arms</span><div class="chips" id="arms"></div></div>
+      <div class="ctl" id="panels-ctl">
+        <details class="menu" id="panels-menu"><summary class="btn">Panels</summary><div class="menu-body" id="panels"></div></details>
+        <label class="check"><input type="checkbox" id="chk-log" name="log"> Log latency</label>
+      </div>
+      <div class="ctl range">
+        <span id="range-label" class="range-label"></span>
+        <button type="button" class="btn" id="btn-reset" title="Show the whole run (r)">Reset zoom</button>
+      </div>
+    </div>
+    <div id="nav-wrap"><canvas id="nav" aria-label="Run overview: drag to select a time range"></canvas></div>
+  </div>
+
+  <main id="main">
+    <section id="view-1" class="view" aria-label="Timeline"></section>
+    <section id="view-2" class="view" aria-label="Events"></section>
+    <section id="view-3" class="view" aria-label="GPU layout"></section>
+  </main>
+</div>
+<aside id="detail" aria-label="Details" aria-hidden="true">
+  <div class="detail-head">
+    <h2 id="detail-title"></h2>
+    <button type="button" class="btn ghost" id="detail-close" title="Close (Esc)">Close</button>
+  </div>
+  <div id="detail-body"></div>
+</aside>
+<div id="tip" role="tooltip" hidden></div>
+<noscript>This page needs JavaScript to draw the charts.</noscript>
+<script id="data" type="application/json">__DATA_JSON__</script>
+<script>/*__UPLOT_JS__*/</script>
+<script>/*__CORE_JS__*/</script>
+<script>/*__APP_JS__*/</script>
+</body>
+</html>
