@@ -877,6 +877,43 @@ def test_non_continuable_contract(case):
     assert sc.non_continuable_reason(path, sc.parse_body(raw), cfg) == case["reason"]
 
 
+#: Shared with the gateway plugin's TestBLReqEvents_ReissueContract
+#: (pkg/plugins/gateway/tre_bl_req_events_test.go): the requests this sidecar re-sends
+#: through the gateway, and how the gateway's request events must classify them.
+GW_CONTRACT = Path(__file__).resolve().parents[1] / "contract" / "gateway_reissue_requests.json"
+
+
+def test_gateway_reissue_contract_depth_header():
+    assert json.loads(GW_CONTRACT.read_text(encoding="utf-8"))["depth_header"] == Config().depth_header
+
+
+@pytest.mark.asyncio
+async def test_gateway_reissue_contract():
+    """Each sidecar case of the contract is what the sidecar really sends to the gateway:
+    the same path, x-tre-* request headers and prompt."""
+    cases = {c["from"]: c for c in json.loads(GW_CONTRACT.read_text(encoding="utf-8"))["cases"]}
+    client = {"x-tre-bl-in-tokens": "5"}  # forwarded unchanged on every reissue
+    sent = {}
+    async with Harness() as h:
+        h.engine_a.put_to_sleep()
+        assert (await h.post("/v1/completions", completion_body(6), headers=client))[0] == 200
+        (sent["sidecar_retry"],) = h.gateway.requests
+    async with Harness(a={"hold_at": 7}) as h:
+        assert (await h.post("/v1/completions", completion_body(24), headers=client, sleep_after=7))[0] == 200
+        (sent["sidecar_continue_completion"],) = h.gateway.requests
+    async with Harness(a={"hold_at": 5}) as h:
+        assert (await h.post("/v1/chat/completions", chat_body(16), headers=client, sleep_after=5))[0] == 200
+        (sent["sidecar_continue_chat"],) = h.gateway.requests
+    assert set(cases) == set(sent) | {"client"}
+    for source, req in sent.items():
+        case = cases[source]
+        assert req["path"] == case["path"], source
+        tre_headers = {k.lower(): v for k, v in req["headers"].items() if k.lower().startswith("x-tre-")}
+        assert tre_headers == case["headers"], source
+        for key in ("prompt", "messages"):  # what the gateway counts input tokens from
+            assert req["body"].get(key) == case["body"].get(key), (source, key)
+
+
 def test_build_continuation_budgets():
     cfg = Config()
     plan = sc.build_continuation(cfg.completions_path, {"prompt": "x", "min_tokens": 5, "seed": 7, "echo": False},

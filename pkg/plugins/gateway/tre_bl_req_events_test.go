@@ -18,8 +18,11 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -244,9 +247,9 @@ func TestBLReqEvents_OffMeansZeroRedisWrites(t *testing.T) {
 func TestBLReqEvents_OffHeadersNotCapturedAndHooksDoNotAllocate(t *testing.T) {
 	s := &Server{}
 	_, _, _, rc := s.HandleRequestHeaders(context.Background(), "rid",
-		treHeadersReq(PathCompletions, HeaderBLInTokens, "5", HeaderTREContinued, "1", HeaderTRERetried, "1"))
+		treHeadersReq(PathCompletions, HeaderBLInTokens, "5", HeaderTREContinued, "1", HeaderTRERetried, "1", HeaderTREReissueDepth, "1"))
 	require.NotNil(t, rc)
-	for _, h := range []string{HeaderBLInTokens, HeaderTREContinued, HeaderTRERetried} {
+	for _, h := range []string{HeaderBLInTokens, HeaderTREContinued, HeaderTRERetried, HeaderTREReissueDepth} {
 		_, ok := rc.ReqHeaders[h]
 		assert.False(t, ok, "%s must not be stored while the feature is off", h)
 	}
@@ -391,6 +394,7 @@ func TestBLReqEvents_InputTokens(t *testing.T) {
 		{"escaped string", "other", "", false, PathCompletions, []byte(`{"prompt":"中\n"}`), 1, "estimate"},
 		{"token ids", "other", "", false, PathCompletions, []byte(`{"prompt":[1,2,3,4,5]}`), 5, "token_ids"},
 		{"token id batches", "other", "", false, PathCompletions, []byte(`{"prompt":[[1,2],[3]]}`), 3, "token_ids"},
+		{"token ids win over header", "other", "2", true, PathCompletions, []byte(`{"prompt":[1,2,3,4,5]}`), 5, "token_ids"}, // continuation: header is the original prompt
 		{"empty prompt", "other", "", false, PathCompletions, []byte(`{"prompt":""}`), 0, "estimate"},
 		{"chat string", "other", "", false, PathChatCompletions, []byte(`{"messages":[{"content":"abc"},{"content":"defg"}]}`), 3, "estimate"},
 		{"chat parts", "other", "", false, PathChatCompletions, []byte(`{"messages":[{"content":[{"type":"text","text":"abcdef"},{"type":"image_url"}]}]}`), 2, "estimate"},
@@ -601,10 +605,17 @@ func TestBLReqEvents_StreamEndHookIdempotent(t *testing.T) {
 // 5. reissue headers
 
 func TestBLReqEvents_Reissue(t *testing.T) {
-	assert.Equal(t, "none", blReissue(map[string]string{}))
-	assert.Equal(t, "continued", blReissue(map[string]string{HeaderTREContinued: ""}))
-	assert.Equal(t, "retried", blReissue(map[string]string{HeaderTRERetried: "1"}))
-	assert.Equal(t, "continued", blReissue(map[string]string{HeaderTREContinued: "1", HeaderTRERetried: "1"}))
+	assert.Equal(t, "none", blReissue(map[string]string{}, false))
+	assert.Equal(t, "none", blReissue(map[string]string{}, true), "a client's own token-id prompt")
+	assert.Equal(t, "continued", blReissue(map[string]string{HeaderTREContinued: ""}, false))
+	assert.Equal(t, "retried", blReissue(map[string]string{HeaderTRERetried: "1"}, true))
+	assert.Equal(t, "continued", blReissue(map[string]string{HeaderTREContinued: "1", HeaderTRERetried: "1"}, false))
+	// the sidecar's own requests carry only the depth header
+	assert.Equal(t, "continued", blReissue(map[string]string{HeaderTREReissueDepth: "2"}, true))
+	assert.Equal(t, "retried", blReissue(map[string]string{HeaderTREReissueDepth: " 1 "}, false))
+	for _, bad := range []string{"0", "-1", "", "x"} {
+		assert.Equal(t, "none", blReissue(map[string]string{HeaderTREReissueDepth: bad}, true), "depth %q", bad)
+	}
 
 	for hdr, want := range map[string]string{"X-TRE-Continued": "continued", "x-tre-retried": "retried"} {
 		t.Run(want, func(t *testing.T) {
@@ -622,6 +633,55 @@ func TestBLReqEvents_Reissue(t *testing.T) {
 			}
 			assert.Equal(t, "3", evs[0]["in_tokens"])
 			assert.Equal(t, "token_ids", evs[0]["in_src"])
+		})
+	}
+}
+
+// blReissueContract is shared with the reissue sidecar's test_gateway_reissue_contract
+// (tre/reissue/tests/test_reissue_sidecar.py), which re-creates every sidecar case from the
+// sidecar's own request-building code. The path is relative to this package directory.
+var blReissueContract = filepath.Join("..", "..", "..", "tre", "reissue", "contract", "gateway_reissue_requests.json")
+
+// The requests the sidecar really sends (depth header, original or token-id body, the
+// client's x-tre-bl-in-tokens forwarded unchanged) produce reissue != none and the token-id
+// count as in_tokens; a client request stays none.
+func TestBLReqEvents_ReissueContract(t *testing.T) {
+	data, err := os.ReadFile(blReissueContract)
+	require.NoError(t, err)
+	var contract struct {
+		DepthHeader string `json:"depth_header"`
+		Cases       []struct {
+			Name     string            `json:"name"`
+			From     string            `json:"from"`
+			Path     string            `json:"path"`
+			Headers  map[string]string `json:"headers"`
+			Body     json.RawMessage   `json:"body"`
+			Reissue  string            `json:"reissue"`
+			InTokens int64             `json:"in_tokens"`
+		} `json:"cases"`
+	}
+	require.NoError(t, json.Unmarshal(data, &contract))
+	// guard: the gateway reads the header the sidecar writes (sidecar side:
+	// test_gateway_reissue_contract_depth_header checks Config.depth_header).
+	require.Equal(t, contract.DepthHeader, HeaderTREReissueDepth)
+	require.NotEmpty(t, contract.Cases)
+	for _, c := range contract.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			r := newBLRedis(t)
+			s := newBLServer(r, testBLConfig())
+			var hdrs []string
+			for k, v := range c.Headers {
+				hdrs = append(hdrs, k, v)
+			}
+			_ = blRun(t, s, "contract-"+c.Name, c.Path, string(c.Body), hdrs, func(srv *mockProcessServer) {
+				srv.On("Recv").Return((*extProcPb.ProcessingRequest)(nil), io.EOF).Once()
+			})
+			s.blEvents.close()
+			evs := r.events(t, "m")
+			require.Equal(t, []string{"arr", "done"}, blKinds(evs))
+			assert.Equal(t, c.Reissue, evs[0]["reissue"])
+			assert.Equal(t, strconv.FormatInt(c.InTokens, 10), evs[0]["in_tokens"])
+			assert.Equal(t, c.From != "client", evs[0]["reissue"] != "none", "reissue iff the sidecar sent it")
 		})
 	}
 }

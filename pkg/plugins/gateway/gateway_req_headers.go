@@ -74,7 +74,7 @@ func (s *Server) HandleRequestHeaders(ctx context.Context, requestID string, req
 			reqHeaders[n.Key] = string(n.RawValue)
 		case HeaderTREExcludePod: // TRE-PATCH(P3-GW-010): may repeat; every value counts
 			reqHeaders[HeaderTREExcludePod] = mergeTREExcludeHeader(reqHeaders[HeaderTREExcludePod], string(n.RawValue))
-		case HeaderBLInTokens, HeaderTREContinued, HeaderTRERetried: // TRE-PATCH(BL-GW-001)
+		case HeaderBLInTokens, HeaderTREContinued, HeaderTRERetried, HeaderTREReissueDepth: // TRE-PATCH(BL-GW-001)
 			s.blCaptureRequestHeader(reqHeaders, strings.ToLower(n.Key), n.RawValue)
 		case HeaderTraceParent:
 			reqHeaders[n.Key] = string(n.RawValue)

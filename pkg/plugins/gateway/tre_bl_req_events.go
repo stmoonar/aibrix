@@ -59,6 +59,10 @@ import (
 //	           (completion, upstream error, abort, shutdown): req_id reissue gw_local_ms
 //	           pod status out_tokens out_src(usage|none) dt_arr_ms
 //
+// reissue (none|retried|continued) classifies the request as the reissue sidecar
+// (tre/reissue/tre_reissue/sidecar.py) sends it, see blReissue. The sidecar's request
+// format is pinned by the shared contract tre/reissue/contract/gateway_reissue_requests.json.
+//
 // The request path never blocks on Redis: events go through a bounded channel drained by
 // one goroutine that writes them in pipelined batches; a full channel drops the event.
 
@@ -71,6 +75,7 @@ const (
 	HeaderBLInTokens       = "x-tre-bl-in-tokens"
 	HeaderTREContinued     = "x-tre-continued"
 	HeaderTRERetried       = "x-tre-retried"
+	HeaderTREReissueDepth  = "x-tre-reissue-depth" // sidecar Config.depth_header: >= 1 on every request it re-sends
 	defaultBLReqMaxLen     = int64(200000)
 	defaultBLReqBuffer     = 10000
 	defaultBLCharsPerToken = 4.0
@@ -85,6 +90,8 @@ const (
 	blKindArr  = "arr"
 	blKindFT   = "ft"
 	blKindDone = "done"
+
+	blInSrcTokenIDs = "token_ids"
 )
 
 var (
@@ -340,12 +347,31 @@ type blReqState struct {
 	respHeadersSeen bool
 }
 
-func blReissue(h map[string]string) string {
+// blReissue classifies a request. x-tre-continued / x-tre-retried on the request win when
+// present. The reissue sidecar does not send them on its requests (only on its response to
+// the client); what it sends is x-tre-reissue-depth >= 1, and:
+//   - a retry re-sends the client's original body unchanged;
+//   - a continuation sends /v1/completions with prompt = prompt ids + generated ids.
+//
+// So depth >= 1 with a token-id prompt is "continued", any other depth >= 1 is "retried".
+// Limits (both only move a request between the two reissue kinds, never to or from
+// "none"): the retry of a client request whose prompt already was token ids reads as
+// "continued", and a continuation with nothing generated yet (the sidecar re-sends the
+// original body) reads as "retried", which is what it is on the wire.
+func blReissue(h map[string]string, tokenIDPrompt bool) string {
 	if _, ok := h[HeaderTREContinued]; ok {
 		return "continued"
 	}
 	if _, ok := h[HeaderTRERetried]; ok {
 		return "retried"
+	}
+	if v, ok := h[HeaderTREReissueDepth]; ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+			if tokenIDPrompt {
+				return "continued"
+			}
+			return "retried"
+		}
 	}
 	return "none"
 }
@@ -378,6 +404,7 @@ func (s *Server) blOnRequestBody(st *processState, req *extProcPb.ProcessingRequ
 	}
 	body := req.GetRequestBody().GetBody()
 	inTokens, inSrc := blInputTokens(rc, st.model, body, e.cfg)
+	reissue := blReissue(rc.ReqHeaders, inSrc == blInSrcTokenIDs)
 	maxTokens := ""
 	for _, k := range [...]string{"max_tokens", "max_completion_tokens"} {
 		if r := gjson.GetBytes(body, k); r.Exists() && r.Type == gjson.Number {
@@ -388,7 +415,7 @@ func (s *Server) blOnRequestBody(st *processState, req *extProcPb.ProcessingRequ
 	b := &blReqState{
 		stream:    BLReqEventsKeyPrefix + st.model,
 		reqID:     st.requestID,
-		reissue:   blReissue(rc.ReqHeaders),
+		reissue:   reissue,
 		pod:       pod,
 		arrAt:     time.Now(),
 		outTokens: -1,
@@ -525,9 +552,11 @@ func blDurMs(d time.Duration) string {
 // ---------------------------------------------------------------------------------------
 // input token count
 
-// blInputTokens returns the prompt length in tokens and its source:
+// blInputTokens returns the prompt length in tokens and its source, first match wins:
+//   - "token_ids": a completions prompt given as token ids (exact, the id count). It goes
+//     first: the reissue sidecar forwards the client's x-tre-bl-in-tokens unchanged on a
+//     continuation whose prompt is the original prompt ids plus the generated ids;
 //   - "header": x-tre-bl-in-tokens, a positive integer set by the client (exact);
-//   - "token_ids": a completions prompt given as token ids (exact, the id count);
 //   - "estimate": ceil(chars / chars_per_token[model]), chars counted in runes.
 //
 // The estimate is a fallback only. A fixed chars/token ratio is inaccurate: CJK text has
@@ -535,14 +564,14 @@ func blDurMs(d time.Duration) string {
 // roughly 2-3x), and chat templates / special tokens are not counted. Clients should send
 // the header when the exact count matters.
 func blInputTokens(rc *types.RoutingContext, model string, body []byte, cfg blReqConfig) (int64, string) {
+	chars, ids := blPromptChars(rc.ReqPath, body, rc.Message)
+	if ids >= 0 {
+		return ids, blInSrcTokenIDs
+	}
 	if v, ok := rc.ReqHeaders[HeaderBLInTokens]; ok {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
 			return n, "header"
 		}
-	}
-	chars, ids := blPromptChars(rc.ReqPath, body, rc.Message)
-	if ids >= 0 {
-		return ids, "token_ids"
 	}
 	return blEstimateTokens(chars, cfg.charsPerTokenFor(model)), "estimate"
 }

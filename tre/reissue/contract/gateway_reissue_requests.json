@@ -1,0 +1,42 @@
+{
+  "description": "Shared contract for how the gateway's baseline request events (pkg/plugins/gateway/tre_bl_req_events.go: blReissue, blInputTokens) classify the requests the reissue sidecar (tre/reissue/tre_reissue/sidecar.py) re-sends through the gateway. depth_header = the sidecar's Config.depth_header default. Each case is one request as it reaches the gateway: path, the x-tre-* request headers (all of them, names lower case) and the JSON body. from = client | sidecar_retry | sidecar_continue_completion | sidecar_continue_chat; the sidecar cases are recorded from the sidecar test harness (tre/reissue/tests/test_reissue_sidecar.py: test_gateway_reissue_contract re-creates each one and compares). reissue / in_tokens = the gateway's arr event fields.",
+  "depth_header": "x-tre-reissue-depth",
+  "cases": [
+    {
+      "name": "client_request",
+      "from": "client",
+      "path": "/v1/completions",
+      "headers": {"x-tre-bl-in-tokens": "5"},
+      "body": {"model": "m", "prompt": "one two three four", "max_tokens": 6, "temperature": 0, "stream": true, "stream_options": {"include_usage": true}},
+      "reissue": "none",
+      "in_tokens": 5
+    },
+    {
+      "name": "retry_engine_sleeping",
+      "from": "sidecar_retry",
+      "path": "/v1/completions",
+      "headers": {"x-tre-bl-in-tokens": "5", "x-tre-reissue-depth": "1", "x-tre-exclude-pod": "pod-a"},
+      "body": {"model": "m", "prompt": "one two three four", "max_tokens": 6, "temperature": 0, "stream": true, "stream_options": {"include_usage": true}},
+      "reissue": "retried",
+      "in_tokens": 5
+    },
+    {
+      "name": "continue_completion_stream",
+      "from": "sidecar_continue_completion",
+      "path": "/v1/completions",
+      "headers": {"x-tre-bl-in-tokens": "5", "x-tre-reissue-depth": "1", "x-tre-exclude-pod": "pod-a"},
+      "body": {"model": "m", "max_tokens": 17, "temperature": 0, "stream": true, "stream_options": {"include_usage": true}, "prompt": [1, 372, 396, 586, 494, 929, 510, 155, 620, 21, 821, 537]},
+      "reissue": "continued",
+      "in_tokens": 12
+    },
+    {
+      "name": "continue_chat_stream",
+      "from": "sidecar_continue_chat",
+      "path": "/v1/completions",
+      "headers": {"x-tre-bl-in-tokens": "5", "x-tre-reissue-depth": "1", "x-tre-exclude-pod": "pod-a"},
+      "body": {"model": "m", "temperature": 0, "stream_options": {"include_usage": true}, "prompt": [1, 619, 582, 586, 258, 376, 976, 112, 578, 865], "max_tokens": 11, "stream": true},
+      "reissue": "continued",
+      "in_tokens": 10
+    }
+  ]
+}
