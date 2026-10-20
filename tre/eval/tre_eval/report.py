@@ -2,6 +2,7 @@
 
 Read-only over the arm directories. Writes under ``--out``:
   index.html                     self-contained (figures embedded), links to every file below
+  viewer.html                    interactive time-axis viewer (tre_eval.viewer; viewer-<trace>.html per trace)
   comparison.csv / .json         one row per arm x model (+ ALL): V_req, percentiles, goodput, GPU-s, ...
   paired.csv                     A - ref on the same request plan, block-bootstrap CIs; multi-seed t-CIs
   onsets.csv, decision_points.csv
@@ -492,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--block-s", type=float, default=30.0, help="bootstrap block length (s)")
     ap.add_argument("--reps", type=int, default=1000, help="bootstrap replicates")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-viewer", action="store_true", help="do not write the interactive viewer.html")
     args = ap.parse_args(argv)
     args.clock_offset = dict(args.clock_offset)
     cap = _load_yaml(args.capacity).get("capacity_rps_per_replica") or {}
@@ -546,6 +548,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"WARN cross figure paired failed: {type(e).__name__}: {e}", file=sys.stderr)
     idx = write_html(args.out, results, comp, paired, multi, cross, validation, args)
+    if not args.no_viewer:
+        from . import viewer as V
+        try:
+            for p in V.write_for_report(args.out):
+                print(f"viewer: {p}")
+        except Exception as e:  # noqa: BLE001 - the viewer is optional; the report stands without it
+            print(f"WARN viewer failed: {type(e).__name__}: {e}", file=sys.stderr)
     n_bad = sum(len(v["mismatches"]) for v in validation.values())
     print(f"report: {idx}  (validation mismatches: {n_bad})")
     return 0

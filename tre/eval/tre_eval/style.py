@@ -13,6 +13,9 @@ ALL_COLOR = "#0b0b0b"
 FAMILY_COLORS = {"tre": "#4a3aa7", "apa": "#e34948", "chiron": "#008300", "tokenscale": "#c98500",
                  "preserve": "#d55181"}
 OTHER_COLOR = "#52514e"
+# dark-surface step of the same hue (interactive viewer dark theme); hues without an entry keep their value
+DARK_STEPS = {"#2a78d6": "#3987e5", "#eb6834": "#d95926", "#1baf7a": "#199e70", "#4a3aa7": "#9085e9",
+              "#e87ba4": "#d55181", "#52514e": "#a3a29b", "#0b0b0b": "#f0efec"}
 LINESTYLES = ["-", "--", ":", "-.", (0, (5, 1, 1, 1)), (0, (1, 1))]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
 HATCHES = [None, "..", "//", "xx", "\\\\", "++"]
