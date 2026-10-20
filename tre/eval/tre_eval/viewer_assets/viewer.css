@@ -176,6 +176,9 @@ table.ev tbody tr.sel { background: var(--brush); }
 .lg i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; }
 .lg i.hatch { background: repeating-linear-gradient(135deg, var(--ink2) 0 1.5px, transparent 1.5px 4px); border: 1px solid var(--ink2); }
 .lg i.frag { background: var(--serious); }
+.lg i.refusal { background: none; border: 0; color: var(--serious); position: relative; }
+.lg i.refusal::before { content: '\2715'; position: absolute; inset: -3px 0 0 0; font-style: normal; font-size: 11px; line-height: 14px; text-align: center; }
+td.num-tip { cursor: help; text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
 .lg i.free { border: 1px dashed var(--axis); }
 
 /* detail panel */

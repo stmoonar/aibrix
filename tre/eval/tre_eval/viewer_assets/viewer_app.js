@@ -76,6 +76,7 @@
 
   let CH = [];          // uPlot instances in the current view
   let LANES = [];       // custom canvases in the current view
+  let RENDER_AC = null; // aborts the window listeners of the previous render's canvases
   let ACTIVE = null;    // uPlot under the mouse
   let GEO = null;       // plot area of a uPlot (css px): {l, r}
   let MX = 0, MY = 0;
@@ -440,7 +441,7 @@
           rows.forEach((r) => {
             const ex = [];
             if (r.hid[i]) ex.push(r.hid[i] + ' hidden');
-            if (r.tgt[i] != null && r.tgt[i] !== r.awake[i]) ex.push('target ' + r.tgt[i]);
+            if (r.tgt[i] != null && r.tgt[i] !== r.awake[i]) ex.push('target ' + r.tgt[i] + (r.a.target_source ? ' (' + r.a.target_source + ')' : ''));
             s += tipRow(armColor(r.a), r.a.dash, r.a.label, r.awake[i] == null ? '–' : r.awake[i], ex.join(', '));
           });
           return s;
@@ -615,7 +616,7 @@
       const p = pos(e);
       const it = L.hit(p[0], p[1]);
       if (it && o.click) o.click(it);
-    });
+    }, { signal: RENDER_AC.signal });
     cv.addEventListener('dblclick', () => resetZoom());
     cv.addEventListener('wheel', (e) => {
       if (!(e.ctrlKey || e.metaKey)) return;
@@ -705,8 +706,8 @@
     }
     if (it.type === 'frag') {
       const f = it.obj;
-      return tipHead('Fragmentation · ' + a.label, f.t0) +
-        tipRow(modelColor(f.model), null, f.model + ' below target', f.free + ' GPUs free', 'no aligned slot') +
+      return tipHead('Stranded TP ' + f.tp + ' slot · ' + a.label, f.t0) +
+        tipRow(css('--serious'), null, 'up to ' + f.free + ' GPUs free', '', 'no aligned free ' + f.tp + '-GPU slot') +
         '<div class="tr">' + C.fmtT(f.t0) + ' → ' + C.fmtT(f.t1) + '<span class="v">' + (f.t1 - f.t0) + ' s</span></div>';
     }
     return null;
@@ -909,9 +910,12 @@
   function renderGpus(sec) {
     const lg = h('div', { class: 'legend-row' });
     MODELS.forEach((m) => lg.append(h('span', { class: 'lg' }, h('i', { style: 'background:' + modelColor(m) }), m + (MODEL[m].tp > 1 ? ' (TP ' + MODEL[m].tp + ')' : ''))));
-    lg.append(h('span', { class: 'lg' }, h('i', { class: 'hatch' }), 'hidden (SafeScale probe)'));
+    lg.append(h('span', { class: 'lg' }, h('i', { class: 'hatch' }), 'hidden (not routable)'));
     lg.append(h('span', { class: 'lg' }, h('i', { class: 'free' }), 'free GPU'));
-    lg.append(h('span', { class: 'lg' }, h('i', { class: 'frag' }), 'fragmentation: TP≥2 model below target, enough free GPUs, no aligned free slot'));
+    const tps = MODELS.map((m) => MODEL[m].tp).filter((k) => k >= 2);
+    if (tps.length) lg.append(h('span', { class: 'lg', title: 'From the GPU layout only, the same rule for every arm' }, h('i', { class: 'frag' }),
+      'stranded TP slot: ≥ ' + Math.min.apply(null, tps) + ' GPUs free but no aligned free slot'));
+    lg.append(h('span', { class: 'lg' }, h('i', { class: 'refusal' }), 'SM 409 refusal (slot occupied)'));
     sec.append(lg);
 
     // total GPUs awake per arm (shares the cursor and zoom)
@@ -943,9 +947,10 @@
       const bars = C.gpuBars(a.gpus);
       const s = (a.summary || {}).ALL || {};
       const fragS = a.frag.reduce((x, f) => x + (f.t1 - f.t0), 0);
+      const refs = a.events.filter((e) => e.kind === 'refusal');
       const panel = h('div', { class: 'panel' },
         h('div', { class: 'gantt-head' }, swatch(a), h('span', { class: 'panel-title', text: a.label }),
-          h('span', { class: 'stat', text: (s.mean_gpus != null ? 'mean ' + C.fmtNum(s.mean_gpus, 2) + ' GPUs' : '') + ' · ' + bars.length + ' awake intervals · fragmentation ' + fragS + ' s' })));
+          h('span', { class: 'stat', text: (s.mean_gpus != null ? 'mean ' + C.fmtNum(s.mean_gpus, 2) + ' GPUs' : '') + ' · ' + bars.length + ' awake intervals · stranded TP slot ' + fragS + ' s' + (refs.length ? ' · ' + refs.length + ' SM 409' : '') })));
       sec.append(panel);
       Lane(panel, {
         height: height, axis: true,
@@ -996,6 +1001,21 @@
               L.add({ arm: a, type: 'bar', obj: b, idx: bi }, x0, y0, x1, y0 + hh);
             });
           });
+          // SM 409 refusals: a red cross on the lanes of the refused binding (in the strip when it has none)
+          ctx.strokeStyle = css('--serious');
+          ctx.lineWidth = 1.6;
+          refs.forEach((e) => {
+            const x = L.tx(e.t);
+            if (x < L.left() - 4 || x > L.right() + 4) return;
+            const pb = e.binding ? e.binding.split('/') : [];
+            let ys = pb.length === 3 ? pb[2].split(',').map((i) => laneY[pb[1] + '/' + i]).filter((v) => v != null) : [];
+            ys = ys.length ? ys.map((v) => v + laneH / 2) : [2 + fragH / 2];
+            ys.forEach((yc) => {
+              ctx.beginPath(); ctx.moveTo(x - 3.5, yc - 3.5); ctx.lineTo(x + 3.5, yc + 3.5); ctx.moveTo(x + 3.5, yc - 3.5); ctx.lineTo(x - 3.5, yc + 3.5); ctx.stroke();
+              L.add({ arm: a, type: 'ev', obj: e }, x - 5, yc - 6, x + 5, yc + 6);
+            });
+          });
+          ctx.lineWidth = 1;
         },
         gutter: (ctx, L) => {
           ctx.font = '10.5px ' + css('--font'); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
@@ -1056,11 +1076,11 @@
       kv(dl, 'GPUs', o.gpus.join(', '));
       kv(dl, 'Hidden', o.hidden.length ? o.hidden.map((x) => C.fmtT(x[0]) + '–' + C.fmtT(x[1])).join(', ') : 'never');
     } else if (it.type === 'frag') {
-      title = 'Fragmentation';
+      title = 'Stranded TP ' + o.tp + ' slot';
       t0 = o.t0; t1 = o.t1;
       kv(dl, 'Interval', C.fmtT(o.t0) + ' → ' + C.fmtT(o.t1) + '  (' + (o.t1 - o.t0) + ' s)');
-      kv(dl, 'Free GPUs', String(o.free));
-      kv(dl, 'Meaning', o.model + ' had fewer awake replicas than its target, at least ' + (MODEL[o.model] ? MODEL[o.model].tp : 2) + ' GPUs were free, but no aligned free slot existed.');
+      kv(dl, 'Free GPUs', 'up to ' + o.free);
+      kv(dl, 'Meaning', 'At least ' + o.tp + ' GPUs had no awake binding, but no aligned ' + o.tp + '-GPU slot was completely free, so a TP ' + o.tp + ' replica could not be placed. Computed from the GPU layout only, the same way for every arm.');
     } else {
       const k = KIND[o.kind] || { label: o.kind };
       title = k.label;
@@ -1211,13 +1231,14 @@
     sc.innerHTML = '';
     const tbl = h('table');
     tbl.append(h('caption', { text: 'Whole-run scores for ' + (key === 'ALL' ? 'all models' : key) + ' (comparison.csv; V_req = share of scored requests that miss the SLO)' }));
-    const cols = ['Arm', 'Requests', 'V_req (95% CI)', 'TTFT p95', 'TPOT p95', 'Mean GPUs', 'GPU·s / good req', 'Up / down', 'Probes c / r', 'Valid', 'Checks'];
+    const cols = ['Arm', 'Requests', 'V_req (95% CI)', 'TTFT p95', 'TPOT p95', 'Mean GPUs', 'GPU·s / good req', 'Wakes / sleeps', 'Probes c / r', 'Valid', 'Checks'];
     tbl.append(h('thead', null, h('tr', null, cols.map((c) => h('th', { text: c })))));
     const tb = h('tbody');
     D.arms.forEach((a) => {
       const s = (a.summary || {})[key] || {};
-      const evs = (k) => a.events.filter((e) => e.kind === k && (key === 'ALL' || e.model === key)).length;
-      const pr = a.probes.filter((p) => key === 'ALL' || p.model === key);
+      const inLoad = (t) => t != null && t >= 0 && (a.load_s == null || t <= a.load_s);  // the scored load window only
+      const evs = (k) => a.events.filter((e) => e.kind === k && inLoad(e.t) && (key === 'ALL' || e.model === key)).length;
+      const pr = a.probes.filter((p) => inLoad(p.t0) && (key === 'ALL' || p.model === key));
       const v = a.validation || {};
       const mism = (v.mismatches || []).length;
       const checked = ((v.score_json || {}).checked || 0) + ((v.compare_json || {}).checked || 0);
@@ -1232,8 +1253,9 @@
         h('td', { text: s.tpot_p95_ms != null ? C.fmtNum(s.tpot_p95_ms, 1) + ' ms' : '–' }),
         h('td', { text: C.fmtNum(s.mean_gpus, 2) }),
         h('td', { text: C.fmtNum(s.gpu_s_per_good_req, 3) }),
-        h('td', { text: evs('decision_up') + ' / ' + evs('decision_down') }),
-        h('td', { text: pr.length ? pr.filter((p) => p.outcome === 'commit').length + ' / ' + pr.filter((p) => p.outcome === 'rollback').length : '–', title: 'SafeScale probes: commit / rollback' }),
+        h('td', { text: evs('wake') + ' / ' + evs('sleep'), class: 'num-tip',
+          title: 'SM wakes / sleeps in [0, load end]\nDecisions (' + (a.decision_source || 'unknown source') + '): ' + evs('decision_up') + ' up / ' + evs('decision_down') + ' down' }),
+        h('td', { text: pr.length ? pr.filter((p) => p.outcome === 'commit').length + ' / ' + pr.filter((p) => p.outcome === 'rollback').length : '–', title: 'SafeScale probes started in [0, load end]: commit / rollback' }),
         h('td', { class: valid === 'valid' ? 'ok' : valid === 'invalid' ? 'bad' : '', text: valid }),
         h('td', { class: mism ? 'bad' : nw ? 'warn' : 'ok', title: (a.warnings || []).join('\n'),
           text: (mism ? mism + ' mismatch' + (mism > 1 ? 'es' : '') : checked ? checked + ' ok' : 'not checked') + (nw ? ', ' + nw + ' warn.' : '') })));
@@ -1317,6 +1339,8 @@
     hideTip();
     CH.forEach((u) => u.destroy());
     CH = []; LANES = []; ACTIVE = null; GEO = null; REFILL = null;
+    if (RENDER_AC) RENDER_AC.abort();
+    RENDER_AC = new AbortController();
     renderBar();
     [1, 2, 3].forEach((v) => { const s = $('#view-' + v); s.innerHTML = ''; s.classList.toggle('on', v === S.v); });
     const sec = $('#view-' + S.v);
