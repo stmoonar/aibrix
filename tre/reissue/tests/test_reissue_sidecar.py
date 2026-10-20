@@ -880,7 +880,18 @@ def test_non_continuable_contract(case):
 #: Shared with the gateway plugin's TestBLReqEvents_ReissueContract
 #: (pkg/plugins/gateway/tre_bl_req_events_test.go): the requests this sidecar re-sends
 #: through the gateway, and how the gateway's request events must classify them.
+#: TRE_REGEN_GW_CONTRACT=1 rewrites the sidecar cases (path, headers, body, in_tokens of a
+#: token-id prompt) from what the sidecar sends; reissue / in_src stay as written.
 GW_CONTRACT = Path(__file__).resolve().parents[1] / "contract" / "gateway_reissue_requests.json"
+
+
+def _dump_gw_contract(doc: dict) -> str:
+    """One line per case field, so a regenerated file diffs cleanly."""
+    cases = ",\n".join(
+        "    {\n" + ",\n".join(f"      {json.dumps(k)}: {json.dumps(v)}" for k, v in c.items()) + "\n    }"
+        for c in doc["cases"])
+    head = ",\n".join(f"  {json.dumps(k)}: {json.dumps(v)}" for k, v in doc.items() if k != "cases")
+    return "{\n" + head + ',\n  "cases": [\n' + cases + "\n  ]\n}\n"
 
 
 def test_gateway_reissue_contract_depth_header():
@@ -891,7 +902,8 @@ def test_gateway_reissue_contract_depth_header():
 async def test_gateway_reissue_contract():
     """Each sidecar case of the contract is what the sidecar really sends to the gateway:
     the same path, x-tre-* request headers and prompt."""
-    cases = {c["from"]: c for c in json.loads(GW_CONTRACT.read_text(encoding="utf-8"))["cases"]}
+    doc = json.loads(GW_CONTRACT.read_text(encoding="utf-8"))
+    cases = {c["from"]: c for c in doc["cases"] if c["from"] != "client"}
     client = {"x-tre-bl-in-tokens": "5"}  # forwarded unchanged on every reissue
     sent = {}
     async with Harness() as h:
@@ -904,12 +916,20 @@ async def test_gateway_reissue_contract():
     async with Harness(a={"hold_at": 5}) as h:
         assert (await h.post("/v1/chat/completions", chat_body(16), headers=client, sleep_after=5))[0] == 200
         (sent["sidecar_continue_chat"],) = h.gateway.requests
-    assert set(cases) == set(sent) | {"client"}
+    assert set(cases) == set(sent)
+    tre_headers = {source: {k.lower(): v for k, v in req["headers"].items() if k.lower().startswith("x-tre-")}
+                   for source, req in sent.items()}
+    if os.environ.get("TRE_REGEN_GW_CONTRACT") == "1":
+        for source, req in sent.items():
+            case = cases[source]
+            case.update(path=req["path"], headers=tre_headers[source], body=req["body"])
+            if isinstance(req["body"].get("prompt"), list):
+                case["in_tokens"] = len(req["body"]["prompt"])
+        GW_CONTRACT.write_text(_dump_gw_contract(doc), encoding="utf-8")
     for source, req in sent.items():
         case = cases[source]
         assert req["path"] == case["path"], source
-        tre_headers = {k.lower(): v for k, v in req["headers"].items() if k.lower().startswith("x-tre-")}
-        assert tre_headers == case["headers"], source
+        assert tre_headers[source] == case["headers"], source
         for key in ("prompt", "messages"):  # what the gateway counts input tokens from
             assert req["body"].get(key) == case["body"].get(key), (source, key)
 

@@ -365,15 +365,23 @@ func blReissue(h map[string]string, tokenIDPrompt bool) string {
 	if _, ok := h[HeaderTRERetried]; ok {
 		return "retried"
 	}
-	if v, ok := h[HeaderTREReissueDepth]; ok {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
-			if tokenIDPrompt {
-				return "continued"
-			}
-			return "retried"
+	if blResent(h) {
+		if tokenIDPrompt {
+			return "continued"
 		}
+		return "retried"
 	}
 	return "none"
+}
+
+// blResent: the reissue sidecar sent this request (x-tre-reissue-depth >= 1).
+func blResent(h map[string]string) bool {
+	v, ok := h[HeaderTREReissueDepth]
+	if !ok {
+		return false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	return err == nil && n > 0
 }
 
 // blCaptureRequestHeader keeps the headers the event stream needs; they are only stored
@@ -403,7 +411,7 @@ func (s *Server) blOnRequestBody(st *processState, req *extProcPb.ProcessingRequ
 		}
 	}
 	body := req.GetRequestBody().GetBody()
-	inTokens, inSrc := blInputTokens(rc, st.model, body, e.cfg)
+	inTokens, inSrc := blInputTokens(rc, st.model, body, e.cfg, blResent(rc.ReqHeaders))
 	reissue := blReissue(rc.ReqHeaders, inSrc == blInSrcTokenIDs)
 	maxTokens := ""
 	for _, k := range [...]string{"max_tokens", "max_completion_tokens"} {
@@ -553,25 +561,34 @@ func blDurMs(d time.Duration) string {
 // input token count
 
 // blInputTokens returns the prompt length in tokens and its source, first match wins:
-//   - "token_ids": a completions prompt given as token ids (exact, the id count). It goes
-//     first: the reissue sidecar forwards the client's x-tre-bl-in-tokens unchanged on a
-//     continuation whose prompt is the original prompt ids plus the generated ids;
-//   - "header": x-tre-bl-in-tokens, a positive integer set by the client (exact);
+//   - "token_ids", only for a request the reissue sidecar re-sent (resent): a completions
+//     prompt given as token ids. The sidecar forwards the client's x-tre-bl-in-tokens
+//     unchanged on a continuation whose prompt is the original prompt ids plus the
+//     generated ids, so the id count is the exact length and the header is not;
+//   - "header": x-tre-bl-in-tokens, a positive integer set by the client (exact). A client
+//     request keeps in_src=header even when its prompt is token ids (the baseline shells
+//     count client arrivals without the header);
+//   - "token_ids": a completions prompt given as token ids (exact, the id count);
 //   - "estimate": ceil(chars / chars_per_token[model]), chars counted in runes.
 //
 // The estimate is a fallback only. A fixed chars/token ratio is inaccurate: CJK text has
 // far fewer characters per token than English (a ratio of 4 underestimates Chinese by
 // roughly 2-3x), and chat templates / special tokens are not counted. Clients should send
 // the header when the exact count matters.
-func blInputTokens(rc *types.RoutingContext, model string, body []byte, cfg blReqConfig) (int64, string) {
-	chars, ids := blPromptChars(rc.ReqPath, body, rc.Message)
-	if ids >= 0 {
-		return ids, blInSrcTokenIDs
+func blInputTokens(rc *types.RoutingContext, model string, body []byte, cfg blReqConfig, resent bool) (int64, string) {
+	if resent && rc.ReqPath == PathCompletions {
+		if _, ids := blCompletionPromptChars(gjson.GetBytes(body, "prompt")); ids >= 0 {
+			return ids, blInSrcTokenIDs
+		}
 	}
 	if v, ok := rc.ReqHeaders[HeaderBLInTokens]; ok {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
 			return n, "header"
 		}
+	}
+	chars, ids := blPromptChars(rc.ReqPath, body, rc.Message)
+	if ids >= 0 {
+		return ids, blInSrcTokenIDs
 	}
 	return blEstimateTokens(chars, cfg.charsPerTokenFor(model)), "estimate"
 }

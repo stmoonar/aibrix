@@ -394,7 +394,7 @@ func TestBLReqEvents_InputTokens(t *testing.T) {
 		{"escaped string", "other", "", false, PathCompletions, []byte(`{"prompt":"中\n"}`), 1, "estimate"},
 		{"token ids", "other", "", false, PathCompletions, []byte(`{"prompt":[1,2,3,4,5]}`), 5, "token_ids"},
 		{"token id batches", "other", "", false, PathCompletions, []byte(`{"prompt":[[1,2],[3]]}`), 3, "token_ids"},
-		{"token ids win over header", "other", "2", true, PathCompletions, []byte(`{"prompt":[1,2,3,4,5]}`), 5, "token_ids"}, // continuation: header is the original prompt
+		{"client token ids keep the header", "other", "5", true, PathCompletions, []byte(`{"prompt":[1,2,3,4,5]}`), 5, "header"},
 		{"empty prompt", "other", "", false, PathCompletions, []byte(`{"prompt":""}`), 0, "estimate"},
 		{"chat string", "other", "", false, PathChatCompletions, []byte(`{"messages":[{"content":"abc"},{"content":"defg"}]}`), 3, "estimate"},
 		{"chat parts", "other", "", false, PathChatCompletions, []byte(`{"messages":[{"content":[{"type":"text","text":"abcdef"},{"type":"image_url"}]}]}`), 2, "estimate"},
@@ -409,11 +409,20 @@ func TestBLReqEvents_InputTokens(t *testing.T) {
 			if c.hasHeader {
 				rc.ReqHeaders[HeaderBLInTokens] = c.header
 			}
-			n, src := blInputTokens(rc, c.model, c.body, cfg)
+			n, src := blInputTokens(rc, c.model, c.body, cfg, false)
 			assert.Equal(t, c.want, n)
 			assert.Equal(t, c.src, src)
 		})
 	}
+
+	// a sidecar continuation: the forwarded header is the original prompt, the ids are exact
+	rc := types.NewRoutingContext(context.Background(), "", "m", "", "rid", "")
+	defer rc.Delete()
+	rc.ReqPath = PathCompletions
+	rc.ReqHeaders = map[string]string{HeaderBLInTokens: "2"}
+	n, src := blInputTokens(rc, "m", []byte(`{"prompt":[1,2,3,4,5]}`), cfg, true)
+	assert.Equal(t, int64(5), n)
+	assert.Equal(t, "token_ids", src)
 }
 
 func TestBLReqEvents_CharsPerTokenAndConfig(t *testing.T) {
@@ -643,8 +652,9 @@ func TestBLReqEvents_Reissue(t *testing.T) {
 var blReissueContract = filepath.Join("..", "..", "..", "tre", "reissue", "contract", "gateway_reissue_requests.json")
 
 // The requests the sidecar really sends (depth header, original or token-id body, the
-// client's x-tre-bl-in-tokens forwarded unchanged) produce reissue != none and the token-id
-// count as in_tokens; a client request stays none.
+// client's x-tre-bl-in-tokens forwarded unchanged) produce reissue != none and, for a
+// continuation, the token-id count as in_tokens; a client request stays none with
+// in_src=header, token-id prompt or not.
 func TestBLReqEvents_ReissueContract(t *testing.T) {
 	data, err := os.ReadFile(blReissueContract)
 	require.NoError(t, err)
@@ -658,6 +668,7 @@ func TestBLReqEvents_ReissueContract(t *testing.T) {
 			Body     json.RawMessage   `json:"body"`
 			Reissue  string            `json:"reissue"`
 			InTokens int64             `json:"in_tokens"`
+			InSrc    string            `json:"in_src"`
 		} `json:"cases"`
 	}
 	require.NoError(t, json.Unmarshal(data, &contract))
@@ -681,6 +692,7 @@ func TestBLReqEvents_ReissueContract(t *testing.T) {
 			require.Equal(t, []string{"arr", "done"}, blKinds(evs))
 			assert.Equal(t, c.Reissue, evs[0]["reissue"])
 			assert.Equal(t, strconv.FormatInt(c.InTokens, 10), evs[0]["in_tokens"])
+			assert.Equal(t, c.InSrc, evs[0]["in_src"])
 			assert.Equal(t, c.From != "client", evs[0]["reissue"] != "none", "reissue iff the sidecar sent it")
 		})
 	}

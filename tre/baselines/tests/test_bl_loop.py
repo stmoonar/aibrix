@@ -730,3 +730,31 @@ def test_metrics_report_policy_counters_and_non_streaming_arrivals(tmp_path) -> 
     assert 'tre_bl_nonstream_arrivals_total{policy="scripted",model="a"} 2' in text
     assert 'tre_bl_nonheader_in_tokens_total{policy="scripted",model="a"} 1' in text   # P2-D
     assert 'tre_bl_policy_events_total{policy="scripted",model="a",name="ft_without_arr"} 2' in text
+
+
+def test_sidecar_reissues_do_not_fail_the_in_tokens_check(tmp_path) -> None:
+    """A sidecar continuation's arr counts its token-id prompt (in_src=token_ids): it is not a
+    client arrival without the header, so a run with reissues stays valid."""
+    from dataclasses import replace
+
+    from tre_baselines.snapshot import RequestEvent
+    from tre_baselines.tools import arm
+
+    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy({}), dry_run=True)
+    gather = shell.source.gather
+    kinds = [("none", "header"), ("continued", "token_ids"), ("retried", "header")]
+
+    def with_events(tick=0):
+        snap = gather(tick)
+        evs = tuple(RequestEvent(kind="arr", model="a", pod="p", req_id=f"r{i}", ts_ms=snap.now_ms, in_tokens=5,
+                                 in_src=src, max_tokens=5, out_tokens=None, status=None, reissue=reissue)
+                    for i, (reissue, src) in enumerate(kinds))
+        return replace(snap, models={**snap.models, "a": replace(snap.models["a"], events=evs)})
+
+    shell.source.gather = with_events
+    shell.tick_once()
+    text = shell.metrics_text()
+    assert 'tre_bl_arrivals_total{policy="scripted",model="a"} 3' in text
+    doc = arm.run_validity({"p": text}, {"gw_bl_dropped0": 0.0}, 0.0, client_sent_in_tokens=True)
+    assert doc["arrivals"]["a"]["arrivals"] == 3 and doc["arrivals"]["a"].get("nonheader_in_tokens", 0) == 0
+    assert doc["events_valid"] is True, doc["invalid_because"]
