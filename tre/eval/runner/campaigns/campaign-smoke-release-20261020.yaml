@@ -1,0 +1,80 @@
+# NOTE: results_root, trace_root, trace_host_root and the other absolute paths below are site-specific; edit them for another cluster.
+# GPU smoke of release 20261020-db24f36b (gateway-plugins / SM / controller / baseline-scaler, built from db24f36b):
+# gateway reissue tags in the baseline request events, baseline shell events_valid with reissues, runner validity
+# changes, controller + SM under active mode. Arms: tokenscale (baseline arm, TRE_BL_REQ_EVENTS on; sidecar
+# reissues expected) then tre (production). Slice: Alternating seed1 [100, 430) s = the end of the 8b-hot phase
+# (8b hot until 180 s), the whole 7b-hot phase (180-360 s) and the start of 14b-hot (360 s): two hot-model
+# transitions, so both arms scale down under load and the sidecar continues aborted requests (e1-envoy4 tokenscale:
+# 8b down at 166/189/221 s, 7b down at 368/389 s, ~400 continues in this window).
+# Acceptance, tokenscale: count(arr, reissue=none) = client requests per model; count(arr, reissue!=none) = sidecar
+#   requests actually sent (retry + continue with a target); continued arr in_src=token_ids, in_tokens = prompt +
+#   generated; client arr in_src=header; baseline/run_validity.json events_valid=true; skipped_reissue > 0.
+# Acceptance, tre: valid; controller / SM act (wakes, sleeps, probes) without errors; SM 5xx = 0.
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-release-20261020.yaml --dry-run --probe
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-release-20261020.yaml > /data/nfs_shared_data/xxy/smoke-release-20261020.out 2>&1 &
+name: smoke-release-20261020
+round: smoke-release-20261020       # exclusive-window marker: "validation <start> <end> round=smoke-release-20261020"
+results_root: /data/nfs_shared_data/xxy/smoke-release-20261020
+trace_root: /data/nfs_shared_data/xxy/traces-v2-vslo-20261007
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v2
+seed: 1
+arms: [tokenscale, tre]
+order: fixed
+max_attempts: 1                     # a smoke failure is looked at, not retried
+eta: {overhead_s: 330, report_s: 60}
+
+env:
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    controller_env: {TRE_ABLATION_DISABLE_SAFESCALE: false}
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${TRE_REPO}/eval/configs/t7-decision-points.yaml
+  ref: tre
+  reps: 200
+  timeout_s: 600
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Alternating
+    slice: {start_s: 100, duration_s: 330}   # 8b-hot end (180 s), 7b-hot (180-360 s), 14b-hot start (360 s)
