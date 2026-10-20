@@ -51,12 +51,20 @@ The viewer follows `load.py` exactly, so every marker lines up with the report's
   controller clock (`t0`, `t1`, and `t_hide` from `hide_anchor.controller_ts_ms`, not the Redis
   stamp), so a probe starts at the decision that opened it.
 - Scaler refusals: `baseline-scaler.log` is stamped by the scaler host's clock, which `load.py`
-  never reads. Each line is paired with its SM 409 access line (corrected SM clock) within 5 s
-  and drawn at that SM time, which lines up with the decision markers. To pair them, the log is
-  shifted by the baseline-scaler node offset when `components.json` names the node, else by the
-  node offset (or none) under which most lines find a 409 (stated in a warning). In the E1
-  campaign of 10-19 the scaler log runs about 164 s ahead (node9), while its decisions (from the
-  decision stream) are already on the reference clock.
+  never reads. Each line is paired with its SM 409 access line (corrected SM clock) of the same
+  model when scaler stamp − SM time is in [−1, 8 + `elapsed_s`] s, the closest first, and drawn
+  at that SM time, which lines up with the decision markers. (In the E1 data of 10-19 the
+  difference is −0.2 to +5 s, also for slow calls: the SM line marks the response. Adding
+  `elapsed_s` to the upper bound keeps the pairing if it marked the request.)
+- To pair them, the log is shifted by the offset of the scaler's node when `components.json`
+  names it. Otherwise each candidate shift (none, or one of the node offsets) is tried, and the
+  one with the most pairs is used only if it is clearly better: at least 3 pairs and at least
+  twice the runner-up's count. The warning states the margin (for example "23/23 at −163.5 s,
+  4/23 at +0.0 s"). If no shift is clearly better, every scaler line is "time uncertain": it is
+  listed in the event table only, never drawn on a time axis, and the SM 409 access lines are
+  drawn instead. In the E1 campaign of 10-19 the scaler log runs about 164 s ahead (the
+  scaler's node), while its decisions (from the decision stream) are already on the reference
+  clock.
 
 Known limitation: `load.py` does not correct the controller and baseline-scaler clocks. When
 their node is not the reference node (offset ≠ 0), or their node is unknown while offsets are
@@ -88,9 +96,10 @@ series. The page shows a warning for that arm.
 - `events` kinds: `decision_up`, `decision_down` (TRE / APA / baseline scaler), `wake`
   (SM `wake_start` → `wake_done`, `t_end` = done; a start without done keeps reason
   `no wake_done`, and a second start on the same binding closes the first that way), `sleep`
-  (SM, `reason` = path), `refusal` (baseline scaler: SM refused with 409, matched to the SM 409
-  access line within 5 s; without the scaler log, the SM 409 lines; unmatched lines on either
-  side are counted in a warning), `counterfactual` (what the
+  (SM, `reason` = path), `refusal` (baseline scaler: SM refused with 409, paired with the SM
+  409 access line as described under the clock rule; without the scaler log, or with an
+  uncertain scaler clock, the SM 409 lines; unpaired lines on either side are counted in a
+  warning), `counterfactual` (what the
   TRE controller would have done on a baseline arm, observe mode). Layout `hidden/unhidden`,
   sidecar and SM polling lines are not markers (probe spans and Gantt hatching show hiding).
 - `probes` from `safescale.json`, only for arms with `decision_source == tre`, and only probes
@@ -108,6 +117,9 @@ series. The page shows a warning for that arm.
   so a "below target" figure cannot be compared across arms. The page names the source when it
   shows a target value. Without `two_gpu_slots` the pairs (0,1), (2,3), ... are assumed, with a
   warning.
+  It covers idle GPUs only. A placement blocked by GPUs that are awake (occupied) is not
+  stranded time; see the SM 409 marks and the SafeScale probe outcomes for that (for example
+  TRE shows 0 s in T7 because it never leaves a GPU idle).
 - The data JSON is embedded with `<`, `>`, `&` written as `\u003c`, `\u003e`, `\u0026` (no string
   can end the script element or open a comment), and NaN / ±Inf become `null`.
 

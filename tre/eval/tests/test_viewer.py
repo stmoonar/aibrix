@@ -170,3 +170,28 @@ console.log('core ok');
     r = subprocess.run(["node", str(harness), os.path.join(ASSETS, "viewer_core.js"), str(blob)],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_scaler_refusals_trust_an_inferred_clock_shift_only_with_a_clear_margin(tmp_path):
+    import time
+    clock = V._Clock({"load_start_epoch": T0, "clock_offsets_s": {"n1": 0.0, "n2": 10.0}})  # scaler node unknown
+
+    def log(ts):  # scaler on n2: its stamps run 10 s ahead; 0.5 s after the SM answered
+        with open(tmp_path / "baseline-scaler.log", "w") as fh:
+            for t in ts:
+                e = T0 + t + 10.0 + 0.5
+                fh.write(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(e)) + f",{int(e % 1 * 1000):03d} WARNING x.loop "
+                         f"SM refused m-b up->2: {{'code': 409, 'reason': 'slot_occupied', 'elapsed_s': 0.1}}\n")
+    sm = [{"t": t, "model": "m-b"} for t in (20.0, 40.0, 60.0)]
+    log([20.0, 40.0, 60.0])
+    warns = []
+    ref, sure = V._refusals(str(tmp_path), clock, sm, warns.append)
+    assert sure and [r["t"] for r in ref] == [20.0, 40.0, 60.0]  # drawn at the SM time
+    assert any("3/3 at -10.0 s" in w and "0/3 at +0.0 s" in w for w in warns)
+    # only 2 pairs under the best shift: not a clear margin -> time uncertain, kept out of the time axes
+    log([20.0, 40.0])
+    ev = V.build_events([{"t": str(t), "source": "sm_api", "kind": "wake", "model": "m-b", "value": "409"} for t in (20, 40)],
+                        str(tmp_path), clock)
+    ref = [e for e in ev if e["src"] == "baseline"]
+    assert len(ref) == 2 and all(e.get("uncertain") for e in ref)
+    assert sorted(e["t"] for e in ev if e["src"] == "sm_api") == [20, 40]  # the SM 409 lines are the markers

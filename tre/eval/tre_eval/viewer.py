@@ -346,26 +346,35 @@ def _nearest_line(index: dict, kind: str, binding: str | None, t: float | None) 
     return best[1] if best else None
 
 
-def _match(sm409: list[dict], items: list[tuple[float, str]], tol: float = 5.0) -> list[int | None]:
-    """Greedy one-to-one pairing of (t, model) items with SM 409 lines of the same model within ``tol`` s."""
+# Pairing window for (scaler log stamp - SM 409 access line), seconds. The scaler stamps its line after the
+# HTTP call returns; the SM writes its access line when it answers. E1 10-19 data: -0.2 .. +5.0 s, the same
+# for slow calls (elapsed_s up to 5.4 s), i.e. the SM line sits at the response, not at the request. The
+# upper bound adds elapsed_s so a pairing still works if the SM line marks the request instead.
+PAIR_LO, PAIR_HI = -1.0, 8.0
+
+
+def _match(sm409: list[dict], items: list[tuple[float, str, float]]) -> list[int | None]:
+    """Greedy one-to-one pairing of (scaler time, model, elapsed_s) items with SM 409 lines of the same model,
+    scaler - SM in [PAIR_LO, PAIR_HI + elapsed_s], the closest first."""
     used: set[int] = set()
     out: list[int | None] = []
-    for t, model in items:
-        j = min((k for k, e in enumerate(sm409) if k not in used and e["model"] == model and abs(e["t"] - t) <= tol),
-                key=lambda k: abs(sm409[k]["t"] - t), default=None)
+    for t, model, el in items:
+        j = min((k for k, e in enumerate(sm409) if k not in used and e["model"] == model
+                 and PAIR_LO <= t - e["t"] <= PAIR_HI + el), key=lambda k: abs(t - sm409[k]["t"]), default=None)
         if j is not None:
             used.add(j)
         out.append(j)
     return out
 
 
-def _refusals(raw: str | None, clock: _Clock, sm409: list[dict], warn) -> list[dict] | None:
+def _refusals(raw: str | None, clock: _Clock, sm409: list[dict], warn) -> tuple[list[dict], bool] | None:
     """baseline-scaler.log 'SM refused' lines (None when there is no log), each paired with its SM 409
-    access line (events.csv, SM clock corrected by load.py) within 5 s, and drawn at that SM time: the
-    same reference clock as the decision markers. The log is stamped by the scaler host's clock, which
-    load.py never reads: we shift it by the baseline-scaler node offset when the node is known, else by
-    the node offset (or none) under which most lines meet an SM 409. Unpaired lines on either side are
-    counted in a warning; an unpaired refusal is drawn at its shifted log stamp."""
+    access line (events.csv, SM clock corrected by load.py) and drawn at that SM time: the same reference
+    clock as the decision markers. The log is stamped by the scaler host's clock, which load.py never reads:
+    we shift it by the baseline-scaler node offset when the node is known, else by the candidate node offset
+    (or none) under which most lines pair with an SM 409. The inferred shift is trusted only when it is
+    clearly better than the runner-up (>= 3 pairs and >= 2x the runner-up's pairs); otherwise every scaler
+    line is 'time uncertain' (event table only) and the second return value is False."""
     p = os.path.join(raw, "baseline-scaler.log") if raw else None
     if not p or not os.path.exists(p):
         return None
@@ -383,33 +392,45 @@ def _refusals(raw: str | None, clock: _Clock, sm409: list[dict], warn) -> list[d
                 d = {"raw": mt.group(6)}
             t = clock.rel(_utc_epoch(mt.group(1), mt.group(2)))
             if t is not None:
-                lines.append((t, mt, d, line.rstrip("\n")[:LOG_MAX]))
+                lines.append((t, mt, d, line.rstrip("\n")[:LOG_MAX], max(_f(d.get("elapsed_s")) or 0.0, 0.0)))
+
+    def pair(off: float) -> list[int | None]:
+        return _match(sm409, [(t - off, mt.group(3), el) for t, mt, _, _, el in lines])
+
     node = clock.nodes.get("baseline-scaler")
-    if node is not None:
-        cands = [clock.off.get(node, 0.0)]
-    else:
-        cands = [0.0] + sorted({v for v in clock.off.values() if abs(v) > 0.5})
-    best = max(cands, key=lambda off: (sum(j is not None for j in _match(sm409, [(t - off, mt.group(3)) for t, mt, _, _ in lines])),
-                                       -abs(off)))
-    pairs = _match(sm409, [(t - best, mt.group(3)) for t, mt, _, _ in lines])
-    if node is None and abs(best) > 0.5:
-        warn(f"baseline-scaler.log stamps shifted by {-best:+.1f} s (node unknown; the node offset under which its "
-             "refusals meet the SM 409 lines)")
+    cands = [clock.off.get(node, 0.0)] if node is not None else \
+        [0.0] + sorted({v for v in clock.off.values() if abs(v) > 0.5})
+    counts = {off: sum(j is not None for j in pair(off)) for off in cands}
+    ranked = sorted(cands, key=lambda off: (-counts[off], abs(off)))
+    best = ranked[0]
+    sure = True
+    if len(cands) > 1 and lines:
+        margin = ", ".join(f"{counts[o]}/{len(lines)} at {0.0 - o:+.1f} s" for o in ranked)
+        sure = counts[best] >= 3 and counts[best] >= 2 * counts[ranked[1]]
+        if sure:
+            warn(f"baseline-scaler.log stamps shifted by {-best:+.1f} s (scaler's node unknown; pairs with SM 409 "
+                 f"lines: {margin})")
+        else:
+            warn(f"baseline-scaler.log clock unknown (scaler's node unknown; no clearly best shift: {margin}): its "
+                 f"{len(lines)} refusal(s) are listed in the event table as 'time uncertain' and not drawn; the SM 409 "
+                 "access lines are drawn instead")
+    pairs = pair(best) if sure else [None] * len(lines)
     out = []
-    for (t, mt, d, log), j in zip(lines, pairs):
+    for (t, mt, d, log, _), j in zip(lines, pairs):
         if j is not None:
             d = {**d, "scaler_log_t": _rt(t - best)}
         out.append({"t": sm409[j]["t"] if j is not None else t - best, "model": mt.group(3),
-                    "binding": d.get("binding_id"), "matched": j is not None,
+                    "binding": d.get("binding_id"), "matched": j is not None, "uncertain": not sure,
                     "reason": d.get("reason") or d.get("error"), "dir": mt.group(4), "to": int(mt.group(5)),
                     "detail": d, "log": log})
-    n_sm = len(sm409) - sum(j is not None for j in pairs)
-    n_sc = sum(j is None for j in pairs)
-    if n_sm:
-        warn(f"{n_sm} SM 409 response(s) without a matching baseline-scaler 'SM refused' line within 5 s (not drawn)")
-    if n_sc:
-        warn(f"{n_sc} baseline-scaler refusal(s) without a matching SM 409 access line within 5 s (drawn at the log stamp)")
-    return out
+    if sure:
+        n_sm = len(sm409) - sum(j is not None for j in pairs)
+        n_sc = sum(j is None for j in pairs)
+        if n_sm:
+            warn(f"{n_sm} SM 409 response(s) without a matching baseline-scaler 'SM refused' line (not drawn)")
+        if n_sc:
+            warn(f"{n_sc} baseline-scaler refusal(s) without a matching SM 409 access line (drawn at the shifted log stamp)")
+    return out, sure
 
 
 def build_events(ev_rows: list[dict], raw: str | None, clock: _Clock, warn=lambda m: None) -> list[dict]:
@@ -459,18 +480,19 @@ def build_events(ev_rows: list[dict], raw: str | None, clock: _Clock, warn=lambd
                        "reason": det.get("reason"), "value": _f(r.get("value")), "detail": det})
         elif src == "sm_api" and str(r.get("value")) == "409":
             sm409.append({"t": t, "model": model, "path": b, "kind": kind})
-    ref = _refusals(raw, clock, sm409, warn)
-    if ref is None:
+    got = _refusals(raw, clock, sm409, warn)
+    ref, sure = got if got is not None else ([], False)
+    if not sure:  # no scaler log, or its clock is uncertain: the SM 409 lines (reference clock) are the markers
         for e in sm409:
             ev.append({"t": _rt(e["t"]), "kind": "refusal", "model": e["model"], "src": "sm_api", "reason": "409",
                        "detail": {"request": e["kind"], "path": e["path"]}})
-    else:
-        for e in ref:
-            if e["t"] is None:
-                continue
-            ev.append({"t": _rt(e["t"]), "kind": "refusal", "model": e["model"], "binding": e["binding"],
-                       "src": "baseline", "reason": e["reason"],
-                       "detail": {**e["detail"], "request": f"{e['dir']} -> {e['to']}"}, "log": e["log"]})
+    for e in ref:
+        x = {"t": _rt(e["t"]), "kind": "refusal", "model": e["model"], "binding": e["binding"],
+             "src": "baseline", "reason": e["reason"],
+             "detail": {**e["detail"], "request": f"{e['dir']} -> {e['to']}"}, "log": e["log"]}
+        if e["uncertain"]:
+            x["uncertain"] = True  # event table only, never on a time axis
+        ev.append(x)
     ev.sort(key=lambda e: (e["t"], e["kind"]))
     for i, e in enumerate(ev):
         e["id"] = i

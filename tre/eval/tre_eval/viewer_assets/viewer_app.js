@@ -720,7 +720,7 @@
     return (n ? n.short : p[1]) + ' / GPU ' + p[2];
   }
   function eventsOf(a, m, kinds) {
-    return a.events.filter((e) => kinds.indexOf(e.kind) >= 0 && (m === 'all' || e.model === m));
+    return a.events.filter((e) => !e.uncertain && kinds.indexOf(e.kind) >= 0 && (m === 'all' || e.model === m));  // 'time uncertain': table only
   }
   function probesOf(a, m) { return S.k.indexOf('probe') >= 0 ? a.probes.filter((p) => m === 'all' || p.model === m) : []; }
 
@@ -821,7 +821,7 @@
         { id: 'ws', label: 'Wake / sleep', kinds: ['wake', 'sleep'] },
       ];
       if (a.probes.length) rows.push({ id: 'probe', label: 'Probes', kinds: ['probe'] });
-      if (a.events.some((e) => e.kind === 'refusal')) rows.push({ id: 'ref', label: 'Refusals', kinds: ['refusal'] });
+      if (a.events.some((e) => e.kind === 'refusal' && !e.uncertain)) rows.push({ id: 'ref', label: 'Refusals', kinds: ['refusal'] });
       if (a.events.some((e) => e.kind === 'counterfactual') && S.k.indexOf('counterfactual') >= 0) rows.push({ id: 'cf', label: 'TRE (observe)', kinds: ['counterfactual'] });
       const n = (k) => eventsOf(a, S.m, [k]).length;
       const stats = [n('decision_up') + ' up', n('decision_down') + ' down', n('wake') + ' wakes', n('sleep') + ' sleeps'];
@@ -882,10 +882,10 @@
         const kind = x.type === 'probe' ? 'probe' : o.kind;
         const k = KIND[kind] || { glyph: '?', label: kind };
         const dur = x.type === 'probe' ? (o.t1 != null ? C.fmtNum(o.t1 - o.t0, 1) + ' s' : 'open') : (o.t_end != null ? C.fmtNum(o.t_end - o.t, 2) + ' s' : (o.value != null ? C.fmtNum(o.value) : ''));
-        const reason = x.type === 'probe' ? o.outcome + (o.reason && o.reason !== o.outcome ? ': ' + o.reason : '') : (o.reason == null ? '' : o.reason);
+        const reason = (o.uncertain ? 'time uncertain · ' : '') + (x.type === 'probe' ? o.outcome + (o.reason && o.reason !== o.outcome ? ': ' + o.reason : '') : (o.reason == null ? '' : o.reason));
         const key = selKey(x.a, x.type, o.id);
         const tr = h('tr', { class: S.e === key ? 'sel' : null, onclick: () => select({ arm: x.a, type: x.type, obj: o }) },
-          h('td', { text: C.fmtT(x.t) }),
+          h('td', o.uncertain ? { text: '~' + C.fmtT(x.t), class: 'warn', title: 'time uncertain: the clock of this log is unknown' } : { text: C.fmtT(x.t) }),
           h('td', null, swatch(x.a), x.a.label),
           h('td', null, o.model ? modelDot(o.model) : null, o.model || ''),
           h('td', null, h('span', { class: 'mk', style: 'color:' + modelColor(o.model), text: k.glyph }), ' ', k.label),
@@ -913,9 +913,9 @@
     lg.append(h('span', { class: 'lg' }, h('i', { class: 'hatch' }), 'hidden (not routable)'));
     lg.append(h('span', { class: 'lg' }, h('i', { class: 'free' }), 'free GPU'));
     const tps = MODELS.map((m) => MODEL[m].tp).filter((k) => k >= 2);
-    if (tps.length) lg.append(h('span', { class: 'lg', title: 'From the GPU layout only, the same rule for every arm' }, h('i', { class: 'frag' }),
+    if (tps.length) lg.append(h('span', { class: 'lg', title: 'From the GPU layout only, the same rule for every arm. It counts idle GPUs only: a placement blocked by GPUs that are awake (occupied) is not stranded; see the SM 409 marks and the probe outcomes for that (TRE shows 0 s because it never leaves a GPU idle).' }, h('i', { class: 'frag' }),
       'stranded TP slot: ≥ ' + Math.min.apply(null, tps) + ' GPUs free but no aligned free slot'));
-    lg.append(h('span', { class: 'lg' }, h('i', { class: 'refusal' }), 'SM 409 refusal (slot occupied)'));
+    lg.append(h('span', { class: 'lg' }, h('i', { class: 'refusal' }), 'SM 409 refusal'));
     sec.append(lg);
 
     // total GPUs awake per arm (shares the cursor and zoom)
@@ -947,7 +947,7 @@
       const bars = C.gpuBars(a.gpus);
       const s = (a.summary || {}).ALL || {};
       const fragS = a.frag.reduce((x, f) => x + (f.t1 - f.t0), 0);
-      const refs = a.events.filter((e) => e.kind === 'refusal');
+      const refs = a.events.filter((e) => e.kind === 'refusal' && !e.uncertain);
       const panel = h('div', { class: 'panel' },
         h('div', { class: 'gantt-head' }, swatch(a), h('span', { class: 'panel-title', text: a.label }),
           h('span', { class: 'stat', text: (s.mean_gpus != null ? 'mean ' + C.fmtNum(s.mean_gpus, 2) + ' GPUs' : '') + ' · ' + bars.length + ' awake intervals · stranded TP slot ' + fragS + ' s' + (refs.length ? ' · ' + refs.length + ' SM 409' : '') })));
@@ -1085,7 +1085,7 @@
       const k = KIND[o.kind] || { label: o.kind };
       title = k.label;
       t0 = o.t; t1 = o.t_end != null ? o.t_end : o.t;
-      kv(dl, 'Time', C.fmtT(o.t) + '  (' + o.t + ' s)');
+      kv(dl, 'Time', o.uncertain ? 'time uncertain (clock of the log unknown); log stamp ~' + C.fmtT(o.t) : C.fmtT(o.t) + '  (' + o.t + ' s)');
       if (o.t_end != null) kv(dl, 'Done', C.fmtT(o.t_end) + '  (after ' + C.fmtNum(o.t_end - o.t, 2) + ' s)');
       kv(dl, 'Source', o.src);
       kv(dl, o.kind === 'sleep' ? 'Path' : o.kind === 'wake' ? 'Status' : 'Reason', o.reason == null ? null : String(o.reason));
@@ -1103,7 +1103,7 @@
     body.append(h('div', { class: 'detail-actions' }, zoomBtn, otherView));
     // nearby events on the same arm (causal chain: decision -> wake -> sleep ...)
     const near = [];
-    a.events.forEach((e) => { if (e !== o && e.t >= t0 - 15 && e.t <= t1 + 15 && (!model || !e.model || e.model === model || (o.binding && e.binding === o.binding))) near.push({ type: 'ev', o: e, t: e.t }); });
+    a.events.forEach((e) => { if (e !== o && !e.uncertain && e.t >= t0 - 15 && e.t <= t1 + 15 && (!model || !e.model || e.model === model || (o.binding && e.binding === o.binding))) near.push({ type: 'ev', o: e, t: e.t }); });
     a.probes.forEach((p) => { if (p !== o && p.t0 <= t1 + 15 && probeEnd(p) >= t0 - 15) near.push({ type: 'probe', o: p, t: p.t0 }); });
     near.sort((x, y) => x.t - y.t);
     if (near.length) {
