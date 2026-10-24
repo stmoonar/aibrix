@@ -28,7 +28,7 @@ collateral 503s. Two compounding root causes:
 | --- | --- | --- |
 | `backendtrafficpolicy-aibrix-system.yaml` | per-model circuit breakers on the shared gateway (Gateway aibrix-system/aibrix-eg, NodePort 31592) - the APA arm's path until 2026-09-24, no longer used by either arm | additive, aibrix-system ns |
 | `backendtrafficpolicy-tre-v2.yaml` | per-model circuit breakers on the serving path of BOTH arms, TRE and APA (Gateway tre-v2/tre-aibrix-eg, NodePort 31094); the per-model ORIGINAL_DST clusters of `overlays/tre-v2/gateway-extproc.yaml` carry the same values | additive, tre-v2 ns |
-| `envoyproxy-nofile-patch.yaml` | raise envoy RLIMIT_NOFILE 1024→65536 | **modifies shared aibrix-system EnvoyProxy** (class-level → both envoys) |
+| `envoyproxy-nofile-patch.yaml` | raise envoy RLIMIT_NOFILE 1024→65536; envoy cpu 4 + `concurrency: 4` (was cpu 1, 64 worker threads → CFS throttling) | **modifies shared aibrix-system EnvoyProxy** (class-level → both envoys) |
 
 Circuit-breaker values (per model, per gateway): maxConnections 4096,
 maxPendingRequests 1024, maxParallelRequests 4096, maxParallelRetries 16. Each

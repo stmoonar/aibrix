@@ -5,6 +5,11 @@
 # clusters; it is the hard ceiling behind the t1 UF/socket_creation_failure
 # storm (see backendtrafficpolicy-aibrix-system.yaml header).
 #
+# It also sets envoy cpu 4 + spec.concurrency 4 (10-08 change, validated live).
+# Envoy defaults to one worker thread per host core (64 here); under a small CPU
+# quota that causes CFS throttling and adds TTFT. Keep concurrency == the envoy
+# container's cpu limit (guarded by test_gateway_extproc.py).
+#
 # This is a JSON *merge* patch against the aibrix-owned EnvoyProxy CR
 # 'aibrix-custom-proxy-config' (referenced by GatewayClass aibrix-eg, so it
 # applies to BOTH the aibrix-system and tre-v2 envoy deployments). The CR's own
@@ -24,6 +29,7 @@
 # ROLLBACK: re-apply the same patch with the 'command:' line removed from the
 #   envoy container (reverts to EG's default entrypoint / soft=1024).
 spec:
+  concurrency: 4
   provider:
     kubernetes:
       envoyDeployment:
@@ -43,10 +49,10 @@ spec:
                     - envoy
                     resources:
                       limits:
-                        cpu: 1
+                        cpu: 4
                         memory: 1Gi
                       requests:
-                        cpu: 1
+                        cpu: 4
                         memory: 1Gi
                   - name: shutdown-manager
                     image: envoyproxy/gateway:v1.2.8
