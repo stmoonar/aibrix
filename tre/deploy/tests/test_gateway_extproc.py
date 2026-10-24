@@ -386,16 +386,32 @@ def test_upstream_idle_timeout_equals_the_registry_value_on_every_upstream_clust
     assert registry.reissue().server_keepalive_s >= registry.gateway().upstream_idle_timeout_s + 1.0
 
 
+def _cores(q) -> float:
+    """Kubernetes CPU quantity -> cores: "4", 4, "4000m" -> 4.0."""
+    q = str(q)
+    return float(q[:-1]) / 1000 if q.endswith("m") else float(q)
+
+
+_CONFIG = DEPLOY_ROOT.parents[1] / "config"
+
+
 @pytest.mark.parametrize("path", [
     DEPLOY_ROOT / "gateway-hardening" / "envoyproxy-nofile-patch.yaml",
-    DEPLOY_ROOT.parents[1] / "config" / "gateway" / "gateway.yaml",
+    _CONFIG / "gateway" / "gateway.yaml",
+    _CONFIG / "overlays" / "release" / "envoy_proxy_patch.yaml",
+    _CONFIG / "overlays" / "vke" / "default" / "envoy_proxy_patch.yaml",
+    _CONFIG / "overlays" / "vke-ipv6" / "envoy_proxy_patch.yaml",
 ])
 def test_envoy_worker_threads_equal_the_cpu_limit(path: Path) -> None:
     # Default Envoy runs one worker per host core (64) under a small CPU quota -> CFS
-    # throttling and extra TTFT (10-08). concurrency must be set and match the quota.
-    # Both the base CR (config/gateway) and the hardening patch must agree, or
-    # re-applying either one silently reverts the other.
+    # throttling and extra TTFT (10-08). Every file that sets the envoy cpu limit must
+    # also set spec.concurrency to the same number of cores. Files are checked as written
+    # (not kustomize-rendered); a patch that sets no cpu inherits the base and is skipped.
     doc = next(d for d in _docs(path) if d.get("kind", "EnvoyProxy") == "EnvoyProxy")
-    containers = doc["spec"]["provider"]["kubernetes"]["envoyDeployment"]["patch"]["value"]["spec"]["template"]["spec"]["containers"]
-    res = next(c for c in containers if c["name"] == "envoy")["resources"]
-    assert doc["spec"]["concurrency"] == res["limits"]["cpu"] == res["requests"]["cpu"]
+    patch = doc["spec"]["provider"]["kubernetes"].get("envoyDeployment", {}).get("patch", {})
+    containers = patch.get("value", {}).get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    limits = next((c.get("resources", {}).get("limits", {}) for c in containers if c["name"] == "envoy"), {})
+    if "cpu" not in limits:
+        pytest.skip(f"{path.name} sets no envoy cpu limit (inherits the base)")
+    assert doc["spec"].get("concurrency") == _cores(limits["cpu"]), (
+        f"{path}: spec.concurrency must equal envoy limits.cpu ({limits['cpu']})")

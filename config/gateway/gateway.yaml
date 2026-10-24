@@ -29,8 +29,8 @@ metadata:
   name: custom-proxy-config
   namespace: aibrix-system
 spec:
-  # envoy cpu 4 + concurrency 4: see tre/deploy/gateway-hardening (default 64 workers throttle under a small CPU quota)
-  concurrency: 4
+  # Envoy worker threads (concurrency) must equal the envoy cpu limit; the default (one per host core) throttles under a small quota. This default keeps threads == cpu (1/1); the TRE cluster uses 4/4 via tre/deploy/gateway-hardening/envoyproxy-nofile-patch.yaml.
+  concurrency: 1
   provider:
     type: Kubernetes
     kubernetes:
@@ -74,10 +74,10 @@ spec:
                       image: envoyproxy/envoy:v1.33.2
                       resources:
                         requests:
-                          cpu: 4
+                          cpu: 1
                           memory: 1Gi
                         limits:
-                          cpu: 4
+                          cpu: 1
                           memory: 1Gi
                     - name: shutdown-manager
                       image: envoyproxy/gateway:v1.2.8

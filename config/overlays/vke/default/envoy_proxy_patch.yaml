@@ -4,6 +4,7 @@ metadata:
   name: aibrix-custom-proxy-config
   namespace: aibrix-system
 spec:
+  concurrency: 2
   provider:
     type: Kubernetes
     kubernetes:

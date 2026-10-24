@@ -19,7 +19,8 @@
 # The full containers array is restated because merge-patch replaces arrays.
 #
 # APPLY:
-#   kubectl patch envoyproxy aibrix-custom-proxy-config -n aibrix-system #     --type merge --patch-file envoyproxy-nofile-patch.yaml
+#   kubectl patch envoyproxy aibrix-custom-proxy-config -n aibrix-system \
+#     --type merge --patch-file envoyproxy-nofile-patch.yaml
 #   then wait for both proxy Deployments (named with a generated hash suffix, so
 #   select them by label), e.g. for tre-v2:
 #   kubectl -n envoy-gateway-system get deploy -o name \
@@ -28,8 +29,14 @@
 # VERIFY:  kubectl -n envoy-gateway-system exec <envoy-pod> -c envoy -- cat /proc/1/limits | grep 'open files'
 # ROLLBACK: re-apply the same patch with the 'command:' line removed from the
 #   envoy container (reverts to EG's default entrypoint / soft=1024).
+# ROLLBACK (cpu/concurrency): re-apply this patch with envoy cpu 1 (requests and
+#   limits) and 'concurrency: null' (merge patch deletes the field), or restore the
+#   EnvoyProxy CR from the pre-change backup taken by the ops runbook.
 spec:
   concurrency: 4
+  logging:
+    level:
+      default: warn
   provider:
     kubernetes:
       envoyDeployment:
