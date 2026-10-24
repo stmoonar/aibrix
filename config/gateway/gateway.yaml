@@ -29,6 +29,8 @@ metadata:
   name: custom-proxy-config
   namespace: aibrix-system
 spec:
+  # envoy cpu 4 + concurrency 4: see tre/deploy/gateway-hardening (default 64 workers throttle under a small CPU quota)
+  concurrency: 4
   provider:
     type: Kubernetes
     kubernetes:
@@ -72,10 +74,10 @@ spec:
                       image: envoyproxy/envoy:v1.33.2
                       resources:
                         requests:
-                          cpu: 1
+                          cpu: 4
                           memory: 1Gi
                         limits:
-                          cpu: 1
+                          cpu: 4
                           memory: 1Gi
                     - name: shutdown-manager
                       image: envoyproxy/gateway:v1.2.8

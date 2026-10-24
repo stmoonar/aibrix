@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from scripts.openloop import parse_envoy_counters
@@ -385,11 +386,16 @@ def test_upstream_idle_timeout_equals_the_registry_value_on_every_upstream_clust
     assert registry.reissue().server_keepalive_s >= registry.gateway().upstream_idle_timeout_s + 1.0
 
 
-def test_envoy_worker_threads_equal_the_cpu_limit() -> None:
+@pytest.mark.parametrize("path", [
+    DEPLOY_ROOT / "gateway-hardening" / "envoyproxy-nofile-patch.yaml",
+    DEPLOY_ROOT.parents[1] / "config" / "gateway" / "gateway.yaml",
+])
+def test_envoy_worker_threads_equal_the_cpu_limit(path: Path) -> None:
     # Default Envoy runs one worker per host core (64) under a small CPU quota -> CFS
     # throttling and extra TTFT (10-08). concurrency must be set and match the quota.
-    hardening = DEPLOY_ROOT / "gateway-hardening" / "envoyproxy-nofile-patch.yaml"
-    doc = yaml.safe_load(hardening.read_text(encoding="utf-8"))
+    # Both the base CR (config/gateway) and the hardening patch must agree, or
+    # re-applying either one silently reverts the other.
+    doc = next(d for d in _docs(path) if d.get("kind", "EnvoyProxy") == "EnvoyProxy")
     containers = doc["spec"]["provider"]["kubernetes"]["envoyDeployment"]["patch"]["value"]["spec"]["template"]["spec"]["containers"]
     res = next(c for c in containers if c["name"] == "envoy")["resources"]
     assert doc["spec"]["concurrency"] == res["limits"]["cpu"] == res["requests"]["cpu"]
