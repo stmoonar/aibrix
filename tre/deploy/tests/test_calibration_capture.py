@@ -13,7 +13,7 @@ import pytest
 from scripts import calibration_campaign as campaign
 from scripts import calibration_capture as cc
 from scripts import openloop, r3_grid, rewindow_from_raw
-from tre_common.rediskeys import decision_hist_key, hist_key, inst_key, pods_key
+from tre_common.rediskeys import GATEWAY_CADENCE_KEY, decision_hist_key, hist_key, inst_key, pods_key
 from tre_common.tss import tss_terms, replica_factor
 
 
@@ -191,7 +191,11 @@ class FakeRedis:
     def __init__(self, now_ms: int = 1_000_000) -> None:
         self.sets: dict[str, set] = {}
         self.zsets: dict[str, dict[str, float]] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.now_ms = now_ms
+
+    def hgetall(self, key):
+        return {k.encode(): str(v).encode() for k, v in self.hashes.get(key, {}).items()}
 
     def sadd(self, key, *members):
         self.sets.setdefault(key, set()).update(m.encode() for m in members)
@@ -608,6 +612,31 @@ def test_range_and_tail_are_in_redis_time() -> None:
     assert CFG.controller_lag_bounds == (-2_000, 31_500)
     with pytest.raises(ValueError):  # below window + round + blind spot
         cc.ClockDomainConfig(window_ms=30_000, margin_ms=51_999)
+
+
+class Cluster2s(Cluster):
+    """A gateway that declares instant 0.5 s / evidence 2 s, and a controller on that grid."""
+
+    P = 2_000
+
+    def __init__(self, **kw) -> None:
+        kw.setdefault("gw_phase", 600)
+        kw.setdefault("ctl_offset", 1_000)
+        super().__init__(**kw)
+        self.r.hashes[GATEWAY_CADENCE_KEY] = {"instant_ms": 500, "evidence_ms": 2_000}
+
+
+def test_a_2s_gateway_is_checked_and_dumped_on_its_declared_round(tmp_path: Path) -> None:
+    c = Cluster2s()
+    c.advance(RS)
+    assert cc.gateway_round_ms(c.r) == 2_000 and cc.gateway_round_ms(FakeRedis()) == cc.GATEWAY_ROUND_MS
+    cfg = cc.ClockDomainConfig(window_ms=30_000, period_ms=cc.gateway_round_ms(c.r))
+    assert cfg.controller_read_offset_ms == 1_500  # the sampler's cap: round - retry
+    v = cc.check_clock_domains(c.r, "m7", cfg, sleep=c.sleep)
+    assert v["ok"] and v["reasons"] == [], v
+    s = cc.dump_gateway_docs(c.r, _layout(tmp_path), c.pods, lo_ms=RS - 30_000, hi_ms=RS)
+    assert s["round_interval_ms"] == 2_000 and s["instant_interval_ms"] == 500
+    assert s["round_stamp_phases_ms"] == [0]  # every 2 s stamp is on the round, not mod 10 s
 
 
 def _controller_at(lag: int, *, end: int = 950_000) -> Cluster:

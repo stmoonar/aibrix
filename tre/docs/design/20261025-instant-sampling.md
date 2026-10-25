@@ -1,7 +1,8 @@
 # Instant sampling: 0.5 s instant docs, coverage flags, span-normalised tokens (2026-10-25)
 
 Branch `fix/v2-sampling-20261025`. Status: implemented, not deployed. Revised after
-review round 1 (H1, H1b, H2, M1–M5, L4–L6, S1–S5).
+review round 1 (H1, H1b, H2, M1–M5, L4–L6, S1–S5) and round 2 (evidence period 2 s by
+default, fixed-timer fast loop, cheaper snapshot build).
 
 ## Problem
 
@@ -19,7 +20,7 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
    | setting | default | what uses it |
    |---|---|---|
    | `TRE_INSTANT_SAMPLE_INTERVAL_MS` | 500 | gateway `tre:v2:inst` docs; controller per-pod coverage grid |
-   | `TRE_EVIDENCE_PERIOD_MS` | 10 000 | gateway `tre:v2:hist` docs and v1 legacy keys; controller phase-aligned grid, O1 grid / suffixes, SafeScale `evidence_step_ms`, saturation "latest grid", `scrape_current_pods` grid, N2 warning refresh term, gateway-clock lag bound |
+   | `TRE_EVIDENCE_PERIOD_MS` | 2 000 (10 000 before round 2) | gateway `tre:v2:hist` docs and v1 legacy keys; controller phase-aligned grid, O1 grid / suffixes, SafeScale `evidence_step_ms`, saturation "latest grid", `scrape_current_pods` grid, N2 warning refresh term, gateway-clock lag bound |
 
    The evidence period must be a multiple of the instant period; the metrics window a
    multiple of the evidence period. Neither is the upstream `RequestTraceWriteInterval`
@@ -79,7 +80,8 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
 10. **SafeScale evidence store** (M5): `read_instant=False` - latency histograms only,
     raw deltas, no flags; the I3 rule still leaves frozen pods out.
 11. **Sampler**: `window_freshness` only waits for the end tick (the gateway-wide "round
-    written" signal). A snapshot the store marks stale (cadence) is not retried.
+    written" signal). A snapshot the store marks stale (cadence) is not retried. Phase
+    offset `min(2 s, period / 2)` = 1 s at 2 s: a published snapshot is about 1-2 s old.
 12. **Count rules become spans** (same span at any evidence period; deprecated count
     aliases are read as N × 10 s with a warning; both names set = refused):
 
@@ -109,10 +111,51 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
   non-blocking queue; `scraped_ms` stamped before the fetch), so coverage at a 0.5 s
   instant period is normally 1.0.
 
-## Evidence period 2 s
+## Evidence period 2 s (round 2, default)
 
-Not the default yet. All period uses are on `TRE_EVIDENCE_PERIOD_MS`; the count rules
-are spans; the read offset defaults to `min(2 s, period / 2)`. The calibration capture
-takes its round grid from `EVIDENCE_PERIOD_MS` (`GATEWAY_ROUND_MS`); round phases come
-from the histogram docs. Before 2 s goes live: θ re-calibration on the new estimator,
-the remaining 10 s assumptions of the calibration tooling, and the per-refresh read cost.
+- **Default** 2 000 ms in the code (`rediskeys.EVIDENCE_PERIOD_MS`, Go
+  `defaultTREEvidencePeriod`), both overlays and the guard tests. Read offset
+  `TRE_METRICS_PHASE_OFFSET_MS` 1 000. The window stays 30 s; v1 legacy keys stay on 10 s.
+- **Fast loop on a fixed timer.** `rescue_task` runs every `TRE_RESCUE_INTERVAL_SECONDS`
+  (5 s) and takes the newest published snapshot; a publish no longer wakes it
+  (`SnapshotBox.wait_newer` and its trigger are removed). A snapshot is at most about
+  2 s old when the loop reads it (one evidence period plus the read offset). Reading the
+  same `window_end_ms` twice is safe: the EMA is time-based (`TssEma`, tau on the window
+  end), band dwell is gone, and the O1 / saturation / stale rules are spans on window
+  ends, so a repeated or skipped window does not advance them.
+- **Cheap build.** One snapshot = two pipelined round trips (`_Batch`): (1) the pod sets
+  and the cadence hash, (2) per pod the window's inst and hist docs plus the hist
+  baseline as one doc (`ZREVRANGEBYSCORE … LIMIT 0 1` at or before the window start). An
+  O1 suffix is built only when the model has a breakpoint inside the window (callback
+  `suffix_breakpoint`, the O1 `SignalState`), and only the one suffix O1 reads
+  (`ceil(bp / period) × period`). A breakpoint first seen after a read is used from the
+  next snapshot (one snapshot, about 2 s, late).
+- **Bench** (76, local Redis, 20 pods, 3 models, 50 builds incl. `tss_terms`, load avg
+  about 6): 2 s period p50 35.6 / p99 50.6 ms without a breakpoint, 50.5 / 80.6 ms with
+  one; 10 s period 26.7 / 41.0 and 40.2 / 58.9 ms.
+- **Calibration tooling.**
+  - `calibration_capture`: the round grid is the gateway's declared evidence period
+    (`gateway_round_ms`, from `tre:v2:gateway:cadence`; 10 s for an older gateway). The
+    clock-domain bounds, round phases (`mod period`) and the read-offset cap
+    (`period − 500`) follow it. The flush wait stays a 12 s upper bound (it returns at
+    the next doc, 0.5 s with instant docs).
+  - θ fit: windows end on `FIT_GRID_MS` = 10 s (step 10 s), as before; these windows
+    are a subset of the 2 s controller windows. The fit's queue signal stays the 10 s
+    live-grid subsample of the 1 Hz sidecar (`LIVE_GRID_MS` = 10 s, fixed, no longer
+    tied to the gateway period). So a fit samples the same window starts and the same
+    queue samples as before. The live controller averages all 0.5 s instant docs, which
+    is closer to `--instant-grid raw`; changing the fit's queue signal is part of the
+    θ re-calibration, not of this change.
+  - `r3_grid` live sampler lookback: 2 × the declared instant period (20 s fallback).
+- **Percentile mode audit.** The controller reads `TRE_PERCENTILE_MODE` once
+  (`config.py`) and passes it to the main and the SafeScale evidence `MetricsStore`
+  (suffix windows use the same store) and to `SafeScaleConfig` (`safescale_direct`). The
+  pooled p95 paths (`safescale_evidence`, `safescale_task`) use the store's `p95_rule`;
+  their `"bucket_upper"` fallback applies only to a store without a rule (test fakes).
+  No controller path hardcodes a mode. The offline tools take the mode from their own
+  input, not from the env: the SLO label spec (`slo_labels`, `b_prime`,
+  `preserve_mu`), `calibration_dataset` overrides, `r3_grid` / `rewindow_from_raw`
+  `--percentile-mode`; each defaults to `bucket_upper`, the controller default. A run
+  with `TRE_PERCENTILE_MODE=interpolated` must pass the same mode to these tools.
+- **Before it goes live:** θ re-calibration on the new estimator (θ, λ, τ, w_p, c/b
+  together), and a real-cluster smoke of the 2 s gateway write cost.

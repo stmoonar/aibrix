@@ -80,8 +80,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from tre_common.rediskeys import (
-    EVIDENCE_PERIOD_MS,
-    INSTANT_SAMPLE_INTERVAL_MS,
+    GATEWAY_CADENCE_KEY,
+    LEGACY_GRID_MS,
     decision_hist_key,
     hist_key,
     inst_key,
@@ -134,10 +134,12 @@ DROPPED_LABELS = frozenset({"model_name"})
 #: A full snapshot row every this many rows, so a truncated file loses at most this much.
 DEFAULT_KEYFRAME_EVERY = 300
 
-#: The gateway's round grid of the controller windows: its histogram docs and the
-#: phase-aligned controller's window ends are on this period (2026-10-25: the evidence
-#: period; instant docs come every INSTANT_SAMPLE_INTERVAL_MS in between).
-GATEWAY_ROUND_MS = EVIDENCE_PERIOD_MS
+#: The gateway's round grid when it declares none: the gateway images before 2026-10-25
+#: wrote every doc on this 10 s grid. A newer gateway declares its periods in
+#: ``tre:v2:gateway:cadence``; the round grid of the controller windows (its histogram
+#: docs, the phase-aligned controller's window ends) is then the declared evidence
+#: period (:func:`gateway_round_ms`; instant docs come every ``instant_ms`` between).
+GATEWAY_ROUND_MS = LEGACY_GRID_MS
 #: How long to wait for the gateway's next Redis write (its ticker has an arbitrary
 #: phase against the round, so up to one round plus the write itself).
 DEFAULT_GATEWAY_FLUSH_WAIT_S = GATEWAY_ROUND_MS / 1000.0 + 2.0
@@ -941,6 +943,31 @@ GATEWAY_RETENTION_MS = 30 * 60 * 1000
 #: ``period - retry`` = 9.5 s when the gateway writes late in its round
 #: (``tre_controller.loops.metrics_task.PhaseAlignedSampler``).
 DEFAULT_CONTROLLER_READ_OFFSET_MS = GATEWAY_ROUND_MS - 500
+
+
+def declared_cadence(redis_client: Any) -> dict[str, int]:
+    """The gateway's declared periods (``instant_ms``, ``evidence_ms``) from
+    ``tre:v2:gateway:cadence``; {} when it declares none (older gateway) or on a read
+    error."""
+    try:
+        raw = redis_client.hgetall(GATEWAY_CADENCE_KEY) or {}
+    except Exception:  # noqa: BLE001 - undeclared
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        name = key.decode() if isinstance(key, bytes) else str(key)
+        if name in ("instant_ms", "evidence_ms"):
+            try:
+                out[name] = int(value.decode() if isinstance(value, bytes) else value)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def gateway_round_ms(redis_client: Any) -> int:
+    """The gateway's round grid: its declared evidence period, else the 10 s grid."""
+    value = declared_cadence(redis_client).get("evidence_ms")
+    return int(value) if value and value > 0 else GATEWAY_ROUND_MS
 #: ... and the window reaches the decision history on the next tick of a loop that
 #: writes it: the rescue loop (``TRE_RESCUE_INTERVAL_SECONDS``, 5 s) or, when the fast loop
 #: is disabled, the fairness loop (``TRE_FAIRNESS_INTERVAL_SECONDS``, 10 s). The bound
@@ -980,7 +1007,8 @@ class ClockDomainConfig:
     window_ms: int = 30_000
     period_ms: int = GATEWAY_ROUND_MS
     tolerance_ms: int = DEFAULT_CLOCK_TOLERANCE_MS
-    controller_read_offset_ms: int = DEFAULT_CONTROLLER_READ_OFFSET_MS
+    #: None: ``period - 500`` (the sampler's adapt cap: period minus its retry step).
+    controller_read_offset_ms: Optional[int] = None
     controller_tick_ms: int = DEFAULT_CONTROLLER_TICK_MS
     margin_ms: Optional[int] = None
     attempts: int = DEFAULT_CLOCK_CHECK_ATTEMPTS
@@ -988,6 +1016,8 @@ class ClockDomainConfig:
     poll_s: float = DEFAULT_GATEWAY_POLL_S
 
     def __post_init__(self) -> None:
+        if self.controller_read_offset_ms is None:
+            object.__setattr__(self, "controller_read_offset_ms", max(0, int(self.period_ms) - 500))
         if min(self.window_ms, self.period_ms) <= 0 or min(
                 self.tolerance_ms, self.controller_read_offset_ms, self.controller_tick_ms) < 0:
             raise ValueError(f"invalid clock-domain config: {self}")
@@ -1357,6 +1387,7 @@ def dump_gateway_docs(
     known: Optional[set] = None,
     known_upto_ms: Optional[int] = None,
     known_pods: Optional[Iterable[str]] = None,
+    round_ms: Optional[int] = None,
 ) -> dict:
     """``ZRANGEBYSCORE [lo_ms, hi_ms]`` of every pod's hist and inst key, one JSONL per
     pod and kind: ``{"score": round stamp ms, "doc": parsed JSON}``. Pods with no doc in
@@ -1371,6 +1402,8 @@ def dump_gateway_docs(
     observation was final (its redis TIME minus the blind spot); ``late_writes`` counts
     the dumped docs stamped up to there that were not seen then (:func:`_late_docs`)."""
     observed_at = redis_time_ms(redis_client)
+    if round_ms is None:
+        round_ms = gateway_round_ms(redis_client)
     fetched: dict[str, dict[str, list]] = {kind: {} for kind in GATEWAY_KINDS}
     for kind in GATEWAY_KINDS:
         key_of = hist_key if kind == "hist" else inst_key
@@ -1408,7 +1441,7 @@ def dump_gateway_docs(
             files[kind][pod] = _rel(path, layout.cell_dir)
     # Round phases from the histogram docs (one per round; the instant docs in between
     # are on the finer instant grid, 2026-10-25).
-    phases = sorted({s % GATEWAY_ROUND_MS for s in hist_stamps})
+    phases = sorted({s % int(round_ms) for s in hist_stamps})
     late = (_late_docs(fetched, known, int(known_upto_ms), known_pods)
             if known is not None and known_upto_ms is not None and known_pods else None)
     return {
@@ -1423,8 +1456,8 @@ def dump_gateway_docs(
         "docs": counts,
         "bytes": total_bytes,
         "round_stamp_phases_ms": phases,
-        "round_interval_ms": GATEWAY_ROUND_MS,
-        "instant_interval_ms": INSTANT_SAMPLE_INTERVAL_MS,
+        "round_interval_ms": int(round_ms),
+        "instant_interval_ms": declared_cadence(redis_client).get("instant_ms", int(round_ms)),
         "last_round_ms": max(stamps) if stamps else None,
     }
 
@@ -1820,7 +1853,7 @@ def capture_after_cell(
         except Exception as exc:  # noqa: BLE001
             errors.append(f"vllm_metrics: {exc!r}")
     if redis_client is not None and (gateway_dump or controller_ticks):
-        cfg = clock_config or ClockDomainConfig(window_ms=int(window_ms))
+        cfg = clock_config or ClockDomainConfig(window_ms=int(window_ms), period_ms=gateway_round_ms(redis_client))
         if clock_end is None and clock_start is not None:
             clock_end = cell_clock_mark(redis_client, model, cfg, start=clock_start, now_ms=now_ms, sleep=sleep)
         clock = clock_record(cfg, clock_start, clock_end)

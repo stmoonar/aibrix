@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from tre_common import slo_labels
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from scripts.rewindow_from_raw import LIVE_GRID_MS
 
 from scripts import adaptive_boundary as boundary
 from scripts import calibration_capture as capture
@@ -898,7 +898,7 @@ def build_dataset(
             "membership": settings.membership(),
             "kind": "sliding" if settings.step_ms < settings.window_ms else "tumbling",
             "bounds": "each attempt's own [start_ms, end_ms] from its guard artifact",
-            "queue_source": f"sidecar samples on the live grid ({SCRAPE_INTERVAL_MS} ms)",
+            "queue_source": f"sidecar samples on the live grid ({LIVE_GRID_MS} ms)",
             "percentile_mode": settings.percentile_mode,
             "implementation": "scripts.rewindow_from_raw.label_cell",
         },
@@ -1051,7 +1051,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
                     window_align=settings.window_align,
                     percentile_mode=settings.percentile_mode,
                     min_latency_samples=settings.min_latency_samples,
-                    instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+                    instant_sample_interval_ms=LIVE_GRID_MS,
                     instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
                     start_ms=rewindow_from_raw._as_int(guard.get("start_ms")),
                     end_ms=rewindow_from_raw._as_int(guard.get("end_ms")),
@@ -1293,7 +1293,7 @@ def online_windows(records, instants, guard, cell, spec, settings: Settings, lab
         window_align=settings.online_window_align,
         percentile_mode=settings.percentile_mode,
         min_latency_samples=settings.min_latency_samples,
-        instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+        instant_sample_interval_ms=LIVE_GRID_MS,
         instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
         start_ms=rewindow_from_raw._as_int(guard.get("start_ms")),
         end_ms=rewindow_from_raw._as_int(guard.get("end_ms")),

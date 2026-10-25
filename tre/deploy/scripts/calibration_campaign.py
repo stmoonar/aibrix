@@ -139,7 +139,7 @@ from scripts import openloop
 from scripts import prompt_corpus as corpus_record
 from scripts import r3_grid
 from scripts import static_grid
-from scripts.openloop import LIVE_GRID_MS
+from scripts.openloop import FIT_GRID_MS, LIVE_GRID_MS
 
 #: Stage a shape's boundary search occupies in the campaign order. It is not one of
 #: ``gen.PRIMITIVES``: its cells are generated at campaign time from what the previous
@@ -559,9 +559,10 @@ def require_capture_clock_domains(args, models: Optional[Sequence[str]] = None) 
     import redis  # type: ignore[import-not-found]
 
     url = getattr(args, "redis_url", None) or capture.DEFAULT_REDIS_URL
-    cfg = capture.ClockDomainConfig(window_ms=int(args.window_ms))
+    client = redis.Redis.from_url(url)
+    cfg = capture.ClockDomainConfig(window_ms=int(args.window_ms), period_ms=capture.gateway_round_ms(client))
     try:
-        verdicts = capture.require_clock_domains(redis.Redis.from_url(url), list(models), cfg)
+        verdicts = capture.require_clock_domains(client, list(models), cfg)
     except capture.ClockDomainMismatch as exc:
         raise SystemExit(str(exc)) from None
     for model, v in verdicts.items():
@@ -2881,9 +2882,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--cooldown-s ({args.cooldown_s:g}) must be >= the metrics window "
             f"(--window-ms {args.window_ms} = {args.window_ms / 1000.0:g} s)"
         )
-    if args.fit_window_align == "grid" and args.fit_step_ms % LIVE_GRID_MS:
+    if args.fit_window_align == "grid" and args.fit_step_ms % FIT_GRID_MS:
         ap.error(
-            f"--fit-window-align grid needs --fit-step-ms to be a multiple of {LIVE_GRID_MS} "
+            f"--fit-window-align grid needs --fit-step-ms to be a multiple of {FIT_GRID_MS} "
             f"(got {args.fit_step_ms}); use --fit-window-align none for a free-phase step"
         )
     if collection:
