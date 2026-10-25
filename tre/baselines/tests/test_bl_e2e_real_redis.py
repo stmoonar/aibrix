@@ -431,9 +431,11 @@ def _policy_params(policy: str, tmp_path) -> dict:
         # default busy_def (effective): busy = ceil(in flight / B); theta 1 -> one pod per B
         return {"batch_mode": "static", "static_b": 4, "theta": {"*": 1.0}}
     if policy == "tokenscale":
-        vel = {"buckets": [[200.0] * 3] * 3, "v_prefill": 1000.0}
+        vel = {"buckets": [[200.0] * 3] * 3}
+        centers = [[[x, y] for y in (30, 100, 200)] for x in (30, 100, 200)]  # one per cell of the edges
         return {"models": [A, B], "bucket_edges": {"*": {"in": [50, 150], "out": [50, 150]}},
-                "velocity": {A: vel, B: vel}, "misbucket_rate": 0.0, "window_s": 3, "seed": 0}
+                "bucket_centers": {"*": centers}, "velocity": {A: vel, B: vel}, "misbucket_rate": 0.0,
+                "window_s": 3, "seed": 0}
     if policy == "preserve":
         # Windows of PHASE_S s: w0 low, w1 high (N=3), w2 low. mu in tok/s per replica.
         reqs = [{"timestamp": t, "model_name": A, "prompt_length": 50, "max_output_tokens": 50}
@@ -446,7 +448,8 @@ def _policy_params(policy: str, tmp_path) -> dict:
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps(reqs), encoding="utf-8")
         mu = {"p": 100.0, "d": 100.0, "t": 200.0}
-        return {"trace_path": str(path), "window_s": PHASE_S, "tier1": "oracle", "mu": {A: mu, B: dict(mu)}}
+        return {"trace_path": str(path), "window_s": PHASE_S, "tier1": "oracle", "load_error_mode": "none",
+                "mu": {A: mu, B: dict(mu)}}
     raise AssertionError(policy)
 
 
@@ -542,7 +545,7 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     assert all(h.events.written[k] > 0 for k in ("arr", "ft", "done"))
     if policy == "tokenscale":
         # Go-format events reached the policy: lambda > 0, odd events were counted, not fatal
-        assert any(ln["inputs"].get("lambda_in", 0) > 0 and ln["inputs"].get("new_events", 0) > 0 for ln in mine)
+        assert any(sum(ln["inputs"].get("lambda_b", {}).values()) > 0 and ln["inputs"].get("new_events", 0) > 0 for ln in mine)
         last = mine[-1]["inputs"]
         assert last["skipped_reissue"] > 0 and last["skipped_missing_in"] > 0 and last["missing_out"] >= 0
         assert any(ln["inputs"].get("missing_out", 0) > 0 for ln in mine)

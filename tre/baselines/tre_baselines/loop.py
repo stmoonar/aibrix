@@ -19,7 +19,9 @@
   ``incomplete``, the policy's own reason in ``inputs.policy_reason``) whenever
   :func:`~tre_baselines.snapshot.evidence_gaps` lists a gap for the model (with the
   policy's ``needs_events`` / ``event_history_s``). The policies apply the same gate
-  themselves; this one covers any policy that does not.
+  themselves; this one covers any policy that does not. A policy that gates its evidence
+  itself, by design differently, opts out with ``evidence_backstop = False`` (PreServe:
+  Tier-1 is never held, Tier-2 holds in both directions, v1 D56 / D64).
 * The dispatcher is asynchronous: a model whose previous SM call is still running gets
   ``inflight_skip`` (not queued); the tick never waits for the SM.
 * Donor before dependent (no arbiter): scale-downs are submitted first. A scale-up that
@@ -362,6 +364,7 @@ class BaselineShell:
 
         needs_events = bool(getattr(self.policy, "needs_events", False))
         history_s = float(getattr(self.policy, "event_history_s", 0.0) or 0.0)
+        backstop = bool(getattr(self.policy, "evidence_backstop", True))
         planned: list[dict] = []
         for model, ms in snap.models.items():
             decision = decisions.get(model)
@@ -369,7 +372,7 @@ class BaselineShell:
             clamped = ms.awake if raw is None else clamp(raw, ms.min_replicas, ms.max_replicas)
             reason = "no_decision" if decision is None else decision.reason
             inputs = {} if decision is None else dict(decision.inputs)
-            if clamped < ms.awake:
+            if clamped < ms.awake and backstop:
                 gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s, events=needs_events, history_s=history_s)
                 if gaps:  # backstop: never scale down on incomplete evidence
                     inputs.update(gaps=list(gaps), policy_reason=reason, policy_clamped=clamped)

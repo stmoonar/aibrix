@@ -50,15 +50,17 @@ TRE_REPO_DEFAULT = HERE.parents[1]          # .../tre
 BASE_ARMS = ("tre", "apa", "chiron", "tokenscale", "preserve")
 BASELINE_ARMS = ("chiron", "tokenscale", "preserve")
 DEFAULT_LABELS = {"tre": "TRE", "apa": "APA-kvcache", "chiron": "Chiron-global",
-                  "tokenscale": "TokenScale-colocated", "preserve": "PreServe-oracle"}
+                  "tokenscale": "TokenScale-colocated", "preserve": "PreServe"}
 DONE_MARKER = "CAMPAIGN_DONE.json"
 FAILED_SUFFIX = ".CAMPAIGN_FAILED.json"
 ORDER_METHODS = ("williams", "cyclic", "fixed")
-PRESERVE_KEYS = {"trace_path", "trace_seed", "trace_schedule", "trace_match_parts", "window_s", "lead_s",
-                 "tier1", "noise_sigma", "noise_seed", "mu", "max_output_len", "map_factor", "lookahead_iters",
-                 "kv_high", "overload_frac", "t_f", "ext_frac", "out_len_is_upper_bound", "kv_capacity_tokens",
-                 "kv_agree_tol", "hold_mode", "req_ttl_s"}
-TIER1_MODES = ("oracle_noisy", "oracle", "last_window")
+# the PreServe policy's keys (tre_baselines/policies/preserve.py, 2026-10-26 port)
+PRESERVE_KEYS = {"calibration", "trace_path", "trace_seed", "trace_schedule", "trace_match_parts", "trace_name",
+                 "window_s", "lead_s", "tier1", "noise_sigma", "noise_seed", "seq_len", "predictors",
+                 "predictor_rules", "history_path", "mu", "load_error_mode", "load_error_seed", "max_model_len",
+                 "max_output_len", "map_factor", "lookahead_iters", "kv_high", "overload_frac", "t_f", "ext_frac",
+                 "out_len_is_upper_bound", "t2_reset_at_window", "kv_capacity_tokens", "kv_agree_tol", "req_ttl_s"}
+TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 # controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
@@ -77,7 +79,8 @@ DEFAULTS: dict = {
     "eta": {"overhead_s": 300, "report_s": 120},
     "env": {},
     "arm_defs": {},
-    "preserve": {"trace_host_root": None, "trace_pod_root": "/etc/tre-baselines-traces", "match_parts": 3},
+    "preserve": {"trace_host_root": None, "trace_pod_root": "/etc/tre-baselines-traces", "match_parts": 3,
+                 "history_root": None},   # Real_* history files: <history_root>/<trace>/seed<k>/preserve_history.json
     "report": {"enabled": True, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
                "reps": 1000, "timeout_s": 900, "nice": 10, "extra_args": []},
     "precheck": {"gpu_truth_max_age_s": 30, "breakpoint_lookback_s": 60, "wait_s": 300, "poll_s": 30,
@@ -622,6 +625,39 @@ def _tail(path: str, parts: int) -> tuple:
     return tuple(bits[-parts:]) if parts > 0 else ()
 
 
+PRE_T0_NAME = "pre_t0.json"                    # the generator's history (synthetic traces)
+PRESERVE_HISTORY_NAME = "preserve_history.json"  # tools/preserve_history real (Real_*)
+
+
+def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, tail: tuple,
+                          log: Callable[[str], None]) -> dict:
+    """PreServe mLSTM's history before t0 next to the oracle copy (the policy reads
+    ``<trace dir>/pre_t0.json``, else ``preserve_history.json``): the generator's ``pre_t0.json``
+    next to the replayed trace, else ``<preserve.history_root>/<trace>/seed<k>/preserve_history.json``.
+    A shifted or sliced trace has no matching past: refused for mlstm."""
+    if len(tail) < 3:
+        raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs preserve.match_parts >= 3 (the oracle copy "
+                            "must keep <trace>/seed<k>/ so the policy finds the trace name and its history)")
+    if d.oracle_shift or e.slice:
+        raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift / slice)")
+    src = Path(e.src_dir) / PRE_T0_NAME
+    if not src.is_file():
+        root = pc.get("history_root")
+        src = Path(root) / Path(*tail[:-1]) / PRESERVE_HISTORY_NAME if root else src
+    if not src.is_file():
+        raise CampaignError(f"{e.out_name}/{d.id}: no PreServe history ({Path(e.src_dir) / PRE_T0_NAME}, or "
+                            f"preserve.history_root/<trace>/seed<k>/{PRESERVE_HISTORY_NAME})")
+    dst = host_path.parent / src.name
+    sha = sha256_file(src)
+    if not (dst.is_file() and sha256_file(dst) == sha):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".tmp")
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+        log(f"preserve history {e.out_name}/{d.id}: {src} -> {dst}")
+    return {"source": str(src), "path": str(dst), "sha256": sha}
+
+
 def prepare_preserve(c: dict, e: TraceEntry, d: ArmDef, log: Callable[[str], None]) -> dict:
     """Oracle copy of the replayed trace (stripped; phase-shifted for an oracle_shift arm) under
     the shell's trace volume + the rendered policy-configmaps file. Returns the env + record."""
@@ -657,6 +693,8 @@ def prepare_preserve(c: dict, e: TraceEntry, d: ArmDef, log: Callable[[str], Non
         log(f"preserve oracle {e.out_name}/{d.id}: {host_path} ({len(recs)} requests, shift {delta})")
     overrides = {**e.preserve_policy, **d.policy}
     text, params = render_preserve_policy(bl_cm, pod_path, parts, overrides)
+    if str(params.get("tier1", "mlstm")) == "mlstm":
+        rec["history"] = copy_preserve_history(pc, e, d, host_path, tail, log)
     pol_path = Path(c["results_root"]) / "_policy" / e.out_name / f"{d.id}.policy-configmaps.yaml"
     write_text_atomic(pol_path, text)
     rec.update(oracle_host_path=str(host_path), oracle_pod_path=pod_path, oracle_sha256=sha256_file(host_path),

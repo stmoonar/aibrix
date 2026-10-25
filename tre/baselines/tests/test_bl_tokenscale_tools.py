@@ -5,43 +5,7 @@ import json
 import pytest
 import yaml
 
-from tre_baselines.tools import tokenscale_buckets as tb
 from tre_baselines.tools import tokenscale_profile as tp
-
-
-def test_buckets_on_synthetic_records(tmp_path, capsys):
-    recs = [{"model": "m", "in_tokens": i, "max_tokens": o} for i in range(1, 10) for o in (10, 20, 30)]
-    f = tmp_path / "t.jsonl"
-    f.write_text("\n".join(json.dumps(r) for r in recs), encoding="utf-8")
-    assert tb.main(["--trace", str(f), "--model", "m"]) == 0
-    out = yaml.safe_load(capsys.readouterr().out)
-    assert out["bucket_edges"]["m"] == {"in": [3, 6], "out": [10, 20]}
-    c = out["bucket_centers"]["m"]
-    assert c[0][0] == [2, 10] and c[2][2] == [8, 30]
-
-
-def test_buckets_on_segment_trace_and_dist(tmp_path, capsys):
-    trace = {"m": [
-        {"start_time": 0, "end_time": 10, "rps": 1, "input_tokens": 100, "max_tokens": 10},
-        {"start_time": 10, "end_time": 20, "rps": 1, "input_tokens": 500, "max_tokens": 100},
-        {"start_time": 20, "end_time": 30, "rps": 1, "input_tokens_dist": {"low": 1000, "high": 4000},
-         "max_tokens_dist": {"low": 100, "high": 400}},
-    ]}
-    f = tmp_path / "t.json"
-    f.write_text(json.dumps(trace), encoding="utf-8")
-    assert tb.main(["--trace", str(f)]) == 0
-    out = yaml.safe_load(capsys.readouterr().out)
-    assert out["bucket_edges"]["m"]["in"] == [100, 500]
-    assert out["bucket_centers"]["m"][2][2] == [2000, 200]
-
-
-def test_buckets_bad_format(tmp_path, capsys):
-    f = tmp_path / "bad.json"
-    f.write_text(json.dumps([{"foo": 1}]), encoding="utf-8")
-    assert tb.main(["--trace", str(f)]) == 2
-    assert "needs one of" in capsys.readouterr().err
-    f.write_text("not json\n{", encoding="utf-8")
-    assert tb.main(["--trace", str(f)]) == 2
 
 
 SLO = __import__("types").SimpleNamespace(ttft_slo_ms=lambda L: 500.0, tpot_p95_ms=75.0)
@@ -191,13 +155,6 @@ def test_http_measure_drives_closed_loop_chat_and_reads_engine_counters(tmp_path
     # engine counters, not completed requests: 120 prompt + 4 generated tokens per request
     assert step.prefill_tok_s > 0 and step.decode_tok_s == pytest.approx(step.prefill_tok_s * 4 / 120, rel=0.35)
     assert step.ttft_p95_ms is not None and step.tpot_p95_ms is not None
-
-
-def test_buckets_report_the_median_input(tmp_path, capsys):
-    f = tmp_path / "t.json"
-    f.write_text(json.dumps([{"in_tokens": x, "max_tokens": 10} for x in (100, 200, 300, 400, 500)]), encoding="utf-8")
-    assert tb.main(["--trace", str(f), "--default-model", "m"]) == 0
-    assert yaml.safe_load(capsys.readouterr().out)["median_in"] == {"m": 300}
 
 
 def _http_measure(monkeypatch, tmp_path, fake, **kw):

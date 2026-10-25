@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -158,9 +159,9 @@ func sorted(s ...string) []string {
 }
 
 var (
-	blArrFields  = sorted("kind", "req_id", "reissue", "gw_local_ms", "pod", "in_tokens", "in_src", "max_tokens", "stream")
-	blFTFields   = sorted("kind", "req_id", "reissue", "gw_local_ms", "pod", "dt_arr_ms")
-	blDoneFields = sorted("kind", "req_id", "reissue", "gw_local_ms", "pod", "status", "out_tokens", "out_src", "dt_arr_ms")
+	blArrFields  = sorted("kind", "req_id", "client_id", "reissue", "gw_local_ms", "pod", "in_tokens", "in_src", "max_tokens", "stream")
+	blFTFields   = sorted("kind", "req_id", "client_id", "reissue", "gw_local_ms", "pod", "dt_arr_ms")
+	blDoneFields = sorted("kind", "req_id", "client_id", "reissue", "gw_local_ms", "pod", "status", "out_tokens", "out_src", "dt_arr_ms")
 )
 
 func blRespHeaders(code string) *extProcPb.ProcessingRequest {
@@ -247,9 +248,10 @@ func TestBLReqEvents_OffMeansZeroRedisWrites(t *testing.T) {
 func TestBLReqEvents_OffHeadersNotCapturedAndHooksDoNotAllocate(t *testing.T) {
 	s := &Server{}
 	_, _, _, rc := s.HandleRequestHeaders(context.Background(), "rid",
-		treHeadersReq(PathCompletions, HeaderBLInTokens, "5", HeaderTREContinued, "1", HeaderTRERetried, "1", HeaderTREReissueDepth, "1"))
+		treHeadersReq(PathCompletions, HeaderBLInTokens, "5", HeaderTREContinued, "1", HeaderTRERetried, "1", HeaderTREReissueDepth, "1",
+			HeaderTRERequestID, "req_1"))
 	require.NotNil(t, rc)
-	for _, h := range []string{HeaderBLInTokens, HeaderTREContinued, HeaderTRERetried, HeaderTREReissueDepth} {
+	for _, h := range []string{HeaderBLInTokens, HeaderTREContinued, HeaderTRERetried, HeaderTREReissueDepth, HeaderTRERequestID} {
 		_, ok := rc.ReqHeaders[h]
 		assert.False(t, ok, "%s must not be stored while the feature is off", h)
 	}
@@ -302,6 +304,7 @@ func TestBLReqEvents_StreamingCompletionsSequence(t *testing.T) {
 		assert.Equal(t, arr["req_id"], e["req_id"])
 		assert.Equal(t, "p", e["pod"])
 		assert.Equal(t, "none", e["reissue"])
+		assert.Equal(t, "", e["client_id"], "no x-tre-request-id: empty")
 		ms, err := strconv.ParseInt(e["gw_local_ms"], 10, 64)
 		require.NoError(t, err)
 		assert.InDelta(t, time.Now().UnixMilli(), ms, 60_000)
@@ -321,6 +324,33 @@ func TestBLReqEvents_StreamingCompletionsSequence(t *testing.T) {
 	assert.Equal(t, "200", done["status"])
 	assert.Equal(t, "2", done["out_tokens"])
 	assert.Equal(t, "usage", done["out_src"])
+}
+
+// The client's x-tre-request-id is on every event of the request (trimmed, cut to
+// blClientIDMaxRunes runes); req_id stays the gateway's own id.
+func TestBLReqEvents_ClientIDOnEveryEvent(t *testing.T) {
+	for name, tc := range map[string]struct{ in, want string }{
+		"plain": {" req_000042 ", "req_000042"},
+		"long":  {strings.Repeat("é", blClientIDMaxRunes+5), strings.Repeat("é", blClientIDMaxRunes)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newBLRedis(t)
+			s := newBLServer(r, testBLConfig())
+			err := blRun(t, s, "client-id-"+name, PathCompletions, `{"model":"m","prompt":"hi","max_tokens":4,"stream":true}`,
+				[]string{HeaderTRERequestID, tc.in}, func(srv *mockProcessServer) {
+					srv.On("Recv").Return(blRespHeaders("200"), nil).Once()
+					srv.On("Recv").Return(blRespBody("data: {\"choices\":[{\"text\":\"a\"}]}\n\ndata: [DONE]\n\n", true), nil).Once()
+				})
+			require.NoError(t, err)
+			s.blEvents.close()
+			evs := r.events(t, "m")
+			require.Equal(t, []string{"arr", "ft", "done"}, blKinds(evs))
+			for _, e := range evs {
+				assert.Equal(t, tc.want, e["client_id"])
+				assert.NotEqual(t, tc.want, e["req_id"])
+			}
+		})
+	}
 }
 
 func TestBLReqEvents_ChatNonStreamingEstimateWithContentParts(t *testing.T) {
@@ -669,6 +699,7 @@ func TestBLReqEvents_ReissueContract(t *testing.T) {
 			Reissue  string            `json:"reissue"`
 			InTokens int64             `json:"in_tokens"`
 			InSrc    string            `json:"in_src"`
+			ClientID string            `json:"client_id"`
 		} `json:"cases"`
 	}
 	require.NoError(t, json.Unmarshal(data, &contract))
@@ -693,6 +724,11 @@ func TestBLReqEvents_ReissueContract(t *testing.T) {
 			assert.Equal(t, c.Reissue, evs[0]["reissue"])
 			assert.Equal(t, strconv.FormatInt(c.InTokens, 10), evs[0]["in_tokens"])
 			assert.Equal(t, c.InSrc, evs[0]["in_src"])
+			// the sidecar forwards the client's id unchanged: a reissue keeps the client_id
+			require.NotEmpty(t, c.ClientID, "every contract case carries x-tre-request-id")
+			for _, e := range evs {
+				assert.Equal(t, c.ClientID, e["client_id"])
+			}
 			assert.Equal(t, c.From != "client", evs[0]["reissue"] != "none", "reissue iff the sidecar sent it")
 		})
 	}

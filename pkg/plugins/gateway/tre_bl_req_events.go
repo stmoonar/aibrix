@@ -51,13 +51,20 @@ import (
 // gw_local_ms (gateway wall clock) and dt_arr_ms (gateway monotonic clock) are
 // informational. Every value is a string.
 //
-//	kind=arr   once the target pod is chosen: req_id reissue gw_local_ms pod in_tokens
-//	           in_src(header|estimate|token_ids) max_tokens stream
+//	kind=arr   once the target pod is chosen: req_id client_id reissue gw_local_ms pod
+//	           in_tokens in_src(header|estimate|token_ids) max_tokens stream
 //	kind=ft    first non-empty response body frame of a non-error response:
-//	           req_id reissue gw_local_ms pod dt_arr_ms
+//	           req_id client_id reissue gw_local_ms pod dt_arr_ms
 //	kind=done  exactly once per request that had arr, when its ext_proc stream ends
-//	           (completion, upstream error, abort, shutdown): req_id reissue gw_local_ms
-//	           pod status out_tokens out_src(usage|none) dt_arr_ms
+//	           (completion, upstream error, abort, shutdown): req_id client_id reissue
+//	           gw_local_ms pod status out_tokens out_src(usage|none) dt_arr_ms
+//
+// req_id is this gateway request (a new one for every reissue). client_id is the client's
+// own request id (header x-tre-request-id, trimmed, at most blClientIDMaxRunes runes; empty
+// when absent). The reissue sidecar forwards it unchanged on every retry / continuation, so
+// one client request keeps one client_id across reissues: the baseline shells key
+// per-request draws (TokenScale misbucketing, PreServe length errors) on it, which makes
+// them independent of arrival order and equal in every arm.
 //
 // reissue (none|retried|continued) classifies the request as the reissue sidecar
 // (tre/reissue/tre_reissue/sidecar.py) sends it, see blReissue. The sidecar's request
@@ -76,6 +83,8 @@ const (
 	HeaderTREContinued     = "x-tre-continued"
 	HeaderTRERetried       = "x-tre-retried"
 	HeaderTREReissueDepth  = "x-tre-reissue-depth" // sidecar Config.depth_header: >= 1 on every request it re-sends
+	HeaderTRERequestID     = "x-tre-request-id"    // the client's request id (replayer, sidecar forward it)
+	blClientIDMaxRunes     = 128                   // = the sidecar's request_id_of truncation
 	defaultBLReqMaxLen     = int64(200000)
 	defaultBLReqBuffer     = 10000
 	defaultBLCharsPerToken = 4.0
@@ -334,6 +343,7 @@ func (e *blReqEmitter) close() {
 type blReqState struct {
 	stream   string // Redis key
 	reqID    string
+	clientID string
 	reissue  string
 	pod      string
 	arrAt    time.Time
@@ -372,6 +382,16 @@ func blReissue(h map[string]string, tokenIDPrompt bool) string {
 		return "retried"
 	}
 	return "none"
+}
+
+// blClientID: the client's request id (x-tre-request-id), trimmed and cut to
+// blClientIDMaxRunes runes; "" when absent.
+func blClientID(h map[string]string) string {
+	v := strings.TrimSpace(h[HeaderTRERequestID])
+	if utf8.RuneCountInString(v) > blClientIDMaxRunes {
+		v = string([]rune(v)[:blClientIDMaxRunes])
+	}
+	return v
 }
 
 // blResent: the reissue sidecar sent this request (x-tre-reissue-depth >= 1).
@@ -423,6 +443,7 @@ func (s *Server) blOnRequestBody(st *processState, req *extProcPb.ProcessingRequ
 	b := &blReqState{
 		stream:    BLReqEventsKeyPrefix + st.model,
 		reqID:     st.requestID,
+		clientID:  blClientID(rc.ReqHeaders),
 		reissue:   reissue,
 		pod:       pod,
 		arrAt:     time.Now(),
@@ -432,6 +453,7 @@ func (s *Server) blOnRequestBody(st *processState, req *extProcPb.ProcessingRequ
 	e.enqueue(blReqEvent{stream: b.stream, values: []string{
 		"kind", blKindArr,
 		"req_id", b.reqID,
+		"client_id", b.clientID,
 		"reissue", b.reissue,
 		"gw_local_ms", strconv.FormatInt(b.arrAt.UnixMilli(), 10),
 		"pod", b.pod,
@@ -461,6 +483,7 @@ func (s *Server) blOnResponseBody(st *processState, frame []byte) {
 	s.blEvents.enqueue(blReqEvent{stream: b.stream, values: []string{
 		"kind", blKindFT,
 		"req_id", b.reqID,
+		"client_id", b.clientID,
 		"reissue", b.reissue,
 		"gw_local_ms", strconv.FormatInt(now.UnixMilli(), 10),
 		"pod", b.pod,
@@ -500,6 +523,7 @@ func (s *Server) blOnStreamEnd(st *processState, err error) {
 	s.blEvents.enqueue(blReqEvent{stream: b.stream, values: []string{
 		"kind", blKindDone,
 		"req_id", b.reqID,
+		"client_id", b.clientID,
 		"reissue", b.reissue,
 		"gw_local_ms", strconv.FormatInt(now.UnixMilli(), 10),
 		"pod", b.pod,

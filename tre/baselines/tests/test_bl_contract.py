@@ -60,7 +60,7 @@ def test_static_policy_holds_awake_and_satisfies_protocol() -> None:
 def test_config_reads_registry_limits_through_common_readers() -> None:
     config = load_config(ENV)
     assert config.dry_run is True  # default
-    assert config.tick_s == 2.0
+    assert config.tick_s == 5.0  # every arm on the TRE fast-loop cadence (2026-10-26)
     assert config.sm_url == "http://sm.test:8000"
     assert config.abort_sleep_path == "urgent"  # a no-drain path: hide, ack, abort + continue
     assert config.scrape_timeout_s == 2.5 and config.decision_stream is True
@@ -132,7 +132,7 @@ def test_missing_idle_ttft_fit_refuses_an_actuating_shell(tmp_path) -> None:
 def test_arms_are_named_as_adaptations(tmp_path) -> None:
     labels = {name: getattr(factory, "label", None) for name, factory in POLICIES.items()}
     assert labels == {"static": "static", "chiron": "Chiron-global", "tokenscale": "TokenScale-colocated",
-                      "preserve": "PreServe-oracle"}
+                      "preserve": "PreServe"}
     from bl_fakes import FakeCluster, FakeRedis, FakeSource, limits, make_config
     from tre_baselines.loop import BaselineShell
     from tre_baselines.policies.chiron import ChironPolicy

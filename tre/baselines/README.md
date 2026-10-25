@@ -4,8 +4,10 @@ The baseline autoscalers of TRE v2 (scaling parts only) as one small service, th
 **baseline shell**. Each arm is an adaptation and is named so in decision records and
 docs: **Chiron-global** (`TRE_BL_POLICY=chiron`; only the global instance loop scales, B
 is static = engine max_num_seqs; the virtual Alg.1 B is a sensitivity row), **TokenScale-colocated** (`tokenscale`; the PD-disaggregated velocity policy
-on colocated P+D replicas), **PreServe-oracle** (`preserve`; Tier-1 is the replayed trace
-plus noise, not mLSTM; `max_tokens` as the length prediction). Every tick it builds a snapshot (service
+on colocated P+D replicas; the paper's cells, no V_P), **PreServe** (`preserve`; the paper's mLSTM
+Tier-1 with v1's paper_past weights, Tier-2 on `max_tokens` plus the paper's Tab. 2 load errors, v1's
+faithful composition; `PreServe-oracle` only as the oracle sensitivity). Every tick (5 s = the TRE fast
+loop, `TRE_BL_TICK_S`) it builds a snapshot (service
 manager `/v2/state`, each awake pod's `/metrics`, the gateway request-event stream
 `tre:v2:bl:req:<model>`, the replay marker `tre:v2:bl:replay_t0`), asks the selected
 policy for a desired replica count per model, clamps it to the registry bounds and sends
@@ -40,7 +42,11 @@ local workspace):
 ```
 tre_baselines/   snapshot.py (policy contract)  sources.py  loop.py  sm_client.py  main.py
                  policies/{chiron,tokenscale,preserve,static}.py   trace_oracle.py
-                 tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  tokenscale_profile.py  preserve_mu.py
+                 policies/preserve_{tier1,anticipator,predictor,load_errors,history}.py
+                 tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  velocity_ladder.py  freeze_params.py
+                          preserve_history.py  tokenscale_profile.py  preserve_mu.py (old procedure)
+weights/         preserve-mlstm-20261024-paper/{code,conv,pooled}-paper.npz (v1 paper_past, REPORT.md)
+requirements-baselines.txt   numpy==1.26.4 (mLSTM forward pass; the image sets *_NUM_THREADS=1)
 examples/        one parameter file per policy (chiron.yaml, tokenscale.yaml, preserve.yaml)
 tests/           unit tests + test_bl_e2e_real_redis.py (fake environment, real Redis)
 ```
@@ -129,29 +135,41 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   (alg1) at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
   (`kv_request_tokens`, engine cache info), recorded as `b_max` / `b_max_src` per decision; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
-- TokenScale-colocated and PreServe-oracle (`tools/tokenscale_profile`, run from `tre/` with
-  `PYTHONPATH=common:deploy:calibration:replayer:loadgen_v1:baselines`; the senders import
-  `tre_replayer`): the hot alt trace has one shape (in ~492, out 400), so the buckets
-  degenerate to one cell (disclose). Exactly one awake replica per model (checked), models in
-  parallel, needs an exclusive window.
-  - TokenScale V_b / V_P (main runs), open loop: `python3 -m tre_baselines.tools.tokenscale_profile
-    --open-loop --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url <chat endpoint URL> --sm-url <SM>
-    --out-dir <dir> --raw-dir <dir>/raw --base-rps <model>=<req/s>,... --prefill-base-rps <model>=<req/s>,...
-    --prefill-rate-factors 0.5,0.7,0.8,0.9,1.0,1.1,1.2 --i-have-user-approval`: velocity at the KNEE of the
-    Poisson ladders = the highest-throughput step whose waiting queue is bounded (least-squares slope of
-    `vllm:num_requests_waiting` over the measured window <= 2 % of the offered req/s). V_b = (in+out) tok/s
-    on the mixed ladder, V_P = prefill tok/s on the out=1 ladder.
-  - Sensitivity "TokenScale-aggressive": the closed-loop maxima (the same command without `--open-loop`:
-    concurrency 1 ... 64, extended while gaining > 5 %, 60 s steps; V_b = peak (in+out) tok/s, V_P = peak
-    prefill tok/s with out=1), shipped as `deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml`.
-  - PreServe mu, open loop: the mixed ladder of the same `--open-loop` run (`--base-rps`;
-    1.0x = calibration rho* x C_s token rate / (in + out)): Poisson rates 0.3 ... 1.3 x,
-    110 s steps, 20 s warm-up; mu = engine tok/s of the highest rate whose requests sent in the
-    measured window meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms (c/b from the
-    registry), with >= 150 of them (~20 min). The closed-loop mu is not used: a constant output
-    length keeps the workers in lockstep (bursts of c prefills), which biased it 3-6x low.
-- PreServe-oracle: `window_s` 30 (rule W <= P/4, W >= 10 x wake_p95, see policy-configmaps.yaml; sensitivity 600 = paper, `sensitivity/preserve-window600.yaml`), `noise_sigma` 0.0772 (sensitivity 0.30).
-  (`tools/preserve_mu` over a calibration capture is a cross-check only.)
+- **2026-10-26 (v1 port, docs/campaign-v2-20261026-plan.md)**: TokenScale cells use the paper's boundaries
+  (input < 256 / < 1024 / else, output < 100 / < 350 / >= 350) with each cell's calibration point = the mean
+  (in, out) of the campaign's replayed requests in it: `tools/tokenscale_buckets --trace-root <set> --traces ...
+  --out <report>`. V_b (peak of full steps, v1 D53 queue-growth criterion, two full steps in a row stop) and
+  PreServe mu (normalized-latency SLO = 3 x isolated NL, every request in a step's window, v1 D58) are measured
+  direct to the pods with `tools/velocity_ladder {ladder|isolated|mu|summarize}` (module docstring). This
+  replaces the knee / single-shape procedure below for the main runs.
+- **Freeze step.** `python3 -m tre_baselines.tools.freeze_params tokenscale --report <buckets report> --profile
+  <ladder profile> --write` and `... preserve --mu <mu.yaml> --write` render the whole policy block of
+  `deploy/baselines/tre/policy-configmaps.yaml` from the calibration outputs (input sha256 in the header);
+  until then the blocks say `calibration: pending` and the policies refuse to start (`--pending` renders that).
+- TokenScale: no V_P (v1 D51); lambda' per cell = true input + the cell's represented output after the
+  simulated 15 % misbucketing, drawn from `hash(seed, model, client request id)` (`x-tre-request-id`, carried by
+  the gateway's bl events as `client_id`; a sidecar reissue keeps it, so a reissue lands in the same cell).
+- PreServe: `window_s` 30 (v1 D18); mu = variant B of `velocity_ladder mu`: cells whose P share lies in the
+  traces' pooled 30 s window share **[p5, p95]** (deviation from v1's [min, max], recorded in the output:
+  v1's range was narrow because its traces were; `--p-share-range minmax` restores it). Tier-1 needs the
+  history before t0 next to the trace (below). The old knee / closed-loop procedure (`tokenscale_profile`,
+  `preserve_mu`) and its sensitivity rows (TokenScale-aggressive / window10, PreServe window600) are retired.
+
+## PreServe history before t0
+
+The mLSTM's first forecast needs the 25 windows before the replay (paper section 5.3; v1 #8). The policy
+reads `history_path`, default `<trace dir>/pre_t0.json` if present, else `<trace dir>/preserve_history.json`
+(format: `policies/preserve_history.py`; a file for another trace / seed, window or fewer than `seq_len`
+windows refuses the policy):
+
+- synthetic traces: the generator's `pre_t0.json` (`tre-pre-t0-v1`, rule in the spec's `pre_t0`);
+- `Real_*`: `python3 -m tre_baselines.tools.preserve_history real --counts <v1 history/Real_*_slice_*_tok70.json>
+  --trace <trace dir>/traces_tre.effective.json --out <dir>/preserve_history.json` (the Azure windows right
+  before the slice x the trace's rate / the slice's rate x the trace's mean lengths);
+- `preserve_history check --trace T [--history H]` loads it as the policy does and prints the last history
+  window next to the trace's first one.
+
+The campaign runner copies the history file next to its copy of the trace, keeping `<trace>/seed<k>/`.
 
 ## Trace volume (PreServe Tier-1)
 
@@ -201,10 +219,6 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   can make that t0 lead the first real send. The replayer should write the marker at its
   first send (not done: `tre/replayer` is outside this line); until then PreServe Tier-1
   windows may start early by the warm-up.
-- **mu window.** `tools/preserve_mu.py` profiles over 30 s windows while Tier-1 plans over
-  600 s windows; a 30 s maximum is biased high relative to what a replica sustains over
-  10 min (fewer replicas planned). Use a 600 s-equivalent window if the capture allows,
-  else disclose.
 - **PreServe map.** Requests enter the look-ahead map at `ft` (prefill done); non-streaming
   requests have no `ft` until their output is complete, so they are not in the map (the
   experiments stream). Requests still in prefill are not in the map either (paper).
@@ -213,11 +227,9 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
 - **T1 schema.** The service manager's structured 409 body and the new `/v2/state` fields
   are provisional (the T1 line is not merged); the shell parses both plain and structured
   refusals (and honours `retry_after_s` when present).
-- **Frozen parameters.** Chiron theta_trace, TokenScale V_b / V_P and PreServe mu were
-  measured on the 20261006 engine and are frozen in `deploy/baselines/tre/policy-configmaps.yaml`
-  (the example files keep placeholders; the policies refuse to start on them); the TokenScale
-  sensitivity row is `deploy/baselines/tre/sensitivity/tokenscale-aggressive.yaml`. PreServe's
-  `trace_path` must name the replayed trace in the trace volume (75/76 cluster: overlay
+- **Frozen parameters.** Chiron theta_trace is frozen in `deploy/baselines/tre/policy-configmaps.yaml`;
+  TokenScale and PreServe are `calibration: pending` until the 2026-10-26 ladder (freeze step above).
+  PreServe's `trace_path` must name the replayed trace in the trace volume (75/76 cluster: overlay
   `deploy/baselines/tre-cluster-75-76`, hostPath).
 - **Stale owner.** The pre-call check leaves the time between the check and the SM
   handling the request; closing it needs the SM to reject a stale owner generation.

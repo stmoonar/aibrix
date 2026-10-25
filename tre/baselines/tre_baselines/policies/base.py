@@ -53,6 +53,17 @@ class Policy(Protocol):
 
 INCOMPLETE = "incomplete"
 
+#: ``calibration: pending`` in a policy ConfigMap: its measured values are not frozen yet.
+CALIBRATION_PENDING = "pending"
+
+
+def refuse_pending(params: Mapping[str, Any], policy: str) -> None:
+    """Fail closed on a ConfigMap whose measured values are not frozen yet (``calibration:
+    pending``): the shell must not start an arm on placeholders."""
+    if str(params.get("calibration", "")).strip().lower() == CALIBRATION_PENDING:
+        raise ValueError(f"{policy} policy cannot start: calibration pending (freeze the measured values first, "
+                         "tools/freeze_params)")
+
 
 def hold_if_incomplete(decision: Decision, awake: int, gaps: Sequence[str]) -> Decision:
     """``decision`` unless it scales down on incomplete evidence: then hold at ``awake``

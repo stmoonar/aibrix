@@ -1,94 +1,100 @@
-"""PreServe-oracle baseline, scaling part only (§4.1 Alg.2, §4.3.1, §4.3.2).
+"""PreServe baseline, scaling part only (§4.1 Alg.2, §4.3.1, §4.3.2), v1 "faithful" composition.
 
-Not reproduced: the mLSTM workload forecaster (Tier-1 uses the replayed trace, see
-:mod:`preserve_tier1`), the DistilBERT response-length predictor (Tier-2 uses the request's
-``max_tokens`` as its predicted output length) and the load-aware router.
+Decision 2026-10-26 (``docs/campaign-v2-20261026-plan.md`` #5): Tier-1 is the paper's mLSTM
+forecaster, the rest follows TRE v1's faithful PreServe (``tre_code`` dev ``ceb88b4``,
+``tre_preserve/policy.py`` ``_compose_faithful``; v1 D54-D58, D64, D65). Not reproduced: the
+DistilBERT response-length predictor (Tier-2 uses the request's ``max_tokens`` plus the paper's
+Tab. 2 error, "PreServe w/ load errors", :mod:`preserve_load_errors`) and the load-aware router.
 
-Tier-1, once per window of ``window_s`` (paper: 10 min), on the first tick whose
-``(replay t0, window index)`` differs from the last one handled (window index
-``floor(((now - t0) / 1000 + lead_s) / window_s)``; a new replay marker restarts at window 0
-without a shell restart):
-``N = ceil(max(P/(mu_p W), D/(mu_d W), (P+D)/(mu_t W)))`` -> target ``N``.
+Composition (v1 faithful)::
 
-Tier-2, every tick, per awake pod: the load-look-ahead map (:mod:`preserve_anticipator`)
-fed by the gateway request events. Of it the scaler reads ``U[0:l]`` only:
+    desired = clamp(max(N_T1, N_T2), min_replicas, max_replicas)
 
-* a pod is *overloaded* when more than ``overload_frac`` of ``U[0:l]`` is above ``kv_high``
-  -> one extra instance per overloaded pod ("one potentially overloaded instance, one
-  additional instance"). A pod is credited once per overload episode (it is credited again
-  only after it left overload), so a persisting overload does not add an instance every
-  tick; ours, the paper does not say how often the rule is evaluated.
-* Tier-2 never isolates below the current window's Tier-1 ``N`` (decision 2026-10-06; a
-  state gate: the window's forecast is evidence too). It may add above ``N`` and isolate
-  back down to ``N``; ``tier2_below_t1`` counts the windows in which Tier-2 wanted to go
-  below ``N`` (once per window, reported).
-* scale-down, at most once per Tier-1 window (paper), when every pod's
-  ``max U[0:l] < T_f``: the paper isolates ``N_c - sum_p max(U'_p) / T_f`` instances, i.e.
-  keeps ``sum_p max(U'_p) / T_f`` of them: the load packed onto instances each at ``T_f``.
-  We keep ``ceil`` of that (isolate the floor), at least 1, and only act when it is below
-  ``N_c = awake``. The map must be complete and agree with the engines (ours; no timer):
-  no evidence gap (:func:`~tre_baselines.snapshot.evidence_gaps` with events: every pod
-  scraped, gauges present, every request in flight known from the stream since the last
-  gap) and, per pod, ``|U[0] - vllm:kv_cache_usage_perc| <= kv_agree_tol``; otherwise the
-  scale-down waits (``down: incomplete``) without using up the window's one scale-down.
-  The isolated instances are put to sleep through the shared transparent-sleep path
-  (abort + sidecar continuation), not drained: that cost is reported, not hidden.
+* **N_T1** (Tier-1), set at the first tick of each window ``i`` of ``window_s`` (30 s, v1 D18)
+  from the replay start ``t0``: ``N = ceil(max(P/(mu_p W), D/(mu_d W), (P+D)/(mu_t W)))`` with
+  the forecast ``P_hat``, ``D_hat`` (:class:`preserve_tier1.MlstmTier1`; the history before
+  ``t0`` is the trace's history file, :mod:`preserve_history`). None before ``t0`` or without a
+  replay; after the trace and on a forecast error the last value is kept. Tier-1 reads no
+  Tier-2 signal, so **an evidence gap never holds it** (v1 D56 / D64); the shell's
+  unknown-is-not-idle backstop is off for this policy (``evidence_backstop = False``), the
+  policy gates Tier-2 itself.
+* **N_T2** (Tier-2), its own count across windows (upstream ``num_inst_lookahead``), starting
+  at the awake count. A window start resets it to ``min_replicas`` and forgets the credited
+  overload episodes (``t2_reset_at_window``, v1 D54 #2: the window starts at ``N_{i+1}``). This
+  reset happens even while Tier-2 is frozen (as v1 ``_compose_faithful``): ``frozen`` means
+  Tier-2 made no evidence-driven change, not that ``N_T2`` stayed constant.
+  Every tick, per awake pod, the load-look-ahead map ``U`` (:mod:`preserve_anticipator`):
 
-Composition: on a window start Tier-1 sets the target and Tier-2 may only add to it in the
-same tick; inside a window only Tier-2 changes it; otherwise the target is held. Any target
-below ``awake`` is held at ``awake`` while the evidence is incomplete (reason
-``incomplete``; the target itself is kept and applies once the evidence is complete).
+  - **overload** (v1 D55, sliding look-ahead): a pod is overloaded when, for any start offset
+    ``t`` in ``[0, H]``, ``H = ceil(tick_s / TPOT_pod)``, more than ``overload_frac`` of the
+    paper window ``U[t, t + l)`` is above ``kv_high`` (a checker that runs every iteration
+    between two ticks). A new overload episode on ``k`` pods: ``N_T2 = max(N_T1, N_T2) + k``
+    (one extra instance per potentially overloaded instance, on the current count);
+  - **underload**, at most once per window: when every pod's ``max U[0:l] < T_f``,
+    ``N_T2 = max(1, ceil(sum max U / T_f))`` if that is below ``N_T2`` (the load packed onto
+    instances each at ``T_f``; the isolated ones sleep through the shared abort path);
+  - **incomplete evidence holds Tier-2 in both directions** (``frozen``): any gap of
+    :func:`~tre_baselines.snapshot.evidence_gaps` (event loss, unscraped pod, missing gauges,
+    stale scrape) or a pod without a KV capacity. ``frozen`` (every tick, also under
+    ``inputs``) and ``t2_hold`` (the reasons) are logged; the run's frozen-tick share is a
+    validity check. The map / engine KV disagreement is logged only (v1 #7, no gate).
 
-Iterations vs wall clock (ours; the paper is iteration-based): a pod's head advances
-``dt / TPOT_pod`` iterations, fractional part carried, with ``TPOT_pod`` the mean
-inter-token latency between the pod's last two scrapes (``d itl_sum / d itl_count``) or the
-model's TPOT SLO when there is no sample. Each event first advances its pod to the event's
-Redis time, so a prefill that finished early in the tick lands where it belongs; the tick
-then walks each head to ``max(scrape time, last event time)`` (an event written between the
-scrape and the stream read is not "out of order").
+Iterations vs wall clock (ours, as v1 and v2 before): a pod's head advances ``dt / TPOT_pod``
+iterations, fraction carried; ``TPOT_pod`` = mean inter-token latency between the pod's last two
+scrapes, else the model's TPOT SLO. Each event first walks its pod to the event's Redis time.
 
-Output length (ours): the predicted output is the request's ``max_tokens``, which vLLM
-enforces, so by default (``out_len_is_upper_bound: true``) there is no virtual extension.
-A request leaves the map only on its ``done`` (or when its pod is gone, or when the engine
-reports nothing in flight at all, which is a ``done`` for everything there): when the
-estimated head passes ``D`` first, the request keeps its full size ``(P + D) / M`` until
-then (anomaly ``overdue``). The paper's 0.2 * D extension (``ext_frac``) exists because its
-length predictor can under-estimate; it is used only with ``out_len_is_upper_bound: false``.
-Non-streaming requests have no ``ft`` before their output is complete, so they are not in
-the map (the experiments stream).
+A request enters the map at its first token (``ft``) with ``P`` = ``in_tokens`` and ``D_hat`` =
+the predicted output: ``clip(max_tokens + err, 1, max_model_len - P)`` with load errors
+(``load_error_mode: paper_tab2``, the paper's RQ2 headline arm; the draw is a function of
+``(seed, model, client request id)``), then the map runs the paper's refinement (early end on
+``done``, virtual extension ``ext_frac`` x ``D_hat`` while running past it); without load
+errors ``D_hat`` = ``max_tokens``, a hard cap (no extension, overdue requests keep their size).
+A request leaves the map on its ``done`` (or when its pod is gone, or the engine reports nothing
+in flight). Non-streaming requests have no ``ft`` before they end, so they are not in the map
+(the experiments stream).
 
-Params (``config.policy_params``, example in ``examples/preserve.yaml``):
+Params (``config.policy_params``, example ``examples/preserve.yaml``):
 
-====================  ====================  ===================================================
-key                   default               origin
-====================  ====================  ===================================================
-trace_path            (required)            ours: the trace the campaign replays (read once)
-trace_seed            0                     ours: fallback of the replay's ``--seed``; the marker's
-                                            ``seed`` (``snap.replay.seed``) wins (segment traces)
-trace_schedule        poisson               ours: what ``tre_replayer.run_trace`` sends
-trace_match_parts     2                     ours: replay marker must end in the same N parts
-window_s              600                   paper (10 min window)
-lead_s                0                     ours: fire Tier-1 this early (s); wake is seconds
-tier1                 oracle_noisy          ours (D8): oracle_noisy | oracle | last_window
-noise_sigma           ~0.0772               ours: lognormal sigma, mean APE 6.17 % (Table 1)
-noise_seed            config.seed           ours
-mu                    (required)            paper Alg.1 profile; ``tools/preserve_mu.py``
-max_output_len        trace max max_tokens  paper: "maximum output tokens" (e.g. 4096);
-                      per model, else 4096  int or {model: int}
-map_factor            1.2                   ours: ring length = ceil(max_output_len * 1.2)
-lookahead_iters       100                   paper (l)
-kv_high               0.95                  paper
-overload_frac         0.10                  paper
-t_f                   0.30                  paper (T_f)
-ext_frac              0.2                   paper (virtual extension); only with
-                                            ``out_len_is_upper_bound: false``
-out_len_is_upper_bound true                 ours: max_tokens is a hard cap -> no extension
-kv_capacity_tokens    {}                    ours: M per model when the pod lacks cache_config
-kv_agree_tol          0.15                  ours: scale-down needs |U[0] - engine KV| <= this
-hold_mode             target                ours: target (keep the last target) | awake
-req_ttl_s             1800                  ours: forget arr/done bookkeeping older than this
-                                            (never a request in the map)
-====================  ====================  ===================================================
+======================  =====================  ================================================
+key                     default                origin
+======================  =====================  ================================================
+calibration             (none)                 ``pending``: refuse (mu not frozen)
+trace_path              (required)             ours: the replayed trace (window count, max lengths)
+trace_seed              0                      ours: fallback of the replay's ``--seed``
+trace_schedule          poisson                ours: what ``tre_replayer.run_trace`` sends
+trace_match_parts       2                      ours: replay marker must end in the same N parts
+trace_name              path part -3           the trace's name (``<name>/seed<k>/<file>``):
+                                               picks the predictor set
+window_s                30                     v1 D18 (paper 600 s; our traces are 12 min)
+lead_s                  0                      ours: fire Tier-1 this early (s)
+tier1                   mlstm                  paper; ``oracle_noisy`` / ``oracle`` /
+                                               ``last_window`` = sensitivity (D8)
+predictors              (required, mlstm)      ``{set: {path, sha256}}`` (v1 paper_past weights)
+predictor_rules         Real_code->code,       ``[[trace name prefix, set]]``; else ``pooled``
+                        Real_conv->conv
+seq_len                 25                     paper (the weights' own seq_len must match)
+history_path            <trace dir>/           the history before t0 (:mod:`preserve_history`):
+                        pre_t0.json, else      the generator's (synthetic) / the Azure windows
+                        preserve_history.json  before the slice (Real_*)
+noise_sigma, noise_seed                        oracle_noisy only (sensitivity)
+mu                      (required)             paper Alg.1 (``tools/velocity_ladder mu``)
+load_error_mode         paper_tab2             paper RQ2 "w/ load errors" (Tab. 2) | none
+load_error_seed         config.seed            ours
+max_model_len           131072                 engine context (upper clip of D_hat)
+max_output_len          trace max max_tokens   map ring base length; int or {model: int}
+map_factor              1.2                    ours: ring = ceil(max_output_len x 1.2), >= H + l
+lookahead_iters         100                    paper (l)
+kv_high                 0.95                   paper
+overload_frac           0.10                   paper
+t_f                     0.30                   paper (T_f)
+out_len_is_upper_bound  not load errors        ours: true = ``max_tokens`` is a hard cap (no
+                                               extension); must be false with load errors
+ext_frac                0.2                    paper (virtual extension, with load errors)
+t2_reset_at_window      true                   v1 D54 #2
+kv_capacity_tokens      {}                     ours: M per model when the pod lacks cache_config
+kv_agree_tol            0.15                   ours: logged only (``kv_disagree``)
+req_ttl_s               1800                   ours: forget arr/done bookkeeping older than this
+======================  =====================  ================================================
 """
 from __future__ import annotations
 
@@ -96,18 +102,24 @@ import logging
 import math
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Hashable, Mapping, Optional
 
 from tre_baselines import trace_oracle
+from tre_baselines.policies import preserve_history
+from tre_baselines.policies import preserve_load_errors as load_errors
 from tre_baselines.policies import preserve_tier1 as tier1
-from tre_baselines.policies.base import Decision, hold_if_incomplete
+from tre_baselines.policies.base import Decision, refuse_pending
 from tre_baselines.policies.preserve_anticipator import LookaheadMap
 from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, RequestEvent, evidence_gaps
 
 LOG = logging.getLogger(__name__)
 
 DEFAULT_MAX_OUTPUT_LEN = 4096
-HOLD_MODES = ("target", "awake")
+DEFAULT_PREDICTOR_RULES = (("Real_code", "code"), ("Real_conv", "conv"))
+DEFAULT_PREDICTOR_SET = "pooled"
+#: tre/baselines (in the image /app/tre/baselines): relative predictor paths resolve here.
+BASELINES_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -127,6 +139,8 @@ class _ArrInfo:
     in_tokens: Optional[int]
     max_tokens: Optional[int]
     ts_ms: int
+    draw_key: str = ""
+    reissue: bool = False
 
 
 @dataclass
@@ -140,16 +154,19 @@ class _ModelState:
     pending_ft: dict[str, dict[tuple[str, Optional[str]], tuple["_ArrInfo", int]]] = field(default_factory=dict)
     #: active request key -> pod holding it.
     active: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
-    target: Optional[int] = None
     #: (replay t0_ms, window index) of the last Tier-1 firing.
     t1_window: Optional[tuple[int, int]] = None
-    #: Tier-1 N of the current window (None: Tier-1 inactive or no estimate). Tier-2 may add
-    #: above it and isolate back down to it, never below (decision 2026-10-06).
-    t1_n: Optional[int] = None
-    #: Down key of the last window whose clamp at t1_n was counted (once per window).
-    below_t1_key: Optional[Hashable] = None
+    n_t1: Optional[int] = None
+    n_t2: Optional[int] = None
     credited: set[str] = field(default_factory=set)
-    last_down_key: Optional[Hashable] = None
+    #: window key of the last Tier-2 underload change (once per window)
+    t2_down_key: Optional[Hashable] = None
+    t2_hold_ticks: int = 0
+    ticks: int = 0
+    #: mLSTM Tier-1 of the current replay (t0_ms, object)
+    mlstm: Optional[tuple[int, tier1.MlstmTier1]] = None
+    err: load_errors.ErrorStats = field(default_factory=load_errors.ErrorStats)
+    err_rows: list = field(default_factory=list)
 
 
 def _r(x: Optional[float], nd: int = 4) -> Optional[float]:
@@ -164,23 +181,50 @@ def _per_model(raw: Any, cast=float) -> dict[str, Any]:
     return {"*": cast(raw)}
 
 
+def predictor_set_for(trace: str, rules: Any, default: str = DEFAULT_PREDICTOR_SET) -> str:
+    """Real_code* -> code, Real_conv* -> conv, anything else -> pooled (v1 ``tier1.trace_sets``)."""
+    for prefix, name in rules:
+        if str(trace).startswith(str(prefix)):
+            return str(name)
+    return default
+
+
+def trace_name_of(trace_path: str, part: int = 3) -> str:
+    """The trace name in ``.../<name>/seed<k>/<file>`` (``part`` = position from the end)."""
+    pieces = [p for p in str(trace_path).replace("\\", "/").split("/") if p]
+    return pieces[-part] if len(pieces) >= part else (pieces[0] if pieces else "")
+
+
 class PreServePolicy:
     name = "preserve"
-    #: Arm name in decision records and docs (Tier-1 = trace oracle + noise, not mLSTM).
-    label = "PreServe-oracle"
+    #: Arm name in decision records and docs.
+    label = "PreServe"
     needs_events = True
+    #: The policy gates Tier-2 itself and never holds Tier-1 (v1 D56 / D64): no shell backstop.
+    evidence_backstop = False
 
-    def __init__(self, config: Any = None, *, oracle: Optional[trace_oracle.TraceOracle] = None) -> None:
+    def __init__(self, config: Any = None, *, oracle: Optional[trace_oracle.TraceOracle] = None,
+                 predictors: Optional[Mapping[str, Any]] = None,
+                 history: Optional[Mapping[str, Any]] = None) -> None:
+        """``predictors`` ({"prompt", "response"}) and ``history`` ({model: rows}) are for tests:
+        they replace the files of the mLSTM Tier-1."""
         params = dict(getattr(config, "policy_params", None) or {})
+        refuse_pending(params, self.name)
         models = dict(getattr(config, "models", None) or {})
-        self.seed = int(params.get("noise_seed", getattr(config, "seed", 0) or 0))
-        self.window_s = float(params.get("window_s", 600.0))
+        cfg_seed = int(getattr(config, "seed", 0) or 0)
+        self.seed = int(params.get("noise_seed", cfg_seed))
+        self.window_s = float(params.get("window_s", 30.0))
         if self.window_s <= 0:
             raise ValueError("preserve: window_s must be > 0")
         self.lead_s = float(params.get("lead_s", 0.0))
-        self.mode = str(params.get("tier1", "oracle_noisy"))
+        if self.lead_s != 0.0 and str(params.get("tier1", "mlstm")) == "mlstm":
+            raise ValueError("preserve: lead_s must be 0 with tier1 mlstm (an early window start would close "
+                             "the observed window before it ends)")
+        self.mode = str(params.get("tier1", "mlstm"))
         if self.mode not in tier1.TIER1_MODES:
             raise ValueError(f"preserve: tier1 must be one of {tier1.TIER1_MODES}")
+        if self.mode != "mlstm":
+            self.label = "PreServe-oracle"
         self.sigma = float(params.get("noise_sigma", tier1.DEFAULT_NOISE_SIGMA))
         if self.sigma < 0:
             raise ValueError("preserve: noise_sigma must be >= 0")
@@ -189,16 +233,64 @@ class PreServePolicy:
         self._oracle_injected = oracle is not None
         self._trace_schedule = str(params.get("trace_schedule", trace_oracle.SCHEDULE_POISSON))
         self._oracle_seed = int(params.get("trace_seed", 0))
+        trace_path = params.get("trace_path")
         if oracle is None:
-            path = params.get("trace_path")
-            if not path:
-                raise ValueError("preserve: params.trace_path is required (Tier-1 reads the replayed trace)")
+            if not trace_path:
+                raise ValueError("preserve: params.trace_path is required (the replayed trace)")
             oracle = trace_oracle.load_oracle(
-                str(path), window_s=self.window_s, seed=self._oracle_seed, schedule=self._trace_schedule,
+                str(trace_path), window_s=self.window_s, seed=self._oracle_seed, schedule=self._trace_schedule,
             )
         elif oracle.window_s != self.window_s:
             raise ValueError("preserve: oracle window_s differs from params.window_s")
         self.oracle = oracle
+        self.trace_name = str(params.get("trace_name") or trace_name_of(str(trace_path or oracle.path)))
+
+        # Tier-1 mLSTM: weights (sha256 checked) and the history before t0, at start (fail closed)
+        self.seq_len = int(params.get("seq_len", 25))
+        self.predictor_set: Optional[str] = None
+        self._predictors: Optional[Mapping[str, Any]] = None
+        self._history: dict[str, list] = {}
+        self.history_info: dict[str, Any] = {}
+        if self.mode == "mlstm":
+            rules = params.get("predictor_rules") or DEFAULT_PREDICTOR_RULES
+            self.predictor_set = predictor_set_for(self.trace_name, rules)
+            if predictors is not None:
+                self._predictors = predictors
+            else:
+                from tre_baselines.policies import preserve_predictor  # numpy: only for this mode
+
+                spec = (params.get("predictors") or {}).get(self.predictor_set)
+                if not isinstance(spec, Mapping) or not spec.get("path") or not spec.get("sha256"):
+                    raise ValueError(f"preserve: predictors.{self.predictor_set} needs path and sha256")
+                wpath = Path(str(spec["path"]))
+                if not wpath.is_absolute():  # shipped weights: relative to tre/baselines
+                    wpath = BASELINES_ROOT / wpath
+                self._predictors = preserve_predictor.load_predictors(str(wpath), str(spec["sha256"]))
+                for k, pr in self._predictors.items():
+                    if pr.seq_len != self.seq_len:
+                        raise ValueError(f"preserve: predictor {k} seq_len {pr.seq_len} != seq_len {self.seq_len}")
+            if history is not None:
+                self._history = {m: list(v) for m, v in history.items()}
+                self.history_info = {"path": None, "injected": True}
+            else:
+                tpath = str(trace_path or oracle.path)
+                hpath = str(params.get("history_path") or preserve_history.default_path(tpath))
+                self._history, self.history_info = preserve_history.load(
+                    hpath, window_s=self.window_s, models=sorted(self.mu), seq_len=self.seq_len,
+                    trace=self.trace_name, seed=preserve_history.seed_of(tpath))
+            missing = sorted(m for m in self.mu if len(self._history.get(m, ())) < self.seq_len)
+            if missing:
+                raise ValueError(f"preserve: history lacks {self.seq_len} windows for {missing}")
+
+        # load errors (paper RQ2 "PreServe w/ load errors")
+        self.load_error_mode = str(params.get("load_error_mode", "paper_tab2"))
+        self.errors = load_errors.make(self.load_error_mode, int(params.get("load_error_seed", cfg_seed)))
+        self.max_model_len = int(params.get("max_model_len", 131072))
+        self.out_len_is_upper_bound = bool(params.get("out_len_is_upper_bound", self.errors is None))
+        if self.errors is not None and self.out_len_is_upper_bound:
+            raise ValueError("preserve: with load errors D_hat is a prediction, not an upper bound "
+                             "(out_len_is_upper_bound must be false)")
+
         self.max_output_len = _per_model(params.get("max_output_len"), int)
         self.map_factor = float(params.get("map_factor", 1.2))
         self.l = int(params.get("lookahead_iters", 100))
@@ -206,37 +298,40 @@ class PreServePolicy:
         self.overload_frac = float(params.get("overload_frac", 0.10))
         self.t_f = float(params.get("t_f", 0.30))
         self.ext_frac = float(params.get("ext_frac", 0.2))
-        self.out_len_is_upper_bound = bool(params.get("out_len_is_upper_bound", True))
+        self.t2_reset_at_window = bool(params.get("t2_reset_at_window", True))
         self.kv_agree_tol = float(params.get("kv_agree_tol", 0.15))
         if not 0.0 < self.kv_agree_tol <= 1.0:
             raise ValueError("preserve: kv_agree_tol must be in (0, 1]")
         if self.l < 1 or self.map_factor < 1.0 or not 0 < self.t_f <= 1 or self.ext_frac <= 0:
             raise ValueError("preserve: need lookahead_iters >= 1, map_factor >= 1, 0 < t_f <= 1, ext_frac > 0")
         self.kv_capacity = _per_model(params.get("kv_capacity_tokens"), float)
-        self.hold_mode = str(params.get("hold_mode", "target"))
-        if self.hold_mode not in HOLD_MODES:
-            raise ValueError(f"preserve: hold_mode must be one of {HOLD_MODES}")
         self.req_ttl_ms = int(float(params.get("req_ttl_s", 1800.0)) * 1000)
         self._models: dict[str, _ModelState] = {}
         #: Cumulative anomaly counters (per model), for tests and the run summary.
         self.anomalies: dict[str, Counter] = {}
 
     def counters(self) -> Mapping[str, Mapping[str, int]]:
-        """Cumulative anomaly counters per model (ft_without_arr, unknown_req, unknown_pod,
-        tier2_below_t1, ...), reported by the shell for per-run validity."""
-        return {m: dict(c) for m, c in self.anomalies.items()}
+        """Cumulative counters per model (anomalies, tier2 holds, ...), reported by the shell."""
+        out = {m: dict(c) for m, c in self.anomalies.items()}
+        for m, st in self._models.items():
+            out.setdefault(m, {}).update(t2_hold_ticks=st.t2_hold_ticks, ticks=st.ticks)
+        return out
 
     # --------------------------------------------------------------- helpers
 
-    def map_length(self, model: str) -> int:
-        mol = self.max_output_len.get(model, self.max_output_len.get("*"))
-        if mol is None:
-            mol = self.oracle.max_tokens_max.get(model) or DEFAULT_MAX_OUTPUT_LEN
-        return max(1, int(math.ceil(int(mol) * self.map_factor)))
-
-    def _default_D(self, model: str) -> int:
+    def _mol(self, model: str) -> int:
         mol = self.max_output_len.get(model, self.max_output_len.get("*"))
         return int(mol if mol is not None else (self.oracle.max_tokens_max.get(model) or DEFAULT_MAX_OUTPUT_LEN))
+
+    def horizon(self, tpot_s: float, tick_s: float) -> int:
+        """H: iterations a pod runs until the next tick (the continuous checker's start offsets)."""
+        return int(math.ceil(float(tick_s) / float(tpot_s) - 1e-9))
+
+    def map_length(self, model: str, tpot_s: float = 0.0, tick_s: float = 0.0) -> int:
+        n = max(self.l, int(math.ceil(self._mol(model) * self.map_factor)))
+        if tpot_s > 0 and tick_s > 0:
+            n = max(n, self.horizon(tpot_s, tick_s) + self.l)
+        return n
 
     def _capacity(self, model: str, pod: PodSnapshot) -> Optional[float]:
         if pod.num_gpu_blocks and pod.block_size and pod.num_gpu_blocks > 0 and pod.block_size > 0:
@@ -260,9 +355,35 @@ class PreServePolicy:
         if overdue:  # the estimate ran ahead of the request: it stays (floor) until done
             anom["overdue"] += len(overdue)
 
+    def overload_scan(self, ps: _PodState, tick_s: float) -> tuple[float, int, Optional[int], float, list[float]]:
+        """v1 D55: emulate a checker that runs every iteration between two ticks. For every start
+        offset t in [0, H] the paper window U[t, t + l) is overloaded when more than
+        ``overload_frac`` of it is above ``kv_high``; the pod is when any t is. The map holds only
+        requests already started, so a window ahead is a lower bound of the load then (without
+        load errors). Returns (fraction at t = 0, H, first overloaded t or None, the largest
+        fraction, U[0, l))."""
+        l = self.l
+        H = self.horizon(ps.tpot_s, tick_s)
+        need = H + l
+        if need > ps.amap.length:
+            ps.amap.grow(need)
+        w = ps.amap.window(need)
+        acc = [0]
+        for u in w:
+            acc.append(acc[-1] + (1 if u > self.kv_high else 0))
+        frac0 = acc[l] / float(l)
+        t_star: Optional[int] = None
+        best = 0.0
+        for t in range(H + 1):
+            f = (acc[t + l] - acc[t]) / float(l)
+            best = max(best, f)
+            if t_star is None and f > self.overload_frac:
+                t_star = t
+        return frac0, H, t_star, best, w[:l]
+
     # ------------------------------------------------------------- Tier-2 feed
 
-    def _sync_pods(self, ms: ModelSnapshot, st: _ModelState, anom: Counter, skipped: dict) -> None:
+    def _sync_pods(self, ms: ModelSnapshot, st: _ModelState, anom: Counter, skipped: dict, tick_s: float) -> None:
         present = {p.pod: p for p in ms.pods}
         keep = set(present) | set(ms.unscraped)
         for name in [n for n in st.pods if n not in keep]:
@@ -279,7 +400,7 @@ class PreServePolicy:
                 if M is None:
                     skipped[name] = "no_kv_capacity"
                     continue
-                amap = LookaheadMap(self.map_length(ms.model), ext_frac=self.ext_frac,
+                amap = LookaheadMap(self.map_length(ms.model, fallback, tick_s), ext_frac=self.ext_frac,
                                     out_len_is_upper_bound=self.out_len_is_upper_bound)
                 ps = _PodState(amap=amap, M=M)
                 st.pods[name] = ps
@@ -305,10 +426,15 @@ class PreServePolicy:
         hits = [k for k in st.active if k[0] == req_id and (pod is None or k[1] is None)]
         return hits[0] if len(hits) == 1 else None
 
-    def _on_event(self, ms: ModelSnapshot, st: _ModelState, e: RequestEvent, anom: Counter) -> None:
+    def _on_event(self, ms: ModelSnapshot, st: _ModelState, e: RequestEvent, anom: Counter,
+                  t1m: Optional[tier1.MlstmTier1]) -> None:
         key = (e.req_id, e.pod)
         if e.kind == "arr":
-            st.arr[key] = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms))
+            st.arr[key] = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms), e.draw_key, e.reissue != "none")
+            if not e.client_id:
+                anom["no_client_id"] += 1
+            if t1m is not None and e.reissue == "none":  # Tier-1 counts new demand only
+                t1m.observe_arrival(int(e.ts_ms), e.in_tokens, e.max_tokens)
             return
         if e.kind == "ft":
             if key in st.tombstones or (e.req_id, None) in st.tombstones:
@@ -319,7 +445,7 @@ class PreServePolicy:
             info = st.arr.pop(key, None) or st.arr.pop((e.req_id, None), None)
             if info is None:
                 anom["ft_without_arr"] += 1
-                info = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms))
+                info = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms), e.draw_key, e.reissue != "none")
             pod = e.pod
             if not pod:
                 anom["unknown_pod"] += 1
@@ -363,14 +489,20 @@ class PreServePolicy:
         D = info.max_tokens
         if D is None or D <= 0:
             anom["missing_max_tokens"] += 1
-            D = self._default_D(ms.model)
+            D = self._mol(ms.model)
+        true_d = int(D)
+        if self.errors is not None and info.max_tokens:
+            D = self.errors.predict(ms.model, info.draw_key or key[0], true_d, int(P), self.max_model_len)
+            if not info.reissue:  # the realised error of new demand (a reissue repeats its original's)
+                st.err.add(true_d, int(D))
+                st.err_rows.append([info.draw_key or key[0], true_d, int(D)])
         if key in st.active:
             anom["dup_ft"] += 1
             old_pod = st.active.pop(key)
             if old_pod in st.pods:
                 st.pods[old_pod].amap.remove(key)
         self._advance_to(st, ps, int(ts_ms), anom)
-        ps.amap.add(key, int(P), int(D), ps.M, ts_ms=int(ts_ms))
+        ps.amap.add(key, int(P), int(D), ps.M, ts_ms=int(ts_ms), max_tokens=true_d)
         st.active[key] = pod
 
     def _apply_buffered(self, ms: ModelSnapshot, st: _ModelState, anom: Counter) -> None:
@@ -411,7 +543,7 @@ class PreServePolicy:
 
     # ---------------------------------------------------------------- Tier-1
 
-    def _tier1(self, snap: ClusterSnapshot, ms: ModelSnapshot, st: _ModelState):
+    def _tier1(self, snap: ClusterSnapshot):
         """(window index or None, inactive reason or None)."""
         if snap.replay is None:
             return None, "tier1_no_replay"
@@ -436,7 +568,25 @@ class PreServePolicy:
             return None, "tier1_after_trace"
         return idx, None
 
-    def _tier1_n(self, model: str, idx: int) -> tuple[Optional[int], dict]:
+    def _mlstm_for(self, snap: ClusterSnapshot, model: str, st: _ModelState) -> Optional[tier1.MlstmTier1]:
+        """The mLSTM Tier-1 of the current replay (a new ``t0`` starts a fresh history)."""
+        if self.mode != "mlstm" or snap.replay is None or model not in self.mu:
+            return None
+        if not self.oracle.matches(snap.replay, self.match_parts):
+            return None
+        t0 = int(snap.replay.t0_ms)
+        if st.mlstm is None or st.mlstm[0] != t0:
+            st.mlstm = (t0, tier1.MlstmTier1(model=model, t0_ms=t0, window_s=self.window_s,
+                                             n_windows=self.oracle.n_windows, predictors=self._predictors,
+                                             mu=self.mu[model], seq_len=self.seq_len,
+                                             history=self._history[model]))
+        return st.mlstm[1]
+
+    def _tier1_n(self, model: str, idx: int, t1m: Optional[tier1.MlstmTier1]) -> tuple[Optional[int], dict]:
+        if self.mode == "mlstm":
+            if t1m is None:
+                return None, {"window": idx, "mode": "mlstm", "error": "no_mlstm"}
+            return t1m.decide(idx)
         true = self.oracle.window(model, idx)
         prev = None
         if idx > 0:
@@ -466,14 +616,18 @@ class PreServePolicy:
         anom: Counter = Counter()
         awake = int(ms.awake)
         if ms.model not in self.mu:
-            return Decision(desired=awake, reason="no_mu", inputs={"awake": awake})
+            return Decision(desired=awake, reason="no_mu", inputs={"awake": awake, "frozen": False})
+        st.ticks += 1
+        st.err_rows = []
+        tick_s = float(snap.tick_s)
+        t1m = self._mlstm_for(snap, ms.model, st)
 
         # Tier-2 feed: pods, events, then walk every head to its scrape instant.
         skipped: dict[str, str] = {}
-        self._sync_pods(ms, st, anom, skipped)
+        self._sync_pods(ms, st, anom, skipped, tick_s)
         self._apply_buffered(ms, st, anom)
         for e in ms.events:
-            self._on_event(ms, st, e, anom)
+            self._on_event(ms, st, e, anom, t1m)
         for pod in ms.pods:
             ps = st.pods.get(pod.pod)
             if ps is not None:
@@ -486,8 +640,12 @@ class PreServePolicy:
             if ps is not None:
                 self._advance_to(st, ps, max(int(snap.now_ms), ps.last_ms or 0), anom)
         self._expire(st, int(snap.now_ms), anom)
+        gaps = list(evidence_gaps(ms, int(snap.now_ms), tick_s, events=True))
+        lossy = sorted(g for g in gaps if g in ("no_event_history", "event_gap"))
+        if t1m is not None and lossy:
+            t1m.flag(t1m.index(int(snap.now_ms)), "+".join(lossy))
 
-        # Tier-2 read: U[0:l] of each evaluated pod.
+        # Tier-2 read
         t2: dict[str, dict] = {}
         overloaded: list[str] = []
         max_us: list[float] = []
@@ -496,100 +654,96 @@ class PreServePolicy:
             ps = st.pods.get(pod.pod)
             if ps is None:
                 continue
-            w = ps.amap.window(self.l)
-            frac = sum(1 for u in w if u > self.kv_high) / float(self.l)
-            max_u = max(w) if w else 0.0
-            ps.overloaded = frac > self.overload_frac
+            frac, H, t_star, frac_max, w = self.overload_scan(ps, tick_s)
+            ps.overloaded = t_star is not None
+            max_u = max(w) if w else 0.0  # underload: the window at now (ahead lacks future arrivals)
             if ps.overloaded:
                 overloaded.append(pod.pod)
             max_us.append(max_u)
             u0 = ps.amap.at(0)
-            t2[pod.pod] = {"overload_frac": _r(frac, 3), "maxU": _r(max_u), "U0": _r(u0),
-                           "kv": _r(pod.kv_usage), "tpot": ps.tpot_src}
-            # The map must agree with what the engine holds before it may justify a
-            # scale-down (a map missing requests reads low).
+            t2[pod.pod] = {"overload_frac": _r(frac, 3), "maxU": _r(max_u), "U0": _r(u0), "kv": _r(pod.kv_usage),
+                           "reqs": len(ps.amap.requests), "tpot": _r(ps.tpot_s, 4), "tpot_src": ps.tpot_src,
+                           "H": H, "t_star": t_star, "frac_max": _r(frac_max, 3), "ring": ps.amap.length}
             if pod.kv_usage is None or abs(u0 - pod.kv_usage) > self.kv_agree_tol:
-                kv_disagree[pod.pod] = [_r(u0), _r(pod.kv_usage)]
-        gaps = evidence_gaps(ms, int(snap.now_ms), snap.tick_s, events=True)
+                kv_disagree[pod.pod] = [_r(u0), _r(pod.kv_usage)]  # logged only (v1 #7)
         for name in list(st.credited):
             ps = st.pods.get(name)
             if ps is None or not ps.overloaded:
                 st.credited.discard(name)  # the episode ended: may be credited again
 
-        idx, t1_off = self._tier1(snap, ms, st)
         lo, hi = int(ms.min_replicas), int(ms.max_replicas)
 
         def clamp(n: int) -> int:
-            return max(lo, min(hi, n)) if hi >= lo else n
+            return max(lo, min(hi, int(n))) if hi >= lo else int(n)
 
-        base = st.target if (self.hold_mode == "target" and st.target is not None) else awake
-        reason = "hold"
-        t1_info: dict = {"inactive": t1_off} if t1_off else {"window": idx}
-        down_info: Optional[str] = None
-
+        # Tier-1
+        idx, t1_off = self._tier1(snap)
         t1_key = None if idx is None else (int(snap.replay.t0_ms), idx)
-        if t1_key is None:
-            st.t1_n = None  # no Tier-1 window in force (no replay, before t0, after the trace)
-        if t1_key is not None and t1_key != st.t1_window:
+        t1_info: dict = {"inactive": t1_off} if idx is None else {"window": idx}
+        if st.n_t2 is None:
+            st.n_t2 = clamp(awake)
+        reasons: list[str] = []
+        if idx is None:
+            if t1_off != "tier1_after_trace":
+                st.n_t1 = None  # before t0 / no replay: Tier-2 alone
+            # after the trace: the last forecast stays the floor (no evidence-free scale-down)
+        elif t1_key != st.t1_window:
             st.t1_window = t1_key
-            N, t1_info = self._tier1_n(ms.model, idx)
-            st.t1_n = None if N is None else clamp(N)
-            st.credited = set(overloaded)
+            N, t1_info = self._tier1_n(ms.model, idx, t1m)
             if N is None:
-                reason = "tier1_no_history"
-                new = base + len(overloaded)
+                reasons.append("tier1_error")  # N_T1 keeps its last value
             else:
-                reason = "tier1_window"
-                new = N + len(overloaded)
-            if overloaded:
-                reason += "+tier2_overload"
-            st.target = clamp(new)
+                st.n_t1 = clamp(N)
+                reasons.append("tier1_window")
+                if self.t2_reset_at_window:
+                    st.n_t2 = lo
+                    st.credited.clear()  # a pod still overloaded counts again on the new base
+
+        # Tier-2: incomplete inputs hold it in both directions
+        hold = sorted(set(gaps) | ({"no_kv_capacity"} if skipped else set()))
+        down_info: Optional[str] = None
+        if hold:
+            st.t2_hold_ticks += 1
+            down_info = "tier2_hold"
         else:
             fresh = [p for p in overloaded if p not in st.credited]
             if fresh:
                 st.credited.update(fresh)
-                st.target = clamp(base + len(fresh))
-                reason = "tier2_overload"
+                cur = max(st.n_t1 if st.n_t1 is not None else lo, st.n_t2)
+                st.n_t2 = clamp(cur + len(fresh))
+                reasons.append("tier2_overload")
             else:
                 down_key: Hashable = (t1_key if t1_key is not None
                                       else ("wall", int(snap.now_ms) // int(self.window_s * 1000)))
                 if not max_us:
                     down_info = "no_pods"
-                elif skipped or gaps or kv_disagree:
-                    down_info = "incomplete"
                 elif any(u >= self.t_f for u in max_us):
                     down_info = "above_t_f"
-                elif down_key == st.last_down_key:
+                elif down_key == st.t2_down_key:
                     down_info = "done_this_window"
                 else:
                     keep = max(1, int(math.ceil(sum(max_us) / self.t_f - 1e-9)))
-                    if st.t1_n is not None and keep < st.t1_n:
-                        # The window's forecast is evidence too: Tier-2 does not isolate
-                        # below the Tier-1 N (e.g. at a window start, before the burst
-                        # fills the look-ahead maps). Counted once per window.
-                        if st.below_t1_key != down_key:
-                            st.below_t1_key = down_key
-                            anom["tier2_below_t1"] += 1
-                        keep = st.t1_n
-                    if keep < awake:
-                        st.last_down_key = down_key
-                        st.target = clamp(keep)
-                        reason = "tier2_underload"
+                    if keep < st.n_t2:
+                        st.t2_down_key = down_key
+                        st.n_t2 = clamp(keep)
+                        reasons.append("tier2_underload")
                     else:
                         down_info = "no_gain"
-                if reason == "hold":
-                    st.target = clamp(base)
+        desired = clamp(max(st.n_t1 if st.n_t1 is not None else lo, st.n_t2))
+        frozen = bool(hold)
+        if frozen:
+            reasons.append("tier2_frozen")
 
         for k, v in anom.items():
             cum[k] += v
         inputs: dict[str, Any] = {
-            "awake": awake,
-            "target": st.target,
-            "tier1": t1_info,
-            "tier1_n": st.t1_n,
-            "tier2": t2,
-            "tier2_below_t1": cum["tier2_below_t1"],
+            "awake": awake, "target": desired, "n_t1": st.n_t1, "n_t2": st.n_t2,
+            "frozen": frozen, "tier1": t1_info, "tier2": t2, "t2_hold_ticks": st.t2_hold_ticks,
         }
+        if gaps:
+            inputs["gaps"] = list(gaps)
+        if hold:
+            inputs["t2_hold"] = hold
         if down_info:
             inputs["down"] = down_info
         if skipped:
@@ -598,6 +752,6 @@ class PreServePolicy:
             inputs["kv_disagree"] = kv_disagree
         if anom:
             inputs["anom"] = dict(sorted(anom.items()))
-        # Any target below awake (Tier-1 or Tier-2) waits for complete evidence; the
-        # target itself is kept.
-        return hold_if_incomplete(Decision(desired=int(st.target), reason=reason, inputs=inputs), awake, gaps)
+        if self.errors is not None:
+            inputs["load_err"] = {"new": st.err_rows, "cum": st.err.summary()}
+        return Decision(desired=int(desired), reason="+".join(reasons) or "hold", inputs=inputs)

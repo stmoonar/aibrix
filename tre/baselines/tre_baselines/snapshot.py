@@ -109,6 +109,16 @@ class RequestEvent:
     stream: Optional[bool] = None
     #: The stream entry ID, kept for tie-breaking and debugging.
     entry_id: str = ""
+    #: The client's request id (gateway field ``client_id`` = header ``x-tre-request-id``);
+    #: the same on every reissue of one client request. None when the client sent none.
+    client_id: Optional[str] = None
+
+    @property
+    def draw_key(self) -> str:
+        """The key of per-request random draws (misbucketing, length errors): the client's
+        id, so a draw does not depend on arrival order and is the same in every arm; the
+        gateway's ``req_id`` only when the client sent none (not reproducible, counted)."""
+        return self.client_id or self.req_id
 
 
 @dataclass(frozen=True)

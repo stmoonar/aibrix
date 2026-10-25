@@ -904,7 +904,9 @@ async def test_gateway_reissue_contract():
     the same path, x-tre-* request headers and prompt."""
     doc = json.loads(GW_CONTRACT.read_text(encoding="utf-8"))
     cases = {c["from"]: c for c in doc["cases"] if c["from"] != "client"}
-    client = {"x-tre-bl-in-tokens": "5"}  # forwarded unchanged on every reissue
+    # forwarded unchanged on every reissue: the input count and the client's request id (the
+    # gateway's bl events carry it as client_id, so a reissue keeps the client's id)
+    client = {"x-tre-bl-in-tokens": "5", "x-tre-request-id": "req_000042"}
     sent = {}
     async with Harness() as h:
         h.engine_a.put_to_sleep()
@@ -930,6 +932,7 @@ async def test_gateway_reissue_contract():
         case = cases[source]
         assert req["path"] == case["path"], source
         assert tre_headers[source] == case["headers"], source
+        assert tre_headers[source]["x-tre-request-id"] == client["x-tre-request-id"] == case["client_id"], source
         for key in ("prompt", "messages"):  # what the gateway counts input tokens from
             assert req["body"].get(key) == case["body"].get(key), (source, key)
 

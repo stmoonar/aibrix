@@ -37,6 +37,11 @@ Sanity (baseline_sanity.sh):
                   (steady: settle = min(settle_s, 0.4 x phase length); Chiron S2: see _chiron_up;
                   --records defaults to records.jsonl next to the meta file)
   summary         --root DIR --arm A --out summary.json
+  decision-validity --decisions DIR_OR_FILES --t0-ms T --duration-s D [--tick-s 5] [--min-tick-cov 0.9]
+                  [--max-frozen 0.05] [--models a,b] [--max-no-client-id 0] [--out F]
+                                                    per model: ticks in [t0, t0+D) >= 0.9 x D / tick,
+                                                    frozen-tick share <= 0.05, no draw without the
+                                                    client id (exit 2 when not)
 """
 from __future__ import annotations
 
@@ -185,33 +190,61 @@ def _tail(path: str, parts: int) -> tuple:
     return tuple(bits[-parts:]) if parts > 0 else ()
 
 
+def _pos(x) -> bool:
+    try:
+        return float(x) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def policy_problems(policy: str, params: dict, models: list[str]) -> list[str]:
-    """Placeholder / missing parameters that the policy itself would refuse (checked early)."""
+    """Placeholder / missing parameters that the policy itself would refuse (checked early).
+    Schema of the 2026-10-26 port (``tools/freeze_params`` renders the blocks): TokenScale
+    ``bucket_centers`` + ``velocity.<m>.buckets`` (no ``v_prefill``, D51); PreServe ``mu`` p/d/t,
+    ``trace_path`` and, for ``tier1: mlstm`` (default), ``predictors.<set>`` path + sha256."""
     out = []
     if not isinstance(params, dict) or not params:
         return ["policy file is empty ({}): parameters not frozen/applied yet"]
+    if str(params.get("calibration", "")).lower() == "pending":
+        out.append("calibration: pending (parameters not frozen yet: tools/freeze_params)")
     if policy == "chiron":
         theta = params.get("theta") or {}
         for m in models:
             v = theta.get(m, theta.get("*")) if isinstance(theta, dict) else theta
-            if v is None or float(v) <= 0:
+            if not _pos(v):
                 out.append(f"theta[{m}] missing / null")
     elif policy == "tokenscale":
         vel = params.get("velocity") or {}
+        cen = params.get("bucket_centers") or {}
         for m in models:
             v = vel.get(m) if isinstance(vel, dict) else None
-            if not v or not v.get("buckets") or not v.get("v_prefill"):
-                out.append(f"velocity[{m}] missing")
+            b = v.get("buckets") if isinstance(v, dict) else None
+            if not (isinstance(b, list) and len(b) == 3 and all(isinstance(r, list) and len(r) == 3 and all(map(_pos, r))
+                                                                for r in b)):
+                out.append(f"velocity[{m}].buckets missing / not 3x3 > 0")
+            if isinstance(v, dict) and "v_prefill" in v:
+                out.append(f"velocity[{m}].v_prefill present (no V_P in the port, D51)")
+            c = cen.get(m, cen.get("*")) if isinstance(cen, dict) else None
+            if not (isinstance(c, list) and len(c) == 3 and all(isinstance(r, list) and len(r) == 3 for r in c)):
+                out.append(f"bucket_centers[{m}] missing / not 3x3")
         if "model-a" in (params.get("models") or []) or "model-a" in vel:
             out.append("example placeholder model-a present")
     elif policy == "preserve":
         mu = params.get("mu") or {}
         for m in models:
             v = mu.get(m) or {}
-            if not v or float(v.get("t") or 0) <= 0:
-                out.append(f"mu[{m}] missing / 0")
+            if not all(_pos(v.get(k)) for k in ("p", "d", "t")):
+                out.append(f"mu[{m}] missing / 0 (needs p, d, t)")
         if not params.get("trace_path"):
             out.append("trace_path missing")
+        if str(params.get("tier1", "mlstm")) == "mlstm":
+            preds = params.get("predictors") or {}
+            sets = {str(s) for _p, s in (params.get("predictor_rules") or [])} | {"pooled"}
+            for name in sorted(sets):
+                spec = preds.get(name) if isinstance(preds, dict) else None
+                sha = str((spec or {}).get("sha256") or "")
+                if not (spec or {}).get("path") or len(sha) != 64:
+                    out.append(f"predictors.{name} needs path and a sha256")
     return out
 
 
@@ -331,6 +364,69 @@ def cmd_mktrace(a) -> int:
 
 
 # ------------------------------------------------------------------ sanity: analysis
+
+
+def is_frozen(line: dict) -> bool:
+    """A decision whose policy held its own evidence-driven part (PreServe Tier-2 ``frozen``)."""
+    inp = line.get("inputs") if isinstance(line.get("inputs"), dict) else {}
+    return bool(line.get("frozen") or inp.get("frozen") or "frozen" in str(line.get("reason") or ""))
+
+
+def _no_client_id(line: dict) -> int:
+    """Arrivals of this tick whose draw key fell back to the gateway id (TokenScale ``no_client_id``,
+    PreServe ``anom.no_client_id``)."""
+    inp = line.get("inputs") if isinstance(line.get("inputs"), dict) else {}
+    anom = inp.get("anom") if isinstance(inp.get("anom"), dict) else {}
+    try:
+        return int(inp.get("no_client_id") or 0) + int(anom.get("no_client_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def decision_validity(dec: list[dict], t0_ms: int, duration_s: float, tick_s: float,
+                      min_tick_cov: float = 0.9, max_frozen: float = 0.05, models: list[str] | None = None,
+                      max_no_client_id: int = 0) -> dict:
+    """Per-run validity from the decision lines of the replay window [t0, t0 + duration) (S5,
+    2026-10-26): per model (every one of ``models``; a model without lines fails), ticks seen >=
+    ``min_tick_cov`` x duration / tick, the share of frozen ticks <= ``max_frozen`` (a baseline that
+    sat frozen did not run its algorithm), and at most ``max_no_client_id`` arrivals whose random
+    draw (misbucketing, load error) fell back to the gateway id (not the same in every arm)."""
+    end = t0_ms + int(duration_s * 1000)
+    per: dict[str, dict] = {m: {"ticks": 0, "frozen": 0, "no_client_id": 0} for m in (models or [])}
+    for d in dec:
+        ts, m = d.get("ts_ms"), d.get("model")
+        if m is None or not isinstance(ts, (int, float)) or not t0_ms <= ts < end:
+            continue
+        r = per.setdefault(m, {"ticks": 0, "frozen": 0, "no_client_id": 0})
+        r["ticks"] += 1
+        r["frozen"] += is_frozen(d)
+        r["no_client_id"] += _no_client_id(d)
+    want = duration_s / tick_s
+    problems = []
+    for m, r in sorted(per.items()):
+        r["tick_cov"] = round(r["ticks"] / want, 4)
+        r["frozen_share"] = round(r["frozen"] / r["ticks"], 4) if r["ticks"] else None
+        if r["tick_cov"] < min_tick_cov:
+            problems.append(f"{m}: tick coverage {r['tick_cov']} < {min_tick_cov}")
+        if r["frozen_share"] is not None and r["frozen_share"] > max_frozen:
+            problems.append(f"{m}: frozen ticks {r['frozen_share']} > {max_frozen}")
+        if r["no_client_id"] > max_no_client_id:
+            problems.append(f"{m}: {r['no_client_id']} arrivals without x-tre-request-id (draws not reproducible)")
+    if not per:
+        problems.append("no decision lines in the replay window")
+    return {"t0_ms": t0_ms, "duration_s": duration_s, "tick_s": tick_s, "expected_ticks": round(want, 1),
+            "min_tick_cov": min_tick_cov, "max_frozen": max_frozen, "max_no_client_id": max_no_client_id,
+            "models": per, "valid": not problems, "invalid_because": problems}
+
+
+def cmd_decision_validity(a) -> int:
+    models = [m for m in (a.models or "").split(",") if m]
+    doc = decision_validity(load_decisions(a.decisions), a.t0_ms, a.duration_s, a.tick_s, a.min_tick_cov, a.max_frozen,
+                            models, a.max_no_client_id)
+    if a.out:
+        json.dump(doc, open(a.out, "w"), indent=1)
+    print(json.dumps({"valid": doc["valid"], "invalid_because": doc["invalid_because"]}))
+    return 0 if doc["valid"] else 2
 
 
 def load_decisions(paths: list[str]) -> list[dict]:
@@ -455,7 +551,7 @@ def analyze(meta: dict, dec: list[dict], validity: dict | None, mode: str,
             records: list[dict] | None = None) -> dict:
     part, policy = meta["part"], meta["policy"]
     t_load = int(meta["t_load_redis_ms"])
-    tick_s = float(meta.get("tick_s", 2))
+    tick_s = float(meta.get("tick_s", 5))
     res: dict = {"part": part, "policy": policy, "mode": mode, "checks": {}, "notes": [], "phases": []}
     models = sorted({d["model"] for d in dec})
     res["decision_lines"] = len(dec)
@@ -697,6 +793,13 @@ def main(argv=None) -> int:
     p.add_argument("--mode", required=True, choices=["dry", "act"]); p.add_argument("--decisions", nargs="+", required=True)
     p.add_argument("--meta", required=True); p.add_argument("--validity"); p.add_argument("--out", required=True)
     p.add_argument("--records"); p.set_defaults(fn=cmd_analyze)
+    p = sub.add_parser("decision-validity"); p.add_argument("--decisions", nargs="+", required=True)
+    p.add_argument("--t0-ms", type=int, required=True); p.add_argument("--duration-s", type=float, required=True)
+    p.add_argument("--tick-s", type=float, default=5.0); p.add_argument("--min-tick-cov", type=float, default=0.9)
+    p.add_argument("--max-frozen", type=float, default=0.05); p.add_argument("--out")
+    p.add_argument("--models", default="", help="managed models (a model without lines fails)")
+    p.add_argument("--max-no-client-id", type=int, default=0)
+    p.set_defaults(fn=cmd_decision_validity)
     p = sub.add_parser("summary"); p.add_argument("--root", required=True); p.add_argument("--arm", required=True)
     p.add_argument("--out", required=True); p.set_defaults(fn=cmd_summary)
     a = ap.parse_args(argv)

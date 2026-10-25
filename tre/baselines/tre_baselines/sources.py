@@ -262,6 +262,7 @@ def parse_event(model: str, entry_id: Any, fields: Mapping[Any, Any]) -> Optiona
         reissue=reissue,
         entry_id=entry_id,
         stream=_opt_bool(data.get("stream")),
+        client_id=_opt_str(data.get("client_id")),
     )
 
 

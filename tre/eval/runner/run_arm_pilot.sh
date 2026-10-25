@@ -17,7 +17,7 @@
 #   8. (2026-10-05) sidecar `tre_reissue_nofile` startup line recorded per pod at run start
 #      (sidecar_nofile.tsv; expect after>=65535: 65535 where the runtime soft limit is 1024, else the hard limit); record only.
 #   9. (2026-10-06) baseline arms chiron | tokenscale | preserve (labels Chiron-global /
-#      TokenScale-colocated / PreServe-oracle, in arm_label): run mode observe/active, TRE scaling
+#      TokenScale-colocated / PreServe, in arm_label): run mode observe/active, TRE scaling
 #      off (2026-10-07: controller run mode observe, see 11) and 0 APA CRs (decision source NONE), policy ConfigMap
 #      checked (non-empty, no placeholder, = $BL_CM_FILE when given), `arm enable --policy --execute`
 #      (waits for /healthz + owner lock), `arm mark-replay` at the first send (MARK_AT), loadgen
@@ -76,7 +76,7 @@ case "$ARM" in
   apa) ARM_LABEL=APA-kvcache ;;
   chiron) ARM_LABEL=Chiron-global; IS_BL=1 ;;
   tokenscale) ARM_LABEL=TokenScale-colocated; IS_BL=1 ;;
-  preserve) ARM_LABEL=PreServe-oracle; IS_BL=1 ;;
+  preserve) ARM_LABEL=PreServe; IS_BL=1 ;;
   *) echo "arm must be tre|apa|chiron|tokenscale|preserve" >&2; exit 2;;
 esac
 ARM_LABEL="${ARM_LABEL_OVERRIDE:-$ARM_LABEL}"

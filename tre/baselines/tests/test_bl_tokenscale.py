@@ -22,11 +22,18 @@ def _grid(**over):
     return g
 
 
+#: calibration points inside the test edges (in <= 100 / <= 200 / else, out <= 50 / <= 100 / else);
+#: the hand events below sit exactly on them, so lambda' = lambda when nothing is misbucketed
+CENTERS = [[[50, 20], [50, 70], [50, 200]], [[150, 20], [150, 70], [150, 200]], [[300, 20], [300, 70], [300, 200]]]
+PAPER_EDGES = {"in": [255, 1023], "out": [99, 349]}
+
+
 def _params(**kw):
     p = {
         "models": [M],
         "bucket_edges": {"*": {"in": [100, 200], "out": [50, 100]}},
-        "velocity": {M: {"buckets": _grid(b00=7, b11=11, b22=25), "v_prefill": BIG}},
+        "bucket_centers": {"*": CENTERS},
+        "velocity": {M: {"buckets": _grid(b00=7, b11=11, b22=25)}},
         "misbucket_rate": 0.0,
         "window_s": 10,
     }
@@ -42,10 +49,11 @@ def _policy(**kw):
     return build_policy("tokenscale", _cfg(_params(**kw)))
 
 
-def _ev(ts, tin=50, mt=20, src="header", reissue="none", kind="arr"):
+def _ev(ts, tin=50, mt=20, src="header", reissue="none", kind="arr", cid="auto"):
     _COUNTER[0] += 1
-    return RequestEvent(kind=kind, model=M, pod=None, req_id=f"r{_COUNTER[0]}", ts_ms=ts, in_tokens=tin,
-                        in_src=src, max_tokens=mt, out_tokens=None, status=None, reissue=reissue)
+    return RequestEvent(kind=kind, model=M, pod=None, req_id=f"gw-{_COUNTER[0]}", ts_ms=ts, in_tokens=tin,
+                        in_src=src, max_tokens=mt, out_tokens=None, status=None, reissue=reissue,
+                        client_id=f"req_{_COUNTER[0]:06d}" if cid == "auto" else cid)
 
 
 COMPLETE = object()
@@ -76,23 +84,70 @@ def test_registered():
 
 def test_hand_computed_3x3():
     d = _policy().decide(_snap(100_000, _hand_events()))[M]
-    # lambda: 14, 22, 50 tok/s ; 14/7 + 22/11 + 50/25 = 6 ; lambda_in = 550/10 = 55 -> 0.055
+    # lambda: 14, 22, 50 tok/s ; 14/7 + 22/11 + 50/25 = 6 (no prefill term, v1 D51)
     assert d.reason == "velocity" and d.desired == 6
     lam = d.inputs["lambda_b"]
     assert (lam["00"], lam["11"], lam["22"]) == (14.0, 22.0, 50.0)
-    assert d.inputs["term_buckets"] == 6.0 and d.inputs["lambda_in"] == 55.0
+    assert d.inputs["term_buckets"] == 6.0 == d.inputs["term_true_out"]
+    assert "term_prefill" not in d.inputs
 
 
 def test_ceil_rounds_up():
-    p = _policy(velocity={M: {"buckets": _grid(b00=6, b11=11, b22=25), "v_prefill": BIG}})
+    p = _policy(velocity={M: {"buckets": _grid(b00=6, b11=11, b22=25)}})
     d = p.decide(_snap(100_000, _hand_events()))[M]
     assert d.inputs["term_buckets"] > 6.3 and d.desired == 7  # 14/6 + 2 + 2 = 6.33
 
 
-def test_prefill_guard_dominates():
-    p = _policy(velocity={M: {"buckets": _grid(b00=7, b11=11, b22=25), "v_prefill": 5.0}})
-    d = p.decide(_snap(100_000, _hand_events()))[M]
-    assert d.inputs["term_prefill"] == 11.0 and d.desired == 11  # 55/5 > 6
+def test_lambda_counts_the_represented_output_of_the_landing_bucket():
+    """lambda' = true input + the output of the calibration point of the bucket the request
+    lands in after misbucketing (v1 D47 / D66), never its true output."""
+    d = _policy().decide(_snap(100_000, [_ev(99_000, 60, 30), _ev(99_000, 60, 45)]))[M]
+    assert d.inputs["lambda_b"]["00"] == 2 * (60 + 20) / 10  # centre out 20, true 30 / 45
+    assert d.inputs["term_true_out"] == round((90 + 105) / 10 / 7, 4)
+    moved = _policy(misbucket_rate=1.0).decide(_snap(100_000, [_ev(99_000, 60, 30) for _ in range(50)]))[M]
+    lam = moved.inputs["lambda_b"]
+    assert moved.inputs["misbucketed"] == 50 and lam["00"] == 0.0
+    n01, n02 = moved.inputs["events_b"]["01"], moved.inputs["events_b"]["02"]
+    assert n01 + n02 == 50 and n01 > 0 and n02 > 0
+    assert lam["01"] == n01 * (60 + 70) / 10 and lam["02"] == n02 * (60 + 200) / 10
+
+
+@pytest.mark.parametrize("tin,b_in", [(255, 0), (256, 1), (1023, 1), (1024, 2), (8192, 2), (16310, 2)])
+@pytest.mark.parametrize("tout,b_out", [(99, 0), (100, 1), (349, 1), (350, 2)])
+def test_paper_boundaries(tin, b_in, tout, b_out):
+    """TokenScale Table II / DynamoLLM: input < 256 / < 1024 / else (> 8192 is long too),
+    output < 100 / < 350 / >= 350, as inclusive integer edges."""
+    centers = [[[100, 50], [100, 200], [100, 600]], [[600, 50], [600, 200], [600, 600]],
+               [[2000, 50], [2000, 200], [2000, 600]]]
+    p = _policy(bucket_edges={"*": PAPER_EDGES}, bucket_centers={"*": centers})
+    d = p.decide(_snap(100_000, [_ev(99_000, tin, tout)]))[M]
+    assert d.inputs["events_b"][f"{b_in}{b_out}"] == 1
+
+
+def _mis_draws(events, seed=7):
+    d = _policy(misbucket_rate=0.15, seed=seed).decide(_snap(100_000, events))[M]
+    return d.inputs["events_b"], d.inputs["misbucketed"]
+
+
+def test_misbucketing_is_a_function_of_the_client_id_not_of_arrival_order():
+    evs = [_ev(99_000, 50, 20) for _ in range(2000)]
+    by_id = {e.client_id: e for e in evs}
+    fwd, n = _mis_draws(evs)
+    assert 0.13 < n / 2000 < 0.17
+    assert _mis_draws(list(reversed(evs))) == (fwd, n)
+    # new gateway ids (a re-run or another arm) with the same client ids: the same draws
+    again = [RequestEvent(**{**e.__dict__, "req_id": "other-" + e.req_id}) for e in by_id.values()]
+    assert _mis_draws(again) == (fwd, n)
+    assert _mis_draws(evs, seed=8) != (fwd, n)
+
+
+def test_a_missing_client_id_falls_back_to_the_gateway_id_and_is_counted():
+    d = _policy(misbucket_rate=0.15).decide(_snap(100_000, [_ev(99_000, cid=None), _ev(99_000)]))[M]
+    assert d.inputs["no_client_id"] == 1
+    # the fallback key is the gateway id: the same draws as clients that sent those ids
+    evs = [_ev(99_000, 50, 20) for _ in range(400)]
+    as_gw = [RequestEvent(**{**e.__dict__, "req_id": e.client_id, "client_id": None}) for e in evs]
+    assert _mis_draws(as_gw)[1] > 0 and _mis_draws(as_gw) == _mis_draws(evs)
 
 
 def test_window_eviction():
@@ -118,21 +173,7 @@ def test_reissue_skipped_and_other_kinds_ignored():
 def test_missing_max_tokens_uses_default():
     d = _policy(default_out_tokens=80).decide(_snap(100_000, [_ev(99_000, 50, None)]))[M]
     assert d.inputs["missing_out"] == 1
-    assert d.inputs["lambda_b"]["01"] == (50 + 80) / 10  # out 80 -> output bucket 1
-
-
-def _run_mis(seed):
-    p = _policy(misbucket_rate=0.15, seed=seed)
-    return p.decide(_snap(100_000, [_ev(99_000, 50, 20) for _ in range(4000)]))[M]
-
-
-def test_misbucket_rate_and_determinism():
-    d = _run_mis(7)
-    assert 0.13 < d.inputs["misbucketed"] / 4000 < 0.17
-    # a misbucketed event never stays in its true bucket, so bucket 00 keeps ~85 %
-    assert 0.83 < d.inputs["lambda_b"]["00"] * 10 / (4000 * 70) < 0.87
-    assert _run_mis(7) == d
-    assert _run_mis(8).inputs["lambda_b"] != d.inputs["lambda_b"]
+    assert d.inputs["lambda_b"]["01"] == (50 + 70) / 10  # out 80 -> output bucket 1, counted at its centre 70
 
 
 def test_rate_zero_never_misbuckets():
@@ -195,9 +236,18 @@ def test_factory_fails_closed_on_bad_velocity(bad):
     g = _grid()
     g[1][2] = bad
     with pytest.raises(ValueError, match=r"buckets\[1\]\[2\]"):
-        _policy(velocity={M: {"buckets": g, "v_prefill": 5.0}})
+        _policy(velocity={M: {"buckets": g}})
+
+
+def test_factory_refuses_a_prefill_velocity_and_centres_outside_their_bucket():
     with pytest.raises(ValueError, match="v_prefill"):
-        _policy(velocity={M: {"buckets": _grid(), "v_prefill": bad}})
+        _policy(velocity={M: {"buckets": _grid(), "v_prefill": 5.0}})
+    bad = [row[:] for row in CENTERS]
+    bad[1] = [[150, 20], [150, 120], [150, 200]]  # out 120 is bucket 2, not 1
+    with pytest.raises(ValueError, match=r"bucket_centers\[m\]\[1\]\[1\]"):
+        _policy(bucket_centers={"*": bad})
+    with pytest.raises(ValueError, match="bucket_centers"):
+        _policy(bucket_centers={})
 
 
 def test_factory_fails_closed_on_missing_model_or_edges():

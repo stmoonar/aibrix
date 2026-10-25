@@ -308,6 +308,43 @@ def test_preserve_arm_gets_its_oracle_copy_and_rendered_policy(tmp_path):
             assert oracle[0]["timestamp"] != 0.0
 
 
+def test_preserve_mlstm_arm_gets_the_history_next_to_its_oracle_copy(tmp_path):
+    """tier1 mlstm (the default): the generator's pre_t0.json, else history_root's
+    preserve_history.json, lands next to the oracle copy; without one the arm is refused."""
+    hroot = tmp_path / "hist"
+    extra = {"traces": [{"trace": "Alternating", "arms": ["preserve"]}, {"trace": "Simul_spike", "arms": ["preserve"]}],
+             "arms": ["preserve"], "preserve": {"history_root": str(hroot)}}
+    write_campaign(tmp_path, traces=["Alternating", "Simul_spike"], arms=["preserve"], extra=extra)
+    (tmp_path / "bl.yaml").write_text(BL_CM.replace("tier1: oracle_noisy", "tier1: mlstm"))
+    wins = [{"start_s": -30.0 * (25 - i), "end_s": -30.0 * (24 - i), "requests": 1, "prompt_tokens": 10,
+             "output_tokens": 5} for i in range(25)]
+    (tmp_path / "traces" / "Alternating" / "seed1" / "pre_t0.json").write_text(json.dumps(
+        {"format": "tre-pre-t0-v1", "trace": "Alternating", "seed": 1, "t0_s": 0.0, "window_s": 30.0,
+         "windows": {"m7": wins}, "requests": []}))
+    real = hroot / "Simul_spike" / "seed1" / "preserve_history.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(json.dumps({"format": "tre-preserve-history-v1", "trace": "Simul_spike", "seed": 1,
+                                "window_s": 30.0, "models": {"m7": [[10.0, 5.0]] * 25}}))
+    c = C.load_campaign(str(tmp_path / "campaign.yaml"))
+    entries = C.resolve_traces(c)
+    d = C.arm_def(c, "preserve")
+    for e, name in zip(entries, ("pre_t0.json", "preserve_history.json")):
+        rec = C.prepare_preserve(c, e, d, lambda _m: None)["record"]
+        assert Path(rec["history"]["path"]) == Path(rec["oracle_host_path"]).parent / name
+        # the copy is what the policy loads for the rendered trace path (trace name + seed match)
+        ph = pytest.importorskip("tre_baselines.policies.preserve_history")
+        from tre_baselines.policies.preserve import trace_name_of
+
+        host = rec["oracle_host_path"]
+        assert ph.default_path(host) == rec["history"]["path"]
+        hist, _info = ph.load(ph.default_path(host), window_s=30.0, models=["m7"], seq_len=25,
+                              trace=trace_name_of(rec["oracle_pod_path"]), seed=ph.seed_of(rec["oracle_pod_path"]))
+        assert len(hist["m7"]) == 25
+    real.unlink()
+    with pytest.raises(C.CampaignError, match="no PreServe history"):
+        C.prepare_preserve(c, entries[1], d, lambda _m: None)
+
+
 # ------------------------------------------------------------------ pieces
 def test_slice_and_shift_keep_ids_and_counts():
     recs = [{"request_id": f"r{i}", "timestamp": float(i)} for i in range(10)]
