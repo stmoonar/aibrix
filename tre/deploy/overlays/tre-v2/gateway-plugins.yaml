@@ -120,6 +120,12 @@ spec:
               value: dual
             - name: AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS
               value: "50"
+            # 2026-10-25: TRE doc periods (instant docs / histogram docs, one MULTI/EXEC
+            # per round). MUST equal the same env vars on tre-v2-controller.
+            - name: TRE_INSTANT_SAMPLE_INTERVAL_MS
+              value: "500"
+            - name: TRE_EVIDENCE_PERIOD_MS
+              value: "10000"
             - name: AIBRIX_PREFILL_REQUEST_TIMEOUT
               value: "60"
             - name: TRE_DEFAULT_RPM
