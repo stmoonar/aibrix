@@ -732,12 +732,10 @@ scaling:
   saturation_kv_threshold: 0.9
   saturation_confirm_ms: 20000
   saturation_max_step_factor: 2
-  # Instant sample validity (2026-10-25, docs/design/20261025-instant-sampling.md): an
-  # instant doc counts only if its tick minus the pod's last successful gateway scrape
-  # (scraped_ms) is at most sample_max_scrape_age_ms; a pod with fewer valid docs than
-  # sample_min_ratio of the window's instant ticks is left out of the window like a
-  # scrape-stale pod (no scale-down / release evidence while it serves).
-  sample_max_scrape_age_ms: 1000
+  # Instant sample coverage (2026-10-25, docs/design/20261025-instant-sampling.md): a
+  # pod's coverage = distinct gateway scraped_ms in the window / (window / instant
+  # period). Below sample_min_ratio the pod is flagged: no donor / shrink / release for
+  # its model while it serves (receivers unaffected); the pod stays in the window.
   sample_min_ratio: 0.9
 # Node GPU-truth agent DaemonSet (deploy/gen_gpu_truth_manifest.py renders
 # overlays/tre-v2/gpu-truth.yaml from this and cluster.nodes). Only the generator

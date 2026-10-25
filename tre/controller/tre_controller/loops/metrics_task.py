@@ -11,7 +11,7 @@ Two refresh modes (``TRE_METRICS_REFRESH_MODE``):
   a token delta spanning the full window - and publishes an immutable snapshot whose
   ``ts_ms`` / ``window_end_ms`` is that boundary. A window whose end tick the gateway has
   not written yet is re-read every ``retry_ms`` until the next boundary (2026-10-25:
-  only the end tick is checked here; per-pod completeness is the store's rule); if it
+  only the end tick is checked here; per-pod coverage is the store's flag); if it
   never appears the window is *stale*: logged, the previous snapshot keeps being served,
   and once stale windows have lasted ``stale_hold_ms`` the served snapshot is marked
   ``stale`` so the decision loops stop acting on it. The fetch runs in a worker thread,
@@ -180,8 +180,8 @@ def window_freshness(
     in one transaction). ``period_ms`` is kept for the call sites.
 
     2026-10-25: only the end tick. The former rule (every tick of the window, pooled over
-    all pods) let a pod missing ticks pass whenever another pod covered them; completeness
-    is now per pod, on the pod's own valid docs (the store's ``sample_incomplete_pods``).
+    all pods) let a pod missing ticks pass whenever another pod covered them; coverage
+    is now per pod, on the pod's own docs (the store's ``sample_incomplete_pods`` flag).
     Ticks are pooled over every pod of every model here: this is the gateway-wide "round
     written" signal. A window with no tick at all is reported fresh with reason
     ``no_ticks`` - nothing is serving, or the store does not report ticks; the sampler
@@ -342,6 +342,11 @@ class PhaseAlignedSampler:
                 snapshot = None
                 reason = f"error:{exc}"
             fetch_ns = time.perf_counter_ns() - fetch_t0
+            if snapshot is not None and snapshot.stale:
+                # The store marked it stale (a gateway cadence mismatch): no retry helps,
+                # and the decision loops stop at once (not after stale_hold_ms).
+                self._record_poll(fetch_ns, snapshot, stale=True)
+                return self._mark_stale(end, attempts, missed, snapshot.stale_reason or "store_stale", now=True)
             if snapshot is not None:
                 verdict = window_freshness(
                     snapshot, window_end_ms=end, window_ms=self.window_ms, period_ms=self.period_ms
@@ -380,13 +385,15 @@ class PhaseAlignedSampler:
         self._box.set(published)
         return SampleOutcome("published", end, attempts, missed, reason, self.offset_ms)
 
-    def _mark_stale(self, end: int, attempts: int, missed: int, reason: str | None) -> SampleOutcome:
+    def _mark_stale(
+        self, end: int, attempts: int, missed: int, reason: str | None, *, now: bool = False
+    ) -> SampleOutcome:
         self.consecutive_stale += 1
         previous = self._box.get()
         if previous is None:
             self._box.set(MetricsSnapshot(ts_ms=end, models=MappingProxyType({}), stale=True))
             action = "no previous snapshot; serving an empty stale one"
-        elif self._stale_for_ms(end) > self.stale_hold_ms:
+        elif now or self._stale_for_ms(end) > self.stale_hold_ms:
             if not previous.stale:
                 self._box.set(replace(previous, stale=True))
             action = f"previous window {previous.ts_ms} now marked stale"

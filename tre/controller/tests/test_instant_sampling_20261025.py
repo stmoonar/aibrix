@@ -1,18 +1,21 @@
 """Instant sampling (2026-10-25, design docs/design/20261025-instant-sampling.md).
 
-Instant docs every 0.5 s, histogram docs every evidence period. A doc counts only if its
-scrape was at most ``max_scrape_age_ms`` old at its tick; a pod is complete for a window
-only on its OWN valid docs (another pod covering the ticks does not help); an incomplete
-serving pod is left out and the model gives no scale-down / release evidence (the I4
-treatment of a scrape-stale pod); a pod's queue level is the mean over its valid samples.
-Count-based rules keep their span at any evidence period (saturation confirm: >= 20 s).
+Instant docs every 0.5 s, histogram docs every evidence period. A pod's queue level is
+the mean over all its instant docs in the window; its tokens are the counter delta over
+the real ``scraped_ms`` span of the histogram docs, scaled to the window. Coverage
+(distinct ``scraped_ms``) and the span only flag a pod: a donor-gate flag, the pod stays
+in the window. Only frozen (I3) pods and pods without docs are left out, from queue and
+tokens alike. Count-based rules keep their span at any evidence period.
 """
 from __future__ import annotations
 
 import pytest
 
 from relay_view import expand_relays
-from test_signal_validity_20261004 import _Queue, _Redis, _registry
+from test_signal_validity_20261004 import _Queue, _Redis
+from tre_common.registry import (
+    ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams,
+)
 from tre_controller.loops.tick import run_planner_tick
 from tre_controller.planning.classify import ModelState
 from tre_controller.planning.planner import ClusterView, ScaleAction
@@ -24,16 +27,43 @@ INSTANT = 500
 EVIDENCE = 10_000
 END = 1_000_000_000_000
 WINDOW = 30_000
+ORIGIN = END - 40_000
 
 
-def _write_pod(redis, model, pod, *, running, waiting=0.0, gen_per_s=100.0, missing=(), scrape_age_ms=lambda ts: 50):
-    """Gateway docs of one pod over (END - 40 s, END]: instant docs every 0.5 s (except
-    ticks in ``missing``), histogram docs every 10 s; ``scraped_ms = ts - scrape_age_ms(ts)``."""
+def _registry(*names: str) -> Registry:
+    specs = [
+        ModelSpec(
+            name=name, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=4, vllm_image="img",
+            slo=SloSpec(ttft_p95_ms=1200.0, tpot_p95_ms=100.0, e2e_p95_ms=10_000.0),
+            trs=TrsParams(w_p=0.04, w_d=1.0, lambda_wait=2.625, qmin=1.0, ema_alpha=1.0, theta_m=100.0,
+                          tau_crit=0.8, tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=1),
+        )
+        for name in names
+    ]
+    nodes = tuple(NodeSpec(name=node, gpus=4, two_gpu_slots=((0, 1), (2, 3))) for node in ("n", "n2"))
+    return Registry(ClusterTopology(nodes=nodes), specs)
+
+
+def _fresh(ts):
+    return ts - 50
+
+
+def _slow(ts):
+    """A scrape that lands only every 1 s: two docs in a row repeat one scraped_ms
+    (coverage 30 of 60)."""
+    return ts - ts % 1_000 - 50
+
+
+def _write_pod(redis, model, pod, *, running, waiting=0.0, gen_per_s=100.0, missing=(), scraped=_fresh):
+    """Gateway docs of one pod over [END - 40 s, END]: instant docs every 0.5 s (except
+    ticks in ``missing``), histogram docs every 10 s; ``scraped_ms = scraped(ts)``, and
+    the histogram counters as of that observation (``gen_per_s`` tokens per second)."""
     redis.sadd(f"tre:v2:pods:{model}", f"default/{pod}")
-    for ts in range(END - 40_000, END + 1, INSTANT):
-        base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod, "scraped_ms": ts - scrape_age_ms(ts)}
+    for ts in range(ORIGIN, END + 1, INSTANT):
+        seen = scraped(ts)
+        base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod, "scraped_ms": seen}
         if ts % EVIDENCE == 0:
-            n = (ts - (END - 40_000)) // 1000
+            n = (seen - ORIGIN) / 1000 + 1.0
             redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_histogram_metrics": {
                 f"{model}/request_prompt_tokens": {"sum": 50.0 * n, "count": n, "buckets": {"+Inf": n}},
                 f"{model}/request_generation_tokens": {"sum": gen_per_s * n, "count": n, "buckets": {"+Inf": n}},
@@ -45,10 +75,10 @@ def _write_pod(redis, model, pod, *, running, waiting=0.0, gen_per_s=100.0, miss
         }}, ts)
 
 
-def _store(redis, registry, **kw):
+def _store(redis, registry, min_sample_ratio=0.9, **kw):
     return MetricsStore(
         redis, registry, instant_sample_interval_ms=INSTANT, evidence_period_ms=EVIDENCE,
-        max_scrape_age_ms=1_000, min_sample_ratio=0.9, **kw,
+        min_sample_ratio=min_sample_ratio, **kw,
     )
 
 
@@ -56,68 +86,130 @@ def _read(store, model="m"):
     return store.read_model_window(model, END - WINDOW, END, use_cache=False, start_exclusive=True)
 
 
-#: 10 of the window's 60 instant ticks (1 in 6: ratio 0.83 < 0.9).
+def _snapshot(redis, registry):
+    return _store(redis, registry).read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
+
+
+def _binding(pod, model, gpu, awake=True, node="n"):
+    return Binding(serve_id=pod, model=model, slot=Slot(node, (gpu,)), awake=awake)
+
+
+def _released(result, model):
+    return any(
+        isinstance(a, ScaleAction) and a.model == model and a.delta < 0 for a in expand_relays(result.actions)
+    ) or any(e.startswith(f"safescale_probe_skipped:{model}:") for e in result.events)
+
+
+def _tick(snapshot, registry, *bindings):
+    view = ClusterView(topology=registry.topology(), bindings=tuple(bindings))
+    return run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
+                            cluster_view=view)
+
+
+#: 10 of the window's 60 instant ticks (1 in 6: coverage 0.83 < 0.9).
 LOST = frozenset(range(END - WINDOW + INSTANT, END + 1, 6 * INSTANT))
+DONOR_VIEW = (
+    _binding("m-0", "m", 0), _binding("m-1", "m", 1), _binding("r-0", "r", 2), _binding("r-1", "r", 3),
+    _binding("r-2", "r", 0, awake=False), _binding("r-3", "r", 1, awake=False),
+)
 
 
-@pytest.mark.parametrize("incomplete", [False, True], ids=["complete", "pod_lost_ticks"])
-def test_a_pod_missing_ticks_is_incomplete_although_another_pod_covers_them(incomplete):
-    """m-1 loses 1 in 6 of its instant docs; m-0 has every tick, so the gateway-wide tick
-    union is complete (the former check passed). m-1 is incomplete on its own docs: left
-    out, and m - HIGH on m-0 alone - is not donor evidence for the CRITICAL r."""
+@pytest.mark.parametrize("case", ["complete", "pod_lost_ticks", "all_pods_slow_scrapes"])
+def test_a_flagged_serving_pod_blocks_the_donor_and_stays_in_the_window(case):
+    """m-1 loses 1 in 6 of its instant docs (m-0 has every tick: another pod covering the
+    ticks does not help), or every pod's scrape lands only every 1 s (H2). The flagged
+    pods stay in the window - queue and tokens - and m, HIGH, is no donor for the
+    CRITICAL r (only the donor is blocked)."""
     redis = _Redis()
-    _write_pod(redis, "m", "m-0", running=2, gen_per_s=2_000)
-    _write_pod(redis, "m", "m-1", running=2, gen_per_s=2_000, missing=LOST if incomplete else ())
+    scraped = _slow if case == "all_pods_slow_scrapes" else _fresh
+    _write_pod(redis, "m", "m-0", running=2, gen_per_s=2_000, scraped=scraped)
+    _write_pod(redis, "m", "m-1", running=2, gen_per_s=2_000, scraped=scraped,
+               missing=LOST if case == "pod_lost_ticks" else ())
+    for pod in ("r-0", "r-1"):
+        _write_pod(redis, "r", pod, running=20, waiting=10, gen_per_s=10, scraped=scraped)
+    registry = _registry("m", "r")
+    snapshot = _snapshot(redis, registry)
+    m = snapshot.models["m"]
+    flagged = {"complete": (), "pod_lost_ticks": ("m-1",), "all_pods_slow_scrapes": ("m-0", "m-1")}[case]
+    assert m.sample_incomplete_pods == flagged
+    assert set(m.per_pod) == {"m-0", "m-1"}
+    assert m.avg_running == pytest.approx(4.0)
+    assert m.generation_tokens == pytest.approx(2 * 2_000 * 30, rel=0.02)
+
+    result = _tick(snapshot, registry, *DONOR_VIEW)
+    assert result.classifications["m"].state == ModelState.HIGH
+    assert result.classifications["r"].state == ModelState.CRITICAL
+    assert _released(result, "m") is (case == "complete")
+    if case != "complete":
+        assert result.model_contexts["m"]["sample_quality_hold"] == "samples_incomplete"
+        assert f"samples_incomplete:m:{','.join(flagged)}" in result.events
+
+
+def test_h2_receivers_with_slow_scrapes_scale_up_by_the_normal_step():
+    """H2: every pod of the CRITICAL r scrapes only every 1 s (all flagged). The TSS is
+    computed, the rescue takes the whole deficit on free GPUs - not the one-step cap of a
+    thin partial window (the former I4 knock-on) - and the saturation rescue still sees
+    the pods' newest gauges."""
+    redis = _Redis()
+    for pod in ("r-0", "r-1"):
+        _write_pod(redis, "r", pod, running=20, waiting=10, gen_per_s=10, scraped=_slow)
+    registry = _registry("r")
+    snapshot = _snapshot(redis, registry)
+    assert snapshot.models["r"].sample_incomplete_pods == ("r-0", "r-1")
+    result = _tick(
+        snapshot, registry,
+        _binding("r-0", "r", 0), _binding("r-1", "r", 1),
+        _binding("r-2", "r", 2, awake=False), _binding("r-3", "r", 3, awake=False),
+    )
+    context = result.model_contexts["r"]
+    assert result.classifications["r"].state == ModelState.CRITICAL
+    assert context["z_m"] is not None
+    up = sum(a.delta for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.model == "r"
+             and a.delta > 0)
+    assert up == 2
+    assert not any(e.startswith("rescue_low_evidence_step:r:") for e in result.events)
+    # The saturation rescue's input: each pod's newest gauges, at the window end.
+    for pod in snapshot.models["r"].per_pod.values():
+        assert (pod.latest_instant_ms, pod.latest_waiting) == (END, 10.0)
+
+
+def test_m1_a_serving_pod_without_any_doc_blocks_the_donor():
+    """M1: m-1 serves (fleet view) but the gateway wrote no doc of it. m is HIGH on m-0
+    alone - no donor for the CRITICAL r."""
+    redis = _Redis()
+    _write_pod(redis, "m", "m-0", running=2, gen_per_s=4_000)
     for pod in ("r-0", "r-1"):
         _write_pod(redis, "r", pod, running=20, waiting=10, gen_per_s=10)
     registry = _registry("m", "r")
-    snapshot = _store(redis, registry).read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
-    m = snapshot.models["m"]
-    assert END in m.instant_ticks_ms  # the sampler's end-tick check passes either way
-    assert m.sample_incomplete_pods == (("m-1",) if incomplete else ())
-    assert set(m.per_pod) == ({"m-0"} if incomplete else {"m-0", "m-1"})
-
-    def binding(pod, model, gpu, awake=True):
-        return Binding(serve_id=pod, model=model, slot=Slot("n", (gpu,)), awake=awake)
-
-    view = ClusterView(topology=registry.topology(), bindings=(
-        binding("m-0", "m", 0), binding("m-1", "m", 1), binding("r-0", "r", 2), binding("r-1", "r", 3),
-        binding("r-2", "r", 0, awake=False), binding("r-3", "r", 1, awake=False),
-    ))
-    result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
-                              cluster_view=view)
+    snapshot = _snapshot(redis, registry)
+    assert snapshot.models["m"].sample_incomplete_pods == ()
+    result = _tick(snapshot, registry, *DONOR_VIEW)
     assert result.classifications["m"].state == ModelState.HIGH
-    assert result.classifications["r"].state == ModelState.CRITICAL
-    released = any(isinstance(a, ScaleAction) and a.model == "m" and a.delta < 0
-                   for a in expand_relays(result.actions)) or any(
-        e.startswith("safescale_probe_skipped:m:") for e in result.events)
-    assert released is not incomplete
-    if incomplete:
-        assert result.model_contexts["m"]["signal_hold_reason"] == "samples_incomplete"
-        assert "samples_incomplete:m:m-1" in result.events
+    assert result.model_contexts["m"]["sample_quality_hold"] == "pod_missing"
+    assert not _released(result, "m")
 
 
-def test_docs_with_an_old_scrape_count_as_missing():
-    """The pod's scrape stalls for the window's last 6 s: the gateway still writes its
-    docs (frozen values, old scraped_ms). The 11 docs over 1 s old are missing (49/60 < 0.9): the pod
-    is incomplete. With the scrape stalled only 0.8 s (under max_scrape_age_ms) it is not."""
-    stall_from = END - 6_000
-
-    def stalled(ts):
-        return ts - stall_from + 50 if ts > stall_from else 50
-
+@pytest.mark.parametrize("min_sample_ratio", [0.0, 0.9])
+def test_queue_and_tokens_come_from_one_pod_set(min_sample_ratio):
+    """m-1's scrape froze before the window (I3): its docs repeat a frozen queue (50
+    running) and frozen counters - left out of queue AND tokens. m-2 scrapes slowly
+    (flagged): in queue AND tokens. At any min ratio."""
+    frozen = lambda ts: min(ts, END - 35_000) - 50  # noqa: E731
     redis = _Redis()
-    _write_pod(redis, "m", "m-0", running=4, scrape_age_ms=stalled)
-    assert _read(_store(redis, _registry("m"))).sample_incomplete_pods == ("m-0",)
+    _write_pod(redis, "m", "m-0", running=2, gen_per_s=1_000)
+    _write_pod(redis, "m", "m-1", running=50, gen_per_s=1_000, scraped=frozen)
+    _write_pod(redis, "m", "m-2", running=4, gen_per_s=1_000, scraped=_slow)
+    window = _read(_store(redis, _registry("m"), min_sample_ratio))
+    assert set(window.per_pod) == {"m-0", "m-2"}
+    assert window.avg_running == pytest.approx(2.0 + 4.0)
+    assert window.generation_tokens == pytest.approx(2 * 1_000 * 30, rel=0.02)
+    assert window.scrape_stale_pods == ("m-1",)
+    assert window.sample_incomplete_pods == (("m-2",) if min_sample_ratio else ())
 
-    redis = _Redis()
-    _write_pod(redis, "m", "m-0", running=4, scrape_age_ms=lambda ts: 800)
-    assert _read(_store(redis, _registry("m"))).sample_incomplete_pods == ()
 
-
-def test_queue_level_is_the_mean_of_the_valid_samples_not_biased_low():
-    """3 of 60 instant docs lost (complete at 0.95): the queue level is the pods' true
-    level, not 57/60 of it (the v1 failure: Q too low -> Z too high -> false HIGH)."""
+def test_queue_level_is_the_mean_of_all_docs_not_biased_low():
+    """3 of 60 instant docs lost (coverage 0.95, not flagged): the queue level is the
+    pod's true level, not 57/60 of it (the v1 failure: Q too low -> Z too high)."""
     lost = {END - 10_000, END - 5_000, END - 1_000}
     redis = _Redis()
     _write_pod(redis, "m", "m-0", running=6, waiting=2, missing=lost)
@@ -128,14 +220,22 @@ def test_queue_level_is_the_mean_of_the_valid_samples_not_biased_low():
     assert window.generation_tokens == pytest.approx(100.0 * 30)
 
 
-def test_a_pod_whose_histogram_docs_stop_early_is_incomplete():
-    """The window's last evidence boundary has no histogram doc of the pod: its token
-    delta would cover 20 of 30 s. Incomplete, left out (not a 1/3 lower TSS)."""
+@pytest.mark.parametrize("case", ["start_doc_lost", "no_baseline_in_lookback"])
+def test_a_lost_baseline_still_gives_the_true_token_rate(case):
+    """H1: the histogram doc at the window start is lost - the delta runs from the doc
+    10 s earlier (40 s of tokens, formerly 1.33x). H1b: no doc at or before the start at
+    all - the baseline is the first doc inside the window (20 s of tokens, formerly
+    0.67x). Divided by the real scraped_ms span, the rate is the true one either way;
+    H1b's 20 s span is under 0.67 windows: flagged."""
     redis = _Redis()
     _write_pod(redis, "m", "m-0", running=4)
     key = "tre:v2:hist:default/m-0"
-    redis.zsets[key] = [(score, member) for score, member in redis.zsets[key] if score < END]
-    assert _read(_store(redis, _registry("m"))).sample_incomplete_pods == ("m-0",)
+    keep = (lambda score: score != END - WINDOW) if case == "start_doc_lost" else (lambda score: score > END - WINDOW)
+    redis.zsets[key] = [(score, member) for score, member in redis.zsets[key] if keep(score)]
+    window = _read(_store(redis, _registry("m")))
+    assert window.generation_tokens == pytest.approx(100.0 * 30)
+    assert window.prompt_tokens == pytest.approx(50.0 * 30)
+    assert window.sample_incomplete_pods == (() if case == "start_doc_lost" else ("m-0",))
 
 
 @pytest.mark.parametrize("grid_ms, windows_to_fire", [(10_000, 2), (2_000, 10)])
@@ -154,4 +254,5 @@ def test_saturation_confirm_needs_20s_of_evidence_at_any_cadence(grid_ms, window
             fired_at = k
             break
     assert fired_at == windows_to_fire
-    assert (fired_at - 1) * grid_ms + grid_ms >= 20_000
+    # One window fewer would have spanned under 20 s.
+    assert (fired_at - 1) * grid_ms < 20_000 <= fired_at * grid_ms

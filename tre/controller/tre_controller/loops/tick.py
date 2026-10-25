@@ -1232,13 +1232,14 @@ def _model_contexts(
         spec = registry.model(model_name)
         stale_pods = getattr(metrics, "scrape_stale_pods", ())
         if stale_pods:
-            # I3: the gateway's last successful scrape of these pods predates the window;
-            # their docs are left out (no valid pod left -> tokens missing, not zero).
+            # I3 (2026-10-25: merged into the sample rule): no sample of these pods was
+            # observed in the window; they are left out (no pod left -> tokens missing,
+            # not zero) and are the frozen-scrape rescue evidence below.
             events.append(f"scrape_stale:{model_name}:{','.join(stale_pods)}")
         incomplete_pods = getattr(metrics, "sample_incomplete_pods", ())
         if incomplete_pods:
-            # 2026-10-25: too few valid instant samples (or histogram docs ending early) in
-            # the window: left out like a scrape-stale pod, by the same I4 rule below.
+            # 2026-10-25: flagged pods (too few samples, a token span over 1.5 windows, or
+            # left out): a donor-gate flag (I4 below), nothing else.
             events.append(f"samples_incomplete:{model_name}:{','.join(incomplete_pods)}")
         counts = cluster_counts.get(model_name)
         assigned_replicas = metrics.assigned_replicas
@@ -1334,6 +1335,7 @@ def _model_contexts(
                     hidden_pods.get(model_name, ()),
                 )
         else:
+            window = None
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
             # not that the model is idle (a live idle pod reports zero-delta tokens, which is the
             # tokens branch above with Y_m<=1e-9). Do NOT touch the traffic-onset cursor here:
@@ -1367,15 +1369,31 @@ def _model_contexts(
         # 2026-10-02: the SM replica floor / headroom (donor bound of the planner).
         context.update(_sm_floor_context(cluster_view, model_name))
         serving_now = routable_by_model.get(model_name, frozenset()) if routable_by_model is not None else None
-        held_stale = set(stale_pods) if serving_now is None else set(stale_pods) & serving_now
-        held_incomplete = set(incomplete_pods) if serving_now is None else set(incomplete_pods) & serving_now
-        if tokens_available and (held_stale or held_incomplete):
-            # I4: a serving pod's data is missing from this window (its scrape is stale,
-            # or 2026-10-25 its valid samples are incomplete), so the level comes from the
-            # other pods only - no scale-down / release evidence (the planner's donor
-            # gate); a receiver still acts (step-capped).
-            context["signal_full_window"] = False
-            context["signal_hold_reason"] = "scrape_stale" if held_stale else "samples_incomplete"
+        flagged = set(incomplete_pods)
+        if window is not None and not window.full:
+            # The decision window is an O1 suffix: its own flags count too.
+            flagged |= set(getattr(window.metrics, "sample_incomplete_pods", ()) or ())
+        if serving_now is None:
+            held_incomplete = flagged | set(stale_pods)
+        elif raw_metrics.per_pod:
+            # M1: a serving pod without complete data in the window (flagged, I3-stale,
+            # or no doc at all) holds as well. (An empty per_pod: no pod data at all -
+            # tokens missing below, or a synthetic window without per-pod data.)
+            complete = set(raw_metrics.per_pod) - flagged
+            held_incomplete = set(serving_now) - complete
+        else:
+            held_incomplete = (flagged | set(stale_pods)) & set(serving_now)
+        if tokens_available and held_incomplete:
+            # I4 (review round 1): a serving pod's data is incomplete in this window -
+            # no scale-down / release / donor evidence (the planner's donor gate). Only
+            # that: the level, the receiver steps and the O1 window are unchanged.
+            missing = held_incomplete - set(raw_metrics.per_pod or ())
+            context["sample_quality_hold"] = (
+                "scrape_stale" if missing & set(stale_pods)
+                else "pod_missing" if missing
+                else "samples_incomplete"
+            )
+            context["window_idle"] = False
         else:
             # Q3 (2026-10-06): the whole current serving window is idle - tokens known
             # and zero, no running / waiting request - with every serving pod scraped in

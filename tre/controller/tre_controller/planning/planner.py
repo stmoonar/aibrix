@@ -603,7 +603,11 @@ def build_plan(
                     continue
                 warmup_suppressed.append(item.model_name)
                 continue
-        elif ctx.get("signal_full_window", True) is False and not _idle_window_evidence(item, ctx):
+        elif (
+            ctx.get("signal_full_window", True) is False or ctx.get("sample_quality_hold")
+        ) and not _idle_window_evidence(item, ctx):
+            # sample_quality_hold (2026-10-25): a serving pod's samples are incomplete -
+            # no donor / shrink / release from the model (receivers are not affected).
             breakpoint_held.append(item.model_name)
             continue
         kept.append(item)
@@ -615,7 +619,12 @@ def build_plan(
                 if reason
                 else f"receiver_suppressed_signal_warmup:{model}"
             )
-        events.extend(f"donor_suppressed_breakpoint_window:{model}" for model in breakpoint_held)
+        events.extend(
+            f"donor_suppressed_samples_incomplete:{model}"
+            if model_contexts.get(model, {}).get("signal_full_window", True) is not False
+            else f"donor_suppressed_breakpoint_window:{model}"
+            for model in breakpoint_held
+        )
         classifications = kept
     # H3: exempt receivers that got a free-capacity step this tick (the others are
     # reported as held at the end of the rescue section).

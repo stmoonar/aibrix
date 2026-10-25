@@ -67,8 +67,9 @@ spec:
             - name: TRE_MONITOR_INTERVAL_SECONDS
               value: "20"
             # 2026-10-25: the gateway's two TRE doc periods; MUST equal the same env vars
-            # on tre-gateway-plugins (the controller's startup cadence check refuses a
-            # mismatch). Instant docs (queue gauges): per-pod completeness / freshness grid.
+            # on tre-gateway-plugins (the gateway declares them in tre:v2:gateway:cadence; a
+            # mismatch marks the snapshots stale). Instant docs (queue gauges): the per-pod
+            # coverage grid.
             # Evidence period (histogram docs): the sampler grid, O1 grid, SafeScale
             # evidence step. The metrics window must be a multiple of both.
             - name: TRE_INSTANT_SAMPLE_INTERVAL_MS

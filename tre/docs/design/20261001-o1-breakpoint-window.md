@@ -260,6 +260,11 @@ level computed from tokens observed in the current window. Both reuse the O1 don
   donor gate: the remaining pods may be the light ones. No valid pod left: tokens None
   (the held / UNKNOWN path). An old gateway (no `scraped_ms` on any doc of the model
   in the window) keeps every pod. Event `scrape_stale:<model>:<pods>`.
+  **Superseded 2026-10-25** (design 20261025-instant-sampling.md): a serving pod that
+  is I3-stale, flagged or missing sets `sample_quality_hold` (donor gate only, not
+  `signal_full_window`, so receivers are no longer step-capped by it); O1 suffixes keep
+  the window's pod set and flag instead of dropping; a doc without `scraped_ms` is
+  flagged (the old-gateway branch is removed).
 
 **Deliberate exception (scale-up stays aggressive):** a receiver on such a level still
 acts - a held CRITICAL on its last value, a scrape-stale CRITICAL on its valid pods. The

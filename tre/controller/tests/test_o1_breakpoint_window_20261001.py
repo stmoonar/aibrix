@@ -3,8 +3,8 @@
 A model decides on the part of its 30 s window after its last breakpoint (traffic onset,
 routable-count change): complete 10 s grids only (the grid holding the breakpoint
 excluded), the TSS numerator scaled to a whole window, the queue averaged over those
-grids, the EMA restarted at the breakpoint. Scale-ups act after ``min_evidence_grids``
-grids; scale-downs need a whole window after the breakpoint. Replaces the ADR-0013 onset
+grids, the EMA restarted at the breakpoint. Scale-ups act after ``min_evidence_ms``
+of complete grids; scale-downs need a whole window after the breakpoint. Replaces the ADR-0013 onset
 warmup guard (``scaling.onset_warmup_guard`` keeps it switchable)."""
 
 from __future__ import annotations

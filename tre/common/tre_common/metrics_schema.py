@@ -19,7 +19,7 @@ class PodWindowMetrics:
     token_counter_reset: bool = False
     #: Timestamps (ms) of the gateway instant docs read for this window (as written,
     #: stale ones included). Provenance for the phase-aligned sampler, which waits until
-    #: the gateway has written the window's end tick (2026-10-25: per-pod completeness is
+    #: the gateway has written the window's end tick (2026-10-25: per-pod coverage is
     #: the store's ``sample_incomplete_pods``). Excluded from equality.
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
     #: Window average of vLLM ``kv_cache_usage_perc`` (``gpu_cache_usage_perc`` before
@@ -108,16 +108,17 @@ class ModelWindowMetrics:
     #: a suffix only while a breakpoint (traffic onset, routable-count change) lies
     #: inside the window. Excluded from equality.
     suffix_windows: tuple["ModelWindowMetrics", ...] = field(default=(), compare=False)
-    #: I3 (2026-10-04): pods left out of this window because the gateway's last
-    #: successful scrape of them (doc ``scraped_ms``) lies before the window - their
-    #: docs repeat frozen values. Diagnostics only; excluded from equality.
+    #: I3 (2026-10-04; 2026-10-25 the sample rule): pods left out of this window
+    #: because no sample of them was observed in it (no ``scraped_ms`` in the window -
+    #: their docs repeat frozen values). Frozen-scrape rescue evidence; also in
+    #: ``sample_incomplete_pods``. Excluded from equality.
     scrape_stale_pods: tuple[str, ...] = field(default=(), compare=False)
-    #: 2026-10-25: pods left out of this window because they have fewer valid instant
-    #: docs (scrape at most ``scaling.sample_max_scrape_age_ms`` old at the doc's tick)
-    #: than ``scaling.sample_min_ratio`` of the window's instant ticks, or their histogram
-    #: docs stop before the window's last evidence boundary. Treated like
-    #: ``scrape_stale_pods`` by the controller (no scale-down / release evidence while one
-    #: serves); not frozen-scrape rescue evidence. Excluded from equality.
+    #: 2026-10-25 (review round 1 D2): flagged pods - samples (distinct ``scraped_ms``
+    #: in the window) below ``scaling.sample_min_ratio`` x (window / instant period), a
+    #: token span over 1.5 windows, or left out (0 samples / no token span). A
+    #: donor-gate flag only: a pod with samples stays in the window; while a flagged
+    #: pod serves, the controller takes no donor / shrink / release from the model.
+    #: Excluded from equality.
     sample_incomplete_pods: tuple[str, ...] = field(default=(), compare=False)
     #: Some pod of this model (sleeping ones included) has a successful gateway scrape
     #: inside the window: the gateway scraper is alive. False for an old gateway.
@@ -141,3 +142,5 @@ class MetricsSnapshot:
     ts_ms: int
     models: dict[str, ModelWindowMetrics]
     stale: bool
+    #: Why the store marked the snapshot stale (e.g. a gateway cadence mismatch).
+    stale_reason: str | None = field(default=None, compare=False)

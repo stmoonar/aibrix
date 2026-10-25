@@ -18,7 +18,7 @@ A1 "engine full" is read from the external 5 s gauge sampler (``pod_gauges.jsonl
 A2 eligibility (numerator zero / receiver gate not warm) comes from the recorded tick of
    that window. Exact until the first simulated step; afterwards the recorded run had a
    different replica count, so a simulated routable change is also assumed to put the
-   model under the O1 evidence gate for ``min_evidence_grids`` complete grids after it;
+   model under the O1 evidence gate for ``min_evidence_ms`` of complete grids after it;
 A3 after the first simulated step the gauges are still the recorded ones (recorded
    replica count): later steps are indicative only (they overstate saturation when the
    simulation has more replicas than the recording, understate it in the other case);
@@ -198,7 +198,7 @@ def replay_run(
     registry: Any,
     config: SaturationRescueConfig,
     wake_s: float = 3.0,
-    min_evidence_grids: int = 2,
+    min_evidence_ms: int = 20_000,
     margin_ms: int = 1000,
 ) -> dict:
     t0 = _epoch(directory / "load_start_epoch")
@@ -259,7 +259,7 @@ def replay_run(
             if simulated and reason is None and changes:
                 # A2: the O1 evidence gate after a simulated routable change.
                 eff = int(math.ceil((changes[-1] + margin_ms) / grid) * grid)
-                if end_ms > eff - grid and end_ms < eff + min_evidence_grids * grid:
+                if end_ms > eff - grid and end_ms < eff + min_evidence_ms:
                     reason = REASON_O1_HOLD
             y_total = state.get("y_m")
             idle = y_total is not None and float(y_total) <= 1e-9 and float(state.get("q_ctl") or 0.0) <= 1.0 + 1e-9
@@ -407,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         result = replay_run(
             run, registry=registry, config=config, wake_s=args.wake_s,
-            min_evidence_grids=int(getattr(scaling, "min_evidence_grids", 2)),
+            min_evidence_ms=int(getattr(scaling, "min_evidence_ms", 20_000)),
             margin_ms=int(getattr(scaling, "breakpoint_margin_ms", 1000)),
         )
         results.append(result)

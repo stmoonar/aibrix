@@ -11,7 +11,6 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.gateway_inflight import instance_max_age_ms
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
-from tre_controller.gateway_cadence import check_gateway_cadence
 from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
@@ -339,8 +338,16 @@ def create_controller_dependencies(
         registry,
         instant_sample_interval_ms=cfg.instant_sample_interval_ms,
         evidence_period_ms=cfg.evidence_period_ms,
-        # 2026-10-25: per-doc freshness and per-pod completeness (registry scaling.sample_*).
-        max_scrape_age_ms=getattr(scaling_config, "sample_max_scrape_age_ms", None),
+        # Declared gateway cadence (review round 1, M4/L6): checked on every snapshot
+        # read against the gateway's tre:v2:gateway:cadence hash (TRE_GATEWAY_INTERVAL_CHECK:
+        # fail = a mismatch marks the snapshot stale, warn = logs only, off = no check).
+        expected_cadence=(
+            None
+            if cfg.gateway_interval_check == "off"
+            else (int(cfg.instant_sample_interval_ms), int(cfg.evidence_period_ms))
+        ),
+        cadence_enforce=cfg.gateway_interval_check == "fail",
+        # 2026-10-25: per-pod completeness (registry scaling.sample_min_ratio).
         min_sample_ratio=float(getattr(scaling_config, "sample_min_ratio", 0.0) or 0.0),
         percentile_mode=cfg.percentile_mode,
         schema=cfg.metrics_schema,
@@ -363,17 +370,17 @@ def create_controller_dependencies(
         config=cfg.safescale,
         store=ControllerStateStore(redis_client),
         evidence=MetricsEvidenceReader(
-            # Same rules as the controller's store, but no histogram lookback: a pod's
-            # delta starts at its first doc stamped at or after the evidence start.
+            # Latency histograms only (M5, 2026-10-25): no instant docs are read. No
+            # histogram lookback: a pod's delta starts at its first doc stamped at or
+            # after the evidence start; a pod counts when a doc of the window was
+            # observed in it (frozen scrape -> left out); the end-of-window check is
+            # the reader's (_evidence_incomplete), as before.
             MetricsStore(
                 metrics_redis_client,
                 registry,
                 instant_sample_interval_ms=cfg.instant_sample_interval_ms,
                 evidence_period_ms=cfg.evidence_period_ms,
-                # Per-doc freshness as the controller's store; no completeness rule: the
-                # evidence is latency histograms with their own end-of-window check
-                # (_evidence_incomplete), as before.
-                max_scrape_age_ms=getattr(scaling_config, "sample_max_scrape_age_ms", None),
+                read_instant=False,
                 percentile_mode=cfg.percentile_mode,
                 schema=cfg.metrics_schema,
                 histogram_lookback_ms=0,
@@ -535,24 +542,7 @@ async def main(
         redis_client_factory=redis_client_factory,
         sm_transport=sm_transport,
     )
-    verify_gateway_cadence(deps, cfg)
     await (runner or run_controller)(deps, cfg)
-
-
-def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) -> None:
-    """Startup assertion (D8): the gateway's instant / histogram doc periods equal
-    TRE_INSTANT_SAMPLE_INTERVAL_MS / TRE_EVIDENCE_PERIOD_MS. Raises
-    GatewayCadenceMismatch on a mismatch in ``fail`` mode; only warns without evidence."""
-    redis_client = getattr(deps.store, "redis_client", None)
-    if redis_client is None:
-        return
-    check_gateway_cadence(
-        redis_client,
-        [spec.name for spec in deps.registry.models()],
-        mode=getattr(cfg, "gateway_interval_check", "fail"),
-        expected_ms=cfg.instant_sample_interval_ms,
-        expected_hist_ms=cfg.evidence_period_ms,
-    )
 
 
 def _create_redis_client(

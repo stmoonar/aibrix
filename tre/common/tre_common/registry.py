@@ -548,12 +548,10 @@ class ScalingRegistryConfig:
     #: the former ``saturation_consecutive_ticks: 2`` (deprecated alias, x 10 s).
     saturation_confirm_ms: int = 20_000
     saturation_max_step_factor: float = 2.0
-    #: Sampling validity (2026-10-25, design docs/design/20261025-instant-sampling.md):
-    #: an instant doc counts only if its tick minus the pod's last successful scrape
-    #: (``scraped_ms``, gateway clock) is at most ``sample_max_scrape_age_ms``; a pod is
-    #: complete for a window when its valid docs are at least ``sample_min_ratio`` of the
-    #: window's instant ticks. An incomplete pod is left out like a scrape-stale one.
-    sample_max_scrape_age_ms: int = 1000
+    #: Sampling coverage (2026-10-25, design docs/design/20261025-instant-sampling.md):
+    #: a pod's coverage = distinct ``scraped_ms`` in the window / (window / instant
+    #: period); below ``sample_min_ratio`` the pod is flagged (no donor / shrink /
+    #: release for its model while it serves). The pod stays in the window.
     sample_min_ratio: float = 0.9
 
 
@@ -593,7 +591,7 @@ SCALING_KEYS = frozenset({
     "gateway_clock_tolerance_ms", "gateway_clock_check_s",
     "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
     "saturation_max_step_factor",
-    "sample_max_scrape_age_ms", "sample_min_ratio",
+    "sample_min_ratio",
 }) | frozenset(SCALING_COUNT_ALIASES)
 
 
@@ -707,9 +705,6 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         ),
         saturation_max_step_factor=_scaling_number(
             raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0, high=4.0
-        ),
-        sample_max_scrape_age_ms=_scaling_count(
-            raw, "sample_max_scrape_age_ms", defaults.sample_max_scrape_age_ms, 0
         ),
         sample_min_ratio=_scaling_number(raw, "sample_min_ratio", defaults.sample_min_ratio, low=0.0, high=1.0),
     )

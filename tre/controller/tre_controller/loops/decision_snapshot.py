@@ -178,6 +178,7 @@ def _model_states(
             "signal_window_start_ms": context.get("signal_window_start_ms"),
             "signal_evidence_grids": context.get("signal_evidence_grids"),
             "signal_hold_reason": context.get("signal_hold_reason"),
+            "sample_quality_hold": context.get("sample_quality_hold"),
             "state": state,
             "signal_source": context.get("signal_source"),
             "signal_unavailable_reason": context.get("signal_unavailable_reason"),

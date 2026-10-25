@@ -80,7 +80,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from tre_common.rediskeys import (
-    SCRAPE_INTERVAL_MS,
+    EVIDENCE_PERIOD_MS,
+    INSTANT_SAMPLE_INTERVAL_MS,
     decision_hist_key,
     hist_key,
     inst_key,
@@ -133,9 +134,13 @@ DROPPED_LABELS = frozenset({"model_name"})
 #: A full snapshot row every this many rows, so a truncated file loses at most this much.
 DEFAULT_KEYFRAME_EVERY = 300
 
+#: The gateway's round grid of the controller windows: its histogram docs and the
+#: phase-aligned controller's window ends are on this period (2026-10-25: the evidence
+#: period; instant docs come every INSTANT_SAMPLE_INTERVAL_MS in between).
+GATEWAY_ROUND_MS = EVIDENCE_PERIOD_MS
 #: How long to wait for the gateway's next Redis write (its ticker has an arbitrary
-#: phase against the 10 s round, so up to one interval plus the write itself).
-DEFAULT_GATEWAY_FLUSH_WAIT_S = SCRAPE_INTERVAL_MS / 1000.0 + 2.0
+#: phase against the round, so up to one round plus the write itself).
+DEFAULT_GATEWAY_FLUSH_WAIT_S = GATEWAY_ROUND_MS / 1000.0 + 2.0
 #: ... after a cell, before the dump: none by default - the end mark's clock check has
 #: just waited for a gateway round (:func:`cell_clock_mark`).
 DEFAULT_CAPTURE_FLUSH_WAIT_S = 0.0
@@ -935,7 +940,7 @@ GATEWAY_RETENTION_MS = 30 * 60 * 1000
 #: offset starts at ``TRE_METRICS_PHASE_OFFSET_MS`` (2 s) and adapts up to
 #: ``period - retry`` = 9.5 s when the gateway writes late in its round
 #: (``tre_controller.loops.metrics_task.PhaseAlignedSampler``).
-DEFAULT_CONTROLLER_READ_OFFSET_MS = SCRAPE_INTERVAL_MS - 500
+DEFAULT_CONTROLLER_READ_OFFSET_MS = GATEWAY_ROUND_MS - 500
 #: ... and the window reaches the decision history on the next tick of a loop that
 #: writes it: the rescue loop (``TRE_RESCUE_INTERVAL_SECONDS``, 5 s) or, when the fast loop
 #: is disabled, the fairness loop (``TRE_FAIRNESS_INTERVAL_SECONDS``, 10 s). The bound
@@ -973,7 +978,7 @@ class ClockDomainConfig:
     margin is refused, and the tail (:func:`tail_ms`) includes the blind spot too."""
 
     window_ms: int = 30_000
-    period_ms: int = SCRAPE_INTERVAL_MS
+    period_ms: int = GATEWAY_ROUND_MS
     tolerance_ms: int = DEFAULT_CLOCK_TOLERANCE_MS
     controller_read_offset_ms: int = DEFAULT_CONTROLLER_READ_OFFSET_MS
     controller_tick_ms: int = DEFAULT_CONTROLLER_TICK_MS
@@ -1030,7 +1035,7 @@ def dump_range_ms(redis_start_ms: int, redis_end_ms: int, margin_ms: int) -> tup
     return int(redis_start_ms) - int(margin_ms), int(redis_end_ms) + int(margin_ms)
 
 
-def tail_ms(redis_end_ms: int, window_ms: int, blind_spot_ms: int, period_ms: int = SCRAPE_INTERVAL_MS) -> int:
+def tail_ms(redis_end_ms: int, window_ms: int, blind_spot_ms: int, period_ms: int = GATEWAY_ROUND_MS) -> int:
     """The last round stamp / window end a dump must hold to be *complete*: the last grid
     window end ``B`` whose window ``(B - window, B]`` can hold data of the cell, a gateway
     offset inside the blind spot included (data up to ``redis_end + blind`` in the
@@ -1251,7 +1256,7 @@ def wait_for_gateway_write(
 ) -> dict:
     """Wait (bounded) until the gateway writes its next round, and time that write.
 
-    The gateway stamps each round with ``now - now % 10 s`` (its own clock) but its
+    The gateway stamps each doc with its boundary (its own clock) but its
     ticker runs at an arbitrary phase, so ``redis TIME at first sight - round stamp`` is
     the *write phase* / write delay (resolution: ``poll_s``; the clock-domain check,
     :func:`_check_once`, judges it). ``timeout_s <= 0`` skips the wait."""
@@ -1380,6 +1385,7 @@ def dump_gateway_docs(
     files: dict[str, dict[str, str]] = {kind: {} for kind in GATEWAY_KINDS}
     counts: dict[str, dict[str, int]] = {kind: {} for kind in GATEWAY_KINDS}
     stamps: list[int] = []
+    hist_stamps: list[int] = []
     total_bytes = 0
     for kind in GATEWAY_KINDS:
         key_of = hist_key if kind == "hist" else inst_key
@@ -1392,13 +1398,17 @@ def dump_gateway_docs(
             for member, score in members:
                 s = int(float(score))
                 stamps.append(s)
+                if kind == "hist":
+                    hist_stamps.append(s)
                 rows.append({"score": s, "doc": _parse_member(member)})
             path = layout.gateway_dump_path(kind, pod)
             header = {"kind": "header", "schema": GATEWAY_DUMP_SCHEMA, "redis_key": key_of(pod),
                       "pod": pod, "doc_kind": kind, "range_ms": [lo_ms, hi_ms]}
             total_bytes += _write_jsonl_atomic(path, header, rows)
             files[kind][pod] = _rel(path, layout.cell_dir)
-    phases = sorted({s % SCRAPE_INTERVAL_MS for s in stamps})
+    # Round phases from the histogram docs (one per round; the instant docs in between
+    # are on the finer instant grid, 2026-10-25).
+    phases = sorted({s % GATEWAY_ROUND_MS for s in hist_stamps})
     late = (_late_docs(fetched, known, int(known_upto_ms), known_pods)
             if known is not None and known_upto_ms is not None and known_pods else None)
     return {
@@ -1413,7 +1423,8 @@ def dump_gateway_docs(
         "docs": counts,
         "bytes": total_bytes,
         "round_stamp_phases_ms": phases,
-        "round_interval_ms": SCRAPE_INTERVAL_MS,
+        "round_interval_ms": GATEWAY_ROUND_MS,
+        "instant_interval_ms": INSTANT_SAMPLE_INTERVAL_MS,
         "last_round_ms": max(stamps) if stamps else None,
     }
 

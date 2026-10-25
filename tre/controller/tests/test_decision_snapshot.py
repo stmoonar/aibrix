@@ -84,6 +84,7 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
             "signal_window_start_ms": None,
             "signal_evidence_grids": None,
             "signal_hold_reason": None,
+            "sample_quality_hold": None,
             "state": None,
             "signal_source": "zm",
             "signal_unavailable_reason": None,

@@ -193,13 +193,13 @@ class ControllerConfig:
     profile_proc_sample_interval_s: float
     profile_flush_interval_s: float
     safescale: SafeScaleConfig
-    # --- D8 (plan §6.9i): phase-aligned sampler, gateway cadence check ---
+    # --- D8 (plan §6.9i): phase-aligned sampler, declared gateway cadence ---
     # Defaults keep direct constructions (tests) working; from_env sets them all.
     # TRE_METRICS_REFRESH_MODE: phase_aligned (default) | free_running (old loop).
     metrics_refresh_mode: str = "phase_aligned"
     # TRE_EVIDENCE_PERIOD_MS: the gateway's histogram-doc period = the phase-aligned
     # window grid, the O1 grid, the SafeScale evidence step and the saturation "latest
-    # grid". Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (startup cadence check) and be
+    # grid". Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (declared cadence hash) and be
     # a multiple of instant_sample_interval_ms (the gateway's instant-doc period).
     evidence_period_ms: int = EVIDENCE_PERIOD_MS
     # TRE_METRICS_PHASE_OFFSET_MS: read at boundary + offset (a floor, see adapt).
@@ -304,7 +304,7 @@ class ControllerConfig:
             if key in values:
                 LOG.warning("%s=%s is ignored: the timer was removed (timer cleanup 2026-10-02)", key, values.get(key))
         # 2026-10-25: two gateway periods (tre_common.rediskeys). The instant period is
-        # the per-pod completeness / freshness grid only; every grid / cadence use of the
+        # the per-pod coverage-flag grid only; every grid / cadence use of the
         # former single period is the evidence period.
         instant_sample_interval_ms = _get_positive_int(
             values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", INSTANT_SAMPLE_INTERVAL_MS
@@ -412,9 +412,9 @@ class ControllerConfig:
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
             metrics_window_ms=metrics_window_ms,
             metrics_window_mode=metrics_window_mode,
-            # Must equal the gateway's instant-doc period (startup cadence check): the
-            # per-pod completeness check counts a window's expected instant ticks on it.
-            # Queue averages are the mean over a pod's valid samples (no divisor).
+            # Must equal the gateway's instant-doc period (declared cadence hash): the
+            # per-pod coverage flag counts a window's expected samples on it. Queue
+            # averages are the mean over a pod's instant docs (no divisor).
             instant_sample_interval_ms=instant_sample_interval_ms,
             evidence_period_ms=evidence_period_ms,
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),

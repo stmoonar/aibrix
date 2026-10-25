@@ -393,8 +393,8 @@ def test_shipped_registry_scaling_section():
         # Onset saturation rescue (2026-10-02), at its built-in defaults.
         "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
         "saturation_max_step_factor",
-        # Instant sample validity (2026-10-25), at its built-in defaults.
-        "sample_max_scrape_age_ms", "sample_min_ratio",
+        # Instant sample completeness (2026-10-25), at its built-in default.
+        "sample_min_ratio",
     }
     assert not hasattr(registry.scaling(), "donor_surplus_release")  # retired 2026-10-07 (F1-B)
     assert registry.scaling().rescue_max_step_pods == 4

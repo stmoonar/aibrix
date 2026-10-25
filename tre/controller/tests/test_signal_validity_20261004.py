@@ -271,21 +271,22 @@ def test_a_stale_serving_pod_makes_no_donor(stale):
         e.startswith("safescale_probe_skipped:m:") for e in result.events)
     assert released is not stale
     if stale:
-        assert result.model_contexts["m"]["signal_hold_reason"] == "scrape_stale"
+        assert result.model_contexts["m"]["sample_quality_hold"] == "scrape_stale"
 
 
-def test_scrape_validity_is_judged_per_o1_suffix():
-    """E: each O1 suffix window is judged against its own start - a pod whose last
-    successful fetch lies inside the window but before the last grid is valid for the
-    whole window and the 20 s suffix, not for the last 10 s."""
+def test_o1_suffixes_keep_the_window_pod_set_and_flag_a_pod_without_new_data():
+    """E (review round 1: one pod set): a pod whose last successful fetch lies inside the
+    window but before the last grid is valid for the whole window. Every O1 suffix keeps
+    the window's pod set (queue and tokens from the same pods); the last 10 s, without
+    a new observation of the pod, flag it (donor gate) instead of dropping it."""
     redis = _Redis()
     _write_pod(redis, "m", "m-0", gen_per_grid=1_000, running=4, waiting=0, scraped_ms=END - 15_000)
     store = MetricsStore(redis, _registry("m"), instant_sample_interval_ms=10_000, suffix_period_ms=10_000)
     window = store.read_model_window("m", END - 30_000, END, use_cache=False, start_exclusive=True)
     assert window.generation_tokens is not None
     last_20s, last_10s = window.suffix_windows
-    assert last_20s.generation_tokens is not None
-    assert last_10s.generation_tokens is None and not last_10s.per_pod
+    assert set(last_20s.per_pod) == set(last_10s.per_pod) == {"m-0"}
+    assert "m-0" in last_10s.sample_incomplete_pods
 
 
 # ---------------------------------------- frozen-scrape rescue (2026-10-04)
