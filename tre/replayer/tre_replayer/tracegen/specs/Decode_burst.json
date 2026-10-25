@@ -1,7 +1,7 @@
 {
  "trace": "Decode_burst",
- "duration_s": 1260,
- "isolates": "A5 decode: KV growth at constant arrival rate; slow decay (700) = scale-down evidence; models in turn 8b, 7b, 14b",
+ "duration_s": 720,
+ "isolates": "A5 decode: KV growth at a constant arrival rate (rho_ref 0.8 each); out 400 -> 1200 (8b) / 1270 (7b) / 1110 (14b) for 200 s, then 700 for 120 s (slow decay = scale-down evidence while a backlog drains), models in turn 8b, 7b, 14b, each decay overlapping the next burst; no designed contention (need <= 8 in the additive and the shape-aware unit)",
  "defaults": {
   "lengths": {
    "in": {
@@ -36,15 +36,15 @@
         400
        ],
        [
-        120,
+        60,
         1200
        ],
        [
-        360,
+        260,
         700
        ],
        [
-        480,
+        380,
         400
        ]
       ]
@@ -67,15 +67,15 @@
         400
        ],
        [
-        480,
+        260,
         1270
        ],
        [
-        720,
+        460,
         700
        ],
        [
-        840,
+        580,
         400
        ]
       ]
@@ -98,16 +98,12 @@
         400
        ],
        [
-        840,
-        1230
+        460,
+        1110
        ],
        [
-        1080,
+        660,
         700
-       ],
-       [
-        1200,
-        400
        ]
       ]
      }
@@ -115,13 +111,30 @@
    }
   }
  },
- "audit": {},
+ "pre_t0": {
+  "rule": "baseline",
+  "duration_s": 750,
+  "window_s": 30,
+  "at_s": 0
+ },
+ "audit": {
+  "r7": {
+   "contention": false,
+   "blind_band_free": false
+  },
+  "r2_note": "the 700-token decay segments (120 s: 8b 260-380, 7b 460-580; 14b 660-720 is the final 60 s) are below the hot threshold, so R2 judges the 200 s bursts only; the short decay / final segments are written exemptions of the 150 s rule",
+  "exempt": {
+   "R5": {
+    "dsqwen-14b": "sized in the shape-aware unit: 14b at out 1110 is KV-bound, rho_shape 1.95 (additive 1.83); 1230 (additive 2.01) is rho_shape 2.25 = 3 replicas, which with the overlapping 7b decay (2) and 8b (1) needs 9 GPUs > 8 (hidden contention)"
+   }
+  }
+ },
  "adjustments": [
-  "R5: burst out mean 7b 1200 -> 1270 and 14b 1200 -> 1230 (design rho at out 1200 was 1.91 / 1.96 < 2.0; minimal out for 2.0 is 1264 / 1226 at in 492 and req/s fixed at rho_base 0.8)"
+  "R5: burst out mean 7b 1270 (minimal out for design rho 2.0 at in 492 and req/s fixed at rho_base 0.8, as in the 1260 s trace)",
+  "R7 (shape-aware capacity, 10-26 review): 14b burst out 1230 -> 1110 so its KV-bound need stays 2 replicas while the 7b decay overlaps (460-580 s needed 1 + 2 + 6 = 9 GPUs at 1230); 8b keeps 1200 (rho_shape 3.25 = 4 replicas, fits: 4 + 1 + 2)"
  ],
  "seeds": [
-  1,
-  2,
-  3
- ]
+  1
+ ],
+ "seeds_note": "campaign seed 1 (10-26); append seeds to generate more"
 }

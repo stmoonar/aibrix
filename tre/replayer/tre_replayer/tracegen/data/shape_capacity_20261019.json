@@ -1,0 +1,12 @@
+{
+ "name": "shape_capacity_20261019",
+ "note": "Audit-only KV-bound capacity per model (tracegen.shape). kv_tokens = KV pool per replica in tokens, measured on the e1-envoy4 runs (1 replica, kv 0.25-0.9: sum of in-flight contexts / kv usage, all four arms agree); tpot_kv_s = client TPOT p50 when KV is full (TokenScale arm, Decode_burst); ttft_s = mean TTFT used by the Little's-law KV knee. Same numbers as docs/scripts/e1_envoy4_20261019/scripts/shape_cf_ts.py (local workspace) and shape_kvcap.py. Engine: vLLM 0.30 patched image, max-num-seqs 256, gpu-memory-utilization 0.85.",
+ "source": "e1-envoy4-20261019 shape-analysis (Decode_burst_s1 / Prefill_mix_s1, all arms)",
+ "ttft_s": 0.4,
+ "max_num_seqs": 256,
+ "models": {
+  "dsqwen-7b": {"kv_tokens": 320000, "tpot_kv_s": 0.045},
+  "dsllama-8b": {"kv_tokens": 135000, "tpot_kv_s": 0.047},
+  "dsqwen-14b": {"kv_tokens": 199000, "tpot_kv_s": 0.05}
+ }
+}

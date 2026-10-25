@@ -1,0 +1,179 @@
+{
+ "trace": "Tight_pool",
+ "duration_s": 720,
+ "subtitle": "integer overload, sum need 9 > 8",
+ "isolates": "A3 + loaded donors: base 2/2/2 fills the 8-GPU pool for every arm's demand estimate (all base rho >= 1.25, outside TokenScale's knee band); 150 s surges 8b, 7b, 14b in turn. During the 8b and 7b surges the replicas needed at V_slo sum to 9 > 8 (integer overload): the pre-registered answer is to sacrifice 14b (receiver -> 4, 14b -> 1); during the 14b surge the need is exactly 8 and the answer is that nobody moves",
+ "defaults": {
+  "lengths": {
+   "in": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:in",
+    "mean": 492,
+    "min": 32,
+    "trunc_q": 0.995
+   },
+   "out": {
+    "dist": "lognormal",
+    "sigma_from": "conv2023:out",
+    "mean": 400,
+    "min": 1,
+    "trunc_q": 0.995
+   }
+  }
+ },
+ "models": {
+  "dsllama-8b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 1.35,
+     "starts_s": [
+      90
+     ],
+     "width_s": 150,
+     "peaks": [
+      2.8
+     ]
+    }
+   }
+  },
+  "dsqwen-7b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 1.45,
+     "starts_s": [
+      330
+     ],
+     "width_s": 150,
+     "peaks": [
+      2.8
+     ]
+    }
+   }
+  },
+  "dsqwen-14b": {
+   "rate": {
+    "unit": "rho",
+    "fn": {
+     "kind": "pulses",
+     "base": 1.25,
+     "starts_s": [
+      570
+     ],
+     "width_s": 150,
+     "peaks": [
+      2.0
+     ]
+    }
+   }
+  }
+ },
+ "pre_t0": {
+  "rule": "baseline",
+  "duration_s": 750,
+  "window_s": 30,
+  "at_s": 0
+ },
+ "audit": {
+  "r7": {
+   "contention": true,
+   "blind_band_free": true
+  },
+  "r8": {
+   "lag_s": 30,
+   "base": {
+    "dsllama-8b": 2,
+    "dsqwen-7b": 2,
+    "dsqwen-14b": 2
+   },
+   "events": [
+    {
+     "name": "8b surge",
+     "surge_model": "dsllama-8b",
+     "window_s": [
+      90,
+      240
+     ],
+     "until_s": 330,
+     "expect": "sacrifice_14b",
+     "options": {
+      "sacrifice_14b": {
+       "dsllama-8b": 4,
+       "dsqwen-7b": 2,
+       "dsqwen-14b": 1
+      },
+      "take_from_7b": {
+       "dsllama-8b": 3,
+       "dsqwen-7b": 1,
+       "dsqwen-14b": 2
+      },
+      "no_move": {
+       "dsllama-8b": 2,
+       "dsqwen-7b": 2,
+       "dsqwen-14b": 2
+      }
+     }
+    },
+    {
+     "name": "7b surge",
+     "surge_model": "dsqwen-7b",
+     "window_s": [
+      330,
+      480
+     ],
+     "until_s": 570,
+     "expect": "sacrifice_14b",
+     "options": {
+      "sacrifice_14b": {
+       "dsllama-8b": 2,
+       "dsqwen-7b": 4,
+       "dsqwen-14b": 1
+      },
+      "take_from_8b": {
+       "dsllama-8b": 1,
+       "dsqwen-7b": 3,
+       "dsqwen-14b": 2
+      },
+      "no_move": {
+       "dsllama-8b": 2,
+       "dsqwen-7b": 2,
+       "dsqwen-14b": 2
+      }
+     }
+    },
+    {
+     "name": "14b surge",
+     "surge_model": "dsqwen-14b",
+     "window_s": [
+      570,
+      720
+     ],
+     "until_s": 720,
+     "expect": "no_move",
+     "options": {
+      "no_move": {
+       "dsllama-8b": 2,
+       "dsqwen-7b": 2,
+       "dsqwen-14b": 2
+      },
+      "take_from_7b_and_8b": {
+       "dsllama-8b": 1,
+       "dsqwen-7b": 1,
+       "dsqwen-14b": 3
+      }
+     }
+    }
+   ]
+  },
+  "r2_note": "the 14b surge (570-720 s) ends with the trace: a hot run cut by the trace end is not judged by R2"
+ },
+ "layout_note": "90 s base (30 s trim + 60 s settle), surges 90-240 (8b), 330-480 (7b), 570-720 (14b); 90 s gaps = the longest equal gaps that fit three 150 s surges and a 90 s lead in 720 s (the review asked for 150 s); the fluid check (audit R8) has 14b back to 2 replicas and its backlog drained before the next surge with a 30 s reaction lag",
+ "seeds": [
+  1,
+  2,
+  3
+ ]
+}

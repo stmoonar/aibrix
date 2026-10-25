@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Generates the v2 trace set (docs: trace-design-v2.md, round 2) from a clean checkout; CPU only, nice 19.
+# Generates a v2 trace set (docs: trace-design-v2.md round 2; 720 s set: tre/docs/design/20261026-traces-720.md)
+# from a clean checkout; CPU only, nice 19.
 # Usage: generate_traces_v2.sh <tre dir> <azure 2024 csv dir> <out root> <v1 traces_v9 dir> [spec ...]
 # (Real-*: the v1 traces_v9 per-model files, named by sha256 in the specs; no spec args = all specs)
-# Writes <out root>/<trace>/seed<k>/{design.json,manifest.json,traces_tre.effective.json},
+# SEEDS="1 2" restricts every spec to those seeds (default: each spec's seeds).
+# Writes <out root>/<trace>/seed<k>/{design.json,manifest.json,traces_tre.effective.json[,pre_t0.json]},
 # <out root>/by-name/<trace>_s<k> links (runner ICSE root), audit.{md,json}.
 # CAPACITY=<capacity json> overrides tracegen's default capacity file (e.g. the 2026-10-06 knee file).
 set -euo pipefail
@@ -13,8 +15,10 @@ test -z "$(git status --porcelain -- . ../loadgen_v1/configs/traces_v2)" || { ec
 G="nice -n 19 python3 -m tre_replayer.tracegen"
 CSV="--azure-csv conv2024=$AZ/AzureLLMInferenceTrace_conv_1week.csv --azure-csv code2024=$AZ/AzureLLMInferenceTrace_code_1week.csv --source v1_traces_v9=$V1"
 SPECS=("$@"); [ ${#SPECS[@]} -gt 0 ] || SPECS=(tre_replayer/tracegen/specs/*.json)
-for spec in "${SPECS[@]}"; do $G generate --spec "$spec" --out-root "$OUT" $CSV ${CAPACITY:+--capacity "$CAPACITY"}; done
-RUNS=(); for spec in "${SPECS[@]}"; do t=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['trace'])" "$spec"); RUNS+=("$OUT/$t"/seed*); done
+SEEDARGS=(); for k in ${SEEDS:-}; do SEEDARGS+=(--seed "$k"); done
+for spec in "${SPECS[@]}"; do $G generate --spec "$spec" --out-root "$OUT" $CSV ${CAPACITY:+--capacity "$CAPACITY"} "${SEEDARGS[@]}"; done
+RUNS=(); for spec in "${SPECS[@]}"; do t=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['trace'])" "$spec")
+  if [ -n "${SEEDS:-}" ]; then for k in $SEEDS; do RUNS+=("$OUT/$t/seed$k"); done; else RUNS+=("$OUT/$t"/seed*); fi; done
 $G link-names "$OUT"
 $G materialize "${RUNS[@]}" --processes 4
 $G audit $(ls -d "$OUT"/*/seed* | grep -v /_) --json "$OUT/audit.json" --md "$OUT/audit.md" > /dev/null

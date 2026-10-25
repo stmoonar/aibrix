@@ -187,6 +187,56 @@ def test_outputs_are_capped_by_the_route_timeout_rule_and_keep_their_mean(tmp_pa
     assert audit.audit_run(tmp_path / "run")["out_cap_ok"]
 
 
+def test_inputs_capped_at_8192_keep_their_mean():
+    """Prefill_mix: a mean-2000 prompt lognormal truncated at 8192 tokens keeps its mean (mu is
+    re-solved), never draws above the cap; a short-prompt mean is untouched by the cap."""
+    d = lengths.solve(2000, 0.985, min_tokens=32, max_tokens=8192)
+    assert d.hi == 8192 and d.mean == pytest.approx(2000, rel=1e-3)
+    draws = [d.draw(random.Random(i)) for i in range(20000)]
+    assert max(draws) <= 8192 and sum(draws) / len(draws) == pytest.approx(2000, rel=0.03)
+    assert lengths.solve(300, 0.985, min_tokens=32, max_tokens=8192) == lengths.solve(300, 0.985, min_tokens=32)
+
+
+def test_pre_t0_history_follows_its_rule_and_leaves_the_design_unchanged(tmp_path):
+    """pre_t0 (PreServe warm-up): [-D, 0) at the base rate ('baseline') or the previous period;
+    own random streams, so the trace's design bytes do not depend on it; manifest names the file."""
+    pulse = {"rate": {"unit": "rps", "fn": {"kind": "pulses", "base": 4.0, "starts_s": [100], "width_s": 100, "peaks": [20.0]}}}
+    spec = _spec(**{"dsqwen-7b": pulse})
+    plain = generate.generate(_write(tmp_path, spec, "a.json"), 1, tmp_path / "a")
+    assert plain["pre_t0"] is None and not (tmp_path / "a" / generate.PRE_T0_FILE).exists()
+    spec["pre_t0"] = {"rule": "baseline", "at_s": 0, "duration_s": 600, "window_s": 30}
+    man = generate.generate(_write(tmp_path, spec, "b.json"), 1, tmp_path / "b")
+    assert man["design"]["sha256"] == plain["design"]["sha256"]
+    raw = (tmp_path / "b" / generate.PRE_T0_FILE).read_bytes()
+    assert man["pre_t0"]["sha256"] == generate.sha256_bytes(raw)
+    pre = json.loads(raw)
+    ts = [r["timestamp"] for r in pre["requests"]]
+    assert all(-600 <= t < 0 for t in ts) and ts == sorted(ts)
+    assert abs(len(ts) - 2400) < 4 * math.sqrt(2400)        # the base rate, not the pulse
+    ws = pre["windows"]["dsqwen-7b"]
+    assert len(ws) == 20 and sum(w["requests"] for w in ws) == len(ts)
+    # periodic: the window before t0 replays the end of the period
+    sq = {"rate": {"unit": "rps", "fn": {"kind": "square", "low": 2.0, "high": 20.0, "period_s": 200, "high_s": 100,
+                                         "offset_s": 100, "ramp_s": 0}}}
+    spec = _spec(**{"dsqwen-7b": sq})
+    spec["pre_t0"] = {"rule": "previous_period", "period_s": 200, "duration_s": 200, "window_s": 100}
+    generate.generate(_write(tmp_path, spec, "c.json"), 1, tmp_path / "c")
+    lo, hi = (w["requests"] for w in json.loads((tmp_path / "c" / generate.PRE_T0_FILE).read_text())["windows"]["dsqwen-7b"])
+    assert abs(lo - 200) < 4 * math.sqrt(200) and abs(hi - 2000) < 4 * math.sqrt(2000)
+
+
+def test_tight_pool_pre_registered_answers_hold_in_the_fluid_queue(tmp_path):
+    """The committed Tight_pool spec: during the 8b / 7b surges sacrificing 14b beats taking from
+    the other TP1 model and staying put on both V_req and the worst model's violated fraction;
+    during the 14b surge nobody moves (audit R8); R7 sees the integer overload (need 9 > 8)."""
+    from pathlib import Path
+    sp = Path(generate.__file__).resolve().parent / "specs" / "Tight_pool.json"
+    generate.generate(sp, 1, tmp_path / "run")
+    r = audit.audit_run(tmp_path / "run")
+    assert r["R8"] == "met" and [e["best_V_req"] for e in r["r8"]] == ["sacrifice_14b", "sacrifice_14b", "no_move"]
+    assert r["R7"] == "met" and r["r7"]["need_slo_max"] == 9
+
+
 def test_every_spec_can_be_replayed_by_name(tmp_path):
     """The runner looks up $LOADGEN_CONFIG_ROOT/<trace>_s<k>/config.yaml: the committed configs
     are what the generator writes now, every seed has its name, and the config loads."""

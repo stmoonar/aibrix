@@ -45,6 +45,8 @@ PHASE_TYPE = "tracegen-v2"
 DESIGN_FIELDS = ("request_id", "timestamp", "model_name", "prompt_length", "phase_type", "max_output_tokens")
 DESIGN_FILE = "design.json"
 MANIFEST_FILE = "manifest.json"
+PRE_T0_FILE = "pre_t0.json"
+PRE_T0_FORMAT = "tre-pre-t0-v1"
 
 
 def rng_for(seed: int, trace: str, model: str, stream: str) -> random.Random:
@@ -187,6 +189,64 @@ def _real_rows(spec: dict, seed: int, cap: Capacity, fits: dict, azure_csv: dict
     return out, info
 
 
+def _pre_t0_map(rule: dict):
+    """Trace time of the design that a pre-t0 instant ``t`` (< 0) replays."""
+    kind = rule["rule"]
+    if kind == "baseline":            # one-shot traces: the rates and lengths at ``at_s`` (the base)
+        at = float(rule.get("at_s", 0.0))
+        return lambda t: at
+    if kind == "previous_period":     # periodic traces: t mod period (the period before t0)
+        period = float(rule["period_s"])
+        return lambda t: t % period
+    raise ValueError(f"unknown pre_t0 rule {kind!r}")
+
+
+def pre_t0_plan(spec: dict, seed: int, cap: Capacity, fits: dict) -> dict | None:
+    """What the generator defines as "sent before t0" (spec ``pre_t0``), for history-driven
+    baselines (PreServe's Tier-1 warm-up, v1 #8): the same per-model processes (Poisson
+    arrivals by thinning, lengths from the same length models) on [-duration_s, 0), with the
+    design time mapped by the rule; own random streams (``pre_t0-arrivals``, ``pre_t0-lengths``),
+    so the trace's design is unchanged. Returns the file object (requests + per-window sums)."""
+    rule = spec.get("pre_t0")
+    if not rule:
+        return None
+    dur = float(rule["duration_s"])
+    width = float(rule.get("window_s", 30))
+    tmap = _pre_t0_map(rule)
+    raw = []
+    for name, plan in model_plans(spec, seed, cap, fits).items():
+        times = nhpp(lambda u, plan=plan: plan.lam(tmap(u - dur)), dur,
+                     rng_for(seed, spec["trace"], name, "pre_t0-arrivals"))
+        lrng = rng_for(seed, spec["trace"], name, "pre_t0-lengths")
+        for u in times:
+            tm = tmap(u - dur)
+            raw.append((u - dur, name, plan.lengths["in"].draw(tm, lrng), plan.lengths["out"].draw(tm, lrng)))
+    raw.sort(key=lambda r: (r[0], r[1]))
+    reqs = [{"request_id": f"pre_{k:06d}", "timestamp": round(t, 6), "model_name": m, "prompt_length": int(i),
+             "max_output_tokens": int(o)} for k, (t, m, i, o) in enumerate(raw)]
+    nw = int(math.ceil(dur / width))
+    windows = {}
+    for m in sorted({r["model_name"] for r in reqs} | set(spec.get("models", {}))):
+        ws = [{"start_s": -dur + k * width, "end_s": -dur + (k + 1) * width, "requests": 0,
+               "prompt_tokens": 0, "output_tokens": 0} for k in range(nw)]
+        for r in reqs:
+            if r["model_name"] == m:
+                w = ws[min(nw - 1, int((r["timestamp"] + dur) // width))]
+                w["requests"] += 1; w["prompt_tokens"] += r["prompt_length"]; w["output_tokens"] += r["max_output_tokens"]
+        windows[m] = ws
+    return {"format": PRE_T0_FORMAT, "trace": spec["trace"], "seed": seed, "rule": rule, "t0_s": 0.0,
+            "duration_s": dur, "window_s": width, "windows": windows, "requests": reqs}
+
+
+def dumps_pre_t0(obj: dict) -> bytes:
+    """Canonical bytes: header fields, per-window sums, then one request per line."""
+    head = {k: v for k, v in obj.items() if k not in ("windows", "requests")}
+    body = json.dumps(head, ensure_ascii=False)[:-1]
+    win = ",\n".join(f" {json.dumps(m)}: {json.dumps(ws)}" for m, ws in obj["windows"].items())
+    reqs = ",\n".join(" " + json.dumps(r, ensure_ascii=False) for r in obj["requests"])
+    return (body + ',\n"windows": {\n' + win + '\n},\n"requests": [\n' + reqs + "\n]}\n").encode("utf-8")
+
+
 def design_rows(spec: dict, seed: int, cap: Capacity | None = None, fits: dict | None = None,
                 azure_csv: dict | None = None) -> tuple[list[dict], dict]:
     """The design plan (sorted, ids assigned) and generation info."""
@@ -277,9 +337,18 @@ def generate(spec_path: str | Path, seed: int, out_dir: str | Path, *, capacity_
     plan = dumps_plan(rows)
     (out / DESIGN_FILE).write_bytes(plan)
     used_fits = sorted({k for k in json.dumps(spec).split('"') if k in fits})
+    pre = pre_t0_plan(spec, seed, cap, fits)
+    pre_info = None
+    if pre is not None:
+        pre_bytes = dumps_pre_t0(pre)
+        (out / PRE_T0_FILE).write_bytes(pre_bytes)
+        pre_info = {"file": PRE_T0_FILE, "format": PRE_T0_FORMAT, "sha256": sha256_bytes(pre_bytes),
+                    "rule": pre["rule"], "requests": len(pre["requests"]),
+                    "per_model": {m: sum(w["requests"] for w in ws) for m, ws in pre["windows"].items()}}
     manifest = {
         "format": FORMAT,
         "trace": spec["trace"], "seed": seed, "duration_s": spec["duration_s"],
+        "subtitle": spec.get("subtitle"),
         "generator": code_provenance(),
         "spec_file": Path(spec_path).name, "spec_sha256": sha256_bytes(spec_bytes), "spec": spec,
         "capacity": cap.raw,
@@ -296,6 +365,7 @@ def generate(spec_path: str | Path, seed: int, out_dir: str | Path, *, capacity_
                                  for m, c in cap.models.items()}},
         "design": {"file": DESIGN_FILE, "sha256": sha256_bytes(plan), "requests": len(rows),
                    "per_model": summary(rows, float(spec["duration_s"]))},
+        "pre_t0": pre_info,
         "client_contract": "replay the effective file with tre_loadgen_v1 --trace-file <effective> --ignore-eos: "
                            "every request carries its own max_output_tokens (never null), so the config's "
                            "models[].max_tokens is never used",

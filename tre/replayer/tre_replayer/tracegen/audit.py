@@ -23,6 +23,28 @@ at the SLO margin = ``max(floor, ceil(rho / u))``, ``u`` = 0.85, capped at ``max
 * **R5** depth: the median design rho over a model's hot runs (= the plateau) is ``>= 2.0``.
 * Exemptions: ``audit.exempt`` {"R1a"|"R1b"|"R2"|"R3"|"R5": reason} or
   {"R5": {"<model>": reason}} - reported as "exempt", never as "met".
+* **R7** contention, on the design rho (1 s grid): seconds where the replicas needed at V_slo
+  (``ceil(rho)``, floor / max_awake applied) summed over models (x gpus) exceed the pool, and the
+  same with TokenScale's knee view (``ceil(rho_factor * rho)``); seconds a model's design rho
+  sits in TokenScale's knee band ``(k, k / rho_factor]`` (k = 1..3), on plateaus (rho constant)
+  and in all. ``audit.r7.contention`` true: met when both need sums exceed the pool somewhere;
+  false: met when no run of seconds outside ``overload_windows_s`` longer than one ramp
+  (``r2_slack_s``, 3 s: models switching shape at the same edge) needs more than the pool, in
+  the additive and in the shape-aware unit (design rho x the 30 s bin's shape factor, below). ``audit.r7.blind_band_free``: no plateau second
+  in the band.
+* **R8** pre-registered decision points (``audit.r8.events``), checked with a fluid queue: per
+  model, work arrives at the design rho (replica-seconds at V_slo per second) and is served at
+  ``n / rho_factor`` (the knee); the backlog diverges above it and drains below it. An option
+  is an allocation that holds from ``start + lag_s`` to ``end + lag_s`` (base outside it). An
+  arrival violates when the backlog wait ``B / (n / rho_factor)`` is over 0.5 s, else with
+  probability ``(u - 1) / (1 / rho_factor - 1)`` clipped to [0, 1] for per-replica load
+  ``u = rho / n`` (0 at V_slo, 1 at the knee). Scored over ``[start, until_s)``: violated
+  requests (V_req) and the worst model's violated fraction (max-min); met when the expected
+  option is best on both, at ``lag_s`` (``2 lag_s`` reported beside it). Also the static
+  max-min per-replica rho and when every backlog is drained.
+* **Shape-aware capacity** (:mod:`.shape`, report; judged only through R7 = false): 30 s bins of
+  the plan with the KV knee, ``G_shape`` and the summed need.
+* **In cap**: no prompt above ``audit.in_max`` (8192) tokens (``in_cap_ok``).
 * **Out cap**: no request's ``max_output_tokens`` above the model's route-timeout cap
   (``capacity.route_cap``; ``out_cap_ok``).
 * **In flight** (Little's law at the knee): a request occupies its replica for
@@ -46,6 +68,7 @@ from .capacity import Capacity, load_capacity, load_fits
 from .generate import DESIGN_FILE, MANIFEST_FILE, model_plans
 from .lengths import DEFAULT_TRUNC_Q  # noqa: F401  (documented default)
 from . import rates
+from . import shape as shape_mod
 
 BIN_S = 10
 R2_MIN_S = 150.0
@@ -53,6 +76,8 @@ R5_MIN_RHO = 2.0
 R3_BAND = (0.8, 1.25)
 LAG_S = 30.0
 INFLIGHT_LIMIT = 420
+IN_MAX = 8192
+FLUID_WAIT_S = 0.5
 ROUTE_TIMEOUT_S = 150.0
 
 
@@ -120,6 +145,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
         over_route = 0
         wmax = 0.0
         omax = 0
+        imax = 0
         for r in rows:
             if r["model_name"] != m:
                 continue
@@ -130,6 +156,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
             counts[k] += 1
             work_s[k] += c
             omax = max(omax, r["max_output_tokens"])
+            imax = max(imax, r["prompt_length"])
             w = mc.service_s(r["max_output_tokens"])
             wmax = max(wmax, w)
             over_route += w > a.get("route_timeout_s", ROUTE_TIMEOUT_S)
@@ -144,7 +171,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
             L.append(acc)
         mean_cost = wsum / n if n else 1.0
         per[m] = {"rho_bins": rho_bins, "counts": counts, "work_s": work_s, "L": L, "n": n,
-                  "mean_cost": mean_cost, "w_max_s": wmax, "out_max_seen": omax, "over_route": over_route}
+                  "mean_cost": mean_cost, "w_max_s": wmax, "out_max_seen": omax, "in_max_seen": imax, "over_route": over_route}
 
     # realised rho on 10 s and 30 s bins; design rho on a 1 s grid (synthetic plans) - real
     # slices have no design, their "design" is the realised 30 s series
@@ -255,7 +282,7 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
             "inflight_per_replica_static_max": max(p["L"]) / r_static if p["L"] else 0,
             "replicas_static": r_static,
             "inflight_per_replica_lag_max": worst_lag, "backlog_wait_max_s": worst_wait,
-            "out_max_seen": p["out_max_seen"], "out_cap": mc.out_max,
+            "out_max_seen": p["out_max_seen"], "out_cap": mc.out_max, "in_max_seen": p["in_max_seen"],
             "w_max_s": p["w_max_s"], "over_route_timeout_frac": p["over_route"] / p["n"] if p["n"] else 0.0,
         }
         r2 = None if not complete else all(x >= r2_min - ramp_slack for x in hot_s)
@@ -284,6 +311,146 @@ def audit_run(run_dir: str | Path, *, fits: dict | None = None) -> dict:
     out["inflight_lag_max"] = max(v["inflight_per_replica_lag_max"] for v in out["models"].values())
     out["inflight_ok"] = out["inflight_lag_max"] <= limit
     out["out_cap_ok"] = all(v["out_cap"] is None or v["out_max_seen"] <= v["out_cap"] for v in out["models"].values())
+    in_max = int(a.get("in_max", IN_MAX))
+    out["in_max"] = in_max
+    out["in_cap_ok"] = all(v["in_max_seen"] <= in_max for v in out["models"].values())
+
+    # shape-aware capacity on realised 30 s bins
+    sc = shape_mod.load_shape()
+    srho = {m: shape_mod.rho_series(rows, m, cap.models[m], sc[m], dur) for m in models if m in sc}
+    nbin = int(math.ceil(dur / 30))
+    g_sh, need_sh, need_add = [], [], []
+    for b in range(nbin):
+        g_sh.append(sum(srho[m][b]["rho_shape"] * cap.models[m].gpus for m in srho))
+        need_sh.append(sum(_need(cap, m, srho[m][b]["rho_shape"]) * cap.models[m].gpus for m in srho))
+        need_add.append(sum(_need(cap, m, srho[m][b]["rho_add"]) * cap.models[m].gpus for m in srho))
+    keep = [b for b in range(nbin) if not overlaps(b * 30, (b + 1) * 30)]
+    # design rho in the shape-aware unit: design rho x the bin's shape factor (rho_shape / rho_add
+    # of its requests), so Poisson noise does not move the judged need
+    kfac = {m: [(x["rho_shape"] / x["rho_add"]) if x["rho_add"] > 0 else 1.0 for x in srho[m]] for m in srho}
+    need_sh_design = [sum(_need(cap, m, design_rho[m][k] * kfac[m][min(nbin - 1, k // 30)]) * cap.models[m].gpus
+                          for m in srho) for k in range(ns)]
+    out["shape"] = {
+        "need_shape_design_max": max(need_sh_design),
+        "need_shape_design_over_pool_s_excl_overload": sum(1 for k in range(ns) if need_sh_design[k] > cap.pool_gpus
+                                                           and not overlaps(k, k + 1)),
+        "need_shape_design_over_pool_runs": [[s0, e0] for s0, e0 in _runs([need_sh_design[k] > cap.pool_gpus
+                                                                           and not overlaps(k, k + 1) for k in range(ns)])],
+        "rho_shape_design_hot": {m: max(design_rho[m][k] * kfac[m][min(nbin - 1, k // 30)] for k in range(ns)) for m in srho},
+        "G_shape_30s_max": max(g_sh), "G_add_30s_max": max(G30),
+        "need_shape_30s_max": max(need_sh), "need_add_30s_max": max(need_add),
+        "need_shape_over_pool_bins": [b * 30 for b in keep if need_sh[b] > cap.pool_gpus],
+        "need_add_over_pool_bins": [b * 30 for b in keep if need_add[b] > cap.pool_gpus],
+        "kv_bound_bins": {m: [x["t0"] for x in srho[m] if x["bind"] == "kv"] for m in srho},
+        "rho_shape_max": {m: max(x["rho_shape"] for x in srho[m]) for m in srho},
+        "rho_add_max": {m: max(x["rho_add"] for x in srho[m]) for m in srho}}
+
+    # R7 on the design grid
+    r7cfg = a.get("r7")
+    pool = cap.pool_gpus
+    need_slo = [sum(_need(cap, m, design_rho[m][k]) * cap.models[m].gpus for m in models) for k in range(ns)]
+    need_ts = [sum(_need(cap, m, cap.models[m].rho_factor * design_rho[m][k]) * cap.models[m].gpus for m in models)
+               for k in range(ns)]
+    in_ov = [overlaps(k, k + 1) for k in range(ns)]
+    blind = {}
+    for m in models:
+        f = cap.models[m].rho_factor
+        d = design_rho[m]
+        inb = [any(kk < d[k] <= kk / f + 1e-12 for kk in (1, 2, 3)) for k in range(ns)]
+        flat = [k > 0 and abs(d[k] - d[k - 1]) < 1e-9 for k in range(ns)]
+        blind[m] = {"all_s": sum(inb), "plateau_s": sum(1 for k in range(ns) if inb[k] and flat[k])}
+    r7 = {"need_slo_over_pool_s": sum(1 for k in range(ns) if need_slo[k] > pool),
+          "need_ts_over_pool_s": sum(1 for k in range(ns) if need_ts[k] > pool),
+          "need_slo_over_pool_s_excl_overload": sum(1 for k in range(ns) if need_slo[k] > pool and not in_ov[k]),
+          "need_slo_max": max(need_slo), "need_ts_max": max(need_ts), "knee_band_s": blind, "config": r7cfg,
+          "need_slo_over_pool_runs_excl_overload": [[s0, e0] for s0, e0 in _runs([need_slo[k] > pool and not in_ov[k]
+                                                                                  for k in range(ns)])]}
+    slack = float(a.get("r2_slack_s", 3.0))   # one 3 s ramp: shapes switching at the same edge overlap for <= one ramp
+    if r7cfg is None:
+        r7["verdict"] = "n/a"
+    else:
+        ok = True
+        if r7cfg.get("contention"):
+            ok = r7["need_slo_over_pool_s"] > 0 and r7["need_ts_over_pool_s"] > 0
+        else:
+            ok = (all(e0 - s0 <= slack for s0, e0 in r7["need_slo_over_pool_runs_excl_overload"])
+                  and all(e0 - s0 <= slack for s0, e0 in out["shape"]["need_shape_design_over_pool_runs"]))
+        if r7cfg.get("blind_band_free"):
+            ok = ok and all(v["plateau_s"] == 0 for v in blind.values())
+        r7["verdict"] = "met" if ok else "FAIL"
+    out["R7"] = r7["verdict"]
+    out["r7"] = r7
+
+    # R8 fluid decision points
+    r8cfg = a.get("r8")
+    if r8cfg and plans:
+        out["r8"] = fluid_r8(r8cfg, plans, cap, design_rho, dur)
+        out["R8"] = "met" if all(e["met"] for e in out["r8"]) else "FAIL"
+    else:
+        out["R8"] = "n/a"
+    return out
+
+
+def _need(cap: Capacity, m: str, rho: float) -> int:
+    """Replicas needed to keep a model at or under rho = 1 per replica (floor / max_awake)."""
+    mc = cap.models[m]
+    return min(mc.max_awake, max(mc.floor, int(math.ceil(rho - 1e-9))))
+
+
+def _fluid(alloc_at, plans, cap, design_rho, t0: int, t1: int) -> dict:
+    """Fluid queues over [t0, t1) for allocation ``alloc_at(k) -> {model: n}`` (see R8)."""
+    res = {m: {"arr": 0.0, "viol": 0.0, "u_sum": 0.0, "u_n": 0, "drained_at": None} for m in plans}
+    back = {m: 0.0 for m in plans}
+    for k in range(t0, t1):
+        al = alloc_at(k)
+        for m, plan in plans.items():
+            f = cap.models[m].rho_factor
+            n = al[m]
+            c = n / f
+            a = design_rho[m][k]
+            back[m] = max(0.0, back[m] + a - c)
+            u = a / n
+            w = back[m] / c
+            v = 1.0 if w > FLUID_WAIT_S else min(1.0, max(0.0, (u - 1.0) / (1.0 / f - 1.0)))
+            lam = plan.lam(k + 0.5)
+            r = res[m]
+            r["arr"] += lam; r["viol"] += lam * v; r["u_sum"] += u; r["u_n"] += 1
+            if back[m] > 1e-9:
+                r["drained_at"] = None
+            elif r["drained_at"] is None:
+                r["drained_at"] = k
+    return {"V_req": sum(r["viol"] for r in res.values()),
+            "arrivals": sum(r["arr"] for r in res.values()),
+            "worst_model_frac": max(r["viol"] / r["arr"] for r in res.values() if r["arr"] > 0),
+            "per_model_frac": {m: (r["viol"] / r["arr"] if r["arr"] else 0.0) for m, r in res.items()},
+            "backlog_end": dict(back),
+            "drained_at_s": {m: r["drained_at"] for m, r in res.items()}}
+
+
+def fluid_r8(cfg: dict, plans: dict, cap: Capacity, design_rho: dict, dur: float) -> list[dict]:
+    lag = int(cfg.get("lag_s", 30))
+    base = cfg["base"]
+    out = []
+    for ev in cfg["events"]:
+        s, e = (int(x) for x in ev["window_s"])
+        until = int(ev.get("until_s", min(dur, e + 2 * lag)))
+        rows = {}
+        for lg in (lag, 2 * lag):
+            for name, alloc in ev["options"].items():
+                def alloc_at(k, alloc=alloc, lg=lg):
+                    return alloc if s + lg <= k < e + lg else base
+                fl = _fluid(alloc_at, plans, cap, design_rho, s, until)
+                u_static = max(sum(design_rho[m][k] / alloc[m] for k in range(s + lg, e)) / max(1, e - s - lg)
+                               for m in plans)
+                fl["maxmin_rho_static"] = u_static
+                rows.setdefault(name, {})[f"lag{lg}"] = fl
+        def rank(key, lg):
+            return sorted(rows, key=lambda n: rows[n][f"lag{lg}"][key])
+        best_v, best_mm = rank("V_req", lag)[0], rank("worst_model_frac", lag)[0]
+        out.append({"name": ev["name"], "surge_model": ev.get("surge_model"), "window_s": [s, e], "until_s": until,
+                    "lag_s": lag, "expect": ev["expect"], "best_V_req": best_v, "best_maxmin": best_mm,
+                    "best_V_req_2lag": rank("V_req", 2 * lag)[0], "best_maxmin_2lag": rank("worst_model_frac", 2 * lag)[0],
+                    "met": best_v == ev["expect"] and best_mm == ev["expect"], "options": rows})
     return out
 
 
@@ -296,8 +463,8 @@ def _f(x, d=2):
 
 
 def markdown(results: list[dict]) -> str:
-    lines = ["| trace | seed | dur s | req | mean ρ 8b/7b/14b | peak ρ 8b/7b/14b (design) | G judged (basis) | G realised 30 s max | static Σ | R1a / R1b | R2 (min hot s) | R3 (CV ratio) | R5 (hot ρ) | in-flight/replica lag 30 s (static) | max out / cap | W>150 s |",
-             "|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|---:|"]
+    lines = ["| trace | seed | dur s | req | mean ρ 8b/7b/14b | peak ρ 8b/7b/14b (design) | G judged (basis) | G realised 30 s max | static Σ | R1a / R1b | R2 (min hot s) | R3 (CV ratio) | R5 (hot ρ) | in-flight/replica lag 30 s (static) | max out / cap | W>150 s | max in ≤ cap | R7 (need SLO/TS s>8; max) | shape: need design max / realised 30 s max (add) / G 30 s max (add) | R8 |",
+             "|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|---:|---|---|---|---|"]
     for r in results:
         ms = [m for m in ORDER if m in r["models"]]
         g = lambda k, d=2: "/".join(_f(r["models"][m][k], d) for m in ms)
@@ -316,5 +483,20 @@ def markdown(results: list[dict]) -> str:
         oc = "/".join(f"{r['models'][m]['out_max_seen']}≤{r['models'][m]['out_cap']}" for m in ms) + ("" if r["out_cap_ok"] else " **FAIL**")
         lines.append(f"| {r['trace']} | {r['seed']} | {r['duration_s']:.0f} | {r['requests']} | {g('mean_rho')} | {g('peak_rho')} | "
                      f"{gx} | {r['G_realised_30s_max']:.2f} | {st} | {r['R1a']} / {r['R1b']} | {r['R2']} ({hot}) | {r['R3']} ({cvr}) | "
-                     f"{r['R5']} ({lvl}) | {inf} ({inf_s}){flag} | {oc} | {wt * 100:.2f}% |")
+                     f"{r['R5']} ({lvl}) | {inf} ({inf_s}){flag} | {oc} | {wt * 100:.2f}% | "
+                     f"{'/'.join(str(r['models'][m]['in_max_seen']) for m in ms)} ≤ {r['in_max']}{'' if r['in_cap_ok'] else ' **FAIL**'} | "
+                     f"{r['R7']} ({r['r7']['need_slo_over_pool_s']}/{r['r7']['need_ts_over_pool_s']}; {r['r7']['need_slo_max']}) | "
+                     f"{r['shape']['need_shape_design_max']} / {r['shape']['need_shape_30s_max']} ({r['shape']['need_add_30s_max']}) / {r['shape']['G_shape_30s_max']:.2f} ({r['shape']['G_add_30s_max']:.2f}) | "
+                     f"{r['R8']} |")
+    r8 = [(r["trace"], r["seed"], e) for r in results for e in r.get("r8") or []]
+    if r8:
+        lines += ["", "R8 (fluid queue, lag {}): violated requests / worst model's violated fraction per option".format(r8[0][2]["lag_s"]), "",
+                  "| trace | seed | event | expect | options: V_req / worst frac / static max-min rho | best (V_req, max-min) | best at 2x lag | met |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for t, sd, e in r8:
+            key = f"lag{e['lag_s']}"
+            opts = "; ".join(f"{n} {v[key]['V_req']:.0f} / {v[key]['worst_model_frac']:.2f} / {v[key]['maxmin_rho_static']:.2f}"
+                             for n, v in e["options"].items())
+            lines.append(f"| {t} | {sd} | {e['name']} | {e['expect']} | {opts} | {e['best_V_req']}, {e['best_maxmin']} | "
+                         f"{e['best_V_req_2lag']}, {e['best_maxmin_2lag']} | {'met' if e['met'] else '**FAIL**'} |")
     return "\n".join(lines) + "\n"
