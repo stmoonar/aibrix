@@ -1,23 +1,25 @@
 # TokenScale-colocated example params for TRE_BL_POLICY=tokenscale (TRE_BL_POLICY_CONFIG points at this file).
-# Every velocity below is a PLACEHOLDER: the policy refuses to start with missing / <= 0
-# entries, and real values must be profiled on the current engine
-# (tools/tokenscale_profile.py) -- do not use these numbers for an experiment.
+# Every velocity and centre below is a PLACEHOLDER: the policy refuses to start with missing / <= 0
+# entries, and real values must be measured on the current engine (tools/tokenscale_buckets.py for
+# the centres, tools/velocity_ladder.py ladder for V) -- do not use these numbers for an experiment.
 models: [model-a]            # optional; default = every model in the registry
-bucket_edges:                # tertiles from tools/tokenscale_buckets.py ("*" = any model)
-  model-a:
-    in: [400, 1200]          # input-token edges: <=400 -> 0, <=1200 -> 1, else 2
-    out: [64, 160]           # max_tokens edges
+bucket_edges:                # paper boundaries (TokenScale Table II / DynamoLLM): in < 256 / < 1024 / else,
+  "*": {in: [255, 1023], out: [99, 349]}   # out < 100 / < 350 / >= 350, as inclusive integer upper bounds
+bucket_centers:              # calibration point [in, out] of each bucket (mean of the replayed requests in it)
+  "*":
+    - [[180, 60], [180, 200], [180, 800]]
+    - [[500, 60], [500, 200], [500, 800]]
+    - [[2000, 60], [2000, 200], [2000, 800]]
 velocity:
   model-a:
-    buckets:                 # (in+out) tokens/s per replica, rows = input bucket, cols = output bucket
+    buckets:                 # (in+out) tokens/s per replica at the centre, rows = input bucket, cols = output bucket
       - [4000, 3500, 3000]
       - [5000, 4500, 4000]
       - [6000, 5500, 5000]
-    v_prefill: 9000          # input tokens/s per replica (out = 1)
-out_len_source: max_tokens   # only implemented source
+out_len_source: max_tokens   # only implemented source (the true output before the simulated error)
 default_out_tokens: 256      # used (and counted as missing_out) when an event has no max_tokens
 misbucket_rate: 0.15         # paper: 85 %-accurate length predictor
 seed: 0                      # default: TRE_BL_SEED
 skip_reissue: true
-window_s: 10                 # not in paper
+window_s: 30                 # not in paper
 max_estimate_frac: 0.05      # not in paper

@@ -1,25 +1,16 @@
 # Per-policy parameters, mounted together at /etc/tre-baselines/<policy>.yaml; the shell
 # reads the file named by TRE_BL_POLICY_CONFIG.
 #
-# FROZEN baseline parameters (2026-10-06, branch feat/baseline-params-20261006), measured on
-# the live engine of images 20261006-bb54543e (vLLM 0.30.0-ts, one awake replica per model):
-#   - Chiron-global theta_trace: tools/chiron_theta --method peak_mean --interval-s 5 on the
-#     hot alt trace (CPU only); sensitivity row "*": 1/3.
-#     busy_band_h (scale-down state band, adaptation 4): max(0.25, 3 sigma(sum_q) / B) from the
-#     sanity S2 3x plateau; sensitivity row: 0 (the plain ceil).
-#     batch_mode static, static_b 256 = engine max_num_seqs (methodology 10-06 sanity round 2):
-#     Chiron's own ablation with static batch sizes; the virtual Alg.1 B collapses (S4: 153 -> 1)
-#     because the engine batch size cannot change at run time. Sensitivity row: sensitivity/chiron-alg1.yaml.
-#   - TokenScale-colocated V_b / V_P: tools/tokenscale_profile --open-loop, velocity at the knee
-#     of Poisson rate ladders (in 492 / out 400 and out=1). Sensitivity row "TokenScale-aggressive"
-#     (closed-loop maxima): sensitivity/tokenscale-aggressive.yaml.
-#   - PreServe-oracle mu: tools/tokenscale_profile --open-loop (Poisson rates 0.3 ... 1.3 x the
-#     calibration rho* x C_s token rate, 110 s steps, 20 s warm-up).
-#     PreServe window_s 30 (rule in the ConfigMap; methodology 10-06); paper 600 is a sensitivity row.
-#     TokenScale window_s 30 (= TRE TSS window; not shorter than TRE, methodology 10-06); 10 s code default is a sensitivity row.
-#   The sha256 of each run's profile.yaml / profile_raw.csv is in the commit messages.
-# Disclose: TokenScale buckets degenerate to one cell (constant trace shape; all nine = V_b,
-# lookups clamp); PreServe mu_p : mu_d fixed by the shape (one free quantity).
+# Chiron-global (code kept, not run in the 2026-10-26 campaign): FROZEN 2026-10-06 (branch
+# feat/baseline-params-20261006) on images 20261006-bb54543e; theta_trace tools/chiron_theta
+# --method peak_mean --interval-s 5 (CPU only); busy_band_h max(0.25, 3 sigma(sum_q) / B); batch_mode
+# static, static_b 256 = engine max_num_seqs. Its theta / band were fitted on the old 492 / 400 shape.
+#
+# TokenScale-colocated and PreServe (v1 port, docs/campaign-v2-20261026-plan.md of the local workspace):
+# `calibration: pending` until the GPU calibration (tools/velocity_ladder on the campaign's cells) is done;
+# the policies refuse to start on a pending block. The blocks are written by
+#   python3 -m tre_baselines.tools.freeze_params {tokenscale|preserve} ... --write
+# (never edit them by hand); each block's first line names its sources' sha256.
 # Do not change any value after a comparison has been seen.
 apiVersion: v1
 kind: ConfigMap
@@ -53,38 +44,25 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   tokenscale.yaml: |
-    bucket_edges:            # tools/tokenscale_buckets on the per-request hot alt schedule
-      dsqwen-7b: {in: [489, 494], out: [400, 400]}
-      dsllama-8b: {in: [493, 497], out: [400, 400]}
-      dsqwen-14b: {in: [489, 494], out: [400, 400]}
-    velocity:                # tok/s per replica at the KNEE of open-loop Poisson ladders (highest throughput
-                             # with a bounded waiting queue: slope(num_requests_waiting) <= 2 % x offered req/s);
-                             # V_b = (in+out) tok/s, in 492 / out 400; v_prefill = V_P = prefill tok/s, out = 1
-                             # (one cell, written to all nine). Closed-loop maxima: sensitivity/tokenscale-aggressive.yaml
-      dsqwen-7b:             # V_b at 10.885 req/s (1.05 x), V_P at 35.0 req/s
-        buckets:
-          - [9313.7, 9313.7, 9313.7]
-          - [9313.7, 9313.7, 9313.7]
-          - [9313.7, 9313.7, 9313.7]
-        v_prefill: 16819.9
-      dsllama-8b:            # V_b at 8.14 req/s (1.1 x), V_P at 33.3 req/s
-        buckets:
-          - [6929.6, 6929.6, 6929.6]
-          - [6929.6, 6929.6, 6929.6]
-          - [6929.6, 6929.6, 6929.6]
-        v_prefill: 16036.6
-      dsqwen-14b:            # V_b at 7.809 req/s (1.1 x), V_P at 27.8 req/s
-        buckets:
-          - [6648.8, 6648.8, 6648.8]
-          - [6648.8, 6648.8, 6648.8]
-          - [6648.8, 6648.8, 6648.8]
-        v_prefill: 13394.8
-    out_len_source: max_tokens
+    # PENDING (tools/freeze_params tokenscale). Sources: none
+    calibration: pending
+    bucket_edges:            # paper (TokenScale Table II / DynamoLLM Table IV): in < 256 / < 1024 / else
+      "*": {in: [255, 1023], out: [99, 349]}   # (> 8192 is long too), out < 100 / < 350 / >= 350
+    bucket_centers:          # [in, out] per cell = mean of the campaign's requests in it (v1 D49), tools/tokenscale_buckets
+      dsqwen-7b: null
+      dsllama-8b: null
+      dsqwen-14b: null
+    velocity:                # (in+out) tok/s per replica at each centre: the PEAK of effective full steps
+                             # (waiting slope > 2 % x offered rps, v1 D53; tools/velocity_ladder), no V_P (D51)
+      dsqwen-7b: null
+      dsllama-8b: null
+      dsqwen-14b: null
+    out_len_source: max_tokens  # the true output picks the bucket before the simulated error
     default_out_tokens: 256  # not in paper
-    misbucket_rate: 0.15     # paper: 85 %-accurate length predictor
+    misbucket_rate: 0.15     # paper: 85 %-accurate length predictor; draw = hash(seed, model, client id)
     seed: 0
     skip_reissue: true
-    window_s: 30             # = TRE TSS window (30 s); paper gives no value; 10 s code default = sensitivity/tokenscale-window10.yaml
+    window_s: 30             # = TRE TSS window (30 s); paper gives no value
     max_estimate_frac: 0.05  # not in paper
 ---
 apiVersion: v1
@@ -96,35 +74,37 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   preserve.yaml: |
-    # Tier-1: the replayed trace + noise (oracle, not mLSTM: disclose). The trace is read from
-    # the per-environment trace volume (README "Trace volume"; on 75/76 the overlay
-    # deploy/baselines/tre-cluster-75-76): the per-request schedule the client replays, with the
-    # prompts stripped (same oracle). The replay marker must name the same trace (last
-    # trace_match_parts components). trace_seed only matters for a segment trace.json.
-    trace_path: /etc/tre-baselines-traces/Alternating_hot_model_periodic_A/traces_tre.effective.json
+    # PENDING (tools/freeze_params preserve). Sources: none
+    calibration: pending
+    # The trace: replaced per run by the campaign runner (its oracle copy in the trace volume); the
+    # history before t0 is <trace dir>/preserve_history.json next to it (tre_baselines.policies.preserve_history).
+    trace_path: /etc/tre-baselines-traces/case/seed1/traces_tre.effective.json
     trace_seed: 0
     trace_schedule: poisson
     trace_match_parts: 2
-    window_s: 30             # rule (fixed before any comparison, trace metadata only): the largest W in
-                             # {30, 60, 120, 300, 600} with W <= P/4 and W >= 10 x wake_p95; P = 220 s (same-model
-                             # hot period of the hot alt trace), wake_p95 ~3 s -> 30. Paper: 10 min = window >> action
-                             # time and << load period. Sensitivity: sensitivity/preserve-window600.yaml (paper value)
+    window_s: 30             # v1 D18 (paper 600 s; the traces are 12 min)
     lead_s: 0
-    tier1: oracle_noisy
-    noise_sigma: 0.07717607558419906   # lognormal sigma for mean APE 6.17 % (paper Table 1); sensitivity 0.30
-    mu:                      # tok/s per replica (engine counters): highest open-loop Poisson rate whose
-                             # steady-state requests meet p95 TTFT <= max(500, 5(c+bL)) and p95 TPOT <= 75 ms
-      dsqwen-7b: {p: 4404.3, d: 3579.5, t: 7983.9}     # 9.330 req/s offered (0.9 x), p95 TTFT 380 ms
-      dsllama-8b: {p: 3515.3, d: 2888.4, t: 6403.6}    # 7.400 req/s (1.0 x), p95 TTFT 472 ms
-      dsqwen-14b: {p: 3381.8, d: 2762.3, t: 6144.1}    # 7.099 req/s (1.0 x), p95 TTFT 499 ms (at the edge)
-    # Tier-2 (paper §4.3.1 / §4.3.2)
+    tier1: mlstm             # paper forecaster; v1 paper_past weights (train before the Real_* slices)
+    seq_len: 25
+    predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)
+      code: {path: weights/preserve-mlstm-20261024-paper/code-paper.npz, sha256: 3e70e4642829427ac5a528bfd6ff77e8e29335960adbab76832a6d5168251fb4}
+      conv: {path: weights/preserve-mlstm-20261024-paper/conv-paper.npz, sha256: 64448df062646bbb0cbe0ce8936330509172046c4bd2ee568b595b4ad4dc4478}
+      pooled: {path: weights/preserve-mlstm-20261024-paper/pooled-paper.npz, sha256: 0dfd5649600b2c86208528e3f0de5b19ac3266fc27af77c2189d6851134c1585}
+    predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled
+    mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,
+                             # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu
+      dsqwen-7b: null
+      dsllama-8b: null
+      dsqwen-14b: null
+    load_error_mode: paper_tab2   # paper RQ2 'PreServe w/ load errors' (Tab. 2 error model)
+    max_model_len: 131072
     map_factor: 1.2
-    lookahead_iters: 100
-    kv_high: 0.95
-    overload_frac: 0.10
-    t_f: 0.30
-    out_len_is_upper_bound: true
-    ext_frac: 0.2
-    kv_agree_tol: 0.15
-    hold_mode: target
+    lookahead_iters: 100     # paper l
+    kv_high: 0.95            # paper
+    overload_frac: 0.10      # paper
+    t_f: 0.30                # paper T_f
+    out_len_is_upper_bound: false   # load errors: D_hat is a prediction (paper refinement)
+    ext_frac: 0.2            # paper virtual extension
+    t2_reset_at_window: true # v1 D54 #2
+    kv_agree_tol: 0.15       # logged only (kv_disagree)
     req_ttl_s: 1800

@@ -21,7 +21,8 @@ Environment:
 ``TRE_REDIS_URL``           Redis URL (required)
 ``TRE_BL_POLICY``           policy name, a key of ``tre_baselines.policies.POLICIES``
 ``TRE_BL_DRY_RUN``          ``true`` (default): decide and log, never call the SM
-``TRE_BL_TICK_S``           tick period in seconds (default 2)
+``TRE_BL_TICK_S``           tick period in seconds (default 5: every baseline arm and the TRE
+                            fast loop ``TRE_RESCUE_INTERVAL_SECONDS`` run on the same cadence, v1 D20)
 ``TRE_BL_LOG_DIR``          decision JSONL directory (default ``./bl-logs``)
 ``TRE_BL_POLICY_CONFIG``    YAML file with the policy's parameters (optional)
 ``TRE_REGISTRY_PATH``       registry YAML (default ``/etc/tre/registry.yaml``)
@@ -98,7 +99,7 @@ class Config:
     redis_url: str
     policy: str
     dry_run: bool = True
-    tick_s: float = 2.0
+    tick_s: float = 5.0
     log_dir: str = "./bl-logs"
     policy_config_path: Optional[str] = None
     policy_params: Mapping[str, Any] = field(default_factory=dict)
@@ -226,7 +227,7 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         raise ValueError(f"TRE_BL_ABORT_SLEEP_PATH {abort_path!r} drains on this registry "
                          f"(service_manager.sleep.no_drain_paths="
                          f"{list(registry.service_manager().sleep.no_drain_paths)})")
-    tick_s = float(env.get("TRE_BL_TICK_S", "").strip() or 2.0)
+    tick_s = float(env.get("TRE_BL_TICK_S", "").strip() or 5.0)
     if tick_s <= 0:
         raise ValueError("TRE_BL_TICK_S must be > 0")
     port = env.get("TRE_BL_METRICS_PORT", "").strip()

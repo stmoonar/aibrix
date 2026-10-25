@@ -33,8 +33,9 @@ spec:
             # Decide and log only; set "false" (with the controller in observe) to actuate.
             - name: TRE_BL_DRY_RUN
               value: "true"
+            # = the TRE fast loop (TRE_RESCUE_INTERVAL_SECONDS of the controller overlay); guard test
             - name: TRE_BL_TICK_S
-              value: "2"
+              value: "5"
             - name: TRE_SM_URL
               value: http://tre-v2-service-manager:8000
             - name: TRE_REDIS_URL

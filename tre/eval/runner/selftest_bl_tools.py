@@ -18,7 +18,7 @@ def line(ts_s, awake, clamped, action="none", model="m", reason="r", **kw):
 
 
 def meta(phases, **kw):
-    m = {"part": "X", "policy": kw.pop("policy", "tokenscale"), "t_load_redis_ms": T0, "tick_s": 2, "settle_s": 10,
+    m = {"part": "X", "policy": kw.pop("policy", "tokenscale"), "t_load_redis_ms": T0, "tick_s": 5, "settle_s": 10,
          "max_changes": 1, "cap_awake": 4, "phases": phases}
     m.update(kw)
     return m
@@ -113,6 +113,18 @@ dec = [line(t, 1, 2, action="guard_controller_active") for t in range(0, 30, 2)]
 r = bt.analyze(meta([ph("steady", 0, 30)]), dec, None, "act")
 expect("guard_controller_active fails", not r["pass"])
 
+# decision validity (S5): tick coverage and frozen share over the replay window
+dv = [{"ts_ms": 1000 + 5000 * k, "model": "a", "tick": k, "policy": "preserve",
+       "inputs": {"frozen": k < 2}, "reason": "hold"} for k in range(12)]
+r = bt.decision_validity(dv, 1000, 60.0, 5.0)
+expect("decision validity: full coverage, frozen 2/12 refused", not r["valid"] and r["models"]["a"]["tick_cov"] == 1.0
+       and r["models"]["a"]["frozen_share"] == round(2 / 12, 4))
+r = bt.decision_validity([{**d, "inputs": {"frozen": False}} for d in dv[::2]], 1000, 60.0, 5.0)
+expect("decision validity: half the ticks refused", not r["valid"] and "tick coverage" in r["invalid_because"][0])
+r = bt.decision_validity([{**d, "inputs": {"frozen": False}} for d in dv], 1000, 60.0, 5.0)
+expect("decision validity: clean run", r["valid"])
+expect("frozen by reason", bt.is_frozen({"reason": "tier1_window+tier2_frozen", "inputs": {}}))
+
 # ---- file-based commands
 tmp = tempfile.mkdtemp()
 reg = os.path.join(tmp, "reg.yaml")
@@ -147,6 +159,7 @@ metadata: {name: tre-v2-baseline-preserve, namespace: tre-v2}
 data:
   preserve.yaml: |
     trace_path: /etc/tre-baselines-traces/Alt/traces_tre.effective.json
+    tier1: oracle
     mu: {a: {p: 1, d: 1, t: 8920}, b: {p: 1, d: 1, t: 7136}}
 """)
 rc, out = run("check-policy", "--policy", "chiron", "--live", live, "--registry", reg, "--frozen", cm)
@@ -155,13 +168,33 @@ open(live, "w").write("theta:\n  a: 0.46\n  b: 0.60\n")
 rc, out = run("check-policy", "--policy", "chiron", "--live", live, "--registry", reg, "--frozen", cm)
 expect("check-policy refuses frozen-different", rc == 2 and '"frozen_equal": false' in out)
 pl = os.path.join(tmp, "preserve.yaml")
-open(pl, "w").write("trace_path: /etc/tre-baselines-traces/Alt/traces_tre.effective.json\nmu: {a: {p: 1, d: 1, t: 8920}, b: {p: 1, d: 1, t: 7136}}\n")
+open(pl, "w").write("trace_path: /etc/tre-baselines-traces/Alt/traces_tre.effective.json\ntier1: oracle\n"
+                   "mu: {a: {p: 1, d: 1, t: 8920}, b: {p: 1, d: 1, t: 7136}}\n")
 rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg, "--frozen", cm,
               "--trace", "/root/x/icse_final/Alt/traces_tre.effective.json")
 expect("preserve trace tail match", rc == 0)
 rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg,
               "--trace", "/root/x/icse_final/Other/traces_tre.effective.json")
 expect("preserve trace tail mismatch refused", rc == 2 and "Tier-1" in out)
+
+# the 2026-10-26 schema: pending refuses; mlstm needs the predictor sha256; TokenScale has no V_P
+open(pl, "w").write("calibration: pending\ntrace_path: /x/Alt/t.json\nmu: {a: {p: 1, d: 1, t: 8920}, b: {p: 1, d: 1, t: 1}}\n")
+rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg)
+expect("preserve pending + no predictors refused", rc == 2 and "pending" in out and "predictors.pooled" in out)
+sha = "0" * 64
+open(pl, "w").write("trace_path: /x/Alt/t.json\nmu: {a: {p: 1, d: 1, t: 8920}, b: {p: 1, d: 1, t: 1}}\n"
+                   f"predictors: {{pooled: {{path: w/p.npz, sha256: '{sha}'}}}}\n")
+rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg)
+expect("preserve mlstm with predictors accepted", rc == 0)
+tl = os.path.join(tmp, "tokenscale.yaml")
+grid = "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]"
+cen = "[[[1, 1], [1, 2], [1, 3]], [[2, 1], [2, 2], [2, 3]], [[3, 1], [3, 2], [3, 3]]]"
+open(tl, "w").write(f"bucket_centers: {{'*': {cen}}}\nvelocity: {{a: {{buckets: {grid}}}, b: {{buckets: {grid}, v_prefill: 9}}}}\n")
+rc, out = run("check-policy", "--policy", "tokenscale", "--live", tl, "--registry", reg)
+expect("tokenscale v_prefill refused", rc == 2 and "velocity[b].v_prefill" in out and "velocity[a]" not in out)
+open(tl, "w").write(f"bucket_centers: {{'*': {cen}}}\nvelocity: {{a: {{buckets: {grid}}}, b: {{buckets: {grid}}}}}\n")
+rc, out = run("check-policy", "--policy", "tokenscale", "--live", tl, "--registry", reg)
+expect("tokenscale new schema accepted", rc == 0)
 
 pdir = os.path.join(tmp, "pol")
 os.makedirs(pdir)

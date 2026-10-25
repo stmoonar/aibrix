@@ -1,0 +1,4 @@
+# baseline shell only (PreServe mLSTM Tier-1: numpy forward pass of the v1 paper_past weights).
+# Pinned: the version on the 76 host where the weights were checked against v1 (v1 trained with numpy 2.2.6;
+# the forward pass uses only basic float64 array ops).
+numpy==1.26.4

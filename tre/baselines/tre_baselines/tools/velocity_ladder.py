@@ -43,7 +43,11 @@ Port of the TRE v1 tool (``tre_code`` dev ``python/tre_tokenscale/tools/profile_
   effective and **every** request sent in its window completed with NL <= SLO; mu_p / mu_d / mu_t
   = per term the highest engine rate over passing steps. Variant B (v1 D58, used) keeps only the
   cells whose P share in / (in + out) lies in the campaign traces' window share range
-  (``p_share.pooled`` [min, max] of the buckets report); variant A (all cells) is reported.
+  (``p_share.pooled`` of the buckets report, **[p5, p95]** by default, ``--p-share-range
+  minmax`` for v1's [min, max]); variant A (all cells) is reported. Deviation from v1 (coordinator
+  2026-10-26, recorded in the output as ``p_share_deviation``): v1's [min, max] was narrow because
+  v1's traces were; on the v2 set a few extreme 30 s windows would stretch it to almost [0.18, 0.94]
+  and let shapes far from the load pick mu, so the central 90 % of the merged windows is used.
 
 * ``summarize`` (offline): V / knees again from step logs (logs of runs over disjoint ``--cells``
   merge into one grid).
@@ -1395,6 +1399,8 @@ def mu_main(argv: List[str]) -> int:
     ap.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES)
     ap.add_argument("--route-timeout-s", type=float, default=DEFAULT_ROUTE_TIMEOUT_S)
     ap.add_argument("--max-fail-frac", type=float, default=DEFAULT_MAX_FAIL_FRAC)
+    ap.add_argument("--p-share-range", choices=["p5p95", "minmax"], default="p5p95",
+                    help="variant B's P-share range from p_share.pooled: [p5, p95] (default) or v1's [min, max]")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     models = [m.strip() for m in a.models.split(",") if m.strip()]
@@ -1402,12 +1408,19 @@ def mu_main(argv: List[str]) -> int:
                   min_samples=a.min_samples)
     rep = load_report(a.report)
     pooled = (rep.get("p_share") or {}).get("pooled") or {}
-    lo, hi = pooled.get("min"), pooled.get("max")
+    klo, khi = ("p5", "p95") if a.p_share_range == "p5p95" else ("min", "max")
+    lo, hi = pooled.get(klo), pooled.get(khi)
     if lo is None or hi is None:
-        print("error: the report has no p_share.pooled range", file=sys.stderr)
+        print(f"error: the report has no p_share.pooled {klo} / {khi}", file=sys.stderr)
         return 2
     ladder, iso = Path(a.ladder_dir), Path(a.isolated_dir)
-    summary: Dict[str, Any] = {"p_share_range": [lo, hi], "slo_factor": a.slo_factor, "models": {}}
+    summary: Dict[str, Any] = {"p_share_range": [lo, hi], "p_share_range_rule": f"pooled [{klo}, {khi}]",
+                               "slo_factor": a.slo_factor, "models": {}}
+    if a.p_share_range == "p5p95":
+        summary["p_share_deviation"] = (
+            f"v1 D58 used [min, max] = [{pooled.get('min')}, {pooled.get('max')}]; here [p5, p95]: v1's range was "
+            "narrow because v1's traces were, on this set a few extreme windows would let shapes far from the "
+            "load pick mu")
     all_rows: List[Dict[str, Any]] = []
     mu_b: Dict[str, Any] = {}
     for m in models:

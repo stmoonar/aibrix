@@ -3,8 +3,8 @@ event writer (Go) and the campaign, which repeat these literals."""
 from __future__ import annotations
 
 #: STREAM per model, written by the gateway (XADD * MAXLEN ~): request events
-#: ``kind=arr|ft|done`` with ``pod, req_id, in_tokens, in_src, max_tokens, out_tokens,
-#: status, reissue``. Entry ID = Redis server clock.
+#: ``kind=arr|ft|done`` with ``pod, req_id, client_id, in_tokens, in_src, max_tokens,
+#: out_tokens, status, reissue``. Entry ID = Redis server clock.
 REQ_STREAM_PREFIX = "tre:v2:bl:req:"
 #: STRING (JSON ``{"t0_ms", "trace_path", "seed"}``) written by the campaign at replay start.
 REPLAY_T0_KEY = "tre:v2:bl:replay_t0"

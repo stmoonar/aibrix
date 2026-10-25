@@ -308,6 +308,30 @@ def test_preserve_arm_gets_its_oracle_copy_and_rendered_policy(tmp_path):
             assert oracle[0]["timestamp"] != 0.0
 
 
+def test_preserve_mlstm_arm_gets_the_history_next_to_its_oracle_copy(tmp_path):
+    """tier1 mlstm (the default): the generator's pre_t0.json, else history_root's
+    preserve_history.json, lands next to the oracle copy; without one the arm is refused."""
+    hroot = tmp_path / "hist"
+    extra = {"traces": [{"trace": "Alternating", "arms": ["preserve"]}, {"trace": "Simul_spike", "arms": ["preserve"]}],
+             "arms": ["preserve"], "preserve": {"history_root": str(hroot)}}
+    write_campaign(tmp_path, traces=["Alternating", "Simul_spike"], arms=["preserve"], extra=extra)
+    (tmp_path / "bl.yaml").write_text(BL_CM.replace("tier1: oracle_noisy", "tier1: mlstm"))
+    (tmp_path / "traces" / "Alternating" / "seed1" / "pre_t0.json").write_text('{"format": "tre-pre-t0-v1"}')
+    real = hroot / "Simul_spike" / "seed1" / "preserve_history.json"
+    real.parent.mkdir(parents=True)
+    real.write_text('{"format": "tre-preserve-history-v1"}')
+    c = C.load_campaign(str(tmp_path / "campaign.yaml"))
+    entries = C.resolve_traces(c)
+    d = C.arm_def(c, "preserve")
+    for e, name in zip(entries, ("pre_t0.json", "preserve_history.json")):
+        rec = C.prepare_preserve(c, e, d, lambda _m: None)["record"]
+        assert Path(rec["history"]["path"]) == Path(rec["oracle_host_path"]).parent / name
+        assert Path(rec["history"]["path"]).read_text().startswith('{"format"')
+    real.unlink()
+    with pytest.raises(C.CampaignError, match="no PreServe history"):
+        C.prepare_preserve(c, entries[1], d, lambda _m: None)
+
+
 # ------------------------------------------------------------------ pieces
 def test_slice_and_shift_keep_ids_and_counts():
     recs = [{"request_id": f"r{i}", "timestamp": float(i)} for i in range(10)]

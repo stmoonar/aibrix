@@ -155,8 +155,8 @@ models:
   - {name: dsqwen-14b, max_awake_replicas: 4, slo: {ttft_p95_ms: 2000, tpot_p95_ms: 75, e2e_p95_ms: 15000}}
 EOF
 printf 'theta: {dsqwen-7b: 0.46, dsllama-8b: 0.534, dsqwen-14b: 0.46}\nalpha: 0.5\n' > $H/state/policy-chiron.yaml
-printf 'velocity: {dsqwen-7b: {buckets: [[12000]], v_prefill: 30000}, dsllama-8b: {buckets: [[10000]], v_prefill: 25000}, dsqwen-14b: {buckets: [[8000]], v_prefill: 20000}}\nwindow_s: 10\n' > $H/state/policy-tokenscale.yaml
-printf 'trace_path: /etc/tre-baselines-traces/Alt/traces_tre.effective.json\nwindow_s: 600\nmu: {dsqwen-7b: {p: 1, d: 1, t: 8920}, dsllama-8b: {p: 1, d: 1, t: 7136}, dsqwen-14b: {p: 1, d: 1, t: 6000}}\n' > $H/state/policy-preserve.yaml
+printf 'bucket_centers: {"*": [[[100, 50], [100, 200], [100, 500]], [[500, 50], [500, 200], [500, 500]], [[2000, 50], [2000, 200], [2000, 500]]]}\nvelocity: {dsqwen-7b: {buckets: [[12000, 12000, 12000], [12000, 12000, 12000], [12000, 12000, 12000]]}, dsllama-8b: {buckets: [[10000, 10000, 10000], [10000, 10000, 10000], [10000, 10000, 10000]]}, dsqwen-14b: {buckets: [[8000, 8000, 8000], [8000, 8000, 8000], [8000, 8000, 8000]]}}\nwindow_s: 10\n' > $H/state/policy-tokenscale.yaml
+printf 'trace_path: /etc/tre-baselines-traces/Alt/traces_tre.effective.json\nwindow_s: 30\ntier1: oracle\nload_error_mode: none\nmu: {dsqwen-7b: {p: 1, d: 1, t: 8920}, dsllama-8b: {p: 1, d: 1, t: 7136}, dsqwen-14b: {p: 1, d: 1, t: 6000}}\n' > $H/state/policy-preserve.yaml
 python3 - "$H/state/sm_state.json" <<'EOF'
 import json, sys
 ids = ["dsqwen-7b/nscc-ds-4a100-node9/0", "dsllama-8b/nscc-ds-4a100-node9/1", "dsqwen-14b/nscc-ds-4a100-node10/0,1"]

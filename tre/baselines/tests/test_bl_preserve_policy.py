@@ -1,4 +1,5 @@
-"""PreServe policy: event feed, iteration clock, Tier-2 thresholds, Tier-1 composition."""
+"""PreServe policy: event feed, iteration clock, Tier-2 thresholds, faithful composition (v1),
+mLSTM Tier-1, load errors."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,7 +11,7 @@ from tre_baselines import trace_oracle as to
 from tre_baselines.config import Config, ModelLimits
 from tre_baselines.policies import POLICIES, Policy, build_policy
 from tre_baselines.policies import preserve_tier1 as t1
-from tre_baselines.policies.preserve import PreServePolicy
+from tre_baselines.policies.preserve import PreServePolicy, predictor_set_for, trace_name_of
 from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, ReplayInfo, RequestEvent
 
 FIX = Path(__file__).resolve().parent / "fixtures"
@@ -20,9 +21,9 @@ MU = {"p": 100.0, "d": 100.0, "t": 150.0}
 ORACLE = to.build_oracle(
     [to.TraceRequest(10.0, "m", 60_000, 30_000), to.TraceRequest(20.0, "m", 60_000, 30_000),
      to.TraceRequest(700.0, "m", 60_000, 30_000), to.TraceRequest(1500.0, "m", 60_000, 0)],
-    path="repo/traces/case/trace.json", fmt=to.FORMAT_REQUESTS, window_s=600.0, duration_s=1500.0,
+    path="repo/traces/case/seed1/trace.json", fmt=to.FORMAT_REQUESTS, window_s=600.0, duration_s=1500.0,
 )
-REPLAY = ReplayInfo(t0_ms=0, trace_path="/mnt/x/traces/case/trace.json")
+REPLAY = ReplayInfo(t0_ms=0, trace_path="/mnt/x/traces/case/seed1/trace.json")
 
 
 def cfg(params: dict, models=("m",), seed: int = 0) -> Config:
@@ -33,7 +34,9 @@ def cfg(params: dict, models=("m",), seed: int = 0) -> Config:
 
 
 def make(**params) -> PreServePolicy:
-    p = {"mu": {"m": dict(MU)}, "max_output_len": 4096}
+    """The feed / Tier-2 tests: oracle Tier-1 on 600 s windows, no load errors."""
+    p = {"mu": {"m": dict(MU)}, "max_output_len": 4096, "tier1": "oracle", "load_error_mode": "none",
+         "window_s": 600.0}
     p.update(params)
     return PreServePolicy(cfg(p), oracle=ORACLE)
 
@@ -47,17 +50,19 @@ def pod(name: str, t: int, itl=(0.0, 0.0), M: Optional[int] = 10_000, *, running
                        num_gpu_blocks=blocks, block_size=bs, scraped_at_ms=t, events_cover=cover)
 
 
-def ev(kind: str, req: str, p: Optional[str], ts: int, inn=None, mx=None, reissue="none") -> RequestEvent:
+def ev(kind: str, req: str, p: Optional[str], ts: int, inn=None, mx=None, reissue="none",
+       cid: Optional[str] = "auto") -> RequestEvent:
     return RequestEvent(kind=kind, model="m", pod=p, req_id=req, ts_ms=ts, in_tokens=inn,
-                        in_src="header", max_tokens=mx, out_tokens=None, status=None, reissue=reissue)
+                        in_src="header", max_tokens=mx, out_tokens=None, status=None, reissue=reissue,
+                        client_id=f"c-{req}" if cid == "auto" else cid)
 
 
-def snap(now: int, pods, events=(), awake=None, unscraped=(), replay=None, since=0) -> ClusterSnapshot:
+def snap(now: int, pods, events=(), awake=None, unscraped=(), replay=None, since=0, tick_s=2.0) -> ClusterSnapshot:
     ms = ModelSnapshot(model="m", awake=len(pods) if awake is None else awake, min_replicas=1,
                        max_replicas=8, gpus_per_replica=1, ttft_slo_ms=500.0, tpot_slo_ms=75.0,
                        max_num_seqs=256, pods=tuple(pods), events=tuple(events), unscraped=tuple(unscraped),
                        events_since_ms=since)
-    return ClusterSnapshot(now_ms=now, tick_s=2.0, models={"m": ms}, replay=replay)
+    return ClusterSnapshot(now_ms=now, tick_s=tick_s, models={"m": ms}, replay=replay)
 
 
 def amap(policy: PreServePolicy, name: str = "p0"):
@@ -76,26 +81,34 @@ def test_registered_and_factory_fails_closed() -> None:
     trace = str(FIX / "preserve_trace_requests.json")
     models = ("dsqwen-7b", "dsllama-8b")
     mu = {m: dict(MU) for m in models}
-    policy = build_policy("preserve", cfg({"mu": mu, "trace_path": trace}, models))
+    base = {"mu": mu, "trace_path": trace, "tier1": "oracle"}
+    policy = build_policy("preserve", cfg(base, models))
     assert isinstance(policy, Policy) and policy.oracle.n_requests == 5
-    assert policy.map_length("dsqwen-7b") == 84  # trace max max_tokens 70 x 1.2
+    assert policy.map_length("dsqwen-7b") == 100  # trace max max_tokens 70 x 1.2 = 84 < l
     assert policy.map_length("unknown") == 4916  # 4096 x 1.2
-    per_model = build_policy("preserve", cfg({"mu": mu, "trace_path": trace,
-                                              "max_output_len": {"dsqwen-7b": 1000}}, models))
-    assert per_model.map_length("dsqwen-7b") == 1200 and per_model.map_length("dsllama-8b") == 600
+    assert policy.map_length("unknown", 0.01, 5.0) == 4916 and policy.map_length("dsqwen-7b", 0.01, 5.0) == 600
     with pytest.raises(ValueError, match="managed models"):
-        build_policy("preserve", cfg({"mu": {"dsqwen-7b": dict(MU)}, "trace_path": trace}, models))
+        build_policy("preserve", cfg({**base, "mu": {"dsqwen-7b": dict(MU)}}, models))
     with pytest.raises(ValueError):
-        build_policy("preserve", cfg({"trace_path": trace}, models))
+        build_policy("preserve", cfg({**base, "mu": None}, models))
     with pytest.raises(ValueError):
-        build_policy("preserve", cfg({"mu": {**mu, "dsqwen-7b": {"p": 1, "d": 1, "t": 0}},
-                                      "trace_path": trace}, models))
+        build_policy("preserve", cfg({**base, "mu": {**mu, "dsqwen-7b": {"p": 1, "d": 1, "t": 0}}}, models))
     with pytest.raises(ValueError, match="trace_path"):
-        build_policy("preserve", cfg({"mu": mu}, models))
-    with pytest.raises(ValueError):
-        build_policy("preserve", cfg({"mu": mu, "trace_path": trace, "tier1": "mlstm"}, models))
-    with pytest.raises(ValueError):
-        build_policy("preserve", cfg({"mu": mu, "trace_path": trace, "hold_mode": "x"}, models))
+        build_policy("preserve", cfg({"mu": mu, "tier1": "oracle"}, models))
+    with pytest.raises(ValueError, match="calibration pending"):
+        build_policy("preserve", cfg({**base, "calibration": "pending"}, models))
+    with pytest.raises(ValueError, match="upper bound"):  # D_hat with errors is a prediction
+        build_policy("preserve", cfg({**base, "out_len_is_upper_bound": True}, models))
+    # mlstm (the default) needs the weights with their sha256 and a history file next to the trace
+    with pytest.raises(ValueError, match="predictors"):
+        build_policy("preserve", cfg({"mu": mu, "trace_path": trace}, models))
+
+
+def test_trace_name_and_predictor_set() -> None:
+    assert trace_name_of("/etc/x/camp/plain/Real_code/seed1/traces_tre.effective.json") == "Real_code"
+    rules = [["Real_code", "code"], ["Real_conv", "conv"]]
+    assert predictor_set_for("Real_code", rules) == "code" and predictor_set_for("Real_conv", rules) == "conv"
+    assert predictor_set_for("Tight_pool", rules) == "pooled"
 
 
 # ------------------------------------------------------------- iteration clock
@@ -109,7 +122,7 @@ def test_iterations_follow_measured_tpot_and_events_land_at_their_time() -> None
     # itl counters: 64 tokens in 1.0 s -> TPOT 1/64 s -> 64 iterations per second
     d = p.decide(snap(3000, [pod("p0", 3000, (1.0, 64.0))],
                       [ev("arr", "r2", "p0", 1500, 0, 100), ev("ft", "r2", "p0", 2000)]))
-    assert d["m"].inputs["tier2"]["p0"]["tpot"] == "itl"
+    assert d["m"].inputs["tier2"]["p0"]["tpot_src"] == "itl"
     assert m.it == 128
     assert m.requests[("r2", "p0")].start == 64  # placed at its ft time, not at the tick
     assert m.at(0) == pytest.approx((1128 + 64) / 10_000)
@@ -121,13 +134,13 @@ def test_tpot_falls_back_to_the_slo_and_carries_fractions() -> None:
     p = make()
     p.decide(snap(1000, [pod("p0", 1000, (1.0, 64.0))]))
     d = p.decide(snap(3000, [pod("p0", 3000, (1.0, 64.0))]))  # no new ITL samples
-    assert d["m"].inputs["tier2"]["p0"]["tpot"] == "slo"
+    assert d["m"].inputs["tier2"]["p0"]["tpot_src"] == "slo"
     assert amap(p).it == 26  # 2 s / 75 ms = 26.67
     p.decide(snap(5000, [pod("p0", 5000, (1.0, 64.0))]))
     assert amap(p).it == 53  # 26.67 + 0.67 carried
     # a counter reset (engine restart) is not a sample either
     d = p.decide(snap(7000, [pod("p0", 7000, (0.1, 5.0))]))
-    assert d["m"].inputs["tier2"]["p0"]["tpot"] == "slo"
+    assert d["m"].inputs["tier2"]["p0"]["tpot_src"] == "slo"
     assert p.anomalies["m"]["counter_reset"] == 1
 
 
@@ -186,6 +199,7 @@ def test_pod_without_kv_capacity_is_skipped_unless_configured() -> None:
     p = make()
     d = p.decide(snap(1000, [pod("p0", 1000, M=None)]))
     assert d["m"].inputs["skipped"] == {"p0": "no_kv_capacity"}
+    assert d["m"].inputs["frozen"] is True and "no_kv_capacity" in d["m"].inputs["t2_hold"]
     q = make(kv_capacity_tokens={"m": 1000})
     q.decide(snap(1000, [pod("p0", 1000, M=None)], load("r", "p0", 1000, 500, 10)))
     assert amap(q).at(0) == pytest.approx(0.5)
@@ -197,201 +211,6 @@ def test_bookkeeping_expires_but_a_request_in_the_map_does_not() -> None:
     p.decide(snap(20_000, [pod("p0", 20_000)]))
     assert p._models["m"].arr == {} and p.anomalies["m"]["expired_arr"] == 1
     assert list(p._models["m"].active) == [("r", "p0")]  # leaves the map only on done
-
-
-# ------------------------------------------------------------------- Tier-2
-
-
-def test_overload_threshold_and_one_instance_per_overloaded_pod() -> None:
-    p = make()
-    pods = [pod("p0", 1000, M=1000), pod("p1", 1000, M=1000)]
-    # p0: U_i = (861+i)/1000 > 0.95 for i = 90..99 -> exactly 10 % -> not overloaded
-    d = p.decide(snap(1000, pods, load("a", "p0", 1000, 861, 200)))
-    assert d["m"].reason == "hold" and d["m"].desired == 2
-    assert d["m"].inputs["tier2"]["p0"]["overload_frac"] == pytest.approx(0.10)
-    # p1: 11 % above 0.95 -> overloaded -> one more instance
-    d = p.decide(snap(1000, pods, load("b", "p1", 1000, 862, 200)))
-    assert d["m"].reason == "tier2_overload" and d["m"].desired == 3
-    # still overloaded next tick: already credited, the target is held (awake lags)
-    d = p.decide(snap(1000, pods))
-    assert d["m"].reason == "hold" and d["m"].desired == 3
-    # the episode ends, then p1 overloads again -> one more
-    p.decide(snap(1000, pods, [ev("done", "b", "p1", 1000)]))
-    d = p.decide(snap(1000, pods, load("c", "p1", 1000, 990, 200)))
-    assert d["m"].reason == "tier2_overload" and d["m"].desired == 4
-    # two fresh overloaded pods in one tick -> +2 (clamped to the model max 8)
-    q = make()
-    d = q.decide(snap(1000, pods, load("a", "p0", 1000, 990, 200) + load("b", "p1", 1000, 990, 200)))
-    assert d["m"].desired == 4
-
-
-def test_hold_mode_awake_releases_the_target() -> None:
-    p = make(hold_mode="awake")
-    pods = [pod("p0", 1000, M=1000)]
-    assert p.decide(snap(1000, pods, load("a", "p0", 1000, 990, 200)))["m"].desired == 2
-    assert p.decide(snap(1000, pods))["m"].desired == 1
-
-
-def test_scale_down_formula_once_per_window_and_guards() -> None:
-    p = make()
-    def pods_at(t):
-        return [pod(f"p{i}", t, M=1000, kv=kv) for i, kv in enumerate((0.25, 0.2, 0.2, 0.0))]
-
-    pods = pods_at(1000)
-    events = load("a", "p0", 1000, 250) + load("b", "p1", 1000, 200) + load("c", "p2", 1000, 200)
-    # all max U < 0.3; keep ceil((0.25 + 0.2 + 0.2 + 0) / 0.3) = ceil(2.17) = 3 of 4
-    d = p.decide(snap(1000, pods, events))
-    assert d["m"].reason == "tier2_underload" and d["m"].desired == 3
-    # same window: no second scale-down
-    d = p.decide(snap(3000, pods_at(3000)))
-    assert d["m"].reason == "hold" and d["m"].desired == 3 and d["m"].inputs["down"] == "done_this_window"
-    # next window (wall-clock window of window_s while Tier-1 is inactive): allowed again
-    d = p.decide(snap(600_000, pods_at(600_000)))
-    assert d["m"].reason == "tier2_underload" and d["m"].desired == 3
-
-
-def test_scale_down_blockers() -> None:
-    def pods3(*kv, cover=True):
-        return [pod(f"p{i}", 1000, M=1000, kv=k, cover=cover) for i, k in enumerate(kv)]
-
-    ev3 = load("a", "p0", 1000, 250) + load("b", "p1", 1000, 200) + load("c", "p2", 1000, 200)
-    d = make().decide(snap(1000, pods3(0.25, 0.2, 0.2), ev3))  # keep 3 of 3
-    assert d["m"].reason == "hold" and d["m"].inputs["down"] == "no_gain"
-    d = make().decide(snap(1000, pods3(0.3, 0, 0), load("a", "p0", 1000, 300)))  # 0.30 is not below T_f
-    assert d["m"].inputs["down"] == "above_t_f"
-    d = make().decide(snap(1000, pods3(0, 0, 0), unscraped=("p9",), awake=4))
-    assert d["m"].inputs["down"] == "incomplete" and d["m"].desired == 4
-    d = make().decide(snap(1000, [], awake=2))
-    assert d["m"].inputs["down"] == "no_pods" and d["m"].desired == 2
-    # never below one instance
-    d = make().decide(snap(1000, pods3(0, 0, 0)))
-    assert d["m"].reason == "tier2_underload" and d["m"].desired == 1
-
-
-def test_unknown_is_not_idle_no_scale_down() -> None:
-    """Review repro: running 20, KV 0.9, empty event history -> was tier2_underload after
-    the 60 s grace. Now the map must be complete and agree with the engine's KV."""
-    p = make()
-    for t in (1000, 63_000, 600_000):
-        busy = [pod("p0", t, M=1000, running=20.0, kv=0.9, cover=False), pod("p1", t, M=1000, kv=0.0)]
-        d = p.decide(snap(t, busy, since=None))["m"]
-        assert (d.desired, d.inputs["down"]) == (2, "incomplete")
-    # complete events but the map (empty) disagrees with the engine's KV by > 0.15
-    d = make().decide(snap(1000, [pod("p0", 1000, M=1000, kv=0.9), pod("p1", 1000, M=1000, kv=0.0)]))["m"]
-    assert (d.desired, d.inputs["down"]) == (2, "incomplete") and d.inputs["kv_disagree"] == {"p0": [0.0, 0.9]}
-    # a KV gauge that is missing is unknown, not agreement
-    d = make().decide(snap(1000, [pod("p0", 1000, M=1000, kv=None), pod("p1", 1000, M=1000, kv=0.0)]))["m"]
-    assert d.inputs["down"] == "incomplete"
-    # the window's one scale-down was not used up: it happens once the evidence is complete
-    d = p.decide(snap(600_002, [pod("p0", 600_002, M=1000, kv=0.0), pod("p1", 600_002, M=1000, kv=0.0)]))["m"]
-    assert (d.desired, d.reason) == (1, "tier2_underload")
-
-
-# ------------------------------------------------------------ Tier-1 + composition
-
-
-def test_tier1_oracle_windows_and_hold() -> None:
-    p = make(tier1="oracle")
-    pods = [pod("p0", 1000)]
-    d = p.decide(snap(1000, pods, replay=REPLAY))
-    assert d["m"].reason == "tier1_window" and d["m"].desired == 2
-    assert d["m"].inputs["tier1"] == {"window": 0, "mode": "oracle", "P_hat": 120000.0,
-                                      "D_hat": 60000.0, "W": 600.0, "N": 2}
-    d = p.decide(snap(3000, pods, replay=REPLAY))  # same window; awake still 1
-    assert d["m"].reason == "hold" and d["m"].desired == 2
-    d = p.decide(snap(600_000, pods, replay=REPLAY))
-    assert d["m"].reason == "tier1_window" and d["m"].desired == 1
-    d = p.decide(snap(1_200_000, pods, awake=1, replay=REPLAY))  # partial last window (300 s)
-    assert d["m"].desired == 2 and d["m"].inputs["tier1"]["W"] == 300.0
-    d = p.decide(snap(1_800_000, pods, replay=REPLAY))
-    assert d["m"].reason == "hold" and d["m"].inputs["tier1"] == {"inactive": "tier1_after_trace"}
-
-
-def test_tier1_inactive_reasons() -> None:
-    pods = [pod("p0", 1000)]
-    assert make().decide(snap(1000, pods))["m"].inputs["tier1"] == {"inactive": "tier1_no_replay"}
-    other = ReplayInfo(0, "/mnt/x/traces/other/trace.json")
-    assert make().decide(snap(1000, pods, replay=other))["m"].inputs["tier1"] == {"inactive": "tier1_trace_mismatch"}
-    late = ReplayInfo(10_000, REPLAY.trace_path)
-    assert make().decide(snap(5000, pods, replay=late))["m"].inputs["tier1"] == {"inactive": "tier1_before_t0"}
-
-
-def test_tier1_plus_overload_in_the_same_tick() -> None:
-    p = make(tier1="oracle")
-    pods = [pod("p0", 1000, M=1000)]
-    d = p.decide(snap(1000, pods, load("a", "p0", 1000, 990, 200), replay=REPLAY))
-    assert d["m"].reason == "tier1_window+tier2_overload" and d["m"].desired == 3
-    d = p.decide(snap(1000, pods, replay=REPLAY))  # credited at the window start
-    assert d["m"].reason == "hold" and d["m"].desired == 3
-
-
-def test_last_window_mode() -> None:
-    p = make(tier1="last_window")
-    pods = [pod("p0", 1000)]
-    d = p.decide(snap(1000, pods, replay=REPLAY))
-    assert d["m"].reason == "tier1_no_history" and d["m"].desired == 1
-    d = p.decide(snap(600_000, pods, replay=REPLAY))
-    assert d["m"].reason == "tier1_window" and d["m"].desired == 2  # window 0's actual load
-    assert d["m"].inputs["tier1"]["P_hat"] == 120000.0
-
-
-def test_oracle_noisy_is_seeded_and_deterministic() -> None:
-    def run(seed: int):
-        p = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "max_output_len": 4096}, seed=seed), oracle=ORACLE)
-        seq = [snap(1000, [pod("p0", 1000)], load("a", "p0", 1000, 500, 50), replay=REPLAY),
-               snap(3000, [pod("p0", 3000, (1.0, 64.0))], replay=REPLAY),
-               snap(600_000, [pod("p0", 600_000, (2.0, 128.0))], replay=REPLAY)]
-        return [p.decide(s) for s in seq]
-
-    a, b = run(4), run(4)
-    assert a == b
-    inputs = a[0]["m"].inputs["tier1"]
-    assert inputs["mode"] == "oracle_noisy"
-    assert inputs["P_hat"] == round(120000 * t1.noise_factor(4, "m", 0, "P", t1.DEFAULT_NOISE_SIGMA), 1)
-    assert inputs["D_hat"] == round(60000 * t1.noise_factor(4, "m", 0, "D", t1.DEFAULT_NOISE_SIGMA), 1)
-    assert run(5)[0]["m"].inputs["tier1"]["P_hat"] != inputs["P_hat"]
-
-
-def test_model_without_mu_is_held() -> None:
-    p = PreServePolicy(cfg({"mu": {"m": dict(MU)}}, models=()), oracle=ORACLE)
-    ms = ModelSnapshot(model="z", awake=2, min_replicas=1, max_replicas=4, gpus_per_replica=1,
-                       ttft_slo_ms=500.0, tpot_slo_ms=75.0, max_num_seqs=None, pods=(), events=())
-    d = p.decide(ClusterSnapshot(now_ms=1, tick_s=2.0, models={"z": ms}))
-    assert d["z"].reason == "no_mu" and d["z"].desired == 2
-
-
-# ------------------------------------------------------------ replay seed from the marker
-
-
-def test_replay_seed_of_the_marker_wins_over_trace_seed_param() -> None:
-    trace = str(FIX / "preserve_trace_segments.json")
-    params = {"mu": {"m": dict(MU)}, "trace_path": trace, "trace_seed": 0, "window_s": 60.0}
-    p = PreServePolicy(cfg(params))
-    seed0 = to.load_oracle(trace, window_s=60.0, seed=0)
-    seed7 = to.load_oracle(trace, window_s=60.0, seed=7)
-    assert seed0.totals != seed7.totals  # the seed really moves the arrivals
-    assert p.oracle.totals == seed0.totals
-    # no seed in the marker: the param stays in force
-    p.decide(snap(1000, [pod("p0", 1000)], replay=ReplayInfo(t0_ms=0, trace_path=trace)))
-    assert p.oracle.totals == seed0.totals
-    # marker seed: the oracle is rebuilt once with it
-    p.decide(snap(2000, [pod("p0", 2000)], replay=ReplayInfo(t0_ms=0, trace_path=trace, seed=7)))
-    assert p.oracle.totals == seed7.totals and p._oracle_seed == 7
-    oracle = p.oracle
-    p.decide(snap(3000, [pod("p0", 3000)], replay=ReplayInfo(t0_ms=0, trace_path=trace, seed=7)))
-    assert p.oracle is oracle  # not reloaded again
-    # a marker without seed after that keeps the last one (the marker is per run)
-    p.decide(snap(4000, [pod("p0", 4000)], replay=ReplayInfo(t0_ms=0, trace_path=trace)))
-    assert p.oracle is oracle
-
-
-def test_injected_oracle_is_never_replaced_by_the_marker_seed() -> None:
-    p = make()
-    p.decide(snap(1000, [pod("p0", 1000)], replay=ReplayInfo(t0_ms=0, trace_path="x/trace.json", seed=3)))
-    assert p.oracle is ORACLE
-
-
-# ------------------------------------------------------------ review fixes (P1 / P2)
 
 
 def test_map_clears_only_on_done() -> None:
@@ -429,44 +248,8 @@ def test_event_after_the_scrape_is_not_out_of_order() -> None:
     assert p.anomalies["m"]["out_of_order"] == 0 and amap(p).it == 53  # 26 + 27 (carry)
 
 
-def test_second_replay_restarts_tier1_at_window_0() -> None:
-    p = make(tier1="oracle")
-    pods = [pod("p0", 1000)]
-    assert p.decide(snap(1000, pods, replay=REPLAY))["m"].reason == "tier1_window"
-    d = p.decide(snap(600_000, pods, replay=REPLAY))
-    assert d["m"].inputs["tier1"]["window"] == 1 and d["m"].desired == 1
-    second = ReplayInfo(t0_ms=5_000_000, trace_path=REPLAY.trace_path)
-    d = p.decide(snap(5_001_000, pods, replay=second))  # a new run, same shell
-    assert d["m"].reason == "tier1_window" and d["m"].inputs["tier1"]["window"] == 0
-    assert d["m"].desired == 2
-    d = p.decide(snap(5_003_000, pods, replay=second))
-    assert d["m"].reason == "hold"
-
-
-def test_tier2_never_isolates_below_the_windows_tier1_n() -> None:
-    """Review P1-3: at a window start Tier-1 provisions N=2 before the burst fills the
-    look-ahead maps; Tier-2 used to isolate back to 1 on the next tick (empty maps)."""
-    p = make(tier1="oracle")
-    two = lambda t, kv=(0.0, 0.0): [pod(f"p{i}", t, M=1000, kv=k) for i, k in enumerate(kv)]  # noqa: E731
-    d = p.decide(snap(1000, two(1000), replay=REPLAY))["m"]
-    assert (d.reason, d.desired, d.inputs["tier1_n"]) == ("tier1_window", 2, 2)
-    d = p.decide(snap(3000, two(3000), replay=REPLAY))["m"]  # empty maps: Tier-2 wants 1
-    assert d.desired == 2 and d.reason == "hold" and d.inputs["tier2_below_t1"] == 1
-    # Tier-2 may add above N ...
-    d = p.decide(snap(5000, two(5000, (0.99, 0.0)), load("a", "p0", 5000, 990, 200), replay=REPLAY))["m"]
-    assert (d.reason, d.desired) == ("tier2_overload", 3)
-    # ... and isolate back down to N, not below
-    p.decide(snap(7000, two(7000, (0.99, 0.0)), [ev("done", "a", "p0", 7000)], replay=REPLAY))
-    three = [pod(f"p{i}", 9000, M=1000, kv=0.0) for i in range(3)]
-    d = p.decide(snap(9000, three, replay=REPLAY))["m"]
-    assert (d.reason, d.desired) == ("tier2_underload", 2) and d.inputs["tier2_below_t1"] == 1  # once per window
-    # next window N=1: the floor follows the window
-    d = p.decide(snap(600_000, two(600_000), awake=2, replay=REPLAY))["m"]
-    assert d.desired == 1 and d.inputs["tier1_n"] == 1
-
-
 def test_ft_for_a_pod_not_yet_in_the_snapshot_is_applied_when_it_appears() -> None:
-    """Review P2-5: the event stream can run ahead of /v2/state (a pod just woke)."""
+    """The event stream can run ahead of /v2/state (a pod just woke)."""
     p = make()
     p.decide(snap(1000, [pod("p0", 1000)], load("r", "p1", 1000, 500, 100) + load("s", "p1", 1000, 300, 100)))
     assert p.anomalies["m"]["ft_buffered"] == 2 and p.anomalies["m"]["unknown_pod"] == 0
@@ -475,3 +258,319 @@ def test_ft_for_a_pod_not_yet_in_the_snapshot_is_applied_when_it_appears() -> No
     assert list(amap(p, "p1").requests) == [("r", "p1")] and p._models["m"].active == {("r", "p1"): "p1"}
     assert d.inputs["anom"]["ft_buffered_applied"] == 1 and p.anomalies["m"]["done_while_buffered"] == 1
     assert amap(p, "p1").requests[("r", "p1")].start == 0 and amap(p, "p1").it == 26  # walked from 1000 ms
+
+
+# ------------------------------------------------------------------- Tier-2 (faithful)
+
+
+def test_overload_threshold_and_one_instance_per_overloaded_pod() -> None:
+    p = make()
+    pods = [pod("p0", 1000, M=1000), pod("p1", 1000, M=1000)]
+    # p0: U_i = (861+i)/1000 > 0.95 for i = 90..99 -> exactly 10 % at every start offset -> not overloaded
+    d = p.decide(snap(1000, pods, load("a", "p0", 1000, 861, 100)))
+    assert d["m"].reason == "hold" and d["m"].desired == 2 and d["m"].inputs["n_t2"] == 2  # starts at awake
+    assert d["m"].inputs["tier2"]["p0"]["overload_frac"] == pytest.approx(0.10)
+    # p1: 11 % above 0.95 -> overloaded -> one more instance on the current count
+    d = p.decide(snap(1000, pods, load("b", "p1", 1000, 862, 100)))
+    assert d["m"].reason == "tier2_overload" and d["m"].desired == 3
+    # still overloaded next tick: already credited, the count is held (awake lags)
+    d = p.decide(snap(1000, pods))
+    assert d["m"].reason == "hold" and d["m"].desired == 3
+    # the episode ends, then p1 overloads again -> one more
+    p.decide(snap(1000, pods, [ev("done", "b", "p1", 1000)]))
+    d = p.decide(snap(1000, pods, load("c", "p1", 1000, 990, 200)))
+    assert d["m"].reason == "tier2_overload" and d["m"].desired == 4
+    # two fresh overloaded pods in one tick -> +2
+    q = make()
+    d = q.decide(snap(1000, pods, load("a", "p0", 1000, 990, 200) + load("b", "p1", 1000, 990, 200)))
+    assert d["m"].desired == 4
+
+
+def test_overload_ahead_of_now_before_the_next_tick_is_caught() -> None:
+    """v1 D55: the map's load crosses kv_high only past U[0:l) but before the next tick
+    (start offsets up to H = ceil(tick / TPOT)): overloaded now, not one tick late."""
+    pods = [pod("p0", 1000, M=1000)]
+    # U_i = (840 + i)/1000 > 0.95 from i = 111: U[0:100) is clean
+    d = make().decide(snap(1000, pods, load("a", "p0", 1000, 840, 300), tick_s=2.0))["m"]
+    row = d.inputs["tier2"]["p0"]
+    assert row["overload_frac"] == 0.0 and row["H"] == 27 and row["t_star"] == 22
+    assert (d.reason, d.desired) == ("tier2_overload", 2)
+    # a shorter tick (H = 7) does not reach it
+    d = make().decide(snap(1000, pods, load("a", "p0", 1000, 840, 300), tick_s=0.5))["m"]
+    assert d.inputs["tier2"]["p0"]["t_star"] is None and d.desired == 1
+
+
+def test_scale_down_formula_once_per_window() -> None:
+    p = make()
+
+    def pods_at(t):
+        return [pod(f"p{i}", t, M=1000, kv=kv) for i, kv in enumerate((0.25, 0.2, 0.2, 0.0))]
+
+    events = load("a", "p0", 1000, 250) + load("b", "p1", 1000, 200) + load("c", "p2", 1000, 200)
+    # all max U < 0.3; keep ceil((0.25 + 0.2 + 0.2 + 0) / 0.3) = ceil(2.17) = 3 of 4
+    d = p.decide(snap(1000, pods_at(1000), events))
+    assert d["m"].reason == "tier2_underload" and d["m"].desired == 3
+    d = p.decide(snap(3000, pods_at(3000)))  # same window: no second change
+    assert d["m"].reason == "hold" and d["m"].desired == 3 and d["m"].inputs["down"] == "done_this_window"
+    d = p.decide(snap(600_000, pods_at(600_000)))  # next wall-clock window (Tier-1 inactive)
+    assert d["m"].reason == "hold" and d["m"].inputs["down"] == "no_gain"  # 3 is not below N_T2 = 3
+
+
+def test_scale_down_blockers_and_floor() -> None:
+    def pods3(*kv):
+        return [pod(f"p{i}", 1000, M=1000, kv=k) for i, k in enumerate(kv)]
+
+    ev3 = load("a", "p0", 1000, 250) + load("b", "p1", 1000, 200) + load("c", "p2", 1000, 200)
+    d = make().decide(snap(1000, pods3(0.25, 0.2, 0.2), ev3))  # keep 3 of 3
+    assert d["m"].reason == "hold" and d["m"].inputs["down"] == "no_gain"
+    d = make().decide(snap(1000, pods3(0.3, 0, 0), load("a", "p0", 1000, 300)))  # 0.30 is not below T_f
+    assert d["m"].inputs["down"] == "above_t_f"
+    d = make().decide(snap(1000, [], awake=2))
+    assert d["m"].inputs["down"] == "no_pods" and d["m"].desired == 2
+    d = make().decide(snap(1000, pods3(0, 0, 0)))  # never below one instance
+    assert d["m"].reason == "tier2_underload" and d["m"].desired == 1
+
+
+def test_incomplete_evidence_freezes_tier2_in_both_directions() -> None:
+    """v1 D56 / D64: an evidence gap holds Tier-2 (no overload credit, no underload), logged as
+    ``frozen``; once the evidence is complete Tier-2 acts again."""
+    p = make()
+    for t in (1000, 63_000):
+        busy = [pod("p0", t, M=1000, running=20.0, kv=0.9, cover=False), pod("p1", t, M=1000, kv=0.0)]
+        d = p.decide(snap(t, busy, since=None))["m"]
+        assert (d.desired, d.inputs["down"], d.inputs["frozen"]) == (2, "tier2_hold", True)
+        assert "tier2_frozen" in d.reason and set(d.inputs["t2_hold"]) == {"event_gap", "no_event_history"}
+    # an overload during a gap is not credited either
+    d = p.decide(snap(64_000, [pod("p0", 64_000, M=1000, kv=0.99), pod("p1", 64_000, M=1000)],
+                      load("a", "p0", 64_000, 990, 200), unscraped=("p9",), awake=3))["m"]
+    assert d.inputs["frozen"] is True and d.desired == 2 and d.inputs["t2_hold"] == ["unscraped"]
+    # complete: the pending overload is acted on
+    d = p.decide(snap(65_000, [pod("p0", 65_000, M=1000, kv=0.99), pod("p1", 65_000, M=1000)]))["m"]
+    assert d.inputs["frozen"] is False and (d.reason, d.desired) == ("tier2_overload", 3)
+    assert p.counters()["m"]["t2_hold_ticks"] == 3 and p.counters()["m"]["ticks"] == 4
+
+
+def test_kv_disagreement_is_logged_not_a_gate() -> None:
+    d = make().decide(snap(1000, [pod("p0", 1000, M=1000, kv=0.9), pod("p1", 1000, M=1000, kv=None)]))["m"]
+    assert d.inputs["kv_disagree"] == {"p0": [0.0, 0.9], "p1": [0.0, None]}
+    assert (d.reason, d.desired, d.inputs["frozen"]) == ("tier2_underload", 1, False)
+
+
+# ------------------------------------------------------------ Tier-1 + composition
+
+
+def test_desired_is_max_of_the_two_tiers_and_a_window_start_resets_tier2() -> None:
+    p = make(tier1="oracle")
+    pods = [pod("p0", 1000, M=1000)]
+    d = p.decide(snap(1000, pods, replay=REPLAY))["m"]
+    assert d.reason == "tier1_window" and (d.desired, d.inputs["n_t1"], d.inputs["n_t2"]) == (2, 2, 1)
+    assert d.inputs["tier1"] == {"window": 0, "mode": "oracle", "P_hat": 120000.0, "D_hat": 60000.0, "W": 600.0, "N": 2}
+    d = p.decide(snap(3000, pods, replay=REPLAY))["m"]  # same window, empty map: Tier-2 cannot isolate below N_T1
+    assert d.desired == 2
+    # an overload adds on max(N_T1, N_T2)
+    d = p.decide(snap(5000, [pod("p0", 5000, M=1000, kv=0.99)], load("a", "p0", 5000, 990, 200), replay=REPLAY))["m"]
+    assert (d.reason, d.desired, d.inputs["n_t2"]) == ("tier2_overload", 3, 3)
+    # window 1: N_T1 = 1 and N_T2 back to the minimum; the still-overloaded pod counts again on the new base
+    d = p.decide(snap(600_000, [pod("p0", 600_000, M=1000, kv=0.99)], replay=REPLAY))["m"]
+    assert d.reason == "tier1_window+tier2_overload" and (d.inputs["n_t1"], d.inputs["n_t2"], d.desired) == (1, 2, 2)
+
+
+def test_tier1_is_never_held_by_an_evidence_gap() -> None:
+    """v1 D56: Tier-1 reads no Tier-2 signal; a window whose forecast is lower scales down
+    even while Tier-2 is frozen."""
+    p = make(tier1="oracle")
+    p.decide(snap(1000, [pod("p0", 1000)], replay=REPLAY))
+    d = p.decide(snap(600_000, [pod("p0", 600_000, cover=False), pod("p1", 600_000)], awake=2, since=None,
+                      replay=REPLAY))["m"]
+    assert d.inputs["frozen"] is True and d.inputs["n_t1"] == 1
+    assert d.desired == 1 and d.inputs["n_t2"] == 1  # the window start resets N_T2; frozen does not hold Tier-1
+
+
+def test_tier1_after_the_trace_keeps_its_last_value_before_t0_none() -> None:
+    p = make(tier1="oracle")
+    pods = [pod("p0", 1000)]
+    p.decide(snap(1000, pods, replay=REPLAY))
+    d = p.decide(snap(1_200_000, pods, replay=REPLAY))["m"]  # partial last window (300 s)
+    assert d.inputs["n_t1"] == 2 and d.inputs["tier1"]["W"] == 300.0
+    d = p.decide(snap(1_800_000, pods, replay=REPLAY))["m"]
+    assert d.inputs["tier1"] == {"inactive": "tier1_after_trace"} and d.inputs["n_t1"] == 2
+    late = ReplayInfo(10_000, REPLAY.trace_path)
+    d = make().decide(snap(5000, pods, replay=late))["m"]
+    assert d.inputs["tier1"] == {"inactive": "tier1_before_t0"} and d.inputs["n_t1"] is None
+    other = ReplayInfo(0, "/mnt/x/traces/case/seed2/trace.json")  # trace_match_parts 2
+    assert make().decide(snap(1000, pods, replay=other))["m"].inputs["tier1"] == {"inactive": "tier1_trace_mismatch"}
+
+
+def test_oracle_noisy_is_seeded_and_deterministic() -> None:
+    def run(seed: int):
+        p = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "max_output_len": 4096, "tier1": "oracle_noisy",
+                                "load_error_mode": "none", "window_s": 600.0}, seed=seed), oracle=ORACLE)
+        return p.decide(snap(1000, [pod("p0", 1000)], replay=REPLAY))["m"].inputs["tier1"]
+
+    a = run(4)
+    assert a == run(4) and a["mode"] == "oracle_noisy"
+    assert a["P_hat"] == round(120000 * t1.noise_factor(4, "m", 0, "P", t1.DEFAULT_NOISE_SIGMA), 1)
+    assert run(5)["P_hat"] != a["P_hat"]
+
+
+def test_model_without_mu_is_held() -> None:
+    p = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "tier1": "oracle", "load_error_mode": "none",
+                            "window_s": 600.0}, models=()), oracle=ORACLE)
+    ms = ModelSnapshot(model="z", awake=2, min_replicas=1, max_replicas=4, gpus_per_replica=1,
+                       ttft_slo_ms=500.0, tpot_slo_ms=75.0, max_num_seqs=None, pods=(), events=())
+    d = p.decide(ClusterSnapshot(now_ms=1, tick_s=2.0, models={"z": ms}))
+    assert d["z"].reason == "no_mu" and d["z"].desired == 2 and d["z"].inputs["frozen"] is False
+
+
+def test_replay_seed_of_the_marker_wins_over_trace_seed_param() -> None:
+    trace = str(FIX / "preserve_trace_segments.json")
+    params = {"mu": {"m": dict(MU)}, "trace_path": trace, "trace_seed": 0, "window_s": 60.0, "tier1": "oracle",
+              "load_error_mode": "none"}
+    p = PreServePolicy(cfg(params))
+    seed0 = to.load_oracle(trace, window_s=60.0, seed=0)
+    seed7 = to.load_oracle(trace, window_s=60.0, seed=7)
+    assert seed0.totals != seed7.totals and p.oracle.totals == seed0.totals
+    p.decide(snap(2000, [pod("p0", 2000)], replay=ReplayInfo(t0_ms=0, trace_path=trace, seed=7)))
+    assert p.oracle.totals == seed7.totals and p._oracle_seed == 7
+
+
+# ------------------------------------------------------------ mLSTM Tier-1
+
+
+class _Mean:
+    """A stand-in forecaster: the mean of its input (records every call)."""
+
+    seq_len = 3
+
+    def __init__(self) -> None:
+        self.calls: list[list[float]] = []
+
+    def predict(self, history):
+        self.calls.append(list(history))
+        return sum(history) / len(history)
+
+
+def mlstm(history=None, **params):
+    preds = {"prompt": _Mean(), "response": _Mean()}
+    p = {"mu": {"m": dict(MU)}, "tier1": "mlstm", "seq_len": 3, "load_error_mode": "none", "window_s": 30.0}
+    p.update(params)
+    oracle = to.build_oracle([to.TraceRequest(1.0, "m", 1, 1), to.TraceRequest(89.0, "m", 1, 1)],
+                             path=ORACLE.path, fmt=to.FORMAT_REQUESTS, window_s=30.0, duration_s=89.0)
+    pol = PreServePolicy(cfg(p), oracle=oracle, predictors=preds,
+                         history={"m": history or [[3000.0, 1500.0]] * 3})
+    return pol, preds
+
+
+def test_mlstm_history_holds_the_past_then_observed_windows_never_a_prediction() -> None:
+    p, preds = mlstm(history=[[900.0, 300.0], [3000.0, 1500.0], [6000.0, 3000.0]])
+    pods = [pod("p0", 1000)]
+    d = p.decide(snap(1000, pods, replay=REPLAY))["m"]
+    # window 0: mean of the pre-t0 history (3300, 1600) -> N = ceil(max(3300/3000, 1600/3000, 4900/4500)) = 2
+    assert d.inputs["tier1"]["P_hat"] == 3300.0 and d.inputs["tier1"]["N"] == 2 and d.inputs["n_t1"] == 2
+    # arrivals of window 0: new demand only (a reissue is not), with their max_tokens
+    evs = [ev("arr", "a", "p0", 5000, 1200, 600), ev("arr", "b", "p0", 6000, 1800, 300),
+           ev("arr", "a", "p0", 7000, 1300, 500, reissue="continued")]
+    p.decide(snap(8000, pods, evs, replay=REPLAY))
+    d = p.decide(snap(30_500, pods, replay=REPLAY))["m"]
+    assert preds["prompt"].calls[-1] == [3000.0, 6000.0, 3000.0]  # observed P of window 0 = 3000
+    assert preds["response"].calls[-1] == [1500.0, 3000.0, 900.0]
+    assert d.inputs["tier1"]["last_closed"] == {"window": 0, "P": 3000.0, "D": 900.0, "requests": 2, "flags": []}
+    # a window with no arrival closes as zero, never as the forecast
+    d = p.decide(snap(60_500, pods, replay=REPLAY))["m"]
+    assert preds["prompt"].calls[-1] == [6000.0, 3000.0, 0.0]
+
+
+def test_mlstm_flags_a_window_observed_through_an_event_gap_and_restarts_per_replay() -> None:
+    p, preds = mlstm()
+    p.decide(snap(1000, [pod("p0", 1000)], replay=REPLAY))
+    p.decide(snap(2000, [pod("p0", 2000, cover=False)], replay=REPLAY))
+    d = p.decide(snap(30_500, [pod("p0", 30_500)], replay=REPLAY))["m"]
+    assert d.inputs["tier1"]["last_closed"]["flags"] == ["event_gap"]
+    second = ReplayInfo(t0_ms=5_000_000, trace_path=REPLAY.trace_path)
+    d = p.decide(snap(5_000_100, [pod("p0", 5_000_100)], replay=second))["m"]
+    assert d.inputs["tier1"]["window"] == 0 and preds["prompt"].calls[-1] == [3000.0] * 3  # fresh history
+
+
+def test_mlstm_refuses_a_short_history() -> None:
+    with pytest.raises(ValueError, match="history"):
+        mlstm(history=[[1.0, 1.0]] * 2)
+
+
+def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
+    np = pytest.importorskip("numpy")
+    from tre_baselines.policies import preserve_history as ph
+    from tre_baselines.tools import freeze_params as fp
+
+    sha = fp.weights_sha256()
+    trace = tmp_path / "Real_code" / "seed1" / "trace.json"
+    trace.parent.mkdir(parents=True)
+    trace.write_text('[{"timestamp": 1.0, "model_name": "m", "prompt_length": 100, "max_output_tokens": 50}]')
+    hist = {"format": ph.FORMAT, "trace": "Real_code", "window_s": 30,
+            "models": {"m": [[30000.0 + 100 * i, 15000.0] for i in range(25)]}}
+    (trace.parent / ph.DEFAULT_NAME).write_text(__import__("json").dumps(hist))
+    params = {"mu": {"m": dict(MU)}, "trace_path": str(trace), "load_error_mode": "none",
+              "predictors": {k: {"path": f"{fp.WEIGHTS}/{k}-paper.npz", "sha256": v} for k, v in sha.items()}}
+    p = build_policy("preserve", cfg(params))
+    assert p.predictor_set == "code" and p.history_info["trace"] == "Real_code"
+    est = p._predictors["prompt"].predict(p._history["m"] and [r[0] for r in p._history["m"]])
+    assert np.isfinite(est) and 0 < est < 1e6
+    bad = {**params, "predictors": {**params["predictors"], "code": {"path": f"{fp.WEIGHTS}/code-paper.npz",
+                                                                     "sha256": "0" * 64}}}
+    with pytest.raises(ValueError, match="sha256"):
+        build_policy("preserve", cfg(bad))
+    (trace.parent / ph.DEFAULT_NAME).unlink()
+    with pytest.raises(ValueError, match="history"):
+        build_policy("preserve", cfg(params))
+
+
+# ------------------------------------------------------------ load errors
+
+
+def test_load_errors_are_a_function_of_the_client_id_and_enter_the_map() -> None:
+    def run(order):
+        p = make(load_error_mode="paper_tab2", out_len_is_upper_bound=False)
+        evs = [e for r in order for e in (ev("arr", r, "p0", 1000, 100, 400), ev("ft", r, "p0", 1000))]
+        d = p.decide(snap(1000, [pod("p0", 1000)], evs))["m"]
+        return {k[0]: req.D_pred for k, req in amap(p).requests.items()}, d.inputs["load_err"]
+
+    ids = [f"r{i}" for i in range(400)]
+    fwd, info = run(ids)
+    assert run(list(reversed(ids)))[0] == fwd  # not the arrival order
+    assert any(v != 400 for v in fwd.values()) and all(v >= 1 for v in fwd.values())
+    assert info["cum"]["n"] == 400 and 40 < info["cum"]["mae"] < 120  # Tab. 2 MAE 78.25
+    assert sorted(r[0] for r in info["new"]) == sorted(f"c-{r}" for r in ids)
+    # a reissue repeats its original's error and is not counted again
+    p = make(load_error_mode="paper_tab2", out_len_is_upper_bound=False)
+    d = p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)],
+                      [ev("arr", "x", "p0", 1000, 100, 400), ev("ft", "x", "p0", 1000),
+                       ev("arr", "x", "p1", 1000, 100, 400, "retried"), ev("ft", "x", "p1", 1000, reissue="retried")]))
+    assert amap(p, "p0").requests[("x", "p0")].D_pred == amap(p, "p1").requests[("x", "p1")].D_pred
+    assert d["m"].inputs["load_err"]["cum"]["n"] == 1
+
+
+def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:
+    """``pre_t0.json`` (tre-pre-t0-v1) next to a synthetic trace is the default history; it must be
+    contiguous windows ending at t0 and name the replayed trace and seed."""
+    import json
+
+    from tre_baselines.policies import preserve_history as ph
+
+    d = tmp_path / "Tight_pool" / "seed2"
+    d.mkdir(parents=True)
+    trace = d / "traces_tre.effective.json"
+    trace.write_text("[]")
+    assert ph.default_path(str(trace)) == str(d / ph.DEFAULT_NAME)  # Real_*: no pre_t0.json
+    wins = [{"start_s": -90.0 + 30 * i, "end_s": -60.0 + 30 * i, "requests": 1, "prompt_tokens": 100 * (i + 1),
+             "output_tokens": 10 * (i + 1)} for i in range(3)]
+    doc = {"format": ph.PRE_T0_FORMAT, "trace": "Tight_pool", "seed": 2, "t0_s": 0.0, "window_s": 30.0,
+           "windows": {"m": wins}, "requests": []}
+    (d / ph.PRE_T0_NAME).write_text(json.dumps(doc))
+    assert ph.default_path(str(trace)) == str(d / ph.PRE_T0_NAME)
+    kw = dict(window_s=30.0, models=["m"], seq_len=3, trace="Tight_pool", seed=ph.seed_of(str(trace)))
+    hist, info = ph.load(ph.default_path(str(trace)), **kw)
+    assert hist == {"m": [(100.0, 10.0), (200.0, 20.0), (300.0, 30.0)]} and info["format"] == ph.PRE_T0_FORMAT
+    for bad, match in (({"seed": 1}, "seed"), ({"trace": "Simul_spike"}, "trace"), ({"window_s": 60.0}, "window_s"),
+                       ({"windows": {"m": wins[:1] + wins[2:]}}, "contiguous"),
+                       ({"windows": {"m": wins[1:]}}, "seq_len")):
+        with pytest.raises(ph.HistoryError, match=match):
+            ph.parse({**doc, **bad}, **kw)

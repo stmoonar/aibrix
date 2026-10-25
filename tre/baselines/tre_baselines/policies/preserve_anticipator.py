@@ -1,5 +1,10 @@
 """PreServe instance load anticipator (§4.3.1): the per-pod load-look-ahead map.
 
+Back-port of the TRE v1 file (``tre_code`` dev ``ceb88b4``, ``tre_preserve/anticipator.py``; decision
+2026-10-26): v2's map plus :meth:`LookaheadMap.grow` (the D55 overload scan reads up to one tick
+ahead) and ``ActiveRequest.max_tokens`` (with load errors ``D_pred`` is a prediction). In v2 a
+request enters the map at its first token (``ft`` event); in v1 at ``routed``.
+
 ``U[i]`` is the predicted KV usage (fraction of the pod's token capacity ``M``) ``i``
 iterations from now. It is kept as a ring of ``length`` slots indexed by *absolute*
 iteration ``a`` (slot ``a % length``); the head ``it`` is the current iteration, so the
@@ -23,7 +28,10 @@ live part is ``[it, it + length)`` and ``U[i]`` of the paper is slot ``(it + i) 
   - ``out_len_is_upper_bound=False`` (the paper, section 4.3.1): extend ``D`` by
     ``ext_frac * D_pred`` (paper: 0.2), repeatedly, while the head is at or beyond the
     planned end. The paper needs this because its response-length predictor can
-    under-estimate; ``max_tokens`` cannot.
+    under-estimate; ``max_tokens`` cannot. Used with load errors (``tre_preserve.load_errors``:
+    ``D_pred`` = the erroneous prediction ``D_hat``). The paper writes the extension as
+    ``0.2 D_hat`` with ``D_hat`` its symbol for the ground truth, which is unknown while the
+    request runs, so the base is the prediction (upstream instead extends by a fixed 30 tokens).
 * Advancing the head by ``k`` consumes (zeroes) ``k`` slots and reveals ``k`` new tail
   slots, which are filled from the requests still active. Contributions beyond the
   current tail are never written early, so a request longer than the ring (``D`` above
@@ -55,11 +63,13 @@ class ActiveRequest:
     #: Absolute iteration up to which (exclusive) its contribution has been written.
     filled: int
     extensions: int = 0
-    #: Redis-clock ms of the ``ft`` event.
+    #: Redis-clock ms of the event that added it (v2: ``ft``; v1: ``routed``).
     ts_ms: int = 0
     #: Upper-bound mode: the output length the value never grows past (``D_pred``);
     #: beyond it an overdue request holds ``(P + cap) / M``. None = paper mode.
     cap: Optional[int] = None
+    #: The request's own ``max_tokens`` when ``D_pred`` is a prediction (load errors), logged.
+    max_tokens: Optional[int] = None
 
     def value(self, a: int) -> float:
         i = a - self.start
@@ -106,7 +116,8 @@ class LookaheadMap:
         else:
             req.filled = max(req.filled, lo)
 
-    def add(self, key: Hashable, P: int, D: int, M: float, ts_ms: int = 0) -> ActiveRequest:
+    def add(self, key: Hashable, P: int, D: int, M: float, ts_ms: int = 0,
+            max_tokens: Optional[int] = None) -> ActiveRequest:
         """Prefill of ``key`` finished at the current head. Replaces an active ``key``."""
         if M <= 0:
             raise ValueError("KV capacity M must be > 0")
@@ -114,7 +125,8 @@ class LookaheadMap:
             self.remove(key)
         D = max(0, int(D))
         req = ActiveRequest(P=max(0, int(P)), D_pred=D, D=D, start=self.it, M=float(M),
-                            filled=self.it, ts_ms=int(ts_ms), cap=D if self.upper_bound else None)
+                            filled=self.it, ts_ms=int(ts_ms), cap=D if self.upper_bound else None,
+                            max_tokens=max_tokens)
         self.requests[key] = req
         self._fill(req)
         return req
@@ -128,6 +140,24 @@ class LookaheadMap:
         if req.filled > lo:
             self._write(req, lo, req.filled, -1.0)
         return req
+
+    def grow(self, length: int) -> None:
+        """Lengthen the ring to ``length`` slots (never shrinks). The live values keep their
+        absolute iterations; every request then fills the newly visible tail exactly as
+        :meth:`advance` would (an overdue upper-bound request again holds its full size over the
+        whole visible ring)."""
+        n = int(length)
+        if n <= self.length:
+            return
+        live = [self.U[(self.it + i) % self.length] for i in range(self.length)]
+        self.U = [0.0] * n
+        for i, v in enumerate(live):
+            self.U[(self.it + i) % n] = v
+        self.length = n
+        for req in self.requests.values():
+            if req.overdue:
+                req.D = self.it + n - req.start
+            self._fill(req)
 
     def _extend(self, req: ActiveRequest) -> None:
         step = max(1, int(math.ceil(self.ext_frac * req.D_pred)))

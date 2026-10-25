@@ -1,39 +1,45 @@
-# PreServe-oracle baseline parameters (TRE_BL_POLICY=preserve, TRE_BL_POLICY_CONFIG=<this file>).
-# Tier-1 uses the replayed trace plus noise (an oracle), not the paper's mLSTM: disclose.
-# See tre_baselines/policies/preserve.py for the full table (paper vs ours).
+# PreServe baseline parameters (TRE_BL_POLICY=preserve, TRE_BL_POLICY_CONFIG=<this file>).
+# Paper Tier-1 (mLSTM, v1 paper_past weights) + Tier-2 with the paper's Tab. 2 load errors,
+# composed as TRE v1's faithful PreServe. Full table (paper vs ours): tre_baselines/policies/preserve.py.
+# The deployed block is rendered by tools/freeze_params (deploy/baselines/tre/policy-configmaps.yaml).
+calibration: pending      # remove (or "frozen") once mu is measured; pending refuses to start
 
 # --- Tier-1 (window-level provisioning, paper §4.1 / Alg.2) ---
-# The trace the campaign replays, as mounted in the shell pod (read once at start): the
-# deployment's `traces` volume is mounted at /etc/tre-baselines-traces (an emptyDir until
-# patched, see README "Trace volume"); traces shipped in the image live under
-# /app/tre/replayer/traces_*. The replay marker tre:v2:bl:replay_t0 must name the same
-# trace (last trace_match_parts path components equal), otherwise Tier-1 stays inactive.
-trace_path: /etc/tre-baselines-traces/case/trace.json   # replace with the run's trace
-trace_seed: 0            # = the replay's --seed (segment traces are re-scheduled from it)
-trace_schedule: poisson  # what tre_replayer.run_trace sends
+# The replayed trace as mounted in the shell pod (the campaign runner replaces it per run). The
+# replay marker tre:v2:bl:replay_t0 must name the same trace (last trace_match_parts parts).
+trace_path: /etc/tre-baselines-traces/case/seed1/traces_tre.effective.json
+# history_path: <trace dir>/preserve_history.json   # the windows before t0 (preserve_history)
+trace_seed: 0             # = the replay's --seed (segment traces are re-scheduled from it)
+trace_schedule: poisson
 trace_match_parts: 2
-window_s: 600            # paper: 10 min (main runs; a 720 s trace fires Tier-1 twice: disclose).
-                         # sensitivity: 60
+window_s: 30              # v1 D18 (paper 600 s; the traces are 12 min)
 lead_s: 0
-tier1: oracle_noisy      # oracle_noisy | oracle | last_window
-# noise_sigma: 0.0772    # default: lognormal sigma with mean APE 6.17 % (paper Table 1); sensitivity: 0.30
-# Per-replica serving capability, tok/s (tools/preserve_mu.py over a calibration capture).
-# Required for every managed model: the policy refuses to start without it.
+tier1: mlstm              # paper; sensitivity: oracle_noisy | oracle | last_window
+seq_len: 25
+predictors:               # relative paths are under tre/baselines; sha256 is checked at start
+  code: {path: weights/preserve-mlstm-20261024-paper/code-paper.npz, sha256: <sha256>}
+  conv: {path: weights/preserve-mlstm-20261024-paper/conv-paper.npz, sha256: <sha256>}
+  pooled: {path: weights/preserve-mlstm-20261024-paper/pooled-paper.npz, sha256: <sha256>}
+predictor_rules: [[Real_code, code], [Real_conv, conv]]   # by trace name prefix; else pooled
+# Per-replica serving capability, tok/s (tools/velocity_ladder mu, variant B). Required for
+# every managed model.
 mu:
-  dsqwen-7b: {p: 0.0, d: 0.0, t: 0.0}    # placeholders: fill from preserve_mu output
+  dsqwen-7b: {p: 0.0, d: 0.0, t: 0.0}    # placeholders
   dsllama-8b: {p: 0.0, d: 0.0, t: 0.0}
   dsqwen-14b: {p: 0.0, d: 0.0, t: 0.0}
 
 # --- Tier-2 (in-window, per pod, paper §4.3.1 / §4.3.2) ---
-# max_output_len: 4096   # default: the trace's largest max_tokens per model, else 4096
-map_factor: 1.2          # ring length = ceil(max_output_len * map_factor)
-lookahead_iters: 100     # paper l
-kv_high: 0.95            # paper
-overload_frac: 0.10      # paper
-t_f: 0.30                # paper T_f
-out_len_is_upper_bound: true  # ours: max_tokens is a hard cap in vLLM -> no virtual extension
-ext_frac: 0.2            # paper virtual extension (only used when out_len_is_upper_bound: false)
+load_error_mode: paper_tab2   # paper RQ2 "PreServe w/ load errors"; none = max_tokens exact
+max_model_len: 131072
+# max_output_len: 4096    # default: the trace's largest max_tokens per model, else 4096
+map_factor: 1.2
+lookahead_iters: 100      # paper l
+kv_high: 0.95             # paper
+overload_frac: 0.10       # paper
+t_f: 0.30                 # paper T_f
+out_len_is_upper_bound: false   # must be false with load errors (D_hat is a prediction)
+ext_frac: 0.2             # paper virtual extension
+t2_reset_at_window: true  # v1 D54 #2
 # kv_capacity_tokens: {dsqwen-7b: 100000}   # only if a pod lacks vllm:cache_config_info
-kv_agree_tol: 0.15       # ours: Tier-2 scale-down needs |U[0] - engine KV usage| <= this per pod
-hold_mode: target        # target | awake
-req_ttl_s: 1800          # ours: GC of arr/done bookkeeping only (a request leaves the map on done)
+kv_agree_tol: 0.15        # logged only (kv_disagree)
+req_ttl_s: 1800           # GC of arr/done bookkeeping only (a request leaves the map on done)
