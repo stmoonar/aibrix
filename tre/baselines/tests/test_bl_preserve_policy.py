@@ -118,15 +118,15 @@ def test_trace_name_and_predictor_set() -> None:
 
 def test_iterations_follow_measured_tpot_and_events_land_at_their_time() -> None:
     p = make()
-    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "r1", "p0", 900, 1000, 512), ev("ft", "r1", "p0", 1000)]))
+    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "r1", "p0", 1000, 1000, 512)]))
     m = amap(p)
     assert m.it == 0 and m.at(0) == pytest.approx(0.1) and m.at(511) == pytest.approx(0.1511)
     # itl counters: 64 tokens in 1.0 s -> TPOT 1/64 s -> 64 iterations per second
     d = p.decide(snap(3000, [pod("p0", 3000, (1.0, 64.0))],
-                      [ev("arr", "r2", "p0", 1500, 0, 100), ev("ft", "r2", "p0", 2000)]))
+                      [ev("arr", "r2", "p0", 2000, 0, 100), ev("ft", "r2", "p0", 2500)]))
     assert d["m"].inputs["tier2"]["p0"]["tpot_src"] == "itl"
     assert m.it == 128
-    assert m.requests[("r2", "p0")].start == 64  # placed at its ft time, not at the tick
+    assert m.requests[("r2", "p0")].start == 64  # placed at its arr (route) time, not at its ft or the tick
     assert m.at(0) == pytest.approx((1128 + 64) / 10_000)
     assert m.at(35) == pytest.approx((1163 + 99) / 10_000)
     assert m.at(36) == pytest.approx(1164 / 10_000)
@@ -173,26 +173,27 @@ def test_out_of_order_unknown_and_missing_events_do_not_crash() -> None:
     events = [
         ev("done", "zz", "p0", 5000),                                  # unknown request
         ev("arr", "q", "p0", 5000, 10, 5), ev("done", "q", "p0", 5000),
-        ev("ft", "q", "p0", 5000),                                     # ft after its done
-        ev("ft", "w", "p0", 5000, 100, 10),                            # ft without arr
-        ev("arr", "x", "pZ", 5000, 10, 5), ev("ft", "x", "pZ", 5000),  # pod not in snapshot (yet)
-        ev("arr", "y", "p0", 5000, 10, None), ev("ft", "y", "p0", 5000),  # no max_tokens
-        ev("arr", "v", None, 5000, None, 5), ev("ft", "v", "p0", 5000),   # no in_tokens, arr without pod
-        ev("ft", "o", "p0", 4000, 1, 1),                               # older than the pod's clock
+        ev("ft", "q", "p0", 5000),                                     # ft after its done: ignored
+        ev("ft", "w", "p0", 5000, 100, 10),                            # ft without arr: ignored
+        ev("arr", "x", "pZ", 5000, 10, 5),                             # pod not in snapshot (yet)
+        ev("arr", "y", "p0", 5000, 10, None),                          # no max_tokens
+        ev("arr", "u", "p0", 5000, None, 5),                           # no in_tokens
+        ev("arr", "v", None, 5000, 10, 5),                             # arr without pod (not routed)
+        ev("arr", "o", "p0", 4000, 1, 1),                              # older than the pod's clock
     ]
     d = p.decide(snap(5000, pods, events))
     anom = p.anomalies["m"]
-    assert anom["unknown_req"] == 1 and anom["done_before_ft"] == 1 and anom["ft_after_done"] == 1
-    assert anom["ft_without_arr"] == 2 and anom["ft_buffered"] == 1  # pZ: kept until it appears
+    assert anom["unknown_req"] == 1 and anom["unknown_pod"] == 1
+    assert anom["arr_buffered"] == 1  # pZ: kept until it appears
     assert anom["missing_max_tokens"] == 1 and anom["missing_in_tokens"] == 1
     assert anom["out_of_order"] == 1
     assert d["m"].inputs["anom"]["unknown_req"] == 1
     m = amap(p)
-    assert set(m.requests) == {("w", "p0"), ("y", "p0"), ("v", "p0"), ("o", "p0")}
+    assert set(m.requests) == {("y", "p0"), ("u", "p0"), ("o", "p0")}
     assert m.requests[("y", "p0")].D == 4096  # max_output_len stands in for max_tokens
     assert m.at(4095) == pytest.approx((10 + 4095) / 10_000) and m.at(4096) == 0.0
     # the pod disappears: its map goes, a later done is just unknown
-    p.decide(snap(7000, [], [ev("done", "w", "p0", 6000)], awake=0))
+    p.decide(snap(7000, [], [ev("done", "y", "p0", 6000)], awake=0))
     assert "p0" not in p._models["m"].pods and p._models["m"].active == {}
     assert anom["pod_dropped"] == 1 and anom["unknown_req"] == 2
 
@@ -209,9 +210,9 @@ def test_pod_without_kv_capacity_is_skipped_unless_configured() -> None:
 
 def test_bookkeeping_expires_but_a_request_in_the_map_does_not() -> None:
     p = make(req_ttl_s=10)
-    p.decide(snap(1000, [pod("p0", 1000)], load("r", "p0", 1000, 100, 10) + [ev("arr", "s", "p0", 1000, 5, 5)]))
+    p.decide(snap(1000, [pod("p0", 1000)], load("r", "p0", 1000, 100, 10) + [ev("arr", "s", "pZ", 1000, 5, 5)]))
     p.decide(snap(20_000, [pod("p0", 20_000)]))
-    assert p._models["m"].arr == {} and p.anomalies["m"]["expired_arr"] == 1
+    assert p._models["m"].pending == {} and p.anomalies["m"]["expired_buffered_arr"] == 1
     assert list(p._models["m"].active) == [("r", "p0")]  # leaves the map only on done
 
 
@@ -250,16 +251,47 @@ def test_event_after_the_scrape_is_not_out_of_order() -> None:
     assert p.anomalies["m"]["out_of_order"] == 0 and amap(p).it == 53  # 26 + 27 (carry)
 
 
-def test_ft_for_a_pod_not_yet_in_the_snapshot_is_applied_when_it_appears() -> None:
+def test_arr_for_a_pod_not_yet_in_the_snapshot_is_applied_when_it_appears() -> None:
     """The event stream can run ahead of /v2/state (a pod just woke)."""
     p = make()
     p.decide(snap(1000, [pod("p0", 1000)], load("r", "p1", 1000, 500, 100) + load("s", "p1", 1000, 300, 100)))
-    assert p.anomalies["m"]["ft_buffered"] == 2 and p.anomalies["m"]["unknown_pod"] == 0
+    assert p.anomalies["m"]["arr_buffered"] == 2 and p.anomalies["m"]["unknown_pod"] == 0
     p.decide(snap(1500, [pod("p0", 1500)], [ev("done", "s", "p1", 1400)]))  # s ends before p1 shows up
     d = p.decide(snap(3000, [pod("p0", 3000), pod("p1", 3000)]))["m"]
     assert list(amap(p, "p1").requests) == [("r", "p1")] and p._models["m"].active == {("r", "p1"): "p1"}
-    assert d.inputs["anom"]["ft_buffered_applied"] == 1 and p.anomalies["m"]["done_while_buffered"] == 1
+    assert d.inputs["anom"]["arr_buffered_applied"] == 1 and p.anomalies["m"]["done_while_buffered"] == 1
     assert amap(p, "p1").requests[("r", "p1")].start == 0 and amap(p, "p1").it == 26  # walked from 1000 ms
+
+
+def test_a_routed_request_counts_before_its_first_token() -> None:
+    """v1 parity (2026-10-26): the map books a request at its route decision (``arr``), so a
+    request queued in vLLM counts before its first token; it leaves on done or abort."""
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "q", "p0", 1000, 2000, 50),
+                                            ev("arr", "a", "p0", 1000, 1000, 50)]))
+    assert amap(p).at(0) == pytest.approx(0.3)  # no ft yet: both count
+    # an idle scrape right after the route is no done: the request may not have reached the engine
+    p.decide(snap(1500, [pod("p0", 1500, running=0.0)], [ev("ft", "q", "p0", 1400)]))
+    assert set(amap(p).requests) == {("q", "p0"), ("a", "p0")}  # ft changed nothing
+    p.decide(snap(1600, [pod("p0", 1600)], [ev("done", "a", "p0", 1600)]))  # abort (status canceled)
+    assert set(amap(p).requests) == {("q", "p0")}
+    p.decide(snap(1700, [pod("p0", 1700)], [ev("done", "q", "p0", 1700)]))
+    assert amap(p).requests == {} and amap(p).total() == 0.0
+
+
+def test_a_slept_then_woken_pod_starts_with_an_empty_map() -> None:
+    """Events of a pod's earlier awake period (read late, or buffered while it slept) never
+    enter its map after it wakes; events routed after it left the snapshot still do."""
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)], load("r1", "p0", 1000, 500, 100)))
+    pods1 = [pod("p1", 3000)]
+    p.decide(snap(3000, pods1, [ev("arr", "r2", "p0", 2500, 500, 100)], awake=1))  # p0 slept
+    assert "p0" not in p._models["m"].pods
+    p.decide(snap(8000, [pod("p1", 8000)], [ev("arr", "r3", "p0", 2900, 500, 100),     # read late
+                                            ev("arr", "r5", "p0", 7000, 300, 100)], awake=1))  # after its wake
+    d = p.decide(snap(9000, [pod("p0", 9000), pod("p1", 9000)], [ev("arr", "r4", "p0", 8500, 200, 100)]))
+    assert set(amap(p).requests) == {("r5", "p0"), ("r4", "p0")}
+    assert p.anomalies["m"]["buffered_stale"] == 2 and d["m"].inputs["anom"]["arr_buffered_applied"] == 1
 
 
 # ------------------------------------------------------------------- Tier-2 (faithful)

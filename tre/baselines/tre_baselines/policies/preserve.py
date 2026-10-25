@@ -43,15 +43,26 @@ Iterations vs wall clock (ours, as v1 and v2 before): a pod's head advances ``dt
 iterations, fraction carried; ``TPOT_pod`` = mean inter-token latency between the pod's last two
 scrapes, else the model's TPOT SLO. Each event first walks its pod to the event's Redis time.
 
-A request enters the map at its first token (``ft``) with ``P`` = ``in_tokens`` and ``D_hat`` =
-the predicted output: ``clip(max_tokens + err, 1, max_model_len - P)`` with load errors
-(``load_error_mode: paper_tab2``, the paper's RQ2 headline arm; the draw is a function of
-``(seed, model, client request id)``), then the map runs the paper's refinement (early end on
-``done``, virtual extension ``ext_frac`` x ``D_hat`` while running past it); without load
-errors ``D_hat`` = ``max_tokens``, a hard cap (no extension, overdue requests keep their size).
-A request leaves the map on its ``done`` (or when its pod is gone, or the engine reports nothing
-in flight). Non-streaming requests have no ``ft`` before they end, so they are not in the map
-(the experiments stream).
+A request enters the map at its ``arr`` event, which the gateway writes once the target pod is
+chosen (the route decision; v1 ``routed``, 2026-10-26 v1 parity), so requests queued inside
+vLLM count too (v1 discloses this as a strengthening against the paper, which books at prefill
+done). It enters with ``P`` = ``in_tokens`` and ``D_hat`` = the predicted output:
+``clip(max_tokens + err, 1, max_model_len - P)`` with load errors (``load_error_mode:
+paper_tab2``, the paper's RQ2 headline arm; the draw is a function of ``(seed, model, client
+request id)``), then the map runs the paper's refinement (early end on ``done``, virtual
+extension ``ext_frac`` x ``D_hat`` while running past it); without load errors ``D_hat`` =
+``max_tokens``, a hard cap (no extension, overdue requests keep their size). Its head starts at
+the ``arr`` time; ``ft`` changes nothing (v1 has no first-token event). A reissue (sidecar
+retry / continuation) is a new gateway request with its own ``arr`` / ``done``: a new map entry
+(Tier-1 does not count it). A request leaves the map on its ``done`` (or when its pod is gone,
+or the engine reports nothing in flight at a scrape at least ``ENGINE_IDLE_MARGIN_MS`` after its
+``arr``: a request routed just before the scrape may not have reached the engine yet, v1).
+
+Events for a pod the snapshot does not show are buffered (the stream can run ahead of
+``/v2/state`` when a pod just woke) and applied when it appears. A pod that leaves the snapshot
+(slept) drops its map and its buffer, and an event for it stamped at or before the tick that saw
+it gone is discarded, also when read later: a woken pod starts with an empty map (its earlier
+requests were interrupted and continued elsewhere).
 
 Params (``config.policy_params``, example ``examples/preserve.yaml``):
 
@@ -93,7 +104,7 @@ ext_frac                0.2                    paper (virtual extension, with lo
 t2_reset_at_window      true                   v1 D54 #2
 kv_capacity_tokens      {}                     ours: M per model when the pod lacks cache_config
 kv_agree_tol            0.15                   ours: logged only (``kv_disagree``)
-req_ttl_s               1800                   ours: forget arr/done bookkeeping older than this
+req_ttl_s               1800                   ours: forget buffered events older than this
 ======================  =====================  ================================================
 """
 from __future__ import annotations
@@ -118,6 +129,9 @@ LOG = logging.getLogger(__name__)
 DEFAULT_MAX_OUTPUT_LEN = 4096
 DEFAULT_PREDICTOR_RULES = (("Real_code", "code"), ("Real_conv", "conv"))
 DEFAULT_PREDICTOR_SET = "pooled"
+#: An idle engine clears only map entries routed at least this long before the scrape (v1
+#: ``ENGINE_IDLE_MARGIN_MS``): a request routed just before it may not have reached the engine.
+ENGINE_IDLE_MARGIN_MS = 1000
 #: tre/baselines (in the image /app/tre/baselines): relative predictor paths resolve here.
 BASELINES_ROOT = Path(__file__).resolve().parents[2]
 
@@ -146,12 +160,12 @@ class _ArrInfo:
 @dataclass
 class _ModelState:
     pods: dict[str, _PodState] = field(default_factory=dict)
-    arr: dict[tuple[str, Optional[str]], _ArrInfo] = field(default_factory=dict)
-    #: (req_id, pod) whose ``done`` came before their ``ft`` -> ts_ms.
-    tombstones: dict[tuple[str, Optional[str]], int] = field(default_factory=dict)
-    #: pod -> request key -> (arr info, ft ts): ``ft`` events for a pod the snapshot does
-    #: not show yet (the stream can run ahead of /v2/state); applied when the pod appears.
-    pending_ft: dict[str, dict[tuple[str, Optional[str]], tuple["_ArrInfo", int]]] = field(default_factory=dict)
+    #: pod -> request key -> arr info: ``arr`` events for a pod the snapshot does not show
+    #: yet (the stream can run ahead of /v2/state); applied when the pod appears.
+    pending: dict[str, dict[tuple[str, Optional[str]], "_ArrInfo"]] = field(default_factory=dict)
+    #: pod -> ``now_ms`` of the last tick that saw it leave the snapshot: an event for it
+    #: stamped at or before this belongs to the earlier awake period and is discarded.
+    gone_ms: dict[str, int] = field(default_factory=dict)
     #: active request key -> pod holding it.
     active: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
     #: (replay t0_ms, window index) of the last Tier-1 firing.
@@ -359,7 +373,7 @@ class PreServePolicy:
         """v1 D55: emulate a checker that runs every iteration between two ticks. For every start
         offset t in [0, H] the paper window U[t, t + l) is overloaded when more than
         ``overload_frac`` of it is above ``kv_high``; the pod is when any t is. The map holds only
-        requests already started, so a window ahead is a lower bound of the load then (without
+        requests already routed, so a window ahead is a lower bound of the load then (without
         load errors). Returns (fraction at t = 0, H, first overloaded t or None, the largest
         fraction, U[0, l))."""
         l = self.l
@@ -383,7 +397,8 @@ class PreServePolicy:
 
     # ------------------------------------------------------------- Tier-2 feed
 
-    def _sync_pods(self, ms: ModelSnapshot, st: _ModelState, anom: Counter, skipped: dict, tick_s: float) -> None:
+    def _sync_pods(self, ms: ModelSnapshot, st: _ModelState, anom: Counter, skipped: dict, tick_s: float,
+                   now_ms: int) -> None:
         present = {p.pod: p for p in ms.pods}
         keep = set(present) | set(ms.unscraped)
         for name in [n for n in st.pods if n not in keep]:
@@ -392,6 +407,11 @@ class PreServePolicy:
             for key in list(dropped.amap.requests):
                 st.active.pop(key, None)
             st.credited.discard(name)
+            # a slept pod: its buffered and later-read earlier events must not return at its wake
+            stale = st.pending.pop(name, None)
+            if stale:
+                anom["buffered_stale"] += len(stale)
+            st.gone_ms[name] = int(now_ms)
         fallback = ms.tpot_slo_ms / 1000.0
         for name, pod in present.items():
             ps = st.pods.get(name)
@@ -429,37 +449,30 @@ class PreServePolicy:
     def _on_event(self, ms: ModelSnapshot, st: _ModelState, e: RequestEvent, anom: Counter,
                   t1m: Optional[tier1.MlstmTier1]) -> None:
         key = (e.req_id, e.pod)
-        if e.kind == "arr":
-            st.arr[key] = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms), e.draw_key, e.reissue != "none")
+        if e.kind == "arr":  # the route decision (v1 ``routed``): the request enters the map
             if not e.client_id:
                 anom["no_client_id"] += 1
             if t1m is not None and e.reissue == "none":  # Tier-1 counts new demand only
                 t1m.observe_arrival(int(e.ts_ms), e.in_tokens, e.max_tokens)
-            return
-        if e.kind == "ft":
-            if key in st.tombstones or (e.req_id, None) in st.tombstones:
-                st.tombstones.pop(key, None)
-                st.tombstones.pop((e.req_id, None), None)
-                anom["ft_after_done"] += 1
-                return
-            info = st.arr.pop(key, None) or st.arr.pop((e.req_id, None), None)
-            if info is None:
-                anom["ft_without_arr"] += 1
-                info = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms), e.draw_key, e.reissue != "none")
             pod = e.pod
-            if not pod:
+            if not pod:  # not routed (v1 ``routed_without_pod``)
                 anom["unknown_pod"] += 1
                 return
-            ps = st.pods.get(pod)
-            if ps is None:  # the pod is not in the snapshot (yet): keep the ft for it
-                st.pending_ft.setdefault(pod, {})[key] = (info, int(e.ts_ms))
-                anom["ft_buffered"] += 1
+            info = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms), e.draw_key, e.reissue != "none")
+            if self._stale(st, pod, info.ts_ms, anom):
                 return
-            self._add_ft(ms, st, key, info, pod, ps, int(e.ts_ms), anom)
+            ps = st.pods.get(pod)
+            if ps is None:  # the pod is not in the snapshot (yet): keep the request for it
+                st.pending.setdefault(pod, {})[key] = info
+                anom["arr_buffered"] += 1
+                return
+            self._add(ms, st, key, info, pod, ps, anom)
+            return
+        if e.kind == "ft":  # v1 has no first-token event: the map was booked at arr
             return
         if e.kind == "done":
-            for pod_name in ([e.pod] if e.pod else list(st.pending_ft)):
-                if st.pending_ft.get(pod_name, {}).pop(key, None) is not None:
+            for pod_name in ([e.pod] if e.pod else list(st.pending)):
+                if st.pending.get(pod_name, {}).pop(key, None) is not None:
                     anom["done_while_buffered"] += 1
                     return
             akey = self._find_active(st, e.req_id, e.pod)
@@ -470,18 +483,22 @@ class PreServePolicy:
                     self._advance_to(st, ps, int(e.ts_ms), anom)
                     ps.amap.remove(akey)
                 return
-            info_key = key if key in st.arr else ((e.req_id, None) if (e.req_id, None) in st.arr else None)
-            if info_key is not None:
-                st.arr.pop(info_key)
-                st.tombstones[key] = int(e.ts_ms)  # a late ft must not be counted
-                anom["done_before_ft"] += 1
-                return
-            anom["unknown_req"] += 1
+            anom["unknown_req"] += 1  # not routed, or its pod is gone (slept)
             return
         anom["bad_event"] += 1
 
-    def _add_ft(self, ms: ModelSnapshot, st: _ModelState, key, info: "_ArrInfo", pod: str, ps: _PodState,
-                ts_ms: int, anom: Counter) -> None:
+    @staticmethod
+    def _stale(st: _ModelState, pod: str, ts_ms: int, anom: Counter) -> bool:
+        """An event for ``pod`` stamped at or before the tick that saw it leave the snapshot."""
+        gone = st.gone_ms.get(pod)
+        if gone is not None and ts_ms <= gone:
+            anom["buffered_stale"] += 1
+            return True
+        return False
+
+    def _add(self, ms: ModelSnapshot, st: _ModelState, key, info: "_ArrInfo", pod: str, ps: _PodState,
+             anom: Counter) -> None:
+        ts_ms = info.ts_ms
         P = info.in_tokens
         if P is None:
             anom["missing_in_tokens"] += 1
@@ -497,7 +514,7 @@ class PreServePolicy:
                 st.err.add(true_d, int(D))
                 st.err_rows.append([info.draw_key or key[0], true_d, int(D)])
         if key in st.active:
-            anom["dup_ft"] += 1
+            anom["dup_arr"] += 1
             old_pod = st.active.pop(key)
             if old_pod in st.pods:
                 st.pods[old_pod].amap.remove(key)
@@ -506,37 +523,36 @@ class PreServePolicy:
         st.active[key] = pod
 
     def _apply_buffered(self, ms: ModelSnapshot, st: _ModelState, anom: Counter) -> None:
-        """``ft`` events kept for a pod that has now appeared: added at their own time."""
-        for pod in [p for p in st.pending_ft if p in st.pods]:
+        """``arr`` events kept for a pod that has now appeared: added at their own time, except
+        those of an earlier awake period of the pod."""
+        for pod in [p for p in st.pending if p in st.pods]:
             ps = st.pods[pod]
-            for key, (info, ts) in sorted(st.pending_ft.pop(pod).items(), key=lambda kv: kv[1][1]):
-                self._add_ft(ms, st, key, info, pod, ps, ts, anom)
-                anom["ft_buffered_applied"] += 1
+            for key, info in sorted(st.pending.pop(pod).items(), key=lambda kv: kv[1].ts_ms):
+                if self._stale(st, pod, info.ts_ms, anom):
+                    continue
+                self._add(ms, st, key, info, pod, ps, anom)
+                anom["arr_buffered_applied"] += 1
 
     def _expire(self, st: _ModelState, now_ms: int, anom: Counter) -> None:
-        """Bookkeeping only: arr records whose ft never came and tombstones. A request in
-        the map is never expired by age (it leaves on done)."""
+        """Bookkeeping only: buffered events whose pod never appeared. A request in the map
+        is never expired by age (it leaves on done)."""
         horizon = now_ms - self.req_ttl_ms
-        for key in [k for k, v in st.arr.items() if v.ts_ms < horizon]:
-            del st.arr[key]
-            anom["expired_arr"] += 1
-        for key in [k for k, ts in st.tombstones.items() if ts < horizon]:
-            del st.tombstones[key]
-        for pod in list(st.pending_ft):
-            for key in [k for k, (_i, ts) in st.pending_ft[pod].items() if ts < horizon]:
-                del st.pending_ft[pod][key]
-                anom["expired_buffered_ft"] += 1
-            if not st.pending_ft[pod]:
-                del st.pending_ft[pod]
+        for pod in list(st.pending):
+            for key in [k for k, info in st.pending[pod].items() if info.ts_ms < horizon]:
+                del st.pending[pod][key]
+                anom["expired_buffered_arr"] += 1
+            if not st.pending[pod]:
+                del st.pending[pod]
 
     @staticmethod
     def _engine_idle(st: _ModelState, ps: _PodState, pod: PodSnapshot, anom: Counter) -> None:
         """The engine reports nothing running or waiting: every request in this pod's map
-        that started before the scrape is done (its done event was lost)."""
+        routed at least ``ENGINE_IDLE_MARGIN_MS`` before the scrape is done (its done event
+        was lost)."""
         if pod.queued != 0:
             return
         for key, req in list(ps.amap.requests.items()):
-            if req.ts_ms <= pod.scraped_at_ms:
+            if req.ts_ms <= pod.scraped_at_ms - ENGINE_IDLE_MARGIN_MS:
                 ps.amap.remove(key)
                 st.active.pop(key, None)
                 anom["engine_idle_done"] += 1
@@ -624,7 +640,7 @@ class PreServePolicy:
 
         # Tier-2 feed: pods, events, then walk every head to its scrape instant.
         skipped: dict[str, str] = {}
-        self._sync_pods(ms, st, anom, skipped, tick_s)
+        self._sync_pods(ms, st, anom, skipped, tick_s, int(snap.now_ms))
         self._apply_buffered(ms, st, anom)
         for e in ms.events:
             self._on_event(ms, st, e, anom, t1m)

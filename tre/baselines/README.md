@@ -219,11 +219,23 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   can make that t0 lead the first real send. The replayer should write the marker at its
   first send (not done: `tre/replayer` is outside this line); until then PreServe Tier-1
   windows may start early by the warm-up.
-- **PreServe map.** Requests enter the look-ahead map at `ft` (prefill done); non-streaming
-  requests have no `ft` until their output is complete, so they are not in the map (the
-  experiments stream). Requests still in prefill are not in the map either (paper).
-- **ft vs TTFT.** The gateway's `ft` event (first byte through Envoy) is used as "prefill
-  done"; its alignment with vLLM's TTFT is not verified.
+- **PreServe map** (2026-10-26, v1 parity). A request enters the look-ahead map at its `arr`
+  event, which the gateway writes once the target pod is chosen (v1 `routed`): `P` = `in_tokens`,
+  `D_hat` = `max_tokens` (or its load-error prediction), the head starting at the `arr` time.
+  So requests queued inside vLLM (waiting, or in prefill) count too, and non-streaming requests
+  are in the map. v1 discloses this as a strengthening against the paper, which books a request
+  at prefill done; v2 booked at `ft` (first token) until this date. `ft` no longer changes the
+  map. A reissue (sidecar retry / continuation) is a new gateway request: a new entry with its
+  own `in_tokens` / `max_tokens` (Tier-1 does not count it). A request leaves on its `done`
+  (completion or abort), when its pod leaves the snapshot, or when the engine reports nothing in
+  flight at a scrape at least 1 s after its `arr` (v1's margin: a request routed just before
+  the scrape may not have reached the engine yet).
+- **PreServe slept pods** (2026-10-26). A pod that leaves the snapshot drops its map and its
+  buffered events, and any event for it stamped at or before the tick that saw it gone is
+  discarded (also when read later), so a woken pod starts with an empty map. Before this fix,
+  events buffered while the pod slept were applied at its wake (smoke 2026-10-26: 51 stale
+  requests, map U0 0.23 vs engine KV 0.011). Events stamped after that tick are still buffered
+  until the pod appears (the stream can run ahead of `/v2/state` after a wake).
 - **T1 schema.** The service manager's structured 409 body and the new `/v2/state` fields
   are provisional (the T1 line is not merged); the shell parses both plain and structured
   refusals (and honours `retry_after_s` when present).

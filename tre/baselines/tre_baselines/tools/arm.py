@@ -28,7 +28,7 @@ Without ``--execute`` nothing is contacted: the tool prints the commands it woul
   request events since the replay marker (``gw_bl_dropped_delta``; any value > 0, a
   negative one (plugin restart) or null makes the run's event evidence suspect), the
   shell's arrivals / non-streaming arrivals per model, SM calls dropped / refused, and the
-  policy's per-model counters (``ft_without_arr``, ``unknown_req``, ``unknown_pod``,
+  policy's per-model counters (``buffered_stale``, ``unknown_req``, ``unknown_pod``,
   ``tier2_below_t1``, ``empty_window_busy``, ...). Metrics are read through the API server
   proxy (``kubectl get --raw .../pods/<pod>:<port>/proxy/metrics``), read only.
 

@@ -2,8 +2,9 @@
 
 Back-port of the TRE v1 file (``tre_code`` dev ``ceb88b4``, ``tre_preserve/anticipator.py``; decision
 2026-10-26): v2's map plus :meth:`LookaheadMap.grow` (the D55 overload scan reads up to one tick
-ahead) and ``ActiveRequest.max_tokens`` (with load errors ``D_pred`` is a prediction). In v2 a
-request enters the map at its first token (``ft`` event); in v1 at ``routed``.
+ahead) and ``ActiveRequest.max_tokens`` (with load errors ``D_pred`` is a prediction). A request
+enters the map at its route decision (v2 gateway ``arr``, v1 ``routed``; v2 used the first
+token until 2026-10-26), so "prefill done" below reads "routed" for the scaler.
 
 ``U[i]`` is the predicted KV usage (fraction of the pod's token capacity ``M``) ``i``
 iterations from now. It is kept as a ring of ``length`` slots indexed by *absolute*
@@ -63,7 +64,7 @@ class ActiveRequest:
     #: Absolute iteration up to which (exclusive) its contribution has been written.
     filled: int
     extensions: int = 0
-    #: Redis-clock ms of the event that added it (v2: ``ft``; v1: ``routed``).
+    #: Redis-clock ms of the event that added it (v2: ``arr``; v1: ``routed``).
     ts_ms: int = 0
     #: Upper-bound mode: the output length the value never grows past (``D_pred``);
     #: beyond it an overdue request holds ``(P + cap) / M``. None = paper mode.
