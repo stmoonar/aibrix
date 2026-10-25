@@ -68,6 +68,7 @@ def run_rescue_tick(
     probe_block_reason: str | None = None,
     fairness_due: bool = False,
     leftover_probes: SafeScaleController | None = None,
+    safescale_scope: str = "all",
 ) -> LoopTickResult:
     """``fairness_due`` (TRE_ABLATION_DISABLE_SLOW_LOOP): this tick plans the fairness
     section too - the single loop then runs every decision."""
@@ -93,6 +94,7 @@ def run_rescue_tick(
         action_cooldown=action_cooldown,
         observe_mode=observe_mode,
         probe_block_reason=probe_block_reason,
+        safescale_scope=safescale_scope,
     )
 
 
@@ -148,6 +150,7 @@ async def rescue_task(
                     ),
                     fairness_due=fairness_due,
                     leftover_probes=leftover_probes,
+                    safescale_scope=getattr(cfg, "safescale_scope", "all"),
                 )
             if model_state_box is not None and result.classifications:
                 # Review 3: the latest signal state, for the queue's commit revalidation.

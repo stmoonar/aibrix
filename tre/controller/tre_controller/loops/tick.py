@@ -12,6 +12,7 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, obser
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
+from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
 from tre_controller.planning.classify import (
     ModelRole,
     ModelState,
@@ -176,8 +177,12 @@ def run_planner_tick(
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     leftover_probes: SafeScaleController | None = None,
+    safescale_scope: str = "all",
 ) -> LoopTickResult:
-    """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
+    """One planner tick. ``safescale_scope`` (TRE_SAFESCALE_SCOPE, 2026-10-26):
+    ``receiverless_shrink`` keeps a probe only for the receiver-less HIGH proactive
+    shrink (:func:`_receiverless_shrink`); a donor planned for a receiver is a relay and
+    a same-slot preemption sleeps its pod at once, as with SafeScale off. ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
@@ -263,7 +268,7 @@ def run_planner_tick(
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
-        release_without_safescale=safescale is None,
+        release_without_safescale=safescale is None or safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK,
         defrag_enabled=_defrag_enabled(registry),
         **_scaling_options(registry),
     )
@@ -310,6 +315,7 @@ def run_planner_tick(
         observe_mode=observe_mode,
         probe_block_reason=probe_block_reason,
         covered_targets=covered_targets,
+        safescale_scope=safescale_scope,
     )
     # C1 review P2-1: a rescue target fully covered by the pods a probe preemption gives
     # back is still a target the window does not reflect yet.
@@ -760,6 +766,7 @@ def _apply_safescale(
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     covered_targets: dict | None = None,
+    safescale_scope: str = "all",
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
     preemption gives back cover every planned scale-up part (none is submitted)."""
@@ -767,6 +774,14 @@ def _apply_safescale(
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
         return _release_without_safescale(actions)
+    if safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK:
+        # TRE_SAFESCALE_SCOPE=receiverless_shrink (2026-10-26): only a receiver-less
+        # shrink stays a probe; any other probe placement is released at once.
+        actions = tuple(
+            action if not _requires_safescale_probe(action) or _receiverless_shrink(action)
+            else _release_without_safescale((action,))[0][0]
+            for action in actions
+        )
 
     converted: list[Action] = []
     events: list[str] = []
@@ -962,6 +977,16 @@ def _weighted_mean(metrics: ModelWindowMetrics, which: str) -> float | None:
 def _requires_safescale_probe(action: Action) -> bool:
     return (isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0) or isinstance(
         action, ShrinkForSlotAction
+    )
+
+
+def _receiverless_shrink(action: Action) -> bool:
+    """A probe shrink with no receiver: the planner pairs a donor with a recipient only
+    on ``ScaleAction.receiver`` (``planner._plan_middle_zone_probe``) and on a same-slot
+    preemption's ``ShrinkForSlotAction.beneficiary``; the HIGH proactive shrink
+    (``high_proactive_safescale``) carries neither."""
+    return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0 and (
+        action.receiver is None
     )
 
 

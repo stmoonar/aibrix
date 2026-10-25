@@ -172,6 +172,11 @@ class ControllerConfig:
     # 2026-10-08: one loop (the fast loop's timer) runs every decision (no fairness loop).
     ablation_disable_slow_loop: bool
     ablation_disable_safescale: bool
+    #: TRE_SAFESCALE_SCOPE (2026-10-26): which placements run as a SafeScale probe -
+    #: ``all``, ``receiverless_shrink`` (only the receiver-less HIGH proactive shrink;
+    #: every other probe placement is released at once, as with ``off``) or ``off``.
+    #: ``ablation_disable_safescale`` is ``safescale_scope == "off"``.
+    safescale_scope: str
     disable_eta_gate: bool
     orphan_scan_enabled: bool
     orphan_grace_s: float
@@ -405,7 +410,8 @@ class ControllerConfig:
             ),
             incomplete_policy=incomplete_policy,
             ablation_disable_slow_loop=_get_bool(values, "TRE_ABLATION_DISABLE_SLOW_LOOP", False),
-            ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),
+            ablation_disable_safescale=_safescale_scope(values) == SAFESCALE_SCOPE_OFF,
+            safescale_scope=_safescale_scope(values),
             disable_eta_gate=_get_bool(values, "TRE_DISABLE_ETA_GATE", False),
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),
             orphan_grace_s=_get_positive_float(values, "TRE_ORPHAN_GRACE_S", 600.0),
@@ -580,6 +586,32 @@ def _get_str(env: Mapping[str, str], key: str, default: str) -> str:
     if not text:
         raise ValueError(f"{key} must not be empty")
     return text
+
+
+SAFESCALE_SCOPE_ALL = "all"
+SAFESCALE_SCOPE_RECEIVERLESS_SHRINK = "receiverless_shrink"
+SAFESCALE_SCOPE_OFF = "off"
+SAFESCALE_SCOPES = (SAFESCALE_SCOPE_ALL, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK, SAFESCALE_SCOPE_OFF)
+
+
+def _safescale_scope(env: Mapping[str, str]) -> str:
+    """TRE_SAFESCALE_SCOPE (default ``all``). TRE_ABLATION_DISABLE_SAFESCALE=true is
+    the alias of ``off``; when both are set they must agree (true with ``off``, false
+    with ``all`` / ``receiverless_shrink``), else the controller refuses to start - an
+    arm must never run a scope it did not ask for."""
+    raw = str(env.get("TRE_SAFESCALE_SCOPE") or "").strip().lower()
+    if raw and raw not in SAFESCALE_SCOPES:
+        raise ValueError(f"TRE_SAFESCALE_SCOPE must be one of {', '.join(SAFESCALE_SCOPES)} (got {raw!r})")
+    disable_set = str(env.get("TRE_ABLATION_DISABLE_SAFESCALE") or "").strip() != ""
+    disable = _get_bool(env, "TRE_ABLATION_DISABLE_SAFESCALE", False)
+    if raw and disable_set and disable != (raw == SAFESCALE_SCOPE_OFF):
+        raise ValueError(
+            f"TRE_ABLATION_DISABLE_SAFESCALE={env.get('TRE_ABLATION_DISABLE_SAFESCALE')} contradicts "
+            f"TRE_SAFESCALE_SCOPE={raw} (the switch is the alias of scope 'off'; set one, or both consistently)"
+        )
+    if raw:
+        return raw
+    return SAFESCALE_SCOPE_OFF if disable else SAFESCALE_SCOPE_ALL
 
 
 def _get_bool(env: Mapping[str, str], key: str, default: bool) -> bool:

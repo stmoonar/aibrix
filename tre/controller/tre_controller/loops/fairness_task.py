@@ -62,6 +62,7 @@ def run_fairness_tick(
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     leftover_probes: SafeScaleController | None = None,
+    safescale_scope: str = "all",
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -85,6 +86,7 @@ def run_fairness_tick(
         observe_mode=observe_mode,
         probe_block_reason=probe_block_reason,
         leftover_probes=leftover_probes,
+        safescale_scope=safescale_scope,
     )
 
 
@@ -138,6 +140,7 @@ async def fairness_task(
                         maintenance.probe_block_reason() if maintenance is not None else None
                     ),
                     leftover_probes=leftover_probes,
+                    safescale_scope=getattr(cfg, "safescale_scope", "all"),
                 )
             if model_state_box is not None and result.classifications:
                 # Review 3: the latest signal state, for the queue's commit revalidation.

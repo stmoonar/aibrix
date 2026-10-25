@@ -112,6 +112,18 @@ Design `tre/docs/design/20261025-instant-sampling.md`, section "Evidence, not ti
   measure, the check gives no verdict instead of suspending O1 (leftover docs of a
   model that is down no longer suspend it).
 
+## Controller setting `TRE_SAFESCALE_SCOPE` (2026-10-26)
+
+Which placements run as a SafeScale probe: `all` (default), `receiverless_shrink` (only
+the receiver-less HIGH proactive shrink, `high_proactive_safescale`; a HIGH / HEALTHY
+donor for a receiver is an immediate relay and a TP same-slot preemption sleeps its pod
+at once, both with the reason suffix `_nosafescale`, as with SafeScale off) or `off`.
+`TRE_ABLATION_DISABLE_SAFESCALE=true` is the alias of `off`; both set and disagreeing
+(true with `all` / `receiverless_shrink`, false with `off`) = the controller refuses to
+start. The startup `ablation_switches` log line carries `safescale_scope`. An arm that
+sets it must restore `TRE_SAFESCALE_SCOPE=all` (or remove it) at its end, together with
+`TRE_ABLATION_DISABLE_SAFESCALE=false`.
+
 ## Not covered here
 
 - theta, lambda, tau, w_p and c/b must be re-calibrated on the new estimator before a

@@ -459,6 +459,8 @@ def create_controller_dependencies(
     logging.getLogger("tre_controller").info(json.dumps({
         "event": "ablation_switches",
         "disable_safescale": bool(getattr(cfg, "ablation_disable_safescale", False)),
+        # TRE_SAFESCALE_SCOPE (2026-10-26): all | receiverless_shrink | off.
+        "safescale_scope": str(getattr(cfg, "safescale_scope", "all")),
         "disable_slow_loop": bool(getattr(cfg, "ablation_disable_slow_loop", False)),
     }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)
