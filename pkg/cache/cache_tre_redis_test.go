@@ -19,6 +19,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -264,37 +265,77 @@ func TestTREMetricSchemaModeRejectsUnknownValue(t *testing.T) {
 
 // treRoundAt is a round on an evidence boundary: instant and histogram docs at stamp.
 func treRoundAt(stamp int64) treRound {
-	return treRound{instantStamps: []int64{stamp}, histStamp: stamp}
+	return treRound{instantStamp: stamp, histStamp: stamp}
 }
 
-// Instant docs every instant tick, histogram docs only on evidence boundaries; a
-// boundary tick late by one instant period is caught up (both doc kinds stamped at the
-// boundary), a later one is lost, and the boundary in progress at start is skipped.
+// Instant docs every tick, histogram docs on the first round of each evidence boundary
+// (stamped with the boundary, however late the round) - including the boundary in
+// progress when the writer (re)starts.
 func TestTRERoundPlannerInstantEveryTickHistOnEvidenceBoundary(t *testing.T) {
 	p := &treRoundPlanner{instantMS: 500, evidenceMS: 10_000}
-	// Started mid-period: no histogram for the boundary already passed.
-	require.Equal(t, treRound{instantStamps: []int64{1_003_500}}, p.next(1_003_500))
 	var hist []int64
 	instant := 0
-	for roundT := int64(1_004_000); roundT <= 1_030_000; roundT += 500 {
+	for roundT := int64(1_003_500); roundT <= 1_030_000; roundT += 500 {
 		r := p.next(roundT)
-		require.Equal(t, []int64{roundT}, r.instantStamps)
+		p.commit(r)
+		require.Equal(t, roundT, r.instantStamp)
 		instant++
 		if r.histStamp != 0 {
 			hist = append(hist, r.histStamp)
 		}
 	}
-	require.Equal(t, 53, instant)
-	require.Equal(t, []int64{1_010_000, 1_020_000, 1_030_000}, hist)
+	require.Equal(t, 54, instant)
+	// First boundary after the (re)start: written, its scraped_ms says when.
+	require.Equal(t, []int64{1_000_000, 1_010_000, 1_020_000, 1_030_000}, hist)
 
-	// The tick at 1_040_000 slipped one instant period: caught up.
-	p.next(1_039_500)
-	r := p.next(1_040_500)
-	require.Equal(t, treRound{instantStamps: []int64{1_040_000, 1_040_500}, histStamp: 1_040_000}, r)
-	// The tick at 1_050_000 slipped two periods: lost, not stamped late.
-	p.next(1_049_500)
-	require.Equal(t, treRound{instantStamps: []int64{1_051_000}}, p.next(1_051_000))
-	require.Equal(t, int64(0), p.next(1_051_500).histStamp)
+	// The round at 1_040_000 came 1.5 s late: it still writes boundary 1_040_000.
+	r := p.next(1_041_500)
+	require.Equal(t, treRound{instantStamp: 1_041_500, histStamp: 1_040_000}, r)
+	p.commit(r)
+	require.Equal(t, int64(0), p.next(1_042_000).histStamp)
+}
+
+// Review round 1: after a failed MULTI/EXEC the boundary is not lost - the next round
+// writes its histogram doc, stamped with the boundary; the declared-cadence hash is
+// written in the same MULTI.
+func TestTREBoundaryRetriedAfterExecFailure(t *testing.T) {
+	t.Setenv("TRE_REDIS_SCHEMA", "v2")
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	store, _ := newTREMetricStoreForTest(t)
+	store.redisClient = client
+	store.treCadence = treWriteCadence{instant: 500 * time.Millisecond, evidence: 2 * time.Second}
+	ctx := context.Background()
+	p := &treRoundPlanner{instantMS: 500, evidenceMS: 2_000, lastHistT: 1_008_000}
+
+	write := func(roundT int64) error {
+		r := p.next(roundT)
+		err := store.writeTREPodMetricsToRedis(ctx, r)
+		if !errors.Is(err, errTREExec) {
+			p.commit(r)
+		}
+		return err
+	}
+	mr.SetError("LOADING redis is loading")
+	require.ErrorIs(t, write(1_010_000), errTREExec)
+	mr.SetError("")
+	require.NoError(t, write(1_010_500))
+
+	podKey := utils.GeneratePodKey("default", "pod-a")
+	entries, err := client.ZRangeByScore(ctx, treV2HistogramKeyPrefix+podKey, &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal([]byte(entries[0]), &doc))
+	require.Equal(t, float64(1_010_000), doc["timestamp"])
+	require.Equal(t, int64(1_010_000), p.lastHistT)
+
+	cadence, err := client.HGetAll(ctx, treV2CadenceKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, "500", cadence["instant_ms"])
+	require.Equal(t, "2000", cadence["evidence_ms"])
+	require.NotEmpty(t, cadence["written_ms"])
 }
 
 // An instant-only round writes the instant docs of every pod in one pipeline and no
@@ -303,7 +344,7 @@ func TestTRERoundPlannerInstantEveryTickHistOnEvidenceBoundary(t *testing.T) {
 func TestWriteTREPodMetricsInstantRoundSkipsHistogramAndLegacy(t *testing.T) {
 	store, client := newTREMetricStoreForTest(t)
 	ctx := context.Background()
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRound{instantStamps: []int64{1_000_500}}))
+	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRound{instantStamp: 1_000_500}))
 
 	podKey := utils.GeneratePodKey("default", "pod-a")
 	inst, err := client.ZRangeByScore(ctx, treV2InstantKeyPrefix+podKey, &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
