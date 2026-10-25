@@ -166,7 +166,7 @@ class MetricsStore:
             )
             for name in names
         }
-        problem = self._cadence_problem(cadence_raw)
+        problem = self._cadence_problem(cadence_raw, int(window_end_ms))
         return MetricsSnapshot(
             ts_ms=int(window_end_ms),
             models=models,
@@ -211,18 +211,22 @@ class MetricsStore:
             out[model][pod] = (baseline[-1:] + hist, inst)
         return out, cadence_raw
 
-    def _cadence_problem(self, raw: Any = None) -> str | None:
+    def _cadence_problem(self, raw: Any = None, window_end_ms: int | None = None) -> str | None:
         """The gateway's declared cadence (``raw``: the hash read with the snapshot)
-        against ``expected_cadence`` (None: no check or it matches). Logged as an error
-        when it changes."""
+        against ``expected_cadence`` and, with ``window_end_ms``, its freshness (M5)
+        (None: no check or it is fine). Logged as an error when it changes."""
         if self._expected_cadence is None:
             return None
         instant_ms, evidence_ms = self._expected_cadence
-        problem = cadence_problem(raw, instant_ms=instant_ms, evidence_ms=evidence_ms)
+        problem = cadence_problem(raw, instant_ms=instant_ms, evidence_ms=evidence_ms, window_end_ms=window_end_ms)
         if problem != self._cadence_logged:
             if problem:
+                written = None
+                if isinstance(raw, dict):
+                    written = next((value for key, value in raw.items() if _decode_text(key) == "written_ms"), None)
                 LOG.error(
-                    "GATEWAY CADENCE: %s - snapshots %s", problem,
+                    "GATEWAY CADENCE: %s (window end %s, declared written_ms %s) - snapshots %s", problem,
+                    window_end_ms, None if written is None else _decode_text(written),
                     "marked stale" if self._cadence_enforce else "not marked stale (warn mode)",
                 )
             else:
@@ -286,6 +290,7 @@ class MetricsStore:
         stale: set[str] = set()
         suffix_incomplete: dict[int, set[str]] = {start: set() for start in suffix_starts}
         all_ticks: set[int] = set()
+        hist_ticks: set[int] = set()
         if self._schema == "v1":
             # O1 suffixes are built for the v2 schema only (v1 = legacy fallback: the
             # controller then waits for a whole clean window after a breakpoint).
@@ -298,6 +303,9 @@ class MetricsStore:
                 pod_name = _pod_name(hist_docs, inst_docs, pod_key)
                 _note_scraped(scraped, pod_name, hist_docs, inst_docs, read_start_ms)
                 all_ticks.update(_doc_ticks(inst_docs))
+                hist_ticks.update(
+                    tick for tick in _doc_ticks(hist_docs) if read_start_ms <= tick <= int(window_end_ms)
+                )
                 if pod_name not in scraped:
                     continue  # no doc in the window (at most the histogram baseline)
                 newest = scraped[pod_name]
@@ -307,11 +315,16 @@ class MetricsStore:
                 pod_metrics, flag = self._window_pod(
                     model, pod_key, hist_docs, inst_docs, read_start_ms, window_start_ms, window_end_ms
                 )
-                if pod_metrics is None:
-                    continue
-                per_pod[pod_metrics.pod] = pod_metrics
                 if flag or newest is None:
                     incomplete.add(pod_name)
+                if pod_metrics is None:
+                    # Review round 3 (M2): no usable token delta (no histogram doc in the
+                    # window, a counter reset without a later doc) or no instant doc - out
+                    # of queue AND tokens, flagged. Its O1 suffixes cannot be better.
+                    for start in suffix_starts:
+                        suffix_incomplete[start].add(pod_name)
+                    continue
+                per_pod[pod_metrics.pod] = pod_metrics
                 for start in suffix_starts:
                     # The suffix (start, end] from the same docs and the same pod: the
                     # histogram baseline is the newest doc at or before the suffix start -
@@ -347,6 +360,7 @@ class MetricsStore:
         model_metrics = replace(
             model_metrics,
             instant_ticks_ms=tuple(sorted(all_ticks)),
+            hist_ticks_ms=tuple(sorted(hist_ticks)),
             sample_incomplete_pods=incomplete_pods,
             scrape_fresh=scrape_fresh,
         )
@@ -430,7 +444,7 @@ class MetricsStore:
         start = -(-int(point) // period) * period  # first grid boundary >= the breakpoint
         return (start,) if window_start_ms < start < window_end_ms else ()
 
-    def read_latest_instant(self, model: str, now_ms: int, lookback_ms: int) -> dict[str, float]:
+    def read_latest_instant(self, model: str, now_ms: int, lookback_ms: int) -> dict[str, float] | None:
         """Latest instant queue snapshot (waiting/running/swapping), summed across pods.
 
         Unlike ``read_model_window`` this returns the single most-recent scrape value per
@@ -440,6 +454,8 @@ class MetricsStore:
         (r3 SMOKE_FINDINGS defect 1: 34/34 zero samples). ``lookback_ms`` should be at
         least ~2 instant periods so the last-written doc is always in range. Used by the offline r3 sidecar
         sampler to capture a queue snapshot that reconciles with the online average.
+        None when no pod has a doc in the lookback (review round 3, L6: unknown, not an
+        empty queue).
         """
         start_ms = max(0, now_ms - lookback_ms)
         if self._schema == "v1":
@@ -450,6 +466,8 @@ class MetricsStore:
                 for pod in self._redis.smembers(pods_key(model))
             }
         totals = {"waiting": 0.0, "running": 0.0, "swapping": 0.0}
+        if not any(inst_by_pod.values()):
+            return None
         for docs in inst_by_pod.values():
             if not docs:
                 continue
@@ -607,6 +625,9 @@ class MetricsStore:
             tpot_p95_ms=_seconds_to_ms(tpot_p95_s),
             e2e_p95_ms=_seconds_to_ms(e2e_p95_s),
             request_count=self._hist_count_delta(
+                model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms
+            ),
+            request_count_observed=self._hist_count_delta(
                 model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms
             ),
             token_counter_reset=(
@@ -778,10 +799,26 @@ class MetricsStore:
         to the window length by the ``scraped_ms`` span of the token baseline and end
         docs. Flagged: coverage below ``min_sample_ratio``, a span outside
         [0.67, 1.5] x window, or no valid span (then the unscaled delta). Without
-        instant reads (the SafeScale evidence store): raw deltas, never flagged."""
+        instant reads (the SafeScale evidence store): raw deltas, never flagged.
+
+        Review round 3 (M2): queue and tokens always come from the same pods. A token
+        counter that went down (the engine restarted) restarts the delta at the first
+        doc after the reset - its ``scraped_ms`` starts the span; flagged. A pod with no
+        usable delta (no histogram doc in the window, or nothing after the reset) is left
+        out - (None, True) - of both. (A pod with histogram docs but no instant doc has
+        coverage 0: flagged by the coverage rule.)"""
+        reset = False
+        if self._read_instant:
+            hist_docs, reset = _after_counter_reset(model, hist_docs)
+            if not _has_window_hist_doc(hist_docs, read_start_ms) or (
+                reset and _token_span_ms(hist_docs, read_start_ms) is None
+            ):
+                return None, True
         metrics = self._aggregate_pod(model, pod_key, hist_docs, inst_docs, read_start_ms)
         if metrics is None or not self._read_instant:
             return metrics, False
+        if reset:
+            metrics = replace(metrics, token_counter_reset=True)
         window_ms = int(window_end_ms) - int(span_start_ms)
         if window_ms <= 0:
             return metrics, True
@@ -806,7 +843,7 @@ class MetricsStore:
         coverage = sum(1 for value in observed if read_start_ms <= value <= window_end_ms)
         if coverage + 1e-9 < self._min_sample_ratio * (window_ms / self._instant_sample_interval_ms):
             flagged = True
-        return metrics, flagged
+        return metrics, flagged or reset
 
     def _instant_avg_optional(self, model: str, metric: str, docs: list[dict[str, Any]]) -> float | None:
         """Mean of the gauge over the samples that actually carry it; None when none
@@ -954,6 +991,28 @@ def _token_span_ms(hist_docs: list[dict[str, Any]], read_start_ms: int) -> int |
     if first is None or last is None or last <= first:
         return None
     return last - first
+
+
+#: The token counters whose decrease marks an engine restart (counter reset).
+_TOKEN_COUNTERS = (HISTOGRAM_METRICS["prompt_tokens"], HISTOGRAM_METRICS["generation_tokens"])
+
+
+def _after_counter_reset(model: str, hist_docs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """``hist_docs`` from the first doc after the last token-counter reset (a ``sum``
+    lower than the previous doc's: the engine restarted), and whether there was one.
+    That doc is the new baseline of every delta."""
+    cut = 0
+    for metric in _TOKEN_COUNTERS:
+        previous: float | None = None
+        for index, doc in enumerate(hist_docs):
+            entry = _metric_entry(model, metric, doc)
+            if entry is None:
+                continue
+            value = _number(entry.get("sum"), 0.0)
+            if previous is not None and value < previous:
+                cut = max(cut, index)
+            previous = value
+    return (hist_docs[cut:], True) if cut else (hist_docs, False)
 
 
 def _scaled(value: float | None, scale: float) -> float | None:

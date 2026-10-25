@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
 
 from tre_common.gpu_placement import placement_policy_from_registry
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_requests
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
@@ -1318,7 +1318,7 @@ def _model_contexts(
                         # Completed requests of the post-breakpoint window (the C1 step
                         # cap's evidence); None on a whole window.
                         "signal_evidence_requests": (
-                            None if window.full else getattr(window.metrics, "request_count", None)
+                            None if window.full else observed_requests(window.metrics)
                         ),
                         # Timer cleanup (2026-10-02): O1 is active and saw this model's
                         # routable count in the fleet view this tick, so a change of it

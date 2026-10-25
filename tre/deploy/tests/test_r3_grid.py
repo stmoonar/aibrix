@@ -332,13 +332,22 @@ def test_make_live_instant_sampler_reads_latest_not_window_average() -> None:
 
 
 def test_r3_grid_uses_single_source_scrape_cadence() -> None:
-    # r3_grid must derive the instant-sample / expected_samples cadence from the single
-    # source of truth (tre_common.rediskeys.SCRAPE_INTERVAL_MS = 10s gateway write
-    # cadence), not a local magic number (r3 SMOKE_FINDINGS defect 2).
-    from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+    # r3_grid derives its cadences from the single source of truth (tre_common.rediskeys),
+    # not a local magic number (r3 SMOKE_FINDINGS defect 2): the closed-loop sampler polls
+    # at the gateway's instant-doc period; the lookback covers 2 x the declared evidence
+    # period (20 s for a gateway that declares none).
+    from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS
 
-    assert r3_grid.SCRAPE_INTERVAL_MS is SCRAPE_INTERVAL_MS
-    assert SCRAPE_INTERVAL_MS == 10_000
+    args = r3_grid.parse_args(["--model", "m7", "--gateway-url", "http://gw/v1/chat/completions",
+                               "--output", "/o/x.csv"])
+    assert args.instant_sample_ms == INSTANT_SAMPLE_INTERVAL_MS
+
+    class _Declared:
+        def hgetall(self, key):
+            return {b"instant_ms": b"500", b"evidence_ms": b"2000"}
+
+    assert r3_grid.live_instant_lookback_ms(_Declared()) == 4_000
+    assert r3_grid.live_instant_lookback_ms(None) == 20_000
 
 
 def test_estimate_capture_bytes_scales_with_grid() -> None:

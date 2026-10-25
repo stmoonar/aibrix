@@ -14,6 +14,12 @@ and calls :func:`cadence_problem`; a missing or different declaration marks the
 snapshot stale (TRE_GATEWAY_INTERVAL_CHECK=fail, the default) or only logs (warn). It
 replaces the former inference from doc spacing, which was startup-only and failed on
 the mixed stamps of a gateway upgrade.
+
+Review round 3 (M5): the declaration must also be fresh. ``written_ms`` (gateway clock,
+the time of the round's MULTI) must be at least ``window_end - evidence_ms`` (the window
+end is a gateway doc stamp, the same clock): a hash left behind by a gateway that
+stopped writing - or an old gateway that never refreshes it - does not vouch for the
+window. Otherwise ``gateway_cadence_stale``.
 """
 from __future__ import annotations
 
@@ -31,8 +37,16 @@ def _int(raw: Mapping[str, Any], key: str) -> int | None:
         return None
 
 
-def cadence_problem(raw: Mapping[Any, Any] | None, *, instant_ms: int, evidence_ms: int) -> str | None:
-    """None when the declared cadence equals the controller's periods, else why not."""
+#: The problem code of a declaration not written for the window being read (M5).
+CADENCE_STALE = "gateway_cadence_stale"
+
+
+def cadence_problem(
+    raw: Mapping[Any, Any] | None, *, instant_ms: int, evidence_ms: int, window_end_ms: int | None = None
+) -> str | None:
+    """None when the declared cadence equals the controller's periods and - with
+    ``window_end_ms`` - was written at or after ``window_end_ms - evidence_ms``, else
+    why not."""
     declared = {_text(key): value for key, value in (raw or {}).items()}
     if not declared:
         return "gateway_cadence_missing"
@@ -44,4 +58,8 @@ def cadence_problem(raw: Mapping[Any, Any] | None, *, instant_ms: int, evidence_
             f" != controller TRE_INSTANT_SAMPLE_INTERVAL_MS={int(instant_ms)}"
             f" TRE_EVIDENCE_PERIOD_MS={int(evidence_ms)}"
         )
+    if window_end_ms is not None:
+        written = _int(declared, "written_ms")
+        if written is None or written < int(window_end_ms) - int(evidence_ms):
+            return CADENCE_STALE
     return None

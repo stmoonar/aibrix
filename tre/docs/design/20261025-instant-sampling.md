@@ -2,7 +2,8 @@
 
 Branch `fix/v2-sampling-20261025`. Status: implemented, not deployed. Revised after
 review round 1 (H1, H1b, H2, M1–M5, L4–L6, S1–S5) and round 2 (evidence period 2 s by
-default, fixed-timer fast loop, cheaper snapshot build).
+default, fixed-timer fast loop, cheaper snapshot build) and round 3 (deploy order,
+counter resets, retention, freshness, see the last section).
 
 ## Problem
 
@@ -159,3 +160,40 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
   with `TRE_PERCENTILE_MODE=interpolated` must pass the same mode to these tools.
 - **Before it goes live:** θ re-calibration on the new estimator (θ, λ, τ, w_p, c/b
   together), and a real-cluster smoke of the 2 s gateway write cost.
+
+## Review round 3
+
+- **Deploy order (H1).** New gateway + old controller: the old `sum / 3` queue reads
+  60 instant docs as 20x Q, every model CRITICAL - a scale-up storm. New controller + old
+  gateway: no cadence hash, every snapshot stale, no action. While images are swapped,
+  in either direction, the run mode is `observe observe`
+  (`deploy/RELEASE-20261025-v2-sampling.md`).
+- **One pod set for queue and tokens (M2).** A token counter that went down (engine
+  restart) restarts the delta at the first histogram doc after the reset; its
+  `scraped_ms` starts the span (span rules apply); flagged. No usable delta (no
+  histogram doc in the window, or none after the reset): the pod is out of queue and
+  tokens, flagged. A pod with histogram docs and no instant doc has coverage 0: flagged.
+- **Retention (M3).** Instant docs 5 min, histogram docs 30 min (gateway). About 2.7 MB
+  per pod (600 x ~0.6 KB + 900 x ~2.6 KB), 53 MB for 20 pods (was 88 MB with 30 min of
+  instant docs). The calibration capture spools a cell's instant docs every 60 s
+  (`InstantSpool`) and a backfill merges the earlier dump's instant rows instead of
+  requiring a superset; `head_within_retention` needs the spool's coverage for cells
+  longer than the instant retention.
+- **Freshness (M4).** A window is written when any pod has its end-boundary histogram
+  doc (written in one MULTI, retried until EXEC succeeds); a round a few hundred ms late
+  never gets an instant doc at the end (nearest-boundary rounding) and no longer leaves
+  the window stale. Without histogram ticks (v1) the end instant tick decides.
+- **Fresh cadence hash (M5).** `written_ms >= window_end - evidence period` (both gateway
+  clock), else `gateway_cadence_stale` (snapshot stale, error logged on change).
+- **L1** `restrict_to_serving` re-derives only the pod aggregates and keeps the store's
+  flags (full window and O1 suffixes). **L2** `runTRERound()` is the loop's and the
+  tests' commit decision. **L3** a histogram doc that cannot be built (schema error,
+  NaN) does not move `lastHistT`. **L4** a scrape's values and its `scraped_ms` are
+  stored and read under one per-pod lock, stamped at the store; an older overlapping
+  fetch is dropped. **L5** `min_evidence_requests` and the low-evidence step count the
+  observed requests (`request_count_observed`), not the span-scaled ones. **L6** the
+  r3 live sampler looks back 2 x the declared evidence period and records no sample
+  when nothing is found (`read_latest_instant` -> None). **L7** default read offset
+  `min(2 s, period / 2)` everywhere.
+- **Not converted yet:** the tick-counted rules (saturation confirm, breakpoint hold,
+  SafeScale tail statistics) - see the evidence-not-ticks redesign.

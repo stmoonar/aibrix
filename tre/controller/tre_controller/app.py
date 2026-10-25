@@ -119,7 +119,8 @@ def build_controller_task_specs(
     planner_safescale = None if safescale_off else deps.safescale
     leftover_probes = deps.safescale if safescale_off else None
     # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-08): every decision runs in the fast loop -
-    # its snapshot-aligned ticks plan the fairness section too, no fairness task runs.
+    # its ticks (fixed TRE_RESCUE_INTERVAL_SECONDS timer, reading the newest snapshot)
+    # plan the fairness section too, no fairness task runs.
     # The fast loop does all the fairness task did besides planning (model state box,
     # decision snapshot); the queue's rescue-over-fairness replacement follows each
     # action's source_loop, which the planner sets per section.

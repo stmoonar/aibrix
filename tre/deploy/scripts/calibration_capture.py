@@ -934,9 +934,15 @@ def active_pods(redis_client: Any, pods: Sequence[str], since_ms: int) -> list[s
 #: Host clocks agree to NTP accuracy, not better: a source may be this much outside its
 #: normal range against redis TIME and still be in redis's time domain.
 DEFAULT_CLOCK_TOLERANCE_MS = 2_000
-#: Gateway docs are trimmed this long after their stamp (``treV2RetentionMS``,
-#: ``pkg/cache/cache_tre_redis.go``).
+#: Gateway histogram docs are trimmed this long after their stamp
+#: (``treV2HistRetentionMS``, ``pkg/cache/cache_tre_redis.go``).
 GATEWAY_RETENTION_MS = 30 * 60 * 1000
+#: ... and instant docs after this long (``treV2InstantRetentionMS``; review round 3,
+#: M3): shorter than a long cell, so a cell's instant docs are spooled while it runs
+#: (:class:`InstantSpool`), and a backfill merges them with the earlier dump.
+GATEWAY_INST_RETENTION_MS = 5 * 60 * 1000
+#: The spool's read period: well inside the instant retention.
+DEFAULT_INST_SPOOL_S = 60.0
 #: The phase-aligned controller reads window ``B`` (a gateway round stamp: the window
 #: is only published once the gateway has written its tick ``B``) at ``B + offset``; the
 #: offset starts at ``TRE_METRICS_PHASE_OFFSET_MS`` (2 s) and adapts up to
@@ -1376,6 +1382,111 @@ def _require_superset(old_path: Path, new_scores: Iterable[int], what: str) -> N
                            f"in redis (e.g. score {min(missing)})")
 
 
+class InstantSpool:
+    """The model's gateway instant docs, read every ``interval_s`` during a cell.
+
+    The gateway keeps instant docs only :data:`GATEWAY_INST_RETENTION_MS` (5 min), less
+    than a long cell plus its margins, so the dump after the cell would miss the head.
+    Each pass reads every pod's docs newer than the last one it saw (from ``start_ms``,
+    the cell's dump range start, on the first pass; pods that join the model's pod set
+    are picked up). :func:`dump_gateway_docs` fills the docs no longer in redis from the
+    spool. ``reads_ms`` (redis TIME of each pass) proves coverage
+    (:meth:`covers`)."""
+
+    def __init__(self, redis_client: Any, model: str, *, start_ms: int,
+                 interval_s: float = DEFAULT_INST_SPOOL_S) -> None:
+        self._redis = redis_client
+        self._model = model
+        self._start_ms = int(start_ms)
+        self._interval_s = float(interval_s)
+        self.members: dict[str, dict[int, Any]] = {}
+        self.reads_ms: list[int] = []
+        self.errors: list[str] = []
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def poll(self) -> None:
+        """One pass (errors are recorded, never raised: a gap shows in ``covers``)."""
+        try:
+            now = redis_time_ms(self._redis)
+            for pod in model_pod_keys(self._redis, self._model):
+                seen = self.members.setdefault(pod, {})
+                lo = max(seen) + 1 if seen else self._start_ms
+                for member, score in self._redis.zrangebyscore(inst_key(pod), lo, "+inf", withscores=True) or ():
+                    seen[int(float(score))] = member
+            if now is not None:
+                self.reads_ms.append(int(now))
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(repr(exc))
+
+    def start(self) -> "InstantSpool":
+        self.poll()
+
+        def loop() -> None:
+            while not self._stop.wait(self._interval_s):
+                self.poll()
+
+        self._thread = threading.Thread(target=loop, name=f"inst-spool-{self._model}", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> "InstantSpool":
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+        self.poll()
+        return self
+
+    def covers(self, lo_ms: int, blind_spot_ms: int) -> bool:
+        """Every instant doc stamped from ``lo_ms`` on was still in redis at some pass:
+        the first pass came before ``lo_ms`` aged out, and no two passes are further
+        apart than the retention (minus the clock check's blind spot)."""
+        if not self.reads_ms:
+            return False
+        reach = GATEWAY_INST_RETENTION_MS - int(blind_spot_ms)
+        reads = sorted(self.reads_ms)
+        return reads[0] < int(lo_ms) + reach and all(b - a < reach for a, b in zip(reads, reads[1:]))
+
+    def rows(self, pod: str, lo_ms: int, hi_ms: int) -> list[tuple[Any, int]]:
+        return [(member, score) for score, member in sorted((self.members.get(pod) or {}).items())
+                if lo_ms <= score <= hi_ms]
+
+    def as_record(self) -> dict:
+        return {"interval_s": self._interval_s, "passes": len(self.reads_ms),
+                "first_read_ms": min(self.reads_ms) if self.reads_ms else None,
+                "last_read_ms": max(self.reads_ms) if self.reads_ms else None,
+                "docs": sum(len(v) for v in self.members.values()), "errors": self.errors[:5]}
+
+
+def _merge_rows(fresh: list, kept: Iterable[tuple[Any, int]]) -> list:
+    """``fresh`` (redis ``(member, score)`` pairs) plus the ``kept`` rows whose score
+    it lacks (one doc per pod and boundary: the fresh read wins), sorted by score."""
+    scores = {int(float(score)) for _member, score in fresh}
+    merged = list(fresh) + [(member, score) for member, score in kept if int(score) not in scores]
+    return sorted(merged, key=lambda pair: float(pair[1]))
+
+
+def _file_rows(path: Path) -> list[tuple[Any, int]]:
+    """``(doc, score)`` of a dump file's rows (the doc as stored; header excluded)."""
+    out = []
+    try:
+        with Path(path).open(encoding="utf-8") as fh:
+            for line in fh:
+                row = json.loads(line)
+                if row.get("kind") != "header" and "score" in row:
+                    out.append((_Stored(row.get("doc")), int(row["score"])))
+    except OSError:
+        pass
+    return out
+
+
+class _Stored:
+    """A doc kept from an earlier dump file (already parsed)."""
+
+    def __init__(self, doc: Any) -> None:
+        self.doc = doc
+
+
 def dump_gateway_docs(
     redis_client: Any,
     layout: CellLayout,
@@ -1388,14 +1499,18 @@ def dump_gateway_docs(
     known_upto_ms: Optional[int] = None,
     known_pods: Optional[Iterable[str]] = None,
     round_ms: Optional[int] = None,
+    spool: Optional[InstantSpool] = None,
 ) -> dict:
     """``ZRANGEBYSCORE [lo_ms, hi_ms]`` of every pod's hist and inst key, one JSONL per
     pod and kind: ``{"score": round stamp ms, "doc": parsed JSON}``. Pods with no doc in
     the range get no file. ``observed_at_redis_ms`` is redis TIME just before the read.
 
-    ``previous`` (the summary of an earlier dump of the same cell): every row of the
-    existing files must still be in the new dump, else :class:`NotASuperset` is raised
-    before anything is written - a backfill only ever widens a dump.
+    ``previous`` (the summary of an earlier dump of the same cell): every histogram row
+    of the existing files must still be in the new dump, else :class:`NotASuperset` is
+    raised before anything is written - a backfill only ever widens a dump. Instant
+    docs live only 5 min in redis (review round 3, M3): the rows of the existing files
+    that redis no longer holds are kept (merged), as are the ``spool`` rows (docs read
+    during the cell, :class:`InstantSpool`) that the read no longer finds.
 
     ``known`` / ``known_upto_ms`` / ``known_pods``: the docs (:func:`_doc_key`) of
     ``known_pods`` already seen at an earlier observation and the stamp up to which that
@@ -1409,12 +1524,24 @@ def dump_gateway_docs(
         key_of = hist_key if kind == "hist" else inst_key
         for pod in pods:
             fetched[kind][pod] = list(redis_client.zrangebyscore(key_of(pod), lo_ms, hi_ms, withscores=True) or [])
+    late = (_late_docs(fetched, known, int(known_upto_ms), known_pods)
+            if known is not None and known_upto_ms is not None and known_pods else None)
+    if spool is not None:
+        for pod in sorted(set(pods) | set(spool.members)):
+            kept = spool.rows(pod, lo_ms, hi_ms)
+            if kept:
+                fetched["inst"][pod] = _merge_rows(fetched["inst"].get(pod, []), kept)
     if previous:
         for kind, per_pod in (previous.get("files") or {}).items():
             for pod, rel in per_pod.items():
+                if kind == "inst":
+                    fetched["inst"][pod] = _merge_rows(fetched["inst"].get(pod, []),
+                                                       _file_rows(layout.cell_dir / rel))
+                    continue
                 _require_superset(layout.cell_dir / rel,
                                   (int(float(s)) for _m, s in fetched.get(kind, {}).get(pod, [])),
                                   f"{kind} {pod}")
+    pods = sorted(set(pods) | set(fetched["inst"]))
     files: dict[str, dict[str, str]] = {kind: {} for kind in GATEWAY_KINDS}
     counts: dict[str, dict[str, int]] = {kind: {} for kind in GATEWAY_KINDS}
     stamps: list[int] = []
@@ -1423,7 +1550,7 @@ def dump_gateway_docs(
     for kind in GATEWAY_KINDS:
         key_of = hist_key if kind == "hist" else inst_key
         for pod in pods:
-            members = fetched[kind][pod]
+            members = fetched[kind].get(pod, [])
             if not members:
                 continue
             counts[kind][pod] = len(members)
@@ -1433,7 +1560,7 @@ def dump_gateway_docs(
                 stamps.append(s)
                 if kind == "hist":
                     hist_stamps.append(s)
-                rows.append({"score": s, "doc": _parse_member(member)})
+                rows.append({"score": s, "doc": member.doc if isinstance(member, _Stored) else _parse_member(member)})
             path = layout.gateway_dump_path(kind, pod)
             header = {"kind": "header", "schema": GATEWAY_DUMP_SCHEMA, "redis_key": key_of(pod),
                       "pod": pod, "doc_kind": kind, "range_ms": [lo_ms, hi_ms]}
@@ -1442,8 +1569,6 @@ def dump_gateway_docs(
     # Round phases from the histogram docs (one per round; the instant docs in between
     # are on the finer instant grid, 2026-10-25).
     phases = sorted({s % int(round_ms) for s in hist_stamps})
-    late = (_late_docs(fetched, known, int(known_upto_ms), known_pods)
-            if known is not None and known_upto_ms is not None and known_pods else None)
     return {
         "observed_at_redis_ms": observed_at,
         "late_writes": None if late is None else len(late),
@@ -1459,6 +1584,7 @@ def dump_gateway_docs(
         "round_interval_ms": int(round_ms),
         "instant_interval_ms": declared_cadence(redis_client).get("instant_ms", int(round_ms)),
         "last_round_ms": max(stamps) if stamps else None,
+        "inst_spool": None if spool is None else spool.as_record(),
     }
 
 
@@ -1809,6 +1935,7 @@ def capture_after_cell(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     info: Optional[Mapping[str, Any]] = None,
+    inst_spool: Optional[InstantSpool] = None,
 ) -> dict:
     """After a cell (its load drained): dump the gateway docs and the controller ticks
     over the cell's redis-time range, write ``cell_meta.json``.
@@ -1876,13 +2003,18 @@ def capture_after_cell(
                         redis_client, layout, pods, lo_ms=lo, hi_ms=hi,
                         known=set((clock_end or {}).get("late_write_baseline") or ()) if end_rng else None,
                         known_upto_ms=end_rng[1] if end_rng else None,
-                        known_pods=(clock_end or {}).get("late_write_pods") or ())
+                        known_pods=(clock_end or {}).get("late_write_pods") or (),
+                        spool=inst_spool)
                     summary["flush_wait"] = wait
                     summary["pods_in_set"] = len(in_set)
                     summary["gateway_instances"] = gateway_instances(redis_client)
                     seen = summary.get("observed_at_redis_ms")
+                    # Histogram docs live 30 min; instant docs 5 min, so a long cell needs
+                    # its spool (read during the cell) to have reached them (M3).
                     summary["head_within_retention"] = (
-                        seen is not None and seen + cfg.blind_spot_ms < lo + GATEWAY_RETENTION_MS)
+                        seen is not None and seen + cfg.blind_spot_ms < lo + GATEWAY_RETENTION_MS
+                        and (seen + cfg.blind_spot_ms < lo + GATEWAY_INST_RETENTION_MS
+                             or (inst_spool is not None and inst_spool.covers(lo, cfg.blind_spot_ms))))
                     summary["clock_domain"] = clock["domain"]["gateway"]
                     if not end_rng or summary["late_writes"]:
                         _gateway_late(clock, "capture dump", summary, cell_level=True)

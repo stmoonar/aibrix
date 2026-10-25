@@ -169,7 +169,7 @@ class ControllerConfig:
     #: ended at most this long before (ms, gateway window ends; TRE_PAPER_STALE_MAX_MS).
     paper_stale_max_ms: int
     incomplete_policy: str
-    # 2026-10-08: one snapshot-aligned loop runs every decision (no fairness loop).
+    # 2026-10-08: one loop (the fast loop's timer) runs every decision (no fairness loop).
     ablation_disable_slow_loop: bool
     ablation_disable_safescale: bool
     disable_eta_gate: bool
@@ -203,8 +203,8 @@ class ControllerConfig:
     # a multiple of instant_sample_interval_ms (the gateway's instant-doc period).
     evidence_period_ms: int = EVIDENCE_PERIOD_MS
     # TRE_METRICS_PHASE_OFFSET_MS: read at boundary + offset (a floor, see adapt).
-    # Default min(2 s, evidence period / 2).
-    metrics_phase_offset_ms: int = 2_000
+    # Default min(2 s, evidence period / 2): 1 s at the default 2 s period.
+    metrics_phase_offset_ms: int = min(2_000, EVIDENCE_PERIOD_MS // 2)
     # TRE_METRICS_PHASE_ADAPT: raise the offset to when the boundary tick actually
     # appears (the gateway ticker phase), re-learned every 600 s of windows.
     metrics_phase_adapt: bool = True

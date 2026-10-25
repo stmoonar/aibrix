@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,11 @@ class PodWindowMetrics:
     e2e_p95_ms: float | None
     request_count: float | None = None
     token_counter_reset: bool = False
+    #: Review round 3 (L5): the completed requests actually observed (the histogram
+    #: count delta, not scaled to the window by the token span like
+    #: ``request_count``). The evidence-count gates (``min_evidence_requests``, the
+    #: low-evidence rescue step) count these. None = not read / no histogram.
+    request_count_observed: float | None = field(default=None, compare=False)
     #: Timestamps (ms) of the gateway instant docs read for this window (as written,
     #: stale ones included). Provenance for the phase-aligned sampler, which waits until
     #: the gateway has written the window's end tick (2026-10-25: per-pod coverage is
@@ -93,8 +99,19 @@ class ModelWindowMetrics:
     per_pod: dict[str, PodWindowMetrics]
     request_count: float | None = None
     token_counter_reset: bool = False
+    #: Review round 3 (L5): the completed requests actually observed (the histogram
+    #: count delta, not scaled to the window by the token span like
+    #: ``request_count``). The evidence-count gates (``min_evidence_requests``, the
+    #: low-evidence rescue step) count these. None = not read / no histogram.
+    request_count_observed: float | None = field(default=None, compare=False)
     #: Union of the per-pod ``instant_ticks_ms`` (see :class:`PodWindowMetrics`).
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
+    #: Review round 3 (M4): the stamps of every histogram doc in the window, over all
+    #: the model's pods (left-out pods included; gateway-wide provenance). The gateway
+    #: writes an evidence boundary's histogram docs in one MULTI and retries the
+    #: boundary until that EXEC succeeds, so a doc at the window end proves its round
+    #: was written (the sampler's freshness rule). Empty for v1 / offline windows.
+    hist_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
     #: The rule the model e2e p95 was formed with (merged pod histograms, gated at
     #: the model level); carried so a re-aggregation (``restrict_to_serving``)
     #: applies the same one. None = max of the per-pod p95s (no histograms).
@@ -144,3 +161,11 @@ class MetricsSnapshot:
     stale: bool
     #: Why the store marked the snapshot stale (e.g. a gateway cadence mismatch).
     stale_reason: str | None = field(default=None, compare=False)
+
+
+def observed_requests(metrics: Any) -> float | None:
+    """The completed requests observed in a window (``request_count_observed``, not
+    scaled by the token span; review round 3, L5), else ``request_count`` (synthetic /
+    offline windows, which carry only that)."""
+    observed = getattr(metrics, "request_count_observed", None)
+    return getattr(metrics, "request_count", None) if observed is None else observed

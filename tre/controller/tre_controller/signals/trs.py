@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
-from tre_common.metrics_schema import ModelWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, observed_requests
 from tre_common.registry import TrsParams
 from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window_is_idle
 
@@ -743,7 +743,7 @@ class SignalState:
             return EffectiveWindow(
                 metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_tokens", **partial
             )
-        if cfg.min_evidence_requests > 0 and float(suffix.request_count or 0.0) < cfg.min_evidence_requests:
+        if cfg.min_evidence_requests > 0 and float(observed_requests(suffix) or 0.0) < cfg.min_evidence_requests:
             return EffectiveWindow(
                 metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_requests", **partial
             )

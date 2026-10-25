@@ -48,7 +48,13 @@ REFRESH_PHASE_ALIGNED = "phase_aligned"
 REFRESH_FREE_RUNNING = "free_running"
 REFRESH_MODES = (REFRESH_PHASE_ALIGNED, REFRESH_FREE_RUNNING)
 
-DEFAULT_PHASE_OFFSET_MS = 2_000
+def default_phase_offset_ms(period_ms: int) -> int:
+    """The read offset when none is configured: ``min(2 s, period / 2)`` (1 s at the
+    default 2 s evidence period; 2 s at 10 s, as before)."""
+    return min(2_000, int(period_ms) // 2)
+
+
+DEFAULT_PHASE_OFFSET_MS = default_phase_offset_ms(EVIDENCE_PERIOD_MS)
 DEFAULT_PHASE_RETRY_MS = 500
 #: Stale windows keep the previous snapshot served this long (ms, window ends; 20 s =
 #: the former 2 windows of 10 s).
@@ -138,9 +144,17 @@ class WindowFreshness:
 def window_freshness(
     snapshot: MetricsSnapshot, *, window_end_ms: int, window_ms: int, period_ms: int = EVIDENCE_PERIOD_MS
 ) -> WindowFreshness:
-    """Whether the gateway has written the window's end round: an instant tick exactly at
-    ``end`` (the gateway writes the end round's instant and histogram docs of every pod
-    in one transaction). ``period_ms`` is kept for the call sites.
+    """Whether the gateway has written the window's end round.
+
+    Review round 3 (M4): a histogram doc stamped ``end`` of any pod proves it. The
+    gateway writes an evidence boundary's histogram docs of every pod in one MULTI,
+    stamped with the boundary even when the round is late, and retries the boundary
+    until that EXEC succeeds. The end *instant* tick is not required: a round a few
+    hundred ms late is stamped with the next instant boundary (nearest-boundary
+    rounding), so ``end`` may never get an instant doc - the window would stay stale
+    for good. Instant coverage is the store's per-pod flag. Without any histogram tick
+    (v1 schema, offline windows) the end instant tick decides, as before.
+    ``period_ms`` is kept for the call sites.
 
     2026-10-25: only the end tick. The former rule (every tick of the window, pooled over
     all pods) let a pod missing ticks pass whenever another pod covered them; coverage
@@ -163,6 +177,16 @@ def window_freshness(
         )
     )
     expected = (end,)
+    hist = {
+        int(tick)
+        for window in snapshot.models.values()
+        for tick in getattr(window, "hist_ticks_ms", ()) or ()
+        if start < int(tick) <= end
+    }
+    if hist:
+        if end not in hist:
+            return WindowFreshness(False, ticks, expected, f"missing_end_round:{end}")
+        return WindowFreshness(True, ticks, expected)
     if not ticks:
         return WindowFreshness(True, ticks, expected, "no_ticks")
     if end not in ticks:
@@ -197,7 +221,7 @@ class PhaseAlignedSampler:
         *,
         window_ms: int,
         period_ms: int = EVIDENCE_PERIOD_MS,
-        offset_ms: int = DEFAULT_PHASE_OFFSET_MS,
+        offset_ms: int | None = None,
         adapt: bool = True,
         retry_ms: int = DEFAULT_PHASE_RETRY_MS,
         stale_hold_ms: int = DEFAULT_STALE_HOLD_MS,
@@ -213,6 +237,8 @@ class PhaseAlignedSampler:
             raise ValueError(
                 f"window_ms={window_ms} must be a multiple of the gateway period {period_ms} ms"
             )
+        if offset_ms is None:
+            offset_ms = default_phase_offset_ms(period_ms)
         if not 0 <= offset_ms < period_ms:
             raise ValueError(f"offset_ms must be in [0, {period_ms})")
         if retry_ms <= 0:
@@ -490,7 +516,7 @@ async def metrics_task(
             snapshot_box,
             window_ms=cfg.metrics_window_ms,
             period_ms=period_ms,
-            offset_ms=getattr(cfg, "metrics_phase_offset_ms", DEFAULT_PHASE_OFFSET_MS),
+            offset_ms=getattr(cfg, "metrics_phase_offset_ms", None),
             adapt=getattr(cfg, "metrics_phase_adapt", True),
             retry_ms=getattr(cfg, "metrics_phase_retry_ms", DEFAULT_PHASE_RETRY_MS),
             stale_hold_ms=getattr(cfg, "metrics_stale_hold_ms", DEFAULT_STALE_HOLD_MS),

@@ -17,12 +17,15 @@ KEY = "tre:v2:gateway:cadence"
 @pytest.mark.parametrize(
     "declared, enforce, stale",
     [
-        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1", "version": "abc"}, True, False),
+        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1030004", "version": "abc"}, True, False),
         ({"instant_ms": "10000", "evidence_ms": "10000", "version": "old"}, True, True),
         (None, True, True),
         ({"instant_ms": "500", "evidence_ms": "2000"}, False, False),
+        # M5: declared for an older round: written_ms < window end - evidence period.
+        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1019999"}, True, True),
+        ({"instant_ms": "500", "evidence_ms": "10000"}, True, True),
     ],
-    ids=["match", "mismatch", "missing", "mismatch_warn_mode"],
+    ids=["match", "mismatch", "missing", "mismatch_warn_mode", "stale_written_ms", "no_written_ms"],
 )
 def test_a_cadence_mismatch_marks_the_snapshot_stale(declared, enforce, stale, caplog) -> None:
     redis = _Redis()
@@ -35,6 +38,8 @@ def test_a_cadence_mismatch_marks_the_snapshot_stale(declared, enforce, stale, c
     with caplog.at_level(logging.ERROR, logger="tre_controller.store.metrics_store"):
         snapshot = store.read_snapshot(1_000_000, 1_030_000, use_cache=False, start_exclusive=True)
     assert snapshot.stale is stale
-    assert (snapshot.stale_reason is None) is (declared is not None and declared.get("instant_ms") == "500"
-                                               and declared.get("evidence_ms") == "10000")
+    assert (snapshot.stale_reason is None) is (not stale and enforce)
+    if declared is not None and declared.get("evidence_ms") == "10000" and declared.get("instant_ms") == "500" \
+            and stale:
+        assert snapshot.stale_reason == "gateway_cadence_stale"
     assert ("GATEWAY CADENCE" in caplog.text) is (snapshot.stale_reason is not None)

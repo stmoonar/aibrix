@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 from tre_common import slo_labels
-from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS, SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
 
 from scripts import openloop
 from scripts import prompt_corpus
@@ -539,18 +539,21 @@ def estimate_capture_bytes(cells: list[GridCell], cell_seconds: float, assumed_r
 
 
 def live_instant_lookback_ms(redis_client) -> int:
-    """2 x the gateway's instant-doc period: its declared ``instant_ms``
-    (``tre:v2:gateway:cadence``), else the 10 s grid of older gateways."""
+    """2 x the longest gateway period it declares (``tre:v2:gateway:cadence``: the
+    evidence period, a few seconds - review round 3, L6: a round late by up to one
+    evidence period is still found), else 2 x the 10 s grid of older gateways."""
     from scripts import calibration_capture as capture
 
-    declared = capture.declared_cadence(redis_client).get("instant_ms") if redis_client is not None else None
-    return 2 * int(declared if declared and declared > 0 else LEGACY_GRID_MS)
+    declared = capture.declared_cadence(redis_client) if redis_client is not None else {}
+    periods = [int(v) for v in (declared.get("instant_ms"), declared.get("evidence_ms")) if v and int(v) > 0]
+    return 2 * (max(periods) if periods else LEGACY_GRID_MS)
 
 
 def _make_live_instant_sampler(store, model: str, lookback_ms: int) -> Callable[[int], dict]:
     """Instant queue snapshot from the live MetricsStore, reusing its instant read seam.
 
-    Returns the LATEST scrape value (via store.read_latest_instant), not a windowed
+    Returns the LATEST scrape value (via store.read_latest_instant; None - no sample
+    row - when no pod has a doc in the lookback), not a windowed
     average. The gateway writes the instant docs on a boundary-aligned ticker (its
     declared instant period; 10 s before 2026-10-25), so a too narrow read misses the
     current doc and records 0 (r3 SMOKE_FINDINGS defect 1). ``lookback_ms`` must be
@@ -858,6 +861,12 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
                                  "clock_domain_mismatch")
             print(f"WARNING: cell {cell_id}: {capture.CLOCK_DOMAIN_MISMATCH} at the cell start ({reasons}); "
                   "its gateway docs / controller ticks will be kept but never marked complete")
+    # The gateway keeps instant docs 5 min only (review round 3, M3): read them while the
+    # cell runs, from the dump range's start on, so the dump after the cell has them all.
+    inst_spool = None
+    if clock_start is not None and not args.no_gateway_dump and clock_start.get("late_write_range_ms"):
+        inst_spool = capture.InstantSpool(
+            redis_client, args.model, start_ms=int(clock_start["late_write_range_ms"][0])).start()
 
     # Reissue contamination (scripts.calibration_capture.reissue_check): the sidecar
     # counters of every model pod right before the load ...
@@ -914,6 +923,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         },
     )
 
+    if inst_spool is not None:
+        inst_spool.stop()
     clock_end = None
     if clock_start is not None:
         clock_end = capture.cell_clock_mark(redis_client, args.model, clock_cfg, start=clock_start)
@@ -1048,6 +1059,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             clock_config=clock_cfg or capture_clock_config(args, redis_client),
             info={"guard_voided": guard.voided, "void_reasons": list(guard.void_reasons),
                   "truncated": guard.truncated, "reissue": reissue},
+            inst_spool=inst_spool,
         )
         gd = meta.get("gateway_redis_dump") or {}
         ct = meta.get("controller_ticks") or {}
@@ -1327,7 +1339,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--metrics-schema", default="v1")
     # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
     # An offline rewindow_from_raw of this capture must be passed --instant-sample-ms
-    # equal to the value used here. Closed-loop default: the 10 s fit grid, as before.
+    # equal to the value used here. Closed-loop default: the gateway's instant period.
     # Schedule mode defaults to 1 s (see scripts/openloop.py).
     ap.add_argument("--instant-sample-ms", type=int, default=None)
     # The store's instant grid (its coverage flag; 2026-10-25 queue means have no divisor).
@@ -1566,7 +1578,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         args.instant_sample_ms = (
             int(openloop.DEFAULT_SIDECAR_INTERVAL_S * 1000)
             if args.schedule is not None
-            else SCRAPE_INTERVAL_MS
+            else INSTANT_SAMPLE_INTERVAL_MS
         )
     return args
 

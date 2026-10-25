@@ -283,6 +283,30 @@ def test_dump_gateway_docs_keeps_only_the_cell_range_per_pod_and_kind(tmp_path: 
     assert s["round_stamp_phases_ms"] == [0] and s["last_round_ms"] == 960_000
 
 
+def test_instant_docs_trimmed_during_a_long_cell_are_kept_by_the_spool_and_backfill(tmp_path: Path) -> None:
+    # Review round 3 (M3): the gateway keeps instant docs 5 min. A spool pass during the
+    # cell holds the head; the dump after the cell and a later backfill both keep it.
+    r = FakeRedis(now_ms=960_000)
+    pods = ["default/pod-a"]
+    _seed_gateway(r, pods, [900_000, 950_000])
+    spool = cc.InstantSpool(r, "m7", start_ms=890_000)
+    spool.poll()
+    r.now_ms = 1_200_000
+    _seed_gateway(r, pods, [1_150_000])
+    del r.zsets[inst_key("default/pod-a")][next(iter(r.zsets[inst_key("default/pod-a")]))]  # trimmed
+    spool.poll()
+    assert spool.covers(890_000, 12_000)
+    layout = _layout(tmp_path)
+    first = cc.dump_gateway_docs(r, layout, pods, lo_ms=890_000, hi_ms=1_160_000, spool=spool)
+    assert first["docs"]["inst"] == {"default/pod-a": 3} and first["docs"]["hist"] == {"default/pod-a": 3}
+    r.zsets[inst_key("default/pod-a")].clear()  # everything aged out before the backfill
+    again = cc.dump_gateway_docs(r, layout, pods, lo_ms=890_000, hi_ms=1_160_000, previous=first)
+    assert again["docs"]["inst"] == {"default/pod-a": 3}
+    rows = [json.loads(x) for x in (layout.cell_dir / again["files"]["inst"]["default/pod-a"]).read_text().splitlines()]
+    assert [row["score"] for row in rows[1:]] == [900_000, 950_000, 1_150_000]
+    assert rows[1]["doc"]["model_metrics"]["m7/num_requests_running"] == 1
+
+
 def test_raw_tss_comes_from_the_controller_or_is_derived_at_factor_one() -> None:
     terms = tss_terms(prompt_tokens=3000.0, generation_tokens=9000.0, avg_running=12.0, avg_waiting=2.0,
                       w_p=0.0, lambda_wait=3.0, qmin=1.0, factor=replica_factor(1, 1))
