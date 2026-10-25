@@ -64,11 +64,18 @@ TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 # controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
-CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP")
+CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE")
+# 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
+# production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
+CONTROLLER_ENV_SCOPE_KEYS = ("TRE_SAFESCALE_SCOPE",)
+SAFESCALE_SCOPES = ("all", "receiverless_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
 # collectors of docs/eval-metrics-spec §7 that every arm directory should hold (missing -> suspect)
 COLLECTOR_FILES = ("layout.jsonl", "pod_metrics_1s.jsonl", "pod_gauges.jsonl", "gpu_map.jsonl", "gpu_truth.jsonl",
                    "resource_usage.jsonl", "apa_status.jsonl", "signal_log.jsonl", "clock_offsets.json",
-                   "components.json", "trace_manifest.json", "controller.log", "sm.ts.log", "live-registry.yaml")
+                   "components.json", "trace_manifest.json", "controller.log", "sm.ts.log", "live-registry.yaml",
+                   # 2026-10-26: gateway cadence / doc completeness (10 s), controller decision history and
+                   # SM operations journal from Redis, the post-run check (first_run_check.py)
+                   "gateway_cadence.jsonl", "decision_hist.jsonl", "sm_operations.jsonl", "run_check.json")
 
 DEFAULTS: dict = {
     "trace_file": "traces_tre.effective.json",
@@ -149,17 +156,46 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
-_VAR = re.compile(r"\$\{(\w+)\}")
+def _expand_str(s: str, env: dict) -> str:
+    out, i = [], 0
+    while True:
+        j = s.find("${", i)
+        if j < 0:
+            out.append(s[i:])
+            return "".join(out)
+        out.append(s[i:j])
+        depth, k = 0, j
+        while k < len(s):
+            if s.startswith("${", k):
+                depth += 1
+                k += 2
+                continue
+            if s[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if k >= len(s):
+            raise CampaignError(f"unterminated ${{ in {s!r}")
+        name, sep, default = s[j + 2:k].partition(":-")
+        if not re.fullmatch(r"\w+", name):
+            raise CampaignError(f"bad variable reference ${{{s[j + 2:k]}}} in {s!r}")
+        if sep and not env.get(name):
+            out.append(_expand_str(default, env))
+        elif name not in env:
+            raise CampaignError(f"${{{name}}} is not set (campaign env block / environment)")
+        else:
+            out.append(str(env[name]))
+        i = k + 1
 
 
 def expand(value: Any, env: dict) -> Any:
-    """``${VAR}`` from ``env`` in every string of ``value`` (dict / list recursively)."""
+    """``${VAR}`` from ``env`` in every string of ``value`` (dict / list recursively);
+    ``${VAR:-default}`` takes ``default`` (itself expanded) when VAR is unset or empty - so one
+    campaign setting (e.g. the trace set) can be switched from the caller's environment without
+    editing the file. The expanded values are recorded per arm."""
     if isinstance(value, str):
-        def sub(m):
-            if m.group(1) not in env:
-                raise CampaignError(f"${{{m.group(1)}}} is not set (campaign env block / environment)")
-            return str(env[m.group(1)])
-        return _VAR.sub(sub, value)
+        return _expand_str(value, env)
     if isinstance(value, dict):
         return {k: expand(v, env) for k, v in value.items()}
     if isinstance(value, list):
@@ -227,9 +263,16 @@ def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
     out = {}
     for k, v in raw.items():
         v = str(v).strip().lower()
-        if v not in ("true", "false"):
+        if k in CONTROLLER_ENV_SCOPE_KEYS:
+            if v not in SAFESCALE_SCOPES:
+                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be one of {SAFESCALE_SCOPES}")
+        elif v not in ("true", "false"):
             raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be true or false")
         out[k] = v
+    sc, ds = out.get("TRE_SAFESCALE_SCOPE"), out.get("TRE_ABLATION_DISABLE_SAFESCALE")
+    if sc is not None and ds is not None and (ds == "true") != (sc == "off"):
+        raise CampaignError(f"arm_defs.{arm_id}.controller_env: TRE_ABLATION_DISABLE_SAFESCALE={ds} contradicts "
+                            f"TRE_SAFESCALE_SCOPE={sc} (the switch is the alias of scope off; the controller would refuse to start)")
     return out
 
 
@@ -829,6 +872,16 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
     if rc == 0 and missing:
         m["missing_collectors"] = missing
         sus.append(f"missing / empty collector files: {missing}")
+    # 2026-10-26: the post-run check of run_arm_pilot.sh (first_run_check.py --json run_check.json):
+    # tick coverage, frozen-tick share, truncated logs, signal-loss counts. Its suspects are
+    # recorded and kept (results of a broken recording, not of the system under test).
+    rchk = read_json(d / "run_check.json")
+    if isinstance(rchk, dict):
+        val = rchk.get("validity") or {}
+        m["run_check"] = {k: val.get(k) for k in ("tick_coverage", "frozen_tick_share", "signal_loss", "log_truncated")
+                          if val.get(k) is not None}
+        sus.extend(f"run check: {x}" for x in val.get("suspect") or [])
+        info.extend(f"run check: {x}" for x in val.get("info") or [])
     verdict = "invalid" if inv else ("suspect" if sus else "valid")
     return {"verdict": verdict, "invalid": inv, "suspect": sus, "info": info, "metrics": m}
 
@@ -876,6 +929,9 @@ def arm_manifest(c: dict, item: PlanItem, e: TraceEntry, attempt: int, t0: float
         "trace_design_sha256": (src_man.get("design") or {}).get("sha256"),
         "trace_slice": src_man.get("slice"), "expected_requests": e.requests,
         "clock_offsets_s": clock.get("offsets_s"),
+        # 2026-10-26: where the baseline scaler ran (its log / decision clocks are that node's clock)
+        "baseline_scaler": dict(comp["baseline_scaler"], clock_offset_s=(clock.get("offsets_s") or {}).get(
+            comp["baseline_scaler"].get("node"))) if isinstance(comp.get("baseline_scaler"), dict) else None,
         "env": {k: c["env"][k] for k in sorted(c["env"])},
         "controller_env": arm_def(c, item.arm).controller_env or None,
         "ablation_switches": read_json(d / "ablation_switches.json"),
@@ -1118,6 +1174,11 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
                 warnings.append(f"{e.out_name}: manifest has no out_cap (generated before the route-timeout cap?)")
         if not Path(e.config).is_file():
             problems.append(f"{e.out_name}: missing loadgen config {e.config}")
+        elif info["duration_s"] and not e.slice:
+            mt = re.search(r"(?m)^\s*duration_seconds:\s*(\d+(?:\.\d+)?)", Path(e.config).read_text())
+            if mt and abs(float(mt.group(1)) - float(info["duration_s"])) > 0.5:
+                warnings.append(f"{e.out_name}: loadgen config duration_seconds={mt.group(1)} != trace manifest "
+                                f"duration_s={info['duration_s']} (config root of another trace set?)")
         if e.slice:
             if info["duration_s"] and e.slice["start_s"] + e.slice["duration_s"] > float(info["duration_s"]):
                 problems.append(f"{e.out_name}: slice {e.slice} beyond the trace ({info['duration_s']} s)")
@@ -1128,7 +1189,8 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
             arm_def(c, a)
         except CampaignError as exc:
             problems.append(str(exc))
-    for f in ("run_arm_pilot.sh", "reset_canonical.sh", "lib_env.sh", "sampler.py", "clock_probe.py", "components.py"):
+    for f in ("run_arm_pilot.sh", "reset_canonical.sh", "lib_env.sh", "sampler.py", "clock_probe.py", "components.py",
+              "collect_redis.py", "first_run_check.py"):
         if not (HERE / f).is_file():
             problems.append(f"runner file missing: {HERE / f}")
     problems.extend(paths_outside_repo(env))
@@ -1560,6 +1622,7 @@ def print_plan(c: dict, entries: list[TraceEntry], plan: list[PlanItem], start: 
     start = time.time() if start is None else start
     w = out.write
     w(f"campaign {c['name']}  round={c['round']}  results={c['results_root']}\n")
+    w(f"trace_root={c.get('trace_root')}  loadgen_config_root={c.get('loadgen_config_root')}\n")
     w(f"order={c['order']}  max_attempts={c['max_attempts']}  eta: arm = trace + {c['eta']['overhead_s']} s overhead"
       f" + {c['eta']['report_s'] if c['report'].get('enabled') else 0} s report + {c.get('gap_s') or 0} s gap\n\n")
     w(f"{'#':>3}  {'trace (out dir)':<34} {'pos':>4}  {'arm':<17} {'label':<22} {'trace':>7} {'est':>8}  {'start':<16} {'end':<16} status\n")

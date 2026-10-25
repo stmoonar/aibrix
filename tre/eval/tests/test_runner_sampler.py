@@ -73,3 +73,22 @@ def test_container_cpu_is_the_cumulative_counter_rate():
     assert first[0]["cpu_cores"] == 0.5          # first sample: kubelet's own rate
     assert second[0]["cpu_cores"] == 0.4         # 2 core-seconds over 5 s
     assert second[0]["rss_mib"] == 2.0
+
+
+def test_cadence_row_counts_docs_against_the_declared_periods_and_records_a_missing_hash():
+    """gateway_cadence.jsonl: per pod the docs of the last period vs the declared instant / evidence
+    periods; a gateway without the cadence hash (images before 2026-10-25) is recorded as null and
+    judged on the legacy 10 s grid, never an error."""
+    doc = '{"timestamp": 1000000, "written_ms": 1000030, "scraped_ms": 999800}'
+    pods = {"default/p1": "m7", "default/p2": "m7"}
+    docs = {"default/p1": {"inst_n": 20, "hist_n": 5, "inst_last": (doc, 1000000), "hist_last_ms": 1000000},
+            "default/p2": {"inst_n": 12, "hist_n": 5, "inst_last": None, "hist_last_ms": None}}
+    cad = {"instant_ms": "500", "evidence_ms": "2000", "last_round_ms": "1000000", "version": "v"}
+    row = sampler.cadence_row(1.0, 1000400, cad, pods, docs, 10.0)
+    assert row["declared"] and row["expected"] == {"inst": 20, "hist": 5} and row["window_end_ms"] == 1000000
+    assert row["summary"] == {"pods": 2, "inst_full": 1, "hist_full": 2}
+    assert (row["pods"]["default/p1"]["write_lag_ms"], row["pods"]["default/p1"]["scrape_age_ms"]) == (30, 200)
+    assert row["pods"]["default/p2"]["write_lag_ms"] is None
+    legacy = sampler.cadence_row(1.0, 1000400, None, pods, docs, 10.0)
+    assert legacy["cadence"] is None and not legacy["declared"] and legacy["expected"] == {"inst": 1, "hist": 1}
+    assert legacy["window_end_ms"] == 1000400 and legacy["window_end_source"] == "redis_time"

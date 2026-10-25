@@ -25,6 +25,10 @@
 #   tre -> controller active  + SM active   (set once TRE is the only decision source)
 #   apa -> controller observe + SM active   (set FIRST: the controller stops actuating before the APA CRs go live)
 # --keep-run-mode leaves both keys alone (the runner, tre/eval/runner, sets them itself per arm).
+# --no-restart (tre --keep-run-mode only; 2026-10-26): skip the controller restart. The runner
+# restarts the controller itself right after (arm start), or leaves it in run mode observe (arm
+# end): the controller reads the mode key on every tick (1 s cache, uncached before SM calls)
+# and rolls back its own open probes on observe, so the restart is not needed for either.
 #
 # Both the TRE controller (tre-v2 ns) and the patched aibrix podautoscaler controller
 # (aibrix-system) route scaling through service-manager, so leaving both live would let them
@@ -46,6 +50,7 @@ KUBECTL="${KUBECTL:-kubectl}"
 CONTROLLER_MODE_KEY="tre:v2:controller:mode"
 BL_OWNER_KEY="tre:v2:bl:owner"
 KEEP_RUN_MODE=0
+NO_RESTART=0
 
 log() { echo "[toggle] $*"; }
 
@@ -121,9 +126,13 @@ cmd_tre() {
   [[ -z "$owner" ]] || die "a baseline shell holds $BL_OWNER_KEY ($owner); refusing to enable TRE (would double-drive scaling)"
   log "2/3 verified 0 APA PodAutoscaler CRs and no baseline owner lock; deleting APA scale anchors"
   delete_apa_anchors
-  log "3/3 restarting the controller"
-  kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY"
-  kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
+  if [[ "$NO_RESTART" -eq 1 ]]; then
+    log "3/3 controller restart skipped (--no-restart: the caller restarts it, or it keeps observing)"
+  else
+    log "3/3 restarting the controller"
+    kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY"
+    kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
+  fi
   set_run_mode active active
   local m; m="$(controller_mode)"
   if [[ "$m" == active ]]; then
@@ -172,16 +181,22 @@ cmd_status() {
 }
 
 main() {
-  if [[ "${2:-}" == "--keep-run-mode" ]]; then
-    KEEP_RUN_MODE=1
-  elif [[ -n "${2:-}" ]]; then
-    echo "usage: $0 {tre|apa|status} [--keep-run-mode]" >&2; exit 2
+  local opt
+  for opt in "${@:2}"; do
+    case "$opt" in
+      --keep-run-mode) KEEP_RUN_MODE=1 ;;
+      --no-restart) NO_RESTART=1 ;;
+      *) echo "usage: $0 {tre|apa|status} [--keep-run-mode] [--no-restart]" >&2; exit 2 ;;
+    esac
+  done
+  if [[ "$NO_RESTART" -eq 1 && ( "${1:-}" != tre || "$KEEP_RUN_MODE" -ne 1 ) ]]; then
+    echo "--no-restart is for 'tre --keep-run-mode' only (the caller restarts the controller or leaves it observing)" >&2; exit 2
   fi
   case "${1:-}" in
     tre) cmd_tre ;;
     apa) cmd_apa ;;
     status) cmd_status ;;
-    *) echo "usage: $0 {tre|apa|status} [--keep-run-mode]" >&2; exit 2 ;;
+    *) echo "usage: $0 {tre|apa|status} [--keep-run-mode] [--no-restart]" >&2; exit 2 ;;
   esac
 }
 

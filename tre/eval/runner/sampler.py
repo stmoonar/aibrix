@@ -24,7 +24,12 @@ Files (one JSON object per line, ``ts`` = this host's epoch seconds = the refere
 * ``resource_usage.jsonl`` (SAMPLE_RESOURCES_S, 5 s): per container of the TRE / AIBrix /
   Envoy namespaces, kubelet ``/stats/summary`` (no metrics-server): ``cpu_cores`` from the
   cumulative ``usageCoreNanoSeconds`` difference (kubelet's own ``usageNanoCores`` on the first
-  sample), ``rss_mib``, ``working_set_mib``.
+  sample), ``rss_mib``, ``working_set_mib``;
+* ``gateway_cadence.jsonl`` (SAMPLE_CADENCE_S, 10 s; 2026-10-26): Redis
+  ``tre:v2:gateway:cadence`` (null on gateway images without it) and per pod of
+  ``tre:v2:pods:<model>`` the instant / hist docs written in the last period against the
+  declared periods, plus the newest instant doc's write lag and scrape age (see
+  :func:`cadence_row`). Bounded: a few ZCOUNTs and one doc per pod per sample.
 """
 from __future__ import annotations
 
@@ -44,6 +49,69 @@ COUNTERS = ("vllm:prompt_tokens_total", "vllm:generation_tokens_total", "vllm:nu
             "vllm:request_success_total")
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 MODEL_LABEL = "model.aibrix.ai/name"
+# Gateway TRE docs (tre_common.rediskeys; read-only here). The cadence hash exists only on
+# gateway images of 2026-10-25 or later (fix/v2-sampling-20261025): absent = recorded as null.
+CADENCE_KEY = "tre:v2:gateway:cadence"
+PODS_KEY_PREFIX = "tre:v2:pods:"
+INST_KEY_PREFIX = "tre:v2:inst:"
+HIST_KEY_PREFIX = "tre:v2:hist:"
+LEGACY_DOC_PERIOD_MS = 10_000   # gateway images before the cadence hash: instant and hist docs every 10 s
+
+
+def _int_or_none(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def cadence_window_end(cadence: dict | None, redis_ms: int) -> int:
+    """End (ms) of the counting window: the gateway's ``last_round_ms`` when it declares one
+    (its newest round, the same clock as the doc stamps), else the Redis clock."""
+    last = _int_or_none((cadence or {}).get("last_round_ms"))
+    return last if last is not None else int(redis_ms)
+
+
+def cadence_row(ts: float, redis_ms: int, cadence: dict | None, pods: dict, docs: dict, period_s: float) -> dict:
+    """One ``gateway_cadence.jsonl`` row. ``pods`` {pod key: model} (``tre:v2:pods:<model>``),
+    ``docs`` {pod key: {inst_n, hist_n, inst_last: (member, score) | None, hist_last_ms}}.
+    Per pod: docs written in the window (``(end - period, end]``), the expected count from the
+    declared periods (legacy 10 s grid when the gateway declares none: ``declared`` false), and
+    for the newest instant doc ``write_lag_ms`` = written_ms - stamp, ``scrape_age_ms`` = stamp -
+    scraped_ms (stale engine metrics); missing fields stay null."""
+    win = int(period_s * 1000)
+    inst_ms = _int_or_none((cadence or {}).get("instant_ms"))
+    hist_ms = _int_or_none((cadence or {}).get("evidence_ms"))
+    declared = inst_ms is not None and hist_ms is not None and inst_ms > 0 and hist_ms > 0
+    p_inst = inst_ms if declared else LEGACY_DOC_PERIOD_MS
+    p_hist = hist_ms if declared else LEGACY_DOC_PERIOD_MS
+    exp_inst = win // p_inst if win >= p_inst else None   # a window shorter than the period expects nothing
+    exp_hist = win // p_hist if win >= p_hist else None
+    end = cadence_window_end(cadence, redis_ms)
+    out_pods, full_i, full_h = {}, 0, 0
+    for pk, model in sorted(pods.items()):
+        d = docs.get(pk) or {}
+        row = {"model": model, "inst_n": d.get("inst_n"), "hist_n": d.get("hist_n"),
+               "inst_last_ms": None, "hist_last_ms": d.get("hist_last_ms"), "write_lag_ms": None, "scrape_age_ms": None}
+        last = d.get("inst_last")
+        if last:
+            member, score = last
+            row["inst_last_ms"] = int(score)
+            try:
+                doc = json.loads(member)
+            except (TypeError, ValueError):
+                doc = {}
+            w, s = _int_or_none(doc.get("written_ms")), _int_or_none(doc.get("scraped_ms"))
+            row["write_lag_ms"] = None if w is None else w - int(score)
+            row["scrape_age_ms"] = None if s is None else int(score) - s
+        full_i += exp_inst is not None and (row["inst_n"] or 0) >= exp_inst
+        full_h += exp_hist is not None and (row["hist_n"] or 0) >= exp_hist
+        out_pods[pk] = row
+    return {"ts": ts, "redis_ms": int(redis_ms), "cadence": cadence or None, "declared": declared,
+            "window_end_ms": end, "window_end_source": "last_round_ms" if _int_or_none((cadence or {}).get("last_round_ms")) is not None
+            else "redis_time",
+            "window_ms": win, "expected": {"inst": exp_inst, "hist": exp_hist},
+            "pods": out_pods, "summary": {"pods": len(out_pods), "inst_full": full_i, "hist_full": full_h}}
 
 
 def env(name: str, default: str) -> str:
@@ -257,8 +325,12 @@ class Sampler:
             try:
                 items = kubectl_json("-n", self.apa_ns, "get", "podautoscalers.autoscaling.aibrix.ai")["items"]
                 self.append("apa_status.jsonl", {"ts": t, "pa": {
-                    i["metadata"]["name"]: {k: i.get("status", {}).get(k) for k in
-                                            ("desiredScale", "actualScale", "lastScaleTime")} for i in items}})
+                    i["metadata"]["name"]: {**{k: i.get("status", {}).get(k) for k in
+                                               ("desiredScale", "actualScale", "lastScaleTime")},
+                                            # 2026-10-26: condition type -> [status, reason] (AbleToScale, ...)
+                                            "conditions": {c.get("type"): [c.get("status"), c.get("reason")]
+                                                           for c in i.get("status", {}).get("conditions") or ()}}
+                    for i in items}})
             except Exception as e:  # noqa: BLE001
                 self.append("apa_status.jsonl", {"ts": t, "error": str(e)[:200]})
         self.every(envf("SAMPLE_APA_S", 1.0), tick)
@@ -288,6 +360,47 @@ class Sampler:
                 self.append("gpu_truth.jsonl", {"ts": t, "error": str(e)[:200]})
         self.every(envf("SAMPLE_GPU_TRUTH_S", 1.0), tick)
 
+    # ---- gateway cadence hash + per-pod TRE doc completeness (Redis, read-only)
+    def cadence_loop(self) -> None:
+        if not self.redis_url:
+            return
+        try:
+            import redis  # noqa: PLC0415
+            r = redis.Redis.from_url(self.redis_url, decode_responses=True, socket_timeout=3.0)
+        except Exception as e:  # noqa: BLE001
+            self.append("gateway_cadence.jsonl", {"ts": time.time(), "error": f"redis unavailable: {e}"[:200]})
+            return
+        models = [m for m in env("MODELS", "").split(",") if m]
+        period_s = envf("SAMPLE_CADENCE_S", 10.0)
+
+        def tick(t):
+            try:
+                sec, usec = r.time()
+                redis_ms = int(sec) * 1000 + int(usec) // 1000
+                cadence = r.hgetall(CADENCE_KEY) or None
+                pods = {}
+                for m in models:
+                    for pk in sorted(r.smembers(PODS_KEY_PREFIX + m) or ()):
+                        pods[pk] = m
+                end = cadence_window_end(cadence, redis_ms)
+                lo, hi = f"({end - int(period_s * 1000)}", str(end)
+                pipe = r.pipeline(transaction=False)
+                for pk in pods:
+                    pipe.zcount(INST_KEY_PREFIX + pk, lo, hi)
+                    pipe.zcount(HIST_KEY_PREFIX + pk, lo, hi)
+                    pipe.zrevrange(INST_KEY_PREFIX + pk, 0, 0, withscores=True)
+                    pipe.zrevrange(HIST_KEY_PREFIX + pk, 0, 0, withscores=True)
+                res = pipe.execute() if pods else []
+                docs = {}
+                for i, pk in enumerate(pods):
+                    ni, nh, li, lh = res[4 * i:4 * i + 4]
+                    docs[pk] = {"inst_n": ni, "hist_n": nh, "inst_last": li[0] if li else None,
+                                "hist_last_ms": int(lh[0][1]) if lh else None}
+                self.append("gateway_cadence.jsonl", cadence_row(t, redis_ms, cadence, pods, docs, period_s))
+            except Exception as e:  # noqa: BLE001
+                self.append("gateway_cadence.jsonl", {"ts": t, "error": str(e)[:200]})
+        self.every(period_s, tick)
+
     # ---- container resources (kubelet summary API through the API server proxy)
     def resources_loop(self) -> None:
         prev: dict = {}
@@ -312,7 +425,7 @@ class Sampler:
 
     def run(self) -> None:
         loops = [self.layout_loop, self.pods_loop, self.gauges_loop, self.apa_loop, self.gpu_truth_loop,
-                 self.resources_loop]
+                 self.resources_loop, self.cadence_loop]
         threads = [threading.Thread(target=f, name=f.__name__, daemon=True) for f in loops]
         for th in threads:
             th.start()

@@ -36,9 +36,13 @@ mode_set() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; lo
 n_apa() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true; }
 bl_replicas() { kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0; }
 bl_owner() { kubectl -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
-CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP"   # = run_arm_pilot.sh note 14
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE"   # = run_arm_pilot.sh notes 14 / 15
+ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; *) echo false ;; esac; }
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
-ctl_not_false() { local k v; for k in $CTL_ENV_KEYS; do v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-false}" = false ] || echo "$k=$v"; done; }
+# settings off their default (unset = default): "K=v" lines
+ctl_not_false() { local k v d; for k in $CTL_ENV_KEYS; do d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-$d}" = "$d" ] || echo "$k=$v"; done; }
+# their reset arguments: a switch -> K=false, the scope -> K- (unset)
+ctl_reset_args() { local kv k; for kv in $(ctl_not_false); do k=${kv%%=*}; if [ "$(ctl_default "$k")" = false ]; then echo "$k=false"; else echo "$k-"; fi; done; }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \
                --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "$REDIS_URL" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
 
@@ -50,7 +54,7 @@ problems() {   # prints one line per deviation from the canonical state
   a=$(n_apa); [ "$a" = 0 ] || echo "APA CRs live: $a"
   r=$(bl_replicas); [ "${r:-0}" = 0 ] || echo "baseline scaler replicas: $r"
   o=$(bl_owner); [ -z "$o" ] || echo "baseline owner lock: $o"
-  c=$(ctl_not_false | tr '\n' ' '); [ -z "$c" ] || echo "controller ablation switches not false: $c"
+  c=$(ctl_not_false | tr '\n' ' '); [ -z "$c" ] || echo "controller ablation switches not false / scope not default: $c"
 }
 
 P=$(problems)
@@ -60,7 +64,7 @@ if [ -z "$P" ] && [ "$MODE" != --force ]; then log "canonical: $(run_mode); awak
 
 mode_set observe observe
 # controller ablation switches back to production (false) - after observe/observe, before anything else
-CF=$(ctl_not_false | sed 's/=.*/=false/' | tr '\n' ' ')
+CF=$(ctl_reset_args | tr '\n' ' ')
 if [ -n "$CF" ]; then
   # shellcheck disable=SC2086
   if kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" $CF && kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s; then
