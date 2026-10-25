@@ -40,7 +40,7 @@ local workspace):
 ```
 tre_baselines/   snapshot.py (policy contract)  sources.py  loop.py  sm_client.py  main.py
                  policies/{chiron,tokenscale,preserve,static}.py   trace_oracle.py
-                 tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  tokenscale_profile.py  preserve_mu.py
+                 tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  velocity_ladder.py  tokenscale_profile.py  preserve_mu.py
 examples/        one parameter file per policy (chiron.yaml, tokenscale.yaml, preserve.yaml)
 tests/           unit tests + test_bl_e2e_real_redis.py (fake environment, real Redis)
 ```
@@ -129,6 +129,13 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   (alg1) at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
   (`kv_request_tokens`, engine cache info), recorded as `b_max` / `b_max_src` per decision; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
+- **2026-10-26 (v1 port, docs/campaign-v2-20261026-plan.md)**: TokenScale cells use the paper's boundaries
+  (input < 256 / < 1024 / else, output < 100 / < 350 / >= 350) with each cell's calibration point = the mean
+  (in, out) of the campaign's replayed requests in it: `tools/tokenscale_buckets --trace-root <set> --traces ...
+  --out <report>`. V_b (peak of full steps, v1 D53 queue-growth criterion, two full steps in a row stop) and
+  PreServe mu (normalized-latency SLO = 3 x isolated NL, every request in a step's window, v1 D58) are measured
+  direct to the pods with `tools/velocity_ladder {ladder|isolated|mu|summarize}` (module docstring). This
+  replaces the knee / single-shape procedure below for the main runs.
 - TokenScale-colocated and PreServe-oracle (`tools/tokenscale_profile`, run from `tre/` with
   `PYTHONPATH=common:deploy:calibration:replayer:loadgen_v1:baselines`; the senders import
   `tre_replayer`): the hot alt trace has one shape (in ~492, out 400), so the buckets
