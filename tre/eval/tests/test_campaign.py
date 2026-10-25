@@ -503,3 +503,46 @@ def test_ablation_safescale_campaign_plan(tmp_path):
     assert {i.arm: C.arm_def(c, i.arm).controller_env for i in plan} == {
         "tre": {"TRE_ABLATION_DISABLE_SAFESCALE": "false"}, "tre-nosafescale": {"TRE_ABLATION_DISABLE_SAFESCALE": "true"}}
     assert all(i.base_arm == "tre" for i in plan) and c["env"]["GW_PARITY"] == "1"
+
+
+def test_v2_20261026_campaign_and_smoke_plans(tmp_path):
+    """The shipped 10-26 campaign: 7 traces x 4 arms, every arm first in at least one trace (no arm
+    always first), the TRE arm with SafeScale off, PreServe labelled as the faithful arm; the smoke:
+    two ~7 min slices with the same 4 arms and a different first arm per trace."""
+    env = {"TRE_REPO": str(tmp_path)}
+    c = C.load_campaign(RUNNER / "campaigns" / "campaign-v2-20261026.yaml", environ=env)
+    plan = C.build_plan(c)
+    arms = {"tre-ss-receiverless", "tokenscale", "preserve", "apa"}
+    assert len(plan) == 28 and {i.arm for i in plan} == arms
+    assert [e.trace for e in C.resolve_traces(c)] == ["Tight_pool", "Simul_spike", "Real_code", "Real_conv",
+                                                      "Prefill_mix", "Decode_burst", "Sinusoidal"]
+    firsts = [i.arm for i in plan if i.position == 1]
+    assert set(firsts) == arms
+    assert C.arm_def(c, "tre-ss-receiverless").controller_env == {
+        "TRE_SAFESCALE_SCOPE": "receiverless_shrink", "TRE_ABLATION_DISABLE_SAFESCALE": "false"}
+    assert C.arm_def(c, "preserve").label == "PreServe" and C.arm_def(c, "preserve").base == "preserve"
+    assert c["env"]["GW_PARITY"] == "1" and c["report"]["ref"] == "tre-ss-receiverless" and not c["report"]["decision_points"]
+    s = C.load_campaign(RUNNER / "campaigns" / "campaign-smoke-v2-20261026.yaml", environ=env)
+    entries = C.resolve_traces(s)
+    assert [e.trace for e in entries] == ["Simul_spike", "Prefill_mix"]
+    assert all(360 <= e.slice["duration_s"] <= 480 and e.client_dir.startswith(s["results_root"]) for e in entries)
+    sp = C.build_plan(s)
+    assert len(sp) == 8 and {i.arm for i in sp} == arms
+    assert len({i.arm for i in sp if i.position == 1}) == 2
+
+
+def test_trace_set_is_one_setting_switchable_from_the_environment(tmp_path):
+    """trace_root / loadgen_config_root come from CAMPAIGN_TRACE_ROOT / CAMPAIGN_CONFIG_ROOT: the
+    file's default, or the caller's value when set (recorded in the env block)."""
+    path = RUNNER / "campaigns" / "campaign-v2-20261026.yaml"
+    c = C.load_campaign(path, environ={"TRE_REPO": "/r"})
+    assert c["trace_root"] == c["env"]["CAMPAIGN_TRACE_ROOT"] and c["trace_root"].endswith("traces-v2-720-20261026")
+    assert c["loadgen_config_root"] == c["env"]["CAMPAIGN_CONFIG_ROOT"] and c["loadgen_config_root"].startswith("/r/")
+    c2 = C.load_campaign(path, environ={"TRE_REPO": "/r", "CAMPAIGN_TRACE_ROOT": "/t2", "CAMPAIGN_CONFIG_ROOT": "/c2"})
+    assert (c2["trace_root"], c2["loadgen_config_root"]) == ("/t2", "/c2")
+    assert C.resolve_traces(c2)[0].src_dir == "/t2/Tight_pool/seed1"
+    c3 = C.load_campaign(path, environ={"TRE_REPO": "/r", "CAMPAIGN_TIGHT_POOL": "T7_tight_pool"})
+    assert C.resolve_traces(c3)[0].trace == "T7_tight_pool"
+    assert C.expand("${X:-${Y}/z}", {"Y": "y"}) == "y/z"
+    with pytest.raises(C.CampaignError):
+        C.expand("${X}", {})

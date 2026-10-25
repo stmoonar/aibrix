@@ -1,0 +1,100 @@
+# NOTE: results_root, the trace / config roots and the other absolute paths below are site-specific; edit them for another cluster.
+# Smoke of campaign-v2-20261026.yaml before the full run: the same 4 arms, env, policies and checks, on two slices of
+# ~7 min (420 s) each, for log-based verification of the controller (sampling, Z / decision times, fast loop 5 s,
+# O1, saturation rescue) and of the baselines (5 s tick, TokenScale cells, PreServe mLSTM) against their decision logs.
+#   Simul_spike [150, 570): sized for the 720 s set (the 1200 s spec's pulses at 75/375/675/975 s, width 150 s,
+#                           scaled x0.6 -> 45/225/405/585 s, width 90 s): pulse 2 up + down, pulse 3 up + down.
+#   Prefill_mix [150, 570): 180 s phases scaled x0.6 -> 108 s: four hot-model / stage rotations.
+# CHECK the slices against the regenerated 720 s set before running (the dry-run prints the request counts; a
+# slice beyond the trace is a problem). Arm order: Williams rows 0 and 1 (different first arm per trace).
+#
+#   CAMPAIGN_TRACE_ROOT=... CAMPAIGN_CONFIG_ROOT=... tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-v2-20261026.yaml --dry-run --probe
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-v2-20261026.yaml > /data/nfs_shared_data/xxy/smoke-v2-20261026.out 2>&1 &
+#   python3 tre/eval/runner/first_run_check.py /data/nfs_shared_data/xxy/smoke-v2-20261026/<trace>_slice150-570_s1/<arm>
+#
+# The smoke may run from the branch (AGENTS.md rule 6 exception for smoke); the dry-run warns.
+name: smoke-v2-20261026
+round: smoke-v2-20261026            # exclusive-window marker: "validation <start> <end> round=smoke-v2-20261026"
+results_root: /data/nfs_shared_data/xxy/smoke-v2-20261026
+trace_root: ${CAMPAIGN_TRACE_ROOT}
+loadgen_config_root: ${CAMPAIGN_CONFIG_ROOT}
+seed: 1
+arms: [tre-ss-receiverless, tokenscale, preserve, apa]
+order: williams
+max_attempts: 1                     # a smoke failure is looked at, not retried
+gap_s: 0
+# per arm: trace (720 s) + overhead. e1-envoy4: median wall - trace = 346 s; minus ~70 s saved by this runner
+# (no gateway rollouts between arms, one controller restart per arm) -> ~280 s; report ~150 s.
+eta: {overhead_s: 280, report_s: 60}
+
+env:
+  CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
+  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2_720}"   # default is a guess: set it
+  CAMPAIGN_TIGHT_POOL: "${CAMPAIGN_TIGHT_POOL:-Tight_pool}"
+  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-}"
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"               # the event stream stays on between arms (every arm wants it): no gateway rollouts
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  # post-run check (first_run_check.py, run_check.json): expected periods and limits
+  RUN_CHECK_CONTROLLER_TICK_S: "5"  # controller fast loop (TRE_RESCUE_INTERVAL_SECONDS)
+  RUN_CHECK_BASELINE_TICK_S: "5"    # baseline scaler tick (TRE_BL_TICK_S, 5 s from feat/bl-v1-port-20261026)
+  RUN_CHECK_COVERAGE_MIN: "0.9"     # ticks during the load >= 0.9 x load / tick
+  RUN_CHECK_FROZEN_MAX: "0.05"      # PreServe frozen-tick share, when the policy reports it
+
+arm_defs:
+  tre-ss-receiverless:
+    base: tre
+    label: TRE-SS-receiverless
+    # the startup line ablation_switches must log safescale_scope=receiverless_shrink (ablation_switches.json
+    # keeps the effective values); a controller image without the setting refuses the arm (exit 4)
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  preserve:
+    base: preserve
+    label: PreServe                 # faithful (mLSTM, load errors), not the oracle
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
+  trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${CAMPAIGN_DECISION_POINTS}   # optional (empty: none); t7-decision-points.yaml is for the 1200 s T7 trace
+  ref: tre-ss-receiverless
+  reps: 200
+  timeout_s: 600
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Simul_spike
+    slice: {start_s: 150, duration_s: 420}
+  - trace: Prefill_mix
+    slice: {start_s: 150, duration_s: 420}
