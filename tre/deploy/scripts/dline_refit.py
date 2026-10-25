@@ -445,6 +445,21 @@ def dataset_numerator(directory: Path) -> str:
     return str((doc.get("numerator") or {}).get("source") or l3.NUMERATOR_GATEWAY)
 
 
+def dataset_queue_estimator(directory: Path) -> str:
+    """The queue estimator a standard dataset's ``avg_running`` / ``avg_waiting`` were
+    built with (its manifest's ``queue_estimator.name``,
+    :data:`scripts.rewindow_from_raw.QUEUE_ESTIMATORS`); a manifest from before the record
+    (2026-10-25) is :data:`~scripts.rewindow_from_raw.QUEUE_ESTIMATOR_UNRECORDED`."""
+    from scripts.rewindow_from_raw import QUEUE_ESTIMATOR_UNRECORDED
+
+    man = Path(directory) / DATASET_MANIFEST
+    try:
+        doc = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return QUEUE_ESTIMATOR_UNRECORDED
+    return str((doc.get("queue_estimator") or {}).get("name") or QUEUE_ESTIMATOR_UNRECORDED)
+
+
 def dataset_attribution(directory: Path) -> str:
     """The label attribution a standard dataset was built with (its manifest's
     ``attribution.value``; ``calibration_dataset.dataset_attribution`` when the labels
@@ -520,7 +535,7 @@ def prompt_token_mismatched_cells(src: DatasetSource) -> set[tuple[str, str]]:
 
 def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                        sentinels: bool = True, models: Optional[Sequence[str]] = None,
-                       train_dynamic: bool = False) -> dict:
+                       train_dynamic: bool = False, queue_estimator: Optional[str] = None) -> dict:
     """D16: cut the training set (constant-load cells) out of standard datasets;
     ``train_dynamic``: plus the train-split dynamic cells (:data:`DYNAMIC_TRAINING_RULE`).
 
@@ -548,6 +563,15 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
         # one theta, one label: completion and hybrid label a window's requests differently
         raise TrainingSetError(f"the datasets were built with different label attributions {attributions}; "
                                "rebuild them with one calibration_dataset --attribution")
+    estimators = {s.name: dataset_queue_estimator(s.directory) for s in sources}
+    if len(set(estimators.values())) > 1:
+        # one theta, one queue: the estimators read the same window's queue differently
+        raise TrainingSetError(f"the datasets were built with different queue estimators {estimators}; "
+                               "rebuild them with one calibration_dataset --queue-estimator")
+    if queue_estimator is not None and set(estimators.values()) - {queue_estimator}:
+        raise TrainingSetError(f"--queue-estimator {queue_estimator}: the datasets were built with "
+                               f"{estimators} (rebuild them with calibration_dataset --queue-estimator "
+                               f"{queue_estimator})")
     bad_attr = sorted({a for a in attributions.values() if a not in ATTRIBUTIONS})
     if bad_attr:
         raise TrainingSetError(f"unknown label attribution(s) {bad_attr} (known: {list(ATTRIBUTIONS)})")
@@ -692,6 +716,7 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             "windows_csv_sha256": sha256_file(s.windows),
             "manifest_sha256": sha256_file(man) if man.exists() else None, "format_revision": rev,
             "numerator": numerators[s.name], "attribution": attributions[s.name],
+            "queue_estimator": estimators[s.name],
         })
     doc = {
         "what": ("D16 training set: the constant-load cells of the sources (theta is fitted on these only)"
@@ -715,6 +740,8 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
         "numerator": next(iter(numerators.values()), None),
         # The label attribution of every source (one by construction); the fit stages label with it.
         "attribution": next(iter(attributions.values()), ATTRIBUTION_COMPLETION),
+        # The queue estimator of every source (one by construction; rewindow_from_raw.QUEUE_ESTIMATORS).
+        "queue_estimator": next(iter(estimators.values()), None),
         "dynamic_training": {"admitted": bool(train_dynamic),
                              "rule": DYNAMIC_TRAINING_RULE if train_dynamic else
                              "off: D16 - constant-load cells only (no --train-dynamic)",
@@ -863,11 +890,18 @@ def step90_s(tau_s: float, dt_ref_s: float = DT_REF_S) -> float:
     return dt_ref_s * math.ceil(math.log(0.1) / math.log(1.0 - a))
 
 
-def spec_for(tau_s: float, w_p: float, lam: float):
+#: The fit method of the theta / band fits this run makes (``--fit-method``,
+#: :data:`tre_calibration.fit.FIT_METHODS`). The alpha stage's own fits (alpha_fit) and the
+#: v1 lambda / w_p selection do not use it; final (and the v2 wp stage) do.
+FIT_METHOD = "ba_argmax_quantile_grid"
+
+
+def spec_for(tau_s: float, w_p: float, lam: float, fit_method: Optional[str] = None):
     from scripts import theta_verdict as tv
 
     return tv.build_signal_spec("tss", w_p=w_p, lambda_wait=lam, qmin=1.0,
-                                ema_tau_ms=(tau_s * 1000.0 if tau_s > 0 else None))
+                                ema_tau_ms=(tau_s * 1000.0 if tau_s > 0 else None),
+                                fit_method=FIT_METHOD if fit_method is None else fit_method)
 
 
 # ------------------------------------------------------------------ scoring helpers
@@ -1322,6 +1356,12 @@ def _legacy_stop(stop: Mapping[str, Any]) -> Optional[bool]:
 #: The theta uncertainty band disclosed next to D (coordinator 2026-10-05, replacing the
 #: dropped plateau-midpoint rule): the fit's own candidates within this BA of the best.
 PLATEAU_BA_TOLERANCE = 0.005
+THETA_SELECTION_RULE_M2 = ("theta = the midpoint of the BA plateau of tre_calibration.fit."
+                           "fit_theta_by_balanced_accuracy over the unique grid (every distinct healthy "
+                           "value in the healthy-quantile range): all candidates within the plateau eps (.005) "
+                           "of the best BA, contiguous or not; tau_crit / tau_high = the midpoints of their "
+                           "BA plateaus (eps .005) on the delta grids (fit method "
+                           "m2_unique_grid_plateau_midpoint, user 2026-10-25)")
 THETA_SELECTION_RULE = ("theta = the BA-argmax candidate of tre_calibration.fit.fit_theta_by_balanced_accuracy "
                         "(candidates: the fit config's healthy-quantile grid); exact BA ties (1e-12) break on the "
                         "higher violating-window specificity, then on the larger oriented theta (the threshold "
@@ -1400,12 +1440,18 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     v["published"]["d5_merged_published"] = True
     # the theta uncertainty band (disclosed; theta stays the fit's argmax), on the training windows
     spec_f = spec_for(tau, wp, lam)
-    selection = {"rule": THETA_SELECTION_RULE, "theta": v["published"]["theta_m"],
+    from tre_calibration.fit import FIT_METHOD_ARGMAX, fit_method as named_fit_method
+
+    method = named_fit_method(spec_f.fit_method)
+    selection = {"rule": THETA_SELECTION_RULE if method.name == FIT_METHOD_ARGMAX else THETA_SELECTION_RULE_M2,
+                 "theta": v["published"]["theta_m"],
                  "plateau": theta_plateau(spec_f.load(p["fitting"], label, TRIM_RAMP_WINDOWS),
                                           spec_f.default_config(), fit_theta=v["published"]["theta_m"])}
+    if method.name != FIT_METHOD_ARGMAX:
+        selection["fit_method"] = method.as_dict()
     (out_dir / "verdict_final.json").write_text(json.dumps(v, indent=1, default=str))
     pub = v["published"]
-    extra = {"theta_selection": selection,
+    extra = {"theta_selection": selection, "fit_method": method.name,
              "absolute_thresholds": absolute_thresholds(pub["theta_m"], pub["tau_crit"], pub.get("tau_high"))}
     if not holdout:
         spec = spec_for(tau, wp, lam)
@@ -1707,10 +1753,15 @@ def code_state() -> dict:
     return {"commit": commit, "dirty": dirty, "tre_root": str(root)}
 
 
-def freeze_paths(freeze_file: Path) -> dict[str, Path]:
+def freeze_paths(freeze_file: Path, *, dev: bool = False) -> dict[str, Path]:
     """The files that go with a freeze file: its sha256 sidecar, the accept result, the
-    accept marker and the accept work dir (the per-model validation CSVs)."""
+    accept marker and the accept work dir (the per-model validation CSVs). ``dev``: the
+    DEV evaluation's own result / marker / work dir (``accept --dev-opened-m``), never the
+    ``.accepted`` marker of an acceptance."""
     f = Path(freeze_file)
+    if dev:
+        return {"freeze": f, "sidecar": Path(f"{f}.sha256"), "result": f.with_name(f"{f.stem}.dev_accept.json"),
+                "marker": Path(f"{f}.dev_accepted"), "work": f.with_name(f"{f.stem}.dev_accept.d")}
     return {"freeze": f, "sidecar": Path(f"{f}.sha256"), "result": f.with_name(f"{f.stem}.accept.json"),
             "marker": Path(f"{f}.accepted"), "work": f.with_name(f"{f.stem}.accept.d")}
 
@@ -1868,6 +1919,9 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
     except (ValueError, KeyError) as exc:
         return None, [f"B' severity cut: {exc}"]
     a_deadband = deadband_freeze_record(verdict_for_holdout(ver), p["fitting"])
+    methods, m_problems = freeze_methods(fin, ver, man_doc)
+    if m_problems:
+        return None, m_problems
 
     h2_path = fit_dir / H2_MANIFEST
     stage_files = {name: d / f"{name}.json" for name in FREEZE_STAGE_FILES}
@@ -1916,8 +1970,44 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         "theta_selection": fin.get("theta_selection") or {"rule": "final.json predates the record: the BA argmax"},
         "absolute_thresholds": absolute_thresholds(fin["theta_published"], fin["tau_crit"], pub.get("tau_high")),
         "a_deadband": a_deadband,
+        # 2026-10-25: how the windows' queue and the thresholds were made, and the datasets
+        # the training set was cut from (each by its manifest sha256) - what a rerun needs
+        "methods": methods,
+        "input_datasets": {str(src.get("run")): {k: src.get(k) for k in (
+            "directory", "manifest_sha256", "windows_csv_sha256", "sealed_split", "queue_estimator")}
+            for src in man_doc.get("sources") or []},
     }
     return entry, []
+
+
+def freeze_methods(fin: Mapping[str, Any], ver: Mapping[str, Any],
+                   trainset_doc: Mapping[str, Any]) -> tuple[dict, list[str]]:
+    """The methods record of one model's freeze entry: the queue estimator of the training
+    windows (trainset.json, from the dataset manifests: a manifest without the record is the
+    pre-2026-10-25 live-grid sum, dataset_queue_estimator) and the fit method of
+    theta and the bands (the verdict's signal spec; absent = the BA argmax), with the plateau
+    eps. A final.json naming another fit method than its verdict is a problem."""
+    from tre_calibration.fit import DEFAULT_FIT_METHOD, fit_method as named_fit_method
+
+    from scripts.rewindow_from_raw import QUEUE_ESTIMATOR_UNRECORDED, QUEUE_ESTIMATORS
+
+    problems: list[str] = []
+    name = str((ver.get("signal_spec") or {}).get("fit_method") or DEFAULT_FIT_METHOD)
+    if fin.get("fit_method") not in (None, name):
+        problems.append(f"final.json fit method {fin.get('fit_method')!r} != verdict_final.json's {name!r}")
+    try:
+        method = named_fit_method(name)
+    except ValueError as exc:
+        return {}, [str(exc)]
+    qe = str(trainset_doc.get("queue_estimator") or QUEUE_ESTIMATOR_UNRECORDED)
+    if qe not in QUEUE_ESTIMATORS:
+        problems.append(f"trainset.json queue estimator {qe!r} is not one of {sorted(QUEUE_ESTIMATORS)}")
+    grid, divisor = QUEUE_ESTIMATORS.get(qe, (None, None))
+    return {"queue_estimator": {"name": qe, "instant_grid": grid, "divisor": divisor},
+            "fit_method": method.as_dict(),
+            "theta_method": f"{method.candidate_grid} grid, {method.theta_selection}",
+            "band_method": f"ba_grid, {method.band_selection}",
+            "plateau_eps": method.plateau_eps}, problems
 
 
 def deadband_freeze_record(vh: Mapping[str, Any], training_csv: Path) -> dict:
@@ -2035,12 +2125,32 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
         "self_hash_rule": ("freeze_sha256 = sha256 of json.dumps(doc without freeze_sha256, sort_keys=True, "
                            "separators=(',', ':'), ensure_ascii=False) in UTF-8"),
     }
+    doc["manifest"] = freeze_manifest(doc)
     doc["freeze_sha256"] = canonical_sha256(doc)
     data = _json_bytes(doc)
     fp["freeze"].parent.mkdir(parents=True, exist_ok=True)
     _write_once(fp["freeze"], data)
     _write_once(fp["sidecar"], f"{hashlib.sha256(data).hexdigest()}  {fp['freeze'].name}\n".encode())
     return doc
+
+
+#: Output fields of a freeze entry the reproduction manifest lists.
+MANIFEST_OUTPUT_KEYS = ("published", "registry", "ci_half_frac", "train_ba_at_published", "absolute_thresholds")
+
+
+def freeze_manifest(doc: Mapping[str, Any]) -> dict:
+    """The freeze's reproduction record (2026-10-25): code commit, per model the methods,
+    the input datasets (manifest sha256) and the output parameters - one place to read
+    what reproducing this freeze takes. Every field is a copy of the entry it comes from."""
+    return {
+        "what": ("reproduction manifest: rerun calibration_dataset (queue estimator below) on the input "
+                 "datasets' runs, then dline_refit trainset / alpha / wp / final (fit method below) / freeze "
+                 "at this code commit; deploy/scripts/calibration/run_freeze_m2.sh does both"),
+        "code": doc.get("code"),
+        "models": {m: {"methods": e.get("methods"), "input_datasets": e.get("input_datasets"),
+                       "outputs": {k: e.get(k) for k in MANIFEST_OUTPUT_KEYS}}
+                   for m, e in sorted((doc.get("models") or {}).items())},
+    }
 
 
 def accept_gate_record(rule: str) -> dict:
@@ -2126,9 +2236,11 @@ def _parse_sums_line(line: str) -> tuple[str, str]:
 
 
 def check_m_manifest(path: Path, freeze_doc: Mapping[str, Any],
-                     freeze_file_sha256: str) -> tuple[Optional[dict], list[str]]:
+                     freeze_file_sha256: str, *, other_freeze_ok: bool = False) -> tuple[Optional[dict], list[str]]:
     """An M manifest (the collection side's ``<M root>/<model>/M_manifest.json``) and every
-    reason it cannot be accepted against this freeze."""
+    reason it cannot be accepted against this freeze. ``other_freeze_ok`` (only
+    ``accept --dev-opened-m``): an M sealed under another freeze is not a problem - the
+    caller records that freeze and labels the evaluation DEV; every other check stays."""
     path = Path(path)
     try:
         man = json.loads(path.read_text(encoding="utf-8"))
@@ -2147,7 +2259,7 @@ def check_m_manifest(path: Path, freeze_doc: Mapping[str, Any],
     if entry is None:
         return None, [f"{path}: model {model!r} is not in the freeze ({sorted(freeze_doc['models'])})"]
     fr = man["freeze"] if isinstance(man["freeze"], dict) else {}
-    if fr.get("sha256") != freeze_file_sha256:
+    if fr.get("sha256") != freeze_file_sha256 and not other_freeze_ok:
         problems.append(f"sealed under another freeze: manifest freeze sha256 {fr.get('sha256')} != "
                         f"{freeze_file_sha256} (this freeze file)")
     want_label = canonical_sha256(entry["verdict_for_holdout"]["label_def"])
@@ -2616,7 +2728,7 @@ def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int
 
 
 def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
-                   m_manifests: Sequence[str]) -> tuple[dict, list[str]]:
+                   m_manifests: Sequence[str], *, dev: bool = False) -> tuple[dict, list[str]]:
     """Every refusal check of ``accept`` but the once-only one; the inputs when none fails."""
     problems: list[str] = []
     try:
@@ -2635,7 +2747,7 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
     manifest_paths: dict[str, Path] = {}
     unreadable = False
     for text in m_manifests:
-        man, pr = check_m_manifest(Path(text), doc, freeze_sha)
+        man, pr = check_m_manifest(Path(text), doc, freeze_sha, other_freeze_ok=dev)
         problems += pr
         if man is None:
             unreadable = True
@@ -2665,6 +2777,17 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
             problems.append(f"dataset {s.name} ({s.directory}) was built with the {have!r} TSS numerator; the "
                             f"freeze fitted {wrong} with {sorted({frozen_numerators[m_] for m_ in wrong})} "
                             "(rebuild it with calibration_dataset --numerator)")
+    from scripts.rewindow_from_raw import QUEUE_ESTIMATOR_UNRECORDED
+
+    frozen_q = {m_: str(((e.get("methods") or {}).get("queue_estimator") or {}).get("name")
+                        or QUEUE_ESTIMATOR_UNRECORDED) for m_, e in sorted(doc["models"].items())}
+    for s in sources:
+        have = dataset_queue_estimator(s.directory)
+        wrong = sorted(m_ for m_, q_ in frozen_q.items() if q_ != have)
+        if wrong:
+            problems.append(f"dataset {s.name} ({s.directory}) was built with the {have!r} queue estimator; "
+                            f"the freeze fitted {wrong} on {sorted({frozen_q[m_] for m_ in wrong})} windows "
+                            "(rebuild it with calibration_dataset --queue-estimator)")
     frozen_attr = {m_: label_attribution((e.get("verdict_for_holdout") or {}).get("label_def"))
                    for m_, e in sorted(doc["models"].items())}
     for s in sources:
@@ -3015,10 +3138,26 @@ def result_differences(stored: Any, recomputed: Any, *, ignore: frozenset = ACCE
     return [f"{where}: stored {stored!r} != recomputed {recomputed!r}"]
 
 
+#: What ``accept --dev-opened-m`` writes into its result (``evaluation``).
+DEV_EVALUATION_RULE = (
+    "DEV: this freeze was evaluated on M sets already opened under another freeze (accept "
+    "--dev-opened-m). M is not a hold-out for this freeze - the fit's choices may have been made "
+    "after seeing it - so the result is a development check, never an acceptance: it is written to "
+    "<freeze stem>.dev_accept.json, the .accepted marker is never written, and a real acceptance "
+    "still needs an M sealed under this freeze")
+
+
+def dev_evaluation_record(reason: str, inp: Mapping[str, Any]) -> dict:
+    return {"kind": "DEV", "rule": DEV_EVALUATION_RULE, "reason": reason,
+            "m_sealed_under_freeze": {m: (man.get("freeze") or {}).get("sha256")
+                                      for m, man in sorted((inp.get("manifests") or {}).items())},
+            "this_freeze_sha256": inp.get("freeze_sha256")}
+
+
 def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequence[str], *,
                  recheck: bool = False, n_resamples: int = ACCEPT_RESAMPLES,
                  command: Sequence[str] = (), b_prime_thresholds: Optional[Path] = None,
-                 dwell_windows: Optional[int] = None) -> int:
+                 dwell_windows: Optional[int] = None, dev_opened_m: Optional[str] = None) -> int:
     """Plan §6.9f A-D, once. Returns 0 = evaluated and passed, :data:`EXIT_ACCEPT_FAILED`
     = evaluated and failed, :data:`EXIT_REFUSED` = refused (nothing written); with
     ``recheck``: 0 = the stored result reproduces, :data:`EXIT_RECHECK_DIFFERS` = not."""
@@ -3026,7 +3165,11 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
     import tempfile
 
     freeze_file = Path(freeze_file)
-    fp = freeze_paths(freeze_file)
+    dev = dev_opened_m is not None
+    if dev and not str(dev_opened_m).strip():
+        print("accept REFUSED - nothing was written:\n  - --dev-opened-m needs a reason")
+        return EXIT_REFUSED
+    fp = freeze_paths(freeze_file, dev=dev)
     problems: list[str] = []
     stored_bytes, stored = b"", {}
     if recheck:
@@ -3053,7 +3196,7 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
     else:
         dwell, dwell_source = ONLINE_DWELL_WINDOWS, ("default: ONLINE_DWELL_WINDOWS = the controller's "
                                                      "TRE_DWELL_WINDOWS (deploy/overlays/tre-v2/controller.yaml)")
-    inp, pr = _accept_inputs(freeze_file, datasets, m_manifests)
+    inp, pr = _accept_inputs(freeze_file, datasets, m_manifests, dev=dev)
     problems += pr
     if "doc" in inp:
         bp_cfgs, bp_summary, bp_problems = b_prime_inputs(inp["doc"], b_prime_thresholds, dwell, dwell_source)
@@ -3074,6 +3217,8 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
         n_resamples, seed = int(stored["bootstrap"]["n_resamples"]), int(stored["bootstrap"]["seed"])
         with tempfile.TemporaryDirectory(prefix="dline_accept_recheck_") as tmp:
             new = _accept_result(freeze_file, inp, Path(tmp), n_resamples=n_resamples, seed=seed, command=command)
+            if dev:
+                new["evaluation"] = dev_evaluation_record(str(dev_opened_m), inp)
         new = json.loads(_json_bytes(new).decode("utf-8"))
         print_ranking_table(new)
         if stored_rev != new.get("format_revision"):
@@ -3100,6 +3245,9 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
     fp["work"].mkdir()
     try:
         result = _accept_result(freeze_file, inp, fp["work"], n_resamples=n_resamples, seed=SEED, command=command)
+        if dev:
+            result["evaluation"] = dev_evaluation_record(str(dev_opened_m), inp)
+            print(f"DEV evaluation (M already opened; not an acceptance): {dev_opened_m}")
         for f in fp["work"].iterdir():
             os.chmod(f, 0o444)
         data = _json_bytes(result)
@@ -3131,7 +3279,7 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
                 f"old B {'pass' if c['B']['passed'] else 'fail'}; "
                 f"C TTFT-only recall {c['C']['critical_recall_ttft_only']} on {c['C']['windows']} windows)")
     print_ranking_table(result)
-    print(f"wrote {fp['result']} and {fp['marker']}")
+    print(f"wrote {fp['result']} and {fp['marker']}" + (" (DEV)" if dev else ""))
     for x in result.get("disclosed_limitations") or []:
         print(f"  limitation (disclosed, not failing): {x}")
     if not result["passed"]:
@@ -3139,7 +3287,8 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
         for x in result["failed"]:
             print(f"  - {x}")
         return EXIT_ACCEPT_FAILED
-    print("acceptance passed" + (f" (verdict {result['verdict']})" if onset_rule else ""))
+    print(("DEV check passed" if dev else "acceptance passed")
+          + (f" (verdict {result['verdict']})" if onset_rule else ""))
     return 0
 
 
@@ -3212,6 +3361,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="accept: recompute in a temp dir and compare with the stored result; writes nothing")
     ap.add_argument("--accept-resamples", type=int, default=ACCEPT_RESAMPLES,
                     help="accept: cell-bootstrap resamples of the A-C intervals")
+    ap.add_argument("--fit-method", default=None,
+                    help="final (and the v2 wp stage): how theta and tau_crit / tau_high are chosen, one of "
+                         "tre_calibration.fit.FIT_METHODS - ba_argmax_quantile_grid (default, the 2026-10-05 "
+                         "freeze's) or m2_unique_grid_plateau_midpoint (user 2026-10-25); recorded in "
+                         "final.json, the verdict's signal spec and the freeze")
+    ap.add_argument("--queue-estimator", default=None,
+                    help="trainset: refuse unless every dataset was built with this queue estimator "
+                         "(scripts.rewindow_from_raw.QUEUE_ESTIMATORS); the training set records the "
+                         "datasets' estimator either way")
+    ap.add_argument("--dev-opened-m", default=None, metavar="REASON",
+                    help="accept: evaluate this freeze on M sets sealed under ANOTHER freeze (already opened) "
+                         "as a DEV check: recorded with REASON, written to <freeze stem>.dev_accept.json, "
+                         "never the .accepted marker (DEV_EVALUATION_RULE)")
     ap.add_argument("--b-prime-thresholds", type=Path, default=None,
                     help="accept, only under a freeze older than format revision 3 (no sealed B' cut): "
                          "the B' thresholds decided before M (severity_cut_train {model: cut} + gate, "
@@ -3240,8 +3402,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ValueError as exc:
         ap.error(str(exc))
     command = ["python", "-m", "scripts.dline_refit", *(sys.argv[1:] if argv is None else argv)]
-    global D13_MAX_CI_FRACTION
+    global D13_MAX_CI_FRACTION, FIT_METHOD
     D13_MAX_CI_FRACTION = args.max_ci_half_width_fraction
+    if args.fit_method is not None:
+        from tre_calibration.fit import FIT_METHODS
+
+        if args.fit_method not in FIT_METHODS:
+            ap.error(f"--fit-method {args.fit_method!r}: expected one of {sorted(FIT_METHODS)}")
+        if args.stage not in ("final", "wp"):
+            ap.error("--fit-method applies to the final (and v2 wp) stage")
+        FIT_METHOD = args.fit_method
+    if args.queue_estimator is not None and args.stage != "trainset":
+        ap.error("--queue-estimator applies to the trainset stage")
+    if args.dev_opened_m is not None and args.stage != "accept":
+        ap.error("--dev-opened-m applies to the accept stage")
 
     if args.stage in ("verify-freeze", "accept"):
         if args.freeze_file is None:
@@ -3254,7 +3428,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       "recorded in the freeze (--dwell-windows is the B' gate's dwell)")
             return stage_accept(args.freeze_file, args.dataset, args.m_manifest, recheck=args.recheck,
                                 n_resamples=args.accept_resamples, command=command,
-                                b_prime_thresholds=args.b_prime_thresholds, dwell_windows=args.dwell_windows)
+                                b_prime_thresholds=args.b_prime_thresholds, dwell_windows=args.dwell_windows,
+                                dev_opened_m=args.dev_opened_m)
         try:
             doc = verify_freeze(args.freeze_file)
         except FreezeError as exc:
@@ -3282,10 +3457,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ap.error("trainset needs --dataset and / or --h2-dataset")
         try:
             doc = build_training_set(sources, args.fit_dir, sentinels=not args.no_sentinels,
-                                     models=args.model or None, train_dynamic=args.train_dynamic)
+                                     models=args.model or None, train_dynamic=args.train_dynamic,
+                                     queue_estimator=args.queue_estimator)
         except TrainingSetError as exc:
             raise SystemExit(f"trainset: {exc}")
-        print(json.dumps({"attribution": doc["attribution"], "dynamic_training": doc["dynamic_training"]["admitted"],
+        print(json.dumps({"attribution": doc["attribution"], "queue_estimator": doc["queue_estimator"],
+                          "dynamic_training": doc["dynamic_training"]["admitted"],
                           "models": {m: {k: v[k] for k in ("windows", "cells", "family_windows", "dynamic")}
                                      for m, v in doc["models"].items()},
                           "h2_rows_sha256": doc["h2"]["rows_sha256"], "m_unread": doc["m_unread"]}, indent=1))
@@ -3321,7 +3498,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"lambda_wait={q['lambda_wait']:g} delta_crit={q['delta_crit']:g} delta_high={q['delta_high']:g} "
                   f"CRIT abs={ab['critical_abs']} HIGH abs={ab['high_abs']} "
                   f"plateau=[{pl.get('theta_lo')}, {pl.get('theta_hi')}] s0={e['a_deadband'].get('s0')} "
-                  f"attribution={e['label_attribution']}")
+                  f"attribution={e['label_attribution']} queue={e['methods']['queue_estimator']['name']} "
+                  f"fit={e['methods']['fit_method']['name']}")
         print(f"accept gate: {doc['accept_gate']['rule']}")
         print(f"wrote {args.freeze_file} (freeze_sha256 {doc['freeze_sha256']}) and "
               f"{freeze_paths(args.freeze_file)['sidecar']}")
