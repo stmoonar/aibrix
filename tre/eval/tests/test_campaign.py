@@ -345,6 +345,33 @@ def test_preserve_mlstm_arm_gets_the_history_next_to_its_oracle_copy(tmp_path):
         C.prepare_preserve(c, entries[1], d, lambda _m: None)
 
 
+def test_preserve_mlstm_on_a_slice_from_zero_uses_the_source_trace_history(tmp_path):
+    """A smoke slice that starts at 0 keeps the trace's own past: the history is copied and the
+    policy is told the source trace's name (the history refuses another); any other start is refused."""
+    extra = {"traces": [{"trace": "Alternating", "slice": {"start_s": 0, "duration_s": 50}},
+                        {"trace": "Alternating", "slice": {"start_s": 10, "duration_s": 50}}], "arms": ["preserve"]}
+    write_campaign(tmp_path, traces=["Alternating"], arms=["preserve"], extra=extra)
+    (tmp_path / "bl.yaml").write_text(BL_CM.replace("tier1: oracle_noisy", "tier1: mlstm"))
+    wins = [{"start_s": -30.0 * (25 - i), "end_s": -30.0 * (24 - i), "requests": 1, "prompt_tokens": 10,
+             "output_tokens": 5} for i in range(25)]
+    (tmp_path / "traces" / "Alternating" / "seed1" / "pre_t0.json").write_text(json.dumps(
+        {"format": "tre-pre-t0-v1", "trace": "Alternating", "seed": 1, "t0_s": 0.0, "window_s": 30.0,
+         "windows": {"m7": wins}, "requests": []}))
+    c = C.load_campaign(str(tmp_path / "campaign.yaml"))
+    zero, later = C.resolve_traces(c)
+    d = C.arm_def(c, "preserve")
+    C.prepare_slice(zero, lambda _m: None)
+    out = C.prepare_preserve(c, zero, d, lambda _m: None)["record"]
+    assert out["policy_params_changed"]["trace_name"] == "Alternating"
+    ph = pytest.importorskip("tre_baselines.policies.preserve_history")
+    hist, _info = ph.load(out["history"]["path"], window_s=30.0, models=["m7"], seq_len=25, trace="Alternating",
+                          seed=ph.seed_of(out["oracle_pod_path"]))
+    assert len(hist["m7"]) == 25
+    C.prepare_slice(later, lambda _m: None)
+    with pytest.raises(C.CampaignError, match="slice must start at 0"):
+        C.prepare_preserve(c, later, d, lambda _m: None)
+
+
 # ------------------------------------------------------------------ pieces
 def test_slice_and_shift_keep_ids_and_counts():
     recs = [{"request_id": f"r{i}", "timestamp": float(i)} for i in range(10)]
@@ -561,11 +588,19 @@ def test_v2_20261026_campaign_and_smoke_plans(tmp_path):
     assert C.arm_def(c, "tre-ss-receiverless").controller_env == {
         "TRE_SAFESCALE_SCOPE": "receiverless_shrink", "TRE_ABLATION_DISABLE_SAFESCALE": "false"}
     assert C.arm_def(c, "preserve").label == "PreServe" and C.arm_def(c, "preserve").base == "preserve"
-    assert c["env"]["GW_PARITY"] == "1" and c["report"]["ref"] == "tre-ss-receiverless" and not c["report"]["decision_points"]
+    assert c["env"]["GW_PARITY"] == "1" and c["report"]["ref"] == "tre-ss-receiverless"
+    # the 720 s set: configs regenerated in place, the Tight_pool decision points, PreServe mLSTM with
+    # the Real_* history root
+    assert c["loadgen_config_root"] == f"{tmp_path}/loadgen_v1/configs/traces_v2"
+    assert c["report"]["decision_points"] == f"{tmp_path}/eval/configs/t7-decision-points.yaml"
+    assert C.arm_def(c, "preserve").policy.get("tier1") == "mlstm" and c["preserve"]["match_parts"] >= 3
+    assert c["preserve"]["history_root"]
     s = C.load_campaign(RUNNER / "campaigns" / "campaign-smoke-v2-20261026.yaml", environ=env)
     entries = C.resolve_traces(s)
     assert [e.trace for e in entries] == ["Simul_spike", "Prefill_mix"]
     assert all(360 <= e.slice["duration_s"] <= 480 and e.client_dir.startswith(s["results_root"]) for e in entries)
+    # PreServe mLSTM runs on a slice only from 0 (the trace's own history before t0)
+    assert all(e.slice["start_s"] == 0 for e in entries) and C.arm_def(s, "preserve").policy.get("tier1") == "mlstm"
     sp = C.build_plan(s)
     assert len(sp) == 8 and {i.arm for i in sp} == arms
     assert len({i.arm for i in sp if i.position == 1}) == 2

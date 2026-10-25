@@ -9,9 +9,11 @@
 # Trace set: ONE setting each, switchable without editing this file (defaults below):
 #   CAMPAIGN_TRACE_ROOT   <root>/<trace>/seed<k>/{traces_tre.effective.json, manifest.json}
 #   CAMPAIGN_CONFIG_ROOT  <root>/<trace>/config.yaml (loadgen configs of that set; the dry-run warns when a config's
-#                         duration_seconds differs from the trace manifest's duration_s)
-#   CAMPAIGN_TIGHT_POOL   name of the tight-pool trace (default Tight_pool; T7_tight_pool in the 1200 s set)
-#   CAMPAIGN_DECISION_POINTS  report decision-point file for that set (default none)
+#                         duration_seconds differs from the trace manifest's duration_s). Default: the repo's
+#                         loadgen_v1/configs/traces_v2, regenerated in place for the 720 s set (feat/traces-720-20261026)
+#   CAMPAIGN_TIGHT_POOL   name of the tight-pool trace (default Tight_pool; the 1200 s T7_tight_pool configs are gone)
+#   CAMPAIGN_DECISION_POINTS  report decision-point file for that set (default eval/configs/t7-decision-points.yaml,
+#                         the Tight_pool decision points; applies_to matches "tight" only)
 #
 #   CAMPAIGN_TRACE_ROOT=... CAMPAIGN_CONFIG_ROOT=... tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-v2-20261026.yaml --dry-run --probe
 #   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-v2-20261026.yaml > /data/nfs_shared_data/xxy/campaign-v2-20261026.out 2>&1 &
@@ -36,9 +38,9 @@ eta: {overhead_s: 280, report_s: 150}
 
 env:
   CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
-  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2_720}"   # default is a guess: set it
+  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2}"
   CAMPAIGN_TIGHT_POOL: "${CAMPAIGN_TIGHT_POOL:-Tight_pool}"
-  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-}"
+  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-${TRE_REPO}/eval/configs/t7-decision-points.yaml}"
   RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
   TRE_DIR: ${RELEASE_TRE}
   BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
@@ -65,17 +67,20 @@ arm_defs:
   preserve:
     base: preserve
     label: PreServe                 # faithful (mLSTM, load errors), not the oracle
+    policy: {tier1: mlstm}          # history before t0: pre_t0.json next to a synthetic trace, else preserve.history_root
 
 preserve:
   trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
   trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
-  match_parts: 3
+  match_parts: 3                    # mlstm needs >= 3 (<trace>/seed<k>/<file>: trace name + history)
+  # Real_* history (tools/preserve_history real): <history_root>/<trace>/seed<k>/preserve_history.json
+  history_root: /data/nfs_shared_data/xxy/bl-history-20261026
 
 report:
   enabled: true
   per_arm: true
   capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
-  decision_points: ${CAMPAIGN_DECISION_POINTS}   # optional (empty: none); t7-decision-points.yaml is for the 1200 s T7 trace
+  decision_points: ${CAMPAIGN_DECISION_POINTS}   # Tight_pool (720 s) decision points; empty: none
   ref: tre-ss-receiverless
   reps: 1000
   timeout_s: 1200

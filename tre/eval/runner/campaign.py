@@ -677,16 +677,19 @@ def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, t
     """PreServe mLSTM's history before t0 next to the oracle copy (the policy reads
     ``<trace dir>/pre_t0.json``, else ``preserve_history.json``): the generator's ``pre_t0.json``
     next to the replayed trace, else ``<preserve.history_root>/<trace>/seed<k>/preserve_history.json``.
-    A shifted or sliced trace has no matching past: refused for mlstm."""
+    A shifted trace, or a slice that does not start at 0, has no matching past: refused for mlstm
+    (a slice from 0 keeps the trace's own past; prepare_preserve names the source trace for it)."""
     if len(tail) < 3:
         raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs preserve.match_parts >= 3 (the oracle copy "
                             "must keep <trace>/seed<k>/ so the policy finds the trace name and its history)")
-    if d.oracle_shift or e.slice:
-        raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift / slice)")
+    if d.oracle_shift or (e.slice and float(e.slice["start_s"]) != 0.0):
+        raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift; "
+                            "a slice must start at 0)")
     src = Path(e.src_dir) / PRE_T0_NAME
     if not src.is_file():
         root = pc.get("history_root")
-        src = Path(root) / Path(*tail[:-1]) / PRESERVE_HISTORY_NAME if root else src
+        parts = (e.trace, f"seed{e.seed}") if e.slice else tail[:-1]
+        src = Path(root) / Path(*parts) / PRESERVE_HISTORY_NAME if root else src
     if not src.is_file():
         raise CampaignError(f"{e.out_name}/{d.id}: no PreServe history ({Path(e.src_dir) / PRE_T0_NAME}, or "
                             f"preserve.history_root/<trace>/seed<k>/{PRESERVE_HISTORY_NAME})")
@@ -735,6 +738,10 @@ def prepare_preserve(c: dict, e: TraceEntry, d: ArmDef, log: Callable[[str], Non
                                       "requests": len(recs), "sha256": sha256_file(host_path)})
         log(f"preserve oracle {e.out_name}/{d.id}: {host_path} ({len(recs)} requests, shift {delta})")
     overrides = {**e.preserve_policy, **d.policy}
+    if e.slice and "trace_name" not in overrides:
+        # a slice replays from <results>/_traces/<key>/: the policy's trace name (predictor rule, the
+        # history's trace check) is the source trace's, not the slice key
+        overrides["trace_name"] = e.trace
     text, params = render_preserve_policy(bl_cm, pod_path, parts, overrides)
     if str(params.get("tier1", "mlstm")) == "mlstm":
         rec["history"] = copy_preserve_history(pc, e, d, host_path, tail, log)
