@@ -40,7 +40,7 @@ from tre_sm.allocator.slots import Binding, Slot
 GRID = 10_000
 W = 30_000
 THETA = 100.0
-O1 = BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_grids=2)
+O1 = BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=2 * GRID)
 
 
 # ------------------------------------------------------------------- fixtures
@@ -573,18 +573,22 @@ def test_trickle_from_idle_never_scales_and_a_burst_scales_after_two_grids():
 def test_scaling_registry_o1_keys():
     assert parse_scaling_config(None).breakpoint_window is True
     cfg = parse_scaling_config({"breakpoint_window": False, "onset_warmup_guard": True,
-                                "min_evidence_grids": 3, "min_evidence_requests": 5})
-    assert (cfg.breakpoint_window, cfg.onset_warmup_guard, cfg.min_evidence_grids, cfg.min_evidence_requests) == (
-        False, True, 3, 5)
+                                "min_evidence_ms": 30_000, "min_evidence_requests": 5})
+    assert (cfg.breakpoint_window, cfg.onset_warmup_guard, cfg.min_evidence_ms, cfg.min_evidence_requests) == (
+        False, True, 30_000, 5)
+    # 2026-10-25: the deprecated count key is read as N x 10 s; both keys = refused.
+    assert parse_scaling_config({"min_evidence_grids": 3}).min_evidence_ms == 30_000
+    with pytest.raises(ValueError):
+        parse_scaling_config({"min_evidence_grids": 3, "min_evidence_ms": 30_000})
     assert parse_scaling_config({"breakpoint_margin_ms": 0}).breakpoint_margin_ms == 0
     assert parse_scaling_config(None).breakpoint_margin_ms == 1000
-    for bad in ({"min_evidence_grids": 0}, {"min_evidence_grids": 1.5}, {"min_evidence_requests": -1},
+    for bad in ({"min_evidence_ms": 0}, {"min_evidence_grids": 1.5}, {"min_evidence_requests": -1},
                 {"breakpoint_margin_ms": -1},
                 {"breakpoint_window": "yes"}, {"min_evidence_grids": True}):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
-    built = BreakpointWindowConfig.from_registry(_registry(min_evidence_grids=3), grid_ms=GRID)
-    assert built == BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_grids=3)
+    built = BreakpointWindowConfig.from_registry(_registry(min_evidence_ms=30_000), grid_ms=GRID)
+    assert built == BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=30_000)
     # A registry without a scaling section (older loaders / fakes): the O1 defaults.
     assert BreakpointWindowConfig.from_registry(object(), grid_ms=GRID).enabled is True
 
@@ -624,8 +628,8 @@ def test_safescale_observation_uses_the_planner_signal_under_o1():
 def test_shipped_registry_enables_o1_with_the_default_evidence():
     scaling = load_registry().scaling()
     assert scaling.breakpoint_window is True and scaling.onset_warmup_guard is False
-    assert scaling.min_evidence_grids == 2 and scaling.min_evidence_requests == 3
-    assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_windows == 6
+    assert scaling.min_evidence_ms == 20_000 and scaling.min_evidence_requests == 3
+    assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_ms == 60_000
     assert scaling.breakpoint_lowevidence_requests == 10
     assert scaling.gateway_clock_tolerance_ms == 2000 and scaling.gateway_clock_check_s == 60
     assert json.dumps(sorted(ScalingRegistryConfig.__dataclass_fields__))  # serialisable names
@@ -728,7 +732,7 @@ def test_starving_receiver_falls_back_to_the_whole_window_after_hold_max_windows
     """P2-2: a routable count that changes every window holds the model forever; after
     hold_max_windows held windows the receiver decides on the whole window, donors not."""
     registry = _registry(10_000.0)
-    state = SignalState(warmup_ms=-1, breakpoint=replace(O1, hold_max_windows=4))
+    state = SignalState(warmup_ms=-1, breakpoint=replace(O1, hold_max_ms=4 * GRID))
     _prime_onset(state, 500_000)
     seen = []
     for k in range(8):
@@ -909,7 +913,7 @@ def test_c1_settle_without_o1_or_while_suspended_is_c1_alone():
 def test_hold_fallback_never_settles_c1():
     """Review P2-1: the whole-window fallback still holds the old replica count."""
     registry = _registry(10_000.0)
-    state = SignalState(warmup_ms=-1, breakpoint=replace(O1, hold_max_windows=2))
+    state = SignalState(warmup_ms=-1, breakpoint=replace(O1, hold_max_ms=2 * GRID))
     _prime_onset(state, 500_000)
     last = None
     for k in range(6):
@@ -1023,8 +1027,8 @@ def test_o1_donor_hold_exempts_only_current_window_idle_evidence():
     cache = PaperStateCache()
     fresh = {"routable_pods": 3, "assigned_replicas": 3, "Y_m": 0.0, "Q": 0.0, "signal_full_window": True,
              "window_idle": True}
-    cache.apply("m", fresh, tokens_available=True)
-    held, _ = cache.apply("m", {"routable_pods": 3, "assigned_replicas": 3}, tokens_available=False)
+    cache.apply("m", fresh, tokens_available=True, window_end_ms=10_000)
+    held, _ = cache.apply("m", {"routable_pods": 3, "assigned_replicas": 3}, tokens_available=False, window_end_ms=20_000)
     assert held["window_idle"] is False
     held_plan = plan(ModelState.IDLE, held)
     assert "donor_suppressed_breakpoint_window:m" in held_plan.events and not held_plan.actions

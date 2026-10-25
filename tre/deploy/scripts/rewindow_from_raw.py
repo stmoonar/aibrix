@@ -12,9 +12,10 @@ those into the SAME window CSV the online path emits (r3_grid.CSV_COLUMNS), at a
 
   * token totals   -> sum of per-request usage tokens in the window (== the histogram
                       sum-delta the online path takes).
-  * queue avg      -> sum(instant samples in window) / expected_samples, with
-                      expected_samples = max(1, window_ms // instant_sample_interval_ms)
-                      (mirrors MetricsStore._instant_avg exactly).
+  * queue avg      -> mean of the instant samples in the window (mirrors
+                      MetricsStore._instant_avg exactly; until 2026-10-25 it was
+                      sum / expected_samples, the same on a window with every sample).
+                      The declared cadence is still validated (resolve_instant_cadence).
   * p95            -> histogram_percentile(cumulative-from-samples, 0.95, mode) reusing
                       tre_common.percentile.histogram_percentile — the very function
                       MetricsStore uses — with the same bucket_upper / interpolated modes
@@ -560,8 +561,9 @@ def aggregate_window(
     tpot_samples = [r["tpot_ms"] for r in served if r.get("tpot_ms") is not None]
     e2e_samples = [r["e2e_ms"] for r in served if r.get("e2e_ms") is not None]
 
-    # queue: instant samples are inclusive [start, end] and divided by expected_samples,
-    # exactly as MetricsStore._instant_avg does.
+    # queue: instant samples are inclusive [start, end]; their mean, exactly as
+    # MetricsStore._instant_avg does (2026-10-25: the mean over the samples present, not
+    # sum / expected_samples - a missing sample no longer reads the queue low).
     def _stamp(sample: dict) -> int:
         ts = int(sample["ts_ms"])
         return ts // instant_tick_ms * instant_tick_ms if instant_tick_ms else ts
@@ -576,10 +578,10 @@ def aggregate_window(
             s for s in instant_samples
             if s.get("ts_ms") is not None and window_start_ms <= _stamp(s) <= window_end_ms
         ]
-    expected_samples = max(1, int((window_end_ms - window_start_ms) / instant_sample_interval_ms))
-    avg_waiting = sum(float(s.get("waiting", 0.0)) for s in inst) / expected_samples
-    avg_running = sum(float(s.get("running", 0.0)) for s in inst) / expected_samples
-    avg_swapping = sum(float(s.get("swapping", 0.0)) for s in inst) / expected_samples
+    samples = max(1, len(inst))
+    avg_waiting = sum(float(s.get("waiting", 0.0)) for s in inst) / samples
+    avg_running = sum(float(s.get("running", 0.0)) for s in inst) / samples
+    avg_swapping = sum(float(s.get("swapping", 0.0)) for s in inst) / samples
 
     return ModelWindowMetrics(
         model=model,

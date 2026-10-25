@@ -96,24 +96,31 @@ class LoopTickResult:
 @dataclass
 class _PaperState:
     context: dict
-    stale_windows: int = 0
+    #: Window end (ms, gateway grid) of the last window whose tokens were known.
+    good_end_ms: int
 
 
 class PaperStateCache:
-    def __init__(self, *, max_stale_windows: int = 3) -> None:
-        self.max_stale_windows = max(0, int(max_stale_windows))
+    """A model whose tokens are missing keeps its last computed context while that
+    context's window ended at most ``max_stale_ms`` before the current window
+    (2026-10-25: elapsed window time, not a count of reads - 30 s = the former
+    3 windows of 10 s, at any evidence period)."""
+
+    def __init__(self, *, max_stale_ms: int = 30_000) -> None:
+        self.max_stale_ms = max(0, int(max_stale_ms))
         self._by_model: dict[str, _PaperState] = {}
 
-    def apply(self, model_name: str, context: dict, *, tokens_available: bool) -> tuple[dict, tuple[str, ...]]:
+    def apply(
+        self, model_name: str, context: dict, *, tokens_available: bool, window_end_ms: int
+    ) -> tuple[dict, tuple[str, ...]]:
         if tokens_available:
-            self._by_model[model_name] = _PaperState(dict(context), stale_windows=0)
+            self._by_model[model_name] = _PaperState(dict(context), good_end_ms=int(window_end_ms))
             return context, ()
 
         previous = self._by_model.get(model_name)
         if previous is None:
             return context, (f"paper_state_stale_unknown:{model_name}",)
-        previous.stale_windows += 1
-        if previous.stale_windows > self.max_stale_windows:
+        if int(window_end_ms) - previous.good_end_ms > self.max_stale_ms:
             return context, (f"paper_state_stale_unknown:{model_name}",)
         held = dict(previous.context)
         held.update(
@@ -388,13 +395,14 @@ def _apply_saturation_rescue(
 ) -> tuple[list, tuple[str, ...]]:
     """Onset saturation rescue (design 20261002-saturation-onset-rescue): a model whose
     TSS cannot decide yet (numerator zero / receiver gate not warm) and whose engines are
-    full on ``saturation_consecutive_ticks`` consecutive windows becomes a CRITICAL
+    full on every window across ``saturation_confirm_ms`` becomes a CRITICAL
     receiver (``saturation_rescue``). A warm TSS is never overridden. A step whose rescue
     target the queue reports as ended without adding a replica is released at once."""
     tracker = getattr(signal_state, "saturation", None)
     if tracker is None or not tracker.config.enabled:
         return classifications, ()
-    need = tracker.config.consecutive_ticks
+    # Windows the confirmation span takes at this grid (diagnostics: "pending k/need").
+    need = -(-int(tracker.config.confirm_ms) // max(1, int(tracker.config.grid_ms)))
     routable_by_model = _routable_pod_ids(cluster_view)
     targets = getattr(queue, "rescue_targets", None)
     failed_dispatch = (
@@ -690,7 +698,7 @@ def _action_cooldowns(
     Only for models O1 does not track this tick (:func:`_o1_tracks`): with O1 active the
     routable-count change of the action is a breakpoint, and the model takes part in no
     scale-down until a whole window follows it and is a receiver only on
-    ``min_evidence_grids`` grids of post-change evidence - the window-start rule would
+    ``min_evidence_ms`` of post-change evidence - the window-start rule would
     only add a fixed wait on top. While O1 is off or suspended (gateway clock check),
     without a fleet view of the model or on a stale-held context this rule still holds."""
     last_actions = getattr(queue, "last_actions", None)
@@ -1154,10 +1162,10 @@ def compute_model_signal(
         )
         signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
         return ModelSignal(result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window)
-    limit = int(getattr(signal_state.breakpoint, "hold_max_windows", 0) or 0)
+    limit = int(getattr(signal_state.breakpoint, "hold_max_ms", 0) or 0)
     if not window.warm and limit > 0 and held >= limit:
         # Review P2-2: the routable count keeps changing (crash loop, probes): after
-        # ``hold_max_windows`` held windows a receiver decides on the whole window as
+        # ``hold_max_ms`` of held windows a receiver decides on the whole window as
         # before O1 (EMA advanced); donors keep waiting for a clean one (window.full).
         result = computer.compute(
             TRSInput.from_metrics(metrics, spec.trs),
@@ -1227,6 +1235,11 @@ def _model_contexts(
             # I3: the gateway's last successful scrape of these pods predates the window;
             # their docs are left out (no valid pod left -> tokens missing, not zero).
             events.append(f"scrape_stale:{model_name}:{','.join(stale_pods)}")
+        incomplete_pods = getattr(metrics, "sample_incomplete_pods", ())
+        if incomplete_pods:
+            # 2026-10-25: too few valid instant samples (or histogram docs ending early) in
+            # the window: left out like a scrape-stale pod, by the same I4 rule below.
+            events.append(f"samples_incomplete:{model_name}:{','.join(incomplete_pods)}")
         counts = cluster_counts.get(model_name)
         assigned_replicas = metrics.assigned_replicas
         if counts is not None:
@@ -1353,14 +1366,16 @@ def _model_contexts(
         context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
         # 2026-10-02: the SM replica floor / headroom (donor bound of the planner).
         context.update(_sm_floor_context(cluster_view, model_name))
-        if tokens_available and stale_pods and (
-            routable_by_model is None or set(stale_pods) & routable_by_model.get(model_name, frozenset())
-        ):
-            # I4: a serving pod's data is missing from this window (its scrape is stale),
-            # so the level comes from the other pods only - no scale-down / release
-            # evidence (the planner's donor gate); a receiver still acts (step-capped).
+        serving_now = routable_by_model.get(model_name, frozenset()) if routable_by_model is not None else None
+        held_stale = set(stale_pods) if serving_now is None else set(stale_pods) & serving_now
+        held_incomplete = set(incomplete_pods) if serving_now is None else set(incomplete_pods) & serving_now
+        if tokens_available and (held_stale or held_incomplete):
+            # I4: a serving pod's data is missing from this window (its scrape is stale,
+            # or 2026-10-25 its valid samples are incomplete), so the level comes from the
+            # other pods only - no scale-down / release evidence (the planner's donor
+            # gate); a receiver still acts (step-capped).
             context["signal_full_window"] = False
-            context["signal_hold_reason"] = "scrape_stale"
+            context["signal_hold_reason"] = "scrape_stale" if held_stale else "samples_incomplete"
         else:
             # Q3 (2026-10-06): the whole current serving window is idle - tokens known
             # and zero, no running / waiting request - with every serving pod scraped in
@@ -1402,7 +1417,9 @@ def _model_contexts(
                 }
             )
         if paper_state_cache is not None:
-            context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
+            context, model_events = paper_state_cache.apply(
+                model_name, context, tokens_available=tokens_available, window_end_ms=int(metrics.window_end_ms)
+            )
             events.extend(model_events)
         contexts[model_name] = context
     return contexts, tuple(events)

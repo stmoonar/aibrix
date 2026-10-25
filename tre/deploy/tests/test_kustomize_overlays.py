@@ -113,7 +113,15 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_PERCENTILE_MODE"] == "bucket_upper"
     assert _env(controller)["TRE_INCOMPLETE_POLICY"] == "drop_model"
     assert _env(controller)["TRE_HIST_BASELINE_LOOKBACK_MS"] == "90000"
-    assert _env(controller)["TRE_PAPER_STALE_MAX_WINDOWS"] == "3"
+    assert _env(controller)["TRE_PAPER_STALE_MAX_MS"] == "30000"  # the former 3 windows of 10 s
+    # 2026-10-25: the gateway's two TRE doc periods, pinned on both sides and equal (the
+    # controller refuses to start on a mismatch it measures).
+    for name, value in (("TRE_INSTANT_SAMPLE_INTERVAL_MS", "500"), ("TRE_EVIDENCE_PERIOD_MS", "10000")):
+        gateway_env = {
+            item["name"]: item.get("value")
+            for item in gateway_plugins["spec"]["template"]["spec"]["containers"][0].get("env", [])
+        }
+        assert _env(controller)[name] == gateway_env[name] == value
     assert _env(controller)["TRE_METRICS_SCHEMA"] == "v2"  # D7 (09-22): gateway zsets, no legacy SCAN
     # D8 (09-22): phase-aligned 10 s sampler, pinned explicitly. Band dwell OFF (v1/paper
     # alignment A5), also pinned: "1" = act on the first window.

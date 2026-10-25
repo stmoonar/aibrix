@@ -239,7 +239,8 @@ def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClo
         redis_client,
         [spec.name for spec in deps.registry.models()],
         deps.signal_state,
-        period_ms=int(getattr(cfg, "instant_sample_interval_ms", breakpoint.grid_ms)),
+        # The stamp-lag fallback bound (2 x period) on the evidence period (O1's grid).
+        period_ms=int(getattr(cfg, "evidence_period_ms", breakpoint.grid_ms)),
         tolerance_ms=int(config.gateway_clock_tolerance_ms),
     )
 
@@ -323,25 +324,30 @@ def create_controller_dependencies(
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
     breakpoint_config = BreakpointWindowConfig.from_registry(
-        registry, grid_ms=cfg.instant_sample_interval_ms
+        registry, grid_ms=cfg.evidence_period_ms
     )
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
     )
-    saturation_config = SaturationRescueConfig.from_registry(registry, grid_ms=cfg.instant_sample_interval_ms)
+    saturation_config = SaturationRescueConfig.from_registry(registry, grid_ms=cfg.evidence_period_ms)
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
     )
+    scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
     store = MetricsStore(
         metrics_redis_client,
         registry,
         instant_sample_interval_ms=cfg.instant_sample_interval_ms,
+        evidence_period_ms=cfg.evidence_period_ms,
+        # 2026-10-25: per-doc freshness and per-pod completeness (registry scaling.sample_*).
+        max_scrape_age_ms=getattr(scaling_config, "sample_max_scrape_age_ms", None),
+        min_sample_ratio=float(getattr(scaling_config, "sample_min_ratio", 0.0) or 0.0),
         percentile_mode=cfg.percentile_mode,
         schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
         # O1: the grid-aligned suffix windows the breakpoint window decides on.
-        suffix_period_ms=cfg.instant_sample_interval_ms if breakpoint_config.enabled else 0,
+        suffix_period_ms=cfg.evidence_period_ms if breakpoint_config.enabled else 0,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -363,6 +369,11 @@ def create_controller_dependencies(
                 metrics_redis_client,
                 registry,
                 instant_sample_interval_ms=cfg.instant_sample_interval_ms,
+                evidence_period_ms=cfg.evidence_period_ms,
+                # Per-doc freshness as the controller's store; no completeness rule: the
+                # evidence is latency histograms with their own end-of-window check
+                # (_evidence_incomplete), as before.
+                max_scrape_age_ms=getattr(scaling_config, "sample_max_scrape_age_ms", None),
                 percentile_mode=cfg.percentile_mode,
                 schema=cfg.metrics_schema,
                 histogram_lookback_ms=0,
@@ -416,7 +427,7 @@ def create_controller_dependencies(
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
         "slo_mode": cfg.safescale.slo_mode,
         "early_commit": cfg.safescale.early_commit,
-        "early_commit_min_grids": cfg.safescale.early_commit_min_grids,
+        "early_commit_min_evidence_ms": cfg.safescale.early_commit_min_evidence_ms,
         "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
     }, sort_keys=True))
     # The effective ablation switches (production: both false).
@@ -529,7 +540,8 @@ async def main(
 
 
 def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) -> None:
-    """Startup assertion (D8): gateway write period == SCRAPE_INTERVAL_MS. Raises
+    """Startup assertion (D8): the gateway's instant / histogram doc periods equal
+    TRE_INSTANT_SAMPLE_INTERVAL_MS / TRE_EVIDENCE_PERIOD_MS. Raises
     GatewayCadenceMismatch on a mismatch in ``fail`` mode; only warns without evidence."""
     redis_client = getattr(deps.store, "redis_client", None)
     if redis_client is None:
@@ -539,6 +551,7 @@ def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) 
         [spec.name for spec in deps.registry.models()],
         mode=getattr(cfg, "gateway_interval_check", "fail"),
         expected_ms=cfg.instant_sample_interval_ms,
+        expected_hist_ms=cfg.evidence_period_ms,
     )
 
 

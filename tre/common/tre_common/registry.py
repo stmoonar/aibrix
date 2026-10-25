@@ -503,9 +503,10 @@ class ScalingRegistryConfig:
     #: The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
     #: ``breakpoint_window: false`` the guard always applies (= pre-O1), whatever this says.
     onset_warmup_guard: bool = False
-    #: O1: complete gateway grids after the breakpoint before the model's signal decides
-    #: (scale-ups; scale-downs always need a whole clean window). 2 = 20 s on the 10 s grid.
-    min_evidence_grids: int = 2
+    #: O1: post-breakpoint evidence (complete gateway grids, in ms) before the model's
+    #: signal decides (scale-ups; scale-downs always need a whole clean window). 20 s =
+    #: the former ``min_evidence_grids: 2`` on the 10 s grid (deprecated alias, x 10 s).
+    min_evidence_ms: int = 20_000
     #: O1: also this many completed requests in the post-breakpoint window (0 = off).
     #: Tokens count at request completion: with one short request done and long ones
     #: still running, a 20 s suffix can read Z ~ 5 % (review P2-1).
@@ -520,10 +521,11 @@ class ScalingRegistryConfig:
     #: ``breakpoint_partial_max_step: 0`` = no cap at all.
     breakpoint_partial_max_step: int = 1
     breakpoint_lowevidence_requests: int = 10
-    #: O1: after this many consecutive held metrics windows (10 s each) a receiver
+    #: O1: after its windows have been held this long (gateway clock, ms) a receiver
     #: decides on the whole window again (donors still need a clean one) - a model whose
-    #: routable count keeps changing is not starved (review P2-2). 0 = never.
-    breakpoint_hold_max_windows: int = 6
+    #: routable count keeps changing is not starved (review P2-2). 0 = never. 60 s = the
+    #: former ``breakpoint_hold_max_windows: 6`` (deprecated alias, x 10 s).
+    breakpoint_hold_max_ms: int = 60_000
     #: O1 same-clock check (gateway doc stamps vs the controller clock, review P2-3):
     #: tolerance and period (s, 0 = off). A violation suspends O1 (pre-O1 behaviour).
     gateway_clock_tolerance_ms: int = 2000
@@ -542,20 +544,57 @@ class ScalingRegistryConfig:
     #: alone (numerator zero = no decision until requests complete). Factor in [1, 4].
     saturation_rescue: bool = True
     saturation_kv_threshold: float = 0.9
-    saturation_consecutive_ticks: int = 2
+    #: Confirmation span (ms): "full" on every metrics window across this long. 20 s =
+    #: the former ``saturation_consecutive_ticks: 2`` (deprecated alias, x 10 s).
+    saturation_confirm_ms: int = 20_000
     saturation_max_step_factor: float = 2.0
+    #: Sampling validity (2026-10-25, design docs/design/20261025-instant-sampling.md):
+    #: an instant doc counts only if its tick minus the pod's last successful scrape
+    #: (``scraped_ms``, gateway clock) is at most ``sample_max_scrape_age_ms``; a pod is
+    #: complete for a window when its valid docs are at least ``sample_min_ratio`` of the
+    #: window's instant ticks. An incomplete pod is left out like a scrape-stale one.
+    sample_max_scrape_age_ms: int = 1000
+    sample_min_ratio: float = 0.9
+
+
+#: 2026-10-25: count-based keys (N metrics windows / ticks / grids of 10 s) replaced by
+#: time spans, so they keep their span at any evidence period. Deprecated alias ->
+#: (new key, ms per counted unit, minimum count); a registry carrying both is refused.
+SCALING_COUNT_ALIASES: dict[str, tuple[str, int, int]] = {
+    "min_evidence_grids": ("min_evidence_ms", 10_000, 1),
+    "breakpoint_hold_max_windows": ("breakpoint_hold_max_ms", 10_000, 0),
+    "saturation_consecutive_ticks": ("saturation_confirm_ms", 10_000, 1),
+}
+
+
+def _scaling_span_ms(raw: dict[str, Any], key: str, default: int, minimum: int) -> int:
+    """A span in ms from ``key``, or from its deprecated count alias (count x 10 s,
+    with a warning). Both present: refused (two sources for one setting)."""
+    alias = next((old for old, (new, _, _) in SCALING_COUNT_ALIASES.items() if new == key), None)
+    if alias is not None and raw.get(alias) is not None:
+        if raw.get(key) is not None:
+            raise ValueError(f"scaling.{alias} (deprecated) and scaling.{key} are both set; keep {key} only")
+        _, unit_ms, min_count = SCALING_COUNT_ALIASES[alias]
+        count = _scaling_count(raw, alias, 0, min_count)
+        LOG.warning(
+            "registry scaling: %s=%d is deprecated (a count of 10 s windows); read as %s=%d ms",
+            alias, count, key, count * unit_ms,
+        )
+        return count * unit_ms
+    return _scaling_count(raw, key, default, minimum)
 
 
 SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "rescue_max_step_pods",
     "rescue_settle_ema_k",
-    "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
+    "breakpoint_window", "onset_warmup_guard", "min_evidence_ms", "min_evidence_requests",
     "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
-    "breakpoint_hold_max_windows",
+    "breakpoint_hold_max_ms",
     "gateway_clock_tolerance_ms", "gateway_clock_check_s",
-    "saturation_rescue", "saturation_kv_threshold", "saturation_consecutive_ticks",
+    "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
     "saturation_max_step_factor",
-})
+    "sample_max_scrape_age_ms", "sample_min_ratio",
+}) | frozenset(SCALING_COUNT_ALIASES)
 
 
 def _scaling_number(raw: dict[str, Any], key: str, default: float, *, low: float, high: float | None = None) -> float:
@@ -640,7 +679,7 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         rescue_settle_ema_k=settle_k,
         breakpoint_window=_scaling_bool(raw, "breakpoint_window", defaults.breakpoint_window),
         onset_warmup_guard=_scaling_bool(raw, "onset_warmup_guard", defaults.onset_warmup_guard),
-        min_evidence_grids=_scaling_count(raw, "min_evidence_grids", defaults.min_evidence_grids, 1),
+        min_evidence_ms=_scaling_span_ms(raw, "min_evidence_ms", defaults.min_evidence_ms, 1),
         min_evidence_requests=_scaling_count(
             raw, "min_evidence_requests", defaults.min_evidence_requests, 0
         ),
@@ -651,8 +690,8 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         breakpoint_lowevidence_requests=_scaling_count(
             raw, "breakpoint_lowevidence_requests", defaults.breakpoint_lowevidence_requests, 0
         ),
-        breakpoint_hold_max_windows=_scaling_count(
-            raw, "breakpoint_hold_max_windows", defaults.breakpoint_hold_max_windows, 0
+        breakpoint_hold_max_ms=_scaling_span_ms(
+            raw, "breakpoint_hold_max_ms", defaults.breakpoint_hold_max_ms, 0
         ),
         gateway_clock_tolerance_ms=_scaling_count(
             raw, "gateway_clock_tolerance_ms", defaults.gateway_clock_tolerance_ms, 0
@@ -663,12 +702,16 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         saturation_kv_threshold=_scaling_number(
             raw, "saturation_kv_threshold", defaults.saturation_kv_threshold, low=0.01, high=1.0
         ),
-        saturation_consecutive_ticks=_scaling_count(
-            raw, "saturation_consecutive_ticks", defaults.saturation_consecutive_ticks, 1
+        saturation_confirm_ms=_scaling_span_ms(
+            raw, "saturation_confirm_ms", defaults.saturation_confirm_ms, 1
         ),
         saturation_max_step_factor=_scaling_number(
             raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0, high=4.0
         ),
+        sample_max_scrape_age_ms=_scaling_count(
+            raw, "sample_max_scrape_age_ms", defaults.sample_max_scrape_age_ms, 0
+        ),
+        sample_min_ratio=_scaling_number(raw, "sample_min_ratio", defaults.sample_min_ratio, low=0.0, high=1.0),
     )
 
 
@@ -726,7 +769,7 @@ class SafeScaleRegistryConfig:
     #: probe before its deadline once min_commit_samples requests are judged, every
     #: commit gate passes, the hidden pods have nothing in flight (gateway count of the
     #: live plugin instances and vLLM running + waiting), the newest snapshot window
-    #: holds scaling.min_evidence_grids complete post-hide gateway grids (the O1 warm
+    #: holds scaling.min_evidence_ms of complete post-hide gateway grids (the O1 warm
     #: rule) and at least the donor's p95 e2e passed since the hide confirmation. The
     #: former ``early_commit_min_grids`` key is gone (an old registry carrying it still
     #: loads: unknown keys are only warned about).

@@ -44,6 +44,9 @@ class MetricsStore:
         registry: Any,
         *,
         instant_sample_interval_ms: int,
+        evidence_period_ms: int | None = None,
+        max_scrape_age_ms: int | None = None,
+        min_sample_ratio: float = 0.0,
         percentile_mode: str = "bucket_upper",
         schema: str = "v2",
         histogram_lookback_ms: int = 90_000,
@@ -52,6 +55,12 @@ class MetricsStore:
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
+        if evidence_period_ms is not None and evidence_period_ms <= 0:
+            raise ValueError("evidence_period_ms must be positive")
+        if max_scrape_age_ms is not None and max_scrape_age_ms < 0:
+            raise ValueError("max_scrape_age_ms must be non-negative")
+        if not 0.0 <= float(min_sample_ratio) <= 1.0:
+            raise ValueError("min_sample_ratio must be in [0, 1]")
         if suffix_period_ms < 0:
             raise ValueError("suffix_period_ms must be non-negative")
         if histogram_lookback_ms < 0:
@@ -62,7 +71,18 @@ class MetricsStore:
             raise ValueError("schema must be v1 or v2")
         self._redis = redis_client
         self._registry = registry
-        self._instant_sample_interval_ms = instant_sample_interval_ms
+        # 2026-10-25 (design docs/design/20261025-instant-sampling.md): the gateway's
+        # instant-doc period (the completeness grid) and its histogram-doc period (the
+        # "last grid" of scrape_current_pods). One period for older callers (offline
+        # tools re-windowing 10 s data: both docs on one grid).
+        self._instant_sample_interval_ms = int(instant_sample_interval_ms)
+        self._evidence_period_ms = int(evidence_period_ms or instant_sample_interval_ms)
+        # Per-doc freshness: an instant doc counts only if its tick minus the pod's last
+        # successful scrape (scraped_ms, gateway clock) is at most this. None = off.
+        self._max_scrape_age_ms = None if max_scrape_age_ms is None else int(max_scrape_age_ms)
+        # Per-pod completeness: valid instant docs / the window's instant ticks; a pod
+        # below it is left out of the window (sample_incomplete_pods). 0 = off.
+        self._min_sample_ratio = float(min_sample_ratio)
         self._percentile_mode = percentile_mode
         self._schema = schema
         self._histogram_lookback_ms = histogram_lookback_ms
@@ -125,11 +145,18 @@ class MetricsStore:
 
         The phase-aligned sampler ends every window exactly on a gateway write boundary,
         and the gateway stamps its samples with that boundary, so a closed ``[start, end]``
-        window would hold 4 instant ticks (both ends) instead of 3 and the histogram
-        baseline would sit one tick before ``start`` (a 40 s token span). Half-open gives
-        exactly ``window_ms / SCRAPE_INTERVAL_MS`` ticks and a token delta between the
-        ticks at ``start`` and ``end``, i.e. exactly one window. ``window_start_ms`` in the
-        result and the instant-average divisor are unchanged.
+        window would hold one instant tick too many (both ends) and the histogram
+        baseline would sit one evidence period before ``start``. Half-open gives exactly
+        ``window_ms / instant period`` instant ticks and a token delta between the
+        histogram docs at ``start`` and ``end``, i.e. exactly one window.
+
+        2026-10-25: an instant doc whose scrape is older than ``max_scrape_age_ms`` at its
+        tick is missing; a pod's queue gauges are the mean over its valid docs; a pod with
+        fewer valid docs than ``min_sample_ratio`` of the window's instant ticks, or whose
+        histogram docs stop before the window's last evidence boundary, is left out of the
+        window and listed in ``sample_incomplete_pods`` (the controller then takes no
+        scale-down / release evidence from the model while that pod serves, like a
+        scrape-stale pod). Same rules per O1 suffix.
         """
         cache_key = (self._schema, model, int(window_start_ms), int(window_end_ms), bool(start_exclusive))
         # Sliding windows (S1.1) pass use_cache=False: every window is unique, so the
@@ -145,6 +172,8 @@ class MetricsStore:
         # I3: pod name -> newest ``scraped_ms`` of its docs in the window (None: no doc
         # carries the field); only pods with a doc in the window.
         scraped: dict[str, int | None] = {}
+        # Pods left out for too few valid instant docs (2026-10-25); v2 schema only.
+        incomplete: set[str] = set()
         if self._schema == "v1":
             # O1 suffixes are built for the v2 schema only (v1 = legacy fallback: the
             # controller then waits for a whole clean window after a breakpoint).
@@ -154,60 +183,81 @@ class MetricsStore:
             )
         else:
             pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
-            per_pod: dict[str, PodWindowMetrics] = {}
+            docs_by_pod: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
             for pod_key in pods:
-                hist_docs = self._read_zset_docs(
-                    hist_key(pod_key),
-                    read_start_ms,
-                    window_end_ms,
-                    lookback_ms=self._histogram_lookback_ms,
+                docs_by_pod[pod_key] = (
+                    self._read_zset_docs(
+                        hist_key(pod_key),
+                        read_start_ms,
+                        window_end_ms,
+                        lookback_ms=self._histogram_lookback_ms,
+                    ),
+                    self._read_zset_docs(inst_key(pod_key), read_start_ms, window_end_ms),
                 )
-                inst_docs = self._read_zset_docs(inst_key(pod_key), read_start_ms, window_end_ms)
+            # A gateway that writes scraped_ms (any doc of the model carries it): a doc
+            # without it was never scraped. An old gateway: every doc counts (as I3).
+            new_gateway = any(
+                doc.get("scraped_ms") is not None for hist, inst in docs_by_pod.values() for doc in (*hist, *inst)
+            )
+            per_pod = {}
+            for pod_key, (hist_docs, raw_inst_docs) in docs_by_pod.items():
+                inst_docs = self._valid_instant_docs(raw_inst_docs, new_gateway)
                 pod_metrics = self._aggregate_pod(
                     model, pod_key, hist_docs, inst_docs, read_start_ms, window_end_ms,
-                    span_start_ms=window_start_ms,
+                    span_start_ms=window_start_ms, instant_ticks=_doc_ticks(raw_inst_docs),
                 )
-                if pod_metrics is not None:
-                    per_pod[pod_metrics.pod] = pod_metrics
-                    _note_scraped(scraped, pod_metrics.pod, hist_docs, inst_docs, read_start_ms)
+                if pod_metrics is None:
+                    continue
+                per_pod[pod_metrics.pod] = pod_metrics
+                _note_scraped(scraped, pod_metrics.pod, hist_docs, raw_inst_docs, read_start_ms)
+                if not self._pod_complete(inst_docs, hist_docs, read_start_ms, window_end_ms):
+                    incomplete.add(pod_metrics.pod)
                 for start in suffix_starts:
                     # The suffix (start, end] from the same docs: the histogram baseline
                     # is the newest doc before the suffix (the tick at ``start``), the
-                    # instant average runs over the suffix's ticks with the suffix's
-                    # expected-samples divisor - exactly what a read of that shorter
-                    # window would return.
+                    # instant mean runs over the suffix's valid docs - exactly what a
+                    # read of that shorter window would return.
                     suffix_read = start + 1 if start_exclusive else start
+                    suffix_inst = [doc for doc in inst_docs if _number(doc.get("timestamp"), 0.0) >= suffix_read]
+                    suffix_hist = _with_baseline_doc(hist_docs, suffix_read) if hist_docs else []
                     suffix_metrics = self._aggregate_pod(
                         model,
                         pod_key,
-                        _with_baseline_doc(hist_docs, suffix_read) if hist_docs else [],
-                        [doc for doc in inst_docs if _number(doc.get("timestamp"), 0.0) >= suffix_read],
+                        suffix_hist,
+                        suffix_inst,
                         suffix_read,
                         window_end_ms,
                         span_start_ms=start,
                     )
-                    if suffix_metrics is not None:
+                    if suffix_metrics is not None and self._pod_complete(
+                        suffix_inst, suffix_hist, suffix_read, window_end_ms
+                    ):
                         suffix_pods[start][suffix_metrics.pod] = suffix_metrics
 
-        # Ticks are gateway-wide provenance (window freshness): a frozen pod's docs were
-        # still written on the gateway's ticker.
+        # Ticks are gateway-wide provenance (the sampler waits for the window's end
+        # tick): every pod's docs as written, stale or incomplete ones included.
         all_ticks = tuple(sorted({tick for pod in per_pod.values() for tick in pod.instant_ticks_ms}))
         per_pod, stale_pods = _scrape_valid(per_pod, scraped, read_start_ms)
+        incomplete_pods = tuple(sorted(name for name in incomplete if name in per_pod))
+        if incomplete_pods:
+            per_pod = {name: pod for name, pod in per_pod.items() if name not in incomplete}
         model_metrics = self._aggregate_model(model, window_start_ms, window_end_ms, per_pod)
         scrape_fresh = any(value is not None and value >= read_start_ms for value in scraped.values())
+        model_metrics = replace(
+            model_metrics,
+            instant_ticks_ms=all_ticks,
+            sample_incomplete_pods=incomplete_pods,
+            scrape_fresh=scrape_fresh,
+        )
         if stale_pods:
             model_metrics = replace(
                 model_metrics,
-                instant_ticks_ms=all_ticks,
                 scrape_stale_pods=stale_pods,
-                scrape_fresh=scrape_fresh,
                 scrape_stale_inflight=self._stale_inflight(stale_pods),
             )
-        elif scrape_fresh:
-            model_metrics = replace(model_metrics, scrape_fresh=True)
         # P2-2 (2026-10-06): an idle window needs every serving pod scraped in its last
         # grid and nothing in flight on it at the gateway (the tick decides on both).
-        grid_start_ms = int(window_end_ms) - int(self._instant_sample_interval_ms)
+        grid_start_ms = int(window_end_ms) - int(self._evidence_period_ms)
         model_metrics = replace(
             model_metrics,
             scrape_current_pods=frozenset(
@@ -413,10 +463,12 @@ class MetricsStore:
         window_end_ms: int,
         *,
         span_start_ms: int | None = None,
+        instant_ticks: tuple[int, ...] | None = None,
     ) -> PodWindowMetrics | None:
         # window_start_ms is the first *readable* timestamp (start + 1 for a half-open
-        # read); span_start_ms is the nominal window start, which sets the instant-average
-        # divisor (expected samples = window_ms / SCRAPE_INTERVAL_MS).
+        # read); span_start_ms is the nominal window start (kept for the call sites; the
+        # instant averages are means over the docs given, 2026-10-25). ``instant_ticks``:
+        # the ticks to report as provenance (default: those of ``inst_docs``).
         if not hist_docs and not inst_docs:
             return None
         pod_name = _pod_name(hist_docs, inst_docs, pod_key)
@@ -465,7 +517,7 @@ class MetricsStore:
                     model, HISTOGRAM_METRICS["generation_tokens"], hist_docs
                 )
             ),
-            instant_ticks_ms=_doc_ticks(inst_docs),
+            instant_ticks_ms=_doc_ticks(inst_docs) if instant_ticks is None else instant_ticks,
             gpu_cache_usage=self._instant_avg_optional(
                 model, INSTANT_METRICS["gpu_cache"], inst_docs, span_start, window_end_ms
             ),
@@ -607,13 +659,69 @@ class MetricsStore:
         window_start_ms: int,
         window_end_ms: int,
     ) -> float:
-        total = 0.0
+        """Mean of the gauge over the given (valid) instant docs; an absent value reads 0.
+        2026-10-25: the divisor is the number of samples, not the window's expected
+        sample count - a missing sample no longer pulls the queue average down (v1 lost
+        ticks under CPU throttling: Q too low, Z too high, false HIGH). A pod with too few
+        samples is left out by the completeness rule instead. window_start_ms /
+        window_end_ms are unused and kept for the call-site symmetry."""
+        values = [
+            _number(doc_lookup(doc["model_metrics"], model, metric), 0.0)
+            for doc in docs
+            if isinstance(doc.get("model_metrics"), dict)
+        ]
+        return sum(values) / len(values) if values else 0.0
+
+    def _valid_instant_docs(self, docs: list[dict[str, Any]], new_gateway: bool) -> list[dict[str, Any]]:
+        """The instant docs whose metrics are fresh at their tick: ``timestamp -
+        scraped_ms <= max_scrape_age_ms`` (both the gateway clock). A doc without
+        ``scraped_ms`` from a gateway that writes it was never scraped: not valid. Off
+        (every doc valid) without ``max_scrape_age_ms`` or for an old gateway."""
+        if self._max_scrape_age_ms is None or not new_gateway:
+            return docs
+        limit = self._max_scrape_age_ms
+        valid = []
         for doc in docs:
-            metrics = doc.get("model_metrics")
-            if isinstance(metrics, dict):
-                total += _number(doc_lookup(metrics, model, metric), 0.0)
-        expected_samples = max(1, int((window_end_ms - window_start_ms) / self._instant_sample_interval_ms))
-        return total / expected_samples
+            raw = doc.get("scraped_ms")
+            if raw is None:
+                continue
+            if _number(doc.get("timestamp"), 0.0) - _number(raw, float("-inf")) <= limit:
+                valid.append(doc)
+        return valid
+
+    def _pod_complete(
+        self,
+        inst_docs: list[dict[str, Any]],
+        hist_docs: list[dict[str, Any]],
+        read_start_ms: int,
+        window_end_ms: int,
+    ) -> bool:
+        """Per-pod completeness of ``[read_start_ms, window_end_ms]`` (the pod's own docs,
+        never another pod's): its valid instant docs cover at least ``min_sample_ratio``
+        of the instant ticks in the range, and - when it has histogram docs - the newest
+        one is at or after the range's last evidence boundary (its token delta reaches
+        the window end). Every pod is held to the whole range: a pod that joined or left
+        inside it is incomplete (a departed pod is no longer serving, so it holds
+        nothing). Off (always complete) with ``min_sample_ratio`` 0."""
+        if self._min_sample_ratio <= 0.0:
+            return True
+        start, end = int(read_start_ms), int(window_end_ms)
+        period = self._instant_sample_interval_ms
+        expected = end // period - -(-start // period) + 1  # multiples of period in [start, end]
+        if expected > 0:
+            ticks = {
+                int(_number(doc.get("timestamp"), 0.0))
+                for doc in inst_docs
+                if start <= _number(doc.get("timestamp"), 0.0) <= end
+            }
+            if len(ticks) + 1e-9 < self._min_sample_ratio * expected:
+                return False
+        boundary = end - end % self._evidence_period_ms
+        if hist_docs and boundary >= start:
+            newest = max(int(_number(doc.get("timestamp"), 0.0)) for doc in hist_docs)
+            if newest < boundary:
+                return False
+        return True
 
 
     def _instant_avg_optional(

@@ -17,9 +17,10 @@ class PodWindowMetrics:
     e2e_p95_ms: float | None
     request_count: float | None = None
     token_counter_reset: bool = False
-    #: Timestamps (ms) of the gateway instant samples read for this window. Provenance for
-    #: the phase-aligned sampler's freshness check (a window must hold every
-    #: SCRAPE_INTERVAL_MS tick, the newest one at window_end). Excluded from equality.
+    #: Timestamps (ms) of the gateway instant docs read for this window (as written,
+    #: stale ones included). Provenance for the phase-aligned sampler, which waits until
+    #: the gateway has written the window's end tick (2026-10-25: per-pod completeness is
+    #: the store's ``sample_incomplete_pods``). Excluded from equality.
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
     #: Window average of vLLM ``kv_cache_usage_perc`` (``gpu_cache_usage_perc`` before
     #: vLLM 0.11; KV-cache fill, 0..1) from the gateway instant docs; None when no doc
@@ -111,6 +112,13 @@ class ModelWindowMetrics:
     #: successful scrape of them (doc ``scraped_ms``) lies before the window - their
     #: docs repeat frozen values. Diagnostics only; excluded from equality.
     scrape_stale_pods: tuple[str, ...] = field(default=(), compare=False)
+    #: 2026-10-25: pods left out of this window because they have fewer valid instant
+    #: docs (scrape at most ``scaling.sample_max_scrape_age_ms`` old at the doc's tick)
+    #: than ``scaling.sample_min_ratio`` of the window's instant ticks, or their histogram
+    #: docs stop before the window's last evidence boundary. Treated like
+    #: ``scrape_stale_pods`` by the controller (no scale-down / release evidence while one
+    #: serves); not frozen-scrape rescue evidence. Excluded from equality.
+    sample_incomplete_pods: tuple[str, ...] = field(default=(), compare=False)
     #: Some pod of this model (sleeping ones included) has a successful gateway scrape
     #: inside the window: the gateway scraper is alive. False for an old gateway.
     scrape_fresh: bool = field(default=False, compare=False)

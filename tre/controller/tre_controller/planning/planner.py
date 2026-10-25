@@ -564,7 +564,7 @@ def build_plan(
     # metrics window still holds a breakpoint (traffic onset, routable-count change)
     # takes part in no scale-down - neither HIGH / IDLE donor nor middle-zone donor - until
     # a whole window lies after the breakpoint (scale-down stays cautious); as a receiver
-    # it acts once signal_warm (min_evidence_grids complete grids after the breakpoint).
+    # it acts once signal_warm (complete grids spanning min_evidence_ms after the breakpoint).
     # Q3 (2026-10-06): an IDLE model whose whole current window is idle (``window_idle``:
     # tokens known and zero, no queue, every serving pod scraped - never a held context)
     # is exempt: no token at any replica count is the same evidence before and after

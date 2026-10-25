@@ -107,7 +107,7 @@ async def fairness_task(
     maintenance: "MaintenanceWatch | None" = None,
     leftover_probes: SafeScaleController | None = None,
 ) -> None:
-    paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
+    paper_state_cache = PaperStateCache(max_stale_ms=getattr(cfg, "paper_stale_max_ms", 30_000))
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:

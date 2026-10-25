@@ -1,50 +1,41 @@
-"""Startup check: the gateway's write period must equal ``SCRAPE_INTERVAL_MS``.
+"""Startup check: the gateway's TRE doc periods must equal the controller's settings.
 
-The whole signal path assumes the gateway writes its instant/histogram docs every
-``SCRAPE_INTERVAL_MS`` (10 s): the instant-average divisor, the phase-aligned sampler's
-boundary grid, the 3-ticks-per-window freshness rule and the EMA/dwell cadence the
-thresholds were fitted at. The period is the Go constant ``RequestTraceWriteInterval``
-(aibrix ``pkg/cache/trace.go``), which ``/root/aibrix-main`` already changed to 5 s - a
-rebuilt gateway image would silently halve it.
+The gateway writes two kinds of TRE docs (2026-10-25, ``tre_common.rediskeys``):
 
-Two pieces of evidence, both read-only:
+* ``tre:v2:inst:<pod>`` every instant sample period (TRE_INSTANT_SAMPLE_INTERVAL_MS):
+  the controller's per-pod completeness rule counts a window's expected instant ticks on
+  this grid;
+* ``tre:v2:hist:<pod>`` every evidence period (TRE_EVIDENCE_PERIOD_MS): the
+  phase-aligned sampler's boundary grid, the O1 grid and the SafeScale evidence step.
 
-1. **trace metadata** - the gateway exports ``RequestTraceWriteInterval`` in every request
-   trace it writes (``aibrix:<model>_request_trace_<ts>``, key ``meta_interval_sec``,
-   aibrix trace.go ``ToMapLocked``; ``interval_in_seconds`` is accepted as an alias). Only
-   written while a model has traffic, so it is often absent.
-2. **instant tick spacing** - the median spacing of the newest ``tre:v2:inst:<pod>``
-   timestamps, i.e. the cadence the controller actually consumes.
+Evidence (read-only): the median spacing of each pod's newest instant and histogram
+stamps - the cadences the controller actually consumes. (Before 2026-10-25 the
+request-trace metadata ``meta_interval_sec`` was evidence too: both docs were written
+every ``RequestTraceWriteInterval``. They no longer are, so it says nothing about them.)
 
-A mismatch in either is fatal in ``fail`` mode (the default); no evidence at all only logs
-a loud warning - the controller must still start on an idle cluster.
+A mismatch is fatal in ``fail`` mode (the default); no evidence at all only logs a loud
+warning - the controller must still start on an idle cluster.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from statistics import median
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable
 
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS, inst_key, pods_key
+from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS, hist_key, inst_key, pods_key
 
 LOG = logging.getLogger("tre_controller.gateway_cadence")
 
-TRACE_INTERVAL_KEYS = ("meta_interval_sec", "interval_in_seconds")
-#: SCAN budget per model for trace keys (the metrics db also holds ~30k legacy keys).
-TRACE_SCAN_COUNT = 1000
-TRACE_SCAN_MAX_KEYS = 2000
-
 
 class GatewayCadenceMismatch(RuntimeError):
-    """The gateway writes at a different period than ``SCRAPE_INTERVAL_MS``."""
+    """The gateway writes its TRE docs at other periods than the controller expects."""
 
 
 @dataclass
 class CadenceEvidence:
-    trace_interval_s: dict[str, float] = field(default_factory=dict)  # model -> seconds
     inst_spacing_ms: dict[str, float] = field(default_factory=dict)  # pod -> median ms
+    hist_spacing_ms: dict[str, float] = field(default_factory=dict)  # pod -> median ms
     errors: list[str] = field(default_factory=list)
 
 
@@ -52,40 +43,15 @@ def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def read_trace_interval_s(redis_client: Any, model: str) -> Optional[float]:
-    """``meta_interval_sec`` of the newest request trace of ``model``, or None."""
-    newest_key: Optional[str] = None
-    newest_ts = -1
-    seen = 0
-    for raw_key in redis_client.scan_iter(match=f"aibrix:{model}_request_trace_*", count=TRACE_SCAN_COUNT):
-        key = _text(raw_key)
-        seen += 1
-        try:
-            ts = int(key.rsplit("_", 1)[1])
-        except (IndexError, ValueError):
-            continue
-        if ts > newest_ts:
-            newest_key, newest_ts = key, ts
-        if seen >= TRACE_SCAN_MAX_KEYS:
-            break
-    if newest_key is None:
-        return None
-    raw = redis_client.get(newest_key)
-    if raw is None:
-        return None
-    doc = json.loads(_text(raw))
-    for name in TRACE_INTERVAL_KEYS:
-        if isinstance(doc, dict) and doc.get(name) is not None:
-            return float(doc[name])
-    return None
-
-
-def read_inst_spacing_ms(redis_client: Any, model: str, *, samples: int = 7) -> dict[str, float]:
-    """Median spacing of the newest instant ticks, per pod of ``model`` (>= 3 ticks)."""
+def _spacing_ms(
+    redis_client: Any, model: str, key_of: Callable[[str], str], *, samples: int = 7
+) -> dict[str, float]:
+    """Median spacing of the newest stamps of ``key_of(pod)``, per pod of ``model``
+    (>= 3 stamps)."""
     out: dict[str, float] = {}
     for raw_pod in redis_client.smembers(pods_key(model)):
         pod = _text(raw_pod)
-        members = redis_client.zrange(inst_key(pod), -samples, -1, withscores=True)
+        members = redis_client.zrange(key_of(pod), -samples, -1, withscores=True)
         stamps = sorted(int(score) for _member, score in members)
         deltas = [b - a for a, b in zip(stamps, stamps[1:]) if b > a]
         if len(deltas) >= 2:
@@ -93,19 +59,27 @@ def read_inst_spacing_ms(redis_client: Any, model: str, *, samples: int = 7) -> 
     return out
 
 
+def read_inst_spacing_ms(redis_client: Any, model: str, *, samples: int = 7) -> dict[str, float]:
+    """Median spacing of the newest instant ticks, per pod of ``model`` (>= 3 ticks)."""
+    return _spacing_ms(redis_client, model, inst_key, samples=samples)
+
+
+def read_hist_spacing_ms(redis_client: Any, model: str, *, samples: int = 7) -> dict[str, float]:
+    """Median spacing of the newest histogram stamps, per pod of ``model``."""
+    return _spacing_ms(redis_client, model, hist_key, samples=samples)
+
+
 def gather_evidence(redis_client: Any, models: Iterable[str]) -> CadenceEvidence:
     evidence = CadenceEvidence()
     for model in models:
-        try:
-            interval = read_trace_interval_s(redis_client, model)
-            if interval is not None:
-                evidence.trace_interval_s[model] = interval
-        except Exception as exc:  # noqa: BLE001 - evidence is best-effort.
-            evidence.errors.append(f"trace:{model}:{type(exc).__name__}:{exc}")
-        try:
-            evidence.inst_spacing_ms.update(read_inst_spacing_ms(redis_client, model))
-        except Exception as exc:  # noqa: BLE001
-            evidence.errors.append(f"inst:{model}:{type(exc).__name__}:{exc}")
+        for name, reader, target in (
+            ("inst", read_inst_spacing_ms, evidence.inst_spacing_ms),
+            ("hist", read_hist_spacing_ms, evidence.hist_spacing_ms),
+        ):
+            try:
+                target.update(reader(redis_client, model))
+            except Exception as exc:  # noqa: BLE001 - evidence is best-effort.
+                evidence.errors.append(f"{name}:{model}:{type(exc).__name__}:{exc}")
     return evidence
 
 
@@ -114,56 +88,50 @@ def check_gateway_cadence(
     models: Iterable[str],
     *,
     mode: str = "fail",
-    expected_ms: int = SCRAPE_INTERVAL_MS,
+    expected_ms: int = INSTANT_SAMPLE_INTERVAL_MS,
+    expected_hist_ms: int = EVIDENCE_PERIOD_MS,
 ) -> CadenceEvidence | None:
-    """Assert the gateway period equals ``expected_ms`` (see module docstring)."""
+    """Assert the gateway's instant / histogram doc periods equal ``expected_ms`` /
+    ``expected_hist_ms`` (see module docstring)."""
     if mode == "off":
         return None
     evidence = gather_evidence(redis_client, list(models))
-    expected_s = expected_ms / 1000.0
     problems: list[str] = []
-    for model, interval_s in sorted(evidence.trace_interval_s.items()):
-        if abs(interval_s - expected_s) > 1e-9:
-            problems.append(
-                f"trace metadata of {model}: meta_interval_sec={interval_s:g} s != "
-                f"SCRAPE_INTERVAL_MS/1000={expected_s:g} s"
-            )
-    for pod, spacing_ms in sorted(evidence.inst_spacing_ms.items()):
-        # Medians are exact multiples on a healthy ticker; allow 10 % for a skipped tick.
-        if abs(spacing_ms - expected_ms) > 0.1 * expected_ms:
-            problems.append(f"instant ticks of {pod}: median spacing {spacing_ms:g} ms != {expected_ms} ms")
+    for label, spacings, expected, setting in (
+        ("instant", evidence.inst_spacing_ms, expected_ms, "TRE_INSTANT_SAMPLE_INTERVAL_MS"),
+        ("histogram", evidence.hist_spacing_ms, expected_hist_ms, "TRE_EVIDENCE_PERIOD_MS"),
+    ):
+        for pod, spacing_ms in sorted(spacings.items()):
+            # Medians are exact multiples on a healthy ticker; allow 10 % for a skipped tick.
+            if abs(spacing_ms - expected) > 0.1 * expected:
+                problems.append(
+                    f"{label} ticks of {pod}: median spacing {spacing_ms:g} ms != {setting}={expected} ms"
+                )
     if problems:
         message = (
-            "GATEWAY CADENCE MISMATCH - the gateway write period is not SCRAPE_INTERVAL_MS; "
-            "queue averages, the phase-aligned sampler and every fitted threshold assume it. "
-            + "; ".join(problems)
+            "GATEWAY CADENCE MISMATCH - the gateway's TRE doc periods differ from the "
+            "controller's; completeness, the phase-aligned sampler and the O1 grid assume "
+            "them. " + "; ".join(problems)
         )
         if mode == "fail":
             raise GatewayCadenceMismatch(message)
         LOG.error(message)
         return evidence
-    if not evidence.trace_interval_s and not evidence.inst_spacing_ms:
+    if not evidence.inst_spacing_ms and not evidence.hist_spacing_ms:
         LOG.warning(
-            "!!! GATEWAY CADENCE UNVERIFIED !!! no request-trace metadata (meta_interval_sec) and "
-            "no instant ticks to measure; assuming the gateway writes every %d ms. A rebuilt "
-            "gateway with RequestTraceWriteInterval != %g s would silently break the signal. "
-            "errors=%s", expected_ms, expected_s, evidence.errors,
-        )
-        return evidence
-    if not evidence.trace_interval_s:
-        LOG.warning(
-            "!!! GATEWAY TRACE METADATA UNAVAILABLE !!! (no aibrix:<model>_request_trace_* with "
-            "meta_interval_sec; the gateway only writes traces under traffic). Instant tick "
-            "spacing agrees with %d ms over %d pods; re-check once traffic flows.",
-            expected_ms, len(evidence.inst_spacing_ms),
+            "!!! GATEWAY CADENCE UNVERIFIED !!! no instant / histogram ticks to measure; "
+            "assuming the gateway writes instant docs every %d ms and histogram docs every "
+            "%d ms (gateway env TRE_INSTANT_SAMPLE_INTERVAL_MS / TRE_EVIDENCE_PERIOD_MS). "
+            "errors=%s", expected_ms, expected_hist_ms, evidence.errors,
         )
         return evidence
     LOG.info(
-        "gateway_cadence_ok: expected %d ms; trace meta_interval_sec=%s; instant tick spacing "
-        "(ms) over %d pods=%s",
+        "gateway_cadence_ok: instant %d ms over %d pods=%s; histogram %d ms over %d pods=%s",
         expected_ms,
-        evidence.trace_interval_s,
         len(evidence.inst_spacing_ms),
         sorted(set(evidence.inst_spacing_ms.values())),
+        expected_hist_ms,
+        len(evidence.hist_spacing_ms),
+        sorted(set(evidence.hist_spacing_ms.values())),
     )
     return evidence

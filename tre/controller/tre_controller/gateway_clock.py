@@ -1,14 +1,17 @@
 """O1 same-clock check: gateway doc stamps vs the controller clock (review P2-3).
 
 The O1 breakpoint window compares two clocks: routable-change times (the controller's
-clock: ActionQueue SM-call returns, ``ClusterView.fetched_ms``) and the 10 s grid of the
-gateway's doc stamps (``roundT``, the gateway's clock rounded to the boundary). It
+clock: ActionQueue SM-call returns, ``ClusterView.fetched_ms``) and the evidence-period
+grid of the gateway's doc stamps (``roundT``, the gateway's clock rounded to the
+boundary). It
 assumes they are the same clock (NTP-synchronised nodes). Node clocks have drifted before
 (75 ran ~160 s ahead of 76), so the controller checks at start and then periodically:
 
 * ``lag = now - newest instant stamp`` over the registry models' pods. With one clock the
   gateway writes boundary ``B`` at ``B + phase`` (its ticker phase, 0..one period) and
-  the newest stamp is at most about one period old, so ``0 <= lag < 2 * period``;
+  the newest stamp is at most about one period old, so ``0 <= lag < 2 * period``.
+  ``period`` is the evidence period (TRE_EVIDENCE_PERIOD_MS, 2026-10-25); instant docs
+  come every instant period (<= the evidence period), so the bound still holds, loosely;
 * ``lag < -tolerance`` (stamps from the future: the gateway runs ahead) or
   ``lag > 2 * period + tolerance`` (stamps from the past: it runs behind, or stopped
   writing) is a violation.

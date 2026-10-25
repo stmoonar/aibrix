@@ -74,9 +74,9 @@ def test_held_context_is_never_donor_evidence(fresh):
     held level is not current-window evidence, so the model gives nothing up."""
     assert _gives(_plan(dict(fresh)), "d")  # control: the same level from a fresh window donates
 
-    cache = PaperStateCache(max_stale_windows=3)
-    cache.apply("d", dict(fresh), tokens_available=True)
-    held, events = cache.apply("d", _missing_ctx(), tokens_available=False)
+    cache = PaperStateCache(max_stale_ms=30_000)
+    cache.apply("d", dict(fresh), tokens_available=True, window_end_ms=10_000)
+    held, events = cache.apply("d", _missing_ctx(), tokens_available=False, window_end_ms=20_000)
     assert events == ("paper_state_stale_hold:d",)
 
     plan = _plan(held)
@@ -107,9 +107,9 @@ def test_held_receiver_rescue_is_capped_like_thin_evidence():
         return sum(a.delta for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.model == "r" and a.delta > 0)
 
     assert added(plan(dict(fresh))) > 1
-    cache = PaperStateCache(max_stale_windows=3)
-    cache.apply("r", dict(fresh), tokens_available=True)
-    held, _ = cache.apply("r", _missing_ctx(), tokens_available=False)
+    cache = PaperStateCache(max_stale_ms=30_000)
+    cache.apply("r", dict(fresh), tokens_available=True, window_end_ms=10_000)
+    held, _ = cache.apply("r", _missing_ctx(), tokens_available=False, window_end_ms=20_000)
     assert added(plan(held)) == 1
 # ------------------------------------------------- E: frozen gateway scrape
 

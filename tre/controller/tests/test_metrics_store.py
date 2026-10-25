@@ -271,7 +271,7 @@ def test_metrics_store_returns_none_tokens_when_window_has_no_hist_docs():
 
     assert metrics.prompt_tokens is None
     assert metrics.generation_tokens is None
-    assert metrics.avg_waiting == 1.0
+    assert metrics.avg_waiting == 2.0  # mean over the window's one sample (2026-10-25)
 
 
 def test_metrics_store_uses_pre_window_v1_baseline_for_single_hist_doc_delta():
@@ -304,7 +304,7 @@ def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
     assert snapshot.models["dsqwen-7b"].avg_waiting == 3.0
     assert snapshot.models["dsllama-8b"].prompt_tokens is None
     assert snapshot.models["dsllama-8b"].token_counter_reset is True
-    assert snapshot.models["dsllama-8b"].avg_waiting == 3.0
+    assert snapshot.models["dsllama-8b"].avg_waiting == 6.0  # mean over present samples
     assert snapshot.models["dsqwen-14b"].routable_pods == 0
 
 
@@ -418,8 +418,9 @@ def test_kv_cache_usage_averages_actual_samples_not_expected_window_samples():
     metrics = store.read_model_window("dsqwen-7b", 1_000, 11_000)
 
     assert metrics.per_pod["pod-a"].gpu_cache_usage == 0.8
-    # The queue gauges keep the expected-samples divisor (calibration contract).
-    assert metrics.per_pod["pod-a"].avg_running == 0.5
+    # 2026-10-25: the queue gauges are means over the present samples too (a missing
+    # sample no longer reads the queue low; too few samples = the completeness rule).
+    assert metrics.per_pod["pod-a"].avg_running == 1.0
 
 
 def test_metrics_store_exposes_window_mean_ttft_and_tpot_with_counts():

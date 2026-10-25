@@ -147,9 +147,9 @@ def test_contexts_mark_o1_tracking_and_a_stale_hold_clears_it():
     ctx, _ = _model_contexts(_snap(_window(BASE + 2 * GRID, [LOW] * 3)), _registry(), signal_state=state,
                              cluster_view=_view(1, fetched_ms=BASE + 2 * GRID + 500))
     assert ctx["m"]["o1_routable_tracked"] is False
-    cache = PaperStateCache(max_stale_windows=3)
-    cache.apply("m", {"o1_routable_tracked": True, "routable_pods": 1}, tokens_available=True)
-    held, events = cache.apply("m", {"routable_pods": 1}, tokens_available=False)
+    cache = PaperStateCache(max_stale_ms=30_000)
+    cache.apply("m", {"o1_routable_tracked": True, "routable_pods": 1}, tokens_available=True, window_end_ms=10_000)
+    held, events = cache.apply("m", {"routable_pods": 1}, tokens_available=False, window_end_ms=20_000)
     assert events == ("paper_state_stale_hold:m",) and held["o1_routable_tracked"] is False
 
 

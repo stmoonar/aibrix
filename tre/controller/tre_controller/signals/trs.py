@@ -19,9 +19,9 @@ class BreakpointWindowConfig:
     * ``onset_guard`` (``scaling.onset_warmup_guard``): additionally apply the ADR-0013
       onset warmup guard (``TRE_SIGNAL_WARMUP_MS``) on top of O1. With ``enabled=False``
       the guard always applies (pre-O1 behaviour), whatever this flag says;
-    * ``grid_ms``: the gateway write period (``SCRAPE_INTERVAL_MS``, 10 s);
-    * ``min_evidence_grids`` / ``min_evidence_requests``: post-breakpoint evidence a
-      window needs before the model's signal decides a scale-up;
+    * ``grid_ms``: the gateway evidence period (histogram docs, TRE_EVIDENCE_PERIOD_MS);
+    * ``min_evidence_ms`` / ``min_evidence_requests``: post-breakpoint evidence (complete
+      grids, as a span) a window needs before the model's signal decides a scale-up;
     * ``margin_ms`` (``scaling.breakpoint_margin_ms``): added to a routable-count change
       time before it is rounded up to the grid - the SM writes the routable label before
       it answers, the gateway applies it through its pod informer shortly after.
@@ -30,11 +30,11 @@ class BreakpointWindowConfig:
     enabled: bool = True
     onset_guard: bool = False
     grid_ms: int = 10_000
-    min_evidence_grids: int = 2
+    min_evidence_ms: int = 20_000
     min_evidence_requests: int = 3
     margin_ms: int = 1_000
-    #: Consecutive held windows after which a receiver decides on the whole window (0 = never).
-    hold_max_windows: int = 6
+    #: Held this long (ms, window ends) a receiver decides on the whole window (0 = never).
+    hold_max_ms: int = 60_000
 
     @classmethod
     def from_registry(cls, registry: Any, *, grid_ms: int) -> "BreakpointWindowConfig":
@@ -45,14 +45,12 @@ class BreakpointWindowConfig:
             enabled=bool(getattr(config, "breakpoint_window", defaults.enabled)),
             onset_guard=bool(getattr(config, "onset_warmup_guard", defaults.onset_guard)),
             grid_ms=int(grid_ms),
-            min_evidence_grids=max(1, int(getattr(config, "min_evidence_grids", defaults.min_evidence_grids))),
+            min_evidence_ms=max(1, int(getattr(config, "min_evidence_ms", defaults.min_evidence_ms))),
             min_evidence_requests=max(
                 0, int(getattr(config, "min_evidence_requests", defaults.min_evidence_requests))
             ),
             margin_ms=max(0, int(getattr(config, "breakpoint_margin_ms", defaults.margin_ms))),
-            hold_max_windows=max(
-                0, int(getattr(config, "breakpoint_hold_max_windows", defaults.hold_max_windows))
-            ),
+            hold_max_ms=max(0, int(getattr(config, "breakpoint_hold_max_ms", defaults.hold_max_ms))),
         )
 
 
@@ -99,9 +97,10 @@ QUEUE_RISE_MIN_ABS = 1.0
 QUEUE_RISE_MIN_RATIO = 0.1
 
 
-#: H3: queue samples kept per model (one per distinct stamp, ~10 s apart). A baseline
-#: older than this is gone: the receiver stays held, as before H3.
-QUEUE_SAMPLE_HISTORY = 8
+#: H3: queue samples kept per model (one per distinct stamp): those stamped less than
+#: this before the newest (2026-10-25: a span; 80 s = the former 8 samples 10 s apart).
+#: A baseline older than this is gone: the receiver stays held, as before H3.
+QUEUE_SAMPLE_HISTORY_MS = 80_000
 
 
 @dataclass
@@ -429,8 +428,9 @@ class SignalState:
         # model -> whether its last change was seen between two views of this process
         # (False: dated on the first observation, e.g. after a restart - a guess).
         self._change_seen: dict[str, bool] = {}
-        # model -> (last window_end counted, consecutive held windows) - review P2-2.
-        self._hold: dict[str, tuple[int, int]] = {}
+        # model -> (last window_end read, end of the first held window of the current
+        # hold or None) - review P2-2.
+        self._hold: dict[str, tuple[int, int | None]] = {}
         # O1 suspended (same-clock check failed, review P2-3): reason, None = active.
         self.breakpoint_window_suspended: str | None = None
         # The D8 band dwell (TRE_DWELL_WINDOWS, off since the v1 alignment A5) was removed
@@ -544,14 +544,20 @@ class SignalState:
         self.breakpoint_window_suspended = None
 
     def note_hold(self, model: str, window_end_ms: int, held: bool) -> int:
-        """Consecutive held (not warm, post-breakpoint) windows of ``model`` up to this
-        one, counted once per distinct ``window_end_ms``; 0 once a window is not held."""
-        last_end, streak = self._hold.get(model, (None, 0))
-        if last_end == int(window_end_ms):
-            return streak
-        streak = streak + 1 if held else 0
-        self._hold[model] = (int(window_end_ms), streak)
-        return streak
+        """How long (ms) ``model``'s windows have been held (not warm, post-breakpoint)
+        up to this one: from one grid before the first held window's end to this end
+        (2026-10-25: a span on the gateway grid, not a window count - N held windows of
+        the 10 s grid = N x 10 s, as before). Read once per distinct ``window_end_ms``;
+        0 once a window is not held."""
+        end = int(window_end_ms)
+        last_end, first_held = self._hold.get(model, (None, None))
+        if last_end != end:
+            first_held = (first_held if first_held is not None else end) if held else None
+            self._hold[model] = (end, first_held)
+        if first_held is None:
+            return 0
+        grid = int(self.breakpoint.grid_ms) if self.breakpoint is not None else 0
+        return end - first_held + grid
 
     def onset_guard_applies(self) -> bool:
         """Whether the ADR-0013 onset warmup guard gates receivers: always without O1
@@ -641,7 +647,8 @@ class SignalState:
             history[-1] = sample
         else:
             history.append(sample)
-        del history[:-QUEUE_SAMPLE_HISTORY]
+        newest = history[-1].sample_ms
+        history[:] = [item for item in history if newest - item.sample_ms < QUEUE_SAMPLE_HISTORY_MS]
 
     def queue_rise(
         self, model: str, breakpoint_ms: int | None, current: QueueSample | None
@@ -696,7 +703,7 @@ class SignalState:
         Full window when O1 is off, no breakpoint lies inside the window or the
         breakpoint sits at/before the window start. Otherwise the suffix starting at the
         first grid boundary at or after the breakpoint (the partial grid holding it is
-        excluded); ``warm`` once it holds ``min_evidence_grids`` complete grids (and
+        excluded); ``warm`` once its complete grids span ``min_evidence_ms`` (and
         ``min_evidence_requests`` completed requests). The model's EMAs are restarted
         once per breakpoint (the first tick that sees it inside the window), so the
         pre-breakpoint windows never leak into the signal through the EMA."""
@@ -728,7 +735,7 @@ class SignalState:
             # whole clean window, like the pre-O1 guard.
             return EffectiveWindow(metrics=metrics, warm=False, reason="no_suffix", **partial)
         scale = float(span) / float(end - eff_start)
-        if grids < cfg.min_evidence_grids:
+        if grids * grid < cfg.min_evidence_ms:
             return EffectiveWindow(
                 metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_grids", **partial
             )

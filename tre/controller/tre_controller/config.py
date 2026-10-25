@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 #: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
@@ -126,10 +126,10 @@ class SafeScaleConfig:
     # unchanged.
     early_commit: bool = True
     # Q4 (2026-10-06), the single evidence floor: complete post-hide gateway grids the
-    # newest snapshot window must hold = registry scaling.min_evidence_grids (O1's warm
-    # rule; no separate safescale key), and at least the donor's p95 e2e since the hide
-    # confirmation. No W / 2 term, no separate minimum observation time.
-    early_commit_min_grids: int = 2
+    # newest snapshot window must hold, as a span = registry scaling.min_evidence_ms (O1's
+    # warm rule; no separate safescale key), and at least the donor's p95 e2e since the
+    # hide confirmation. No W / 2 term, no separate minimum observation time.
+    early_commit_min_evidence_ms: float = 20_000.0
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
     # queued behind a long action, or re-submitted after a controller restart - is not run
@@ -165,7 +165,9 @@ class ControllerConfig:
     signal_source: str
     signal_idle_rps_eps: float
     signal_warmup_ms: int
-    paper_stale_max_windows: int
+    #: A model whose tokens are missing keeps its last context while its last good window
+    #: ended at most this long before (ms, gateway window ends; TRE_PAPER_STALE_MAX_MS).
+    paper_stale_max_ms: int
     incomplete_policy: str
     # 2026-10-08: one snapshot-aligned loop runs every decision (no fairness loop).
     ablation_disable_slow_loop: bool
@@ -195,16 +197,23 @@ class ControllerConfig:
     # Defaults keep direct constructions (tests) working; from_env sets them all.
     # TRE_METRICS_REFRESH_MODE: phase_aligned (default) | free_running (old loop).
     metrics_refresh_mode: str = "phase_aligned"
+    # TRE_EVIDENCE_PERIOD_MS: the gateway's histogram-doc period = the phase-aligned
+    # window grid, the O1 grid, the SafeScale evidence step and the saturation "latest
+    # grid". Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (startup cadence check) and be
+    # a multiple of instant_sample_interval_ms (the gateway's instant-doc period).
+    evidence_period_ms: int = EVIDENCE_PERIOD_MS
     # TRE_METRICS_PHASE_OFFSET_MS: read at boundary + offset (a floor, see adapt).
+    # Default min(2 s, evidence period / 2).
     metrics_phase_offset_ms: int = 2_000
     # TRE_METRICS_PHASE_ADAPT: raise the offset to when the boundary tick actually
-    # appears (the gateway ticker phase), re-learned every 60 cycles.
+    # appears (the gateway ticker phase), re-learned every 600 s of windows.
     metrics_phase_adapt: bool = True
     # TRE_METRICS_PHASE_RETRY_MS: re-read period while the boundary tick is missing.
     metrics_phase_retry_ms: int = 500
-    # TRE_METRICS_STALE_HOLD_WINDOWS: stale windows during which the previous snapshot
-    # keeps being served before it is marked stale (decision loops then hold).
-    metrics_stale_hold_windows: int = 2
+    # TRE_METRICS_STALE_HOLD_MS: how long (ms, window ends) the previous snapshot keeps
+    # being served through stale windows before it is marked stale (decision loops then
+    # hold). 20 s = the former TRE_METRICS_STALE_HOLD_WINDOWS=2 (deprecated alias, x 10 s).
+    metrics_stale_hold_ms: int = 20_000
     # Timer cleanup review P3-6 (TRE_VIEW_STALE_PERIODS): a fleet view older than this
     # many refresh periods (TRE_FAIRNESS_INTERVAL_SECONDS) raises the cluster_view_stale
     # alert (cluster_view_recovered once fresh again). Alert only: the planner keeps its
@@ -294,15 +303,26 @@ class ControllerConfig:
         for key in REMOVED_TIMER_ENV:
             if key in values:
                 LOG.warning("%s=%s is ignored: the timer was removed (timer cleanup 2026-10-02)", key, values.get(key))
+        # 2026-10-25: two gateway periods (tre_common.rediskeys). The instant period is
+        # the per-pod completeness / freshness grid only; every grid / cadence use of the
+        # former single period is the evidence period.
         instant_sample_interval_ms = _get_positive_int(
-            values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", SCRAPE_INTERVAL_MS
+            values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", INSTANT_SAMPLE_INTERVAL_MS
         )
-        metrics_phase_offset_ms = _get_nonneg_int(values, "TRE_METRICS_PHASE_OFFSET_MS", 2_000)
-        if metrics_phase_offset_ms >= instant_sample_interval_ms:
-            raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below the gateway period")
+        evidence_period_ms = _get_positive_int(values, "TRE_EVIDENCE_PERIOD_MS", EVIDENCE_PERIOD_MS)
+        if evidence_period_ms % instant_sample_interval_ms:
+            raise ValueError(
+                f"TRE_EVIDENCE_PERIOD_MS={evidence_period_ms} must be a multiple of "
+                f"TRE_INSTANT_SAMPLE_INTERVAL_MS={instant_sample_interval_ms}"
+            )
+        metrics_phase_offset_ms = _get_nonneg_int(
+            values, "TRE_METRICS_PHASE_OFFSET_MS", min(2_000, evidence_period_ms // 2)
+        )
+        if metrics_phase_offset_ms >= evidence_period_ms:
+            raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below TRE_EVIDENCE_PERIOD_MS")
 
         safescale_registry = _safescale_registry(registry_path)
-        early_grids = _o1_min_evidence_grids(registry_path)
+        early_evidence_ms = _o1_min_evidence_ms(registry_path)
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
             tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
@@ -312,7 +332,7 @@ class ControllerConfig:
             slo_mode=safescale_registry.slo_mode,
             min_commit_samples=int(safescale_registry.min_commit_samples),
             evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
-            evidence_step_ms=float(instant_sample_interval_ms),
+            evidence_step_ms=float(evidence_period_ms),
             evidence_source=safescale_registry.evidence_source,
             evidence_poll_ms=float(safescale_registry.evidence_poll_s) * 1000.0,
             scrape_timeout_s=float(safescale_registry.scrape_timeout_s),
@@ -328,7 +348,7 @@ class ControllerConfig:
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             early_commit=bool(safescale_registry.early_commit),
-            early_commit_min_grids=early_grids,
+            early_commit_min_evidence_ms=float(early_evidence_ms),
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),
@@ -350,7 +370,7 @@ class ControllerConfig:
         else:
             tail_span_ms = safescale.hq * safescale.probe_poll_seconds * 1000.0
         if metrics_refresh_mode == "phase_aligned":
-            refresh_ms = float(instant_sample_interval_ms)
+            refresh_ms = float(evidence_period_ms)
             read_offset_ms = float(metrics_phase_offset_ms)
         else:
             refresh_ms = _get_positive_float(values, "TRE_METRICS_REFRESH_INTERVAL_SECONDS", 5.0) * 1000.0
@@ -392,12 +412,11 @@ class ControllerConfig:
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
             metrics_window_ms=metrics_window_ms,
             metrics_window_mode=metrics_window_mode,
-            # Must equal the gateway scrape cadence (SCRAPE_INTERVAL_MS): _instant_avg
-            # divides the summed in-window instant buckets by expected_samples =
-            # window_ms / this. A smaller value inflates expected_samples and HALVES the
-            # queue average the controller sees (r3 SMOKE_FINDINGS defect 2). Aligned to
-            # the real 10s write cadence; do not re-introduce a 5s magic number.
+            # Must equal the gateway's instant-doc period (startup cadence check): the
+            # per-pod completeness check counts a window's expected instant ticks on it.
+            # Queue averages are the mean over a pod's valid samples (no divisor).
             instant_sample_interval_ms=instant_sample_interval_ms,
+            evidence_period_ms=evidence_period_ms,
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             percentile_mode=percentile_mode,
@@ -408,7 +427,9 @@ class ControllerConfig:
             # F-onset warmup guard: -1 auto (window fully inside traffic period),
             # 0 disabled (A/B ablation), >0 explicit span-since-onset in ms.
             signal_warmup_ms=signal_warmup_ms,
-            paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
+            paper_stale_max_ms=_get_span_ms(
+                values, "TRE_PAPER_STALE_MAX_MS", "TRE_PAPER_STALE_MAX_WINDOWS", 30_000, minimum=1
+            ),
             incomplete_policy=incomplete_policy,
             ablation_disable_slow_loop=_get_bool(values, "TRE_ABLATION_DISABLE_SLOW_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),
@@ -433,7 +454,9 @@ class ControllerConfig:
             metrics_phase_offset_ms=metrics_phase_offset_ms,
             metrics_phase_adapt=_get_bool(values, "TRE_METRICS_PHASE_ADAPT", True),
             metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
-            metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
+            metrics_stale_hold_ms=_get_span_ms(
+                values, "TRE_METRICS_STALE_HOLD_MS", "TRE_METRICS_STALE_HOLD_WINDOWS", 20_000, minimum=0
+            ),
             view_stale_periods=_get_nonneg_int(values, "TRE_VIEW_STALE_PERIODS", 3),
             gateway_interval_check=gateway_interval_check,
             gateway_stats_urls=tuple(
@@ -506,14 +529,36 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
     return SafeScaleConfig.min_window_ms
 
 
-def _o1_min_evidence_grids(registry_path: str) -> int:
-    """Registry scaling.min_evidence_grids (O1 warm rule; 2 without a readable registry):
-    also the SafeScale early commit's post-hide grids (Q4)."""
+def _o1_min_evidence_ms(registry_path: str) -> int:
+    """Registry scaling.min_evidence_ms (O1 warm rule; 20 s without a readable registry):
+    also the SafeScale early commit's post-hide evidence span (Q4)."""
     try:
         scaling = load_registry(registry_path).scaling()
-        return int(getattr(scaling, "min_evidence_grids", 2) or 1)
+        return int(getattr(scaling, "min_evidence_ms", 20_000) or 1)
     except Exception:  # noqa: BLE001 - the registry load fails loudly elsewhere
-        return 2
+        return 20_000
+
+
+def _get_span_ms(
+    env: Mapping[str, str], key: str, legacy_count_key: str, default: int, *, minimum: int
+) -> int:
+    """A span (ms) from ``key``, or from its deprecated count variable (a count of 10 s
+    metrics windows, 2026-10-25) as count x 10 s with a warning. Both set: refused."""
+    if env.get(legacy_count_key) not in (None, ""):
+        if env.get(key) not in (None, ""):
+            raise ValueError(f"{legacy_count_key} (deprecated) and {key} are both set; keep {key} only")
+        count = _get_nonneg_int(env, legacy_count_key, 0)
+        span = count * LEGACY_GRID_MS
+        if span < minimum:
+            raise ValueError(f"{legacy_count_key} must be at least {math.ceil(minimum / LEGACY_GRID_MS)}")
+        LOG.warning(
+            "%s=%d is deprecated (a count of 10 s windows); read as %s=%d ms", legacy_count_key, count, key, span
+        )
+        return span
+    value = _get_nonneg_int(env, key, default)
+    if value < minimum:
+        raise ValueError(f"{key} must be at least {minimum}")
+    return value
 
 
 def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:

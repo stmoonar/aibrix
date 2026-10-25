@@ -641,7 +641,7 @@ safescale:
   # Z tail, complete evidence of every remaining pod), the hidden pods have nothing in
   # flight (gateway in-flight count of the live plugin instances and vLLM running +
   # waiting, both known and 0), the newest snapshot window holds
-  # scaling.min_evidence_grids complete post-hide gateway grids (10 s each, the O1
+  # scaling.min_evidence_ms of complete post-hide gateway grids (the O1
   # warm rule) and at least the donor's p95 e2e passed since the hide confirmation
   # (2026-10-06: no W / 2 term, no separate early_commit_min_grids key). Rollback
   # checks are unchanged and run first on every tick. false = commit at the deadline
@@ -686,8 +686,9 @@ scaling:
   # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
   # breakpoint_window: false the guard always applies (= pre-O1 behaviour).
   onset_warmup_guard: false
-  # Complete post-breakpoint grids before a scale-up decision (2 = 20 s).
-  min_evidence_grids: 2
+  # Complete post-breakpoint grids (ms) before a scale-up decision. 2026-10-25: a
+  # span, not a count (min_evidence_grids: N is a deprecated alias = N x 10 s).
+  min_evidence_ms: 20000
   # Completed requests the post-breakpoint window also needs (0 = off). Tokens count
   # at completion: one short request done while long ones run reads Z ~ 5 %.
   min_evidence_requests: 3
@@ -701,9 +702,10 @@ scaling:
   # breakpoint_partial_max_step: 0 = no cap.
   breakpoint_partial_max_step: 1
   breakpoint_lowevidence_requests: 10
-  # After this many consecutive held 10 s windows a receiver decides on the whole
-  # window again (routable count changing all the time); donors still wait. 0 = never.
-  breakpoint_hold_max_windows: 6
+  # After its windows have been held this long (ms, gateway clock) a receiver decides
+  # on the whole window again (routable count changing all the time); donors still
+  # wait. 0 = never. (breakpoint_hold_max_windows: N = deprecated alias, N x 10 s.)
+  breakpoint_hold_max_ms: 60000
   # Same-clock check of gateway doc stamps vs the controller clock (O1 compares them):
   # beyond the tolerance O1 is suspended (pre-O1 behaviour) until 3 good checks.
   gateway_clock_tolerance_ms: 2000
@@ -711,8 +713,9 @@ scaling:
   # Onset saturation rescue (design docs/design/20261002-saturation-onset-rescue.md):
   # while a model's TSS cannot decide yet - its window numerator is zero (tokens count at
   # request completion, so nothing has completed) or the O1 evidence gate above still
-  # holds it - a model whose engines are full on saturation_consecutive_ticks consecutive
-  # 10 s metrics windows is a CRITICAL receiver of the fast loop. "Full" = vLLM
+  # holds it - a model whose engines are full on every metrics window across
+  # saturation_confirm_ms is a CRITICAL receiver of the fast loop
+  # (saturation_consecutive_ticks: N = deprecated alias, N x 10 s). "Full" = vLLM
   # num_requests_waiting summed over its routable pods > 0, or their mean KV-cache fill
   # >= saturation_kv_threshold with >= 2 requests running, both from the latest gateway
   # sample (not the 30 s mean). Not full (one long request running, even one that fills
@@ -727,8 +730,15 @@ scaling:
   # TSS / Z / C1 rules alone decide. false = off (TSS rules only).
   saturation_rescue: true
   saturation_kv_threshold: 0.9
-  saturation_consecutive_ticks: 2
+  saturation_confirm_ms: 20000
   saturation_max_step_factor: 2
+  # Instant sample validity (2026-10-25, docs/design/20261025-instant-sampling.md): an
+  # instant doc counts only if its tick minus the pod's last successful gateway scrape
+  # (scraped_ms) is at most sample_max_scrape_age_ms; a pod with fewer valid docs than
+  # sample_min_ratio of the window's instant ticks is left out of the window like a
+  # scrape-stale pod (no scale-down / release evidence while it serves).
+  sample_max_scrape_age_ms: 1000
+  sample_min_ratio: 0.9
 # Node GPU-truth agent DaemonSet (deploy/gen_gpu_truth_manifest.py renders
 # overlays/tre-v2/gpu-truth.yaml from this and cluster.nodes). Only the generator
 # reads this section; the controller, service-manager and UI ignore it.

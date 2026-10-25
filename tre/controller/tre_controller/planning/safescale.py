@@ -1379,8 +1379,8 @@ class SafeScaleStateMachine:
         (:meth:`_judge` early mode: SLO, KV-cache, Z tail, evidence completeness), (c) the
         hidden pods have nothing in flight - the gateway's in-flight count of the live
         plugin instances and vLLM running + waiting both known and 0 - and (d) one
-        evidence floor: the newest snapshot window holds ``early_commit_min_grids``
-        (= ``scaling.min_evidence_grids``, the O1 warm rule) complete post-hide gateway
+        evidence floor: the newest snapshot window holds ``early_commit_min_evidence_ms`` of
+        (= ``scaling.min_evidence_ms``, the O1 warm rule) complete post-hide gateway
         grids AND at least the donor's p95 end-to-end latency passed since the hide
         confirmation (the remaining pods' concurrency needs about one e2e to settle).
         No fixed share of W and no separate minimum observation time.
@@ -1408,19 +1408,21 @@ class SafeScaleStateMachine:
         # new steady state); the post-hide grids below are the other half of the floor.
         inputs = (probe.window_terms or {}).get("inputs") or {}
         p95_e2e = _optional_float(inputs.get("p95_e2e_ms")) if isinstance(inputs, dict) else None
-        grids = max(1, int(getattr(cfg, "early_commit_min_grids", 2) or 1))
+        min_evidence_ms = max(1, int(getattr(cfg, "early_commit_min_evidence_ms", 20_000) or 1))
         min_elapsed = float(p95_e2e or 0.0)
         if elapsed < min_elapsed:
             return None
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
         if not window.p95_available or window.judged_count < max(1, min_samples):
             return None
-        # O1-style warm tail: the newest snapshot window holds ``grids`` complete gateway
-        # grids after the first boundary following the hide.
+        # O1-style warm tail: the newest snapshot window holds complete gateway grids
+        # spanning ``min_evidence_ms`` after the first boundary following the hide (both on
+        # the evidence grid: N complete grids of the 10 s grid = N x 10 s, as before).
         post_hide = self._post_hide_start(probe)
         latest = _latest_window_end(probe)
-        if post_hide is None or latest is None or int(latest) < int(post_hide) + grids * _evidence_step_ms(cfg):
+        if post_hide is None or latest is None or int(latest) - int(post_hide) < min_evidence_ms:
             return None
+        grids = (int(latest) - int(post_hide)) // max(1, _evidence_step_ms(cfg))
         drained = _hidden_drained(probe, poll)
         urgent = sorted({str(name) for name in critical_receivers or ()} - {probe.model})
         if drained is None:

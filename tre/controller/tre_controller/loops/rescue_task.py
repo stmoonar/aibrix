@@ -117,7 +117,7 @@ async def rescue_task(
     fairness_due: bool = False,
     leftover_probes: SafeScaleController | None = None,
 ) -> None:
-    paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
+    paper_state_cache = PaperStateCache(max_stale_ms=getattr(cfg, "paper_stale_max_ms", 30_000))
     wait_newer = getattr(snapshot_box, "wait_newer", None)
     while True:
         seen_version = getattr(snapshot_box, "version", None)

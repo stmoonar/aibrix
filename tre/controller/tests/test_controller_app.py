@@ -158,7 +158,7 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
             "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
             "TRE_REDIS_URL": "redis://example:6379/0",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
-            "TRE_INSTANT_SAMPLE_INTERVAL_MS": "7000",
+            "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
             "TRE_PERCENTILE_MODE": "interpolated",
         }
     )
@@ -168,7 +168,7 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
 
     assert isinstance(deps.store, MetricsStore)
     assert deps.store._redis is redis
-    assert deps.store._instant_sample_interval_ms == 7000
+    assert deps.store._instant_sample_interval_ms == 2500
     assert deps.store._percentile_mode == "interpolated"
     assert deps.store._schema == "v2"
     assert isinstance(deps.snapshot_box, SnapshotBox)

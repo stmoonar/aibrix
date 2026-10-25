@@ -28,8 +28,10 @@ CRITICAL receiver anyway:
   step added must be full themselves (vLLM's waiting queue is per pod: a backlog left on
   the old pods is not a reason for the next step). Every added pod must be full - a
   deliberately conservative rule: one added replica with room means capacity exists;
-* **confirmed** on ``consecutive_ticks`` consecutive metrics windows (counted once per
-  distinct window end: the rescue / fairness re-reads of one snapshot never count twice);
+* **confirmed** when full on every metrics window across ``confirm_ms`` (one grid before
+  the first full window's end up to this end; counted once per distinct window end: the
+  rescue / fairness re-reads of one snapshot never count twice). 2026-10-25: a span, not
+  a window count - 20 s = the former 2 windows of 10 s, at any evidence period;
 * after a rescue step the count restarts and only windows after the routable count rose
   above the decision's count count again (bounded doubling 1 -> 2 -> 4); a step may land
   in parts over several windows (2 -> 3 -> 4 for target 4), every rise up to its target is
@@ -69,13 +71,16 @@ class SaturationRescueConfig:
 
     enabled: bool = True
     kv_threshold: float = 0.9
-    consecutive_ticks: int = 2
+    #: Confirmation span (ms): full on every window from one grid before the first full
+    #: window's end to the current end (``scaling.saturation_confirm_ms``).
+    confirm_ms: int = 20_000
     max_step_factor: float = 2.0
     #: The KV condition alone also needs this many running requests (summed over the
     #: routable pods; per pod for the added-pods check).
     kv_min_running: int = 2
-    #: Gateway instant-sample period: a pod's newest sample older than one grid before
-    #: the window end is stale and ignored.
+    #: Gateway evidence period (the metrics-window grid): a pod's newest sample older than
+    #: one grid before the window end is stale and ignored; one window covers one grid of
+    #: the confirmation span.
     grid_ms: int = 10_000
     #: Fallback only: a rescue step whose routable change is not seen within this long
     #: and whose dispatch result never arrived (no linked queue record, a lost result)
@@ -85,8 +90,8 @@ class SaturationRescueConfig:
 
     @classmethod
     def from_registry(cls, registry: Any, *, grid_ms: int) -> "SaturationRescueConfig":
-        grid = max(1, int(grid_ms))
-        return cls(grid_ms=grid, await_timeout_ms=3 * grid).with_registry(registry)
+        # await_timeout_ms keeps its 30 s (formerly 3 x the 10 s grid) at any grid.
+        return cls(grid_ms=max(1, int(grid_ms))).with_registry(registry)
 
     def with_registry(self, registry: Any) -> "SaturationRescueConfig":
         """This config with the registry's ``scaling.saturation_*`` values (a registry
@@ -99,7 +104,7 @@ class SaturationRescueConfig:
             self,
             enabled=bool(getattr(config, "saturation_rescue", self.enabled)),
             kv_threshold=float(getattr(config, "saturation_kv_threshold", self.kv_threshold)),
-            consecutive_ticks=max(1, int(getattr(config, "saturation_consecutive_ticks", self.consecutive_ticks))),
+            confirm_ms=max(1, int(getattr(config, "saturation_confirm_ms", self.confirm_ms))),
             max_step_factor=min(
                 MAX_STEP_FACTOR_LIMIT,
                 max(1.0, float(getattr(config, "saturation_max_step_factor", self.max_step_factor))),
@@ -137,7 +142,7 @@ class SaturationVerdict:
     reason: str | None
     sample: SaturationSample | None
     full: bool
-    #: Consecutive confirmed windows up to this one.
+    #: Consecutive full windows up to this one (diagnostics; ``fire`` uses the span).
     ticks: int
     fire: bool
     #: Waiting for the routable change of the last rescue step (no counting).
@@ -220,6 +225,8 @@ def saturation_target(n: int, factor: float, cap: int) -> int:
 class _ModelState:
     last_end: int | None = None
     streak: int = 0
+    #: End of the first window of the current full streak (None: no streak).
+    streak_start: int | None = None
     verdict: SaturationVerdict | None = None
     last_routable: int | None = None
     #: Routable count at the last rescue step while its change is not yet seen.
@@ -379,8 +386,14 @@ class SaturationTracker:
             and (frozen or (self.engine_full(sample) and self._added_pods_full(state, sample, routable_ids)))
         )
         counted = state.await_n is None and (state.count_after is None or end > state.count_after)
-        state.streak = state.streak + 1 if (full and counted) else 0
-        fire = state.streak >= (1 if frozen else cfg.consecutive_ticks)
+        if full and counted:
+            state.streak += 1
+            if state.streak_start is None:
+                state.streak_start = end
+        else:
+            state.streak, state.streak_start = 0, None
+        covered = 0 if state.streak_start is None else end - state.streak_start + int(cfg.grid_ms)
+        fire = state.streak >= 1 and (frozen or covered >= cfg.confirm_ms)
         state.verdict = SaturationVerdict(
             model=model,
             window_end_ms=end,
@@ -422,7 +435,7 @@ class SaturationTracker:
 
     @staticmethod
     def _external(state: _ModelState, end: int) -> None:
-        state.streak = 0
+        state.streak, state.streak_start = 0, None
         state.count_after = end
         state.await_n = state.await_end = state.await_ref = None
         state.chain = False
@@ -444,7 +457,7 @@ class SaturationTracker:
         above ``routable`` (any rise up to ``target`` is this step landing, possibly in
         parts), and require the added pods to be full for the next step."""
         state = self._state.setdefault(model, _ModelState())
-        state.streak = 0
+        state.streak, state.streak_start = 0, None
         state.await_n = int(routable)
         state.await_end = int(window_end_ms)
         state.await_ref = None

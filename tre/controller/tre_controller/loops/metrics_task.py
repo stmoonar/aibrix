@@ -3,27 +3,29 @@
 Two refresh modes (``TRE_METRICS_REFRESH_MODE``):
 
 * ``phase_aligned`` (default, plan §6.9i / D8): :class:`PhaseAlignedSampler`. The gateway
-  stamps its instant/histogram samples with a boundary of the
-  ``SCRAPE_INTERVAL_MS`` = 10 s grid. The sampler sleeps until ``next boundary + offset``
-  (``sleep(next_boundary + offset - now)``, not ``sleep(interval)``), reads the half-open
-  window ``(boundary - window_ms, boundary]`` - exactly ``window_ms / 10 s`` instant ticks
-  (3 for 30 s) and a token delta spanning the full window - and publishes an immutable
-  snapshot whose ``ts_ms`` / ``window_end_ms`` is that boundary. A window missing any
-  expected tick (the gateway has not written the boundary yet, or skipped one) is
-  re-read every ``retry_ms`` until the next boundary; if it never completes it is
-  *stale*: logged, the previous snapshot keeps being served, and after
-  ``stale_hold_windows`` consecutive stale windows the served snapshot is marked
+  stamps its histogram samples with a boundary of the evidence-period grid
+  (TRE_EVIDENCE_PERIOD_MS, default 10 s) and its instant samples with a boundary of the
+  finer instant grid (TRE_INSTANT_SAMPLE_INTERVAL_MS, default 0.5 s). The sampler sleeps
+  until ``next evidence boundary + offset`` (``sleep(next_boundary + offset - now)``, not
+  ``sleep(interval)``), reads the half-open window ``(boundary - window_ms, boundary]`` -
+  a token delta spanning the full window - and publishes an immutable snapshot whose
+  ``ts_ms`` / ``window_end_ms`` is that boundary. A window whose end tick the gateway has
+  not written yet is re-read every ``retry_ms`` until the next boundary (2026-10-25:
+  only the end tick is checked here; per-pod completeness is the store's rule); if it
+  never appears the window is *stale*: logged, the previous snapshot keeps being served,
+  and once stale windows have lasted ``stale_hold_ms`` the served snapshot is marked
   ``stale`` so the decision loops stop acting on it. The fetch runs in a worker thread,
   so a slow redis read never blocks the decision loops.
 * ``free_running`` (fallback): the old ``refresh; sleep(metrics_refresh_interval_s)`` loop
   with a sliding window ending at ``now``.
 
-Decision cadence: snapshots change every 10 s in ``phase_aligned`` mode. The rescue loop
+Decision cadence: snapshots change every evidence period in ``phase_aligned`` mode. The rescue loop
 wakes on every publish (:meth:`SnapshotBox.wait_newer`, H1 2026-10-06), i.e. at the learned
 phase offset plus the fetch time, and at the latest ``TRE_RESCUE_INTERVAL_SECONDS`` (5 s)
 after its previous tick when nothing is published (free_running mode, stale windows). A
 re-read of the same snapshot advances neither the EMA nor the band dwell (both keyed by
-``window_end_ms``), so the effective decision cadence is 10 s, reached right after publish.
+``window_end_ms``), so the effective decision cadence is the evidence period, reached right
+after publish.
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ from types import MappingProxyType
 from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import EVIDENCE_PERIOD_MS
 
 if False:  # annotations are strings (from __future__); avoids an import cycle
     from tre_controller.profiling import TickProfiler
@@ -48,10 +50,13 @@ REFRESH_MODES = (REFRESH_PHASE_ALIGNED, REFRESH_FREE_RUNNING)
 
 DEFAULT_PHASE_OFFSET_MS = 2_000
 DEFAULT_PHASE_RETRY_MS = 500
-DEFAULT_STALE_HOLD_WINDOWS = 2
-#: Every this many cycles an adapted (raised) offset is dropped back to the configured one
-#: once, so the sampler re-learns a gateway write phase that moved earlier (restart).
-DEFAULT_PHASE_RELEARN_CYCLES = 60
+#: Stale windows keep the previous snapshot served this long (ms, window ends; 20 s =
+#: the former 2 windows of 10 s).
+DEFAULT_STALE_HOLD_MS = 20_000
+#: Every this long (ms, sampled window ends) an adapted (raised) offset is dropped back
+#: to the configured one once, so the sampler re-learns a gateway write phase that moved
+#: earlier (restart). 600 s = the former 60 cycles of 10 s.
+DEFAULT_PHASE_RELEARN_MS = 600_000
 
 
 class SnapshotStore(Protocol):
@@ -168,15 +173,19 @@ class WindowFreshness:
 
 
 def window_freshness(
-    snapshot: MetricsSnapshot, *, window_end_ms: int, window_ms: int, period_ms: int = SCRAPE_INTERVAL_MS
+    snapshot: MetricsSnapshot, *, window_end_ms: int, window_ms: int, period_ms: int = EVIDENCE_PERIOD_MS
 ) -> WindowFreshness:
-    """Whether the window holds every gateway tick it should: ``(end - window, end]`` on
-    the ``period_ms`` grid, i.e. 3 ticks for 30 s, the newest exactly at ``end``.
+    """Whether the gateway has written the window's end round: an instant tick exactly at
+    ``end`` (the gateway writes the end round's instant and histogram docs of every pod
+    in one transaction). ``period_ms`` is kept for the call sites.
 
-    Ticks are pooled over every pod of every model (the gateway writes all pods on one
-    ticker), so a pod that started mid-window does not make the window stale. A window
-    with no tick at all is reported fresh with reason ``no_ticks`` - nothing is serving,
-    or the store does not report ticks; the sampler decides what that means.
+    2026-10-25: only the end tick. The former rule (every tick of the window, pooled over
+    all pods) let a pod missing ticks pass whenever another pod covered them; completeness
+    is now per pod, on the pod's own valid docs (the store's ``sample_incomplete_pods``).
+    Ticks are pooled over every pod of every model here: this is the gateway-wide "round
+    written" signal. A window with no tick at all is reported fresh with reason
+    ``no_ticks`` - nothing is serving, or the store does not report ticks; the sampler
+    decides what that means.
     """
     end = int(window_end_ms)
     start = end - int(window_ms)
@@ -190,12 +199,11 @@ def window_freshness(
             }
         )
     )
-    expected = tuple(range(end - (int(window_ms) // int(period_ms) - 1) * int(period_ms), end + 1, int(period_ms)))
+    expected = (end,)
     if not ticks:
         return WindowFreshness(True, ticks, expected, "no_ticks")
-    missing = [tick for tick in expected if tick not in ticks]
-    if missing:
-        return WindowFreshness(False, ticks, expected, "missing_ticks:" + ",".join(str(t) for t in missing))
+    if end not in ticks:
+        return WindowFreshness(False, ticks, expected, f"missing_end_tick:{end}")
     return WindowFreshness(True, ticks, expected)
 
 
@@ -225,12 +233,12 @@ class PhaseAlignedSampler:
         snapshot_box: SnapshotBox,
         *,
         window_ms: int,
-        period_ms: int = SCRAPE_INTERVAL_MS,
+        period_ms: int = EVIDENCE_PERIOD_MS,
         offset_ms: int = DEFAULT_PHASE_OFFSET_MS,
         adapt: bool = True,
         retry_ms: int = DEFAULT_PHASE_RETRY_MS,
-        stale_hold_windows: int = DEFAULT_STALE_HOLD_WINDOWS,
-        relearn_cycles: int = DEFAULT_PHASE_RELEARN_CYCLES,
+        stale_hold_ms: int = DEFAULT_STALE_HOLD_MS,
+        relearn_ms: int = DEFAULT_PHASE_RELEARN_MS,
         clock_ms: Callable[[], int] = _default_clock_ms,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         fetch: Callable[[int, int], Awaitable[MetricsSnapshot]] | None = None,
@@ -254,14 +262,18 @@ class PhaseAlignedSampler:
         self.offset_ms = int(offset_ms)
         self.adapt = bool(adapt)
         self.retry_ms = int(retry_ms)
-        self.stale_hold_windows = max(0, int(stale_hold_windows))
-        self.relearn_cycles = max(0, int(relearn_cycles))
+        self.stale_hold_ms = max(0, int(stale_hold_ms))
+        self.relearn_ms = max(0, int(relearn_ms))
+        # Cycles per relearn: the span in sampled windows (60 at 10 s, 300 at 2 s).
+        self.relearn_cycles = -(-self.relearn_ms // self.period_ms) if self.relearn_ms else 0
         self._clock = clock_ms
         self._sleep = sleep
         self._fetch = fetch or self._threaded_fetch
         self._prof = prof
         self.last_end_ms: int | None = None
         self.consecutive_stale = 0
+        #: End of the last published window before the current stale run (None: none yet).
+        self.last_fresh_end_ms: int | None = None
         self.cycles = 0
         self._saw_ticks = False
 
@@ -362,6 +374,7 @@ class PhaseAlignedSampler:
                 )
                 self.offset_ms = learned
         self.consecutive_stale = 0
+        self.last_fresh_end_ms = end
         assert snapshot is not None
         published = freeze_snapshot(replace(snapshot, ts_ms=end, stale=False))
         self._box.set(published)
@@ -373,7 +386,7 @@ class PhaseAlignedSampler:
         if previous is None:
             self._box.set(MetricsSnapshot(ts_ms=end, models=MappingProxyType({}), stale=True))
             action = "no previous snapshot; serving an empty stale one"
-        elif self.consecutive_stale > self.stale_hold_windows:
+        elif self._stale_for_ms(end) > self.stale_hold_ms:
             if not previous.stale:
                 self._box.set(replace(previous, stale=True))
             action = f"previous window {previous.ts_ms} now marked stale"
@@ -384,6 +397,15 @@ class PhaseAlignedSampler:
             end, reason, attempts, self.consecutive_stale, action,
         )
         return SampleOutcome("stale", end, attempts, missed, reason, self.offset_ms)
+
+    def _stale_for_ms(self, end: int) -> int:
+        """How long (ms, window ends) windows have been stale up to ``end``: one period
+        per stale window counted from the last published window (N consecutive stale
+        windows of the 10 s grid = N x 10 s, as before); without a published window yet,
+        the consecutive count times the period."""
+        if self.last_fresh_end_ms is None:
+            return self.consecutive_stale * self.period_ms
+        return int(end) - int(self.last_fresh_end_ms)
 
     def _record_poll(self, fetch_ns: int, snapshot: MetricsSnapshot | None, *, stale: bool) -> None:
         if self._prof is None:
@@ -485,7 +507,7 @@ async def metrics_task(
     # fairness share one window). A cfg without metrics_refresh_mode (older callers,
     # tests) keeps the free-running loop; ControllerConfig defaults to phase_aligned.
     mode = getattr(cfg, "metrics_refresh_mode", REFRESH_FREE_RUNNING)
-    period_ms = getattr(cfg, "instant_sample_interval_ms", SCRAPE_INTERVAL_MS)
+    period_ms = getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS)
     if mode == REFRESH_PHASE_ALIGNED and cfg.metrics_window_ms % period_ms:
         LOG.error(
             "metrics_sampler: phase_aligned needs metrics_window_ms=%d to be a multiple of the "
@@ -501,15 +523,15 @@ async def metrics_task(
             offset_ms=getattr(cfg, "metrics_phase_offset_ms", DEFAULT_PHASE_OFFSET_MS),
             adapt=getattr(cfg, "metrics_phase_adapt", True),
             retry_ms=getattr(cfg, "metrics_phase_retry_ms", DEFAULT_PHASE_RETRY_MS),
-            stale_hold_windows=getattr(cfg, "metrics_stale_hold_windows", DEFAULT_STALE_HOLD_WINDOWS),
+            stale_hold_ms=getattr(cfg, "metrics_stale_hold_ms", DEFAULT_STALE_HOLD_MS),
             sleep=sleep,
             prof=prof,
         )
         LOG.info(
             "metrics_sampler: phase_aligned period=%d ms offset=%d ms window=(end-%d, end] "
-            "adapt=%s retry=%d ms stale_hold=%d",
+            "adapt=%s retry=%d ms stale_hold=%d ms",
             sampler.period_ms, sampler.offset_ms, sampler.window_ms, sampler.adapt,
-            sampler.retry_ms, sampler.stale_hold_windows,
+            sampler.retry_ms, sampler.stale_hold_ms,
         )
         await sampler.run_forever()
         return

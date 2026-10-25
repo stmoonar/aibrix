@@ -127,7 +127,7 @@ class _Queue:
 
 def _state(**config) -> SignalState:
     return SignalState(
-        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_grids=2),
+        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=2 * GRID),
         saturation=SaturationTracker(SaturationRescueConfig(**config)),
     )
 
@@ -433,22 +433,24 @@ def test_store_carries_each_pods_newest_instant_sample():
 
 def test_scaling_config_defaults_and_validation():
     defaults = parse_scaling_config({})
-    assert (defaults.saturation_rescue, defaults.saturation_kv_threshold, defaults.saturation_consecutive_ticks,
-            defaults.saturation_max_step_factor) == (True, 0.9, 2, 2.0)
+    assert (defaults.saturation_rescue, defaults.saturation_kv_threshold, defaults.saturation_confirm_ms,
+            defaults.saturation_max_step_factor) == (True, 0.9, 20_000, 2.0)
     custom = parse_scaling_config({"saturation_rescue": False, "saturation_kv_threshold": 0.95,
-                                   "saturation_consecutive_ticks": 3, "saturation_max_step_factor": 1.5})
-    assert (custom.saturation_rescue, custom.saturation_kv_threshold, custom.saturation_consecutive_ticks,
-            custom.saturation_max_step_factor) == (False, 0.95, 3, 1.5)
+                                   "saturation_confirm_ms": 30_000, "saturation_max_step_factor": 1.5})
+    assert (custom.saturation_rescue, custom.saturation_kv_threshold, custom.saturation_confirm_ms,
+            custom.saturation_max_step_factor) == (False, 0.95, 30_000, 1.5)
+    # 2026-10-25: the deprecated count key reads as N x 10 s.
+    assert parse_scaling_config({"saturation_consecutive_ticks": 3}).saturation_confirm_ms == 30_000
     for bad in ({"saturation_rescue": "yes"}, {"saturation_kv_threshold": 0}, {"saturation_kv_threshold": 1.5},
                 {"saturation_kv_threshold": True}, {"saturation_kv_threshold": "x"},
-                {"saturation_consecutive_ticks": 0}, {"saturation_consecutive_ticks": 1.5},
+                {"saturation_confirm_ms": 0}, {"saturation_consecutive_ticks": 1.5},
                 {"saturation_max_step_factor": 0.5}, {"saturation_max_step_factor": float("nan")}):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
-    registry = _registry(saturation_kv_threshold=0.8, saturation_consecutive_ticks=3, saturation_max_step_factor=3)
+    registry = _registry(saturation_kv_threshold=0.8, saturation_confirm_ms=30_000, saturation_max_step_factor=3)
     config = SaturationRescueConfig.from_registry(registry, grid_ms=GRID)
-    assert (config.enabled, config.kv_threshold, config.consecutive_ticks, config.max_step_factor) == (True, 0.8, 3, 3.0)
-    assert config.grid_ms == GRID and config.await_timeout_ms == 3 * GRID
+    assert (config.enabled, config.kv_threshold, config.confirm_ms, config.max_step_factor) == (True, 0.8, 30_000, 3.0)
+    assert config.grid_ms == GRID and config.await_timeout_ms == 30_000
     assert _scaling_options(registry)["saturation_max_step_factor"] == 3.0
     assert not SaturationRescueConfig.from_registry(_registry(saturation_rescue=False), grid_ms=GRID).enabled
 
@@ -464,7 +466,7 @@ def test_partial_max_step_is_wired_from_the_registry_through_the_tick():
     completed requests in the 20 s suffix -> planned 2 is the uncapped case)."""
 
     def run(requests_per_grid: float) -> int:
-        state = SignalState(breakpoint=BreakpointWindowConfig(enabled=True, grid_ms=GRID, min_evidence_grids=2,
+        state = SignalState(breakpoint=BreakpointWindowConfig(enabled=True, grid_ms=GRID, min_evidence_ms=2 * GRID,
                                                               min_evidence_requests=3))
         registry = _registry(rescue_max_step_pods=4, breakpoint_partial_max_step=1,
                              breakpoint_lowevidence_requests=10, saturation_rescue=False)
@@ -716,12 +718,12 @@ def test_probe_preemption_covers_the_step_and_its_unhide_lands_it():
 
 def test_config_is_read_from_the_registry_every_tick():
     state = _state()
-    registry = _registry(saturation_consecutive_ticks=3)
+    registry = _registry(saturation_confirm_ms=30_000)
     sat = [STARTING] * 3
     planned = [_planned(_tick(state, _window(BASE + i * GRID, sat, (8.0, 0.6)), awake=1, registry=registry))
                for i in (3, 4, 5)]
     assert planned == [0, 0, 1]
-    assert state.saturation.config.consecutive_ticks == 3
+    assert state.saturation.config.confirm_ms == 30_000
     with pytest.raises(ValueError):
         parse_scaling_config({"saturation_max_step_factor": 4.5})
     assert parse_scaling_config({"saturation_max_step_factor": 4}).saturation_max_step_factor == 4.0
@@ -841,7 +843,7 @@ def test_o1_resume_after_a_suspension_does_not_reopen_the_hold_path():
     model stays out of the saturation path."""
     state = SignalState(
         warmup_ms=0,
-        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_grids=2),
+        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=2 * GRID),
         saturation=SaturationTracker(),
     )
     state.suspend_breakpoint_window("gateway_clock")

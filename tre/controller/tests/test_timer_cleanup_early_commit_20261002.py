@@ -6,7 +6,7 @@ Before the deadline (hide confirmation + W) a probe commits once, on the same po
 commit gate passes on the evidence so far, (c) the hidden pods have nothing in flight
 (gateway count of the live plugin instances and vLLM running + waiting, both known and
 0) and (d) one evidence floor (Q4, 2026-10-06): the newest snapshot window holds
-scaling.min_evidence_grids complete post-hide grids and at least the donor's p95 e2e
+scaling.min_evidence_ms of complete post-hide grids and at least the donor's p95 e2e
 passed since the confirmation (no W / 2 term, no minimum observation time). Rollback
 checks are unchanged."""
 
@@ -155,7 +155,7 @@ def test_a_long_e2e_model_never_commits_before_one_p95_e2e():
 
 def test_the_post_hide_grids_follow_the_o1_warm_rule():
     # Three post-hide grids required: the newest window must end at 140 s.
-    h = EarlyHarness(early_commit_min_grids=3)
+    h = EarlyHarness(early_commit_min_evidence_ms=30_000)
     h.start()
     at, decision = _first_terminal(h, HIDE + LONG_W)
     assert decision.status == "commit" and at == 141_000
@@ -281,17 +281,18 @@ def test_an_unreadable_live_inflight_field_is_unknown_and_blocks_early_commit(ra
 def test_registry_and_config_keys(tmp_path):
     assert SafeScaleRegistryConfig().early_commit is True
     shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))
-    assert shipped.safescale().early_commit is True and shipped.scaling().min_evidence_grids == 2
+    assert shipped.safescale().early_commit is True and shipped.scaling().min_evidence_ms == 20_000
     assert parse_safescale_config({"early_commit": False}).early_commit is False
     with pytest.raises(ValueError):
         parse_safescale_config({"early_commit": "yes"})
-    # Q4: the post-hide grids are O1's scaling.min_evidence_grids; a registry that still
-    # carries the removed safescale.early_commit_min_grids loads (unknown key: a warning).
+    # Q4: the post-hide span is O1's scaling.min_evidence_ms; a registry that still
+    # carries the removed safescale.early_commit_min_grids loads (unknown key: a warning),
+    # and the deprecated scaling.min_evidence_grids: N is read as N x 10 s (2026-10-25).
     text = (TRE_DIR / "deploy" / "registry.yaml").read_text()
-    assert "\n  min_evidence_grids: 2\n" in text and "\n  early_commit: true\n" in text
-    text = text.replace("\n  min_evidence_grids: 2\n", "\n  min_evidence_grids: 3\n")
+    assert "\n  min_evidence_ms: 20000\n" in text and "\n  early_commit: true\n" in text
+    text = text.replace("\n  min_evidence_ms: 20000\n", "\n  min_evidence_grids: 3\n")
     text = text.replace("\n  early_commit: true\n", "\n  early_commit: true\n  early_commit_min_grids: 5\n")
     path = tmp_path / "registry.yaml"
     path.write_text(text)
     cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)}).safescale
-    assert cfg.early_commit is True and cfg.early_commit_min_grids == 3
+    assert cfg.early_commit is True and cfg.early_commit_min_evidence_ms == 30_000
