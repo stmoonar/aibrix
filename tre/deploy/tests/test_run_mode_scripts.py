@@ -115,6 +115,19 @@ def test_toggle_tre_sets_both_active_after_the_switch(fake):
     assert mset > restart
 
 
+def test_toggle_tre_no_restart_still_removes_apa_and_never_touches_mode_or_controller(fake):
+    """The runner's form (2026-10-26): APA CRs still deleted and verified, no controller rollout,
+    run mode untouched; --no-restart outside 'tre --keep-run-mode' is refused."""
+    run, kv, calls = fake
+    run("toggle_tre_apa.sh", "tre", "--keep-run-mode", "--no-restart")
+    log = calls()
+    assert any(" delete -f " in line for line in log)
+    assert not any("rollout" in line for line in log) and not any(" MSET " in line for line in log)
+    assert (kv(CTRL), kv(SM)) == (None, None)
+    assert run("toggle_tre_apa.sh", "tre", "--no-restart", check=False).returncode == 2
+    assert run("toggle_tre_apa.sh", "apa", "--keep-run-mode", "--no-restart", check=False).returncode == 2
+
+
 def test_toggle_refuses_apa_while_the_controller_is_active_or_a_baseline_shell_owns(fake, tmp_path):
     run, kv, calls = fake
     run("set_run_mode.sh", "active", "active")
