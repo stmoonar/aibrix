@@ -72,17 +72,30 @@ def _int_or_none(v):
 #: ``written_ms`` (every round's MULTI) for a declaration without it; ``last_round_ms``
 #: was never written by a released gateway (kept for older rows / fixtures).
 WINDOW_END_KEYS = ("last_hist_ms", "written_ms", "last_round_ms")
+#: ``window_end_source`` of a frozen ``last_hist_ms`` (anchored on ``written_ms`` instead).
+HIST_FROZEN_SOURCE = "written_ms_hist_frozen"
 
 
-def cadence_window_anchor(cadence: dict | None, redis_ms: int) -> tuple[int, str]:
-    """(end ms, source) of the counting window: the first declared field of
+def cadence_window_anchor(cadence: dict | None, redis_ms: int) -> tuple[int, str, int | None]:
+    """(end ms, source, anchor_lag_ms) of the counting window: the first declared field of
     :data:`WINDOW_END_KEYS`, else the Redis clock (``redis_time``) - which races the
-    gateway's 500 ms grid (a round stamped just before it may not be written yet)."""
+    gateway's 500 ms grid (a round stamped just before it may not be written yet).
+    ``anchor_lag_ms`` = ``written_ms - last_hist_ms`` (None without both). HSET never
+    deletes a field, so a ``last_hist_ms`` more than 2 evidence periods behind
+    ``written_ms`` is frozen (a gateway rolled back to an image without it, histogram
+    rounds not committing): the window ends at ``written_ms`` then
+    (:data:`HIST_FROZEN_SOURCE`) and the stall shows as short hist counts."""
+    c = cadence or {}
+    hist, written = _int_or_none(c.get("last_hist_ms")), _int_or_none(c.get("written_ms"))
+    lag = written - hist if hist is not None and written is not None else None
+    evidence = _int_or_none(c.get("evidence_ms"))
+    if lag is not None and evidence is not None and evidence > 0 and lag > 2 * evidence:
+        return written, HIST_FROZEN_SOURCE, lag
     for key in WINDOW_END_KEYS:
-        value = _int_or_none((cadence or {}).get(key))
+        value = _int_or_none(c.get(key))
         if value is not None:
-            return value, key
-    return int(redis_ms), "redis_time"
+            return value, key, lag
+    return int(redis_ms), "redis_time", lag
 
 
 def cadence_window_end(cadence: dict | None, redis_ms: int) -> int:
@@ -105,7 +118,7 @@ def cadence_row(ts: float, redis_ms: int, cadence: dict | None, pods: dict, docs
     p_hist = hist_ms if declared else LEGACY_DOC_PERIOD_MS
     exp_inst = win // p_inst if win >= p_inst else None   # a window shorter than the period expects nothing
     exp_hist = win // p_hist if win >= p_hist else None
-    end, end_source = cadence_window_anchor(cadence, redis_ms)
+    end, end_source, anchor_lag = cadence_window_anchor(cadence, redis_ms)
     out_pods, full_i, full_h = {}, 0, 0
     for pk, model in sorted(pods.items()):
         d = docs.get(pk) or {}
@@ -126,7 +139,7 @@ def cadence_row(ts: float, redis_ms: int, cadence: dict | None, pods: dict, docs
         full_h += exp_hist is not None and (row["hist_n"] or 0) >= exp_hist
         out_pods[pk] = row
     return {"ts": ts, "redis_ms": int(redis_ms), "cadence": cadence or None, "declared": declared,
-            "window_end_ms": end, "window_end_source": end_source,
+            "window_end_ms": end, "window_end_source": end_source, "anchor_lag_ms": anchor_lag,
             "window_ms": win, "expected": {"inst": exp_inst, "hist": exp_hist},
             "pods": out_pods, "summary": {"pods": len(out_pods), "inst_full": full_i, "hist_full": full_h}}
 

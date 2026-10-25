@@ -243,7 +243,9 @@ def cadence_scan(p: Path) -> dict:
     # The counts are per window ``(end - period, end]``; ``end`` is the sampler's anchor
     # (gateway ``last_hist_ms`` since 2026-10-26: complete rounds only). Rows anchored on
     # ``redis_time`` race the 500 ms grid and may read one doc short per pod.
+    # A frozen ``last_hist_ms`` (sampler: more than 2 evidence periods behind written_ms).
     sources = Counter(r.get("window_end_source") or "none" for r in rows)
+    anchor_lags = [r["anchor_lag_ms"] for r in rows if isinstance(r.get("anchor_lag_ms"), (int, float))]
     for r in rows:
         exp = r.get("expected") or {}
         end = r.get("window_end_ms") or 0
@@ -260,7 +262,8 @@ def cadence_scan(p: Path) -> dict:
                 ages.append(pod["scrape_age_ms"])
     last_cad = next((r.get("cadence") for r in reversed(rows) if r.get("cadence")), None)
     return {"samples": len(rows), "error_rows": err, "declared_samples": declared, "cadence_last": last_cad,
-            "window_end_sources": dict(sources),
+            "window_end_sources": dict(sources), "hist_frozen_samples": sources.get("written_ms_hist_frozen", 0),
+            "anchor_lag_ms_max": max(anchor_lags) if anchor_lags else None,
             "pod_samples_active": active, "pod_samples_inst_short": short_i, "pod_samples_hist_short": short_h,
             "write_lag_ms_p95": pct(lags, 95), "write_lag_ms_max": max(lags) if lags else None,
             "scrape_age_ms_p95": pct(ages, 95), "scrape_age_ms_max": max(ages) if ages else None}
@@ -517,6 +520,9 @@ def check(d: Path, controller_tick_s: float = 5.0, baseline_tick_s: float = 5.0,
         ab.append(f"baseline events invalid: {rv.get('invalid_because')}")
     if comp["missing"]:
         ab.append(f"missing / empty: {comp['missing']}")
+    if cad and cad.get("hist_frozen_samples"):
+        sus.append(f"gateway last_hist_ms frozen in {cad['hist_frozen_samples']} cadence sample(s) "
+                   f"(written_ms - last_hist_ms max {cad.get('anchor_lag_ms_max')} ms): histogram rounds stalled")
     if cad and cad.get("samples") and not cad.get("declared_samples"):
         info.append("gateway declares no cadence (image before 2026-10-25): doc counts judged on the 10 s grid")
     res["abnormal"] = ab + sus

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -91,10 +92,30 @@ def test_cadence_row_counts_docs_against_the_declared_periods_and_records_a_miss
     assert row["declared"] and row["expected"] == {"inst": 20, "hist": 5} and row["window_end_ms"] == 1000000
     assert row["window_end_source"] == "last_hist_ms"
     pre_round5 = {k: v for k, v in cad.items() if k != "last_hist_ms"}
-    assert sampler.cadence_window_anchor(pre_round5, 1000400) == (1001535, "written_ms")
+    assert sampler.cadence_window_anchor(pre_round5, 1000400) == (1001535, "written_ms", None)
     assert row["summary"] == {"pods": 2, "inst_full": 1, "hist_full": 2}
     assert (row["pods"]["default/p1"]["write_lag_ms"], row["pods"]["default/p1"]["scrape_age_ms"]) == (30, 200)
     assert row["pods"]["default/p2"]["write_lag_ms"] is None
     legacy = sampler.cadence_row(1.0, 1000400, None, pods, docs, 10.0)
     assert legacy["cadence"] is None and not legacy["declared"] and legacy["expected"] == {"inst": 1, "hist": 1}
     assert legacy["window_end_ms"] == 1000400 and legacy["window_end_source"] == "redis_time"
+
+
+def test_cadence_row_falls_back_to_written_ms_on_a_frozen_last_hist_ms(tmp_path):
+    """HSET never deletes last_hist_ms: more than 2 evidence periods behind written_ms it is
+    frozen (gateway rollback, stalled histogram rounds) - the window ends at written_ms and
+    first_run_check flags the run."""
+    import first_run_check as F
+
+    pods = {"default/p1": "m7"}
+    docs = {"default/p1": {"inst_n": 20, "hist_n": 0, "inst_last": None, "hist_last_ms": 990000}}
+    frozen = {"instant_ms": "500", "evidence_ms": "2000", "written_ms": "1000035", "last_hist_ms": "990000"}
+    row = sampler.cadence_row(1.0, 1000400, frozen, pods, docs, 10.0)
+    assert (row["window_end_ms"], row["window_end_source"], row["anchor_lag_ms"]) == (
+        1000035, "written_ms_hist_frozen", 10035)
+    live = sampler.cadence_row(1.0, 1000400, dict(frozen, last_hist_ms="998000"), pods, docs, 10.0)
+    assert live["window_end_source"] == "last_hist_ms"  # 2 periods behind: a late round, not frozen
+    path = tmp_path / "gateway_cadence.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in (row, live)) + "\n")
+    scan = F.cadence_scan(path)
+    assert scan["hist_frozen_samples"] == 1 and scan["anchor_lag_ms_max"] == 10035

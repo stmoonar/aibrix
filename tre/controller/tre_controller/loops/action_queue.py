@@ -500,8 +500,10 @@ class ActionQueue:
         that certainly changed nothing is not stamped (see ``_stamp_changes``). An
         unhide is not a scale-up (it holds like "down"). ``observed`` False = restored
         from the durable scale memory of a previous controller. Not overwritten by a
-        later scale-down: the planner tick holds the O1-exempt free-GPU step until the
-        decision signal reflects this scale-up (``_unsettled_upscales``)."""
+        later scale-down. The planner tick holds the O1-exempt free-GPU step on it
+        (``_unsettled_upscales``) until the decision window starts after it (plus the
+        settle extension when not observed / not O1-tracked); the model also leaves the
+        exempt path once its signal is warm again (then the normal C1 path decides)."""
         return dict(self._last_upscale)
 
     def relay_holds(self) -> dict[tuple[str, str], RelayHold]:

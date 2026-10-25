@@ -98,8 +98,18 @@ window's old-regime value). An earlier C1 rescue target O1 has not settled yet (
 basis of `_rescue_bases`, landed or not), or a fleet view older than the last action, holds
 it (`receiver_o1_exempt_pending`): one stale window buys one wake (2026-10-07; before, a
 landed target released it and the next step re-asked the target from the new count with
-the old window's Z, climbing to `max_awake`). LOW sleeping-capacity wakes carry no rescue
-target and do not block it. Only the O1 evidence holds are exempt (`no_complete_grid`,
+the old window's Z, climbing to `max_awake`). **2026-10-26: any controller scale-up holds the
+exempt step**, not only a C1 rescue target: LOW rescue / fairness wakes and creates, relay
+receivers and SafeScale receiver targets too (`ActionQueue.last_upscales`, stamped when the
+SM call returns with the "up" view-hold rule; persisted with the scale memory). The record
+releases by the window rule (window start >= done + settle); the O1-settled branch never
+applies to an exempt receiver (it is not warm), so the model otherwise leaves the exempt path
+by warming. A later breakpoint of another cause (onset, a scale-down, a lost pod) after the
+release is its own stale window and buys its own wake. Smoke 20261026 (Simul_spike, arm
+TRE-SS-receiverless): 7b went LOW and woke 1 -> 2; the next window still straddled that
+breakpoint, its old tokens over 2 replicas gave Z 0.97 -> 0.35 at flat load, and the exempt
+path stacked a 3rd replica 5 s later (8b the same) - both HIGH at 3 replicas within 25 s,
+and they took the last free GPU pair the TP2 model needed. Only the O1 evidence holds are exempt (`no_complete_grid`,
 `no_suffix`, `evidence_grids`, `evidence_tokens`, `evidence_requests`); a held context
 (`tokens_missing`), `scrape_stale` and a hold fallback stay held. Exempt receivers are planned
 after warm TSS and saturation receivers. Everything else keeps O1: steps from donors, every

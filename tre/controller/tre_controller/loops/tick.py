@@ -640,7 +640,11 @@ def _unsettled_upscales(
     reflect it yet (:func:`_scale_up_reflected`, the rescue-basis rule). The planner
     holds an O1-exempt CRITICAL receiver on it: one stale window buys one wake, whichever
     path made the earlier one. Only the exempt path reads it - C1's base / covered stay
-    the rescue targets'."""
+    the rescue targets'. For that consumer the ``_o1_settled`` branch never fires (an
+    exempt receiver is not warm): the record releases by the window rule (window start
+    >= done + settle), or the model leaves the exempt path by warming. A later breakpoint
+    of another cause (traffic onset, a scale-down) that keeps the model exempt after the
+    window rule released the record reopens the exempt step - its own stale window."""
     read = getattr(queue, "last_upscales", None)
     if not callable(read):
         return {}

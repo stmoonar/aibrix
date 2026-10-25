@@ -271,3 +271,46 @@ def test_low_wake_holds_the_exempt_free_gpu_step_until_o1_settles():
     warm_at = next(k for k, (warm, _) in steps.items() if warm)
     assert all(not planned for k, (_, planned) in steps.items() if k < warm_at)
     assert steps[warm_at][1] and steps[warm_at][1][0][0] == "m"  # settled on new evidence: next step
+
+
+def test_released_upscale_record_leaves_a_later_unrelated_breakpoint_exempt():
+    """The record releases by the window rule (an exempt receiver is never warm): once a
+    whole window follows the LOW wake, a breakpoint of another cause (here a replica lost
+    outside the controller) is its own stale window and buys its own exempt wake."""
+    import asyncio
+
+    from tre_controller.loops.action_queue import ActionQueue
+
+    class _Client:
+        async def set_binding_power(self, serve_id, *, awake):
+            return {"ok": True}
+
+        async def scale_model(self, model, delta, **_kwargs):
+            return {"ok": True}
+
+    low_load, healthy_load, stale_load = (
+        (2600.0, 30.0, 20.0, 100.0), (2600.0, 30.0, 15.0, 100.0), (1000.0, 30.0, 20.0, 100.0)
+    )
+    registry = _registry(10_000.0)
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    base = 4_000_000
+    _prime_onset(state, base - 10 * GRID)
+    now = {"ms": base}
+    queue = ActionQueue(_Client(), now_ms=lambda: now["ms"])
+
+    def tick(end, grids, routable):
+        return run_planner_tick(_snap(_window(end, [grids] * 3, routable=routable)), queue=queue, registry=registry,
+                                rescue_due=True, fairness_due=False,
+                                cluster_view=_view(routable, fetched_ms=end + 3_000), signal_state=state)
+
+    assert [a.reason for a in tick(base, low_load, 1).actions if isinstance(a, ScaleAction)] == [
+        "low_rescue_sleeping_capacity"
+    ]
+    now["ms"] = base + 1_500
+    asyncio.run(queue.drain_once())
+    for k in range(1, 5):  # healthy at 2 replicas: no action; window rule releases the wake
+        assert not tick(base + k * GRID, healthy_load, 2).actions
+    lost = tick(base + 5 * GRID, stale_load, 1)  # m-1 gone (not ours): a new breakpoint
+    assert lost.model_contexts["m"]["signal_warm"] is False
+    assert [(a.model, a.delta) for a in lost.actions if isinstance(a, ScaleAction) and a.delta > 0] == [("m", 1)]
+    assert any(e.startswith("receiver_o1_exempt_free_gpu:m:") for e in lost.events)
