@@ -55,7 +55,7 @@ const (
 	treInstantIntervalEnv     = "TRE_INSTANT_SAMPLE_INTERVAL_MS"
 	treEvidencePeriodEnv      = "TRE_EVIDENCE_PERIOD_MS"
 	defaultTREInstantInterval = 500 * time.Millisecond
-	defaultTREEvidencePeriod  = 10 * time.Second
+	defaultTREEvidencePeriod  = 2 * time.Second
 )
 
 // treWriteCadence is the pair of TRE doc write periods (see the constants above).

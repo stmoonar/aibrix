@@ -75,7 +75,7 @@ spec:
             - name: TRE_INSTANT_SAMPLE_INTERVAL_MS
               value: "500"
             - name: TRE_EVIDENCE_PERIOD_MS
-              value: "10000"
+              value: "2000"
             # D8 (09-22): phase-aligned sampler. Sleeps to the next evidence boundary +
             # offset and reads (boundary-30s, boundary]: a full 30 s token span per
             # window, one new snapshot per evidence period. The offset (default
@@ -85,15 +85,15 @@ spec:
             # TRE_METRICS_WINDOW_MODE).
             - name: TRE_METRICS_REFRESH_MODE
               value: phase_aligned
-            # Pinned; must stay below TRE_EVIDENCE_PERIOD_MS (1000 for a 2 s period).
+            # Pinned; must stay below TRE_EVIDENCE_PERIOD_MS (min(2 s, period / 2)).
             - name: TRE_METRICS_PHASE_OFFSET_MS
-              value: "2000"
+              value: "1000"
             # Only used by TRE_METRICS_REFRESH_MODE=free_running.
             - name: TRE_METRICS_REFRESH_INTERVAL_SECONDS
               value: "5"
-            # The rescue loop still wakes every 5 s, but snapshots change every 10 s and a
-            # re-read of one window advances neither the EMA nor the dwell: the effective
-            # decision cadence is 10 s (acted on <= 5 s after the snapshot is published).
+            # Fixed timers (2026-10-25): the fast loop every 5 s, the slow loop every 10 s;
+            # each reads the latest snapshot (every 2 s: at most ~2 s old). A re-read of one
+            # window advances neither the EMA nor any time-span rule.
             - name: TRE_RESCUE_INTERVAL_SECONDS
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS

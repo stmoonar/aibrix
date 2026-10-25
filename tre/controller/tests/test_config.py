@@ -25,11 +25,11 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.fairness_interval_s == 10.0
     assert config.metrics_window_ms == 30_000
     assert config.metrics_window_mode == "sliding"
-    # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 10 s); the read
+    # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 2 s); the read
     # offset defaults to min(2 s, evidence / 2).
     assert config.instant_sample_interval_ms == INSTANT_SAMPLE_INTERVAL_MS == 500
-    assert config.evidence_period_ms == EVIDENCE_PERIOD_MS == 10_000
-    assert config.metrics_phase_offset_ms == 2_000
+    assert config.evidence_period_ms == EVIDENCE_PERIOD_MS == 2_000
+    assert config.metrics_phase_offset_ms == 1_000
     assert config.metrics_stale_hold_ms == 20_000
     assert config.histogram_lookback_ms == 90_000
     assert config.min_latency_samples == 10
@@ -94,6 +94,7 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_FAIRNESS_INTERVAL_SECONDS": "7.25",
             "TRE_METRICS_WINDOW_MS": "45000",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
+            "TRE_EVIDENCE_PERIOD_MS": "10000",
             "SAFE_SCALE_MIN_WINDOW_MS": "70000",
             "TRE_HIST_BASELINE_LOOKBACK_MS": "120000",
             "TRE_PERCENTILE_MODE": "interpolated",
@@ -307,7 +308,7 @@ def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> 
 
 
 def test_evidence_period_and_spans_2s_cadence_and_deprecated_count_aliases(caplog) -> None:
-    """2026-10-25: a 2 s evidence period moves the read offset to 1 s; count settings are
+    """2026-10-25: a 2 s evidence period (the default) puts the read offset at 1 s; count settings are
     spans (a deprecated count alias = N x 10 s, both names set = refused); the evidence
     period must be a multiple of the instant period."""
     cfg = ControllerConfig.from_env({"TRE_EVIDENCE_PERIOD_MS": "2000"})

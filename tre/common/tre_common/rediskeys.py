@@ -16,7 +16,7 @@ FALLBACK_TTL_SECONDS = 2 * 60 * 60
 # Neither is the upstream request-trace interval (aibrix pkg/cache/trace.go
 # RequestTraceWriteInterval, 10 s, unchanged).
 INSTANT_SAMPLE_INTERVAL_MS = 500
-EVIDENCE_PERIOD_MS = 10_000
+EVIDENCE_PERIOD_MS = 2_000
 
 # The 10 s gateway grid of the gateway images before 2026-10-25 (instant AND histogram
 # docs). The calibration / replayer tooling re-windows data captured on it, and the

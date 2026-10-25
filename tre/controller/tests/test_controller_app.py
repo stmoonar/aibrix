@@ -159,6 +159,7 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
             "TRE_REDIS_URL": "redis://example:6379/0",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
+            "TRE_EVIDENCE_PERIOD_MS": "10000",
             "TRE_PERCENTILE_MODE": "interpolated",
         }
     )
