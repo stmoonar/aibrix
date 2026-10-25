@@ -65,11 +65,29 @@ def _int_or_none(v):
         return None
 
 
+#: Window-end anchors, in order: the gateway's declared progress (its clock, the doc
+#: stamps' clock), then the Redis clock. ``last_hist_ms`` (round 5) = the histogram
+#: boundary of the newest round whose docs are all written (that round's MULTI also wrote
+#: its instant docs and the hash): a window ending there counts complete rounds only.
+#: ``written_ms`` (every round's MULTI) for a declaration without it; ``last_round_ms``
+#: was never written by a released gateway (kept for older rows / fixtures).
+WINDOW_END_KEYS = ("last_hist_ms", "written_ms", "last_round_ms")
+
+
+def cadence_window_anchor(cadence: dict | None, redis_ms: int) -> tuple[int, str]:
+    """(end ms, source) of the counting window: the first declared field of
+    :data:`WINDOW_END_KEYS`, else the Redis clock (``redis_time``) - which races the
+    gateway's 500 ms grid (a round stamped just before it may not be written yet)."""
+    for key in WINDOW_END_KEYS:
+        value = _int_or_none((cadence or {}).get(key))
+        if value is not None:
+            return value, key
+    return int(redis_ms), "redis_time"
+
+
 def cadence_window_end(cadence: dict | None, redis_ms: int) -> int:
-    """End (ms) of the counting window: the gateway's ``last_round_ms`` when it declares one
-    (its newest round, the same clock as the doc stamps), else the Redis clock."""
-    last = _int_or_none((cadence or {}).get("last_round_ms"))
-    return last if last is not None else int(redis_ms)
+    """End (ms) of the counting window (:func:`cadence_window_anchor`)."""
+    return cadence_window_anchor(cadence, redis_ms)[0]
 
 
 def cadence_row(ts: float, redis_ms: int, cadence: dict | None, pods: dict, docs: dict, period_s: float) -> dict:
@@ -87,7 +105,7 @@ def cadence_row(ts: float, redis_ms: int, cadence: dict | None, pods: dict, docs
     p_hist = hist_ms if declared else LEGACY_DOC_PERIOD_MS
     exp_inst = win // p_inst if win >= p_inst else None   # a window shorter than the period expects nothing
     exp_hist = win // p_hist if win >= p_hist else None
-    end = cadence_window_end(cadence, redis_ms)
+    end, end_source = cadence_window_anchor(cadence, redis_ms)
     out_pods, full_i, full_h = {}, 0, 0
     for pk, model in sorted(pods.items()):
         d = docs.get(pk) or {}
@@ -108,8 +126,7 @@ def cadence_row(ts: float, redis_ms: int, cadence: dict | None, pods: dict, docs
         full_h += exp_hist is not None and (row["hist_n"] or 0) >= exp_hist
         out_pods[pk] = row
     return {"ts": ts, "redis_ms": int(redis_ms), "cadence": cadence or None, "declared": declared,
-            "window_end_ms": end, "window_end_source": "last_round_ms" if _int_or_none((cadence or {}).get("last_round_ms")) is not None
-            else "redis_time",
+            "window_end_ms": end, "window_end_source": end_source,
             "window_ms": win, "expected": {"inst": exp_inst, "hist": exp_hist},
             "pods": out_pods, "summary": {"pods": len(out_pods), "inst_full": full_i, "hist_full": full_h}}
 

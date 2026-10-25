@@ -83,9 +83,15 @@ def test_cadence_row_counts_docs_against_the_declared_periods_and_records_a_miss
     pods = {"default/p1": "m7", "default/p2": "m7"}
     docs = {"default/p1": {"inst_n": 20, "hist_n": 5, "inst_last": (doc, 1000000), "hist_last_ms": 1000000},
             "default/p2": {"inst_n": 12, "hist_n": 5, "inst_last": None, "hist_last_ms": None}}
-    cad = {"instant_ms": "500", "evidence_ms": "2000", "last_round_ms": "1000000", "version": "v"}
+    # The gateway's declared progress anchors the window (2026-10-26): last_hist_ms = the
+    # newest complete round's boundary, never the Redis clock that races the 500 ms grid.
+    cad = {"instant_ms": "500", "evidence_ms": "2000", "written_ms": "1001535", "last_hist_ms": "1000000",
+           "version": "v"}
     row = sampler.cadence_row(1.0, 1000400, cad, pods, docs, 10.0)
     assert row["declared"] and row["expected"] == {"inst": 20, "hist": 5} and row["window_end_ms"] == 1000000
+    assert row["window_end_source"] == "last_hist_ms"
+    pre_round5 = {k: v for k, v in cad.items() if k != "last_hist_ms"}
+    assert sampler.cadence_window_anchor(pre_round5, 1000400) == (1001535, "written_ms")
     assert row["summary"] == {"pods": 2, "inst_full": 1, "hist_full": 2}
     assert (row["pods"]["default/p1"]["write_lag_ms"], row["pods"]["default/p1"]["scrape_age_ms"]) == (30, 200)
     assert row["pods"]["default/p2"]["write_lag_ms"] is None

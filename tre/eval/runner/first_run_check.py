@@ -240,6 +240,10 @@ def cadence_scan(p: Path) -> dict:
     declared = sum(1 for r in rows if r.get("declared"))
     short_i = short_h = active = 0
     lags, ages = [], []
+    # The counts are per window ``(end - period, end]``; ``end`` is the sampler's anchor
+    # (gateway ``last_hist_ms`` since 2026-10-26: complete rounds only). Rows anchored on
+    # ``redis_time`` race the 500 ms grid and may read one doc short per pod.
+    sources = Counter(r.get("window_end_source") or "none" for r in rows)
     for r in rows:
         exp = r.get("expected") or {}
         end = r.get("window_end_ms") or 0
@@ -256,6 +260,7 @@ def cadence_scan(p: Path) -> dict:
                 ages.append(pod["scrape_age_ms"])
     last_cad = next((r.get("cadence") for r in reversed(rows) if r.get("cadence")), None)
     return {"samples": len(rows), "error_rows": err, "declared_samples": declared, "cadence_last": last_cad,
+            "window_end_sources": dict(sources),
             "pod_samples_active": active, "pod_samples_inst_short": short_i, "pod_samples_hist_short": short_h,
             "write_lag_ms_p95": pct(lags, 95), "write_lag_ms_max": max(lags) if lags else None,
             "scrape_age_ms_p95": pct(ages, 95), "scrape_age_ms_max": max(ages) if ages else None}
