@@ -52,7 +52,9 @@ from tre_calibration.bootstrap import bootstrap_theta, bootstrap_theta_and_delta
 from tre_calibration.dataset import CalibrationWindow, TssRecompute, load_windows_from_csv
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
+    DEFAULT_FIT_METHOD,
     ThetaFitConfig,
+    fit_method as named_fit_method,
     fit_delta_margins,
     signal_z,
     threshold_balanced_accuracy,
@@ -88,14 +90,18 @@ class SignalSpec:
     label_lambda_wait: float
     tss: TssRecompute | None = None
     ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS
+    #: How theta and the bands are chosen (:data:`tre_calibration.fit.FIT_METHODS`); TSS
+    #: only - an alternative signal keeps its own candidate grid and the BA argmax.
+    fit_method: str = DEFAULT_FIT_METHOD
+
+    def __post_init__(self) -> None:
+        named_fit_method(self.fit_method)
+        if self.signal != "tss" and self.fit_method != DEFAULT_FIT_METHOD:
+            raise ValueError(f"fit method {self.fit_method!r} is for tss; {self.signal} uses the default")
 
     @property
     def direction(self) -> str:
         return "higher_is_healthier" if self.signal == "tss" else alt_signal_direction(self.signal)
-
-    @property
-    def candidate_grid(self) -> str:
-        return "quantile" if self.signal == "tss" else alt_signal_candidate_grid(self.signal)
 
     def load(self, path: str | Path, label: LabelDefinition, trim: int) -> list[CalibrationWindow]:
         if self.signal == "tss":
@@ -110,8 +116,20 @@ class SignalSpec:
             ema_tau_ms=self.ema_tau_ms,
         )
 
+    @property
+    def candidate_grid(self) -> str:
+        if self.signal == "tss":
+            return named_fit_method(self.fit_method).candidate_grid
+        return alt_signal_candidate_grid(self.signal)
+
     def default_config(self) -> ThetaFitConfig:
+        if self.signal == "tss":
+            return named_fit_method(self.fit_method).theta_config(self.direction)
         return ThetaFitConfig(direction=self.direction, candidate_grid=self.candidate_grid)
+
+    def band_kwargs(self) -> dict[str, Any]:
+        """``fit_delta_margins`` selection keywords of the fit method (none for argmax)."""
+        return named_fit_method(self.fit_method).band_kwargs()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +139,8 @@ class SignalSpec:
             "label_lambda_wait": self.label_lambda_wait,
             "ema_tau_ms": self.tss.ema_tau_ms if self.tss is not None else self.ema_tau_ms,
             "tss": self.tss.as_dict() if self.tss is not None else None,
+            # only when not the default, so a default spec keeps its key set
+            **({"fit_method": self.fit_method} if self.fit_method != DEFAULT_FIT_METHOD else {}),
         }
 
     @classmethod
@@ -134,6 +154,7 @@ class SignalSpec:
                 if t else None
             ),
             ema_tau_ms=raw.get("ema_tau_ms"),
+            fit_method=str(raw.get("fit_method") or DEFAULT_FIT_METHOD),
         )
 
 
@@ -145,6 +166,7 @@ def build_signal_spec(
     qmin: float = 1.0,
     ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS,
     label_lambda_wait: float | None = None,
+    fit_method: str = DEFAULT_FIT_METHOD,
 ) -> SignalSpec:
     if signal not in SIGNALS:
         raise ValueError(f"signal must be one of {SIGNALS}")
@@ -156,6 +178,7 @@ def build_signal_spec(
             signal="tss",
             label_lambda_wait=float(lambda_wait if label_lambda_wait is None else label_lambda_wait),
             tss=TssRecompute(w_p=w_p, lambda_wait=lambda_wait, qmin=qmin, ema_tau_ms=tau),
+            fit_method=fit_method,
         )
     if label_lambda_wait is None:
         label_lambda_wait = lambda_wait
@@ -302,6 +325,15 @@ def dwell_acceptance(
     }
 
 
+def _selection_record(side) -> dict[str, Any]:
+    """A band side's plateau record (only when not the argmax, so default reports keep
+    their key set)."""
+    if getattr(side, "selection", "argmax") == "argmax":
+        return {}
+    return {"selection": side.selection, "plateau": list(side.plateau) if side.plateau else None,
+            "plateau_eps": side.plateau_eps}
+
+
 def verdict_report(
     *,
     model: str,
@@ -331,9 +363,10 @@ def verdict_report(
     if not fit.publish or fit.theta is None:
         raise VerdictError(f"{model}/{spec.signal}: merged fit did not publish ({fit.reject_reason})")
     theta = float(fit.theta)
-    delta = fit_delta_margins(windows, theta=theta, direction=direction)
+    delta = fit_delta_margins(windows, theta=theta, direction=direction, **spec.band_kwargs())
     boot, dboot = bootstrap_theta_and_delta_crit(
-        windows, n_resamples=n_resamples, seed=seed, config=config
+        windows, n_resamples=n_resamples, seed=seed, config=config,
+        delta_kwargs=spec.band_kwargs() or None,
     )
     half = (
         (boot.theta_p97_5 - boot.theta_p2_5) / 2.0
@@ -426,6 +459,7 @@ def verdict_report(
                 "clamped": delta.crit.clamped,
                 "clamp_reason": delta.crit.clamp_reason,
                 "used_fallback": delta.crit.used_fallback,
+                **_selection_record(delta.crit),
                 "critical_windows": delta.labels.critical_positive_count,
                 "bootstrap": dboot.as_dict(),
             },
@@ -438,6 +472,7 @@ def verdict_report(
                 "clamped": delta.high.clamped,
                 "clamp_reason": delta.high.clamp_reason,
                 "used_fallback": delta.high.used_fallback,
+                **_selection_record(delta.high),
                 "surplus_windows": delta.labels.surplus_positive_count,
             },
             "waiting": _waiting_stats(fitting_csv, label),

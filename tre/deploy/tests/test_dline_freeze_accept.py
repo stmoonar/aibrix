@@ -601,3 +601,68 @@ def test_freeze_refuses_when_a_training_dataset_manifest_changed(tmp_path) -> No
     w = _world(tmp_path)
     (tmp_path / "run2" / "dataset" / "manifest.json").write_text(json.dumps({"format_revision": 3}))
     assert _freeze(w) != 0
+
+
+# ------------------------------------------------- methods record, DEV accept (2026-10-25)
+
+
+def test_freeze_records_the_queue_estimator_fit_method_and_inputs(tmp_path) -> None:
+    from tre_calibration.fit import FIT_METHOD_ARGMAX, FIT_METHOD_M2
+
+    # a default spec keeps the 2026-10-05 key set (no fit_method key in verdict_for_holdout)
+    assert "fit_method" not in dl.spec_for(10.0, 0.0, 1.0).as_dict()
+    w = _world(tmp_path / "old")
+    assert _freeze(w) == 0
+    e = dl.verify_freeze(w["freeze"])["models"][MODEL]
+    assert e["methods"]["fit_method"]["name"] == FIT_METHOD_ARGMAX
+    # a dataset manifest without the record predates it: the live-grid sum
+    assert e["methods"]["queue_estimator"] == {"name": "live_grid_sum_over_expected", "instant_grid": "live",
+                                               "divisor": "expected"}
+    # new: the datasets record raw_mean, the verdict's spec the M2 method
+    w = _world(tmp_path / "new", train_manifest={"queue_estimator": {"name": "raw_mean"}})
+    d = w["out"] / MODEL / ARM
+    ver = json.loads((d / "verdict_final.json").read_text())
+    ver["signal_spec"] = dl.spec_for(10.0, 0.0, 1.0, fit_method=FIT_METHOD_M2).as_dict()
+    _dump(d / "verdict_final.json", ver)
+    fin = json.loads((d / "final.json").read_text())
+    _dump(d / "final.json", {**fin, "fit_method": FIT_METHOD_M2})
+    assert _freeze(w) == 0
+    doc = dl.verify_freeze(w["freeze"])
+    e = doc["models"][MODEL]
+    assert e["methods"]["fit_method"]["name"] == FIT_METHOD_M2 and e["methods"]["plateau_eps"] == 0.005
+    assert e["methods"]["queue_estimator"] == {"name": "raw_mean", "instant_grid": "raw", "divisor": "present"}
+    src = e["input_datasets"]["run2"]
+    assert src["manifest_sha256"] == _sha(tmp_path / "new" / "run2" / "dataset" / "manifest.json")
+    man = doc["manifest"]
+    assert man["code"] == doc["code"]
+    assert man["models"][MODEL]["methods"] == e["methods"]
+    assert man["models"][MODEL]["outputs"]["published"] == e["published"]
+    # final and verdict disagreeing on the method is refused
+    w = _world(tmp_path / "bad")
+    d = w["out"] / MODEL / ARM
+    fin = json.loads((d / "final.json").read_text())
+    _dump(d / "final.json", {**fin, "fit_method": FIT_METHOD_M2})
+    assert _freeze(w) == dl.EXIT_REFUSED
+
+
+def test_dev_accept_evaluates_an_m_sealed_under_another_freeze_and_never_marks_acceptance(tmp_path, capsys) -> None:
+    w = _world(tmp_path)
+    assert _freeze(w) == 0
+    man = _seal(w, freeze_sha="0" * 64)          # M opened under some other freeze
+    _refused(w, man, capsys, "sealed under another freeze")
+    # an M dataset built with another queue estimator is refused, DEV or not
+    mman = w["mdir"] / "manifest.json"
+    mman.write_text(json.dumps({"format_revision": 2, "queue_estimator": {"name": "raw_mean"}}))
+    capsys.readouterr()
+    assert _accept(w, man, "--dev-opened-m", "dev check") == dl.EXIT_REFUSED
+    assert "queue estimator" in capsys.readouterr().out
+    mman.write_text(json.dumps({"format_revision": 2}))
+    assert _accept(w, man, "--dev-opened-m", "") == dl.EXIT_REFUSED      # a reason is required
+    assert _accept(w, man, "--dev-opened-m", "new freeze on the opened M2 (test)") == 0
+    dev, real = dl.freeze_paths(w["freeze"], dev=True), dl.freeze_paths(w["freeze"])
+    res = json.loads(dev["result"].read_text())
+    assert res["evaluation"]["kind"] == "DEV" and res["evaluation"]["reason"] == "new freeze on the opened M2 (test)"
+    assert res["evaluation"]["m_sealed_under_freeze"] == {MODEL: "0" * 64}
+    assert dev["marker"].exists()
+    assert not real["result"].exists() and not real["marker"].exists() and not real["work"].exists()
+    assert _accept(w, man, "--dev-opened-m", "again") == dl.EXIT_REFUSED   # once, like accept

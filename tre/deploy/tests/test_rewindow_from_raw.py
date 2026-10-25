@@ -622,3 +622,28 @@ def test_the_prompt_file_name_the_replayer_writes_is_the_one_excluded() -> None:
     from tre_replayer.engine import prompt_store
 
     assert prompt_store.PROMPT_FILE_SUFFIX in rewindow_from_raw.SIDECAR_JSONL_SUFFIXES
+
+
+def test_named_queue_estimators_raw_mean_and_the_2026_10_05_live_sum() -> None:
+    # raw_mean (the 2026-10-25 default): every sample present, their mean - a slow sampler
+    # (1.3 s spacing, fewer samples) is a smaller sample, not a scaled queue, so it is not
+    # refused. live_grid_sum_over_expected: the 10 s subsample over window / 10 s, as the
+    # 2026-10-05 freeze's windows were built.
+    registry = load_registry(str(REGISTRY_PATH))
+    spec = registry.model(MODEL)
+    cell = r3_grid.GridCell.from_scenario_id("i512_o128_c8")
+
+    def rows(estimator, samples):
+        return rewindow_from_raw.rewindow_cell(
+            _make_requests(), samples, cell, spec, window_ms=60_000, step_ms=60_000,
+            percentile_mode="bucket_upper", min_latency_samples=0, start_ms=0, end_ms=60_000,
+            **rewindow_from_raw.queue_estimator_kwargs(estimator))
+
+    slow = _hz_sidecar(n=46, spacing_ms=1_300, waiting_at_s=(5, 20))
+    assert rows("raw_mean", slow)[0]["avg_waiting"] == pytest.approx(6.0 / 46)
+    full = _hz_sidecar(waiting_at_s=(5, 20))
+    assert rows("raw_mean", full)[0]["avg_waiting"] == pytest.approx(6.0 / 60)
+    assert rows("live_grid_sum_over_expected", full)[0]["avg_waiting"] == pytest.approx(3.0 / 6)
+    gappy = [s for s in full if s["ts_ms"] != 30_000]     # one live-grid sample missing
+    assert rows("live_grid_sum_over_expected", gappy)[0]["avg_waiting"] == pytest.approx(3.0 / 6)
+    assert rows("live_grid_mean", gappy)[0]["avg_waiting"] == pytest.approx(3.0 / 5)

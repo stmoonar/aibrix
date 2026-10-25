@@ -200,6 +200,20 @@ DEFAULT_DELTA_HIGH_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in 
 CANDIDATE_GRIDS = ("quantile", "unique")
 DEFAULT_CANDIDATE_GRID = "quantile"
 
+#: How one threshold is chosen from its candidates' balanced accuracies (theta, and the
+#: tau_crit / tau_high bands). ``argmax`` (default): the best candidate under the fit's
+#: tie-breaks. ``plateau_midpoint``: the plateau is every candidate whose BA is within
+#: ``plateau_eps`` of the best (all of them, contiguous or not); the threshold is the
+#: midpoint of the plateau's smallest and largest threshold. On a flat BA curve the argmax
+#: hops between grid points with the sampling noise; the midpoint does not (2026-10-25,
+#: theta-offline-q-20261025 analysis/fitmethod).
+SELECTION_ARGMAX = "argmax"
+SELECTION_PLATEAU_MIDPOINT = "plateau_midpoint"
+SELECTIONS = (SELECTION_ARGMAX, SELECTION_PLATEAU_MIDPOINT)
+DEFAULT_SELECTION = SELECTION_ARGMAX
+#: The plateau's BA tolerance (dline_refit's PLATEAU_BA_TOLERANCE, the disclosed band).
+DEFAULT_PLATEAU_EPS = 0.005
+
 #: Accepted values of the explicit ``theta_criterion`` knob.
 THETA_CRITERIA = ("balanced_accuracy", "reliability")
 #: Criterion used by every fit that does not name one.
@@ -301,6 +315,11 @@ class BalancedAccuracyThetaFit:
     #: the *unhealthy* end of the healthy windows, so the same quantile means the same
     #: thing under either orientation.
     direction: str = DEFAULT_SIGNAL_DIRECTION
+    #: How ``theta`` was chosen (:data:`SELECTIONS`); for ``plateau_midpoint`` the
+    #: plateau's [min, max] theta (raw signal units) and its BA tolerance.
+    selection: str = DEFAULT_SELECTION
+    plateau: tuple[float, float] | None = None
+    plateau_eps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +347,11 @@ class DeltaMarginFit:
     #: How the candidates were generated (:data:`CRIT_METHODS` for the crit side;
     #: ``quantile`` for the high side).
     method: str = "quantile"
+    #: How ``tau`` was chosen from the grid (:data:`SELECTIONS`); for ``plateau_midpoint``
+    #: the plateau's [min, max] tau and its BA tolerance.
+    selection: str = DEFAULT_SELECTION
+    plateau: tuple[float, float] | None = None
+    plateau_eps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -360,8 +384,15 @@ def fit_theta_by_balanced_accuracy(
     max_single_scenario_ratio: float = 0.7,
     direction: str = DEFAULT_SIGNAL_DIRECTION,
     candidate_grid: str = DEFAULT_CANDIDATE_GRID,
+    selection: str = DEFAULT_SELECTION,
+    plateau_eps: float = DEFAULT_PLATEAU_EPS,
 ) -> BalancedAccuracyThetaFit:
     """Pick ``theta`` maximising balanced accuracy of "healthy side of theta => slo_met".
+
+    ``selection`` (:data:`SELECTIONS`): ``argmax`` returns the best candidate as below;
+    ``plateau_midpoint`` returns the midpoint of the candidates whose BA is within
+    ``plateau_eps`` of the best (among the candidates meeting ``min_healthy_recall`` when
+    any does), scored at that midpoint.
 
     Under ``higher_is_healthier`` the rule scored is ``signal >= theta ==> slo_met``;
     under ``lower_is_healthier`` it is ``signal <= theta ==> slo_met``. The two are the
@@ -387,6 +418,10 @@ def fit_theta_by_balanced_accuracy(
 
     if candidate_grid not in CANDIDATE_GRIDS:
         raise ValueError(f"candidate_grid must be one of {CANDIDATE_GRIDS}")
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}")
+    if not (math.isfinite(plateau_eps) and plateau_eps >= 0.0):
+        raise ValueError("plateau_eps must be finite and >= 0")
     if candidate_grid == "unique":
         candidates = _unique_candidates(healthy_scores, healthy_quantile_candidates, orientation)
         sorted_healthy = sorted(healthy_scores)
@@ -403,12 +438,14 @@ def fit_theta_by_balanced_accuracy(
     best: dict[str, float] | None = None
     best_quantile: float | None = None
     candidate_count = 0
+    scored: list[dict[str, float]] = []
     for quantile, theta in candidates:
         if theta is None:
             continue
         metrics = score_at(theta)
         candidate_count += 1
         candidate = {"theta": theta, **metrics}
+        scored.append(candidate)
         if best is None:
             best, best_quantile = candidate, quantile
             continue
@@ -452,6 +489,17 @@ def fit_theta_by_balanced_accuracy(
             direction=direction,
         )
 
+    plateau: tuple[float, float] | None = None
+    if selection == SELECTION_PLATEAU_MIDPOINT:
+        eligible = [c for c in scored if c["recall_good"] >= min_healthy_recall] or scored
+        top = max(c["balanced_accuracy"] for c in eligible)
+        inside = [c["theta"] for c in eligible if c["balanced_accuracy"] >= top - plateau_eps - 1e-12]
+        lo, hi = min(inside), max(inside)
+        mid = 0.5 * (lo + hi)
+        best = {"theta": mid, **score_at(mid)}
+        best_quantile = sum(1 for v in healthy_scores if v < mid) / len(healthy_scores)
+        plateau = tuple(sorted((orientation * lo, orientation * hi)))
+
     oriented_theta = float(best["theta"])
     theta = orientation * oriented_theta
     selected = [row for row in rows if orientation * row.signal >= oriented_theta]
@@ -482,6 +530,9 @@ def fit_theta_by_balanced_accuracy(
         coverage_pass=coverage_pass,
         reject_reason=reject_reason,
         direction=direction,
+        selection=selection,
+        plateau=plateau,
+        plateau_eps=plateau_eps if selection == SELECTION_PLATEAU_MIDPOINT else None,
     )
 
 
@@ -518,6 +569,8 @@ def fit_theta(
     min_scenario_families: int = DEFAULT_MIN_SCENARIO_FAMILIES,
     max_single_scenario_ratio: float = DEFAULT_MAX_SINGLE_SCENARIO_RATIO,
     candidate_grid: str = DEFAULT_CANDIDATE_GRID,
+    selection: str = DEFAULT_SELECTION,
+    plateau_eps: float = DEFAULT_PLATEAU_EPS,
 ) -> ReliabilityThetaFit | BalancedAccuracyThetaFit:
     """Fit ``theta`` under the named criterion -- the entry point every fit goes through.
 
@@ -537,7 +590,11 @@ def fit_theta(
             max_single_scenario_ratio=max_single_scenario_ratio,
             direction=direction,
             candidate_grid=candidate_grid,
+            selection=selection,
+            plateau_eps=plateau_eps,
         )
+    if selection != SELECTION_ARGMAX:
+        raise ValueError("selection applies to the balanced-accuracy criterion only")
     return fit_theta_by_reliability(
         windows,
         reliability_target=reliability_target,
@@ -577,10 +634,14 @@ class ThetaFitConfig:
     min_scenario_families: int = DEFAULT_MIN_SCENARIO_FAMILIES
     max_single_scenario_ratio: float = DEFAULT_MAX_SINGLE_SCENARIO_RATIO
     candidate_grid: str = DEFAULT_CANDIDATE_GRID
+    selection: str = DEFAULT_SELECTION
+    plateau_eps: float = DEFAULT_PLATEAU_EPS
 
     def __post_init__(self) -> None:
         if self.candidate_grid not in CANDIDATE_GRIDS:
             raise ValueError(f"candidate_grid must be one of {CANDIDATE_GRIDS}")
+        if self.selection not in SELECTIONS:
+            raise ValueError(f"selection must be one of {SELECTIONS}")
         if self.criterion not in THETA_CRITERIA:
             raise ValueError(f"criterion must be one of {THETA_CRITERIA}")
         if self.direction not in SIGNAL_DIRECTIONS:
@@ -605,6 +666,8 @@ class ThetaFitConfig:
             min_scenario_families=self.min_scenario_families,
             max_single_scenario_ratio=self.max_single_scenario_ratio,
             candidate_grid=self.candidate_grid,
+            selection=self.selection,
+            plateau_eps=self.plateau_eps,
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -617,6 +680,8 @@ class ThetaFitConfig:
             if self.candidate_grid != DEFAULT_CANDIDATE_GRID
             else {}
         )
+        if self.selection != DEFAULT_SELECTION:
+            extra.update({"selection": self.selection, "plateau_eps": self.plateau_eps})
         return {
             **extra,
             "direction": self.direction,
@@ -652,6 +717,8 @@ def fit_delta_margins(
     direction: str = DEFAULT_SIGNAL_DIRECTION,
     high_method: str = DEFAULT_HIGH_METHOD,
     delta_high_grid: Sequence[float] = DEFAULT_DELTA_HIGH_GRID,
+    selection: str = DEFAULT_SELECTION,
+    plateau_eps: float = DEFAULT_PLATEAU_EPS,
 ) -> DeltaMarginsFit:
     """Fit the per-model control margins ``tau_crit = tau_low - delta_crit`` and
     ``tau_high = tau_low + delta_high`` on ``z = signal / theta``.
@@ -674,7 +741,16 @@ def fit_delta_margins(
     ``direction`` is the signal's orientation; ``z`` is computed by :func:`signal_z`, i.e.
     the way the controller normalises that signal, so the same function fits the bands of
     TSS and of every alternative signal (plan §6.9 items 3/5).
+
+    ``selection`` (:data:`SELECTIONS`) picks each side's tau from its grid: ``argmax``
+    (default, the tie-breaks of :func:`_fit_delta_grid`) or ``plateau_midpoint`` (the
+    midpoint of the grid taus within ``plateau_eps`` of the side's best BA). The
+    plateau needs the ``ba_grid`` methods.
     """
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}, got {selection!r}")
+    if selection != SELECTION_ARGMAX and (crit_method != CRIT_METHOD_BA_GRID or high_method != CRIT_METHOD_BA_GRID):
+        raise ValueError("plateau_midpoint selection needs crit_method and high_method ba_grid")
     if high_method not in HIGH_METHODS:
         raise ValueError(f"high_method must be one of {HIGH_METHODS}, got {high_method!r}")
     if not math.isfinite(theta) or theta <= 0.0:
@@ -744,6 +820,8 @@ def fit_delta_margins(
             target_floor=min_critical_recall,
             floor_mode=floor_mode,
             fallback_delta=fallback_delta_crit,
+            selection=selection,
+            plateau_eps=plateau_eps,
         )
     else:
         crit = _fit_one_delta_margin(
@@ -766,6 +844,8 @@ def fit_delta_margins(
             target_floor=min_surplus_precision,
             floor_mode=floor_mode,
             fallback_delta=fallback_delta_high,
+            selection=selection,
+            plateau_eps=plateau_eps,
         )
     else:
         high = _fit_one_delta_margin(
@@ -920,12 +1000,15 @@ def _fit_delta_crit_grid(
     target_floor: float,
     floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
     fallback_delta: float,
+    selection: str = DEFAULT_SELECTION,
+    plateau_eps: float = DEFAULT_PLATEAU_EPS,
 ) -> DeltaMarginFit:
     """delta_crit by balanced accuracy over an explicit grid (plan §6.3 B6); see
     :func:`_fit_delta_grid` with ``side="low"``."""
     return _fit_delta_grid(
         scores, labels, side="low", tau_low=tau_low, delta_grid=delta_grid,
         target_floor=target_floor, floor_mode=floor_mode, fallback_delta=fallback_delta,
+        selection=selection, plateau_eps=plateau_eps,
     )
 
 
@@ -939,8 +1022,13 @@ def _fit_delta_grid(
     target_floor: float,
     floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
     fallback_delta: float,
+    selection: str = DEFAULT_SELECTION,
+    plateau_eps: float = DEFAULT_PLATEAU_EPS,
 ) -> DeltaMarginFit:
     """One band margin by balanced accuracy over an explicit grid.
+
+    ``selection="plateau_midpoint"``: tau is the midpoint (rounded to 1e-6) of the grid
+    taus whose BA is within ``plateau_eps`` of the best, scored at that tau.
 
     ``side="low"`` (delta_crit): ``tau = tau_low - delta``, positive prediction ``z < tau``
     - strictly, exactly as ``classify_model`` decides CRITICAL. Ties break on the
@@ -982,15 +1070,15 @@ def _fit_delta_grid(
     for _s, label in ordered:
         cum_pos.append(cum_pos[-1] + label)
 
-    best: dict[str, float] | None = None
-    for delta in grid:
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}, got {selection!r}")
+
+    def score(delta: float, tau: float) -> dict[str, float]:
         if side == "low":
-            tau = tau_low - delta
             k = bisect.bisect_left(zs, tau)  # count of z < tau
             tp = cum_pos[k]
             predicted = k
         else:
-            tau = tau_low + delta
             k = bisect.bisect_right(zs, tau)  # z <= tau are predicted negative
             tp = cum_pos[-1] - cum_pos[k]
             predicted = len(zs) - k
@@ -999,7 +1087,7 @@ def _fit_delta_grid(
         specificity = (n_neg - fp) / n_neg
         precision = tp / predicted if predicted else 0.0
         meets = recall >= target_floor if side == "low" else precision >= target_floor
-        candidate = {
+        return {
             "delta": delta,
             "tau": tau,
             "balanced_accuracy": 0.5 * (recall + specificity),
@@ -1009,6 +1097,12 @@ def _fit_delta_grid(
             "support_pos": float(n_pos),
             "meets": 1.0 if meets else 0.0,
         }
+
+    best: dict[str, float] | None = None
+    scored: list[dict[str, float]] = []
+    for delta in grid:
+        candidate = score(delta, tau_low - delta if side == "low" else tau_low + delta)
+        scored.append(candidate)
         if best is None:
             best = candidate
             continue
@@ -1026,6 +1120,14 @@ def _fit_delta_grid(
             best = candidate
 
     assert best is not None
+    plateau: tuple[float, float] | None = None
+    if selection == SELECTION_PLATEAU_MIDPOINT:
+        top = max(c["balanced_accuracy"] for c in scored)
+        inside = [c["tau"] for c in scored if c["balanced_accuracy"] >= top - plateau_eps - 1e-12]
+        plateau = (min(inside), max(inside))
+        tau_mid = round(0.5 * (plateau[0] + plateau[1]), 6)
+        delta_mid = round(tau_low - tau_mid if side == "low" else tau_mid - tau_low, 10)
+        best = score(delta_mid, tau_mid)
     delta = float(best["delta"])
     clamped = delta <= grid[0] + 1e-12 or delta >= grid[-1] - 1e-12
     clamp_reason = None
@@ -1048,6 +1150,9 @@ def _fit_delta_grid(
         clamped=clamped,
         clamp_reason=clamp_reason,
         method=CRIT_METHOD_BA_GRID,
+        selection=selection,
+        plateau=plateau,
+        plateau_eps=plateau_eps if selection == SELECTION_PLATEAU_MIDPOINT else None,
     )
 
 
@@ -1234,3 +1339,63 @@ def _quantile(values: Sequence[float], q: float) -> float | None:
         return finite[lo]
     frac = pos - lo
     return finite[lo] * (1.0 - frac) + finite[hi] * frac
+
+
+# ---------------------------------------------------------------------------
+# Named fit methods: one name for how theta and the tau_crit / tau_high bands are chosen,
+# recorded in every artifact that publishes them (verdict fit_config, final.json, freeze).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FitMethod:
+    """How the published theta and bands are chosen from the training windows."""
+
+    name: str
+    candidate_grid: str
+    theta_selection: str
+    band_selection: str
+    plateau_eps: float | None
+    summary: str
+
+    def theta_config(self, direction: str = DEFAULT_SIGNAL_DIRECTION) -> "ThetaFitConfig":
+        return ThetaFitConfig(direction=direction, candidate_grid=self.candidate_grid,
+                              selection=self.theta_selection,
+                              plateau_eps=DEFAULT_PLATEAU_EPS if self.plateau_eps is None else self.plateau_eps)
+
+    def band_kwargs(self) -> dict[str, object]:
+        """``fit_delta_margins`` keyword arguments of the bands' selection."""
+        if self.band_selection == SELECTION_ARGMAX:
+            return {}
+        return {"selection": self.band_selection, "plateau_eps": self.plateau_eps}
+
+    def as_dict(self) -> dict[str, object]:
+        return {"name": self.name, "candidate_grid": self.candidate_grid,
+                "theta_selection": self.theta_selection, "band_selection": self.band_selection,
+                "plateau_eps": self.plateau_eps, "summary": self.summary}
+
+
+#: The 2026-10-05 freeze's method: theta = BA argmax over the healthy-quantile grid,
+#: bands = BA argmax over the delta grids.
+FIT_METHOD_ARGMAX = "ba_argmax_quantile_grid"
+#: M2 (user 2026-10-25): theta = midpoint of the BA plateau (eps .005) over the unique
+#: grid; tau_crit / tau_high = midpoints of their BA plateaus (eps .005) on the delta grids.
+FIT_METHOD_M2 = "m2_unique_grid_plateau_midpoint"
+FIT_METHODS: dict[str, FitMethod] = {
+    FIT_METHOD_ARGMAX: FitMethod(
+        name=FIT_METHOD_ARGMAX, candidate_grid="quantile", theta_selection=SELECTION_ARGMAX,
+        band_selection=SELECTION_ARGMAX, plateau_eps=None,
+        summary="theta: BA argmax over the healthy-quantile grid; bands: BA argmax over the delta grids"),
+    FIT_METHOD_M2: FitMethod(
+        name=FIT_METHOD_M2, candidate_grid="unique", theta_selection=SELECTION_PLATEAU_MIDPOINT,
+        band_selection=SELECTION_PLATEAU_MIDPOINT, plateau_eps=DEFAULT_PLATEAU_EPS,
+        summary=("theta: midpoint of the BA plateau (eps .005) over every distinct healthy value "
+                 "(unique grid); tau_crit / tau_high: midpoints of their BA plateaus (eps .005)")),
+}
+DEFAULT_FIT_METHOD = FIT_METHOD_ARGMAX
+
+
+def fit_method(name: str) -> FitMethod:
+    if name not in FIT_METHODS:
+        raise ValueError(f"unknown fit method {name!r}; expected one of {sorted(FIT_METHODS)}")
+    return FIT_METHODS[name]

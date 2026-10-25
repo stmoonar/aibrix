@@ -117,6 +117,55 @@ SPACING_TOLERANCE = 0.25
 #: The sidecar key the observability gap is measured on unless told otherwise.
 DEFAULT_GAP_KEY = "waiting"
 
+#: What a window's queue average (``avg_running`` / ``avg_waiting`` / ``avg_swapping``) is
+#: divided by: ``present`` = the number of instant samples in the window (their mean, as
+#: MetricsStore._instant_avg; the default since 2026-10-25), ``expected`` = window_ms /
+#: instant_sample_interval_ms whatever arrived (the earlier rule; a missing sample reads
+#: the queue low).
+QUEUE_DIVISOR_PRESENT = "present"
+QUEUE_DIVISOR_EXPECTED = "expected"
+QUEUE_DIVISORS = (QUEUE_DIVISOR_PRESENT, QUEUE_DIVISOR_EXPECTED)
+
+#: Named queue estimators of the theta-fit windows: which sidecar samples feed the queue
+#: average (``instant_grid``) and what divides it. A dataset manifest records the name
+#: (``scripts.calibration_dataset --queue-estimator``), a training set and a freeze carry
+#: it, and ``dline_refit accept`` refuses an M dataset built with another one.
+#:
+#: ``live_grid_sum_over_expected``  the live-grid (10 s) subsample, sum / (window / 10 s):
+#:                                  the windows of the 2026-10-05 freeze (kept so that
+#:                                  freeze still reproduces)
+#: ``live_grid_mean``               the live-grid subsample, mean of the samples present
+#: ``raw_mean``                     every sidecar sample (1 Hz in the campaign), mean of
+#:                                  the samples present - the queue the controller averages
+#:                                  since 2026-10-25 (docs/design/20261025-instant-sampling.md)
+QUEUE_ESTIMATOR_LIVE_SUM = "live_grid_sum_over_expected"
+QUEUE_ESTIMATOR_LIVE_MEAN = "live_grid_mean"
+QUEUE_ESTIMATOR_RAW_MEAN = "raw_mean"
+QUEUE_ESTIMATORS: dict[str, tuple[str, str]] = {
+    QUEUE_ESTIMATOR_LIVE_SUM: ("live", QUEUE_DIVISOR_EXPECTED),
+    QUEUE_ESTIMATOR_LIVE_MEAN: ("live", QUEUE_DIVISOR_PRESENT),
+    QUEUE_ESTIMATOR_RAW_MEAN: ("raw", QUEUE_DIVISOR_PRESENT),
+}
+DEFAULT_QUEUE_ESTIMATOR = QUEUE_ESTIMATOR_RAW_MEAN
+#: The estimator of a dataset whose manifest has no ``queue_estimator`` record: every
+#: standard dataset built before the record existed (2026-10-25) used the live-grid sum.
+QUEUE_ESTIMATOR_UNRECORDED = QUEUE_ESTIMATOR_LIVE_SUM
+
+
+def queue_estimator_kwargs(name: str) -> dict:
+    """``label_cell`` / ``rewindow_cell`` keyword arguments of one named estimator:
+    ``instant_grid``, ``instant_sample_interval_ms`` (the live grid, or the campaign's
+    sidecar cadence) and ``queue_divisor``. In raw mode with the ``present`` divisor the
+    declared cadence divides nothing, so the sidecar's spacing is not checked against it
+    (``check_raw_spacing`` False): a slow sampler (fewer samples) is a smaller sample, not
+    a scaled queue."""
+    if name not in QUEUE_ESTIMATORS:
+        raise ValueError(f"unknown queue estimator {name!r}; expected one of {sorted(QUEUE_ESTIMATORS)}")
+    grid, divisor = QUEUE_ESTIMATORS[name]
+    interval = LIVE_GRID_MS if grid == INSTANT_GRID_LIVE else int(round(openloop.DEFAULT_SIDECAR_INTERVAL_S * 1000))
+    return {"instant_grid": grid, "instant_sample_interval_ms": interval, "queue_divisor": divisor,
+            "check_raw_spacing": not (grid == INSTANT_GRID_RAW and divisor == QUEUE_DIVISOR_PRESENT)}
+
 
 class CadenceMismatchError(ValueError):
     """``--instant-sample-ms`` disagrees with the cadence the sidecar was captured at.
@@ -187,8 +236,12 @@ def resolve_instant_cadence(
     instant_grid: str,
     instant_sample_ms: int,
     source: Optional[str] = None,
+    check_raw_spacing: bool = True,
 ) -> int:
     """Validate the declared cadence against the mode and the sidecar, return it.
+
+    ``check_raw_spacing`` False skips the raw-mode spacing check - only right when the
+    queue average is the mean of the samples present (:func:`queue_estimator_kwargs`).
 
     Fails loudly instead of rescaling: the returned value is the divisor
     ``aggregate_window`` uses for the queue average, so a wrong one is a silent nx error
@@ -214,7 +267,7 @@ def resolve_instant_cadence(
         return LIVE_GRID_MS
 
     # raw mode: only a tagged sidecar tells us what cadence it was captured at.
-    if sidecar_has_live_grid_tags(instant_samples):
+    if check_raw_spacing and sidecar_has_live_grid_tags(instant_samples):
         observed = observed_sample_spacing_ms(instant_samples)
         if observed is not None and abs(observed - instant_sample_ms) > SPACING_TOLERANCE * instant_sample_ms:
             raise CadenceMismatchError(
@@ -530,6 +583,7 @@ def aggregate_window(
     half_open_start: bool = False,
     instant_tick_ms: Optional[int] = None,
     attribution: str = slo_labels.ATTRIBUTION_COMPLETION,
+    queue_divisor: str = QUEUE_DIVISOR_PRESENT,
 ) -> ModelWindowMetrics:
     """Aggregate raw per-request + instant records into one ModelWindowMetrics, using the
     same 口径 as MetricsStore._aggregate_model (see module docstring).
@@ -545,6 +599,8 @@ def aggregate_window(
     """
     if attribution not in slo_labels.ATTRIBUTIONS:
         raise ValueError(f"unknown attribution {attribution!r}; expected one of {slo_labels.ATTRIBUTIONS}")
+    if queue_divisor not in QUEUE_DIVISORS:
+        raise ValueError(f"unknown queue_divisor {queue_divisor!r}; expected one of {QUEUE_DIVISORS}")
     if half_open_start:
         in_window = [
             r for r in records
@@ -585,7 +641,10 @@ def aggregate_window(
             s for s in instant_samples
             if s.get("ts_ms") is not None and window_start_ms <= _stamp(s) <= window_end_ms
         ]
-    samples = max(1, len(inst))
+    if queue_divisor == QUEUE_DIVISOR_EXPECTED:
+        samples = max(1, int((window_end_ms - window_start_ms) / instant_sample_interval_ms))
+    else:
+        samples = max(1, len(inst))
     avg_waiting = sum(float(s.get("waiting", 0.0)) for s in inst) / samples
     avg_running = sum(float(s.get("running", 0.0)) for s in inst) / samples
     avg_swapping = sum(float(s.get("swapping", 0.0)) for s in inst) / samples
@@ -696,6 +755,8 @@ def rewindow_cell(
     window_align: str = WINDOW_ALIGN_NONE,
     token_source: Optional[Callable[[int, int], Optional[tuple[float, float]]]] = None,
     attribution: str = slo_labels.ATTRIBUTION_COMPLETION,
+    queue_divisor: str = QUEUE_DIVISOR_PRESENT,
+    check_raw_spacing: bool = True,
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
     compute_window_results for the trs column). Latency columns are client-side; the
@@ -719,6 +780,7 @@ def rewindow_cell(
         instant_grid=instant_grid,
         instant_sample_ms=instant_sample_interval_ms,
         source=cell.scenario_id,
+        check_raw_spacing=check_raw_spacing,
     )
     instant_samples = select_instant_samples(instant_samples, instant_grid)
     if window_align not in WINDOW_ALIGN_CHOICES:
@@ -743,6 +805,7 @@ def rewindow_cell(
             half_open_start=aligned,
             instant_tick_ms=LIVE_GRID_MS if aligned and instant_grid == INSTANT_GRID_LIVE else None,
             attribution=attribution,
+            queue_divisor=queue_divisor,
         )
         for ws, we in windows_ms
     ]
@@ -793,6 +856,8 @@ def label_cell(
     assigned_replicas: int = 1,
     window_align: str = WINDOW_ALIGN_NONE,
     token_source: Optional[Callable[[int, int], Optional[tuple[float, float]]]] = None,
+    queue_divisor: str = QUEUE_DIVISOR_PRESENT,
+    check_raw_spacing: bool = True,
 ) -> list[dict]:
     """One cell's window rows, each with its SLO labels. THE labelling path.
 
@@ -833,6 +898,7 @@ def label_cell(
         routable_pods=routable_pods, assigned_replicas=assigned_replicas,
         window_align=window_align, token_source=token_source,
         attribution=attribution,
+        queue_divisor=queue_divisor, check_raw_spacing=check_raw_spacing,
     )
     rows = openloop.mark_unserved_request_windows(
         rows, records, closed_right=window_align == WINDOW_ALIGN_GRID
