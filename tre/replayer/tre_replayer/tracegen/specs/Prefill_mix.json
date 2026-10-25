@@ -1,7 +1,7 @@
 {
  "trace": "Prefill_mix",
- "duration_s": 1080,
- "isolates": "A5: several models stage-skewed at once; each 180 s every model takes one of prefill-heavy / decode-heavy / balanced, rotating",
+ "duration_s": 720,
+ "isolates": "A5: several models stage-skewed at once; 60 s balanced lead-in, one rotation of three 180 s windows (each model once prefill-heavy 2000/150, decode-heavy 300/1300 (7b 300/1340, 14b 300/900) and balanced 492/400), 120 s balanced tail; req/s constant (rho_ref 0.8); inputs truncated at 8192 tokens with the lognormal location re-solved so the mean stays 2000",
  "defaults": {
   "lengths": {
    "in": {
@@ -9,7 +9,8 @@
     "sigma_from": "conv2023:in",
     "mean": 492,
     "min": 32,
-    "trunc_q": 0.995
+    "trunc_q": 0.995,
+    "max": 8192
    },
    "out": {
     "dist": "lognormal",
@@ -33,26 +34,18 @@
       "points": [
        [
         0,
-        2000
-       ],
-       [
-        180,
-        300
-       ],
-       [
-        360,
         492
        ],
        [
-        540,
+        60,
         2000
        ],
        [
-        720,
+        240,
         300
        ],
        [
-        900,
+        420,
         492
        ]
       ]
@@ -64,26 +57,18 @@
       "points": [
        [
         0,
-        150
-       ],
-       [
-        180,
-        1300
-       ],
-       [
-        360,
         400
        ],
        [
-        540,
+        60,
         150
        ],
        [
-        720,
+        240,
         1300
        ],
        [
-        900,
+        420,
         400
        ]
       ]
@@ -103,27 +88,19 @@
       "points": [
        [
         0,
-        300
-       ],
-       [
-        180,
         492
        ],
        [
-        360,
+        240,
         2000
        ],
        [
-        540,
+        420,
         300
        ],
        [
-        720,
+        600,
         492
-       ],
-       [
-        900,
-        2000
        ]
       ]
      }
@@ -134,27 +111,19 @@
       "points": [
        [
         0,
-        1340
-       ],
-       [
-        180,
         400
        ],
        [
-        360,
+        240,
         150
        ],
        [
-        540,
+        420,
         1340
        ],
        [
-        720,
+        600,
         400
-       ],
-       [
-        900,
-        150
        ]
       ]
      }
@@ -176,24 +145,20 @@
         492
        ],
        [
-        180,
-        2000
-       ],
-       [
-        360,
+        60,
         300
        ],
        [
-        540,
+        240,
         492
        ],
        [
-        720,
+        420,
         2000
        ],
        [
-        900,
-        300
+        600,
+        492
        ]
       ]
      }
@@ -207,24 +172,20 @@
         400
        ],
        [
-        180,
-        150
-       ],
-       [
-        360,
+        60,
         900
        ],
        [
-        540,
+        240,
         400
        ],
        [
-        720,
+        420,
         150
        ],
        [
-        900,
-        900
+        600,
+        400
        ]
       ]
      }
@@ -232,11 +193,21 @@
    }
   }
  },
+ "pre_t0": {
+  "rule": "baseline",
+  "duration_s": 750,
+  "window_s": 30,
+  "at_s": 0
+ },
  "audit": {
   "hot_rho": {
    "dsllama-8b": 1.5,
    "dsqwen-7b": 1.5,
    "dsqwen-14b": 1.3
+  },
+  "r7": {
+   "contention": false,
+   "blind_band_free": false
   },
   "exempt": {
    "R5": {
@@ -245,11 +216,12 @@
   }
  },
  "adjustments": [
-  "R5: 7b decode-heavy out mean 1300 -> 1340 (design rho at 300/1300 was 1.95 < 2.0; minimal out for 2.0 is 1333)"
+  "R5: 7b decode-heavy out mean 1340 (design rho at 300/1300 was 1.95 < 2.0; minimal out for 2.0 is 1333)",
+  "input cap: lognormal truncated at 8192 tokens (prompt_length = chat-templated count), mu re-solved so the window mean stays 2000; mean-300/492 windows unchanged (their p99.5 cut is below 8192)",
+  "R7 (shape-aware capacity, 10-26 review): window order (8b, 7b, 14b) = (P, B, D), (D, P, B), (B, D, P); the first order tried, (P, D, B), (D, B, P), (B, P, D), put the KV-bound 8b decode-heavy phase (rho_shape 3.08 = 4 replicas) next to the 14b prefill-heavy phase (4 GPUs): 4 + 1 + 4 = 9 > 8. Shapes and rates unchanged"
  ],
  "seeds": [
-  1,
-  2,
-  3
- ]
+  1
+ ],
+ "seeds_note": "campaign seed 1 (10-26); append seeds to generate more"
 }

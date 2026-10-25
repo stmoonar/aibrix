@@ -1,7 +1,7 @@
 {
  "trace": "Simul_spike",
- "duration_s": 1200,
- "isolates": "A2=3 + rescue: three models hot at once; 3 spikes need exactly 8 GPUs, the last one is a marked overload",
+ "duration_s": 720,
+ "isolates": "A2=3, boundary row (pair of Tight_pool: overload without a cheap donor): base 0.5/0.5/0.5; P1 (90-240 s) 1.7/1.7/1.4 needs exactly 8 GPUs (2+2+4: free GPUs only, the 14b needs an aligned pair = a race); P4 (420-570 s) 2.2/2.2/1.6 is a marked overload (need 10 > 8, G 7.6)",
  "defaults": {
   "lengths": {
    "in": {
@@ -28,15 +28,11 @@
      "kind": "pulses",
      "base": 0.5,
      "starts_s": [
-      75,
-      375,
-      675,
-      975
+      90,
+      420
      ],
      "width_s": 150,
      "peaks": [
-      1.7,
-      1.7,
       1.7,
       2.2
      ]
@@ -50,15 +46,11 @@
      "kind": "pulses",
      "base": 0.5,
      "starts_s": [
-      75,
-      375,
-      675,
-      975
+      90,
+      420
      ],
      "width_s": 150,
      "peaks": [
-      1.7,
-      1.7,
       1.7,
       2.2
      ]
@@ -72,15 +64,11 @@
      "kind": "pulses",
      "base": 0.5,
      "starts_s": [
-      75,
-      375,
-      675,
-      975
+      90,
+      420
      ],
      "width_s": 150,
      "peaks": [
-      1.4,
-      1.4,
       1.4,
       1.6
      ]
@@ -88,21 +76,30 @@
    }
   }
  },
+ "pre_t0": {
+  "rule": "baseline",
+  "duration_s": 750,
+  "window_s": 30,
+  "at_s": 0
+ },
  "audit": {
   "overload_windows_s": [
    [
-    975,
-    1128
+    420,
+    573
    ]
   ],
+  "r7": {
+   "contention": false,
+   "blind_band_free": false
+  },
   "exempt": {
-   "R5": "design: three models at >= 2.0 at once need 3+3+6 = 12 GPUs > 8; normal spikes 1.7/1.7/1.4"
+   "R5": "design: three models at >= 2.0 at once need 3+3+6 = 12 GPUs > 8; normal spike 1.7/1.7/1.4"
   }
  },
- "layout_note": "spikes at 75-225, 375-525, 675-825, 975-1125 s (150 s wide, 150 s apart, 75 s of base at each end); the overload spike is the last one, so the three normal spikes are not preceded by its backlog",
+ "layout_note": "spikes at 90-240 (normal, 'P1') and 420-570 s (overload, 'P4'; the name keeps the 1200 s trace's peak numbering), 180 s of base between them and 150 s after the overload to drain; the overload is last so the normal spike is not preceded by its backlog",
  "seeds": [
-  1,
-  2,
-  3
- ]
+  1
+ ],
+ "seeds_note": "campaign seed 1 (10-26); append seeds to generate more"
 }
