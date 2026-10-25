@@ -483,6 +483,17 @@ class Settings:
     #: ``completion`` (default, label v1) or ``hybrid`` (label v2). Signal columns do not
     #: depend on it.
     attribution: str = slo_labels.ATTRIBUTION_COMPLETION
+    #: The queue estimator of the windows' ``avg_running`` / ``avg_waiting``
+    #: (:data:`scripts.rewindow_from_raw.QUEUE_ESTIMATORS`): ``raw_mean`` (default since
+    #: 2026-10-25, the mean of every sidecar sample in the window) or one of the live-grid
+    #: rules (``live_grid_sum_over_expected`` rebuilds the 2026-10-05 freeze's windows).
+    #: Recorded in the manifest; dline_refit trainset / freeze / accept carry and check it.
+    queue_estimator: str = rewindow_from_raw.DEFAULT_QUEUE_ESTIMATOR
+
+    def queue_estimator_record(self) -> dict:
+        grid, divisor = rewindow_from_raw.QUEUE_ESTIMATORS[self.queue_estimator]
+        return {"name": self.queue_estimator, "instant_grid": grid, "divisor": divisor,
+                **({"live_grid_ms": LIVE_GRID_MS} if grid == rewindow_from_raw.INSTANT_GRID_LIVE else {})}
 
     @property
     def window_columns(self) -> list[str]:
@@ -609,8 +620,13 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
     attribution = str(overrides.get("attribution") or slo_labels.ATTRIBUTION_COMPLETION)
     if attribution not in slo_labels.ATTRIBUTIONS:
         raise SystemExit(f"unknown attribution {attribution!r}; expected one of {slo_labels.ATTRIBUTIONS}")
+    queue_estimator = str(overrides.get("queue_estimator") or rewindow_from_raw.DEFAULT_QUEUE_ESTIMATOR)
+    if queue_estimator not in rewindow_from_raw.QUEUE_ESTIMATORS:
+        raise SystemExit(f"unknown queue estimator {queue_estimator!r}; expected one of "
+                         f"{sorted(rewindow_from_raw.QUEUE_ESTIMATORS)}")
     settings = Settings(
         attribution=attribution,
+        queue_estimator=queue_estimator,
         numerator=numerator,
         l3_max_gap_ms=int(overrides.get("l3_max_gap_ms") or l3.DEFAULT_MAX_GAP_MS),
         window_ms=int(overrides.get("window_ms") or DEFAULT_WINDOW_MS),
@@ -885,6 +901,9 @@ def build_dataset(
         # The TSS numerator of the signal columns (scripts.l3_numerator); dline_refit
         # trainset / freeze / accept refuse to mix two.
         "numerator": numerator_doc,
+        # The queue estimator of avg_running / avg_waiting (absent = before 2026-10-25:
+        # live_grid_sum_over_expected); dline_refit trainset / freeze / accept carry it.
+        "queue_estimator": settings.queue_estimator_record(),
         # The label's request-to-window attribution (label v1 = completion, v2 = hybrid);
         # dline_refit trainset / accept and the T14 scorer refuse to mix two.
         "attribution": {"value": settings.attribution,
@@ -898,7 +917,9 @@ def build_dataset(
             "membership": settings.membership(),
             "kind": "sliding" if settings.step_ms < settings.window_ms else "tumbling",
             "bounds": "each attempt's own [start_ms, end_ms] from its guard artifact",
-            "queue_source": f"sidecar samples on the live grid ({LIVE_GRID_MS} ms)",
+            "queue_source": (f"sidecar samples on the live grid ({LIVE_GRID_MS} ms)"
+                             if settings.queue_estimator_record()["instant_grid"] == rewindow_from_raw.INSTANT_GRID_LIVE
+                             else "every sidecar sample (the campaign's 1 Hz)"),
             "percentile_mode": settings.percentile_mode,
             "implementation": "scripts.rewindow_from_raw.label_cell",
         },
@@ -1051,8 +1072,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
                     window_align=settings.window_align,
                     percentile_mode=settings.percentile_mode,
                     min_latency_samples=settings.min_latency_samples,
-                    instant_sample_interval_ms=LIVE_GRID_MS,
-                    instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
+                    **rewindow_from_raw.queue_estimator_kwargs(settings.queue_estimator),
                     start_ms=rewindow_from_raw._as_int(guard.get("start_ms")),
                     end_ms=rewindow_from_raw._as_int(guard.get("end_ms")),
                     truncated_at_ts_ms=rewindow_from_raw._as_int(guard.get("truncated_at_ts_ms")),
@@ -1401,6 +1421,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="request-to-window attribution of the label: completion (default, label v1: "
                          "TTFT / TPOT / min-n by completion) or hybrid (label v2: TTFT and min-n by first "
                          f"token, TPOT by completion; default out dir <run_dir>/{DATASET_DIR_HYBRID})")
+    ap.add_argument("--queue-estimator", choices=sorted(rewindow_from_raw.QUEUE_ESTIMATORS),
+                    default=rewindow_from_raw.DEFAULT_QUEUE_ESTIMATOR,
+                    help="queue average of the windows: raw_mean (default; the mean of every sidecar "
+                         "sample in the window), live_grid_mean, or live_grid_sum_over_expected (the "
+                         "2026-10-05 freeze's windows)")
     ap.add_argument("--allow-prompt-token-mismatch", action="store_true",
                     help="build even when a cell's served requests were off their prompt length "
                          "(recorded; dline_refit trainset still refuses those cells)")
@@ -1413,7 +1438,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "min_latency_samples": args.min_latency_samples,
         "window_align": args.window_align, "min_completed_requests": args.min_completed_requests,
         "numerator": args.numerator, "l3_max_gap_ms": args.l3_max_gap_ms,
-        "attribution": args.attribution,
+        "attribution": args.attribution, "queue_estimator": args.queue_estimator,
     })
     manifest = json.loads((out / MANIFEST).read_text(encoding="utf-8"))
     for name, table in manifest["tables"].items():
