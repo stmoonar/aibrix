@@ -138,6 +138,16 @@ def test_pending_blocks_are_what_the_freeze_tool_renders() -> None:
         assert text == want, policy
 
 
+def test_freeze_notes_are_comments_under_the_header() -> None:
+    """A freeze disclosure (--note) is a comment: the parameters do not change."""
+    from tre_baselines.tools import freeze_params as fp
+
+    block = fp.render_tokenscale(None, None, {})
+    noted = fp.with_notes(block, ["cell b22 measured\n  for 90 s"])
+    assert noted.split("\n")[1] == "# NOTE: cell b22 measured for 90 s"
+    assert yaml.safe_load(noted) == yaml.safe_load(block)
+
+
 def test_cluster_overlay_mounts_traces_read_only_and_stays_off() -> None:
     """The 75/76 overlay only swaps the trace volume to a host directory; the mount stays
     read-only (base) and the deployment ships at 0 replicas."""

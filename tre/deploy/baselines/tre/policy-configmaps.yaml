@@ -7,8 +7,9 @@
 # static, static_b 256 = engine max_num_seqs. Its theta / band were fitted on the old 492 / 400 shape.
 #
 # TokenScale-colocated and PreServe (v1 port, docs/campaign-v2-20261026-plan.md of the local workspace):
-# `calibration: pending` until the GPU calibration (tools/velocity_ladder on the campaign's cells) is done;
-# the policies refuse to start on a pending block. The blocks are written by
+# FROZEN 2026-10-26 from the GPU calibration of that day (tools/velocity_ladder on the campaign's cells,
+# 720 s trace set; disclosures in each block's NOTE lines). A block marked `calibration: pending`
+# (freeze_params --pending) is refused by the policies. The blocks are written by
 #   python3 -m tre_baselines.tools.freeze_params {tokenscale|preserve} ... --write
 # (never edit them by hand); each block's first line names its sources' sha256.
 # Do not change any value after a comparison has been seen.
@@ -44,19 +45,24 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   tokenscale.yaml: |
-    # PENDING (tools/freeze_params tokenscale). Sources: none
-    calibration: pending
+    # FROZEN (tools/freeze_params tokenscale). Sources: report sha256 c29e33ef9b79e9e600ebdcd863c2597eb3190e306e5cfdabd90d60acbc1b1c6b, profile sha256 89c102bd50c445f00357e5074451a958491c845d3cda889dea0ba4df686f36d8
+    # NOTE: dsqwen-14b b22 (in 1738 / out 771) re-measured with velocity_ladder --measure-s 90 (ladder-14b-b22, log sha256 e54b856c5cd8bd2e6f93082d02ef9aee27481553bb26164b1c96080476196e5b): min_completed 150 was unreachable in 60 s at ~2.5 rps; the profile takes that cell (V 5054.9, saturated); every other cell 60 s
+    # NOTE: calibration 2026-10-26 02:51-05:50 +08:00, vLLM 0.30 direct-pod, tools aibrix 5b14b41d, traces traces-v2-720-20261026 seed1; provenance <data root>/bl-calib-20261026/SOURCES.md
+    calibration: frozen
     bucket_edges:            # paper (TokenScale Table II / DynamoLLM Table IV): in < 256 / < 1024 / else
       "*": {in: [255, 1023], out: [99, 349]}   # (> 8192 is long too), out < 100 / < 350 / >= 350
     bucket_centers:          # [in, out] per cell = mean of the campaign's requests in it (v1 D49), tools/tokenscale_buckets
-      dsqwen-7b: null
-      dsllama-8b: null
-      dsqwen-14b: null
+      dsqwen-7b: [[[197, 71], [149, 211], [143, 816]], [[403, 80], [459, 189], [510, 786]], [[2308, 63], [1839, 209], [1664, 762]]]
+      dsllama-8b: [[[214, 75], [152, 210], [144, 819]], [[395, 83], [438, 182], [510, 797]], [[2170, 65], [1832, 207], [1705, 754]]]
+      dsqwen-14b: [[[207, 79], [155, 207], [144, 769]], [[393, 86], [439, 180], [507, 761]], [[2327, 63], [1867, 209], [1738, 771]]]
     velocity:                # (in+out) tok/s per replica at each centre: the PEAK of effective full steps
                              # (waiting slope > 2 % x offered rps, v1 D53; tools/velocity_ladder), no V_P (D51)
-      dsqwen-7b: null
-      dsllama-8b: null
-      dsqwen-14b: null
+      dsqwen-7b:
+        buckets: [[12594.2, 9842.2, 8111.6], [12948.8, 10690.6, 8063.9], [13645.3, 10394.7, 7045.7]]
+      dsllama-8b:
+        buckets: [[10905.9, 8223.7, 5710.6], [10890.2, 9153.1, 4839.0], [11899.0, 8742.9, 4918.8]]
+      dsqwen-14b:
+        buckets: [[9124.2, 7618.1, 6134.3], [9486.6, 8222.3, 5114.9], [10617.1, 8108.5, 5054.9]]
     out_len_source: max_tokens  # the true output picks the bucket before the simulated error
     default_out_tokens: 256  # not in paper
     misbucket_rate: 0.15     # paper: 85 %-accurate length predictor; draw = hash(seed, model, client id)
@@ -74,8 +80,10 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   preserve.yaml: |
-    # PENDING (tools/freeze_params preserve). Sources: none
-    calibration: pending
+    # FROZEN (tools/freeze_params preserve). Sources: mu sha256 04b0b23b6847487447395dd2b5be7d816527ce45ffd99807b4f78aee181d3ba5
+    # NOTE: mu: velocity_ladder mu (aibrix e171131e), scheme B, P share pooled [p5, p95] = [0.2922, 0.8392] (v1 D58: [min, max], the same mu here); no mu cell is the re-measured 14b b22
+    # NOTE: calibration 2026-10-26; provenance <data root>/bl-calib-20261026/SOURCES.md
+    calibration: frozen
     # The trace: replaced per run by the campaign runner (its oracle copy in the trace volume); the
     # history before t0 is next to it: pre_t0.json (synthetic, the generator's), else preserve_history.json
     # (Real_*, tools/preserve_history real); see tre_baselines.policies.preserve_history.
@@ -94,9 +102,9 @@ data:
     predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled
     mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,
                              # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu
-      dsqwen-7b: null
-      dsllama-8b: null
-      dsqwen-14b: null
+      dsqwen-7b: {"p": 6775.7, "d": 5137.7, "t": 9547.0}
+      dsllama-8b: {"p": 3196.9, "d": 4458.1, "t": 7655.0}
+      dsqwen-14b: {"p": 6164.9, "d": 4013.3, "t": 7533.4}
     load_error_mode: paper_tab2   # paper RQ2 'PreServe w/ load errors' (Tab. 2 error model)
     load_error_seed: 0       # the same draws in every arm and replay seed (as TokenScale seed: 0)
     max_model_len: 131072

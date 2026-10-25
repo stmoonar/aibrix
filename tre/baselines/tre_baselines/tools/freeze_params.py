@@ -11,7 +11,8 @@ outputs, so nothing is copied by hand:
 * ``preserve --mu <mu.yaml>``: ``mu`` = variant B of ``tools/velocity_ladder mu``.
 
 ``--pending`` renders the block with ``calibration: pending`` and null values (the state before
-the calibration). Every input's sha256 goes into the block's header comment. Without
+the calibration). ``--note TEXT`` (repeatable) adds a ``# NOTE:`` disclosure line under the header
+(e.g. a cell measured with another setting). Every input's sha256 goes into the block's header comment. Without
 ``--write`` the block is printed; with it the ConfigMap file is rewritten in place (only that
 policy's ``<policy>.yaml: |`` block changes).
 
@@ -130,6 +131,13 @@ def replace_block(text: str, policy: str, block: str) -> str:
     return text[:i] + body + text[j:]
 
 
+def with_notes(block: str, notes) -> str:
+    """``block`` with one ``# NOTE: <text>`` line per note under its header comment."""
+    head, sep, rest = block.partition("\n")
+    lines = "".join(f"# NOTE: {' '.join(str(n).split())}\n" for n in notes or ())
+    return head + sep + lines + rest
+
+
 def weights_sha256() -> dict[str, str]:
     root = TRE_ROOT / "baselines" / WEIGHTS
     return {n: sha256_file(root / f"{n}-paper.npz") for n in WEIGHT_SETS}
@@ -147,6 +155,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         s.add_argument("--pending", action="store_true")
         s.add_argument("--configmaps", default=str(DEFAULT_CM))
         s.add_argument("--write", action="store_true")
+        s.add_argument("--note", action="append", default=[],
+                       help="a disclosure line in the block's header comment (repeatable)")
     a = ap.parse_args(argv)
     try:
         if a.policy == "tokenscale":
@@ -183,6 +193,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (OSError, KeyError, ValueError, TypeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    block = with_notes(block, a.note)
     yaml.safe_load(block)  # the block itself must parse
     if not a.write:
         print(block, end="")
