@@ -70,7 +70,8 @@ fi
 stage_for() {  # stage_for <model> <stage> -> the model's directory name of that stage
   local m=$1 st=$2 o
   for o in $STAGE_OVERRIDES; do
-    if [ "${o%%:*}" = "$m" ] && [ "${o#*:}" != "${o#*:$st=}" ]; then echo "${o#*:$st=}"; return; fi
+    [ "${o%%:*}" = "$m" ] || continue
+    case "${o#*:}" in "$st="*) echo "${o#*:$st=}"; return ;; esac
   done
   echo "$st"
 }
