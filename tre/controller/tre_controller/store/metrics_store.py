@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.gateway_inflight import instance_max_age_ms, live_gateway_instances, pod_inflight
@@ -64,6 +64,7 @@ class MetricsStore:
         histogram_lookback_ms: int = 90_000,
         min_latency_samples: int = 0,
         suffix_period_ms: int = 0,
+        suffix_breakpoint: Callable[[str], int | None] | None = None,
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
@@ -112,6 +113,12 @@ class MetricsStore:
         # suffixes (ModelWindowMetrics.suffix_windows) from the docs already read - no
         # extra redis round trip. 0 = off (the SafeScale evidence store, older callers).
         self._suffix_period_ms = int(suffix_period_ms)
+        # Round 2 (cheap 2 s build): with a breakpoint source, only the one suffix O1
+        # decides on is built - the one starting at the first grid boundary at or after
+        # the model's breakpoint, when that lies inside the window (none without a
+        # breakpoint). None = every grid-aligned suffix (offline tools, tests). A
+        # breakpoint first seen after the read gets its suffix with the next snapshot.
+        self._suffix_breakpoint = suffix_breakpoint
         # P3-2: gateway plugin instance liveness (the registry's SM instance staleness).
         self._gateway_instance_max_age_ms = instance_max_age_ms(registry)
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
@@ -142,13 +149,24 @@ class MetricsStore:
         use_cache: bool = True,
         start_exclusive: bool = False,
     ) -> MetricsSnapshot:
-        models = {
-            spec.name: self.read_model_window(
-                spec.name, window_start_ms, window_end_ms, use_cache=use_cache, start_exclusive=start_exclusive
+        names = [spec.name for spec in self._registry.models()]
+        read_start_ms = int(window_start_ms) + 1 if start_exclusive else int(window_start_ms)
+        prefetched: dict[str, dict] | None = None
+        cadence_raw: Any = None
+        if self._schema == "v2":
+            # Two round trips for the whole snapshot (pod sets + cadence, then every
+            # pod's docs), not one per key.
+            prefetched, cadence_raw = self._fetch_v2(
+                names, read_start_ms, int(window_end_ms), with_cadence=self._expected_cadence is not None
             )
-            for spec in self._registry.models()
+        models = {
+            name: self.read_model_window(
+                name, window_start_ms, window_end_ms, use_cache=use_cache, start_exclusive=start_exclusive,
+                _docs=None if prefetched is None else prefetched[name],
+            )
+            for name in names
         }
-        problem = self._cadence_problem()
+        problem = self._cadence_problem(cadence_raw)
         return MetricsSnapshot(
             ts_ms=int(window_end_ms),
             models=models,
@@ -156,18 +174,51 @@ class MetricsStore:
             stale_reason=problem,
         )
 
-    def _cadence_problem(self) -> str | None:
-        """The gateway's declared cadence against ``expected_cadence`` (None: no check or
-        it matches). Logged as an error when it changes."""
+    def _fetch_v2(
+        self, models: list[str], read_start_ms: int, window_end_ms: int, *, with_cadence: bool = False
+    ) -> tuple[dict[str, dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]], Any]:
+        """model -> pod key -> (histogram docs: the baseline - the newest at or before
+        the window start, within the lookback, one ZREVRANGEBYSCORE ... LIMIT 0 1 - then
+        the window's; the window's instant docs), and the raw cadence hash. Two
+        pipelined round trips."""
+        first = _Batch(self._redis)
+        for model in models:
+            first.add("smembers", pods_key(model))
+        if with_cadence:
+            first.add("hgetall", GATEWAY_CADENCE_KEY)
+        replies = first.run()
+        cadence_raw = replies[len(models)] if with_cadence else None
+        pods_by_model = {
+            model: sorted(_decode_text(pod) for pod in (replies[index] or ())) for index, model in enumerate(models)
+        }
+        second = _Batch(self._redis)
+        layout: list[tuple[str, str]] = []
+        lookback = self._histogram_lookback_ms
+        for model, pods in pods_by_model.items():
+            for pod in pods:
+                layout.append((model, pod))
+                if lookback:
+                    second.add_baseline(hist_key(pod), read_start_ms - 1, max(0, read_start_ms - lookback))
+                second.add("zrangebyscore", hist_key(pod), read_start_ms, window_end_ms)
+                if self._read_instant:
+                    second.add("zrangebyscore", inst_key(pod), read_start_ms, window_end_ms)
+        replies = iter(second.run())
+        out: dict[str, dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]] = {m: {} for m in models}
+        for model, pod in layout:
+            baseline = _parse_docs(next(replies)) if lookback else []
+            hist = _parse_docs(next(replies))
+            inst = _parse_docs(next(replies)) if self._read_instant else []
+            out[model][pod] = (baseline[-1:] + hist, inst)
+        return out, cadence_raw
+
+    def _cadence_problem(self, raw: Any = None) -> str | None:
+        """The gateway's declared cadence (``raw``: the hash read with the snapshot)
+        against ``expected_cadence`` (None: no check or it matches). Logged as an error
+        when it changes."""
         if self._expected_cadence is None:
             return None
         instant_ms, evidence_ms = self._expected_cadence
-        try:
-            raw = self._redis.hgetall(GATEWAY_CADENCE_KEY)
-        except Exception as exc:  # noqa: BLE001 - unknown cadence: fail closed
-            problem: str | None = f"gateway_cadence_unreadable:{type(exc).__name__}"
-        else:
-            problem = cadence_problem(raw, instant_ms=instant_ms, evidence_ms=evidence_ms)
+        problem = cadence_problem(raw, instant_ms=instant_ms, evidence_ms=evidence_ms)
         if problem != self._cadence_logged:
             if problem:
                 LOG.error(
@@ -187,6 +238,7 @@ class MetricsStore:
         *,
         use_cache: bool = True,
         start_exclusive: bool = False,
+        _docs: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] | None = None,
     ) -> ModelWindowMetrics:
         """One model's window. ``start_exclusive`` reads the half-open ``(start, end]``.
 
@@ -223,7 +275,7 @@ class MetricsStore:
 
         # Timestamps are integer ms, so (start, end] == [start + 1, end].
         read_start_ms = int(window_start_ms) + 1 if start_exclusive else int(window_start_ms)
-        suffix_starts = self._suffix_starts(int(window_start_ms), int(window_end_ms))
+        suffix_starts = self._suffix_starts(model, int(window_start_ms), int(window_end_ms))
         suffix_pods: dict[int, dict[str, PodWindowMetrics]] = {start: {} for start in suffix_starts}
         # I3: pod name -> newest ``scraped_ms`` of its docs in the window (None: no doc
         # carries the field); only pods with a doc in the window.
@@ -240,18 +292,7 @@ class MetricsStore:
             suffix_starts = ()
             per_pod = self._read_v1_model_window(model, read_start_ms, window_end_ms, scraped=scraped)
         else:
-            pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
-            docs_by_pod: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
-            for pod_key in pods:
-                docs_by_pod[pod_key] = (
-                    self._read_zset_docs(
-                        hist_key(pod_key),
-                        read_start_ms,
-                        window_end_ms,
-                        lookback_ms=self._histogram_lookback_ms,
-                    ),
-                    self._read_zset_docs(inst_key(pod_key), read_start_ms, window_end_ms) if self._read_instant else [],
-                )
+            docs_by_pod = _docs if _docs is not None else self._fetch_v2([model], read_start_ms, int(window_end_ms))[0][model]
             per_pod = {}
             for pod_key, (hist_docs, inst_docs) in docs_by_pod.items():
                 pod_name = _pod_name(hist_docs, inst_docs, pod_key)
@@ -370,13 +411,24 @@ class MetricsStore:
         except Exception:  # noqa: BLE001 - unknown, never zero
             return None
 
-    def _suffix_starts(self, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
-        """Gateway boundaries strictly inside an aligned window (O1 suffix starts);
-        () when suffixes are off or the window is not on the suffix grid."""
+    def _suffix_starts(self, model: str, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
+        """Gateway boundaries strictly inside an aligned window (O1 suffix starts) - with
+        a breakpoint source only the one O1 would decide on; () when suffixes are off or
+        the window is not on the suffix grid."""
         period = self._suffix_period_ms
         if period <= 0 or window_start_ms % period or window_end_ms % period:
             return ()
-        return tuple(range(window_start_ms + period, window_end_ms, period))
+        if self._suffix_breakpoint is None:
+            return tuple(range(window_start_ms + period, window_end_ms, period))
+        try:
+            point = self._suffix_breakpoint(model)
+        except Exception:  # noqa: BLE001 - no suffix: O1 waits for a whole window
+            LOG.warning("O1 suffix: breakpoint of %s unreadable", model, exc_info=True)
+            return ()
+        if point is None:
+            return ()
+        start = -(-int(point) // period) * period  # first grid boundary >= the breakpoint
+        return (start,) if window_start_ms < start < window_end_ms else ()
 
     def read_latest_instant(self, model: str, now_ms: int, lookback_ms: int) -> dict[str, float]:
         """Latest instant queue snapshot (waiting/running/swapping), summed across pods.
@@ -829,6 +881,60 @@ def _scrape_valid(
         else:
             stale.append(name)
     return kept, tuple(sorted(stale))
+
+
+class _Batch:
+    """Redis reads sent in one pipelined round trip (``transaction=False``); clients
+    without ``pipeline`` (test fakes) run them one by one, same results."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._calls: list[tuple[str, tuple, dict]] = []
+
+    def add(self, name: str, *args: Any, **kwargs: Any) -> None:
+        self._calls.append((name, args, kwargs))
+
+    def add_baseline(self, key: str, max_score: int, min_score: int) -> None:
+        """The newest member scored in ``[min_score, max_score]`` (a list of 0 or 1)."""
+        self._calls.append(("zrevrangebyscore", (key, max_score, min_score), {"start": 0, "num": 1}))
+
+    def run(self) -> list[Any]:
+        if not self._calls:
+            return []
+        make = getattr(self._client, "pipeline", None)
+        if callable(make):
+            try:
+                pipe = make(transaction=False)
+            except TypeError:
+                pipe = None
+            if pipe is not None and all(callable(getattr(pipe, name, None)) for name, _a, _k in self._calls):
+                for name, args, kwargs in self._calls:
+                    getattr(pipe, name)(*args, **kwargs)
+                return list(pipe.execute())
+        return [self._one(name, args, kwargs) for name, args, kwargs in self._calls]
+
+    def _one(self, name: str, args: tuple, kwargs: dict) -> Any:
+        if name == "zrevrangebyscore" and not callable(getattr(self._client, name, None)):
+            key, max_score, min_score = args
+            members = list(self._client.zrangebyscore(key, min_score, max_score))
+            members.sort(key=lambda raw: _number(_doc_or_empty(raw).get("timestamp"), 0.0))
+            return members[-1:]
+        return getattr(self._client, name)(*args, **kwargs)
+
+
+def _doc_or_empty(raw: Any) -> dict[str, Any]:
+    try:
+        doc = json.loads(_decode_text(raw))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _parse_docs(raw_members: Any) -> list[dict[str, Any]]:
+    """Decoded docs of a ZRANGE reply, ascending by ``timestamp``."""
+    docs = [doc for doc in (_doc_or_empty(raw) for raw in (raw_members or ())) if doc]
+    docs.sort(key=lambda doc: _number(doc.get("timestamp"), 0.0))
+    return docs
 
 
 def _scraped_at(doc: dict[str, Any]) -> int | None:

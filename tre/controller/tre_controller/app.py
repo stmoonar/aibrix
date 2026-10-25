@@ -333,6 +333,14 @@ def create_controller_dependencies(
         json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
     )
     scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
+    signal_state = SignalState(
+        warmup_ms=cfg.signal_warmup_ms,
+        # O1 breakpoint window (registry scaling.breakpoint_window /
+        # onset_warmup_guard / min_evidence_*), on the gateway grid.
+        breakpoint=breakpoint_config,
+        # Onset saturation rescue (registry scaling.saturation_*).
+        saturation=SaturationTracker(saturation_config),
+    )
     store = MetricsStore(
         metrics_redis_client,
         registry,
@@ -355,6 +363,8 @@ def create_controller_dependencies(
         min_latency_samples=cfg.min_latency_samples,
         # O1: the grid-aligned suffix windows the breakpoint window decides on.
         suffix_period_ms=cfg.evidence_period_ms if breakpoint_config.enabled else 0,
+        # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
+        suffix_breakpoint=lambda model: signal_state.breakpoint_ms(model) if signal_state.o1_active else None,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -504,14 +514,7 @@ def create_controller_dependencies(
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
-        signal_state=SignalState(
-            warmup_ms=cfg.signal_warmup_ms,
-            # O1 breakpoint window (registry scaling.breakpoint_window /
-            # onset_warmup_guard / min_evidence_*), on the gateway grid.
-            breakpoint=breakpoint_config,
-            # Onset saturation rescue (registry scaling.saturation_*).
-            saturation=SaturationTracker(saturation_config),
-        ),
+        signal_state=signal_state,
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(
             redis_client, grace_s=cfg.orphan_grace_s

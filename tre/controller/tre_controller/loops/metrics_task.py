@@ -4,7 +4,7 @@ Two refresh modes (``TRE_METRICS_REFRESH_MODE``):
 
 * ``phase_aligned`` (default, plan §6.9i / D8): :class:`PhaseAlignedSampler`. The gateway
   stamps its histogram samples with a boundary of the evidence-period grid
-  (TRE_EVIDENCE_PERIOD_MS, default 10 s) and its instant samples with a boundary of the
+  (TRE_EVIDENCE_PERIOD_MS, default 2 s) and its instant samples with a boundary of the
   finer instant grid (TRE_INSTANT_SAMPLE_INTERVAL_MS, default 0.5 s). The sampler sleeps
   until ``next evidence boundary + offset`` (``sleep(next_boundary + offset - now)``, not
   ``sleep(interval)``), reads the half-open window ``(boundary - window_ms, boundary]`` -
@@ -19,13 +19,13 @@ Two refresh modes (``TRE_METRICS_REFRESH_MODE``):
 * ``free_running`` (fallback): the old ``refresh; sleep(metrics_refresh_interval_s)`` loop
   with a sliding window ending at ``now``.
 
-Decision cadence: snapshots change every evidence period in ``phase_aligned`` mode. The rescue loop
-wakes on every publish (:meth:`SnapshotBox.wait_newer`, H1 2026-10-06), i.e. at the learned
-phase offset plus the fetch time, and at the latest ``TRE_RESCUE_INTERVAL_SECONDS`` (5 s)
-after its previous tick when nothing is published (free_running mode, stale windows). A
-re-read of the same snapshot advances neither the EMA nor the band dwell (both keyed by
-``window_end_ms``), so the effective decision cadence is the evidence period, reached right
-after publish.
+Decision cadence: snapshots change every evidence period in ``phase_aligned`` mode. The
+decision loops run on fixed timers and read the latest snapshot: the rescue (fast) loop
+every ``TRE_RESCUE_INTERVAL_SECONDS`` (5 s), the fairness (slow) loop every
+``TRE_FAIRNESS_INTERVAL_SECONDS`` (10 s) (2026-10-25: the 2026-10-06 wake-on-publish of
+the rescue loop is removed; at a 2 s evidence period a tick reads a snapshot at most about
+one period old). A re-read of the same snapshot advances neither the EMA, the band dwell
+nor any time-span rule (all keyed by ``window_end_ms``).
 """
 from __future__ import annotations
 
@@ -73,54 +73,17 @@ class MetricsTaskConfig(Protocol):
 
 
 class SnapshotBox:
-    """The latest published snapshot. ``version`` counts publishes; a decision loop
-    that wants to act right after a publish waits with :meth:`wait_newer`. ``set`` is
-    called on the event loop thread (the sampler awaits its threaded fetch)."""
+    """The latest published snapshot. ``set`` is called on the event loop thread (the
+    sampler awaits its threaded fetch); the decision loops ``get`` it on their timers."""
 
     def __init__(self, snapshot: MetricsSnapshot | None = None) -> None:
         self._snapshot = snapshot
-        self._version = 0
-        self._published: asyncio.Event | None = None
-
-    @property
-    def version(self) -> int:
-        return self._version
 
     def get(self) -> MetricsSnapshot | None:
         return self._snapshot
 
     def set(self, snapshot: MetricsSnapshot) -> None:
         self._snapshot = snapshot
-        self._version += 1
-        event, self._published = self._published, None
-        if event is not None:
-            event.set()
-
-    async def wait_newer(
-        self,
-        version: int,
-        timeout_s: float,
-        *,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> bool:
-        """Wait until a snapshot newer than ``version`` is set, or ``sleep(timeout_s)``
-        returns (the fallback cadence). True when a newer snapshot exists. ``sleep`` is
-        injectable (fake clocks); an exception it raises propagates."""
-        if self._version != version:
-            return True
-        if self._published is None:
-            self._published = asyncio.Event()
-        waiter = asyncio.ensure_future(self._published.wait())
-        timer = asyncio.ensure_future(sleep(timeout_s))
-        try:
-            done, _ = await asyncio.wait({waiter, timer}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for task in (waiter, timer):
-                if not task.done():
-                    task.cancel()
-        if timer in done:
-            timer.result()  # re-raise what the (fake) sleep raised
-        return self._version != version
 
 
 def freeze_snapshot(snapshot: MetricsSnapshot) -> MetricsSnapshot:

@@ -39,12 +39,11 @@ class DecisionWriter(Protocol):
 
 
 class RescueTaskConfig(Protocol):
-    # Fallback wake period of the loop (TRE_RESCUE_INTERVAL_SECONDS, 5 s). H1 (2026-10-06):
-    # the loop ticks right after every snapshot publish (SnapshotBox.wait_newer: the
-    # sampler's learned phase offset plus the fetch), and at the latest rescue_interval_s
-    # after its previous tick when nothing is published (free_running mode, stale
-    # windows). A re-read of the same window_end_ms advances neither the EMA nor the band
-    # dwell, so the effective decision cadence stays 10 s - now with no phase lag.
+    # Fixed period of the fast loop (TRE_RESCUE_INTERVAL_SECONDS, 5 s), the same pattern
+    # as the slow loop's fixed timer (2026-10-25; the 2026-10-06 H1 wake-on-publish is
+    # removed). Each tick reads the latest snapshot: with 2 s snapshots it is at most
+    # about one evidence period old. A re-read of the same window_end_ms advances neither
+    # the EMA, the band dwell nor any time-span rule (all keyed by window_end_ms).
     rescue_interval_s: float
 
 
@@ -118,9 +117,7 @@ async def rescue_task(
     leftover_probes: SafeScaleController | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_ms=getattr(cfg, "paper_stale_max_ms", 30_000))
-    wait_newer = getattr(snapshot_box, "wait_newer", None)
     while True:
-        seen_version = getattr(snapshot_box, "version", None)
         snapshot = snapshot_box.get()
         if snapshot is not None:
             current_view = _current_cluster_view(cluster_view, cluster_view_box)
@@ -169,11 +166,7 @@ async def rescue_task(
                     )
                 else:
                     decision_writer.write("rescue", snapshot, result)
-        if callable(wait_newer) and seen_version is not None:
-            # Next tick on the next publish; rescue_interval_s is the fallback.
-            await wait_newer(seen_version, cfg.rescue_interval_s, sleep=sleep)
-        else:
-            await sleep(cfg.rescue_interval_s)
+        await sleep(cfg.rescue_interval_s)
 
 
 def _current_cluster_view(
