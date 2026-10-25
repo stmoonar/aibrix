@@ -14,9 +14,14 @@ case "$a" in
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SAFESCALE*) cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SLOW_LOOP*) cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_SAFESCALE_SCOPE*) cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null || true ;;
-  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; esac; done ;;
-  *"logs deploy/tre-v2-controller"*) [ -e $S/no_switch_line ] || printf '{"level": "INFO", "logger": "tre_controller", "message": "{\\"disable_safescale\\": %s, \\"disable_slow_loop\\": %s, \\"event\\": \\"ablation_switches\\"}", "time": "2026-10-08 11:01:00,916"}\n' \
-      "$(cat $S/switch_line_safescale 2>/dev/null || cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || echo false)" "$(cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || echo false)" ;;
+  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; esac; done
+      # the controller refuses to start when the switch and the scope disagree (tre_controller.config._safescale_scope)
+      d=$(cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null); c=$(cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null)
+      if [ -n "$d" ] && [ -n "$c" ] && { [ "$d" = true ] && [ "$c" != off ] || [ "$d" != true ] && [ "$c" = off ]; }; then echo "$a" >> $S/inconsistent; fi ;;
+  *"logs deploy/tre-v2-controller"*) ds="$(cat $S/switch_line_safescale 2>/dev/null || cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || echo false)"
+      sc="$(cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null)"; [ -n "$sc" ] || { [ "$ds" = true ] && sc=off || sc=all; }   # as tre_controller.config
+      [ -e $S/no_switch_line ] || printf '{"level": "INFO", "logger": "tre_controller", "message": "{\\"disable_safescale\\": %s, \\"disable_slow_loop\\": %s, \\"event\\": \\"ablation_switches\\", \\"safescale_scope\\": \\"%s\\"}", "time": "2026-10-08 11:01:00,916"}\n' \
+      "$ds" "$(cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || echo false)" "$sc" ;;
   *"get deploy tre-v2-baseline-scaler"*replicas*) cat $S/scaler_replicas 2>/dev/null || echo 0 ;;
   *"get deploy tre-gateway-plugins"*TRE_BL_REQ_EVENTS*) cat $S/events 2>/dev/null || true ;;
   *"set env deploy/tre-gateway-plugins TRE_BL_REQ_EVENTS-"*) rm -f $S/events ;;

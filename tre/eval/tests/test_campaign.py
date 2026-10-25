@@ -486,6 +486,9 @@ def test_ablation_arm_passes_its_controller_switch_and_other_arms_pass_none(tmp_
     ({"base": "apa", "controller_env": {"TRE_ABLATION_DISABLE_SAFESCALE": True}}, "only supported for base tre"),
     ({"base": "tre", "controller_env": {"TRE_ABLATION_DISABLE_FAST_LOOP": True}}, "unknown keys"),
     ({"base": "tre", "controller_env": {"TRE_ABLATION_DISABLE_SAFESCALE": "yes"}}, "true or false"),
+    ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "receiverless"}}, "must be one of"),
+    ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "off", "TRE_ABLATION_DISABLE_SAFESCALE": False}},
+     "contradicts"),
 ])
 def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, bad, match):
     c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {"x": bad}}))

@@ -123,7 +123,7 @@ CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; *) echo false ;; esac; }
 ctl_valid() {   # ctl_valid KEY VALUE
   case "$1" in
-    TRE_SAFESCALE_SCOPE) [[ "$2" =~ ^[a-z][a-z0-9_]*$ ]] ;;
+    TRE_SAFESCALE_SCOPE) case "$2" in all|receiverless_shrink|off) ;; *) return 1 ;; esac ;;
     *) [ "$2" = true ] || [ "$2" = false ] ;;
   esac
 }
@@ -161,9 +161,17 @@ if [ "$SEND_IN_TOKENS" = 1 ]; then
 fi
 for kv in $ARM_CONTROLLER_ENV; do
   case " $CTL_ENV_KEYS " in *" ${kv%%=*} "*) ;; *) echo "ARM_CONTROLLER_ENV: unknown switch '${kv%%=*}' (allowed: $CTL_ENV_KEYS)" >&2; exit 2;; esac
-  ctl_valid "${kv%%=*}" "${kv#*=}" || { echo "ARM_CONTROLLER_ENV: '$kv': bad value (switches true|false, TRE_SAFESCALE_SCOPE [a-z0-9_]+)" >&2; exit 2; }
+  ctl_valid "${kv%%=*}" "${kv#*=}" || { echo "ARM_CONTROLLER_ENV: '$kv': bad value (switches true|false, TRE_SAFESCALE_SCOPE all|receiverless_shrink|off)" >&2; exit 2; }
   [ "$ARM" = tre ] || { echo "ARM_CONTROLLER_ENV is for tre arms only (arm=$ARM)" >&2; exit 2; }
 done
+# the switch is the alias of scope "off": both given must agree, else the controller refuses to start
+_SC=; _DS=
+for kv in $ARM_CONTROLLER_ENV; do
+  case "${kv%%=*}" in TRE_SAFESCALE_SCOPE) _SC=${kv#*=} ;; TRE_ABLATION_DISABLE_SAFESCALE) _DS=${kv#*=} ;; esac
+done
+if [ -n "$_SC" ] && [ -n "$_DS" ] && { { [ "$_DS" = true ] && [ "$_SC" != off ]; } || { [ "$_DS" != true ] && [ "$_SC" = off ]; }; }; then
+  echo "ARM_CONTROLLER_ENV: TRE_ABLATION_DISABLE_SAFESCALE=$_DS contradicts TRE_SAFESCALE_SCOPE=$_SC (true <-> off)" >&2; exit 2
+fi
 if [ -e "$D/client/performance_metrics.json" ]; then
   echo "$D already has client results; set RUN_TAG for a repeat (never overwritten)" >&2; exit 2
 fi
@@ -258,7 +266,10 @@ ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m 
                --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "$REDIS_URL" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
 # ---- controller ablation switches (note 14)
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
-ctl_want() { local kv; for kv in $ARM_CONTROLLER_ENV; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return 0; }; done; ctl_default "$1"; }
+ctl_want() { local kv; for kv in $ARM_CONTROLLER_ENV; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return 0; }; done
+  # scope "off" alone implies the switch true (its alias): a live "false" left as is would disagree and crash-loop
+  [ "$1" = TRE_ABLATION_DISABLE_SAFESCALE ] && [ "$(ctl_want TRE_SAFESCALE_SCOPE)" = off ] && { echo true; return 0; }
+  ctl_default "$1"; }
 ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the settings that differ; unset == default
   local k cur want def args=()
   for k in $CTL_ENV_KEYS; do
@@ -318,13 +329,16 @@ if "{" in line:
         rec = event_of(json.loads(line[line.index("{"):line.rindex("}") + 1]))
     except ValueError:
         rec = None
-want = {"disable_safescale": want_ss == "true", "disable_slow_loop": want_sl == "true"}
+# SafeScale scope (2026-10-26, tre_controller.config._safescale_scope): the switch is the alias of
+# scope "off" - the effective scope is the explicit one, else "off" when the switch is true, else
+# "all"; disable_safescale is logged true exactly for "off". A line without safescale_scope
+# (controller image before the setting) matches only the effective scope "all" / "off" of the switch.
+eff_scope = want_scope if want_scope != "all" else ("off" if want_ss == "true" else "all")
+want = {"disable_safescale": want_ss == "true" or eff_scope == "off", "disable_slow_loop": want_sl == "true"}
 ok = rec is not None and all(rec.get(k) == v for k, v in want.items())
-# SafeScale scope (2026-10-26): the startup line's safescale_scope must equal the wanted one; a line
-# without the field (controller image before the setting) matches only the default "all".
 scope_logged = None if rec is None else rec.get("safescale_scope")
-ok = ok and (scope_logged == want_scope if scope_logged is not None else want_scope == "all")
-want["safescale_scope"] = want_scope
+ok = ok and (scope_logged == eff_scope if scope_logged is not None else eff_scope in ("all", "off") and want_scope == "all")
+want["safescale_scope"] = eff_scope
 effective = None if rec is None else {"disable_safescale": rec.get("disable_safescale"),
                                       "disable_slow_loop": rec.get("disable_slow_loop"),
                                       "safescale_scope": scope_logged if scope_logged is not None else "all (not logged)"}

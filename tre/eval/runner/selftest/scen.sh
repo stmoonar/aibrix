@@ -75,3 +75,19 @@ run env ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SAFESCALE=true" nice bash $H/to
 grep -E "ERROR ablation" $H/pilot/Alt/tre/runner.log | cut -c1-120
 python3 -c "import json;a=json.load(open('$H/pilot/Alt/tre/ablation_switches.json'));print('PASS' if (not a['match'] and a['logged']) else 'FAIL', 'mismatch logged', a['logged'])"
 [ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] && echo "PASS: switch back to false" || echo "FAIL: switch left $(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)"
+echo "== 2026-10-26: SafeScale scope - set and restored together with the switch in ONE set env (never scope/switch disagreeing)"
+reset; echo -n true > $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE; echo -n off > $H/state/ctl_TRE_SAFESCALE_SCOPE   # left by an off arm
+run env ARM_CONTROLLER_ENV="TRE_SAFESCALE_SCOPE=receiverless_shrink TRE_ABLATION_DISABLE_SAFESCALE=false" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+grep "set env deploy/tre-v2-controller" $H/state/calls.log | sed 's/.*set env/set env/'
+python3 -c "import json;a=json.load(open('$H/pilot/Alt/tre/ablation_switches.json'));print('PASS' if a['match'] and a['effective']['safescale_scope'] == 'receiverless_shrink' else 'FAIL', a['effective'])"
+[ ! -e $H/state/inconsistent ] && [ ! -e $H/state/ctl_TRE_SAFESCALE_SCOPE ] && [ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] \
+  && echo "PASS: no inconsistent state, scope unset + switch false after the arm" || echo "FAIL: inconsistent=$(cat $H/state/inconsistent 2>/dev/null) scope=$(cat $H/state/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null)"
+reset; echo -n true > $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE; echo -n off > $H/state/ctl_TRE_SAFESCALE_SCOPE
+run env CONTROLLER_DEPLOY=tre-v2-controller bash $H/tools/reset_canonical.sh 2>&1 | grep -E "controller switches" | cut -c1-140
+[ ! -e $H/state/inconsistent ] && [ ! -e $H/state/ctl_TRE_SAFESCALE_SCOPE ] && [ "$(cat $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE)" = false ] \
+  && echo "PASS: reset_canonical restores both in one call" || echo "FAIL: reset left inconsistent=$(cat $H/state/inconsistent 2>/dev/null)"
+reset; run env ARM_CONTROLLER_ENV="TRE_SAFESCALE_SCOPE=off TRE_ABLATION_DISABLE_SAFESCALE=false" nice bash $H/tools/run_arm_pilot.sh tre Alt 2>&1 | tail -1
+reset; echo -n false > $H/state/ctl_TRE_ABLATION_DISABLE_SAFESCALE
+run env ARM_CONTROLLER_ENV="TRE_SAFESCALE_SCOPE=off" nice bash $H/tools/run_arm_pilot.sh tre Alt >/dev/null 2>&1; echo rc=$?
+grep "set env deploy/tre-v2-controller" $H/state/calls.log | sed 's/.*set env/set env/'
+[ ! -e $H/state/inconsistent ] && echo "PASS: scope off alone also sets the switch true (and both back after)" || echo "FAIL: $(cat $H/state/inconsistent)"

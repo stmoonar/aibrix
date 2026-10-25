@@ -66,6 +66,7 @@ CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_S
 # 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
 CONTROLLER_ENV_SCOPE_KEYS = ("TRE_SAFESCALE_SCOPE",)
+SAFESCALE_SCOPES = ("all", "receiverless_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
 # collectors of docs/eval-metrics-spec §7 that every arm directory should hold (missing -> suspect)
 COLLECTOR_FILES = ("layout.jsonl", "pod_metrics_1s.jsonl", "pod_gauges.jsonl", "gpu_map.jsonl", "gpu_truth.jsonl",
                    "resource_usage.jsonl", "apa_status.jsonl", "signal_log.jsonl", "clock_offsets.json",
@@ -260,11 +261,15 @@ def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
     for k, v in raw.items():
         v = str(v).strip().lower()
         if k in CONTROLLER_ENV_SCOPE_KEYS:
-            if not re.fullmatch(r"[a-z][a-z0-9_]*", v):
-                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be a scope name ([a-z0-9_]+)")
+            if v not in SAFESCALE_SCOPES:
+                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be one of {SAFESCALE_SCOPES}")
         elif v not in ("true", "false"):
             raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be true or false")
         out[k] = v
+    sc, ds = out.get("TRE_SAFESCALE_SCOPE"), out.get("TRE_ABLATION_DISABLE_SAFESCALE")
+    if sc is not None and ds is not None and (ds == "true") != (sc == "off"):
+        raise CampaignError(f"arm_defs.{arm_id}.controller_env: TRE_ABLATION_DISABLE_SAFESCALE={ds} contradicts "
+                            f"TRE_SAFESCALE_SCOPE={sc} (the switch is the alias of scope off; the controller would refuse to start)")
     return out
 
 
