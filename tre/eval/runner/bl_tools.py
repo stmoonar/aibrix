@@ -38,8 +38,10 @@ Sanity (baseline_sanity.sh):
                   --records defaults to records.jsonl next to the meta file)
   summary         --root DIR --arm A --out summary.json
   decision-validity --decisions DIR_OR_FILES --t0-ms T --duration-s D [--tick-s 5] [--min-tick-cov 0.9]
-                  [--max-frozen 0.05] [--out F]   per model: ticks in [t0, t0+D) >= 0.9 x D / tick and
-                                                    frozen-tick share <= 0.05 (exit 2 when not)
+                  [--max-frozen 0.05] [--models a,b] [--max-no-client-id 0] [--out F]
+                                                    per model: ticks in [t0, t0+D) >= 0.9 x D / tick,
+                                                    frozen-tick share <= 0.05, no draw without the
+                                                    client id (exit 2 when not)
 """
 from __future__ import annotations
 
@@ -370,20 +372,35 @@ def is_frozen(line: dict) -> bool:
     return bool(line.get("frozen") or inp.get("frozen") or "frozen" in str(line.get("reason") or ""))
 
 
+def _no_client_id(line: dict) -> int:
+    """Arrivals of this tick whose draw key fell back to the gateway id (TokenScale ``no_client_id``,
+    PreServe ``anom.no_client_id``)."""
+    inp = line.get("inputs") if isinstance(line.get("inputs"), dict) else {}
+    anom = inp.get("anom") if isinstance(inp.get("anom"), dict) else {}
+    try:
+        return int(inp.get("no_client_id") or 0) + int(anom.get("no_client_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def decision_validity(dec: list[dict], t0_ms: int, duration_s: float, tick_s: float,
-                      min_tick_cov: float = 0.9, max_frozen: float = 0.05) -> dict:
+                      min_tick_cov: float = 0.9, max_frozen: float = 0.05, models: list[str] | None = None,
+                      max_no_client_id: int = 0) -> dict:
     """Per-run validity from the decision lines of the replay window [t0, t0 + duration) (S5,
-    2026-10-26): per model, ticks seen >= ``min_tick_cov`` x duration / tick, and the share of
-    frozen ticks <= ``max_frozen`` (a baseline that sat frozen did not run its algorithm)."""
+    2026-10-26): per model (every one of ``models``; a model without lines fails), ticks seen >=
+    ``min_tick_cov`` x duration / tick, the share of frozen ticks <= ``max_frozen`` (a baseline that
+    sat frozen did not run its algorithm), and at most ``max_no_client_id`` arrivals whose random
+    draw (misbucketing, load error) fell back to the gateway id (not the same in every arm)."""
     end = t0_ms + int(duration_s * 1000)
-    per: dict[str, dict] = {}
+    per: dict[str, dict] = {m: {"ticks": 0, "frozen": 0, "no_client_id": 0} for m in (models or [])}
     for d in dec:
         ts, m = d.get("ts_ms"), d.get("model")
         if m is None or not isinstance(ts, (int, float)) or not t0_ms <= ts < end:
             continue
-        r = per.setdefault(m, {"ticks": 0, "frozen": 0})
+        r = per.setdefault(m, {"ticks": 0, "frozen": 0, "no_client_id": 0})
         r["ticks"] += 1
         r["frozen"] += is_frozen(d)
+        r["no_client_id"] += _no_client_id(d)
     want = duration_s / tick_s
     problems = []
     for m, r in sorted(per.items()):
@@ -393,15 +410,19 @@ def decision_validity(dec: list[dict], t0_ms: int, duration_s: float, tick_s: fl
             problems.append(f"{m}: tick coverage {r['tick_cov']} < {min_tick_cov}")
         if r["frozen_share"] is not None and r["frozen_share"] > max_frozen:
             problems.append(f"{m}: frozen ticks {r['frozen_share']} > {max_frozen}")
+        if r["no_client_id"] > max_no_client_id:
+            problems.append(f"{m}: {r['no_client_id']} arrivals without x-tre-request-id (draws not reproducible)")
     if not per:
         problems.append("no decision lines in the replay window")
     return {"t0_ms": t0_ms, "duration_s": duration_s, "tick_s": tick_s, "expected_ticks": round(want, 1),
-            "min_tick_cov": min_tick_cov, "max_frozen": max_frozen, "models": per,
-            "valid": not problems, "invalid_because": problems}
+            "min_tick_cov": min_tick_cov, "max_frozen": max_frozen, "max_no_client_id": max_no_client_id,
+            "models": per, "valid": not problems, "invalid_because": problems}
 
 
 def cmd_decision_validity(a) -> int:
-    doc = decision_validity(load_decisions(a.decisions), a.t0_ms, a.duration_s, a.tick_s, a.min_tick_cov, a.max_frozen)
+    models = [m for m in (a.models or "").split(",") if m]
+    doc = decision_validity(load_decisions(a.decisions), a.t0_ms, a.duration_s, a.tick_s, a.min_tick_cov, a.max_frozen,
+                            models, a.max_no_client_id)
     if a.out:
         json.dump(doc, open(a.out, "w"), indent=1)
     print(json.dumps({"valid": doc["valid"], "invalid_because": doc["invalid_because"]}))
@@ -776,6 +797,8 @@ def main(argv=None) -> int:
     p.add_argument("--t0-ms", type=int, required=True); p.add_argument("--duration-s", type=float, required=True)
     p.add_argument("--tick-s", type=float, default=5.0); p.add_argument("--min-tick-cov", type=float, default=0.9)
     p.add_argument("--max-frozen", type=float, default=0.05); p.add_argument("--out")
+    p.add_argument("--models", default="", help="managed models (a model without lines fails)")
+    p.add_argument("--max-no-client-id", type=int, default=0)
     p.set_defaults(fn=cmd_decision_validity)
     p = sub.add_parser("summary"); p.add_argument("--root", required=True); p.add_argument("--arm", required=True)
     p.add_argument("--out", required=True); p.set_defaults(fn=cmd_summary)

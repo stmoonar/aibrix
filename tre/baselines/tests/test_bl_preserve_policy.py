@@ -102,6 +102,8 @@ def test_registered_and_factory_fails_closed() -> None:
     # mlstm (the default) needs the weights with their sha256 and a history file next to the trace
     with pytest.raises(ValueError, match="predictors"):
         build_policy("preserve", cfg({"mu": mu, "trace_path": trace}, models))
+    with pytest.raises(ValueError, match="lead_s"):
+        build_policy("preserve", cfg({"mu": mu, "trace_path": trace, "lead_s": 5}, models))
 
 
 def test_trace_name_and_predictor_set() -> None:
@@ -505,15 +507,26 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
     trace = tmp_path / "Real_code" / "seed1" / "trace.json"
     trace.parent.mkdir(parents=True)
     trace.write_text('[{"timestamp": 1.0, "model_name": "m", "prompt_length": 100, "max_output_tokens": 50}]')
-    hist = {"format": ph.FORMAT, "trace": "Real_code", "window_s": 30,
+    hist = {"format": ph.FORMAT, "trace": "Real_code", "seed": 1, "window_s": 30,
             "models": {"m": [[30000.0 + 100 * i, 15000.0] for i in range(25)]}}
     (trace.parent / ph.DEFAULT_NAME).write_text(__import__("json").dumps(hist))
     params = {"mu": {"m": dict(MU)}, "trace_path": str(trace), "load_error_mode": "none",
               "predictors": {k: {"path": f"{fp.WEIGHTS}/{k}-paper.npz", "sha256": v} for k, v in sha.items()}}
     p = build_policy("preserve", cfg(params))
     assert p.predictor_set == "code" and p.history_info["trace"] == "Real_code"
-    est = p._predictors["prompt"].predict(p._history["m"] and [r[0] for r in p._history["m"]])
+    est = p._predictors["prompt"].predict([r[0] for r in p._history["m"]])
     assert np.isfinite(est) and 0 < est < 1e6
+    # golden values: v1 tre_preserve.predictor (dev ceb88b4) on these weights, numpy 1.26.4
+    from tre_baselines.policies import preserve_predictor as pp
+
+    hp = [30000.0 + 100 * i + (3000 if i % 5 == 0 else 0) for i in range(25)]
+    hd = [15000.0 + 50 * i for i in range(25)]
+    gold = {"code": (32385.288988438784, 16027.245117373537), "conv": (32027.71266924556, 15797.959411714452),
+            "pooled": (32344.189325879677, 15803.711096508441)}
+    for name, (gp, gd) in gold.items():
+        prs = pp.load_predictors(str(Path(fp.TRE_ROOT) / "baselines" / fp.WEIGHTS / f"{name}-paper.npz"), sha[name])
+        assert prs["prompt"].predict(hp) == pytest.approx(gp, rel=1e-6)
+        assert prs["response"].predict(hd) == pytest.approx(gd, rel=1e-6)
     bad = {**params, "predictors": {**params["predictors"], "code": {"path": f"{fp.WEIGHTS}/code-paper.npz",
                                                                      "sha256": "0" * 64}}}
     with pytest.raises(ValueError, match="sha256"):
@@ -569,7 +582,8 @@ def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:
     kw = dict(window_s=30.0, models=["m"], seq_len=3, trace="Tight_pool", seed=ph.seed_of(str(trace)))
     hist, info = ph.load(ph.default_path(str(trace)), **kw)
     assert hist == {"m": [(100.0, 10.0), (200.0, 20.0), (300.0, 30.0)]} and info["format"] == ph.PRE_T0_FORMAT
-    for bad, match in (({"seed": 1}, "seed"), ({"trace": "Simul_spike"}, "trace"), ({"window_s": 60.0}, "window_s"),
+    for bad, match in (({"seed": 1}, "seed"), ({"seed": None}, "seed"), ({"trace": "Simul_spike"}, "trace"),
+                       ({"trace": None}, "trace"), ({"t0_s": None}, "t0_s"), ({"window_s": 60.0}, "window_s"),
                        ({"windows": {"m": wins[:1] + wins[2:]}}, "contiguous"),
                        ({"windows": {"m": wins[1:]}}, "seq_len")):
         with pytest.raises(ph.HistoryError, match=match):

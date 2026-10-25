@@ -635,6 +635,9 @@ def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, t
     ``<trace dir>/pre_t0.json``, else ``preserve_history.json``): the generator's ``pre_t0.json``
     next to the replayed trace, else ``<preserve.history_root>/<trace>/seed<k>/preserve_history.json``.
     A shifted or sliced trace has no matching past: refused for mlstm."""
+    if len(tail) < 3:
+        raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs preserve.match_parts >= 3 (the oracle copy "
+                            "must keep <trace>/seed<k>/ so the policy finds the trace name and its history)")
     if d.oracle_shift or e.slice:
         raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift / slice)")
     src = Path(e.src_dir) / PRE_T0_NAME

@@ -144,6 +144,10 @@ def test_misbucketing_is_a_function_of_the_client_id_not_of_arrival_order():
 def test_a_missing_client_id_falls_back_to_the_gateway_id_and_is_counted():
     d = _policy(misbucket_rate=0.15).decide(_snap(100_000, [_ev(99_000, cid=None), _ev(99_000)]))[M]
     assert d.inputs["no_client_id"] == 1
+    # the fallback key is the gateway id: the same draws as clients that sent those ids
+    evs = [_ev(99_000, 50, 20) for _ in range(400)]
+    as_gw = [RequestEvent(**{**e.__dict__, "req_id": e.client_id, "client_id": None}) for e in evs]
+    assert _mis_draws(as_gw)[1] > 0 and _mis_draws(as_gw) == _mis_draws(evs)
 
 
 def test_window_eviction():

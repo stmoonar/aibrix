@@ -20,7 +20,9 @@ Composition (v1 faithful)::
   policy gates Tier-2 itself.
 * **N_T2** (Tier-2), its own count across windows (upstream ``num_inst_lookahead``), starting
   at the awake count. A window start resets it to ``min_replicas`` and forgets the credited
-  overload episodes (``t2_reset_at_window``, v1 D54 #2: the window starts at ``N_{i+1}``).
+  overload episodes (``t2_reset_at_window``, v1 D54 #2: the window starts at ``N_{i+1}``). This
+  reset happens even while Tier-2 is frozen (as v1 ``_compose_faithful``): ``frozen`` means
+  Tier-2 made no evidence-driven change, not that ``N_T2`` stayed constant.
   Every tick, per awake pod, the load-look-ahead map ``U`` (:mod:`preserve_anticipator`):
 
   - **overload** (v1 D55, sliding look-ahead): a pod is overloaded when, for any start offset
@@ -215,6 +217,9 @@ class PreServePolicy:
         if self.window_s <= 0:
             raise ValueError("preserve: window_s must be > 0")
         self.lead_s = float(params.get("lead_s", 0.0))
+        if self.lead_s != 0.0 and str(params.get("tier1", "mlstm")) == "mlstm":
+            raise ValueError("preserve: lead_s must be 0 with tier1 mlstm (an early window start would close "
+                             "the observed window before it ends)")
         self.mode = str(params.get("tier1", "mlstm"))
         if self.mode not in tier1.TIER1_MODES:
             raise ValueError(f"preserve: tier1 must be one of {tier1.TIER1_MODES}")

@@ -59,7 +59,9 @@ def default_path(trace_path: str) -> str:
 
 def _pre_t0_rows(doc: Mapping[str, Any], window_s: float) -> dict[str, list]:
     """``{model: [[P, D], ...]}`` of a ``tre-pre-t0-v1`` document (contiguous, ending at t0)."""
-    t0 = float(doc.get("t0_s", 0.0))
+    if not isinstance(doc.get("t0_s"), (int, float)):
+        raise HistoryError("history: t0_s missing")
+    t0 = float(doc["t0_s"])
     wins = doc.get("windows")
     if not isinstance(wins, Mapping):
         raise HistoryError("history: windows missing")
@@ -94,9 +96,10 @@ def parse(doc: Any, *, window_s: float, models: Sequence[str], seq_len: int,
         raise HistoryError("history: window_s missing") from None
     if abs(w - float(window_s)) > 1e-9:
         raise HistoryError(f"history: window_s {w} != the policy's {window_s}")
-    if trace is not None and doc.get("trace") not in (None, trace):
+    # fail closed: the file must say which trace (and, for a .../seed<k>/ path, which seed) it is for
+    if trace is not None and doc.get("trace") != trace:
         raise HistoryError(f"history: for trace {doc.get('trace')!r}, the replayed trace is {trace!r}")
-    if seed is not None and doc.get("seed") is not None and int(doc["seed"]) != int(seed):
+    if seed is not None and (doc.get("seed") is None or int(doc["seed"]) != int(seed)):
         raise HistoryError(f"history: for seed {doc.get('seed')}, the replayed trace is seed {seed}")
     rows_all = _pre_t0_rows(doc, w) if fmt == PRE_T0_FORMAT else doc.get("models")
     if not isinstance(rows_all, Mapping):

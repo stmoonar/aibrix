@@ -124,6 +124,12 @@ expect("decision validity: half the ticks refused", not r["valid"] and "tick cov
 r = bt.decision_validity([{**d, "inputs": {"frozen": False}} for d in dv], 1000, 60.0, 5.0)
 expect("decision validity: clean run", r["valid"])
 expect("frozen by reason", bt.is_frozen({"reason": "tier1_window+tier2_frozen", "inputs": {}}))
+r = bt.decision_validity([{**d, "inputs": {"frozen": False}} for d in dv], 1000, 60.0, 5.0, models=["a", "b"])
+expect("decision validity: a silent model fails", not r["valid"] and r["models"]["b"]["ticks"] == 0)
+r = bt.decision_validity([{**d, "inputs": {"frozen": False, "anom": {"no_client_id": 1}}} for d in dv[:1]] + dv[1:2]
+                         + [{**d, "inputs": {"frozen": False}} for d in dv[2:]], 1000, 60.0, 5.0, max_frozen=0.1)
+expect("decision validity: a draw without the client id fails", not r["valid"]
+       and "x-tre-request-id" in " ".join(r["invalid_because"]))
 
 # ---- file-based commands
 tmp = tempfile.mkdtemp()
