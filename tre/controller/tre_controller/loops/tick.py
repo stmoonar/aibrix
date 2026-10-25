@@ -295,6 +295,9 @@ def run_planner_tick(
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
         # C1: earlier rescue targets the decision windows do not reflect yet.
         rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
+        # H3 exempt basis (2026-10-26): scale-ups of any path the decision signal does
+        # not reflect yet - they hold the O1-exempt free-GPU step (same release rule).
+        unsettled_upscales=_unsettled_upscales(snapshot, queue, registry, contexts) if rescue_due else None,
         # Review P2-1: relays the SM answered with nothing done on a still-current view.
         relay_holds=_relay_holds(queue),
     )
@@ -605,13 +608,53 @@ def _rescue_bases(
         # stamped at the restart, the SM may still be waking - review P2-a) or one covered
         # by a probe preemption (its unhide still to come) keeps the fallback.
         observed = int(getattr(record, "seq", 0) or 0) > 0
-        settle_ms = 0.0 if observed and _o1_tracks(context) else rescue_settle_ms(registry, model)
-        if record.done_ms is not None and metrics.window_start_ms >= record.done_ms + settle_ms:
-            continue  # settled: the signal describes the new replica count
-        if record.done_ms is not None and _o1_settled(context, int(record.done_ms)):
-            continue  # O1: decided on evidence gathered after the scale-up's breakpoint
+        if record.done_ms is not None and _scale_up_reflected(
+            metrics, context, int(record.done_ms), observed=observed, registry=registry, model=model
+        ):
+            continue
         bases[model] = RescueBasis(base=int(record.base), covered=int(record.covered))
     return bases
+
+
+def _scale_up_reflected(
+    metrics, context: dict | None, done_ms: int, *, observed: bool, registry: Registry | None, model: str
+) -> bool:
+    """C1 / H3 settle rule of a completed scale-up: the decision window starts after it
+    (plus ``rescue_settle_ms`` unless O1 tracks the model and this process observed the
+    completion), or O1 decided on evidence gathered after its breakpoint."""
+    settle_ms = 0.0 if observed and _o1_tracks(context) else rescue_settle_ms(registry, model)
+    if metrics.window_start_ms >= done_ms + settle_ms:
+        return True  # settled: the signal describes the new replica count
+    return _o1_settled(context, done_ms)  # O1: evidence gathered after the breakpoint
+
+
+def _unsettled_upscales(
+    snapshot: MetricsSnapshot,
+    queue: PlannerQueue,
+    registry: Registry | None = None,
+    contexts: dict[str, dict] | None = None,
+) -> dict[str, int]:
+    """H3 exempt basis (2026-10-26): model -> when its last scale-up (any path: rescue,
+    LOW rescue / fairness, relay receiver, SafeScale receiver target -
+    ``ActionQueue.last_upscales``) returned, while the model's decision signal does not
+    reflect it yet (:func:`_scale_up_reflected`, the rescue-basis rule). The planner
+    holds an O1-exempt CRITICAL receiver on it: one stale window buys one wake, whichever
+    path made the earlier one. Only the exempt path reads it - C1's base / covered stay
+    the rescue targets'."""
+    read = getattr(queue, "last_upscales", None)
+    if not callable(read):
+        return {}
+    pending: dict[str, int] = {}
+    for model, (done_ms, observed) in read().items():
+        metrics = snapshot.models.get(model)
+        if metrics is None:
+            continue
+        if not _scale_up_reflected(
+            metrics, (contexts or {}).get(model), int(done_ms), observed=bool(observed), registry=registry,
+            model=model,
+        ):
+            pending[model] = int(done_ms)
+    return pending
 
 
 def _o1_settled(context: dict | None, done_ms: int) -> bool:

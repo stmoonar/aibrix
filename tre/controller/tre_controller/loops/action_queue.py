@@ -306,6 +306,11 @@ class ActionQueue:
         #: view-pending gate. An unhide (probe rollback) holds like "down": a CRITICAL
         #: receiver passes, LOW receivers and donors wait for a view showing it.
         self._view_change: dict[str, tuple[int, str]] = {}
+        #: 2026-10-26 (H3 exempt basis): model -> (when the last SM call that may have
+        #: added routable replicas to it returned - any scale-up path: rescue, LOW,
+        #: fairness, relay receiver, SafeScale receiver target -, observed by this
+        #: process). See :meth:`last_upscales`. Durable with the scale memory.
+        self._last_upscale: dict[str, tuple[int, bool]] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
         #: Review P2-1 (2026-10-06): (donor, receiver) -> the hold of a relay the SM
@@ -486,6 +491,18 @@ class ActionQueue:
         relay records both sides (donor "down", receiver "up"); a call that changed
         nothing (``taken: 0``, a relay side with no pair) records nothing (2026-10-02)."""
         return dict(self._view_change)
+
+    def last_upscales(self) -> dict[str, tuple[int, bool]]:
+        """H3 exempt basis (2026-10-26): model -> (when its last scale-up SM call
+        returned, observed). Every call stamped with the "up" view-hold rule counts - a
+        scale-up / wake (any planner path: rescue, LOW, fairness), a relay's receiver
+        side, a SafeScale receiver target - also a failed one that changed pods; a call
+        that certainly changed nothing is not stamped (see ``_stamp_changes``). An
+        unhide is not a scale-up (it holds like "down"). ``observed`` False = restored
+        from the durable scale memory of a previous controller. Not overwritten by a
+        later scale-down: the planner tick holds the O1-exempt free-GPU step until the
+        decision signal reflects this scale-up (``_unsettled_upscales``)."""
+        return dict(self._last_upscale)
 
     def relay_holds(self) -> dict[tuple[str, str], RelayHold]:
         """Review P2-1: (donor, receiver) -> :class:`RelayHold` of its last relay when
@@ -1273,11 +1290,17 @@ class ActionQueue:
                         done_ms=now if done is None or int(rescue.get("outstanding", 0)) > 0 else int(done),
                     )
                     self._restored_unchecked.add(str(model))
+                last_up = entry.get("last_up")
+                if last_up is not None and not (max_age is not None and max_age > 0 and now - int(last_up) > max_age):
+                    # Not observed by this process: the tick releases it by the window
+                    # rule with the EMA extension (like a restored rescue target).
+                    self._last_upscale[str(model)] = (int(last_up), False)
             except (KeyError, TypeError, ValueError, IndexError) as exc:
                 LOG.warning("scale memory of %s ignored: %r", model, exc)
-        if self._rescue or self._last_done:
+        if self._rescue or self._last_done or self._last_upscale:
             LOG.info(json.dumps({"event": "scale_memory_restored", "rescue": sorted(self._rescue),
-                                 "last_done": sorted(self._last_done)}, sort_keys=True))
+                                 "last_done": sorted(self._last_done),
+                                 "last_up": sorted(self._last_upscale)}, sort_keys=True))
 
     def check_restored_targets(self, routable: Mapping[str, int]) -> list[str]:
         """C1 review P3-1: once, at the first tick after a restart, drop every restored
@@ -1305,8 +1328,10 @@ class ActionQueue:
             return
         last = self._last_done.get(model)
         record = self._rescue.get(model)
+        last_up = self._last_upscale.get(model)
         entry = {
             "last_done": list(last) if last else None,
+            "last_up": int(last_up[0]) if last_up else None,
             "rescue": None if record is None else {
                 "target": record.target, "desired": record.desired, "base": record.base,
                 "covered_before": record.covered_before, "issued_ms": record.issued_ms,
@@ -1542,6 +1567,9 @@ class ActionQueue:
         def stamp(target: str, direction: int, hold: str) -> None:
             self._routable_change[target] = (now, direction)
             self._view_change[target] = (now, hold)
+            if hold == "up":
+                self._last_upscale[target] = (now, True)
+                self._persist_scale_memory(target)
             if self._on_fleet_change is not None:
                 try:
                     self._on_fleet_change()

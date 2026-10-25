@@ -488,6 +488,7 @@ def build_plan(
     rescue_bases: Mapping[str, RescueBasis] | None = None,
     view_pending: Mapping[str, str] | None = None,
     relay_holds: Mapping[tuple[str, str], RelayHold] | None = None,
+    unsettled_upscales: Mapping[str, int] | None = None,
 ) -> PlanResult:
     """One plan. Quantity only for the immediate relays (2026-10-02): a CRITICAL / LOW
     receiver's need is met first from free capacity (its sleeping bindings on free
@@ -498,7 +499,9 @@ def build_plan(
     what this tick already took from it. Whatever the relays cannot cover is planned
     again on the next tick from a new view (free capacity first). ``relay_holds``
     ((donor, receiver) -> :class:`RelayHold`): pairs the SM answered with nothing
-    done on the fleet view that is still current - not planned again."""
+    done on the fleet view that is still current - not planned again.
+    ``unsettled_upscales`` (model -> done ms): its last scale-up, of any path, that the
+    decision signal does not reflect yet - holds an O1-exempt receiver (H3)."""
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
     # out a retry backoff. A CRITICAL receiver among them is still planned: the
@@ -696,6 +699,7 @@ def build_plan(
         return needed, min(needed, max(0, recv_assigned - recv_pods))
 
     rescue_bases = rescue_bases or {}
+    unsettled_upscales = unsettled_upscales or {}
     c1 = cfg.rescue_max_step_ratio > 0
     if cfg.rescue_due:
         # C1: (desired, base, covered) of each CRITICAL receiver planned this tick.
@@ -742,13 +746,20 @@ def build_plan(
                 # on evidence, not time. Before, a landed target released it and the next
                 # step re-asked rescue_desired from the new count with the old window's Z
                 # (the old count's): it climbed to max_awake on one stale window.
-                if basis is not None or (
+                # 2026-10-26: an earlier scale-up of ANY path holds it the same way
+                # (``unsettled_upscales``: LOW rescue / fairness wakes, relays, SafeScale
+                # receiver targets leave no rescue target). Smoke 20261026: a LOW wake
+                # 1 -> 2 divided the old window's tokens by 2 (Z 0.97 -> 0.35, flat
+                # load) and the exempt path stacked a third replica 5 s later.
+                upscale_ms = unsettled_upscales.get(recv.model_name)
+                if basis is not None or upscale_ms is not None or (
                     view_pending and recv.model_name in view_pending
                 ):
                     events.append(
                         f"receiver_o1_exempt_pending:{recv.model_name}"
                         f":covered={basis.covered if basis is not None else None}:routable={recv_pods}"
                         f":view_pending={bool(view_pending and recv.model_name in view_pending)}"
+                        f":upscale_ms={upscale_ms}"
                     )
                     return None
             base = basis.base if basis is not None else recv_pods

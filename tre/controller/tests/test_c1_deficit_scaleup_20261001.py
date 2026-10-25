@@ -554,6 +554,8 @@ def test_scale_memory_survives_a_controller_restart():
         before.base, before.target, before.covered, 65_000,
     )
     assert restarted.last_actions() == {"critical": (65_000, "up")}
+    # H3 exempt basis: the scale-up is restored too, as not observed by this process.
+    assert restarted.last_upscales() == {"critical": (65_000, False)}
     # The restarted controller holds on the unreflected window instead of waking again.
     held = run_rescue_tick(_snapshot(20_000), queue=restarted, registry=_registry())
     assert held.submitted == 0

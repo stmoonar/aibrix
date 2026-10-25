@@ -213,3 +213,61 @@ def test_queue_rise_counts_only_pods_of_both_samples_and_ignores_jitter():
 
     noisy = _after_scale_up({"m-0": (31.0, 21.0), "m-1": (0.0, 0.0)})
     assert noisy.model_contexts["m"]["o1_queue_rise"] is None
+
+
+def test_low_wake_holds_the_exempt_free_gpu_step_until_o1_settles():
+    """Smoke 20261026 regression (any scale-up path is the exempt step's basis): a LOW
+    model woke 1 -> 2 (``low_rescue_sleeping_capacity``, no rescue target); the next
+    window still straddles that breakpoint and, its old tokens spread over 2 replicas,
+    shows a lower Z -> CRITICAL, O1-exempt, free GPUs. One stale window buys one wake:
+    no second wake on it. Once O1 decides on evidence after the breakpoint and the
+    receiver is still CRITICAL, the next step is planned."""
+    import asyncio
+
+    from tre_controller.loops.action_queue import ActionQueue
+
+    class _Client:
+        async def set_binding_power(self, serve_id, *, awake):
+            return {"ok": True}
+
+        async def scale_model(self, model, delta, **_kwargs):
+            return {"ok": True}
+
+    def ups(result):
+        return [(a.model, a.delta, a.reason) for a in result.actions if isinstance(a, ScaleAction) and a.delta > 0]
+
+    low_load, stale_load = (2600.0, 30.0, 20.0, 100.0), (1000.0, 30.0, 20.0, 100.0)  # Z 0.95 (LOW), ~0.36
+    registry = _registry(10_000.0)
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    base = 4_000_000
+    _prime_onset(state, base - 10 * GRID)
+    now = {"ms": base}
+    queue = ActionQueue(_Client(), now_ms=lambda: now["ms"])
+
+    def tick(end, grids, routable):
+        return run_planner_tick(_snap(_window(end, [grids] * 3, routable=routable)), queue=queue, registry=registry,
+                                rescue_due=True, fairness_due=False,
+                                cluster_view=_view(routable, fetched_ms=end + 3_000), signal_state=state)
+
+    first = tick(base, low_load, 1)
+    assert ups(first) == [("m", 1, "low_rescue_sleeping_capacity")]
+    now["ms"] = base + 1_500
+    asyncio.run(queue.drain_once())  # the wake returns: 2 routable replicas
+
+    held = tick(base + GRID, stale_load, 2)
+    ctx = held.model_contexts["m"]
+    assert ctx["signal_warm"] is False and ctx["signal_hold_reason"] == "no_suffix"
+    assert held.classifications["m"].state == ModelState.CRITICAL
+    assert ups(held) == []  # free GPUs m-2 / m-3, but the stale window already bought its wake
+    assert any(e.startswith("receiver_o1_exempt_pending:m:") for e in held.events)
+    assert not any(e.startswith("receiver_o1_exempt_free_gpu:m") for e in held.events)
+
+    steps = {}
+    for k in (2, 3, 4):
+        result = tick(base + k * GRID, stale_load, 2)
+        steps[k] = (result.model_contexts["m"]["signal_warm"], ups(result))
+        if steps[k][1]:
+            break
+    warm_at = next(k for k, (warm, _) in steps.items() if warm)
+    assert all(not planned for k, (_, planned) in steps.items() if k < warm_at)
+    assert steps[warm_at][1] and steps[warm_at][1][0][0] == "m"  # settled on new evidence: next step
