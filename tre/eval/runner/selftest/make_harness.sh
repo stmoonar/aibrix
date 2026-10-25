@@ -13,7 +13,8 @@ case "$a" in
   *"get svc"*clusterIP*) echo 127.0.0.1 ;;
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SAFESCALE*) cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SLOW_LOOP*) cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || true ;;
-  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; esac; done ;;
+  *"get deploy tre-v2-controller"*TRE_SAFESCALE_SCOPE*) cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null || true ;;
+  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; esac; done ;;
   *"logs deploy/tre-v2-controller"*) [ -e $S/no_switch_line ] || printf '{"level": "INFO", "logger": "tre_controller", "message": "{\\"disable_safescale\\": %s, \\"disable_slow_loop\\": %s, \\"event\\": \\"ablation_switches\\"}", "time": "2026-10-08 11:01:00,916"}\n' \
       "$(cat $S/switch_line_safescale 2>/dev/null || cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || echo false)" "$(cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || echo false)" ;;
   *"get deploy tre-v2-baseline-scaler"*replicas*) cat $S/scaler_replicas 2>/dev/null || echo 0 ;;
@@ -164,7 +165,15 @@ json.dump({"version": 1, "models": {}, "bindings": [{"binding_id": i, "awake": T
 EOF
 # ---------- tools
 cp $SRC/run_arm_pilot.sh $SRC/reset_canonical.sh $SRC/run_pilot.sh $SRC/baseline_sanity.sh $SRC/bl_tools.py $SRC/score_pilot.py \
-   $SRC/lib_env.sh $SRC/runner.env.example $SRC/clock_probe.py $SRC/components.py $SRC/k8s_names.py $H/tools/
+   $SRC/lib_env.sh $SRC/runner.env.example $SRC/clock_probe.py $SRC/components.py $SRC/k8s_names.py \
+   $SRC/first_run_check.py $H/tools/
+# 2026-10-26: collect_redis.py stub (the fake redis has no ZSET / HSCAN): the two files it writes, empty
+cat > $H/tools/collect_redis.py <<'EOF'
+import sys
+for f in ("decision_hist.jsonl", "sm_operations.jsonl"):
+    open(sys.argv[1] + "/" + f, "w").close()
+print("stub collect_redis")
+EOF
 printf 'import os,sys,time\nd=sys.argv[1]\nfor _ in range(600):\n    if os.path.exists(d+"/STOP"): break\n    time.sleep(0.05)\n' > $H/tools/sampler.py
 printf 'import json,sys\njson.dump({}, open(sys.argv[1],"w"))\n' > $H/tools/snap.py
 printf 'print("analyze ok")\n' > $H/tools/analyze.py

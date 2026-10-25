@@ -14,7 +14,7 @@ fi
 # exported: sampler.py / snap.py / clock_probe.py / components.py read them
 export TRE_NS MODEL_NS APA_NS AIBRIX_NS ENVOY_NS MODEL_SELECTOR SIDECAR_CONTAINER ENGINE_PORT MODELS \
   CLOCK_NODES CLOCK_SSH_OPTS SAMPLE_LAYOUT_S SAMPLE_PODS_S SAMPLE_GAUGES_S SAMPLE_APA_S SAMPLE_GPU_TRUTH_S \
-  SAMPLE_RESOURCES_S POD_LIST_REFRESH_S BL_NS GW_NS
+  SAMPLE_RESOURCES_S POD_LIST_REFRESH_S BL_NS GW_NS BL_DEPLOY SAMPLE_CADENCE_S
 need_env() {   # need_env VAR ... : refuse when a required setting is empty
   local v
   for v in "$@"; do
