@@ -53,6 +53,7 @@ def run_tick_replay(
     signal_state: SignalState | None = None,
     paper_state_cache: PaperStateCache | None = None,
     queue: object | None = None,
+    safescale_scope: str = "all",
 ) -> TickReplayResult:
     """``safescale`` None = no SafeScale: every shrink that would start a probe is
     released immediately (urgent donor path, reason suffix ``_nosafescale``; since
@@ -62,7 +63,8 @@ def run_tick_replay(
     signal path - the O1 breakpoint window, the EMAs, the saturation tracker, the
     missing-token fallback - kept across steps (and across calls, for a closed-loop
     replay that calls this once per tick); None = stateless, as before. ``queue``: where
-    the actions go (default: a :class:`ReplayQueue` that records them)."""
+    the actions go (default: a :class:`ReplayQueue` that records them).
+    ``safescale_scope``: TRE_SAFESCALE_SCOPE, as the live loops pass it."""
     queue = queue if queue is not None else ReplayQueue()
     results: list[LoopTickResult] = []
     actions: list[Action] = []
@@ -85,6 +87,7 @@ def run_tick_replay(
             safescale=safescale,
             signal_state=signal_state,
             paper_state_cache=paper_state_cache,
+            safescale_scope=safescale_scope,
         )
         results.append(result)
         actions.extend(result.actions)

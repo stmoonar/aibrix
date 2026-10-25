@@ -337,10 +337,10 @@ func TestTREBoundaryRetriedAfterExecFailure(t *testing.T) {
 	require.Equal(t, "1010000", cadence["last_hist_ms"])
 }
 
-// Review round 3 (L3): a histogram doc that cannot be built (a NaN sum: json.Marshal
-// refuses it) does not move lastHistT; once it can be built the same boundary is
-// written by the next round.
-func TestTREBoundaryRetriedAfterHistogramBuildError(t *testing.T) {
+// Review round 6 (M2): a NaN histogram value of one pod (json.Marshal refuses it) does
+// not freeze the cadence for every model: the value is left out of that pod's doc, the
+// boundary is written and declared (last_hist_ms), the planner moves on.
+func TestTRENonFiniteHistogramDoesNotFreezeTheCadence(t *testing.T) {
 	t.Setenv("TRE_REDIS_SCHEMA", "v2")
 	store, client := newTREMetricStoreForTest(t)
 	store.treCadence = treWriteCadence{instant: 500 * time.Millisecond, evidence: 2 * time.Second}
@@ -350,28 +350,25 @@ func TestTREBoundaryRetriedAfterHistogramBuildError(t *testing.T) {
 	metaPod, ok := store.metaPods.Load(podKey)
 	require.True(t, ok)
 	ttftKey := store.getPodModelMetricName("dsqwen-7b", metrics.TimeToFirstTokenSeconds)
-	good, ok := metaPod.ModelMetrics.Load(ttftKey)
+	_, ok = metaPod.ModelMetrics.Load(ttftKey)
 	require.True(t, ok)
 	metaPod.ModelMetrics.Store(ttftKey, &metrics.HistogramMetricValue{Sum: math.NaN(), Count: 2, Buckets: map[string]float64{"+Inf": 2}})
 
-	_, err := runTRERound(ctx, store, p, 1_010_000)
-	require.Error(t, err)
-	require.Equal(t, int64(1_008_000), p.lastHistT)
-	inst, err := client.ZCard(ctx, treV2InstantKeyPrefix+podKey).Result()
-	require.NoError(t, err)
-	require.Equal(t, int64(1), inst) // the instant doc of the round is written
-	// Round 5 (L2): the boundary is not declared written while a doc of it is missing.
-	declared, err := client.HGet(ctx, treV2CadenceKey, "last_hist_ms").Result()
-	require.ErrorIs(t, err, redis.Nil, declared)
-
-	metaPod.ModelMetrics.Store(ttftKey, good)
-	r, err := runTRERound(ctx, store, p, 1_010_500)
+	r, err := runTRERound(ctx, store, p, 1_010_000)
 	require.NoError(t, err)
 	require.Equal(t, int64(1_010_000), r.histStamp)
 	require.Equal(t, int64(1_010_000), p.lastHistT)
-	declared, err = client.HGet(ctx, treV2CadenceKey, "last_hist_ms").Result()
+	declared, err := client.HGet(ctx, treV2CadenceKey, "last_hist_ms").Result()
 	require.NoError(t, err)
 	require.Equal(t, "1010000", declared)
+	// The non-finite histogram is left out; it is this pod's only one, so the pod has no
+	// doc at the boundary (the controller flags it per pod) - the instant doc is there.
+	hist, err := client.ZCard(ctx, treV2HistogramKeyPrefix+podKey).Result()
+	require.NoError(t, err)
+	require.Zero(t, hist)
+	inst, err := client.ZCard(ctx, treV2InstantKeyPrefix+podKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), inst)
 }
 
 // Review round 3 (L4): of two overlapping scrapes of one pod, the older fetch that

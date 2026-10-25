@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime/debug"
 	"strings"
@@ -166,10 +167,13 @@ var treHistogramMetricNames = map[string]struct{}{
 // samples. The v1 legacy keys (one SET per doc, 2 h TTL) stay on the 10 s grid of
 // RequestTraceWriteInterval whatever the TRE periods, so their key count is unchanged.
 //
-// It returns histWritten = the round's histogram docs were all built and EXEC
-// succeeded (review round 3, L3): only then may the planner move lastHistT. A schema
-// error, a per-pod build error (e.g. a NaN json.Marshal refuses) or a failed EXEC
-// leaves the boundary to be retried on the next round.
+// It returns histWritten = the round's histogram boundary was written: EXEC succeeded
+// (review round 3, L3); only then may the planner move lastHistT. A schema error or a
+// failed EXEC leaves the boundary to be retried on the next round. Review round 6
+// (M2): one pod cannot stop the boundary for every model - a non-finite histogram
+// value is left out of its doc (collectTREHistogramMetrics), and a pod doc that still
+// cannot be built is skipped alone (that pod lacks the boundary's doc: the controller's
+// per-pod completeness flags it) while the boundary is declared written.
 func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (histWritten bool, err error) {
 	if c.redisClient == nil {
 		return false, nil
@@ -230,7 +234,8 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (
 			doc["timestamp"] = round.histStamp
 			doc["model_histogram_metrics"] = histogramMetrics
 			if err := queueTREMetricDocument(ctx, pipe, podKey, round.histStamp, doc, true, legacyRound, writeV2); err != nil {
-				histOK = false
+				// Round 6 (M2): this pod's doc only; the boundary still advances.
+				klog.ErrorS(err, "TRE histogram doc skipped", "pod", podKey, "boundary", round.histStamp)
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -392,6 +397,12 @@ func collectTREHistogramMetrics(metaPod *Pod) (map[string]any, map[string]struct
 		if !ok {
 			return true
 		}
+		if !finiteHistogram(histValue) {
+			// Review round 6 (M2): JSON has no NaN / Inf - left out, the rest of the
+			// pod's doc is written (the controller sees this histogram missing).
+			klog.V(1).InfoS("TRE histogram with a non-finite value left out", "pod", metaPod.Name, "metric", key)
+			return true
+		}
 		values[key] = map[string]any{
 			"sum":     histValue.GetSum(),
 			"count":   histValue.GetCount(),
@@ -401,6 +412,19 @@ func collectTREHistogramMetrics(metaPod *Pod) (map[string]any, map[string]struct
 		return true
 	})
 	return values, models
+}
+
+func finiteHistogram(h *metrics.HistogramMetricValue) bool {
+	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	if !finite(h.GetSum()) || !finite(h.GetCount()) {
+		return false
+	}
+	for _, v := range h.Buckets {
+		if !finite(v) {
+			return false
+		}
+	}
+	return true
 }
 
 func splitPodModelMetricKey(key string) (string, string, bool) {

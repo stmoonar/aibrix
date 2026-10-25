@@ -128,6 +128,12 @@ def run_safescale_observation_tick(
         accepted_actions.extend(rolled_back)
         submitted += len(rolled_back)
     if snapshot.stale:
+        if not observe_mode:
+            # Review round 6 (M2): no probe is judged on a stale snapshot; one past its W
+            # ceiling is rolled back (unhidden) rather than held until the gateway recovers.
+            stale = _rollback_stale_past_ceiling(queue, safescale, now_ms=snapshot.ts_ms, events=events)
+            accepted_actions.extend(stale)
+            submitted += len(stale)
         return SafeScaleObservationResult(
             submitted=submitted, actions=tuple(accepted_actions), events=tuple(events) + ("snapshot_stale",)
         )
@@ -454,6 +460,17 @@ def _rollback_aborted(queue, safescale, *, now_ms: int, events: list[str]) -> li
     )
 
 
+def _rollback_stale_past_ceiling(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
+    past = getattr(safescale, "probes_past_ceiling", None)
+    probes = past() if callable(past) else []
+    if not probes:
+        return []
+    return rollback_probes(
+        queue, safescale, probes, reason="stale_past_ceiling", event="safescale_stale_rollback",
+        now_ms=now_ms, events=events,
+    )
+
+
 def rollback_probes_for_observe(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
     """Observe mode (user decision 2026-09-28): every ``probing`` probe is rolled
     back. Its queued one-shot actions (if any) are dropped and the single action
@@ -756,9 +773,11 @@ def _tail_terms(
     span = end - start
     hidden = set(hidden_pods)
     remaining = [pod for key, pod in (window.per_pod or {}).items() if key not in hidden and pod.pod not in hidden]
-    counts = [float(count) for count in (observed_requests(pod) for pod in remaining) if count is not None]
-    # No remaining pod with a count (a synthetic window): the window's own, None = unknown.
-    requests = sum(counts) if counts else observed_requests(window)
+    if window.per_pod:
+        # Review round 6 (L2): the remaining pods only (a pod without a count adds 0).
+        requests = sum(float(observed_requests(pod) or 0.0) for pod in remaining)
+    else:  # a synthetic window without a per-pod split: its own count, None = unknown
+        requests = observed_requests(window)
     observed = observed_of(window)
     terms = {
         "tail_start_ms": start,

@@ -47,6 +47,24 @@ def test_only_the_receiverless_high_shrink_runs_as_a_probe():
     ]
 
 
+def test_a_same_slot_preemption_sleeps_its_pod_at_once_and_starts_no_probe():
+    # Review round 6 (L1): the TP same-slot preemption has a beneficiary - immediate.
+    from tre_controller.loops.tick import _apply_safescale
+    from tre_controller.planning.planner import ShrinkForSlotAction
+
+    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    same_slot = ShrinkForSlotAction(
+        donor="high", beneficiary="tp2", serve_id="high-0", slot=None,
+        reason="critical_same_slot_high_shrink", source_loop="rescue",
+    )
+    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (same_slot,), {},
+                              safescale=machine, safescale_scope=SCOPE)
+    [sleep] = out
+    assert (sleep.model, sleep.delta, sleep.pods, sleep.sleep_path) == ("high", -1, ("high-0",), "urgent")
+    assert sleep.reason == "critical_same_slot_high_shrink_nosafescale"
+    assert machine.active_probe("high") is None
+
+
 @pytest.mark.parametrize(("env", "scope"), [
     ({}, "all"),
     ({"TRE_ABLATION_DISABLE_SAFESCALE": "true"}, "off"),

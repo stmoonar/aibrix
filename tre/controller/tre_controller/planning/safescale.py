@@ -389,6 +389,19 @@ class SafeScaleStateMachine:
             self._persist_probe(probe)
         return len(probe.pods)
 
+    def probes_past_ceiling(self, now_ms: int | None = None) -> list[SafeScaleProbe]:
+        """Review round 6 (M2): probing probes whose W ceiling (:func:`_deadline_cap`)
+        has passed on the controller clock (``now_ms``, else the wall clock). While the
+        snapshots are stale no probe is judged; past its ceiling a probe is rolled back
+        (unhidden) instead of keeping its pods hidden until the gateway recovers."""
+        now = now_ms if now_ms is not None else self._wall_ms()
+        if now is None:
+            return []
+        return [
+            probe for probe in self._probes.values()
+            if probe.status == "probing" and int(now) >= _deadline_cap(probe, self._config)
+        ]
+
     def abort_probe(self, model: str, *, pods: tuple[str, ...], reason: str) -> bool:
         """P3: the hide of ``pods`` did not take effect - mark the ``probing`` probe
         owning them for rollback (the SafeScale loop rolls it back, unhiding its
@@ -1053,6 +1066,14 @@ class SafeScaleStateMachine:
         audit = {**tail_audit, **latency_audit}
         if tail_low_evidence:
             audit["tail_low_evidence"] = True
+        min_tail = int(getattr(self._config, "min_commit_samples", 20) or 0)
+        if (
+            not failures and summary.has_traffic and summary.tail_observed_ms is not None
+            and float(summary.tail_requests or 0.0) < min_tail
+        ):
+            # Round 6: a commit on a tail with fewer than min_commit_samples requests (a
+            # whole-window tail, or the ceiling) - counted apart in the audit.
+            audit["tail_low_requests"] = True
         if early is not None:
             audit["early_commit"] = {key: value for key, value in early.items() if key != "deadline_ms"}
         details: dict[str, Any] = {
@@ -1476,6 +1497,11 @@ class SafeScaleStateMachine:
             return None
         if poll.request_id != probe.request_id or probe.window_base_ms is None:
             return None
+        if probe.hide_anchor is None or probe.hide_anchor.newest_doc_ts_ms is None:
+            # Review round 6 (L3): the gateway-clock floor needs the newest gateway doc
+            # at the hide; a start from Redis / controller time could pass it at once
+            # under a node clock skew. The deadline decides instead.
+            return None
         state = probe.direct
         window = state.last if state is not None else None
         if window is None or window.coverage_end_ms is None or int(window.end_ms) != int(wall_now_ms):
@@ -1632,7 +1658,7 @@ class SafeScaleStateMachine:
                 return None
             min_samples = int(getattr(self._config, "min_commit_samples", 20) or 0)
             requests = observation.tail_requests
-            if min_samples > 0 and requests is not None and float(requests) < min_samples:
+            if min_samples > 0 and (requests is None or float(requests) < min_samples):
                 return None
             ttft, tpot = observation.tail_ttft_p95_ms, observation.tail_tpot_p95_ms
         else:
@@ -2204,7 +2230,8 @@ def _summarize_tail(
         # (the planner's own evidence unit - a sliding window gains no requests by waiting).
         requests = newest.tail_requests
         whole = newest.window_start_ms is not None and int(newest.tail_start_ms) <= int(newest.window_start_ms)
-        evidence_ok = not has_traffic or requests is None or whole or float(requests) >= float(min_requests)
+        # Round 6 (L2): an unknown count is not enough.
+        evidence_ok = not has_traffic or whole or (requests is not None and float(requests) >= float(min_requests))
     else:
         # No tail asked (offline / direct constructions): the whole window, as before.
         # A tail asked but not built yet: no post-hide evidence.
