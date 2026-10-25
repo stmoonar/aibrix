@@ -192,10 +192,10 @@ def test_out_of_order_unknown_and_missing_events_do_not_crash() -> None:
     assert set(m.requests) == {("y", "p0"), ("u", "p0"), ("o", "p0")}
     assert m.requests[("y", "p0")].D == 4096  # max_output_len stands in for max_tokens
     assert m.at(4095) == pytest.approx((10 + 4095) / 10_000) and m.at(4096) == 0.0
-    # the pod disappears: its map goes, a later done is just unknown
+    # the pod disappears: its map goes, a later done is counted apart
     p.decide(snap(7000, [], [ev("done", "y", "p0", 6000)], awake=0))
     assert "p0" not in p._models["m"].pods and p._models["m"].active == {}
-    assert anom["pod_dropped"] == 1 and anom["unknown_req"] == 2
+    assert anom["pod_dropped"] == 1 and anom["unknown_req"] == 1 and anom["done_pod_gone"] == 1
 
 
 def test_pod_without_kv_capacity_is_skipped_unless_configured() -> None:
@@ -280,18 +280,36 @@ def test_a_routed_request_counts_before_its_first_token() -> None:
 
 
 def test_a_slept_then_woken_pod_starts_with_an_empty_map() -> None:
-    """Events of a pod's earlier awake period (read late, or buffered while it slept) never
-    enter its map after it wakes; events routed after it left the snapshot still do."""
+    """Events of a pod's earlier awake period (read late, or routed to it until the gateway's
+    hide receipt and buffered while it slept) never enter its map after it wakes."""
     p = make()
     p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)], load("r1", "p0", 1000, 500, 100)))
-    pods1 = [pod("p1", 3000)]
-    p.decide(snap(3000, pods1, [ev("arr", "r2", "p0", 2500, 500, 100)], awake=1))  # p0 slept
+    p.decide(snap(3000, [pod("p1", 3000)], [ev("arr", "r2", "p0", 2500, 500, 100),      # read late
+                                            ev("arr", "r_late", "p0", 3050, 500, 100)],  # gateway lag
+                  awake=1))  # p0 slept
     assert "p0" not in p._models["m"].pods
-    p.decide(snap(8000, [pod("p1", 8000)], [ev("arr", "r3", "p0", 2900, 500, 100),     # read late
-                                            ev("arr", "r5", "p0", 7000, 300, 100)], awake=1))  # after its wake
-    d = p.decide(snap(9000, [pod("p0", 9000), pod("p1", 9000)], [ev("arr", "r4", "p0", 8500, 200, 100)]))
-    assert set(amap(p).requests) == {("r5", "p0"), ("r4", "p0")}
-    assert p.anomalies["m"]["buffered_stale"] == 2 and d["m"].inputs["anom"]["arr_buffered_applied"] == 1
+    p.decide(snap(8000, [pod("p1", 8000)], [ev("done", "r1", "p0", 7000)], awake=1))
+    d = p.decide(snap(13000, [pod("p0", 13000), pod("p1", 13000)],
+                      [ev("arr", "r4", "p0", 12500, 200, 100)]))
+    assert set(amap(p).requests) == {("r4", "p0")}  # r_late (routed after the drop tick) is not back
+    anom = p.anomalies["m"]
+    assert anom["buffered_stale"] == 2 and anom["done_pod_gone"] == 1 and anom["unknown_req"] == 0
+    p.decide(snap(15000, [pod("p0", 15000), pod("p1", 15000)], [ev("done", "r_late", "p0", 14000)]))
+    assert anom["done_pod_gone"] == 2 and anom["unknown_req"] == 0
+    assert "arr_buffered_applied" not in d["m"].inputs["anom"]
+
+
+def test_a_request_without_done_expires_and_holds_tier2_for_one_window() -> None:
+    """v1 parity: a lost done must not keep a request in the map; Tier-2 holds meanwhile."""
+    p = make(done_margin_s=10)  # window_s 600
+    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "r", "p0", 1000, 100, 10)]))
+    d = p.decide(snap(12_000, [pod("p0", 12_000)]))["m"]  # 11 s < 10 x 0.2 + 10 = 12 s
+    assert len(amap(p).requests) == 1 and "done_lost" not in d.inputs.get("gaps", [])
+    d = p.decide(snap(14_000, [pod("p0", 14_000)]))["m"]
+    assert amap(p).requests == {} and p.anomalies["m"]["expired_routed"] == 1
+    assert d.inputs["frozen"] is True and "done_lost" in d.inputs["t2_hold"]
+    d = p.decide(snap(614_500, [pod("p0", 614_500)]))["m"]  # one window (600 s) later
+    assert "done_lost" not in d.inputs.get("gaps", [])
 
 
 # ------------------------------------------------------------------- Tier-2 (faithful)
@@ -335,7 +353,7 @@ def test_overload_ahead_of_now_before_the_next_tick_is_caught() -> None:
 
 
 def test_scale_down_formula_once_per_window() -> None:
-    p = make()
+    p = make(done_margin_s=3600)  # the requests outlive the 600 s jump: not a lost done
 
     def pods_at(t):
         return [pod(f"p{i}", t, M=1000, kv=kv) for i, kv in enumerate((0.25, 0.2, 0.2, 0.0))]
@@ -394,7 +412,7 @@ def test_kv_disagreement_is_logged_not_a_gate() -> None:
 
 
 def test_desired_is_max_of_the_two_tiers_and_a_window_start_resets_tier2() -> None:
-    p = make(tier1="oracle")
+    p = make(tier1="oracle", done_margin_s=3600)  # the request outlives the 600 s jump: not a lost done
     pods = [pod("p0", 1000, M=1000)]
     d = p.decide(snap(1000, pods, replay=REPLAY))["m"]
     assert d.reason == "tier1_window" and (d.desired, d.inputs["n_t1"], d.inputs["n_t2"]) == (2, 2, 1)

@@ -56,13 +56,17 @@ the ``arr`` time; ``ft`` changes nothing (v1 has no first-token event). A reissu
 retry / continuation) is a new gateway request with its own ``arr`` / ``done``: a new map entry
 (Tier-1 does not count it). A request leaves the map on its ``done`` (or when its pod is gone,
 or the engine reports nothing in flight at a scrape at least ``ENGINE_IDLE_MARGIN_MS`` after its
-``arr``: a request routed just before the scrape may not have reached the engine yet, v1).
+``arr``: a request routed just before the scrape may not have reached the engine yet, v1). A
+request without ``done`` after ``max(D_hat, max_tokens) x done_tpot_bound_s + done_margin_s`` is
+expired (its ``done`` was lost, ``expired_routed``) and Tier-2 holds for one window
+(``done_lost`` gap), as v1.
 
 Events for a pod the snapshot does not show are buffered (the stream can run ahead of
 ``/v2/state`` when a pod just woke) and applied when it appears. A pod that leaves the snapshot
-(slept) drops its map and its buffer, and an event for it stamped at or before the tick that saw
-it gone is discarded, also when read later: a woken pod starts with an empty map (its earlier
-requests were interrupted and continued elsewhere).
+(slept) drops its map and its buffer, and an event for it stamped at or before the last tick
+that saw it absent is discarded, also when read later: a woken pod starts with an empty map (its
+earlier requests were interrupted and continued elsewhere; the gateway can route to a just-hidden
+pod until its hide receipt). A ``done`` of such a request counts as ``done_pod_gone``.
 
 Params (``config.policy_params``, example ``examples/preserve.yaml``):
 
@@ -105,6 +109,8 @@ t2_reset_at_window      true                   v1 D54 #2
 kv_capacity_tokens      {}                     ours: M per model when the pod lacks cache_config
 kv_agree_tol            0.15                   ours: logged only (``kv_disagree``)
 req_ttl_s               1800                   ours: forget buffered events older than this
+done_tpot_bound_s       0.2                    v1: a request without done expires after
+done_margin_s           180                    max(D_hat, max_tokens) x bound + margin (v1 D65)
 ======================  =====================  ================================================
 """
 from __future__ import annotations
@@ -166,6 +172,10 @@ class _ModelState:
     #: pod -> ``now_ms`` of the last tick that saw it leave the snapshot: an event for it
     #: stamped at or before this belongs to the earlier awake period and is discarded.
     gone_ms: dict[str, int] = field(default_factory=dict)
+    #: request key -> now_ms: requests of a slept pod (map, buffer or discarded), for ``done_pod_gone``.
+    gone_keys: dict[tuple[str, Optional[str]], int] = field(default_factory=dict)
+    #: now_ms of the last request expired without done (``done_lost`` gap for one window, v1).
+    last_done_lost_ms: Optional[int] = None
     #: active request key -> pod holding it.
     active: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
     #: (replay t0_ms, window index) of the last Tier-1 firing.
@@ -320,6 +330,10 @@ class PreServePolicy:
             raise ValueError("preserve: need lookahead_iters >= 1, map_factor >= 1, 0 < t_f <= 1, ext_frac > 0")
         self.kv_capacity = _per_model(params.get("kv_capacity_tokens"), float)
         self.req_ttl_ms = int(float(params.get("req_ttl_s", 1800.0)) * 1000)
+        self.done_tpot_bound_s = float(params.get("done_tpot_bound_s", 0.2))
+        self.done_margin_s = float(params.get("done_margin_s", 180.0))
+        if self.done_tpot_bound_s < 0 or self.done_margin_s < 0:
+            raise ValueError("preserve: done_tpot_bound_s and done_margin_s must be >= 0")
         self._models: dict[str, _ModelState] = {}
         #: Cumulative anomaly counters (per model), for tests and the run summary.
         self.anomalies: dict[str, Counter] = {}
@@ -406,12 +420,16 @@ class PreServePolicy:
             anom["pod_dropped"] += 1
             for key in list(dropped.amap.requests):
                 st.active.pop(key, None)
+                st.gone_keys[key] = int(now_ms)
             st.credited.discard(name)
             # a slept pod: its buffered and later-read earlier events must not return at its wake
             stale = st.pending.pop(name, None)
             if stale:
                 anom["buffered_stale"] += len(stale)
+                st.gone_keys.update({k: int(now_ms) for k in stale})
             st.gone_ms[name] = int(now_ms)
+        for name in [n for n in st.gone_ms if n not in keep]:
+            st.gone_ms[name] = int(now_ms)  # the limit is the last tick that saw it absent
         fallback = ms.tpot_slo_ms / 1000.0
         for name, pod in present.items():
             ps = st.pods.get(name)
@@ -460,6 +478,7 @@ class PreServePolicy:
                 return
             info = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms), e.draw_key, e.reissue != "none")
             if self._stale(st, pod, info.ts_ms, anom):
+                st.gone_keys[key] = info.ts_ms
                 return
             ps = st.pods.get(pod)
             if ps is None:  # the pod is not in the snapshot (yet): keep the request for it
@@ -483,7 +502,10 @@ class PreServePolicy:
                     self._advance_to(st, ps, int(e.ts_ms), anom)
                     ps.amap.remove(akey)
                 return
-            anom["unknown_req"] += 1  # not routed, or its pod is gone (slept)
+            if st.gone_keys.pop(key, None) is not None:
+                anom["done_pod_gone"] += 1  # its pod slept (map dropped or event discarded)
+                return
+            anom["unknown_req"] += 1
             return
         anom["bad_event"] += 1
 
@@ -529,14 +551,26 @@ class PreServePolicy:
             ps = st.pods[pod]
             for key, info in sorted(st.pending.pop(pod).items(), key=lambda kv: kv[1].ts_ms):
                 if self._stale(st, pod, info.ts_ms, anom):
+                    st.gone_keys[key] = info.ts_ms
                     continue
                 self._add(ms, st, key, info, pod, ps, anom)
                 anom["arr_buffered_applied"] += 1
 
     def _expire(self, st: _ModelState, now_ms: int, anom: Counter) -> None:
-        """Bookkeeping only: buffered events whose pod never appeared. A request in the map
-        is never expired by age (it leaves on done)."""
+        """Buffered events whose pod never appeared, and (v1) map requests whose ``done`` is
+        overdue past ``max(D_hat, max_tokens) x done_tpot_bound_s + done_margin_s``: the done
+        was lost; Tier-2 then holds for one window (``done_lost``)."""
         horizon = now_ms - self.req_ttl_ms
+        for ps in st.pods.values():
+            for key, req in list(ps.amap.requests.items()):
+                bound_s = max(req.D_pred, req.max_tokens or 0) * self.done_tpot_bound_s + self.done_margin_s
+                if now_ms - req.ts_ms > bound_s * 1000:
+                    ps.amap.remove(key)
+                    st.active.pop(key, None)
+                    st.last_done_lost_ms = int(now_ms)
+                    anom["expired_routed"] += 1
+        for key in [k for k, ts in st.gone_keys.items() if ts < horizon]:
+            del st.gone_keys[key]
         for pod in list(st.pending):
             for key in [k for k, info in st.pending[pod].items() if info.ts_ms < horizon]:
                 del st.pending[pod][key]
@@ -657,6 +691,8 @@ class PreServePolicy:
                 self._advance_to(st, ps, max(int(snap.now_ms), ps.last_ms or 0), anom)
         self._expire(st, int(snap.now_ms), anom)
         gaps = list(evidence_gaps(ms, int(snap.now_ms), tick_s, events=True))
+        if st.last_done_lost_ms is not None and int(snap.now_ms) - st.last_done_lost_ms < self.window_s * 1000:
+            gaps.append("done_lost")  # v1: a request may still run unseen
         lossy = sorted(g for g in gaps if g in ("no_event_history", "event_gap"))
         if t1m is not None and lossy:
             t1m.flag(t1m.index(int(snap.now_ms)), "+".join(lossy))

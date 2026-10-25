@@ -229,13 +229,25 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   own `in_tokens` / `max_tokens` (Tier-1 does not count it). A request leaves on its `done`
   (completion or abort), when its pod leaves the snapshot, or when the engine reports nothing in
   flight at a scrape at least 1 s after its `arr` (v1's margin: a request routed just before
-  the scrape may not have reached the engine yet).
+  the scrape may not have reached the engine yet). A request without `done` after
+  `max(D_hat, max_tokens) x done_tpot_bound_s + done_margin_s` (0.2 s/token + 180 s, v1 D65:
+  above the 150 s route timeout) is expired as a lost done (`expired_routed`), and Tier-2 holds
+  for one window (gap `done_lost`), as v1.
 - **PreServe slept pods** (2026-10-26). A pod that leaves the snapshot drops its map and its
-  buffered events, and any event for it stamped at or before the tick that saw it gone is
-  discarded (also when read later), so a woken pod starts with an empty map. Before this fix,
-  events buffered while the pod slept were applied at its wake (smoke 2026-10-26: 51 stale
-  requests, map U0 0.23 vs engine KV 0.011). Events stamped after that tick are still buffered
-  until the pod appears (the stream can run ahead of `/v2/state` after a wake).
+  buffered events, and any event for it stamped at or before the last tick that saw it absent
+  is discarded (also when read later, and also an `arr` the gateway routed to it until the
+  hide receipt), so a woken pod starts with an empty map. A `done` of such a request counts as
+  `done_pod_gone` (not `unknown_req`). Before this fix, events buffered while the pod slept were
+  applied at its wake (smoke 2026-10-26: 51 stale requests, map U0 0.23 vs engine KV 0.011).
+  Cost: an `arr` routed to a just-woken pod before the first tick that lists it is discarded too
+  (at most one tick of requests on that pod, an under-count); a pod never listed before still
+  has its early events buffered.
+- **PreServe deviations from v1** (2026-10-26). (a) v1 `_apply_pending` applied the events
+  buffered while a pod slept at its wake (the same bug as above); v2 drops them. (b) A
+  `reissue=retried` request whose original pod stays listed is in the map twice (original and
+  retry) until the original's `done`; v1 ended the original at its interruption. (c) v1's
+  `arr` de-duplication and its done-before-routed tombstones are not needed: the v2 gateway
+  writes `arr` once per request, and `arr` and `done` come in order from one gateway.
 - **T1 schema.** The service manager's structured 409 body and the new `/v2/state` fields
   are provisional (the T1 line is not merged); the shell parses both plain and structured
   refusals (and honours `retry_after_s` when present).
