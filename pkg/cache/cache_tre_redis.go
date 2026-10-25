@@ -33,8 +33,13 @@ import (
 )
 
 const (
-	treRedisSchemaEnv       = "TRE_REDIS_SCHEMA"
-	treV2RetentionMS        = int64(30 * 60 * 1000)
+	treRedisSchemaEnv = "TRE_REDIS_SCHEMA"
+	// Retention per doc kind (review round 3, M3): histogram docs keep 30 min (the
+	// controller's 90 s token-baseline lookback, SafeScale evidence, calibration
+	// backfills); instant docs - 60 per pod per 30 s window at 0.5 s - keep 5 min (one
+	// window plus margin; calibration captures spool them during a cell).
+	treV2HistRetentionMS    = int64(30 * 60 * 1000)
+	treV2InstantRetentionMS = int64(5 * 60 * 1000)
 	treV2FallbackTTL        = 2 * time.Hour
 	treV1PodMetricsTTL      = treV2FallbackTTL
 	treV2HistogramKeyPrefix = "tre:v2:hist:"
@@ -100,8 +105,9 @@ var errTREExec = errors.New("TRE round MULTI/EXEC failed")
 //     says when the counters were observed (the controller divides the token delta by
 //     that span). A late tick is no special case, and the boundary in progress when the
 //     writer (re)starts is written too.
-//   - lastHistT moves only after the round's EXEC succeeded (commit()), so a failed
-//     EXEC retries B on the next round.
+//   - lastHistT moves only after the round's histogram docs were all built and its
+//     EXEC succeeded (commit(), via runTRERound), so a failed EXEC or a histogram doc
+//     that could not be built retries B on the next round.
 type treRoundPlanner struct {
 	instantMS  int64
 	evidenceMS int64
@@ -116,7 +122,7 @@ func (p *treRoundPlanner) next(roundT int64) treRound {
 	return round
 }
 
-// commit records a round whose EXEC succeeded.
+// commit records a round whose histogram docs were written.
 func (p *treRoundPlanner) commit(round treRound) {
 	if round.histStamp > p.lastHistT {
 		p.lastHistT = round.histStamp
@@ -159,18 +165,24 @@ var treHistogramMetricNames = map[string]struct{}{
 // lost ticks with one serial SET per pod; the controller then averaged over too few
 // samples. The v1 legacy keys (one SET per doc, 2 h TTL) stay on the 10 s grid of
 // RequestTraceWriteInterval whatever the TRE periods, so their key count is unchanged.
-func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) error {
+//
+// It returns histWritten = the round's histogram docs were all built and EXEC
+// succeeded (review round 3, L3): only then may the planner move lastHistT. A schema
+// error, a per-pod build error (e.g. a NaN json.Marshal refuses) or a failed EXEC
+// leaves the boundary to be retried on the next round.
+func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (histWritten bool, err error) {
 	if c.redisClient == nil {
-		return nil
+		return false, nil
 	}
 	writeV1, writeV2, err := treMetricSchemaMode()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	legacyRound := writeV1 && round.histStamp != 0 && floorMod(round.histStamp, int64(RequestTraceWriteInterval/time.Millisecond)) == 0
 
 	var firstErr error
+	histOK := round.histStamp != 0
 	pipe := c.redisClient.TxPipeline()
 	models := make(map[string]struct{})
 	c.metaPods.Range(func(podKey string, metaPod *Pod) bool {
@@ -187,19 +199,22 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) e
 			"pod_namespace": metaPod.Namespace,
 			"pod_ip":        metaPod.Status.PodIP,
 		}
-		// TRE (2026-10-04): scraped_ms is the gateway wall clock of the pod's last
-		// successful engine scrape (omitted if none yet). A failed scrape keeps the old
-		// metrics but does not advance it, so the controller can tell stale metrics from
-		// fresh ones. Read before the metrics: they are at least as new as scraped_ms.
-		if scrapedMS, ok := metaPod.lastScrapeSuccess(); ok {
-			base["scraped_ms"] = scrapedMS
-		}
-		instantMetrics, instantModels := collectTREInstantMetrics(metaPod)
-		var histogramMetrics map[string]any
-		var histogramModels map[string]struct{}
-		if round.histStamp != 0 {
-			histogramMetrics, histogramModels = collectTREHistogramMetrics(metaPod)
-		}
+		// TRE (2026-10-04): scraped_ms is the gateway wall clock at which the pod's
+		// cached engine metrics were stored by their scrape (omitted if none yet). A
+		// failed scrape keeps the old metrics and does not advance it, so the controller
+		// can tell stale metrics from fresh ones. Read with the metrics under the pod's
+		// scrape lock (review round 3, L4): the stamp always belongs to these values.
+		var instantMetrics, histogramMetrics map[string]any
+		var instantModels, histogramModels map[string]struct{}
+		metaPod.readScrape(func(scrapedMS int64, ok bool) {
+			if ok {
+				base["scraped_ms"] = scrapedMS
+			}
+			instantMetrics, instantModels = collectTREInstantMetrics(metaPod)
+			if round.histStamp != 0 {
+				histogramMetrics, histogramModels = collectTREHistogramMetrics(metaPod)
+			}
+		})
 
 		if len(instantMetrics) > 0 {
 			doc := cloneMetricEnvelope(base)
@@ -214,8 +229,11 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) e
 			doc := cloneMetricEnvelope(base)
 			doc["timestamp"] = round.histStamp
 			doc["model_histogram_metrics"] = histogramMetrics
-			if err := queueTREMetricDocument(ctx, pipe, podKey, round.histStamp, doc, true, legacyRound, writeV2); err != nil && firstErr == nil {
-				firstErr = err
+			if err := queueTREMetricDocument(ctx, pipe, podKey, round.histStamp, doc, true, legacyRound, writeV2); err != nil {
+				histOK = false
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 		}
 
@@ -241,12 +259,25 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) e
 		pipe.Expire(ctx, treV2CadenceKey, treV2FallbackTTL)
 	}
 	if pipe.Len() == 0 {
-		return firstErr
+		return false, firstErr
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("%w: %v", errTREExec, err)
+		return false, fmt.Errorf("%w: %v", errTREExec, err)
 	}
-	return firstErr
+	return histOK, firstErr
+}
+
+// runTRERound is one writer tick at gateway wall clock nowMS (review round 3, L2: the
+// loop and the tests run this same commit decision): the round of the nearest instant
+// boundary is written, and the planner commits its histogram boundary only when every
+// histogram doc of it was written.
+func runTRERound(ctx context.Context, store *Store, planner *treRoundPlanner, nowMS int64) (treRound, error) {
+	round := planner.next(nearestBoundaryMS(nowMS, planner.instantMS))
+	histWritten, err := store.writeTREPodMetricsToRedis(ctx, round)
+	if histWritten {
+		planner.commit(round)
+	}
+	return round, err
 }
 
 // treGatewayVersion is the build of this gateway (the main module's VCS revision when
@@ -305,7 +336,11 @@ func queueTREMetricDocument(ctx context.Context, pipe redis.Pipeliner, podKey st
 		boundary := fmt.Sprintf("%d", stamp)
 		pipe.ZRemRangeByScore(ctx, key, boundary, boundary)
 		pipe.ZAdd(ctx, key, redis.Z{Score: float64(stamp), Member: string(value)})
-		pipe.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", stamp-treV2RetentionMS))
+		retention := treV2InstantRetentionMS
+		if histogram {
+			retention = treV2HistRetentionMS
+		}
+		pipe.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", stamp-retention))
 		pipe.Expire(ctx, key, treV2FallbackTTL)
 	}
 	return nil
@@ -413,8 +448,10 @@ func nearestBoundaryMS(nowMS, intervalMS int64) int64 {
 func initTREPodMetricsTraceCache(store *Store, stopCh <-chan struct{}) {
 	cadence := loadTREWriteCadence()
 	store.treCadence = cadence
-	instantMS := int64(cadence.instant / time.Millisecond)
-	planner := &treRoundPlanner{instantMS: instantMS, evidenceMS: int64(cadence.evidence / time.Millisecond)}
+	planner := &treRoundPlanner{
+		instantMS:  int64(cadence.instant / time.Millisecond),
+		evidenceMS: int64(cadence.evidence / time.Millisecond),
+	}
 	// Start within the first quarter of an instant period after a boundary, else wait.
 	maxOffset := cadence.instant / 4
 	go func() {
@@ -433,13 +470,8 @@ func initTREPodMetricsTraceCache(store *Store, stopCh <-chan struct{}) {
 		for {
 			select {
 			case <-ticker.C:
-				round := planner.next(nearestBoundaryMS(time.Now().UnixMilli(), instantMS))
-				err := store.writeTREPodMetricsToRedis(context.Background(), round)
-				if err != nil {
+				if _, err := runTRERound(context.Background(), store, planner, treWallClockMS()); err != nil {
 					klog.ErrorS(err, "error storing TRE pod metrics to redis")
-				}
-				if !errors.Is(err, errTREExec) {
-					planner.commit(round)
 				}
 			case <-stopCh:
 				return

@@ -19,8 +19,8 @@ package cache
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +42,7 @@ func TestWriteTREPodMetricsToRedisV2WritesSortedSets(t *testing.T) {
 	t.Setenv("TRE_REDIS_SCHEMA", "v2")
 	store, client := newTREMetricStoreForTest(t)
 
-	err := store.writeTREPodMetricsToRedis(context.Background(), treRoundAt(12345))
+	err := treWrite(context.Background(), store, treRoundAt(12345))
 	require.NoError(t, err)
 
 	podKey := utils.GeneratePodKey("default", "pod-a")
@@ -68,7 +68,7 @@ func TestWriteTREPodMetricsToRedisV2WritesSortedSets(t *testing.T) {
 func TestWriteTREPodMetricsToRedisDefaultsToDualSchema(t *testing.T) {
 	store, client := newTREMetricStoreForTest(t)
 
-	err := store.writeTREPodMetricsToRedis(context.Background(), treRoundAt(70000))
+	err := treWrite(context.Background(), store, treRoundAt(70000))
 	require.NoError(t, err)
 
 	podKey := utils.GeneratePodKey("default", "pod-a")
@@ -95,9 +95,9 @@ func TestWriteTREPodMetricsToRedisStampsWrittenMSAndKeepsOneDocPerBoundary(t *te
 	treWallClockMS = func() int64 { return clock }
 	t.Cleanup(func() { treWallClockMS = saved })
 
-	require.NoError(t, store.writeTREPodMetricsToRedis(context.Background(), treRoundAt(990_000)))
+	require.NoError(t, treWrite(context.Background(), store, treRoundAt(990_000)))
 	clock = 1_000_250 // the same boundary written again (retry / overlap)
-	require.NoError(t, store.writeTREPodMetricsToRedis(context.Background(), treRoundAt(990_000)))
+	require.NoError(t, treWrite(context.Background(), store, treRoundAt(990_000)))
 
 	podKey := utils.GeneratePodKey("default", "pod-a")
 	for _, prefix := range []string{"tre:v2:inst:", "tre:v2:hist:"} {
@@ -197,14 +197,14 @@ vllm:num_requests_waiting{model_name="dsqwen-7b"} 3
 	}
 
 	// Never scraped: the field is omitted.
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRoundAt(990_000)))
+	require.NoError(t, treWrite(ctx, store, treRoundAt(990_000)))
 	require.NotContains(t, readDoc(treV2HistogramKeyPrefix, 990_000), "scraped_ms")
 
 	// Successful scrape: both docs carry its time.
 	clock = 1_000_100
 	store.refreshPodMetrics(metaPod)
 	clock = 1_000_200
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRoundAt(1_000_000)))
+	require.NoError(t, treWrite(ctx, store, treRoundAt(1_000_000)))
 	inst := readDoc(treV2InstantKeyPrefix, 1_000_000)
 	require.Equal(t, float64(1_000_100), inst["scraped_ms"])
 	require.Equal(t, float64(3), waitingIn(inst))
@@ -216,7 +216,7 @@ vllm:num_requests_waiting{model_name="dsqwen-7b"} 3
 	clock = 1_005_100
 	store.refreshPodMetrics(metaPod)
 	clock = 1_005_200
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRoundAt(1_005_000)))
+	require.NoError(t, treWrite(ctx, store, treRoundAt(1_005_000)))
 	inst = readDoc(treV2InstantKeyPrefix, 1_005_000)
 	require.Equal(t, float64(1_005_200), inst["written_ms"])
 	require.Equal(t, float64(1_000_100), inst["scraped_ms"])
@@ -295,9 +295,9 @@ func TestTRERoundPlannerInstantEveryTickHistOnEvidenceBoundary(t *testing.T) {
 	require.Equal(t, int64(0), p.next(1_042_000).histStamp)
 }
 
-// Review round 1: after a failed MULTI/EXEC the boundary is not lost - the next round
-// writes its histogram doc, stamped with the boundary; the declared-cadence hash is
-// written in the same MULTI.
+// Review round 1 / round 3 (L2): after a failed MULTI/EXEC the boundary is not lost -
+// the next round (runTRERound, the loop's own commit decision) writes its histogram
+// doc, stamped with the boundary; the declared-cadence hash is in the same MULTI.
 func TestTREBoundaryRetriedAfterExecFailure(t *testing.T) {
 	t.Setenv("TRE_REDIS_SCHEMA", "v2")
 	mr := miniredis.RunT(t)
@@ -309,18 +309,14 @@ func TestTREBoundaryRetriedAfterExecFailure(t *testing.T) {
 	ctx := context.Background()
 	p := &treRoundPlanner{instantMS: 500, evidenceMS: 2_000, lastHistT: 1_008_000}
 
-	write := func(roundT int64) error {
-		r := p.next(roundT)
-		err := store.writeTREPodMetricsToRedis(ctx, r)
-		if !errors.Is(err, errTREExec) {
-			p.commit(r)
-		}
-		return err
-	}
 	mr.SetError("LOADING redis is loading")
-	require.ErrorIs(t, write(1_010_000), errTREExec)
+	_, err := runTRERound(ctx, store, p, 1_010_040)
+	require.ErrorIs(t, err, errTREExec)
+	require.Equal(t, int64(1_008_000), p.lastHistT)
 	mr.SetError("")
-	require.NoError(t, write(1_010_500))
+	r, err := runTRERound(ctx, store, p, 1_010_530)
+	require.NoError(t, err)
+	require.Equal(t, treRound{instantStamp: 1_010_500, histStamp: 1_010_000}, r)
 
 	podKey := utils.GeneratePodKey("default", "pod-a")
 	entries, err := client.ZRangeByScore(ctx, treV2HistogramKeyPrefix+podKey, &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
@@ -338,13 +334,70 @@ func TestTREBoundaryRetriedAfterExecFailure(t *testing.T) {
 	require.NotEmpty(t, cadence["written_ms"])
 }
 
+// Review round 3 (L3): a histogram doc that cannot be built (a NaN sum: json.Marshal
+// refuses it) does not move lastHistT; once it can be built the same boundary is
+// written by the next round.
+func TestTREBoundaryRetriedAfterHistogramBuildError(t *testing.T) {
+	t.Setenv("TRE_REDIS_SCHEMA", "v2")
+	store, client := newTREMetricStoreForTest(t)
+	ctx := context.Background()
+	p := &treRoundPlanner{instantMS: 500, evidenceMS: 2_000, lastHistT: 1_008_000}
+	podKey := utils.GeneratePodKey("default", "pod-a")
+	metaPod, ok := store.metaPods.Load(podKey)
+	require.True(t, ok)
+	ttftKey := store.getPodModelMetricName("dsqwen-7b", metrics.TimeToFirstTokenSeconds)
+	good, ok := metaPod.ModelMetrics.Load(ttftKey)
+	require.True(t, ok)
+	metaPod.ModelMetrics.Store(ttftKey, &metrics.HistogramMetricValue{Sum: math.NaN(), Count: 2, Buckets: map[string]float64{"+Inf": 2}})
+
+	_, err := runTRERound(ctx, store, p, 1_010_000)
+	require.Error(t, err)
+	require.Equal(t, int64(1_008_000), p.lastHistT)
+	inst, err := client.ZCard(ctx, treV2InstantKeyPrefix+podKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), inst) // the instant doc of the round is written
+
+	metaPod.ModelMetrics.Store(ttftKey, good)
+	r, err := runTRERound(ctx, store, p, 1_010_500)
+	require.NoError(t, err)
+	require.Equal(t, int64(1_010_000), r.histStamp)
+	require.Equal(t, int64(1_010_000), p.lastHistT)
+}
+
+// Review round 3 (L4): of two overlapping scrapes of one pod, the older fetch that
+// finishes last is dropped; the stamp is taken when the values are stored and is read
+// with them.
+func TestTREScrapeStampBelongsToTheStoredValues(t *testing.T) {
+	clock := int64(1_000_000)
+	saved := treWallClockMS
+	treWallClockMS = func() int64 { return clock }
+	t.Cleanup(func() { treWallClockMS = saved })
+	pod := &Pod{}
+	value := "none"
+
+	clock = 1_000_400 // the newer fetch (started at 1_000_200) finishes first
+	require.True(t, pod.storeScrape(1_000_200, func() { value = "new" }))
+	clock = 1_000_900 // the older fetch (started at 1_000_100) finishes last: dropped
+	require.False(t, pod.storeScrape(1_000_100, func() { value = "old" }))
+	pod.readScrape(func(scrapedMS int64, ok bool) {
+		require.True(t, ok)
+		require.Equal(t, int64(1_000_400), scrapedMS)
+		require.Equal(t, "new", value)
+	})
+}
+
+func treWrite(ctx context.Context, store *Store, r treRound) error {
+	_, err := store.writeTREPodMetricsToRedis(ctx, r)
+	return err
+}
+
 // An instant-only round writes the instant docs of every pod in one pipeline and no
 // histogram doc or v1 legacy key; the legacy keys stay on the 10 s grid at any evidence
 // period (their 2 h TTL would otherwise multiply the key count).
 func TestWriteTREPodMetricsInstantRoundSkipsHistogramAndLegacy(t *testing.T) {
 	store, client := newTREMetricStoreForTest(t)
 	ctx := context.Background()
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRound{instantStamp: 1_000_500}))
+	require.NoError(t, treWrite(ctx, store, treRound{instantStamp: 1_000_500}))
 
 	podKey := utils.GeneratePodKey("default", "pod-a")
 	inst, err := client.ZRangeByScore(ctx, treV2InstantKeyPrefix+podKey, &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
@@ -358,7 +411,7 @@ func TestWriteTREPodMetricsInstantRoundSkipsHistogramAndLegacy(t *testing.T) {
 	require.Empty(t, legacy)
 
 	// A 2 s evidence boundary off the 10 s grid: histogram doc, still no legacy key.
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRoundAt(1_012_000)))
+	require.NoError(t, treWrite(ctx, store, treRoundAt(1_012_000)))
 	hist, err = client.ZCard(ctx, treV2HistogramKeyPrefix+podKey).Result()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), hist)
@@ -366,7 +419,7 @@ func TestWriteTREPodMetricsInstantRoundSkipsHistogramAndLegacy(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, legacy)
 
-	require.NoError(t, store.writeTREPodMetricsToRedis(ctx, treRoundAt(1_010_000)))
+	require.NoError(t, treWrite(ctx, store, treRoundAt(1_010_000)))
 	legacy, err = client.Keys(ctx, "aibrix:pod_*_metrics_*").Result()
 	require.NoError(t, err)
 	require.Len(t, legacy, 2)
