@@ -12,9 +12,10 @@ those into the SAME window CSV the online path emits (r3_grid.CSV_COLUMNS), at a
 
   * token totals   -> sum of per-request usage tokens in the window (== the histogram
                       sum-delta the online path takes).
-  * queue avg      -> sum(instant samples in window) / expected_samples, with
-                      expected_samples = max(1, window_ms // instant_sample_interval_ms)
-                      (mirrors MetricsStore._instant_avg exactly).
+  * queue avg      -> mean of the instant samples in the window (mirrors
+                      MetricsStore._instant_avg exactly; until 2026-10-25 it was
+                      sum / expected_samples, the same on a window with every sample).
+                      The declared cadence is still validated (resolve_instant_cadence).
   * p95            -> histogram_percentile(cumulative-from-samples, 0.95, mode) reusing
                       tre_common.percentile.histogram_percentile — the very function
                       MetricsStore uses — with the same bucket_upper / interpolated modes
@@ -39,8 +40,8 @@ violation through the unserved counts instead).
 Sidecar cadence (why `--instant-grid` exists)
 ---------------------------------------------
 The open-loop campaign (`openloop.py`) samples the queue gauges at 1 Hz, while the live
-control path only ever sees the gateway's boundary-aligned
-:data:`tre_common.rediskeys.SCRAPE_INTERVAL_MS` grid. `openloop.mark_live_grid` tags each
+control path saw only the gateway's boundary-aligned 10 s grid (:data:`LIVE_GRID_MS`,
+fixed: the theta fit's queue signal; see :mod:`scripts.openloop`). `openloop.mark_live_grid` tags each
 sidecar sample with ``on_live_grid``, so one capture answers both questions. Two things
 follow, and both are enforced here rather than left to the operator:
 
@@ -92,7 +93,12 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 from tre_common import slo_labels
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.percentile import histogram_percentile
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import LEGACY_GRID_MS
+
+#: The theta fit's queue grid and window grid, both the fixed 10 s grid (the same values
+#: as :data:`scripts.openloop.LIVE_GRID_MS` / ``FIT_GRID_MS``).
+LIVE_GRID_MS = LEGACY_GRID_MS
+FIT_GRID_MS = LEGACY_GRID_MS
 
 from scripts import openloop, r3_grid
 
@@ -195,17 +201,17 @@ def resolve_instant_cadence(
     where = f" (sidecar {source})" if source else ""
 
     if instant_grid == INSTANT_GRID_LIVE:
-        if instant_sample_ms != SCRAPE_INTERVAL_MS:
-            ratio = instant_sample_ms / SCRAPE_INTERVAL_MS
+        if instant_sample_ms != LIVE_GRID_MS:
+            ratio = instant_sample_ms / LIVE_GRID_MS
             raise CadenceMismatchError(
                 f"--instant-grid live consumes only the live-grid subsample, whose spacing is "
-                f"the gateway cadence SCRAPE_INTERVAL_MS={SCRAPE_INTERVAL_MS} ms, but "
+                f"the gateway cadence LIVE_GRID_MS={LIVE_GRID_MS} ms, but "
                 f"--instant-sample-ms={instant_sample_ms} ms{where}. That flag is the divisor "
                 f"that turns instant samples into a window average, so keeping it would scale "
-                f"every queue average by {SCRAPE_INTERVAL_MS / instant_sample_ms:.6g}x "
-                f"(declared/actual = {ratio:.6g}). Pass --instant-sample-ms {SCRAPE_INTERVAL_MS}."
+                f"every queue average by {LIVE_GRID_MS / instant_sample_ms:.6g}x "
+                f"(declared/actual = {ratio:.6g}). Pass --instant-sample-ms {LIVE_GRID_MS}."
             )
-        return SCRAPE_INTERVAL_MS
+        return LIVE_GRID_MS
 
     # raw mode: only a tagged sidecar tells us what cadence it was captured at.
     if sidecar_has_live_grid_tags(instant_samples):
@@ -218,7 +224,7 @@ def resolve_instant_cadence(
                 f"instant samples into a window average, so every queue average would be scaled "
                 f"by {instant_sample_ms / observed:.6g}x. Pass --instant-sample-ms {observed:.0f} "
                 f"for the raw stream, or --instant-grid live with "
-                f"--instant-sample-ms {SCRAPE_INTERVAL_MS} to fit on the signal the controller sees."
+                f"--instant-sample-ms {LIVE_GRID_MS} to fit on the signal the controller sees."
             )
     return instant_sample_ms
 
@@ -354,7 +360,8 @@ def build_meta(
         "step_ms": step_ms,
         "instant_sample_ms": instant_sample_ms,
         "instant_grid": instant_grid,
-        "live_grid_ms": SCRAPE_INTERVAL_MS,
+        "live_grid_ms": LIVE_GRID_MS,
+        "fit_grid_ms": FIT_GRID_MS,
         "percentile_mode": percentile_mode,
         "min_latency_samples": min_latency_samples,
         "routable_pods": routable_pods,
@@ -434,7 +441,8 @@ def enumerate_windows(
 
 #: ``--window-align`` choices: ``none`` keeps the legacy free-phase windows (first window
 #: at the first stamp of the capture, any step); ``grid`` ends every window on the
-#: ``SCRAPE_INTERVAL_MS`` grid like the phase-aligned controller.
+#: ``FIT_GRID_MS`` (10 s) grid - windows the phase-aligned controller also reads (its
+#: grid, the evidence period, divides it).
 WINDOW_ALIGN_NONE = "none"
 WINDOW_ALIGN_GRID = "grid"
 WINDOW_ALIGN_CHOICES = (WINDOW_ALIGN_NONE, WINDOW_ALIGN_GRID)
@@ -560,8 +568,9 @@ def aggregate_window(
     tpot_samples = [r["tpot_ms"] for r in served if r.get("tpot_ms") is not None]
     e2e_samples = [r["e2e_ms"] for r in served if r.get("e2e_ms") is not None]
 
-    # queue: instant samples are inclusive [start, end] and divided by expected_samples,
-    # exactly as MetricsStore._instant_avg does.
+    # queue: instant samples are inclusive [start, end]; their mean, exactly as
+    # MetricsStore._instant_avg does (2026-10-25: the mean over the samples present, not
+    # sum / expected_samples - a missing sample no longer reads the queue low).
     def _stamp(sample: dict) -> int:
         ts = int(sample["ts_ms"])
         return ts // instant_tick_ms * instant_tick_ms if instant_tick_ms else ts
@@ -576,10 +585,10 @@ def aggregate_window(
             s for s in instant_samples
             if s.get("ts_ms") is not None and window_start_ms <= _stamp(s) <= window_end_ms
         ]
-    expected_samples = max(1, int((window_end_ms - window_start_ms) / instant_sample_interval_ms))
-    avg_waiting = sum(float(s.get("waiting", 0.0)) for s in inst) / expected_samples
-    avg_running = sum(float(s.get("running", 0.0)) for s in inst) / expected_samples
-    avg_swapping = sum(float(s.get("swapping", 0.0)) for s in inst) / expected_samples
+    samples = max(1, len(inst))
+    avg_waiting = sum(float(s.get("waiting", 0.0)) for s in inst) / samples
+    avg_running = sum(float(s.get("running", 0.0)) for s in inst) / samples
+    avg_swapping = sum(float(s.get("swapping", 0.0)) for s in inst) / samples
 
     return ModelWindowMetrics(
         model=model,
@@ -699,9 +708,9 @@ def rewindow_cell(
     gateway's count-at-completion numerator); :mod:`scripts.l3_numerator` supplies the
     vLLM token-counter deltas (L3). Queue, latency and labels never depend on it.
 
-    ``window_align="grid"`` ends every window on the ``SCRAPE_INTERVAL_MS`` grid and reads
-    it half-open ``(start, end]`` (instants stamped with their gateway tick on the live
-    grid), i.e. the window the phase-aligned controller reads; ``"none"`` is the
+    ``window_align="grid"`` ends every window on the ``FIT_GRID_MS`` grid and reads it
+    half-open ``(start, end]`` (instants stamped with their gateway tick on the live
+    grid), i.e. a window the phase-aligned controller reads; ``"none"`` is the
     free-phase windowing (``[start, end)``), kept for the 5 s / unaligned fits and the
     parity check against captures made with it.
     """
@@ -722,7 +731,7 @@ def rewindow_cell(
         start_ms = span[0] if start_ms is None else start_ms
         end_ms = span[1] if end_ms is None else end_ms
     windows_ms = enumerate_windows(
-        start_ms, end_ms, window_ms, step_ms, align_ms=SCRAPE_INTERVAL_MS if aligned else None
+        start_ms, end_ms, window_ms, step_ms, align_ms=FIT_GRID_MS if aligned else None
     )
     metrics = [
         aggregate_window(
@@ -732,7 +741,7 @@ def rewindow_cell(
             instant_sample_interval_ms=instant_sample_interval_ms,
             routable_pods=routable_pods, assigned_replicas=assigned_replicas,
             half_open_start=aligned,
-            instant_tick_ms=SCRAPE_INTERVAL_MS if aligned and instant_grid == INSTANT_GRID_LIVE else None,
+            instant_tick_ms=LIVE_GRID_MS if aligned and instant_grid == INSTANT_GRID_LIVE else None,
             attribution=attribution,
         )
         for ws, we in windows_ms
@@ -1042,7 +1051,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--window-align", default=WINDOW_ALIGN_NONE, choices=list(WINDOW_ALIGN_CHOICES),
         help=(
-            f"grid: window ends on the {SCRAPE_INTERVAL_MS} ms gateway grid, read (start, end] - "
+            f"grid: window ends on the {FIT_GRID_MS} ms grid, read (start, end] - "
             "the phase-aligned controller's window (use with --step-ms 10000; the calibration "
             "fit plan does). none: free-phase windows [start, end) (e.g. the old 5 s step)."
         ),
@@ -1052,12 +1061,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # The divisor for the queue average. It MUST equal the spacing of the samples actually
     # consumed: the sidecar capture cadence in `raw` mode (campaign value 1000), the
     # gateway cadence in `live` mode. A mismatch is refused, not silently rescaled.
-    ap.add_argument("--instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
+    ap.add_argument("--instant-sample-ms", type=int, default=LIVE_GRID_MS)
     ap.add_argument(
         "--instant-grid", default=INSTANT_GRID_RAW, choices=list(INSTANT_GRID_CHOICES),
         help=(
             "raw: every sidecar sample (ground truth, 1 Hz in the campaign). "
-            f"live: only samples tagged on_live_grid, i.e. the {SCRAPE_INTERVAL_MS} ms signal the "
+            f"live: only samples tagged on_live_grid, i.e. the {LIVE_GRID_MS} ms signal the "
             "controller consumes — use this for a theta fit."
         ),
     )
@@ -1090,7 +1099,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"reading raw from {raw_dir}: {size / 1024**2:.1f} MiB on disk{note}")
     print(
         f"instant cadence: --instant-grid {args.instant_grid} "
-        f"--instant-sample-ms {args.instant_sample_ms} (live grid SCRAPE_INTERVAL_MS={SCRAPE_INTERVAL_MS} ms)"
+        f"--instant-sample-ms {args.instant_sample_ms} (live grid LIVE_GRID_MS={LIVE_GRID_MS} ms)"
     )
 
     from tre_common.registry import load_registry

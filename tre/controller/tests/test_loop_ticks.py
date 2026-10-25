@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_common.registry import PlacementConfig
@@ -221,7 +223,7 @@ def test_rescue_tick_caps_receivers_at_max_awake_replicas_not_layout_size() -> N
 
 def test_rescue_tick_holds_previous_paper_state_when_tokens_are_missing_for_one_window() -> None:
     queue = FakeQueue()
-    cache = PaperStateCache(max_stale_windows=3)
+    cache = PaperStateCache(max_stale_ms=30_000)
     first = MetricsSnapshot(
         ts_ms=1,
         stale=False,
@@ -243,21 +245,26 @@ def test_rescue_tick_holds_previous_paper_state_when_tokens_are_missing_for_one_
 
 def test_rescue_tick_marks_paper_state_unknown_after_stale_hold_limit() -> None:
     queue = FakeQueue()
-    cache = PaperStateCache(max_stale_windows=1)
+    # 2026-10-25: the hold is a span of window ends (10 s here), not a count of reads.
+    cache = PaperStateCache(max_stale_ms=10_000)
     first = MetricsSnapshot(
         ts_ms=1,
         stale=False,
         models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=2)},
     )
-    missing = MetricsSnapshot(
-        ts_ms=2,
-        stale=False,
-        models={"critical": _metrics("critical", generation=None, waiting=10.0, running=1.0, assigned=2)},
-    )
+
+    def missing(end_ms: int) -> MetricsSnapshot:
+        window = replace(
+            _metrics("critical", generation=None, waiting=10.0, running=1.0, assigned=2),
+            window_start_ms=end_ms - 60_000, window_end_ms=end_ms,
+        )
+        return MetricsSnapshot(ts_ms=end_ms, stale=False, models={"critical": window})
 
     run_rescue_tick(first, queue=queue, registry=_registry(), paper_state_cache=cache)
-    held = run_rescue_tick(missing, queue=queue, registry=_registry(), paper_state_cache=cache)
-    expired = run_rescue_tick(missing, queue=queue, registry=_registry(), paper_state_cache=cache)
+    held = run_rescue_tick(missing(70_000), queue=queue, registry=_registry(), paper_state_cache=cache)
+    reread = run_rescue_tick(missing(70_000), queue=queue, registry=_registry(), paper_state_cache=cache)
+    expired = run_rescue_tick(missing(80_000), queue=queue, registry=_registry(), paper_state_cache=cache)
+    assert "paper_state_stale_hold:critical" in reread.events  # a re-read is not elapsed time
 
     assert "paper_state_stale_hold:critical" in held.events
     assert "paper_state_stale_unknown:critical" in expired.events
@@ -819,8 +826,8 @@ def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
 
     held = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
     assert not any(isinstance(a, HideAction) for a in held.actions)
-    # The snapshot window (end 60 s) predates the rollback at 90 s.
-    assert "safescale_rollback_hold:hot:no_new_window" in held.events
+    # The snapshot's observations (up to 60 s) predate the rollback at 90 s.
+    assert "safescale_rollback_hold:hot:no_new_evidence" in held.events
     later = MetricsSnapshot(
         ts_ms=200_000, stale=False, models={"hot": replace(snapshot.models["hot"], window_start_ms=100_000,
                                                             window_end_ms=160_000)},

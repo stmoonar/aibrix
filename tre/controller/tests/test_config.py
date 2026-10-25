@@ -7,7 +7,7 @@ import logging
 import pytest
 import yaml
 
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS
 from tre_controller.config import ControllerConfig
 
 
@@ -25,9 +25,12 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.fairness_interval_s == 10.0
     assert config.metrics_window_ms == 30_000
     assert config.metrics_window_mode == "sliding"
-    # Must default to the gateway scrape cadence so expected_samples matches the real 10s
-    # write cadence (r3 SMOKE_FINDINGS defect 2): a mismatch halves the controller's queue.
-    assert config.instant_sample_interval_ms == SCRAPE_INTERVAL_MS == 10_000
+    # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 2 s); the read
+    # offset defaults to min(2 s, evidence / 2).
+    assert config.instant_sample_interval_ms == INSTANT_SAMPLE_INTERVAL_MS == 500
+    assert config.evidence_period_ms == EVIDENCE_PERIOD_MS == 2_000
+    assert config.metrics_phase_offset_ms == 1_000
+    assert config.metrics_stale_hold_ms == 20_000
     assert config.histogram_lookback_ms == 90_000
     assert config.min_latency_samples == 10
     assert config.percentile_mode == "bucket_upper"
@@ -35,7 +38,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.signal_idle_rps_eps == 0.05
     assert config.signal_warmup_ms == -1
     assert config.sm_slow_timeout_s is None  # -> registry service_manager.api_call_timeout_s
-    assert config.paper_stale_max_windows == 3
+    assert config.paper_stale_max_ms == 30_000
     assert config.incomplete_policy == "drop_model"
     assert config.ablation_disable_slow_loop is False
     assert config.ablation_disable_safescale is False
@@ -91,6 +94,7 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_FAIRNESS_INTERVAL_SECONDS": "7.25",
             "TRE_METRICS_WINDOW_MS": "45000",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
+            "TRE_EVIDENCE_PERIOD_MS": "10000",
             "SAFE_SCALE_MIN_WINDOW_MS": "70000",
             "TRE_HIST_BASELINE_LOOKBACK_MS": "120000",
             "TRE_PERCENTILE_MODE": "interpolated",
@@ -116,7 +120,7 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.histogram_lookback_ms == 120_000
     assert config.percentile_mode == "interpolated"
     assert config.signal_source == "latency_p95"
-    assert config.paper_stale_max_windows == 5
+    assert config.paper_stale_max_ms == 50_000
     assert config.incomplete_policy == "drop_all"
     assert config.ablation_disable_slow_loop is True
     assert config.ablation_disable_safescale is True
@@ -199,22 +203,6 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
     assert ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "tumbling"}).metrics_window_mode == "tumbling"
     with pytest.raises(ValueError):
         ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
-
-
-def test_safescale_short_floor_warns_instead_of_refusing_to_start(caplog) -> None:
-    # N2 (tail observations fully post-hide) needs W_floor*(1-hq) >= metrics window +
-    # refresh + read offset = 42000 by default; the 20 s floor cannot satisfy it, so the
-    # guard only warns (v1 ran a 15 s floor the same way).
-    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
-        config = ControllerConfig.from_env({})
-    assert config.safescale.min_window_ms == 20_000.0
-    assert any("SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage() and "min_window_ms=20000.0" in r.getMessage()
-               for r in caplog.records)
-    # A floor that satisfies the invariant (56000*0.75 = 42000) loads without the warning.
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
-        ControllerConfig.from_env({"SAFE_SCALE_WINDOW_FLOOR_MS": "56000"})
-    assert not [r for r in caplog.records if "SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage()]
 
 
 def test_safescale_window_defaults_and_env_parsing() -> None:
@@ -301,3 +289,23 @@ def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> 
     )
     with pytest.raises(ValueError, match="api_call_timeout_s = 360s"):
         resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), slow)
+
+
+def test_evidence_period_and_spans_2s_cadence_and_deprecated_count_aliases(caplog) -> None:
+    """2026-10-25: a 2 s evidence period (the default) puts the read offset at 1 s; count settings are
+    spans (a deprecated count alias = N x 10 s, both names set = refused); the evidence
+    period must be a multiple of the instant period."""
+    cfg = ControllerConfig.from_env({"TRE_EVIDENCE_PERIOD_MS": "2000"})
+    assert (cfg.evidence_period_ms, cfg.metrics_phase_offset_ms) == (2_000, 1_000)
+    # Round 4: SafeScale reads no evidence period (no ``evidence_step_ms``).
+    assert not hasattr(cfg.safescale, "evidence_step_ms")
+    with caplog.at_level(logging.WARNING):
+        legacy = ControllerConfig.from_env({"TRE_PAPER_STALE_MAX_WINDOWS": "5", "TRE_METRICS_STALE_HOLD_WINDOWS": "1"})
+    assert (legacy.paper_stale_max_ms, legacy.metrics_stale_hold_ms) == (50_000, 10_000)
+    assert "deprecated" in caplog.text
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env({"TRE_PAPER_STALE_MAX_WINDOWS": "5", "TRE_PAPER_STALE_MAX_MS": "50000"})
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env({"TRE_EVIDENCE_PERIOD_MS": "2000", "TRE_INSTANT_SAMPLE_INTERVAL_MS": "300"})
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env({"TRE_EVIDENCE_PERIOD_MS": "2000", "TRE_METRICS_PHASE_OFFSET_MS": "2000"})

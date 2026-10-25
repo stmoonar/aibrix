@@ -13,7 +13,7 @@ import pytest
 from scripts import calibration_campaign as campaign
 from scripts import calibration_capture as cc
 from scripts import openloop, r3_grid, rewindow_from_raw
-from tre_common.rediskeys import decision_hist_key, hist_key, inst_key, pods_key
+from tre_common.rediskeys import GATEWAY_CADENCE_KEY, decision_hist_key, hist_key, inst_key, pods_key
 from tre_common.tss import tss_terms, replica_factor
 
 
@@ -191,7 +191,11 @@ class FakeRedis:
     def __init__(self, now_ms: int = 1_000_000) -> None:
         self.sets: dict[str, set] = {}
         self.zsets: dict[str, dict[str, float]] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.now_ms = now_ms
+
+    def hgetall(self, key):
+        return {k.encode(): str(v).encode() for k, v in self.hashes.get(key, {}).items()}
 
     def sadd(self, key, *members):
         self.sets.setdefault(key, set()).update(m.encode() for m in members)
@@ -277,6 +281,30 @@ def test_dump_gateway_docs_keeps_only_the_cell_range_per_pod_and_kind(tmp_path: 
     assert [x["score"] for x in rows[1:]] == [950_000, 960_000]
     assert rows[1]["doc"]["model_histogram_metrics"]["m7/x"]["count"] == 950_000
     assert s["round_stamp_phases_ms"] == [0] and s["last_round_ms"] == 960_000
+
+
+def test_instant_docs_trimmed_during_a_long_cell_are_kept_by_the_spool_and_backfill(tmp_path: Path) -> None:
+    # Review round 3 (M3): the gateway keeps instant docs 5 min. A spool pass during the
+    # cell holds the head; the dump after the cell and a later backfill both keep it.
+    r = FakeRedis(now_ms=960_000)
+    pods = ["default/pod-a"]
+    _seed_gateway(r, pods, [900_000, 950_000])
+    spool = cc.InstantSpool(r, "m7", start_ms=890_000)
+    spool.poll()
+    r.now_ms = 1_200_000
+    _seed_gateway(r, pods, [1_150_000])
+    del r.zsets[inst_key("default/pod-a")][next(iter(r.zsets[inst_key("default/pod-a")]))]  # trimmed
+    spool.poll()
+    assert spool.covers(890_000, 12_000)
+    layout = _layout(tmp_path)
+    first = cc.dump_gateway_docs(r, layout, pods, lo_ms=890_000, hi_ms=1_160_000, spool=spool)
+    assert first["docs"]["inst"] == {"default/pod-a": 3} and first["docs"]["hist"] == {"default/pod-a": 3}
+    r.zsets[inst_key("default/pod-a")].clear()  # everything aged out before the backfill
+    again = cc.dump_gateway_docs(r, layout, pods, lo_ms=890_000, hi_ms=1_160_000, previous=first)
+    assert again["docs"]["inst"] == {"default/pod-a": 3}
+    rows = [json.loads(x) for x in (layout.cell_dir / again["files"]["inst"]["default/pod-a"]).read_text().splitlines()]
+    assert [row["score"] for row in rows[1:]] == [900_000, 950_000, 1_150_000]
+    assert rows[1]["doc"]["model_metrics"]["m7/num_requests_running"] == 1
 
 
 def test_raw_tss_comes_from_the_controller_or_is_derived_at_factor_one() -> None:
@@ -608,6 +636,31 @@ def test_range_and_tail_are_in_redis_time() -> None:
     assert CFG.controller_lag_bounds == (-2_000, 31_500)
     with pytest.raises(ValueError):  # below window + round + blind spot
         cc.ClockDomainConfig(window_ms=30_000, margin_ms=51_999)
+
+
+class Cluster2s(Cluster):
+    """A gateway that declares instant 0.5 s / evidence 2 s, and a controller on that grid."""
+
+    P = 2_000
+
+    def __init__(self, **kw) -> None:
+        kw.setdefault("gw_phase", 600)
+        kw.setdefault("ctl_offset", 1_000)
+        super().__init__(**kw)
+        self.r.hashes[GATEWAY_CADENCE_KEY] = {"instant_ms": 500, "evidence_ms": 2_000}
+
+
+def test_a_2s_gateway_is_checked_and_dumped_on_its_declared_round(tmp_path: Path) -> None:
+    c = Cluster2s()
+    c.advance(RS)
+    assert cc.gateway_round_ms(c.r) == 2_000 and cc.gateway_round_ms(FakeRedis()) == cc.GATEWAY_ROUND_MS
+    cfg = cc.ClockDomainConfig(window_ms=30_000, period_ms=cc.gateway_round_ms(c.r))
+    assert cfg.controller_read_offset_ms == 1_500  # the sampler's cap: round - retry
+    v = cc.check_clock_domains(c.r, "m7", cfg, sleep=c.sleep)
+    assert v["ok"] and v["reasons"] == [], v
+    s = cc.dump_gateway_docs(c.r, _layout(tmp_path), c.pods, lo_ms=RS - 30_000, hi_ms=RS)
+    assert s["round_interval_ms"] == 2_000 and s["instant_interval_ms"] == 500
+    assert s["round_stamp_phases_ms"] == [0]  # every 2 s stamp is on the round, not mod 10 s
 
 
 def _controller_at(lag: int, *, end: int = 950_000) -> Cluster:

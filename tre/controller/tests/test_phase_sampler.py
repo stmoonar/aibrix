@@ -2,8 +2,9 @@
 
 The sampler sleeps to ``boundary + offset``, reads the half-open window
 ``(boundary - W, boundary]`` and publishes an immutable snapshot stamped with the boundary.
-A window missing any expected gateway tick is re-read until the next boundary, then
-declared stale (previous snapshot kept, marked stale after ``stale_hold_windows``).
+A window whose end tick the gateway has not written is re-read until the next boundary,
+then declared stale (previous snapshot kept, marked stale after ``stale_hold_ms``).
+2026-10-25: only the end tick is checked here; per-pod completeness is the store's.
 """
 from __future__ import annotations
 
@@ -226,10 +227,12 @@ def test_without_adapt_the_offset_stays_and_every_cycle_retries() -> None:
 def test_relearn_drops_an_adapted_offset_back_to_the_floor() -> None:
     clock = Clock(BASE + 5_000)
     gateway = Gateway(clock, lag_ms=5_300)
-    sampler = _sampler(clock, gateway, relearn_cycles=3)
-    _run(sampler, 2)
+    sampler = _sampler(clock, gateway, relearn_ms=3 * P)
+    _run(sampler, 3)
     assert sampler.offset_ms == 5_500
-    _run(sampler)  # third cycle -> relearn
+    # Round 4: the relearn is due relearn_ms after the first cycle (controller clock),
+    # not every N cycles.
+    _run(sampler)
     assert sampler.offset_ms == 2_000
     gateway.lag_ms = 1_000  # gateway restarted with an earlier phase
     outcome = _run(sampler)[0]
@@ -240,34 +243,39 @@ def test_missing_tick_is_stale_previous_snapshot_is_kept_then_marked(caplog) -> 
     clock = Clock(BASE + 5_000)
     gateway = Gateway(clock)
     box = SnapshotBox()
-    sampler = _sampler(clock, gateway, box, stale_hold_windows=2)
+    sampler = _sampler(clock, gateway, box, stale_hold_ms=2 * P)
     _run(sampler)
     good = box.get()
-    # the gateway skips one tick: the next 3 windows all contain it -> 3 stale windows
-    gateway.skip = {BASE + 2 * P}
+    # the gateway never writes the next 4 end ticks -> 4 stale windows
+    gateway.skip = {BASE + 2 * P, BASE + 3 * P, BASE + 4 * P, BASE + 5 * P}
     with caplog.at_level(logging.WARNING, logger="tre_controller.metrics"):
         stale = _run(sampler, 3)
     assert [o.kind for o in stale] == ["stale"] * 3
-    assert all(o.reason.startswith("missing_ticks:") for o in stale)
+    # (the third window holds none of this fake gateway's 10 s ticks at all)
+    assert [o.reason.split(":")[0] for o in stale] == ["missing_end_tick", "missing_end_tick", "no_ticks_after_ticks"]
     assert "metrics_window_stale" in caplog.text
     # retried until the next boundary was due, then gave up
     assert stale[0].attempts > 1
-    # hold for 2 windows: the very same (non-stale) snapshot object is served
+    # Round 4: the hold counts controller time from the first READ of the first stale
+    # window (end + offset), not from its give-up one period later: at the third
+    # give-up (3 P - offset after that read) the 2 P hold is over.
     assert sampler.consecutive_stale == 3
+    assert box.get().stale is True and box.get().ts_ms == good.ts_ms
+    assert _run(sampler)[0].kind == "stale"
     assert box.get().stale is True and box.get().ts_ms == good.ts_ms
     recovered = _run(sampler)[0]
     assert recovered.kind == "published" and sampler.consecutive_stale == 0
-    assert box.get().stale is False and box.get().ts_ms == BASE + 5 * P
+    assert box.get().stale is False and box.get().ts_ms == BASE + 6 * P
 
 
 def test_stale_hold_serves_the_identical_previous_snapshot() -> None:
     clock = Clock(BASE + 5_000)
     gateway = Gateway(clock)
     box = SnapshotBox()
-    sampler = _sampler(clock, gateway, box, stale_hold_windows=2)
+    sampler = _sampler(clock, gateway, box, stale_hold_ms=2 * P)
     _run(sampler)
     good = box.get()
-    gateway.skip = {BASE + 2 * P}
+    gateway.skip = {BASE + 2 * P, BASE + 3 * P}
     _run(sampler)
     assert box.get() is good
     _run(sampler)
@@ -310,6 +318,14 @@ def test_window_freshness_pools_ticks_over_pods() -> None:
     snap = MetricsSnapshot(ts_ms=end, models={"m": a, "n": b}, stale=False)
     verdict = window_freshness(snap, window_end_ms=end, window_ms=W, period_ms=P)
     assert verdict.fresh and verdict.ticks == (end - 20_000, end - 10_000, end)
+    # 2026-10-25: interior ticks do not matter here (per-pod completeness is the store's);
+    # a window without its end tick is not written yet.
+    interior = MetricsSnapshot(ts_ms=end, models={"m": a}, stale=False)
+    late = window_freshness(interior, window_end_ms=end, window_ms=W, period_ms=P)
+    assert not late.fresh and late.reason == f"missing_end_tick:{end}"
+    assert window_freshness(
+        MetricsSnapshot(ts_ms=end, models={"n": b}, stale=False), window_end_ms=end, window_ms=W, period_ms=P
+    ).fresh
     # a tick exactly at the window start is outside the half-open window
     only_start = MetricsSnapshot(ts_ms=end, models={"m": _window(end - W, end, (end - W,))}, stale=False)
     assert window_freshness(only_start, window_end_ms=end, window_ms=W, period_ms=P).ticks == ()
@@ -376,13 +392,13 @@ def test_store_half_open_read_gives_three_ticks_and_a_30s_token_span() -> None:
     store = _store_with_ticks(end)
     half = store.read_model_window("m", end - W, end, use_cache=False, start_exclusive=True)
     assert half.instant_ticks_ms == (end - 20_000, end - 10_000, end)
-    assert half.avg_running == pytest.approx(3.0)  # 9 / 3 expected
+    assert half.avg_running == pytest.approx(3.0)  # mean of the 3 samples
     assert half.generation_tokens == pytest.approx(300.0)  # hist(end) - hist(end - 30 s)
     assert (half.window_start_ms, half.window_end_ms) == (end - W, end)
-    # the closed read on a boundary double-counts the start tick (4 ticks / 3) and
-    # takes its token baseline one tick early (40 s span) - why the sampler reads (s, e]
+    # the closed read on a boundary takes its token baseline one tick early (40 s span) -
+    # why the sampler reads (s, e]. (The queue mean is not distorted by the extra tick.)
     closed = store.read_model_window("m", end - W, end, use_cache=False)
-    assert closed.avg_running == pytest.approx(4.0)
+    assert closed.avg_running == pytest.approx(3.0)
     assert closed.generation_tokens == pytest.approx(400.0)
 
 

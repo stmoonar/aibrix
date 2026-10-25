@@ -55,15 +55,14 @@ What is in here
   :func:`preflight_prompt_tokens` does it once per model before a run starts - one
   request, refused on any difference.
 * :func:`make_pod_metrics_sampler` - a 1 Hz sidecar that scrapes the model pods'
-  ``/metrics`` directly instead of reading the gateway's redis buckets. The gateway
-  writes instantaneous gauges on a 10 s boundary-aligned ticker
-  (:data:`tre_common.rediskeys.SCRAPE_INTERVAL_MS`), i.e. 3 samples per 30 s control
-  window. A burst that saturates the engine for a few seconds is therefore very likely
-  to fall entirely between two gateway samples and be recorded as ``avg_waiting == 0``.
-  Sampling at 1 s and *additionally* marking which samples would have landed on the live
-  10 s grid (:func:`mark_live_grid`) lets the campaign compare ground truth against
-  "what the controller would have seen" from the same capture. This changes only the
-  campaign sidecar; the production gateway cadence is untouched.
+  ``/metrics`` directly instead of reading the gateway's redis buckets, and marks which
+  samples land on the 10 s live grid (:func:`mark_live_grid`, :data:`LIVE_GRID_MS`), so
+  one capture answers "ground truth" and "the 10 s subsample". The 10 s grid is the
+  theta fit's queue signal (3 samples per 30 s window) and stays fixed, so fits stay
+  comparable with the fits made before 2026-10-25. Since 2026-10-25 the controller
+  itself averages the gateway's 0.5 s instant docs (``INSTANT_SAMPLE_INTERVAL_MS``),
+  which is closer to ``--instant-grid raw``; changing the fit's queue signal is a
+  re-calibration decision, not done here. This changes only the campaign sidecar.
 """
 from __future__ import annotations
 
@@ -76,7 +75,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import LEGACY_GRID_MS
 from tre_common.vllm_metrics import vllm_candidates
 
 #: Sidecar cadence for the campaign. One sample per second; see the module docstring.
@@ -88,9 +87,15 @@ DEFAULT_SIDECAR_INTERVAL_S = 1.0
 #: ``r3_grid`` mirrors the prompt mode.
 DEFAULT_RPS_WINDOW_S = 1.0
 
-#: The cadence the live control path actually observes. Samples are tagged against this
-#: grid so a capture can be replayed at either resolution.
-LIVE_GRID_MS = SCRAPE_INTERVAL_MS
+#: The theta fit's queue grid ("live grid"): the 10 s gateway grid of the pre-2026-10-25
+#: controller, fixed (it does not follow ``TRE_EVIDENCE_PERIOD_MS``). Samples are tagged
+#: against it so a capture can be replayed at either resolution.
+LIVE_GRID_MS = LEGACY_GRID_MS
+#: The grid the theta fit's windows end on (``--window-align grid``, step a multiple of
+#: it): the 10 s grid as before. The controller's windows end every evidence period (2 s),
+#: a divisor of it, so the fit windows stay a subset of the controller's windows and the
+#: fit samples the same window starts as the fits made before 2026-10-25.
+FIT_GRID_MS = LEGACY_GRID_MS
 
 #: Guard defaults. The deadline is on ``on_wire_delay`` - the gap between a request's
 #: scheduled instant and the instant its bytes actually went to the transport - because

@@ -1,29 +1,24 @@
 """O1 same-clock check: gateway doc stamps vs the controller clock (review P2-3).
 
 The O1 breakpoint window compares two clocks: routable-change times (the controller's
-clock: ActionQueue SM-call returns, ``ClusterView.fetched_ms``) and the 10 s grid of the
-gateway's doc stamps (``roundT``, the gateway's clock rounded to the boundary). It
-assumes they are the same clock (NTP-synchronised nodes). Node clocks have drifted before
-(75 ran ~160 s ahead of 76), so the controller checks at start and then periodically:
+clock: ActionQueue SM-call returns, ``ClusterView.fetched_ms``) and the gateway's
+observation times (``scraped_ms``, the gateway's clock). It assumes they are the same
+clock (NTP-synchronised nodes). Node clocks have drifted before (75 ran ~160 s ahead of
+76), so the controller checks at start and then periodically.
 
-* ``lag = now - newest instant stamp`` over the registry models' pods. With one clock the
-  gateway writes boundary ``B`` at ``B + phase`` (its ticker phase, 0..one period) and
-  the newest stamp is at most about one period old, so ``0 <= lag < 2 * period``;
-* ``lag < -tolerance`` (stamps from the future: the gateway runs ahead) or
-  ``lag > 2 * period + tolerance`` (stamps from the past: it runs behind, or stopped
-  writing) is a violation.
+Direct measurement (review P2-2): every gateway doc carries ``written_ms`` (the
+gateway's wall clock when it wrote the doc). The check watches the instant-doc key of
+the pod whose newest doc is the newest (a pod the gateway still writes) until a new doc
+appears (polling every ``poll_ms``): the write happened between the last poll that saw
+the old doc and the first that sees the new one, so ``offset = written_ms - midpoint``
+is the gateway clock minus the controller clock to about ``poll_ms / 2`` plus a redis
+round trip, independent of the write phase.
 
-Direct measurement (review P2-2): gateway images from 2026-10-01 add ``written_ms`` (the
-gateway's wall clock when it wrote the doc) to every doc. The check watches one pod's
-newest instant doc until a new one appears (polling every ``poll_ms``): the write
-happened between the last poll that saw the old doc and the first that sees the new one,
-so ``offset = written_ms - midpoint`` is the gateway clock minus the controller clock to
-about ``poll_ms / 2`` plus a redis round trip, independent of the write phase.
-
-Fallback (older gateways, no ``written_ms``): the stamp-lag bounds below. The write phase
-is unknown, so an offset is only visible once it exceeds the phase window - a gateway
-ahead by more than ``phase + tolerance`` or behind by more than
-``2 * period - phase + tolerance``.
+Round 4: no measurement, no verdict. The former fallback (``now`` minus the newest doc
+stamp, bounded by ``2 x period + tolerance``) is gone: it only guarded against signal
+lag with a fixed span, and it read leftover docs as a stalled clock - with every model
+down, the old docs suspended O1. Gateway liveness is the sampler's business
+(``last_hist_ms``, stale snapshots).
 
 On a violation O1 is suspended (``SignalState.suspend_breakpoint_window``: whole
 windows, the ADR-0013 onset guard) until ``resume_after`` consecutive good checks.
@@ -46,18 +41,6 @@ def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def newest_instant_stamp_ms(redis_client: Any, models: Iterable[str]) -> Optional[int]:
-    """The newest gateway instant-doc stamp (ms) over ``models``' pods; None without any."""
-    newest: Optional[int] = None
-    for model in models:
-        for pod in redis_client.smembers(pods_key(model)) or ():
-            rows = redis_client.zrange(inst_key(_text(pod)), -1, -1, withscores=True) or ()
-            for _member, score in rows:
-                stamp = int(float(score))
-                newest = stamp if newest is None or stamp > newest else newest
-    return newest
-
-
 def _written_ms(raw: Any) -> Optional[int]:
     try:
         doc = json.loads(_text(raw))
@@ -74,14 +57,28 @@ def _newest_written(redis_client: Any, key: str) -> Optional[int]:
     return None
 
 
+def _newest_doc(redis_client: Any, key: str) -> tuple[Optional[int], Optional[float]]:
+    """(``written_ms``, stamp) of the newest doc of ``key``; (None, None) without one."""
+    rows = redis_client.zrange(key, -1, -1, withscores=True) or ()
+    for member, score in rows:
+        return _written_ms(member), float(score)
+    return None, None
+
+
 def written_probe_key(redis_client: Any, models: Iterable[str]) -> Optional[str]:
-    """An instant-doc key whose newest doc carries ``written_ms`` (None: old gateway)."""
+    """The instant-doc key whose newest doc is the newest of all (and carries
+    ``written_ms``): a pod the gateway still writes, not one whose leftover docs are
+    the first in sorted order. None: no doc with ``written_ms``."""
+    best: tuple[float, str] | None = None
     for model in models:
         for pod in sorted(_text(item) for item in (redis_client.smembers(pods_key(model)) or ())):
             key = inst_key(pod)
-            if _newest_written(redis_client, key) is not None:
-                return key
-    return None
+            written, stamp = _newest_doc(redis_client, key)
+            if written is None or stamp is None:
+                continue
+            if best is None or stamp > best[0]:
+                best = (stamp, key)
+    return best[1] if best is not None else None
 
 
 def measure_written_offset_ms(
@@ -102,7 +99,7 @@ def measure_written_offset_ms(
     process) the midpoint no longer dates the write to ``poll_ms / 2``, so the
     measurement is discarded: the new doc becomes the reference and the next write is
     waited for; None if none comes before the deadline (the caller then falls back to
-    the stamp-lag bounds)."""
+    no verdict)."""
     last = _newest_written(redis_client, key)
     before = clock_ms()
     deadline = before + int(max_wait_ms)
@@ -130,19 +127,8 @@ class ClockReading:
     reason: Optional[str] = None
 
 
-def evaluate_clock(now_ms: int, newest_ms: Optional[int], *, period_ms: int, tolerance_ms: int) -> ClockReading:
-    if newest_ms is None:
-        return ClockReading(True, None, "no_stamps")  # idle / nothing written: no verdict
-    lag = int(now_ms) - int(newest_ms)
-    if lag < -int(tolerance_ms):
-        return ClockReading(False, lag, "gateway_ahead")
-    if lag > 2 * int(period_ms) + int(tolerance_ms):
-        return ClockReading(False, lag, "gateway_behind_or_stalled")
-    return ClockReading(True, lag)
-
-
 class GatewayClockMonitor:
-    """Suspends / resumes O1 on ``signal_state`` from :func:`evaluate_clock` readings."""
+    """Suspends / resumes O1 on ``signal_state`` from direct ``written_ms`` readings."""
 
     def __init__(
         self,
@@ -170,19 +156,20 @@ class GatewayClockMonitor:
 
     def _reading(self) -> ClockReading:
         key = written_probe_key(self._redis, self._models)
-        if key is not None:
-            offset = measure_written_offset_ms(
-                self._redis, key, clock_ms=self._clock, sleep_s=self._sleep, poll_ms=self.poll_ms,
-                max_wait_ms=self.period_ms + 2_000,
-            )
-            if offset is not None:
-                if offset > self.tolerance_ms:
-                    return ClockReading(False, offset, "gateway_ahead")
-                if offset < -self.tolerance_ms:
-                    return ClockReading(False, offset, "gateway_behind")
-                return ClockReading(True, offset)
-        newest = newest_instant_stamp_ms(self._redis, self._models)
-        return evaluate_clock(self._clock(), newest, period_ms=self.period_ms, tolerance_ms=self.tolerance_ms)
+        if key is None:
+            return ClockReading(True, None, "no_written_ms")  # nothing to measure: no verdict
+        offset = measure_written_offset_ms(
+            self._redis, key, clock_ms=self._clock, sleep_s=self._sleep, poll_ms=self.poll_ms,
+            max_wait_ms=self.period_ms + 2_000,
+        )
+        if offset is None:
+            # No new doc (models down, a gateway pause): no measurement, no verdict.
+            return ClockReading(True, None, "no_measurement")
+        if offset > self.tolerance_ms:
+            return ClockReading(False, offset, "gateway_ahead")
+        if offset < -self.tolerance_ms:
+            return ClockReading(False, offset, "gateway_behind")
+        return ClockReading(True, offset)
 
     def check(self) -> ClockReading:
         try:

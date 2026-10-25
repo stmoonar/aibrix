@@ -1,7 +1,8 @@
-"""H1 (2026-10-06, docs baselines-methodology "10-06 晚 TRE 决策延迟修复"), controller side.
+"""Rescue (fast) loop cadence and the LOW-receiver rescue step.
 
-* The rescue loop ticks right after a snapshot is published (not on its free-running
-  5 s phase); ``rescue_interval_s`` is only the fallback when nothing is published.
+* 2026-10-25: the rescue loop ticks on a fixed ``rescue_interval_s`` timer (as the
+  fairness loop does), reading the latest snapshot; a publish does not wake it (the
+  2026-10-06 H1 wake-on-publish is removed).
 * A LOW receiver with a sleeping binding on a free GPU is woken by the rescue loop in
   the same grid; donor-taking steps for LOW stay with the fairness loop.
 * No model gets two scale-ups for one grid across the two loops."""
@@ -22,41 +23,42 @@ from test_planner_slot_occupancy import TOPOLOGY, _cls, _e1_bindings
 LOW_MODEL = "dsllama-8b"
 
 
-# ----------------------------------------------------------------- (a) tick on publish
+# ----------------------------------------------------------------- (a) fixed timer
 
 
-def test_rescue_decides_on_publish_without_waiting_for_the_interval(monkeypatch) -> None:
-    clock = {"ms": 0}
-    decided: list[tuple[int, int]] = []  # (snapshot ts_ms, fake clock at decision)
-    fallback_sleeps: list[float] = []
+def test_rescue_ticks_on_its_timer_and_a_publish_does_not_wake_it(monkeypatch) -> None:
+    decided: list[int] = []  # snapshot ts_ms of each decision
+    timer = asyncio.Queue()
 
     def fake_tick(snapshot, **_kwargs):
-        decided.append((snapshot.ts_ms, clock["ms"]))
+        decided.append(snapshot.ts_ms)
         return LoopTickResult(submitted=0)
 
-    async def never_elapses(seconds: float) -> None:
-        # The fallback interval; the fake clock never reaches it in this test.
-        fallback_sleeps.append(seconds)
-        await asyncio.Event().wait()
+    async def fake_sleep(seconds: float) -> None:
+        assert seconds == 5.0
+        await timer.get()  # the 5 s timer fires when the test says so
 
     monkeypatch.setattr(rescue_mod, "run_rescue_tick", fake_tick)
     box = SnapshotBox(MetricsSnapshot(ts_ms=10_000, models={}, stale=False))
     cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
 
+    async def settle() -> None:
+        for _ in range(5):
+            await asyncio.sleep(0)
+
     async def scenario() -> None:
         task = asyncio.ensure_future(
-            rescue_mod.rescue_task(box, queue=object(), registry=object(), cfg=cfg, sleep=never_elapses)
+            rescue_mod.rescue_task(box, queue=object(), registry=object(), cfg=cfg, sleep=fake_sleep)
         )
-        for _ in range(5):
-            await asyncio.sleep(0)
-        clock["ms"] = 12_300  # boundary 20 s + learned offset, minus 10 s of grid
-        box.set(MetricsSnapshot(ts_ms=20_000, models={}, stale=False))
-        for _ in range(5):
-            await asyncio.sleep(0)
-        clock["ms"] = 22_300
-        box.set(MetricsSnapshot(ts_ms=30_000, models={}, stale=False))
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await settle()
+        box.set(MetricsSnapshot(ts_ms=12_000, models={}, stale=False))
+        box.set(MetricsSnapshot(ts_ms=14_000, models={}, stale=False))
+        await settle()
+        assert decided == [10_000]  # publishes do not wake the loop
+        timer.put_nowait(None)
+        await settle()
+        timer.put_nowait(None)  # nothing new published: the same window is re-read
+        await settle()
         task.cancel()
         try:
             await task
@@ -64,11 +66,7 @@ def test_rescue_decides_on_publish_without_waiting_for_the_interval(monkeypatch)
             pass
 
     asyncio.run(scenario())
-
-    # One decision per publish, each at the publish time (epsilon = 0 on the fake clock),
-    # although the 5 s fallback never elapsed.
-    assert decided == [(10_000, 0), (20_000, 12_300), (30_000, 22_300)]
-    assert fallback_sleeps and all(s == 5.0 for s in fallback_sleeps)
+    assert decided == [10_000, 14_000, 14_000]
 
 
 # ------------------------------------------------- (b) LOW + free sleeping GPU via rescue

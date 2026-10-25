@@ -4,10 +4,10 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Collection, Mapping, Protocol
 
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_of, observed_requests
 from tre_common.registry import Registry
 from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
@@ -128,6 +128,12 @@ def run_safescale_observation_tick(
         accepted_actions.extend(rolled_back)
         submitted += len(rolled_back)
     if snapshot.stale:
+        if not observe_mode:
+            # Review round 6 (M2): no probe is judged on a stale snapshot; one past its W
+            # ceiling is rolled back (unhidden) rather than held until the gateway recovers.
+            stale = _rollback_stale_past_ceiling(queue, safescale, now_ms=snapshot.ts_ms, events=events)
+            accepted_actions.extend(stale)
+            submitted += len(stale)
         return SafeScaleObservationResult(
             submitted=submitted, actions=tuple(accepted_actions), events=tuple(events) + ("snapshot_stale",)
         )
@@ -163,6 +169,7 @@ def run_safescale_observation_tick(
                 if probe.model in _cluster_view_counts(cluster_view)
                 else None
             ),
+            tail_start_ms=_tail_start_ms(safescale, probe.model),
         )
         poll = (direct_polls or {}).get(probe.model)
         # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
@@ -453,6 +460,17 @@ def _rollback_aborted(queue, safescale, *, now_ms: int, events: list[str]) -> li
     )
 
 
+def _rollback_stale_past_ceiling(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
+    past = getattr(safescale, "probes_past_ceiling", None)
+    probes = past() if callable(past) else []
+    if not probes:
+        return []
+    return rollback_probes(
+        queue, safescale, probes, reason="stale_past_ceiling", event="safescale_stale_rollback",
+        now_ms=now_ms, events=events,
+    )
+
+
 def rollback_probes_for_observe(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
     """Observe mode (user decision 2026-09-28): every ``probing`` probe is rolled
     back. Its queued one-shot actions (if any) are dropped and the single action
@@ -664,6 +682,7 @@ def _observation_from_metrics(
     hidden_pods: tuple[str, ...] = (),
     gateway: GatewayCounters | None = None,
     routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
+    tail_start_ms: int | None = None,
 ) -> ProbeObservation:
     if signal_state is not None and getattr(signal_state, "breakpoint", None) is not None:
         # O1: the planner tick's computation (same effective window, same EMA). The hide
@@ -713,7 +732,89 @@ def _observation_from_metrics(
         # The immediate rollback judges max(per pod, pooled) like the deadline gate.
         pooled_ttft_p95_ms=_pooled_p95(metrics, hidden_pods, "ttft_hist", "ttft_hist_count"),
         pooled_tpot_p95_ms=_pooled_p95(metrics, hidden_pods, "tpot_hist", "tpot_hist_count"),
+        observed_ms=observed_of(metrics).t_last_ms,
+        **_tail_terms(metrics, spec, signal_source, hidden_pods, tail_start_ms),
     )
+
+
+def _tail_start_ms(safescale: object, model: str) -> int | None:
+    reader = getattr(safescale, "tail_start_ms", None)
+    try:
+        return reader(model) if callable(reader) else None
+    except Exception:  # noqa: BLE001 - no tail: the gate finds no tail evidence
+        return None
+
+
+def _tail_terms(
+    metrics: ModelWindowMetrics, spec, signal_source: str, hidden_pods: tuple[str, ...], tail_start_ms: int | None
+) -> dict:
+    """Round 5 (H1): the commit gate's tail of this snapshot - the post-hide part of
+    the window, from the first gateway boundary at or after the probe's post-hide start
+    ``tail_start_ms`` (the store builds that suffix, ``MetricsStore(suffix_tail=...)``)
+    to the window end; the whole window once the hide precedes it (one metrics window,
+    30 s, of post-hide evidence). One value per quantity over that span: raw Z (no
+    EMA, the TSS numerator scaled to a whole window as O1 does), traffic, the remaining
+    pods' KV-cache fill (each pod's mean over its instant docs: time-weighted) and the
+    latency p95s; plus its evidence - the observed span (``Observed``, gateway clock)
+    and the requests the remaining pods completed in it (unscaled; None = unknown, a
+    synthetic window without counts). {} without a probe; only ``tail_start_ms`` when
+    the snapshot has no such span yet (no evidence)."""
+    if tail_start_ms is None:
+        return {}
+    end = int(metrics.window_end_ms)
+    if int(tail_start_ms) <= int(metrics.window_start_ms):
+        window = metrics
+    else:
+        candidates = [item for item in metrics.suffix_windows if int(item.window_start_ms) >= int(tail_start_ms)]
+        if not candidates:
+            return {"tail_start_ms": int(tail_start_ms)}
+        window = min(candidates, key=lambda item: int(item.window_start_ms))
+    start = int(window.window_start_ms)
+    span = end - start
+    hidden = set(hidden_pods)
+    remaining = [pod for key, pod in (window.per_pod or {}).items() if key not in hidden and pod.pod not in hidden]
+    if window.per_pod:
+        # Review round 6 (L2): the remaining pods only (a pod without a count adds 0).
+        requests = sum(float(observed_requests(pod) or 0.0) for pod in remaining)
+    else:  # a synthetic window without a per-pod split: its own count, None = unknown
+        requests = observed_requests(window)
+    observed = observed_of(window)
+    terms = {
+        "tail_start_ms": start,
+        "tail_observed_ms": observed.span_ms,
+        "tail_requests": requests,
+    }
+    if span <= 0 or window.prompt_tokens is None or window.generation_tokens is None:
+        return terms
+    whole = float(end - int(metrics.window_start_ms))
+    scale = whole / float(span)
+    inp = TRSInput.from_metrics(window, spec.trs)
+    inp = replace(
+        inp,
+        prompt_tokens_total=inp.prompt_tokens_total * scale,
+        generation_tokens_total=inp.generation_tokens_total * scale,
+        window_ms=whole,
+    )
+    result = TRSComputer(ema_tau_ms=0.0).compute(inp, theta_m=spec.trs.theta_m)
+    signal = get_signal(window, spec, signal_source, trs_z_m=result.Z_m, signal_state=None)
+    return {
+        **terms,
+        "tail_z_m": signal.z_m,
+        "tail_has_traffic": bool(result.Q > 0.0 or (result.Y_m > 0.0 and result.defined)),
+        "tail_gpu_cache": remaining_pods_kv_cache(window, hidden_pods),
+        # max(per pod, pooled remaining pods), as the deadline gate judges.
+        "tail_ttft_p95_ms": _max_known(
+            window.ttft_p95_ms, _pooled_p95(window, hidden_pods, "ttft_hist", "ttft_hist_count")
+        ),
+        "tail_tpot_p95_ms": _max_known(
+            window.tpot_p95_ms, _pooled_p95(window, hidden_pods, "tpot_hist", "tpot_hist_count")
+        ),
+    }
+
+
+def _max_known(*values: float | None) -> float | None:
+    known = [float(value) for value in values if value is not None]
+    return max(known) if known else None
 
 
 def _pooled_p95(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...], hist: str, count: str) -> float | None:

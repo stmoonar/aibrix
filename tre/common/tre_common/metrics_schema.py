@@ -1,6 +1,62 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+
+@dataclass(frozen=True)
+class Observed:
+    """What a window actually observed, on the observation clock (round 4,
+    docs/design/20261025-instant-sampling.md "Evidence, not ticks").
+
+    Every time here is a gateway ``scraped_ms`` (the start of the /metrics fetch whose
+    values a doc carries; gateway wall clock), never a doc stamp (the write grid):
+
+    * ``t_first_ms``: where the window's evidence starts - the observation of the token
+      baseline (the histogram doc the deltas start from), else the first observation;
+    * ``t_last_ms``: the newest observation in the window.
+
+    (Round 5: only what a decision reads. Observation counts, request counts and flags
+    live on the window itself - ``request_count_observed``, ``sample_incomplete_pods``.)
+
+    The evidence period is a storage detail: a decision rule reads spans of these
+    times (``t_last - t_ref``), never a count of windows. None = unknown."""
+
+    t_first_ms: int | None = None
+    t_last_ms: int | None = None
+
+    @property
+    def span_ms(self) -> int:
+        """``t_last - t_first`` (0 when unknown)."""
+        if self.t_first_ms is None or self.t_last_ms is None:
+            return 0
+        return max(0, int(self.t_last_ms) - int(self.t_first_ms))
+
+    def since(self, ref_ms: int | None) -> int:
+        """The observed span after the reference event ``ref_ms`` (a breakpoint, a hide,
+        a rollback; same clock): ``t_last - max(t_first, ref)``, 0 when unknown."""
+        if self.t_last_ms is None:
+            return 0
+        start = self.t_first_ms if ref_ms is None else (
+            int(ref_ms) if self.t_first_ms is None else max(int(self.t_first_ms), int(ref_ms))
+        )
+        if start is None:
+            return 0
+        return max(0, int(self.t_last_ms) - int(start))
+
+    @classmethod
+    def merge(cls, items: Iterable["Observed | None"]) -> "Observed | None":
+        """The observation of several pods together: earliest start, newest end.
+        Order-independent; None when no item is known."""
+        known = [item for item in items if item is not None]
+        if not known:
+            return None
+        firsts = [item.t_first_ms for item in known if item.t_first_ms is not None]
+        lasts = [item.t_last_ms for item in known if item.t_last_ms is not None]
+        return cls(
+            t_first_ms=min(firsts) if firsts else None,
+            t_last_ms=max(lasts) if lasts else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -17,9 +73,15 @@ class PodWindowMetrics:
     e2e_p95_ms: float | None
     request_count: float | None = None
     token_counter_reset: bool = False
-    #: Timestamps (ms) of the gateway instant samples read for this window. Provenance for
-    #: the phase-aligned sampler's freshness check (a window must hold every
-    #: SCRAPE_INTERVAL_MS tick, the newest one at window_end). Excluded from equality.
+    #: Review round 3 (L5): the completed requests actually observed (the histogram
+    #: count delta, not scaled to the window by the token span like
+    #: ``request_count``). The evidence-count gates (``min_evidence_requests``, the
+    #: low-evidence rescue step) count these. None = not read / no histogram.
+    request_count_observed: float | None = field(default=None, compare=False)
+    #: Timestamps (ms) of the gateway instant docs read for this window (as written,
+    #: stale ones included). Provenance for the phase-aligned sampler, which waits until
+    #: the gateway has written the window's end tick (2026-10-25: per-pod coverage is
+    #: the store's ``sample_incomplete_pods``). Excluded from equality.
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
     #: Window average of vLLM ``kv_cache_usage_perc`` (``gpu_cache_usage_perc`` before
     #: vLLM 0.11; KV-cache fill, 0..1) from the gateway instant docs; None when no doc
@@ -58,14 +120,23 @@ class PodWindowMetrics:
     tpot_hist_count: float | None = field(default=None, compare=False)
     #: The pod's NEWEST gateway instant sample in the window (not a window average):
     #: vLLM ``num_requests_waiting`` / ``num_requests_running`` / KV-cache fill (0..1,
-    #: None when the doc does not carry it) and the sample's timestamp (ms). Read by the
+    #: None when the doc does not carry it) and when it was observed (ms; round 4: the
+    #: doc's ``scraped_ms``, the doc stamp only for a doc without one). Read by the
     #: controller's onset saturation rescue (design 20261002-saturation-onset-rescue),
-    #: which judges "engine full" on the latest grid, not on the 30 s mean. None = no
+    #: which judges "engine full" on the latest sample, not on the 30 s mean. None = no
     #: instant doc in the window. Excluded from equality.
     latest_waiting: float | None = field(default=None, compare=False)
     latest_running: float | None = field(default=None, compare=False)
     latest_gpu_cache: float | None = field(default=None, compare=False)
     latest_instant_ms: int | None = field(default=None, compare=False)
+    #: Round 5 (M2): the newest sample is current - observed within the producer's
+    #: cadence of the window end (the store's ``scrape_current_pods`` rule). A stale one
+    #: is not a sample of the engine now (saturation rescue). True for windows the store
+    #: did not build (synthetic / offline).
+    latest_current: bool = field(default=True, compare=False)
+    #: Round 4: the pod's observation of the window (:class:`Observed`); None = not
+    #: read on the observation clock (v1 schema, offline / synthetic windows).
+    observed: Observed | None = field(default=None, compare=False)
 
 
 #: How a model-level p95 is formed from the pods' merged histograms:
@@ -92,8 +163,17 @@ class ModelWindowMetrics:
     per_pod: dict[str, PodWindowMetrics]
     request_count: float | None = None
     token_counter_reset: bool = False
+    #: Review round 3 (L5): the completed requests actually observed (the histogram
+    #: count delta, not scaled to the window by the token span like
+    #: ``request_count``). The evidence-count gates (``min_evidence_requests``, the
+    #: low-evidence rescue step) count these. None = not read / no histogram.
+    request_count_observed: float | None = field(default=None, compare=False)
     #: Union of the per-pod ``instant_ticks_ms`` (see :class:`PodWindowMetrics`).
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
+    #: Round 4: the model's observation of the window (:class:`Observed`, merged over
+    #: the pods in ``per_pod``; the store's flags included). None = not read on the
+    #: observation clock - use :func:`observed_of`.
+    observed: Observed | None = field(default=None, compare=False)
     #: The rule the model e2e p95 was formed with (merged pod histograms, gated at
     #: the model level); carried so a re-aggregation (``restrict_to_serving``)
     #: applies the same one. None = max of the per-pod p95s (no histograms).
@@ -107,10 +187,18 @@ class ModelWindowMetrics:
     #: a suffix only while a breakpoint (traffic onset, routable-count change) lies
     #: inside the window. Excluded from equality.
     suffix_windows: tuple["ModelWindowMetrics", ...] = field(default=(), compare=False)
-    #: I3 (2026-10-04): pods left out of this window because the gateway's last
-    #: successful scrape of them (doc ``scraped_ms``) lies before the window - their
-    #: docs repeat frozen values. Diagnostics only; excluded from equality.
+    #: I3 (2026-10-04; 2026-10-25 the sample rule): pods left out of this window
+    #: because no sample of them was observed in it (no ``scraped_ms`` in the window -
+    #: their docs repeat frozen values). Frozen-scrape rescue evidence; also in
+    #: ``sample_incomplete_pods``. Excluded from equality.
     scrape_stale_pods: tuple[str, ...] = field(default=(), compare=False)
+    #: 2026-10-25 (review round 1 D2): flagged pods - samples (distinct ``scraped_ms``
+    #: in the window) below ``scaling.sample_min_ratio`` x (window / instant period), a
+    #: token span over 1.5 windows, or left out (0 samples / no token span). A
+    #: donor-gate flag only: a pod with samples stays in the window; while a flagged
+    #: pod serves, the controller takes no donor / shrink / release from the model.
+    #: Excluded from equality.
+    sample_incomplete_pods: tuple[str, ...] = field(default=(), compare=False)
     #: Some pod of this model (sleeping ones included) has a successful gateway scrape
     #: inside the window: the gateway scraper is alive. False for an old gateway.
     scrape_fresh: bool = field(default=False, compare=False)
@@ -118,8 +206,8 @@ class ModelWindowMetrics:
     #: mirror, live gateway instances only; ``tre_common.gateway_inflight``).
     scrape_stale_inflight: dict[str, int] = field(default_factory=dict, compare=False)
     #: Review 2026-10-06 P2-2: pods whose newest successful gateway scrape
-    #: (``scraped_ms``) lies in the window's last grid ``[window_end - grid, window_end]``
-    #: (gateway clock). An idle window needs every serving pod here.
+    #: (``scraped_ms``) is fresh at the window end (round 4: at most 4 instant sample
+    #: periods old, gateway clock). An idle window needs every serving pod here.
     scrape_current_pods: frozenset[str] = field(default=frozenset(), compare=False)
     #: P2-2: the gateway in-flight count of each pod with docs in the window (live
     #: gateway instances; ``tre_common.gateway_inflight``), read only when the window has
@@ -133,3 +221,27 @@ class MetricsSnapshot:
     ts_ms: int
     models: dict[str, ModelWindowMetrics]
     stale: bool
+    #: Why the store marked the snapshot stale (e.g. a gateway cadence mismatch).
+    stale_reason: str | None = field(default=None, compare=False)
+    #: Round 5: the newest histogram boundary the gateway wrote completely
+    #: (``last_hist_ms`` of ``tre:v2:gateway:cadence``, in the round's MULTI). The sampler's
+    #: freshness rule: a window ending at ``E`` is complete once this is >= ``E``.
+    #: None = not read (no cadence check, v1 schema, offline).
+    gateway_last_hist_ms: int | None = field(default=None, compare=False)
+
+
+def observed_requests(metrics: Any) -> float | None:
+    """The completed requests observed in a window (``request_count_observed``, not
+    scaled by the token span; review round 3, L5), else ``request_count`` (synthetic /
+    offline windows, which carry only that)."""
+    observed = getattr(metrics, "request_count_observed", None)
+    return getattr(metrics, "request_count", None) if observed is None else observed
+
+
+def observed_of(metrics: Any) -> Observed:
+    """``metrics.observed``, else - a window not read on the observation clock (v1,
+    offline, synthetic) - the window bounds as its observation span."""
+    observed = getattr(metrics, "observed", None)
+    if observed is not None:
+        return observed
+    return Observed(t_first_ms=int(metrics.window_start_ms), t_last_ms=int(metrics.window_end_ms))

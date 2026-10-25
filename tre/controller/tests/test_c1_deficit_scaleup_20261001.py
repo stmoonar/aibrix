@@ -386,13 +386,15 @@ def test_shipped_registry_scaling_section():
         "rescue_max_step_ratio", "rescue_max_step_pods",
         "rescue_settle_ema_k",
         # O1 (2026-10-01): the breakpoint window, at its built-in defaults.
-        "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
+        "breakpoint_window", "onset_warmup_guard", "min_evidence_ms", "min_evidence_requests",
         "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
-        "breakpoint_hold_max_windows",
+        "breakpoint_hold_max_ms",
         "gateway_clock_tolerance_ms", "gateway_clock_check_s",
         # Onset saturation rescue (2026-10-02), at its built-in defaults.
-        "saturation_rescue", "saturation_kv_threshold", "saturation_consecutive_ticks",
+        "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
         "saturation_max_step_factor",
+        # Instant sample completeness (2026-10-25), at its built-in default.
+        "sample_min_ratio",
     }
     assert not hasattr(registry.scaling(), "donor_surplus_release")  # retired 2026-10-07 (F1-B)
     assert registry.scaling().rescue_max_step_pods == 4

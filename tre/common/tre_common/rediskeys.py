@@ -1,16 +1,33 @@
 RETENTION_MS = 30 * 60 * 1000
 FALLBACK_TTL_SECONDS = 2 * 60 * 60
 
-# SINGLE SOURCE OF TRUTH for the instant/histogram scrape cadence. The AIBrix gateway
-# writes the redis inst/hist buckets (inst_key/hist_key, and the legacy
-# aibrix:pod_instant_metrics_* keys) on a fixed, boundary-aligned ticker whose period is
-# the Go constant `RequestTraceWriteInterval = 10 * time.Second`
-# (aibrix pkg/cache/trace.go). That constant lives in aibrix-system and is not tunable
-# from TRE, so the Python side must mirror it here rather than re-inventing a second magic
-# number. `MetricsStore._instant_avg` uses this to count expected samples in a window, and
-# the offline r3 sidecar sampler uses ~2x this as its freshness lookback. Keep in sync if
-# the gateway's RequestTraceWriteInterval ever changes.
+# Gateway TRE doc cadence (2026-10-25: two periods, both set on the gateway-plugins
+# Deployment by env vars of the same names as the controller's; the gateway declares
+# them in GATEWAY_CADENCE_KEY and the controller compares that on every snapshot read):
+#
+# * INSTANT_SAMPLE_INTERVAL_MS - tre:v2:inst docs (queue gauges, KV-cache fill). The
+#   controller's per-pod coverage flag counts on this grid (env
+#   TRE_INSTANT_SAMPLE_INTERVAL_MS, gateway and controller).
+# * EVIDENCE_PERIOD_MS - tre:v2:hist docs (token / latency histograms) and the legacy
+#   aibrix:pod_*_metrics_* keys; the controller's phase-aligned window grid, O1 grid and
+#   SafeScale evidence step (env TRE_EVIDENCE_PERIOD_MS, gateway and controller). A
+#   multiple of the instant period; the metrics window must be a multiple of both.
+#
+# Neither is the upstream request-trace interval (aibrix pkg/cache/trace.go
+# RequestTraceWriteInterval, 10 s, unchanged).
+INSTANT_SAMPLE_INTERVAL_MS = 500
+EVIDENCE_PERIOD_MS = 2_000
+
+# The 10 s gateway grid of the gateway images before 2026-10-25 (instant AND histogram
+# docs). The calibration / replayer tooling re-windows data captured on it, and the
+# count-based settings of before (N windows / ticks / grids) were N x this long: their
+# deprecated aliases are converted with it.
 SCRAPE_INTERVAL_MS = 10_000
+LEGACY_GRID_MS = SCRAPE_INTERVAL_MS
+
+# Declared gateway cadence (hash: instant_ms, evidence_ms, written_ms, version), written
+# by the gateway in the MULTI of every round (review round 1, M4/L6).
+GATEWAY_CADENCE_KEY = "tre:v2:gateway:cadence"
 
 DECISION_LATEST_KEY = "tre:v2:decision:latest"
 # S5.1: per-model decision time-series (score = window_end_ms). Backs the UI timelines

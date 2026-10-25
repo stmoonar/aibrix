@@ -11,7 +11,6 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.gateway_inflight import instance_max_age_ms
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
-from tre_controller.gateway_cadence import check_gateway_cadence
 from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
@@ -44,6 +43,7 @@ from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, Re
 from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
+from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
 from tre_controller.store.state_store import ControllerStateStore
 
@@ -120,7 +120,8 @@ def build_controller_task_specs(
     planner_safescale = None if safescale_off else deps.safescale
     leftover_probes = deps.safescale if safescale_off else None
     # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-08): every decision runs in the fast loop -
-    # its snapshot-aligned ticks plan the fairness section too, no fairness task runs.
+    # its ticks (fixed TRE_RESCUE_INTERVAL_SECONDS timer, reading the newest snapshot)
+    # plan the fairness section too, no fairness task runs.
     # The fast loop does all the fairness task did besides planning (model state box,
     # decision snapshot); the queue's rescue-over-fairness replacement follows each
     # action's source_loop, which the planner sets per section.
@@ -239,7 +240,8 @@ def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClo
         redis_client,
         [spec.name for spec in deps.registry.models()],
         deps.signal_state,
-        period_ms=int(getattr(cfg, "instant_sample_interval_ms", breakpoint.grid_ms)),
+        # The probe watches instant docs: wait one instant period (+ 2 s) for a new one.
+        period_ms=int(getattr(cfg, "instant_sample_interval_ms", 10_000)),
         tolerance_ms=int(config.gateway_clock_tolerance_ms),
     )
 
@@ -322,26 +324,52 @@ def create_controller_dependencies(
         if share
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
-    breakpoint_config = BreakpointWindowConfig.from_registry(
-        registry, grid_ms=cfg.instant_sample_interval_ms
-    )
+    breakpoint_config = BreakpointWindowConfig.from_registry(registry)
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
     )
-    saturation_config = SaturationRescueConfig.from_registry(registry, grid_ms=cfg.instant_sample_interval_ms)
+    saturation_config = SaturationRescueConfig.from_registry(registry)
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
     )
+    scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
+    signal_state = SignalState(
+        warmup_ms=cfg.signal_warmup_ms,
+        # O1 breakpoint window (registry scaling.breakpoint_window /
+        # onset_warmup_guard / min_evidence_*), on observation times.
+        breakpoint=breakpoint_config,
+        # Onset saturation rescue (registry scaling.saturation_*).
+        saturation=SaturationTracker(saturation_config),
+    )
+    # Round 4: the SafeScale tail span source, bound once the state machine exists.
+    tail_start: list = []
     store = MetricsStore(
         metrics_redis_client,
         registry,
         instant_sample_interval_ms=cfg.instant_sample_interval_ms,
+        evidence_period_ms=cfg.evidence_period_ms,
+        # Declared gateway cadence (review round 1, M4/L6): checked on every snapshot
+        # read against the gateway's tre:v2:gateway:cadence hash (TRE_GATEWAY_INTERVAL_CHECK:
+        # fail = a mismatch marks the snapshot stale, warn = logs only, off = no check).
+        expected_cadence=(
+            None
+            if cfg.gateway_interval_check == "off"
+            else (int(cfg.instant_sample_interval_ms), int(cfg.evidence_period_ms))
+        ),
+        cadence_enforce=cfg.gateway_interval_check == "fail",
+        # 2026-10-25: per-pod completeness (registry scaling.sample_min_ratio).
+        min_sample_ratio=float(getattr(scaling_config, "sample_min_ratio", 0.0) or 0.0),
         percentile_mode=cfg.percentile_mode,
         schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
-        # O1: the grid-aligned suffix windows the breakpoint window decides on.
-        suffix_period_ms=cfg.instant_sample_interval_ms if breakpoint_config.enabled else 0,
+        # O1 and the SafeScale tail: the suffix windows they decide on, aligned to the
+        # histogram docs (only the requested ones are built).
+        suffix_period_ms=cfg.evidence_period_ms,
+        # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
+        suffix_breakpoint=lambda model: signal_state.breakpoint_ms(model) if signal_state.o1_active else None,
+        # Round 5: and the SafeScale commit gate's tail - the post-hide suffix of a probing model.
+        suffix_tail=lambda model: tail_start[0](model) if tail_start else None,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -354,15 +382,22 @@ def create_controller_dependencies(
     # (remaining pods: probe pods and pods the fleet state reports asleep excluded),
     # anchored on Redis TIME of the metrics store; thresholds from registry safescale.
     safescale = SafeScaleStateMachine(
+        # Round 4: the Redis evidence path's doc grid (no decision rule reads it).
+        grid=EvidenceGrid(int(cfg.evidence_period_ms)),
         config=cfg.safescale,
         store=ControllerStateStore(redis_client),
         evidence=MetricsEvidenceReader(
-            # Same rules as the controller's store, but no histogram lookback: a pod's
-            # delta starts at its first doc stamped at or after the evidence start.
+            # Latency histograms only (M5, 2026-10-25): no instant docs are read. No
+            # histogram lookback: a pod's delta starts at its first doc stamped at or
+            # after the evidence start; a pod counts when a doc of the window was
+            # observed in it (frozen scrape -> left out); the end-of-window check is
+            # the reader's (_evidence_incomplete), as before.
             MetricsStore(
                 metrics_redis_client,
                 registry,
                 instant_sample_interval_ms=cfg.instant_sample_interval_ms,
+                evidence_period_ms=cfg.evidence_period_ms,
+                read_instant=False,
                 percentile_mode=cfg.percentile_mode,
                 schema=cfg.metrics_schema,
                 histogram_lookback_ms=0,
@@ -381,6 +416,7 @@ def create_controller_dependencies(
         remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
     )
     safescale.restore()
+    tail_start.append(safescale.tail_start_ms)
     # 2026-09-29 B+D: the controller scrapes the probe's remaining pods itself
     # (pod IP from the SM fleet state, port = registry safescale.metrics_port).
     # Not with SafeScale off (TRE_ABLATION_DISABLE_SAFESCALE): no probe is judged.
@@ -416,13 +452,15 @@ def create_controller_dependencies(
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
         "slo_mode": cfg.safescale.slo_mode,
         "early_commit": cfg.safescale.early_commit,
-        "early_commit_min_grids": cfg.safescale.early_commit_min_grids,
+        "early_commit_min_evidence_ms": cfg.safescale.early_commit_min_evidence_ms,
         "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
     }, sort_keys=True))
     # The effective ablation switches (production: both false).
     logging.getLogger("tre_controller").info(json.dumps({
         "event": "ablation_switches",
         "disable_safescale": bool(getattr(cfg, "ablation_disable_safescale", False)),
+        # TRE_SAFESCALE_SCOPE (2026-10-26): all | receiverless_shrink | off.
+        "safescale_scope": str(getattr(cfg, "safescale_scope", "all")),
         "disable_slow_loop": bool(getattr(cfg, "ablation_disable_slow_loop", False)),
     }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)
@@ -486,14 +524,7 @@ def create_controller_dependencies(
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
-        signal_state=SignalState(
-            warmup_ms=cfg.signal_warmup_ms,
-            # O1 breakpoint window (registry scaling.breakpoint_window /
-            # onset_warmup_guard / min_evidence_*), on the gateway grid.
-            breakpoint=breakpoint_config,
-            # Onset saturation rescue (registry scaling.saturation_*).
-            saturation=SaturationTracker(saturation_config),
-        ),
+        signal_state=signal_state,
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(
             redis_client, grace_s=cfg.orphan_grace_s
@@ -524,22 +555,7 @@ async def main(
         redis_client_factory=redis_client_factory,
         sm_transport=sm_transport,
     )
-    verify_gateway_cadence(deps, cfg)
     await (runner or run_controller)(deps, cfg)
-
-
-def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) -> None:
-    """Startup assertion (D8): gateway write period == SCRAPE_INTERVAL_MS. Raises
-    GatewayCadenceMismatch on a mismatch in ``fail`` mode; only warns without evidence."""
-    redis_client = getattr(deps.store, "redis_client", None)
-    if redis_client is None:
-        return
-    check_gateway_cadence(
-        redis_client,
-        [spec.name for spec in deps.registry.models()],
-        mode=getattr(cfg, "gateway_interval_check", "fail"),
-        expected_ms=cfg.instant_sample_interval_ms,
-    )
 
 
 def _create_redis_client(

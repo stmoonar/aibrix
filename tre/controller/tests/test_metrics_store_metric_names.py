@@ -83,8 +83,9 @@ def test_latency_and_cache_read_under_either_identifier(tpot_key: str, cache_key
     assert pod.tpot_count == 4000.0
     assert pod.tpot_avg_ms == pytest.approx(20.0)
     assert pod.gpu_cache_usage == pytest.approx(0.4)
-    latest = store.read_latest_instant(MODEL, 20_000, 20_000)
-    assert latest == {"waiting": 1.0, "running": 2.0, "swapping": 0.0}
+    latest = store.read_latest_instant(MODEL, 21_000)
+    # Round 4: the pod's newest doc at or before now, with its age (no lookback).
+    assert latest == {"waiting": 1.0, "running": 2.0, "swapping": 0.0, "age_ms": 1_000.0}
 
 
 def test_new_identifier_wins_when_both_are_present() -> None:
@@ -93,6 +94,8 @@ def test_new_identifier_wins_when_both_are_present() -> None:
     doc = _inst_doc("kv_cache_usage_perc", 0.25)
     doc["model_metrics"][f"{MODEL}/gpu_cache_usage_perc"] = 0.75
     add_doc(redis, "tre:v2:inst:" + POD, 10_000, doc)
+    for ts, n in ((0, 0.0), (10_000, 20.0)):  # a token delta (M2: same pod set)
+        add_doc(redis, "tre:v2:hist:" + POD, ts, _hist_doc("time_per_output_token_seconds", n))
     store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000)
     window = store.read_model_window(MODEL, 0, 10_000, start_exclusive=True)
     assert window.per_pod["pod-a"].gpu_cache_usage == pytest.approx(0.25)

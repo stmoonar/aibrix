@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 from tre_common import slo_labels
-from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS
 
 from scripts import openloop
 from scripts import prompt_corpus
@@ -504,6 +504,9 @@ def drive_cell(
                     "running": snap.get("running", 0.0),
                     "swapping": snap.get("swapping", 0.0),
                 }
+                if snap.get("age_ms") is not None:
+                    # Round 4: how old the oldest pod's sample was (now - scraped_ms).
+                    row["age_ms"] = snap["age_ms"]
                 if openloop.KV_CACHE_USAGE_KEY in snap:
                     # diagnostic (the pod sampler's mean over pods; None when no pod
                     # reported it); absent when the sampler does not read it
@@ -538,17 +541,18 @@ def estimate_capture_bytes(cells: list[GridCell], cell_seconds: float, assumed_r
     return int(total_requests * RAW_BYTES_PER_REQUEST)
 
 
-def _make_live_instant_sampler(store, model: str, lookback_ms: int) -> Callable[[int], dict]:
+def _make_live_instant_sampler(store, model: str) -> Callable[[int], dict]:
     """Instant queue snapshot from the live MetricsStore, reusing its instant read seam.
 
-    Returns the LATEST scrape value (via store.read_latest_instant), not a windowed
-    average. The gateway writes the instant buckets on a boundary-aligned ~10s ticker
-    (SCRAPE_INTERVAL_MS), so a naive [now-5000, now] read misses the current bucket and
-    records 0 (r3 SMOKE_FINDINGS defect 1). ``lookback_ms`` must be >= ~2x the scrape
-    cadence so the last-written bucket is always captured."""
+    Returns the LATEST scrape value (via store.read_latest_instant: each pod's newest
+    doc at or before ``now``, with ``age_ms``; None - no sample row - when no pod has a
+    doc), not a windowed average. Round 4: no lookback to size against the gateway's
+    period (a too narrow read missed the current doc and recorded 0, r3 SMOKE_FINDINGS
+    defect 1; "2 x the declared period" still missed a late round): the row carries the
+    sample's age instead."""
 
     def sample(now: int) -> dict:
-        return store.read_latest_instant(model, now, lookback_ms)
+        return store.read_latest_instant(model, now)
 
     return sample
 
@@ -650,15 +654,18 @@ def capture_layout_for(args, cell_id: str):
     return capture.CellLayout(cells.parent, Path(args.output).stem, cell_id, raw_root=raw_root)
 
 
-def capture_clock_config(args):
+def capture_clock_config(args, redis_client=None):
     """The capture's clock-domain config (:class:`scripts.calibration_capture.ClockDomainConfig`)
-    from the r3_grid arguments."""
+    from the r3_grid arguments; the round grid is the gateway's declared evidence period
+    (``tre:v2:gateway:cadence``; 10 s for an older gateway / no client)."""
     from scripts import calibration_capture as capture
 
+    offset = getattr(args, "controller_read_offset_ms", None)
     return capture.ClockDomainConfig(
         window_ms=int(args.window_ms),
+        period_ms=capture.gateway_round_ms(redis_client) if redis_client is not None else capture.GATEWAY_ROUND_MS,
         tolerance_ms=int(args.clock_tolerance_ms),
-        controller_read_offset_ms=int(args.controller_read_offset_ms),
+        controller_read_offset_ms=None if offset is None else int(offset),
         controller_tick_ms=int(args.controller_tick_ms),
         margin_ms=args.capture_margin_ms,
     )
@@ -756,7 +763,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         print(f"sidecar: {len(endpoints)} pod /metrics endpoint(s) @ {args.instant_sample_ms}ms"
               + ("" if recorder is None else f"; vLLM metrics -> {layout.vllm_metrics_dir}"))
     else:
-        sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+        sampler = _make_live_instant_sampler(store, args.model)
     if layout is not None:
         from scripts import calibration_capture as capture
 
@@ -835,7 +842,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
     if layout is not None and redis_client is not None and not (args.no_gateway_dump and args.no_controller_ticks):
         from scripts import calibration_capture as capture
 
-        clock_cfg = capture_clock_config(args)
+        clock_cfg = capture_clock_config(args, redis_client)
         clock_start = capture.cell_clock_mark(redis_client, args.model, clock_cfg)
         if not clock_start["check"]["ok"]:
             reasons = "; ".join(clock_start["check"]["reasons"])
@@ -846,6 +853,12 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
                                  "clock_domain_mismatch")
             print(f"WARNING: cell {cell_id}: {capture.CLOCK_DOMAIN_MISMATCH} at the cell start ({reasons}); "
                   "its gateway docs / controller ticks will be kept but never marked complete")
+    # The gateway keeps instant docs 5 min only (review round 3, M3): read them while the
+    # cell runs, from the dump range's start on, so the dump after the cell has them all.
+    inst_spool = None
+    if clock_start is not None and not args.no_gateway_dump and clock_start.get("late_write_range_ms"):
+        inst_spool = capture.InstantSpool(
+            redis_client, args.model, start_ms=int(clock_start["late_write_range_ms"][0])).start()
 
     # Reissue contamination (scripts.calibration_capture.reissue_check): the sidecar
     # counters of every model pod right before the load ...
@@ -902,6 +915,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         },
     )
 
+    if inst_spool is not None:
+        inst_spool.stop()
     clock_end = None
     if clock_start is not None:
         clock_end = capture.cell_clock_mark(redis_client, args.model, clock_cfg, start=clock_start)
@@ -1033,9 +1048,10 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             controller_ticks=not args.no_controller_ticks,
             flush_wait_s=args.gateway_flush_wait_s,
             clock_start=clock_start, clock_end=clock_end,
-            clock_config=clock_cfg or capture_clock_config(args),
+            clock_config=clock_cfg or capture_clock_config(args, redis_client),
             info={"guard_voided": guard.voided, "void_reasons": list(guard.void_reasons),
                   "truncated": guard.truncated, "reissue": reissue},
+            inst_spool=inst_spool,
         )
         gd = meta.get("gateway_redis_dump") or {}
         ct = meta.get("controller_ticks") or {}
@@ -1154,7 +1170,7 @@ def label_schedule_cell_windows(
         window_align=getattr(args, "window_align", "none"),
         percentile_mode=args.percentile_mode,
         min_latency_samples=args.min_latency_samples,
-        instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+        instant_sample_interval_ms=rewindow_from_raw.LIVE_GRID_MS,
         instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
         start_ms=start_ms, end_ms=end_ms,
         truncated_at_ts_ms=truncated_at_ts_ms,
@@ -1238,7 +1254,7 @@ def closed_loop_rows(
         client = rewindow_from_raw.aggregate_window(
             list(raw_records), [], wm.model, wm.window_start_ms, wm.window_end_ms,
             percentile_mode=percentile_mode, min_latency_samples=min_latency_samples,
-            instant_sample_interval_ms=SCRAPE_INTERVAL_MS, attribution=attribution,
+            instant_sample_interval_ms=rewindow_from_raw.LIVE_GRID_MS, attribution=attribution,
         )
         evidence = rewindow_from_raw.window_request_evidence(
             raw_records, wm.window_start_ms, wm.window_end_ms, attribution=attribution)
@@ -1307,23 +1323,19 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--step-ms", type=int, default=None,
                     help="slide step for the window CSV (default: --window-ms, tumbling)")
     ap.add_argument("--window-align", default="none", choices=["none", "grid"],
-                    help="grid: window ends on the 10 s gateway grid, read (start, end] - "
-                         "the phase-aligned controller's window (plan 6.11 D8; the campaign "
-                         "passes grid with --step-ms 10000). none: free-phase windows from "
-                         "the drive's start, [start, end)")
+                    help="grid: window ends on the 10 s fit grid, read (start, end] - "
+                         "a window the phase-aligned controller reads too (plan 6.11 D8; the "
+                         "campaign passes grid with --step-ms 10000). none: free-phase windows "
+                         "from the drive's start, [start, end)")
     ap.add_argument("--redis-url", default=_capture.DEFAULT_REDIS_URL)
     ap.add_argument("--metrics-schema", default="v1")
     # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
-    # This is NOT the divisor MetricsStore uses: the redis buckets it reads are written by
-    # the gateway on its own 10 s ticker, so that divisor is --store-instant-sample-ms and
-    # must stay at SCRAPE_INTERVAL_MS. An offline rewindow_from_raw of this capture must be
-    # passed --instant-sample-ms equal to the value used here.
-    # Closed-loop default stays the gateway cadence. Schedule mode defaults to 1 s: the
-    # gateway grid gives 3 samples per 30 s window, which aliases away the short-lived
-    # waiting queue the bursts primitive exists to produce (see scripts/openloop.py).
+    # An offline rewindow_from_raw of this capture must be passed --instant-sample-ms
+    # equal to the value used here. Closed-loop default: the gateway's instant period.
+    # Schedule mode defaults to 1 s (see scripts/openloop.py).
     ap.add_argument("--instant-sample-ms", type=int, default=None)
-    # expected_samples divisor for the redis windows: the gateway's cadence, not ours.
-    ap.add_argument("--store-instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
+    # The store's instant grid (its coverage flag; 2026-10-25 queue means have no divisor).
+    ap.add_argument("--store-instant-sample-ms", type=int, default=INSTANT_SAMPLE_INTERVAL_MS)
     ap.add_argument("--percentile-mode", default="bucket_upper")
     ap.add_argument("--min-latency-samples", type=int, default=10)  # align with live TRE_MIN_LATENCY_SAMPLES
     ap.add_argument("--registry", default=None)
@@ -1460,10 +1472,9 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "window + one gateway round + the clock check's blind spot, 52 s at 30 s)")
     ap.add_argument("--clock-tolerance-ms", type=int, default=_capture.DEFAULT_CLOCK_TOLERANCE_MS,
                     help="slack of the clock-domain check on both sides of each source's normal lag")
-    ap.add_argument("--controller-read-offset-ms", type=int,
-                    default=_capture.DEFAULT_CONTROLLER_READ_OFFSET_MS,
+    ap.add_argument("--controller-read-offset-ms", type=int, default=None,
                     help="largest phase offset the controller reads a window at (its adapted "
-                         "TRE_METRICS_PHASE_OFFSET_MS; cap 9.5 s)")
+                         "TRE_METRICS_PHASE_OFFSET_MS; default: the cap, gateway round - 0.5 s)")
     ap.add_argument("--controller-tick-ms", type=int, default=_capture.DEFAULT_CONTROLLER_TICK_MS,
                     help="slowest controller loop tick that writes the decision history (fairness "
                          "loop, 10 s; the rescue loop writes every 5 s when enabled)")
@@ -1559,7 +1570,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         args.instant_sample_ms = (
             int(openloop.DEFAULT_SIDECAR_INTERVAL_S * 1000)
             if args.schedule is not None
-            else SCRAPE_INTERVAL_MS
+            else INSTANT_SAMPLE_INTERVAL_MS
         )
     return args
 
@@ -1610,10 +1621,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         schema=args.metrics_schema,
         min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard
     )
-    # Freshness lookback = 2x scrape cadence so the last-written 10s bucket is always in
-    # range even with scrape/write lag (r3 SMOKE_FINDINGS defect 1); read_latest_instant
-    # then takes the freshest bucket, not a lookback-wide average.
-    instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+    # read_latest_instant takes each pod's newest doc (no lookback) and reports its age.
+    instant_sampler = _make_live_instant_sampler(store, args.model)
     run_prompt_preflight(args)
 
     if args.schedule is not None:

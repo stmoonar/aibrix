@@ -280,9 +280,8 @@ func (c *Store) refreshPodMetrics(pod *Pod) {
 	endpoint := fmt.Sprintf("%s:%d", pod.Status.PodIP, podMetricPort)
 	engineType := metrics.GetEngineType(*pod.Pod)
 	identifier := pod.Name
-	// TRE: stamp before the fetch (which can take up to the 5 s timeout), so scraped_ms
-	// never claims the metrics are newer than they are.
-	scrapedMS := treWallClockMS()
+	// TRE: the fetch start orders overlapping scrapes of this pod (storeScrape).
+	fetchStartMS := treWallClockMS()
 	result, err := c.engineMetricsFetcher.FetchAllTypedMetrics(ctx, endpoint, engineType, identifier, metricsToFetch)
 	if err != nil {
 		klog.V(4).InfoS("Failed to fetch typed metrics from engine pod",
@@ -316,12 +315,12 @@ func (c *Store) refreshPodMetrics(pod *Pod) {
 		c.updateThroughputToksPerS(pod, model, metric, metricValue)
 		metrics.EmitMetricToPrometheus(&types.RoutingContext{Model: model}, pod.Pod, metric, metricValue, metricValue.GetLabelValues())
 	}
-	// Update pod metrics using typed results
-	c.updatePodMetricsFromTypedResult(pod, result)
-	// TRE: mark the scrape only after its metrics are stored. The TRE Redis writer reads
-	// this time before the metrics, so a doc's scraped_ms never claims a scrape whose
-	// metrics it does not yet carry.
-	pod.markScrapeSucceeded(scrapedMS)
+	// Update pod metrics using typed results. TRE (review round 3, L4): stored and
+	// stamped as one unit under the pod's scrape lock; a scrape older than the stored
+	// one (overlapping fetches of one pod) is dropped.
+	if !pod.storeScrape(fetchStartMS, func() { c.updatePodMetricsFromTypedResult(pod, result) }) {
+		klog.V(4).InfoS("Dropped a pod metrics scrape older than the stored one", "pod", pod.Name)
+	}
 
 	c.syncRunningRequestsGlobally(pod)
 

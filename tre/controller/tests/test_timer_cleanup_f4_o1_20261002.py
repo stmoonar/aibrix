@@ -3,7 +3,7 @@ F4 action cooldown is only a fallback for models O1 does not track.
 
 With O1 active the routable-count change of an executed action is a breakpoint: the
 model takes part in no scale-down until a whole window follows it and acts as a
-receiver only on ``min_evidence_grids`` grids of post-change evidence. The one gap -
+receiver only on ``min_evidence_ms`` of post-change evidence. The one gap -
 the fleet view the tick decides on was fetched before the action completed, so no
 breakpoint exists yet - is closed by the O1 view-pending gate. While O1 is suspended
 (gateway clock check) or does not see the model, the F4 window-start rule holds as
@@ -93,8 +93,8 @@ def test_o1_replaces_the_f4_hold_of_a_low_receiver():
     results = _low_scenario(_state())
     # The view predates the scale-up: no breakpoint yet -> the O1 view-pending gate holds.
     assert "o1_view_pending_hold:m" in results[1].events and not _ups(results[1].actions)
-    # Breakpoint seen: the receiver waits for min_evidence_grids post-change grids.
-    assert "receiver_held_breakpoint_window:m:evidence_grids" in results[2].events
+    # Breakpoint seen: the receiver waits for min_evidence_ms of post-change grids.
+    assert "receiver_held_breakpoint_window:m:evidence_span" in results[2].events
     assert not _ups(results[2].actions)
     # Two post-change grids (window end BASE + 30 s): it acts again. The F4 rule would
     # still hold it here (window start BASE < the action's completion BASE + 1.5 s).
@@ -147,9 +147,9 @@ def test_contexts_mark_o1_tracking_and_a_stale_hold_clears_it():
     ctx, _ = _model_contexts(_snap(_window(BASE + 2 * GRID, [LOW] * 3)), _registry(), signal_state=state,
                              cluster_view=_view(1, fetched_ms=BASE + 2 * GRID + 500))
     assert ctx["m"]["o1_routable_tracked"] is False
-    cache = PaperStateCache(max_stale_windows=3)
-    cache.apply("m", {"o1_routable_tracked": True, "routable_pods": 1}, tokens_available=True)
-    held, events = cache.apply("m", {"routable_pods": 1}, tokens_available=False)
+    cache = PaperStateCache(max_stale_ms=30_000)
+    cache.apply("m", {"o1_routable_tracked": True, "routable_pods": 1}, tokens_available=True, window_end_ms=10_000)
+    held, events = cache.apply("m", {"routable_pods": 1}, tokens_available=False, window_end_ms=20_000)
     assert events == ("paper_state_stale_hold:m",) and held["o1_routable_tracked"] is False
 
 

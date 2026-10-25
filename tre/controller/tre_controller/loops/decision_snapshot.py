@@ -176,8 +176,9 @@ def _model_states(
             "signal_full_window": context.get("signal_full_window"),
             "signal_breakpoint_ms": context.get("signal_breakpoint_ms"),
             "signal_window_start_ms": context.get("signal_window_start_ms"),
-            "signal_evidence_grids": context.get("signal_evidence_grids"),
+            "signal_evidence_ms": context.get("signal_evidence_ms"),
             "signal_hold_reason": context.get("signal_hold_reason"),
+            "sample_quality_hold": context.get("sample_quality_hold"),
             "state": state,
             "signal_source": context.get("signal_source"),
             "signal_unavailable_reason": context.get("signal_unavailable_reason"),
@@ -191,14 +192,14 @@ def _model_states(
             # H3 (2026-10-06): the queue evidence that exempts a CRITICAL receiver from
             # the O1 hold on free capacity (pre / post-breakpoint samples).
             out[model]["o1_queue_rise"] = dict(context["o1_queue_rise"])
-        if "saturation_ticks" in context:
+        if "saturation_held_ms" in context:
             # Onset saturation rescue (only with the tracker on): the latest-sample
             # engine gauges, the eligibility reason and the confirmed-window count.
             out[model].update(
                 {
                     "saturation_rescue": bool(context.get("saturation_rescue", False)),
                     "saturation_reason": context.get("saturation_reason"),
-                    "saturation_ticks": context.get("saturation_ticks"),
+                    "saturation_held_ms": context.get("saturation_held_ms"),
                     "saturation_waiting": context.get("saturation_waiting"),
                     "saturation_kv": context.get("saturation_kv"),
                     "saturation_running": context.get("saturation_running"),

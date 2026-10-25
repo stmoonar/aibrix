@@ -6,10 +6,11 @@ with a 20 s probe more than half of the judged latency predated the hide. The la
 part of the gate now reads ONE evidence window instead:
 
 * start ``S`` = the first gateway boundary after the hide, anchored on the gateway's
-  own doc stamps: ``S = N + period`` with ``N`` = the newest histogram doc stamp of the
+  own doc stamps: the boundary after ``N``, the newest histogram doc stamp of the
   model when the SM confirmed the hide. A doc stamped ``S`` is written after the hide,
   whatever the node clocks say (they differ by up to 160 s here), so no clock enters
-  the evidence. Without ``N`` (no doc yet) ``S = ceil(hide_ts / period)``;
+  the evidence. Without ``N`` (no doc yet) the first boundary at or after hide_ts. The
+  doc grid is the store's (``tre_controller.store.evidence_grid.EvidenceGrid``);
 * the window holds the docs stamped in ``[S, E]`` (read without the histogram lookback,
   so a pod's delta never starts from a pre-hide doc); ``E`` = the newest snapshot's
   boundary (the same doc-stamp grid the snapshots read);
@@ -26,7 +27,7 @@ kept for the audit and the fallback above; the offsets of the gateway stamps and
 controller clock against it are recorded and alerted on (``safescale_clock_skew_alert``).
 
 Used only with ``safescale.evidence_source: redis`` (the rollback switch). Known
-limitation: the gateway writes a doc for every ready pod every period from its cached
+limitation: the gateway writes a doc for every ready pod every round from its cached
 scrape (``pkg/cache/cache_tre_redis.go``), with a fresh stamp even when that scrape is
 stale, so a doc's stamp does not prove its counters are fresh. The direct path does
 not have this problem and never commits on this evidence.
@@ -98,33 +99,10 @@ class HideAnchor:
         )
 
 
-def evidence_start(anchor: HideAnchor, period_ms: int) -> int:
-    """First gateway boundary after the hide: ``newest doc stamp + period`` (gateway
-    clock, no cross-node clock involved), else ``ceil(hide_ts / period)``."""
-    if anchor.newest_doc_ts_ms is not None:
-        return int(anchor.newest_doc_ts_ms) + int(period_ms)
-    return ceil_boundary(anchor.ts_ms, period_ms)
-
-
 def anchor_reference_ms(anchor: HideAnchor) -> int:
     """The hide in the doc-stamp domain: the newest doc stamp at the hide, else hide_ts.
     The first evidence doc must lie in [evidence start, this + tolerance]."""
     return int(anchor.newest_doc_ts_ms) if anchor.newest_doc_ts_ms is not None else int(anchor.ts_ms)
-
-
-def anchor_clock_offsets(anchor: HideAnchor, *, period_ms: int, tolerance_ms: float) -> dict[str, Any]:
-    """Offsets of the gateway stamps and of the controller clock against hide_ts.
-
-    ``gateway_offset_ms`` = hide_ts - newest doc stamp: 0 .. one period (+ write delay)
-    when the clocks agree. ``controller_offset_ms`` = controller clock - hide_ts: ~0.
-    ``clock_skew_alert`` is True when either is off by more than ``tolerance_ms``. Alert
-    only: the evidence window is anchored on the doc stamps and does not depend on it."""
-    gateway = None if anchor.newest_doc_ts_ms is None else int(anchor.ts_ms) - int(anchor.newest_doc_ts_ms)
-    controller = None if anchor.controller_ts_ms is None else int(anchor.controller_ts_ms) - int(anchor.ts_ms)
-    alert = (gateway is not None and not (-tolerance_ms <= gateway <= period_ms + tolerance_ms)) or (
-        controller is not None and anchor.source == "redis_time" and abs(controller) > tolerance_ms
-    )
-    return {"gateway_offset_ms": gateway, "controller_offset_ms": controller, "clock_skew_alert": bool(alert)}
 
 
 @dataclass(frozen=True)
@@ -176,12 +154,6 @@ class EvidenceSource(Protocol):
 
 class ThresholdResolver(Protocol):
     def resolve(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]: ...
-
-
-def ceil_boundary(ts_ms: int, period_ms: int) -> int:
-    """The first gateway boundary at or after ``ts_ms``."""
-    period = int(period_ms)
-    return -(-int(ts_ms) // period) * period
 
 
 class MetricsEvidenceReader:

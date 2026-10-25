@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.config import SafeScaleConfig
@@ -88,6 +90,27 @@ def _machine() -> SafeScaleStateMachine:
     )
 
 
+def test_a_probe_whose_snapshots_stay_stale_past_its_ceiling_is_unhidden() -> None:
+    # Review round 6 (M2): no probe is judged on a stale snapshot, but past its W
+    # ceiling (start 0 + 60 s) its pods are unhidden instead of staying hidden.
+    clock = {"now": 30_000}
+    machine = SafeScaleStateMachine(
+        config=SafeScaleConfig(min_window_ms=1000.0, window_ceiling_ms=60_000.0),
+        wall_clock_ms=lambda: clock["now"],
+    )
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    queue = FakeQueue()
+    stale = MetricsSnapshot(ts_ms=0, models={}, stale=True)
+
+    result = run_safescale_observation_tick(stale, queue=queue, registry=_registry(), safescale=machine)
+    assert result.submitted == 0 and machine.active_probe("donor").status == "probing"
+    clock["now"] = 61_000
+    result = run_safescale_observation_tick(stale, queue=queue, registry=_registry(), safescale=machine)
+    [[unhide]] = queue.submitted
+    assert isinstance(unhide, UnhideAction) and unhide.pods == ("pod-a",) and unhide.reason == "stale_past_ceiling"
+    assert any(event.startswith("safescale_stale_rollback:donor") for event in result.events)
+
+
 def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> None:
     queue = FakeQueue()
     machine = _machine()
@@ -118,7 +141,7 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
         "safescale_formal_commit_gate_passed:donor",
         "safescale_kv_cache_unavailable:donor",
         # P1-2 audit: hide at 0, window [0, 60 s] -> no pre-hide share; 2 judged.
-        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=1",
     )
 
 
@@ -126,9 +149,12 @@ def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -
     queue = FakeQueue()
     machine = _machine()
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    snapshot = _metrics(ts_ms=500, ttft=1500.0)
+    # Review round 6 (L2): judged once the window's request count is known and >= 20.
+    snapshot = replace(snapshot, models={"donor": replace(snapshot.models["donor"], request_count=25.0)})
 
     result = run_safescale_observation_tick(
-        _metrics(ts_ms=500, ttft=1500.0),
+        snapshot,
         queue=queue,
         registry=_registry(),
         safescale=machine,
@@ -195,7 +221,7 @@ def test_safescale_kv_cache_guard_blocks_commit_like_v1() -> None:
     assert result.events == (
         "safescale_formal_commit_gate_failed:donor",
         "safescale_gate_failures:donor:kv_cache",
-        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=1",
         "safescale_rollback_reason:donor:formal_commit_gate_failed:kv_cache",
     )
 
@@ -317,7 +343,7 @@ def test_kv_cache_unavailable_passes_the_gate_but_is_reported() -> None:
         "safescale_formal_commit_gate_passed:donor",
         "safescale_kv_cache_unavailable:donor",
         # P1-2 audit: hide at 0, window [0, 60 s] -> no pre-hide share; 2 judged.
-        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=1",
     )
     assert probe_holder["details"]["kv_cache"] == "unavailable"
     assert queue.submitted[-1][0].reason == "formal_commit_gate_passed"

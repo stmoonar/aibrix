@@ -633,16 +633,17 @@ safescale:
   # of a fixed backoff (timer cleanup, docs/design/20261002-timer-cleanup.md): a
   # metrics window ending after the rollback AND either a routable count different
   # from the one the failed probe started from or a Z at least this much (absolute)
-  # above the Z that started it. Other rollbacks (evidence gaps, maintenance, hide
-  # failures) need the new window only.
+  # above the Z that started it. Every rollback first needs scaling.min_evidence_ms of
+  # observations after it (round 4; other rollbacks - evidence gaps, maintenance, hide
+  # failures - need only that).
   rollback_retry_z_margin: 0.25
   # Direct path: commit before the deadline (timer cleanup) once, on the same poll,
   # min_commit_samples requests are judged, every commit gate passes (SLO, KV cache,
   # Z tail, complete evidence of every remaining pod), the hidden pods have nothing in
   # flight (gateway in-flight count of the live plugin instances and vLLM running +
-  # waiting, both known and 0), the newest snapshot window holds
-  # scaling.min_evidence_grids complete post-hide gateway grids (10 s each, the O1
-  # warm rule) and at least the donor's p95 e2e passed since the hide confirmation
+  # waiting, both known and 0), the newest snapshot window was observed
+  # scaling.min_evidence_ms after the hide confirmation (the O1 warm rule, on
+  # observation time) and at least the donor's p95 e2e passed since the confirmation
   # (2026-10-06: no W / 2 term, no separate early_commit_min_grids key). Rollback
   # checks are unchanged and run first on every tick. false = commit at the deadline
   # only.
@@ -676,24 +677,25 @@ scaling:
   rescue_settle_ema_k: 2.0
   # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
   # ADR-0015): a model decides on the part of its 30 s metrics window after its last
-  # breakpoint (traffic onset, routable replica-count change), complete 10 s gateway
-  # grids only (the grid holding the breakpoint excluded), the TSS numerator scaled to
-  # a whole window and the EMA restarted at the breakpoint. Scale-ups act after
-  # min_evidence_grids grids; scale-downs wait for a whole window after the breakpoint.
+  # breakpoint (traffic onset, routable replica-count change), the histogram docs after
+  # it only (the evidence period holding the breakpoint excluded), the TSS numerator
+  # scaled to a whole window and the EMA restarted at the breakpoint. Scale-ups act once
+  # the observations after the breakpoint span min_evidence_ms; scale-downs wait for a
+  # whole window after the breakpoint.
   # Replaces the ADR-0013 onset warmup guard. Controller images before O1 ignore these
   # keys (C1 images log them as unknown).
   breakpoint_window: true
   # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
   # breakpoint_window: false the guard always applies (= pre-O1 behaviour).
   onset_warmup_guard: false
-  # Complete post-breakpoint grids before a scale-up decision (2 = 20 s).
-  min_evidence_grids: 2
+  # Observed span after the breakpoint (ms, gateway scraped_ms) before a scale-up
+  # decision (min_evidence_grids: N is a deprecated alias = N x 10 s).
+  min_evidence_ms: 20000
   # Completed requests the post-breakpoint window also needs (0 = off). Tokens count
   # at completion: one short request done while long ones run reads Z ~ 5 %.
   min_evidence_requests: 3
-  # Added to a routable-count change time before it is rounded up to the 10 s grid:
-  # the SM writes the routable label before it answers, the gateway applies it via
-  # its pod informer shortly after.
+  # Added to a routable-count change time: the SM writes the routable label before it
+  # answers, the gateway applies it via its pod informer shortly after.
   breakpoint_margin_ms: 1000
   # A C1 rescue decided on a partial (post-breakpoint) window with fewer than
   # breakpoint_lowevidence_requests completed requests adds at most
@@ -701,9 +703,11 @@ scaling:
   # breakpoint_partial_max_step: 0 = no cap.
   breakpoint_partial_max_step: 1
   breakpoint_lowevidence_requests: 10
-  # After this many consecutive held 10 s windows a receiver decides on the whole
-  # window again (routable count changing all the time); donors still wait. 0 = never.
-  breakpoint_hold_max_windows: 6
+  # After its windows have been held this long (ms from the first to the newest held
+  # observation) a receiver decides on the whole window again (routable count changing
+  # all the time); donors still wait. 0 = never. (breakpoint_hold_max_windows: N =
+  # deprecated alias, (N - 1) x 10 s; 6 -> 50000.)
+  breakpoint_hold_max_ms: 50000
   # Same-clock check of gateway doc stamps vs the controller clock (O1 compares them):
   # beyond the tolerance O1 is suspended (pre-O1 behaviour) until 3 good checks.
   gateway_clock_tolerance_ms: 2000
@@ -711,8 +715,10 @@ scaling:
   # Onset saturation rescue (design docs/design/20261002-saturation-onset-rescue.md):
   # while a model's TSS cannot decide yet - its window numerator is zero (tokens count at
   # request completion, so nothing has completed) or the O1 evidence gate above still
-  # holds it - a model whose engines are full on saturation_consecutive_ticks consecutive
-  # 10 s metrics windows is a CRITICAL receiver of the fast loop. "Full" = vLLM
+  # holds it - a model whose engines are full on every metrics window from the first
+  # full observation to the newest one for saturation_confirm_ms (ms, 0 = the first
+  # full window) is a CRITICAL receiver of the fast loop
+  # (saturation_consecutive_ticks: N = deprecated alias, (N - 1) x 10 s). "Full" = vLLM
   # num_requests_waiting summed over its routable pods > 0, or their mean KV-cache fill
   # >= saturation_kv_threshold with >= 2 requests running, both from the latest gateway
   # sample (not the 30 s mean). Not full (one long request running, even one that fills
@@ -727,8 +733,13 @@ scaling:
   # TSS / Z / C1 rules alone decide. false = off (TSS rules only).
   saturation_rescue: true
   saturation_kv_threshold: 0.9
-  saturation_consecutive_ticks: 2
+  saturation_confirm_ms: 10000
   saturation_max_step_factor: 2
+  # Instant sample coverage (2026-10-25, docs/design/20261025-instant-sampling.md): a
+  # pod's coverage = distinct gateway scraped_ms in the window / (window / instant
+  # period). Below sample_min_ratio the pod is flagged: no donor / shrink / release for
+  # its model while it serves (receivers unaffected); the pod stays in the window.
+  sample_min_ratio: 0.9
 # Node GPU-truth agent DaemonSet (deploy/gen_gpu_truth_manifest.py renders
 # overlays/tre-v2/gpu-truth.yaml from this and cluster.nodes). Only the generator
 # reads this section; the controller, service-manager and UI ignore it.

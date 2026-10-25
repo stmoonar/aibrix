@@ -1,0 +1,133 @@
+# Release 2026-10-25: v2 instant sampling, 2 s evidence period - DRAFT
+
+Plan only: nothing here has been built or applied. Confirm with the owner before any
+step that touches the cluster (a parallel session may be using it). Branch
+`fix/v2-sampling-20261025`; design `tre/docs/design/20261025-instant-sampling.md`.
+
+Images that change: gateway-plugins (TRE doc writer), controller. The SM image is
+swapped in the same order as always (plugins -> SM -> controller) even when its code is
+unchanged, so the three stay one release. Overlay change: `tre-v2-redis` memory request
+256Mi / limit 2Gi (was 128Mi / 512Mi).
+
+## Why the order matters (review round 3, H1)
+
+Mixed versions are not safe while the controller acts:
+
+* **New gateway, old controller:** the old controller averages the instant docs over the
+  expected sample count of its 10 s grid (`sum / 3`). With 0.5 s instant docs that is 60
+  samples divided by 3: Q is 20x too large, Z 20x too small, every model reads CRITICAL
+  and the controller starts a scale-up storm.
+* **New controller, old gateway:** safe. The old gateway writes no
+  `tre:v2:gateway:cadence` hash, so every snapshot is stale
+  (`gateway_cadence_missing`) and the decision loops do nothing
+  (`controller/tests/test_gateway_cadence.py`, case `missing`).
+* **Round 5: new controller, older gateway:** also safe, also stale. The controller
+  needs `last_hist_ms` in the cadence hash (the window-written rule: the newest
+  histogram boundary whose docs were all built); a gateway built before round 5 writes
+  the hash without it, so every snapshot is stale (`gateway_cadence_no_hist`, case
+  `no_last_hist`). The gateway image of this release must be running before the
+  controller can act. A pod whose histogram doc can never be built keeps the boundary
+  unwritten (fail-closed: stale snapshots, loud, never a partial window).
+
+Rule: while the images are being swapped, in either direction, the run mode is
+`observe observe`.
+
+## Redis restart (the limit change restarts the pod)
+
+`tre-v2-redis` has no volume: a pod restart wipes the SM leases and bindings, the
+operation journal and every stream. Save an RDB first and load it back afterwards. The
+procedure exists in `tre_v1/deploy`: `00_stop_v2.sh` (read-only RDB dump with
+`redis-cli --rdb` through `kubectl exec`, checked for the `REDIS` magic) and
+`rollback.sh` `restore_v2_redis` (a local `redis:7.2-alpine` loads the RDB on
+127.0.0.1:16379 and `MIGRATE ... COPY REPLACE` copies every key into the service IP).
+Take the dump only after the writers (controller, SM) are scaled to 0, so nothing is
+written after it. Keys with a TTL can expire in between; that is expected.
+
+## Steps
+
+0. Backup to `<backups>/v2-sampling-20261025/`: the three Deployments, the
+   `tre-v2-redis` Deployment, the registry ConfigMap, and an RDB dump. Write
+   `rollback.sh` (step 6). Exclusive window marker on, parallel sessions told.
+1. `tre/deploy/scripts/set_run_mode.sh observe observe`.
+2. Redis: scale controller and SM to 0; RDB dump (as `00_stop_v2.sh`); apply the new
+   `redis.yaml`; wait Ready; load the RDB (as `restore_v2_redis`); compare `DBSIZE` with
+   the dump.
+3. Swap images: gateway-plugins -> SM (Recreate) -> controller (tags in the overlays and
+   in `deploy/tests/test_kustomize_overlays.py`). The overlays set
+   `TRE_INSTANT_SAMPLE_INTERVAL_MS=500` and `TRE_EVIDENCE_PERIOD_MS=2000` on both the
+   gateway and the controller; they must be equal.
+4. Verify:
+   - `HGETALL tre:v2:gateway:cadence`: `instant_ms 500`, `evidence_ms 2000`, `version` =
+     the plugin image's sha, `written_ms` within a few seconds of now (gateway clock),
+     `last_hist_ms` present and moving every evidence period (2 s);
+   - controller log: `gateway cadence ok`, no `GATEWAY CADENCE` error, snapshots
+     published every 2 s (`metrics_sampler`), no `metrics_window_stale`;
+   - `/v2/...` decision snapshot: `stale: false`, `sample_quality_hold` null on a quiet
+     model.
+5. Restore the run mode (`active active` for the TRE arm).
+6. Rollback: the same procedure in reverse order - `observe observe`, controller -> SM
+   -> plugins back to the previous images, verify, restore the run mode. The redis limit
+   may stay (it does not depend on the images); reverting it repeats step 2.
+
+## Behaviour changes to expect (round 4, "Evidence, not ticks")
+
+Design `tre/docs/design/20261025-instant-sampling.md`, section "Evidence, not ticks
+(round 4)".
+
+- **Registry aliases.** The live registry still uses the deprecated count keys. They
+  are now read as `(N - 1) × 10 s`: `breakpoint_hold_max_windows: 6` = 50 s (round 2
+  read 60 s), `saturation_consecutive_ticks: 2` = 10 s (round 2 read 20 s), which is
+  what they did on the 10 s grid. `min_evidence_grids: 2` stays 20 s. The controller
+  logs a deprecation warning per key; replacing them with `breakpoint_hold_max_ms` /
+  `saturation_confirm_ms` / `min_evidence_ms` is optional (a registry change, released
+  by the usual registry rules).
+- **SafeScale commit gate (also at 10 s; round 5).** Z and KV are one value over the
+  probe's post-hide span of the newest snapshot - from the first gateway doc boundary
+  after the hide to the window end, the whole window once the hide precedes it (raw
+  TSS on that span, time-weighted KV of the remaining pods) - not the min / max over
+  the last 2-3 overlapping snapshots. A tail shorter than one window with fewer than
+  `min_commit_samples` (20) requests of the remaining pods is insufficient evidence:
+  the probe extends (`extend_reason: tail_low_evidence`) up to the W ceiling, where it
+  is judged on what there is (`tail_low_evidence: true` in the audit). Audit fields:
+  `tail_start_ms` / `tail_end_ms` / `tail_observed_ms` / `tail_requests` /
+  `tail_evidence_ok`; `tail_observation_count` is always 1. Not established: whether
+  this gives fewer or more rollbacks than before - no run has compared them.
+- **SafeScale immediate rollback (round 5).** Judged on every new snapshot, one value
+  (max of per-pod and pooled p95) over the same post-hide span, once it holds
+  `min_commit_samples` requests; before, only on whole post-hide windows that did not
+  overlap one already judged.
+- **SafeScale early commit (round 5).** The 20 s evidence floor is measured on the
+  gateway clock only (newest observation minus the first doc boundary after the hide),
+  not against the controller-clock confirmation.
+- **Saturation sample (round 5).** A pod whose newest instant sample is older than 4
+  instant periods at the window end is left out of the "engine full" sample (an added
+  pod without a current sample is not full).
+- **Rollback retry.** A probe rolled back for capacity is retried only after 20 s of
+  new observations (`safescale_rollback_hold:<m>:no_new_evidence`), then only on a
+  higher Z or another routable count (as before). Before, any newer window freed it -
+  2 s after the rollback at the 2 s period.
+- **Stale hold.** The 20 s hold now counts from the first read of the first missing
+  window (about one period sooner than before).
+- **O1 gateway-clock check.** The doc-stamp fallback is gone: with no `written_ms` to
+  measure, the check gives no verdict instead of suspending O1 (leftover docs of a
+  model that is down no longer suspend it).
+
+## Controller setting `TRE_SAFESCALE_SCOPE` (2026-10-26)
+
+Which placements run as a SafeScale probe: `all` (default), `receiverless_shrink` (only
+the receiver-less HIGH proactive shrink, `high_proactive_safescale`; a HIGH / HEALTHY
+donor for a receiver is an immediate relay and a TP same-slot preemption sleeps its pod
+at once, both with the reason suffix `_nosafescale`, as with SafeScale off) or `off`.
+`TRE_ABLATION_DISABLE_SAFESCALE=true` is the alias of `off`; both set and disagreeing
+(true with `all` / `receiverless_shrink`, false with `off`) = the controller refuses to
+start. The startup `ablation_switches` log line carries `safescale_scope`. An arm that
+sets it must restore `TRE_SAFESCALE_SCOPE=all` (or remove it) at its end, together with
+`TRE_ABLATION_DISABLE_SAFESCALE=false`.
+
+## Not covered here
+
+- theta, lambda, tau, w_p and c/b must be re-calibrated on the new estimator before a
+  data-producing run (registry rule: atomic update with the controller).
+- Memory: 20 pods x (600 instant docs x ~0.6 KB + 900 histogram docs x ~2.6 KB) is about
+  53 MB of sampling docs; the 2Gi limit is for the capped streams (`tre:v2:bl:*`,
+  `tre:v2:controller:signal_log`) and the operation journal.

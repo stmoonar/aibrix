@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Collection, Mapping, Optional
 
-from tre_common.metrics_schema import ModelWindowMetrics, P95Rule, PodWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, Observed, P95Rule, PodWindowMetrics
 from tre_common.percentile import histogram_percentile
 
 
@@ -121,10 +121,22 @@ def aggregate_pods(
         assigned_replicas=routable_pods,
         per_pod=dict(per_pod),
         request_count=_sum_optional([pod.request_count for pod in pods]),
+        request_count_observed=_sum_optional([pod.request_count_observed for pod in pods]),
         token_counter_reset=any(pod.token_counter_reset for pod in pods),
         instant_ticks_ms=tuple(sorted({tick for pod in pods for tick in pod.instant_ticks_ms})),
+        observed=Observed.merge(pod.observed for pod in pods),
         p95_rule=p95_rule,
     )
+
+
+#: The fields :func:`aggregate_pods` derives from the pods (re-derived on a
+#: restriction); every other field of a window is kept.
+_POD_AGGREGATES = (
+    "prompt_tokens", "generation_tokens", "avg_waiting", "avg_running", "avg_swapping",
+    "kv_cache_hit_rate", "ttft_p95_ms", "tpot_p95_ms", "e2e_p95_ms", "routable_pods",
+    "assigned_replicas", "per_pod", "request_count", "request_count_observed", "token_counter_reset",
+    "observed",
+)
 
 
 def restrict_to_serving(
@@ -156,14 +168,15 @@ def restrict_to_serving(
         asleep = set(sleeping_pods)
         kept = {key: pod for key, pod in per_pod.items() if pod.pod not in asleep and key not in asleep}
         if len(kept) != len(per_pod):
-            metrics = replace(
-                aggregate_pods(
-                    metrics.model, metrics.window_start_ms, metrics.window_end_ms, kept,
-                    p95_rule=metrics.p95_rule,
-                ),
-                # Ticks are gateway-wide provenance (freshness), not a per-pod quantity.
-                instant_ticks_ms=metrics.instant_ticks_ms,
+            # Only the pod aggregates are recomputed. Everything else - the store's
+            # flags (sample_incomplete_pods, scrape_stale_pods, ...; review round 3, L1:
+            # an IDLE donor releases at once, so a lost flag is a release), the ticks
+            # (gateway-wide provenance) - is kept as read.
+            agg = aggregate_pods(
+                metrics.model, metrics.window_start_ms, metrics.window_end_ms, kept,
+                p95_rule=metrics.p95_rule,
             )
+            metrics = replace(metrics, **{name: getattr(agg, name) for name in _POD_AGGREGATES})
     return replace(
         metrics,
         routable_pods=int(routable_pods),

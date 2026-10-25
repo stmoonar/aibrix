@@ -75,6 +75,7 @@ type Store struct {
 	redisClient         *redis.Client           // Redis client instance
 	prometheusApi       prometheusv1.API        // Prometheus API client
 	modelRouterProvider ModelRouterProviderFunc // Function to get model router
+	treCadence          treWriteCadence         // TRE doc periods the writer runs at (declared in Redis)
 
 	// Metrics related fields
 	subscribers          []metrics.MetricSubscriber    // List of metric subscribers

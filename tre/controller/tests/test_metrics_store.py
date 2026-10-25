@@ -254,8 +254,11 @@ def test_metrics_store_marks_counter_reset_as_missing() -> None:
     )
 
     metrics = store.read_model_window("dsqwen-7b", 1_000, 11_000)
+    # Review round 3 (M2): no doc after the reset - no usable delta: the pod is out of
+    # tokens and queue alike, and flagged.
     assert metrics.prompt_tokens is None
-    assert metrics.token_counter_reset is True
+    assert metrics.per_pod == {}
+    assert metrics.sample_incomplete_pods == ("pod-a",)
 
 
 def test_metrics_store_returns_none_tokens_when_window_has_no_hist_docs():
@@ -271,7 +274,10 @@ def test_metrics_store_returns_none_tokens_when_window_has_no_hist_docs():
 
     assert metrics.prompt_tokens is None
     assert metrics.generation_tokens is None
-    assert metrics.avg_waiting == 1.0
+    # Review round 3 (M2): queue and tokens from one pod set - no histogram doc in the
+    # window: the pod's queue is left out too, and it is flagged.
+    assert metrics.avg_waiting == 0.0
+    assert metrics.sample_incomplete_pods == ("pod-a",)
 
 
 def test_metrics_store_uses_pre_window_v1_baseline_for_single_hist_doc_delta():
@@ -303,8 +309,9 @@ def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
     assert snapshot.models["dsqwen-7b"].prompt_tokens == 32.0
     assert snapshot.models["dsqwen-7b"].avg_waiting == 3.0
     assert snapshot.models["dsllama-8b"].prompt_tokens is None
-    assert snapshot.models["dsllama-8b"].token_counter_reset is True
-    assert snapshot.models["dsllama-8b"].avg_waiting == 3.0
+    # Review round 3 (M2): a reset with no doc after it - out of tokens and queue, flagged.
+    assert snapshot.models["dsllama-8b"].avg_waiting == 0.0
+    assert snapshot.models["dsllama-8b"].sample_incomplete_pods == ("dsllama-8b-pod-a",)
     assert snapshot.models["dsqwen-14b"].routable_pods == 0
 
 
@@ -393,6 +400,9 @@ def test_metrics_store_reads_per_pod_kv_cache_usage_for_the_safescale_guard():
         doc["model_metrics"]["dsqwen-7b/gpu_cache_usage_perc"] = fill
         add_doc(redis, "tre:v2:inst:" + pod_a, ts, doc)
     add_doc(redis, "tre:v2:inst:" + pod_b, 6_000, inst_doc("pod-b", waiting=0, running=1, kv_hit=0.0))
+    for pod_key, name in ((pod_a, "pod-a"), (pod_b, "pod-b")):  # a token delta (M2: same pod set)
+        add_doc(redis, "tre:v2:hist:" + pod_key, 1_000, hist_doc(name, 10, 1, 1.0, 10, {"0.5": 10}))
+        add_doc(redis, "tre:v2:hist:" + pod_key, 11_000, hist_doc(name, 20, 2, 2.0, 20, {"0.5": 20}))
 
     registry = load_registry(str(REGISTRY_PATH))
     store = MetricsStore(redis, registry, instant_sample_interval_ms=5_000, percentile_mode="bucket_upper")
@@ -412,14 +422,17 @@ def test_kv_cache_usage_averages_actual_samples_not_expected_window_samples():
     doc = inst_doc("pod-a", waiting=0, running=1, kv_hit=0.0)
     doc["model_metrics"]["dsqwen-7b/gpu_cache_usage_perc"] = 0.8
     add_doc(redis, "tre:v2:inst:" + pod, 11_000, doc)
+    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
+    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 20, 2, 2.0, 20, {"0.5": 20}))
 
     registry = load_registry(str(REGISTRY_PATH))
     store = MetricsStore(redis, registry, instant_sample_interval_ms=5_000, percentile_mode="bucket_upper")
     metrics = store.read_model_window("dsqwen-7b", 1_000, 11_000)
 
     assert metrics.per_pod["pod-a"].gpu_cache_usage == 0.8
-    # The queue gauges keep the expected-samples divisor (calibration contract).
-    assert metrics.per_pod["pod-a"].avg_running == 0.5
+    # 2026-10-25: the queue gauges are means over the present samples too (a missing
+    # sample no longer reads the queue low; too few samples = the completeness rule).
+    assert metrics.per_pod["pod-a"].avg_running == 1.0
 
 
 def test_metrics_store_exposes_window_mean_ttft_and_tpot_with_counts():

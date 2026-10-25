@@ -8,10 +8,11 @@ if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
 
 from tre_common.gpu_placement import placement_policy_from_registry
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_of, observed_requests
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
+from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
 from tre_controller.planning.classify import (
     ModelRole,
     ModelState,
@@ -96,24 +97,31 @@ class LoopTickResult:
 @dataclass
 class _PaperState:
     context: dict
-    stale_windows: int = 0
+    #: Window end (ms, gateway doc stamp) of the last window whose tokens were known.
+    good_end_ms: int
 
 
 class PaperStateCache:
-    def __init__(self, *, max_stale_windows: int = 3) -> None:
-        self.max_stale_windows = max(0, int(max_stale_windows))
+    """A model whose tokens are missing keeps its last computed context while that
+    context's window ended at most ``max_stale_ms`` before the current window
+    (2026-10-25: elapsed window time, not a count of reads - 30 s = the former
+    3 windows of 10 s, at any evidence period)."""
+
+    def __init__(self, *, max_stale_ms: int = 30_000) -> None:
+        self.max_stale_ms = max(0, int(max_stale_ms))
         self._by_model: dict[str, _PaperState] = {}
 
-    def apply(self, model_name: str, context: dict, *, tokens_available: bool) -> tuple[dict, tuple[str, ...]]:
+    def apply(
+        self, model_name: str, context: dict, *, tokens_available: bool, window_end_ms: int
+    ) -> tuple[dict, tuple[str, ...]]:
         if tokens_available:
-            self._by_model[model_name] = _PaperState(dict(context), stale_windows=0)
+            self._by_model[model_name] = _PaperState(dict(context), good_end_ms=int(window_end_ms))
             return context, ()
 
         previous = self._by_model.get(model_name)
         if previous is None:
             return context, (f"paper_state_stale_unknown:{model_name}",)
-        previous.stale_windows += 1
-        if previous.stale_windows > self.max_stale_windows:
+        if int(window_end_ms) - previous.good_end_ms > self.max_stale_ms:
             return context, (f"paper_state_stale_unknown:{model_name}",)
         held = dict(previous.context)
         held.update(
@@ -169,8 +177,12 @@ def run_planner_tick(
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     leftover_probes: SafeScaleController | None = None,
+    safescale_scope: str = "all",
 ) -> LoopTickResult:
-    """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
+    """One planner tick. ``safescale_scope`` (TRE_SAFESCALE_SCOPE, 2026-10-26):
+    ``receiverless_shrink`` keeps a probe only for the receiver-less HIGH proactive
+    shrink (:func:`_receiverless_shrink`); a donor planned for a receiver is a relay and
+    a same-slot preemption sleeps its pod at once, as with SafeScale off. ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
@@ -256,7 +268,7 @@ def run_planner_tick(
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
-        release_without_safescale=safescale is None,
+        release_without_safescale=safescale is None or safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK,
         defrag_enabled=_defrag_enabled(registry),
         **_scaling_options(registry),
     )
@@ -303,6 +315,7 @@ def run_planner_tick(
         observe_mode=observe_mode,
         probe_block_reason=probe_block_reason,
         covered_targets=covered_targets,
+        safescale_scope=safescale_scope,
     )
     # C1 review P2-1: a rescue target fully covered by the pods a probe preemption gives
     # back is still a target the window does not reflect yet.
@@ -388,13 +401,12 @@ def _apply_saturation_rescue(
 ) -> tuple[list, tuple[str, ...]]:
     """Onset saturation rescue (design 20261002-saturation-onset-rescue): a model whose
     TSS cannot decide yet (numerator zero / receiver gate not warm) and whose engines are
-    full on ``saturation_consecutive_ticks`` consecutive windows becomes a CRITICAL
+    full on every window across ``saturation_confirm_ms`` becomes a CRITICAL
     receiver (``saturation_rescue``). A warm TSS is never overridden. A step whose rescue
     target the queue reports as ended without adding a replica is released at once."""
     tracker = getattr(signal_state, "saturation", None)
     if tracker is None or not tracker.config.enabled:
         return classifications, ()
-    need = tracker.config.consecutive_ticks
     routable_by_model = _routable_pod_ids(cluster_view)
     targets = getattr(queue, "rescue_targets", None)
     failed_dispatch = (
@@ -430,10 +442,11 @@ def _apply_saturation_rescue(
                 routable_by_model.get(model, frozenset()) if routable_by_model is not None else None
             ),
             failed_dispatch=failed_dispatch.get(model),
+            observed_ms=observed_of(metrics).t_last_ms,
         )
         events.extend(verdict.events)
         sample = verdict.sample
-        ctx["saturation_ticks"] = verdict.ticks
+        ctx["saturation_held_ms"] = verdict.held_ms
         ctx["saturation_reason"] = verdict.reason
         ctx["saturation_awaiting_step"] = verdict.awaiting_step
         ctx["saturation_count_after"] = verdict.count_after
@@ -444,7 +457,8 @@ def _apply_saturation_rescue(
             )
         elif verdict.full and sample is not None:
             events.append(
-                f"saturation_pending:{model}:{verdict.ticks}/{need}:reason={verdict.reason}"
+                f"saturation_pending:{model}:held_ms={verdict.held_ms}/{int(tracker.config.confirm_ms)}"
+                f":reason={verdict.reason}"
                 f":waiting={sample.waiting:.0f}:kv={'none' if sample.kv is None else f'{sample.kv:.2f}'}"
             )
         out.append(item)
@@ -544,7 +558,7 @@ def rescue_settle_ms(registry: Registry | None, model: str) -> float:
     ``trs.ema_tau_ms`` (the EMA'd Z lags the raw window by about its time constant).
     While O1 tracks the model the extension is 0 for a target this process dispatched
     (:func:`_rescue_bases`): the routable change is a breakpoint that restarts the EMA
-    and the O1 evidence gate holds the receiver until post-change grids exist. 0 without a registry, a scaling section or
+    and the O1 evidence gate holds the receiver until post-change evidence exists. 0 without a registry, a scaling section or
     a tau (legacy fixed-alpha)."""
     scaling = getattr(registry, "scaling", None)
     if registry is None or not callable(scaling):
@@ -646,7 +660,8 @@ def _probe_backoff_models(
 ) -> dict[str, str]:
     """Models whose receiver-less HIGH probe is held after a rollback -> why
     (``SafeScaleStateMachine.rollback_retry_holds``, timer cleanup 2026-10-02): the
-    decision window's Z, routable count and window end are the evidence a retry needs."""
+    decision window's Z, routable count and newest observation (round 4: the observed
+    span after the rollback is the evidence a retry needs)."""
     holds = getattr(safescale, "rollback_retry_holds", None)
     if not callable(holds):
         return {}
@@ -658,7 +673,7 @@ def _probe_backoff_models(
         signals[model] = (
             float(z) if z is not None else None,
             int(routable) if routable is not None else None,
-            int(metrics.window_end_ms),
+            observed_of(metrics).t_last_ms,
         )
     return dict(holds(signals))
 
@@ -690,7 +705,7 @@ def _action_cooldowns(
     Only for models O1 does not track this tick (:func:`_o1_tracks`): with O1 active the
     routable-count change of the action is a breakpoint, and the model takes part in no
     scale-down until a whole window follows it and is a receiver only on
-    ``min_evidence_grids`` grids of post-change evidence - the window-start rule would
+    ``min_evidence_ms`` of post-change evidence - the window-start rule would
     only add a fixed wait on top. While O1 is off or suspended (gateway clock check),
     without a fleet view of the model or on a stale-held context this rule still holds."""
     last_actions = getattr(queue, "last_actions", None)
@@ -751,6 +766,7 @@ def _apply_safescale(
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     covered_targets: dict | None = None,
+    safescale_scope: str = "all",
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
     preemption gives back cover every planned scale-up part (none is submitted)."""
@@ -758,6 +774,14 @@ def _apply_safescale(
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
         return _release_without_safescale(actions)
+    if safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK:
+        # TRE_SAFESCALE_SCOPE=receiverless_shrink (2026-10-26): only a receiver-less
+        # shrink stays a probe; any other probe placement is released at once.
+        actions = tuple(
+            action if not _requires_safescale_probe(action) or _receiverless_shrink(action)
+            else _release_without_safescale((action,))[0][0]
+            for action in actions
+        )
 
     converted: list[Action] = []
     events: list[str] = []
@@ -956,6 +980,16 @@ def _requires_safescale_probe(action: Action) -> bool:
     )
 
 
+def _receiverless_shrink(action: Action) -> bool:
+    """A probe shrink with no receiver: the planner pairs a donor with a recipient only
+    on ``ScaleAction.receiver`` (``planner._plan_middle_zone_probe``) and on a same-slot
+    preemption's ``ShrinkForSlotAction.beneficiary``; the HIGH proactive shrink
+    (``high_proactive_safescale``) carries neither."""
+    return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0 and (
+        action.receiver is None
+    )
+
+
 def _safescale_probe_model(action: Action) -> str:
     if isinstance(action, ShrinkForSlotAction):
         return action.donor
@@ -1064,8 +1098,9 @@ class ModelSignal:
     metrics: ModelWindowMetrics
     warm: bool
     window: object | None = None
-    #: O1 review P2-2: consecutive held windows reached the limit - a receiver decides
-    #: on the whole window (donors still need a clean one). 0 = no fallback.
+    #: O1 review P2-2: the model's windows have been held for ``hold_max_ms`` of
+    #: observation time (the held span, ms) - a receiver decides on the whole window
+    #: (donors still need a clean one). 0 = no fallback.
     hold_fallback: int = 0
 
 
@@ -1144,8 +1179,12 @@ def compute_model_signal(
         )
     window = signal_state.effective_window(model_name, metrics)
     guard_warm = legacy_warm if signal_state.onset_guard_applies() else True
-    # Review P2-2: consecutive held windows (a full or warm window resets the count).
-    held = signal_state.note_hold(model_name, int(metrics.window_end_ms), not window.warm)
+    # Review P2-2: how long the windows have been held (a full or warm window resets it),
+    # on the window's newest observation (round 4).
+    t_obs = observed_of(metrics).t_last_ms
+    held = signal_state.note_hold(
+        model_name, int(t_obs if t_obs is not None else metrics.window_end_ms), not window.warm
+    )
     if window.full:
         result = computer.compute(
             TRSInput.from_metrics(metrics, spec.trs),
@@ -1154,10 +1193,9 @@ def compute_model_signal(
         )
         signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
         return ModelSignal(result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window)
-    limit = int(getattr(signal_state.breakpoint, "hold_max_windows", 0) or 0)
-    if not window.warm and limit > 0 and held >= limit:
+    if not window.warm and held > 0:
         # Review P2-2: the routable count keeps changing (crash loop, probes): after
-        # ``hold_max_windows`` held windows a receiver decides on the whole window as
+        # ``hold_max_ms`` of held windows a receiver decides on the whole window as
         # before O1 (EMA advanced); donors keep waiting for a clean one (window.full).
         result = computer.compute(
             TRSInput.from_metrics(metrics, spec.trs),
@@ -1224,9 +1262,15 @@ def _model_contexts(
         spec = registry.model(model_name)
         stale_pods = getattr(metrics, "scrape_stale_pods", ())
         if stale_pods:
-            # I3: the gateway's last successful scrape of these pods predates the window;
-            # their docs are left out (no valid pod left -> tokens missing, not zero).
+            # I3 (2026-10-25: merged into the sample rule): no sample of these pods was
+            # observed in the window; they are left out (no pod left -> tokens missing,
+            # not zero) and are the frozen-scrape rescue evidence below.
             events.append(f"scrape_stale:{model_name}:{','.join(stale_pods)}")
+        incomplete_pods = getattr(metrics, "sample_incomplete_pods", ())
+        if incomplete_pods:
+            # 2026-10-25: flagged pods (too few samples, a token span over 1.5 windows, or
+            # left out): a donor-gate flag (I4 below), nothing else.
+            events.append(f"samples_incomplete:{model_name}:{','.join(incomplete_pods)}")
         counts = cluster_counts.get(model_name)
         assigned_replicas = metrics.assigned_replicas
         if counts is not None:
@@ -1299,12 +1343,12 @@ def _model_contexts(
                             None if computed.hold_fallback else signal_state.settle_breakpoint_ms(model_name)
                         ),
                         "signal_window_start_ms": window.start_ms,
-                        "signal_evidence_grids": window.grids,
+                        "signal_evidence_ms": window.evidence_ms,
                         "signal_hold_reason": None if computed.hold_fallback else window.reason,
                         # Completed requests of the post-breakpoint window (the C1 step
                         # cap's evidence); None on a whole window.
                         "signal_evidence_requests": (
-                            None if window.full else getattr(window.metrics, "request_count", None)
+                            None if window.full else observed_requests(window.metrics)
                         ),
                         # Timer cleanup (2026-10-02): O1 is active and saw this model's
                         # routable count in the fleet view this tick, so a change of it
@@ -1321,6 +1365,7 @@ def _model_contexts(
                     hidden_pods.get(model_name, ()),
                 )
         else:
+            window = None
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
             # not that the model is idle (a live idle pod reports zero-delta tokens, which is the
             # tokens branch above with Y_m<=1e-9). Do NOT touch the traffic-onset cursor here:
@@ -1353,18 +1398,37 @@ def _model_contexts(
         context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
         # 2026-10-02: the SM replica floor / headroom (donor bound of the planner).
         context.update(_sm_floor_context(cluster_view, model_name))
-        if tokens_available and stale_pods and (
-            routable_by_model is None or set(stale_pods) & routable_by_model.get(model_name, frozenset())
-        ):
-            # I4: a serving pod's data is missing from this window (its scrape is stale),
-            # so the level comes from the other pods only - no scale-down / release
-            # evidence (the planner's donor gate); a receiver still acts (step-capped).
-            context["signal_full_window"] = False
-            context["signal_hold_reason"] = "scrape_stale"
+        serving_now = routable_by_model.get(model_name, frozenset()) if routable_by_model is not None else None
+        flagged = set(incomplete_pods)
+        if window is not None and not window.full:
+            # The decision window is an O1 suffix: its own flags count too.
+            flagged |= set(getattr(window.metrics, "sample_incomplete_pods", ()) or ())
+        if serving_now is None:
+            held_incomplete = flagged | set(stale_pods)
+        elif raw_metrics.per_pod:
+            # M1: a serving pod without complete data in the window (flagged, I3-stale,
+            # or no doc at all) holds as well. (An empty per_pod: no pod data at all -
+            # tokens missing below, or a synthetic window without per-pod data.)
+            complete = set(raw_metrics.per_pod) - flagged
+            held_incomplete = set(serving_now) - complete
+        else:
+            held_incomplete = (flagged | set(stale_pods)) & set(serving_now)
+        if tokens_available and held_incomplete:
+            # I4 (review round 1): a serving pod's data is incomplete in this window -
+            # no scale-down / release / donor evidence (the planner's donor gate). Only
+            # that: the level, the receiver steps and the O1 window are unchanged.
+            missing = held_incomplete - set(raw_metrics.per_pod or ())
+            context["sample_quality_hold"] = (
+                "scrape_stale" if missing & set(stale_pods)
+                else "pod_missing" if missing
+                else "samples_incomplete"
+            )
+            context["window_idle"] = False
         else:
             # Q3 (2026-10-06): the whole current serving window is idle - tokens known
-            # and zero, no running / waiting request - with every serving pod scraped in
-            # the window's last grid and nothing in flight on it at the gateway (P2-2).
+            # and zero, no running / waiting request - with every serving pod scraped
+            # recently (``scrape_current_pods``) and nothing in flight on it at the
+            # gateway (P2-2).
             # The same at any replica count: an IDLE model is exempt from the O1 donor
             # hold on it (planner). Never on a held or tokens-missing context.
             context["window_idle"] = bool(
@@ -1383,11 +1447,7 @@ def _model_contexts(
         if tracker is not None and tracker.config.enabled:
             # Onset saturation rescue: the routable pods' newest gateway samples (the
             # serving window minus hidden probe pods), not the window averages.
-            sample = saturation_sample(
-                metrics,
-                hidden_pods=hidden_pods.get(model_name, ()),
-                fresh_after_ms=int(metrics.window_end_ms) - int(tracker.config.grid_ms),
-            )
+            sample = saturation_sample(metrics, hidden_pods=hidden_pods.get(model_name, ()))
             context.update(
                 {
                     "saturation_waiting": sample.waiting if sample is not None else None,
@@ -1402,19 +1462,22 @@ def _model_contexts(
                 }
             )
         if paper_state_cache is not None:
-            context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
+            context, model_events = paper_state_cache.apply(
+                model_name, context, tokens_available=tokens_available, window_end_ms=int(metrics.window_end_ms)
+            )
             events.extend(model_events)
         contexts[model_name] = context
     return contexts, tuple(events)
 
 
 def _queue_sample(
-    metrics: ModelWindowMetrics, hidden_pods, fresh_after_ms: int, lambda_wait: float
+    metrics: ModelWindowMetrics, hidden_pods, after_ms: int | None, lambda_wait: float
 ) -> QueueSample | None:
     """H3: the routable pods' (serving window minus hidden probe pods) newest instant
-    samples stamped after ``fresh_after_ms``, as one :class:`QueueSample` (with the
-    per-pod values: a rise is measured on the pods of both samples, review P1-1)."""
-    sample = saturation_sample(metrics, hidden_pods=hidden_pods, fresh_after_ms=fresh_after_ms)
+    samples, those observed after ``after_ms`` only (None: all), as one
+    :class:`QueueSample` (with the per-pod values: a rise is measured on the pods of
+    both samples, review P1-1)."""
+    sample = saturation_sample(metrics, hidden_pods=hidden_pods, after_ms=after_ms)
     if sample is None:
         return None
     lam = float(lambda_wait)
@@ -1441,23 +1504,21 @@ def _o1_queue_rise(
 ) -> dict | None:
     """H3 (2026-10-06): queue evidence for the O1 receiver-hold exemption (planner).
 
-    Every O1-tracked read records the window's queue sample (pods sampled in its last
-    grid) - the baselines. On a held window (``signal_warm`` False, breakpoint inside
-    the window) the current sample takes only pods sampled after the breakpoint and is
-    compared with the newest recorded sample at or before it
-    (:meth:`SignalState.queue_rise`). The instant gauges do not wait for completions, so
-    a sample after the breakpoint is evidence the token window cannot give yet."""
-    breakpoint = getattr(signal_state, "breakpoint", None)
-    grid = int(getattr(breakpoint, "grid_ms", 0) or 0)
-    if grid <= 0:
+    Every O1-tracked read records the window's queue sample (each pod's newest sample
+    in the window, observed at ``scraped_ms``) - the baselines. On a held window
+    (``signal_warm`` False, breakpoint inside the window) the current sample takes only
+    pods observed after the breakpoint and is compared with the newest recorded sample
+    observed at or before it (:meth:`SignalState.queue_rise`). The instant gauges do
+    not wait for completions, so a sample after the breakpoint is evidence the token
+    window cannot give yet."""
+    if getattr(signal_state, "breakpoint", None) is None:
         return None
-    end = int(metrics.window_end_ms)
     lam = float(spec.trs.lambda_wait)
-    signal_state.note_queue_sample(model_name, _queue_sample(metrics, hidden_pods, end - grid, lam))
+    signal_state.note_queue_sample(model_name, _queue_sample(metrics, hidden_pods, None, lam))
     point = getattr(window, "breakpoint_ms", None)
     if signal_warm or window is None or window.full or point is None:
         return None
-    current = _queue_sample(metrics, hidden_pods, max(end - grid, int(point)), lam)
+    current = _queue_sample(metrics, hidden_pods, int(point), lam)
     return signal_state.queue_rise(model_name, int(point), current)
 
 
@@ -1525,8 +1586,8 @@ def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
 def _serving_pods_drained(
     metrics: ModelWindowMetrics, routable_by_model: dict[str, frozenset[str]] | None, model: str
 ) -> bool:
-    """P2-2 (2026-10-06, I3): every serving pod's newest successful scrape lies in the
-    window's last grid (``scrape_current_pods``) and the gateway has no request in flight
+    """P2-2 (2026-10-06, I3): every serving pod's newest successful scrape is fresh at
+    the window end (``scrape_current_pods``) and the gateway has no request in flight
     on it (``gateway_inflight``). A pod scraped only earlier in the window, or an unknown
     in-flight count, is not idle evidence. Without a fleet view the pods with valid
     docs serve."""
