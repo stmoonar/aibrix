@@ -41,7 +41,7 @@ RISE = {"breakpoint_ms": 1_000, "base_ms": 0, "base_q": 80.0, "base_waiting": 20
 
 def _held(**extra) -> dict:
     return {"assigned_replicas": 2, "routable_pods": 2, "awake_replicas": 2, "signal_warm": False,
-            "signal_full_window": False, "signal_hold_reason": "no_complete_grid",
+            "signal_full_window": False, "signal_hold_reason": "no_suffix",
             "signal_evidence_requests": 500.0, **extra}
 
 
@@ -63,7 +63,7 @@ def _ups(plan, model: str = "m") -> int:
 def test_critical_receiver_with_rising_queue_takes_a_free_gpu_despite_the_hold():
     plan = _plan({"m": _held(o1_queue_rise=RISE)}, {"m": (ModelState.CRITICAL, 0.05)}, idle_gpus=2)
     assert _ups(plan) == 1  # one step per decision (Z is the old regime's)
-    assert any(e.startswith("receiver_o1_exempt_free_gpu:m:no_complete_grid:planned=1:bp=1000:q=80.0->120.0")
+    assert any(e.startswith("receiver_o1_exempt_free_gpu:m:no_suffix:planned=1:bp=1000:q=80.0->120.0")
                for e in plan.events)
     assert not any(e.startswith("receiver_held_breakpoint_window:m") for e in plan.events)
 
@@ -92,7 +92,7 @@ def test_exempt_receiver_does_not_take_the_free_gpu_a_confirmed_receiver_needs()
     assert [(a.model, a.delta, a.reason) for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0] == [
         ("c", 1, "critical_idle_capacity")
     ]
-    assert "receiver_held_breakpoint_window:e:no_complete_grid" in plan.events
+    assert "receiver_held_breakpoint_window:e:no_suffix" in plan.events
 
 
 def test_step_that_needs_a_donor_keeps_the_hold():
@@ -102,7 +102,7 @@ def test_step_that_needs_a_donor_keeps_the_hold():
     plan = _plan({"m": _held(o1_queue_rise=RISE), "d": dict(donor)}, states, idle_gpus=0)
     assert not [a for a in plan.actions if getattr(a, "receiver", None) == "m"]
     assert _ups(plan) == 0
-    assert "receiver_held_breakpoint_window:m:no_complete_grid" in plan.events
+    assert "receiver_held_breakpoint_window:m:no_suffix" in plan.events
     assert not any(e.startswith("receiver_o1_exempt_free_gpu") for e in plan.events)
     # control: the same receiver once warm does take from the donor (F1-B: through a
     # SafeScale probe of the HIGH donor, m its promised receiver)
@@ -118,7 +118,7 @@ def test_scale_down_and_low_receiver_after_a_breakpoint_stay_held():
     }
     plan = _plan(contexts, {"d": (ModelState.HIGH, 3.0), "low": (ModelState.LOW, 0.9)}, idle_gpus=2)
     assert "donor_suppressed_breakpoint_window:d" in plan.events
-    assert "receiver_held_breakpoint_window:low:no_complete_grid" in plan.events
+    assert "receiver_held_breakpoint_window:low:no_suffix" in plan.events
     assert not plan.actions
 
 
@@ -131,7 +131,7 @@ def test_critical_receiver_on_a_free_gpu_needs_no_queue_rise_one_wake_per_settle
     settled the receiver acts again. LOW, a held (tokens_missing) context and a stale
     scrape -> held."""
     crit = {"m": (ModelState.CRITICAL, 0.05)}
-    for reason in ("no_complete_grid", "no_suffix", "evidence_grids", "evidence_tokens", "evidence_requests"):
+    for reason in ("no_suffix", "evidence_span", "evidence_tokens", "evidence_requests"):
         plan = _plan({"m": _held(o1_queue_rise=None, signal_hold_reason=reason)}, crit, idle_gpus=2)
         assert _ups(plan) == 1
         assert any(e.startswith(f"receiver_o1_exempt_free_gpu:m:{reason}:planned=1:")
@@ -146,7 +146,7 @@ def test_critical_receiver_on_a_free_gpu_needs_no_queue_rise_one_wake_per_settle
     for pending in (landed, unseen, view):
         assert _ups(pending) == 0
         assert any(e.startswith("receiver_o1_exempt_pending:m:") for e in pending.events)
-        assert "receiver_held_breakpoint_window:m:no_complete_grid" in pending.events
+        assert "receiver_held_breakpoint_window:m:no_suffix" in pending.events
     # Settled (``_rescue_bases`` drops the target): warm -> the normal TSS rescue.
     settled = _plan({"m": _held(signal_warm=True, signal_full_window=True, signal_hold_reason=None,
                                 routable_pods=3, awake_replicas=3, assigned_replicas=3)},
@@ -159,7 +159,7 @@ def test_critical_receiver_on_a_free_gpu_needs_no_queue_rise_one_wake_per_settle
         assert not any(e.startswith("receiver_o1_exempt") for e in stale.events)
     low = _plan({"m": _held(o1_queue_rise=None)}, {"m": (ModelState.LOW, 0.9)}, idle_gpus=2)
     assert _ups(low) == 0
-    assert "receiver_held_breakpoint_window:m:no_complete_grid" in low.events
+    assert "receiver_held_breakpoint_window:m:no_suffix" in low.events
 
 
 def _pods(end: int, samples: dict[str, tuple[float, float]]) -> dict[str, PodWindowMetrics]:
@@ -195,7 +195,7 @@ def _after_scale_up(post: dict[str, tuple[float, float]]):
 def test_tick_measures_the_queue_rise_from_samples_after_the_breakpoint():
     rising = _after_scale_up({"m-0": (30.0, 30.0), "m-1": (10.0, 0.0)})
     ctx = rising.model_contexts["m"]
-    assert ctx["signal_warm"] is False and ctx["signal_hold_reason"] == "no_complete_grid"
+    assert ctx["signal_warm"] is False and ctx["signal_hold_reason"] == "no_suffix"
     assert ctx["o1_queue_rise"]["waiting"] == 30.0 and ctx["o1_queue_rise"]["base_waiting"] == 20.0
     assert [(a.model, a.delta) for a in rising.actions if isinstance(a, ScaleAction)] == [("m", 1)]
     assert any(e.startswith("receiver_o1_exempt_free_gpu:m:") for e in rising.events)

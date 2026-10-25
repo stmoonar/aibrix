@@ -315,39 +315,33 @@ def test_make_live_instant_sampler_reads_latest_not_window_average() -> None:
             self.latest_calls = []
             self.window_calls = 0
 
-        def read_latest_instant(self, model, now_ms, lookback_ms):
-            self.latest_calls.append((model, now_ms, lookback_ms))
-            return {"waiting": 2.0, "running": 6.0, "swapping": 0.0}
+        def read_latest_instant(self, model, now_ms):
+            # Round 4: no lookback - each pod's newest doc, with its age.
+            self.latest_calls.append((model, now_ms))
+            return {"waiting": 2.0, "running": 6.0, "swapping": 0.0, "age_ms": 400.0}
 
         def read_model_window(self, *a, **k):  # must NOT be used by the sampler
             self.window_calls += 1
             raise AssertionError("sampler must not use read_model_window")
 
     store = _FakeStore()
-    sampler = r3_grid._make_live_instant_sampler(store, "dsqwen-7b", lookback_ms=20_000)
+    sampler = r3_grid._make_live_instant_sampler(store, "dsqwen-7b")
     snap = sampler(123_000)
-    assert snap == {"waiting": 2.0, "running": 6.0, "swapping": 0.0}
+    assert snap == {"waiting": 2.0, "running": 6.0, "swapping": 0.0, "age_ms": 400.0}
     assert store.window_calls == 0
-    assert store.latest_calls == [("dsqwen-7b", 123_000, 20_000)]
+    assert store.latest_calls == [("dsqwen-7b", 123_000)]
 
 
 def test_r3_grid_uses_single_source_scrape_cadence() -> None:
     # r3_grid derives its cadences from the single source of truth (tre_common.rediskeys),
     # not a local magic number (r3 SMOKE_FINDINGS defect 2): the closed-loop sampler polls
-    # at the gateway's instant-doc period; the lookback covers 2 x the declared evidence
-    # period (20 s for a gateway that declares none).
+    # at the gateway's instant-doc period. Round 4: there is no lookback to size.
     from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS
 
     args = r3_grid.parse_args(["--model", "m7", "--gateway-url", "http://gw/v1/chat/completions",
                                "--output", "/o/x.csv"])
     assert args.instant_sample_ms == INSTANT_SAMPLE_INTERVAL_MS
-
-    class _Declared:
-        def hgetall(self, key):
-            return {b"instant_ms": b"500", b"evidence_ms": b"2000"}
-
-    assert r3_grid.live_instant_lookback_ms(_Declared()) == 4_000
-    assert r3_grid.live_instant_lookback_ms(None) == 20_000
+    assert not hasattr(r3_grid, "live_instant_lookback_ms")
 
 
 def test_estimate_capture_bytes_scales_with_grid() -> None:

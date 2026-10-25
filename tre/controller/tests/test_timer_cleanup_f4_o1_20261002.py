@@ -94,7 +94,7 @@ def test_o1_replaces_the_f4_hold_of_a_low_receiver():
     # The view predates the scale-up: no breakpoint yet -> the O1 view-pending gate holds.
     assert "o1_view_pending_hold:m" in results[1].events and not _ups(results[1].actions)
     # Breakpoint seen: the receiver waits for min_evidence_ms of post-change grids.
-    assert "receiver_held_breakpoint_window:m:evidence_grids" in results[2].events
+    assert "receiver_held_breakpoint_window:m:evidence_span" in results[2].events
     assert not _ups(results[2].actions)
     # Two post-change grids (window end BASE + 30 s): it acts again. The F4 rule would
     # still hold it here (window start BASE < the action's completion BASE + 1.5 s).

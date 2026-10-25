@@ -174,7 +174,7 @@ def test_a_stalled_probe_is_a_capacity_rollback():
     machine.start_probe(model="d", pods=("d-1",), now_ms=0, window_inputs=ProbeWindowInputs(z_m=1.5, routable_pods=3))
     machine.resolve("d", status="rollback", reason="insufficient_evidence:stalled", now_ms=10_000)
     assert machine.rollback_evidence()["d"].capacity is True
-    assert machine.rollback_retry_holds({"d": (1.5, 3, 20_000)}) == {"d": "same_evidence"}
+    assert machine.rollback_retry_holds({"d": (1.5, 3, 30_000)}) == {"d": "same_evidence"}
 
 
 # ------------------------------------------------------------------ P3-6
@@ -307,7 +307,7 @@ def test_two_models_trading_a_pod_wait_for_evidence_at_every_hop():
     assert _probed(hops[1]) == set()  # the view predates the hop; b's Z still mixed
     # Hop 2: b is a LOW receiver on post-change evidence too thin to act on; hop 3: b's
     # evidence is warm, but a (the only donor) still lacks a whole post-change window.
-    assert "receiver_held_breakpoint_window:b:evidence_grids" in hops[2].events
+    assert "receiver_held_breakpoint_window:b:evidence_span" in hops[2].events
     for k in (2, 3):
         assert _probed(hops[k]) == set(), (k, hops[k].events)
         assert "donor_suppressed_breakpoint_window:a" in hops[k].events

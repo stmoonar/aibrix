@@ -321,7 +321,6 @@ def test_ceiling_multiplier_and_floor_come_from_config_and_registry(tmp_path) ->
     assert (cfg.safescale.min_window_ms, cfg.safescale.e2e_multiplier) == (20_000.0, 2.0)
     assert (cfg.safescale.slo_mode, cfg.safescale.min_commit_samples) == ("labels", 20)
     assert cfg.safescale.evidence_clock_tolerance_ms == 20_000.0
-    assert cfg.safescale.evidence_step_ms == 2_000.0  # the evidence period
     raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
     raw["safescale"] = {"slo_mode": "fixed", "window_ceiling_s": 90, "min_commit_samples": 30,
                         "evidence_clock_tolerance_s": 15}

@@ -4,10 +4,10 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Collection, Mapping, Protocol
 
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_of
 from tre_common.registry import Registry
 from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
@@ -163,6 +163,7 @@ def run_safescale_observation_tick(
                 if probe.model in _cluster_view_counts(cluster_view)
                 else None
             ),
+            tail_span_ms=_tail_span_ms(safescale, probe.model),
         )
         poll = (direct_polls or {}).get(probe.model)
         # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
@@ -664,6 +665,7 @@ def _observation_from_metrics(
     hidden_pods: tuple[str, ...] = (),
     gateway: GatewayCounters | None = None,
     routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
+    tail_span_ms: int | None = None,
 ) -> ProbeObservation:
     if signal_state is not None and getattr(signal_state, "breakpoint", None) is not None:
         # O1: the planner tick's computation (same effective window, same EMA). The hide
@@ -713,7 +715,59 @@ def _observation_from_metrics(
         # The immediate rollback judges max(per pod, pooled) like the deadline gate.
         pooled_ttft_p95_ms=_pooled_p95(metrics, hidden_pods, "ttft_hist", "ttft_hist_count"),
         pooled_tpot_p95_ms=_pooled_p95(metrics, hidden_pods, "tpot_hist", "tpot_hist_count"),
+        observed_ms=observed_of(metrics).t_last_ms,
+        **_tail_terms(metrics, spec, signal_source, hidden_pods, tail_span_ms),
     )
+
+
+def _tail_span_ms(safescale: object, model: str) -> int | None:
+    reader = getattr(safescale, "tail_span_ms", None)
+    try:
+        return reader(model) if callable(reader) else None
+    except Exception:  # noqa: BLE001 - no tail: the gate reads the whole window
+        return None
+
+
+def _tail_terms(
+    metrics: ModelWindowMetrics, spec, signal_source: str, hidden_pods: tuple[str, ...], tail_span_ms: int | None
+) -> dict:
+    """Round 4: the commit gate's tail of this snapshot - the suffix window covering
+    the latest ``tail_span_ms`` (the one with the latest start at or before
+    ``end - tail_span_ms``; the store builds it, ``MetricsStore(suffix_tail=...)``).
+    One value per quantity over that one span: raw Z (no EMA, the TSS numerator scaled
+    to a whole window as O1 does), traffic, the remaining pods' KV-cache fill (each
+    pod's mean over its instant docs: time-weighted, the docs are evenly spaced) and the
+    latency p95s. {} without a span or a suffix (the gate reads the whole window)."""
+    if not tail_span_ms:
+        return {}
+    end = int(metrics.window_end_ms)
+    want = end - int(tail_span_ms)
+    candidates = [item for item in metrics.suffix_windows if int(item.window_start_ms) <= want]
+    if not candidates:
+        return {}
+    suffix = max(candidates, key=lambda item: int(item.window_start_ms))
+    span = end - int(suffix.window_start_ms)
+    if span <= 0 or suffix.prompt_tokens is None or suffix.generation_tokens is None:
+        return {"tail_start_ms": int(suffix.window_start_ms)}
+    whole = float(end - int(metrics.window_start_ms))
+    scale = whole / float(span)
+    inp = TRSInput.from_metrics(suffix, spec.trs)
+    inp = replace(
+        inp,
+        prompt_tokens_total=inp.prompt_tokens_total * scale,
+        generation_tokens_total=inp.generation_tokens_total * scale,
+        window_ms=whole,
+    )
+    result = TRSComputer(ema_tau_ms=0.0).compute(inp, theta_m=spec.trs.theta_m)
+    signal = get_signal(suffix, spec, signal_source, trs_z_m=result.Z_m, signal_state=None)
+    return {
+        "tail_start_ms": int(suffix.window_start_ms),
+        "tail_z_m": signal.z_m,
+        "tail_has_traffic": bool(result.Q > 0.0 or (result.Y_m > 0.0 and result.defined)),
+        "tail_gpu_cache": remaining_pods_kv_cache(suffix, hidden_pods),
+        "tail_ttft_p95_ms": suffix.ttft_p95_ms,
+        "tail_tpot_p95_ms": suffix.tpot_p95_ms,
+    }
 
 
 def _pooled_p95(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...], hist: str, count: str) -> float | None:

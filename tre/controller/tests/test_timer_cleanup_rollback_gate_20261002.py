@@ -3,9 +3,10 @@ whose SafeScale probe rolled back is re-probed on new evidence, not after a fixe
 
 A capacity rollback (SLO violation, formal commit gate, donor health) keeps the Z and
 routable count of the decision that started the probe; the next receiver-less HIGH
-probe needs a metrics window ending after the rollback AND a different routable count
-or a Z at least ``rollback_retry_z_margin`` higher. Other rollbacks need the new
-window only. ``TRE_SAFESCALE_ROLLBACK_BACKOFF_MS`` still parses and is ignored."""
+probe needs new evidence after the rollback (round 4: observations spanning
+``scaling.min_evidence_ms``, 20 s, after it - not merely a newer window) AND a different
+routable count or a Z at least ``rollback_retry_z_margin`` higher. Other rollbacks need
+the new evidence only. ``TRE_SAFESCALE_ROLLBACK_BACKOFF_MS`` still parses and is ignored."""
 
 from __future__ import annotations
 
@@ -45,30 +46,34 @@ def test_capacity_rollback_waits_for_a_higher_z_or_another_replica_count():
     evidence = machine.rollback_evidence()["donor"]
     assert (evidence.capacity, evidence.z_m, evidence.routable, evidence.reason) == (True, 1.5, 3, "slo_violation")
     assert machine.rollback_retry_holds({}) == {"donor": "no_signal"}
-    assert machine.rollback_retry_holds({"donor": (3.0, 4, 10_000)}) == {"donor": "no_new_window"}
+    assert machine.rollback_retry_holds({"donor": (3.0, 4, 10_000)}) == {"donor": "no_new_evidence"}
+    # Round 4: 18 s of observations after the rollback are not the 20 s floor yet.
+    assert machine.rollback_retry_holds({"donor": (3.0, 4, 28_000)}) == {"donor": "no_new_evidence"}
     for z in (1.5, 1.6, 1.74):  # below start + margin: the same evidence, whatever the time
         assert machine.rollback_retry_holds({"donor": (z, 3, 3_600_000)}) == {"donor": "same_evidence"}
-    assert machine.rollback_retry_holds({"donor": (1.75, 3, 20_000)}) == {}
-    assert machine.rollback_retry_holds({"donor": (1.0, 2, 20_000)}) == {}  # n changed
-    assert machine.rollback_retry_holds({"donor": (None, 3, 20_000)}) == {"donor": "same_evidence"}
+    assert machine.rollback_retry_holds({"donor": (1.75, 3, 30_000)}) == {}
+    assert machine.rollback_retry_holds({"donor": (1.0, 2, 30_000)}) == {}  # n changed
+    assert machine.rollback_retry_holds({"donor": (None, 3, 30_000)}) == {"donor": "same_evidence"}
 
 
 def test_the_margin_is_configurable():
     machine = _rolled_back(_machine(rollback_retry_z_margin=0.0))
-    assert machine.rollback_retry_holds({"donor": (1.5, 3, 20_000)}) == {}
+    assert machine.rollback_retry_holds({"donor": (1.5, 3, 30_000)}) == {}
     machine = _rolled_back(_machine(rollback_retry_z_margin=1.0))
-    assert machine.rollback_retry_holds({"donor": (2.4, 3, 20_000)}) == {"donor": "same_evidence"}
-    assert machine.rollback_retry_holds({"donor": (2.5, 3, 20_000)}) == {}
+    assert machine.rollback_retry_holds({"donor": (2.4, 3, 30_000)}) == {"donor": "same_evidence"}
+    assert machine.rollback_retry_holds({"donor": (2.5, 3, 30_000)}) == {}
 
 
 @pytest.mark.parametrize("code", ["evidence_incomplete:no_baseline", "sm_maintenance", "observe_entered",
                                   "hide_failed", "probe_pods_gone"])
-def test_non_capacity_rollback_needs_only_a_new_window(code):
+def test_non_capacity_rollback_needs_only_new_evidence(code):
     machine = _rolled_back(_machine(), reason=code)
     assert code not in CAPACITY_ROLLBACK_CODES
     assert machine.rollback_evidence()["donor"].capacity is False
-    assert machine.rollback_retry_holds({"donor": (1.5, 3, 10_000)}) == {"donor": "no_new_window"}
-    assert machine.rollback_retry_holds({"donor": (1.5, 3, 10_001)}) == {}
+    assert machine.rollback_retry_holds({"donor": (1.5, 3, 10_000)}) == {"donor": "no_new_evidence"}
+    # Round 4: a window newer by 1 ms was enough before (5x sooner at a 2 s period).
+    assert machine.rollback_retry_holds({"donor": (1.5, 3, 10_001)}) == {"donor": "no_new_evidence"}
+    assert machine.rollback_retry_holds({"donor": (1.5, 3, 30_000)}) == {}
 
 
 def test_structured_rollback_code_wins_over_the_queue_reason():
@@ -86,10 +91,10 @@ def test_unknown_starting_z_takes_the_first_window_after_the_rollback():
     machine = _machine()
     machine.start_probe(model="donor", pods=("donor-a",), now_ms=0)  # no window inputs
     machine.resolve("donor", status="rollback", reason="formal_commit_gate_failed", now_ms=10_000)
-    assert machine.rollback_retry_holds({"donor": (1.4, 3, 20_000)}) == {"donor": "same_evidence"}
+    assert machine.rollback_retry_holds({"donor": (1.4, 3, 30_000)}) == {"donor": "same_evidence"}
     assert machine.rollback_evidence()["donor"].z_m == 1.4
-    assert machine.rollback_retry_holds({"donor": (1.6, 3, 30_000)}) == {"donor": "same_evidence"}
-    assert machine.rollback_retry_holds({"donor": (1.65, 3, 30_000)}) == {}
+    assert machine.rollback_retry_holds({"donor": (1.6, 3, 40_000)}) == {"donor": "same_evidence"}
+    assert machine.rollback_retry_holds({"donor": (1.65, 3, 40_000)}) == {}
 
 
 def test_commit_clears_and_preemption_never_records_evidence():

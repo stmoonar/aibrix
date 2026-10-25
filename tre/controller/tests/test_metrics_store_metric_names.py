@@ -83,8 +83,9 @@ def test_latency_and_cache_read_under_either_identifier(tpot_key: str, cache_key
     assert pod.tpot_count == 4000.0
     assert pod.tpot_avg_ms == pytest.approx(20.0)
     assert pod.gpu_cache_usage == pytest.approx(0.4)
-    latest = store.read_latest_instant(MODEL, 20_000, 20_000)
-    assert latest == {"waiting": 1.0, "running": 2.0, "swapping": 0.0}
+    latest = store.read_latest_instant(MODEL, 21_000)
+    # Round 4: the pod's newest doc at or before now, with its age (no lookback).
+    assert latest == {"waiting": 1.0, "running": 2.0, "swapping": 0.0, "age_ms": 1_000.0}
 
 
 def test_new_identifier_wins_when_both_are_present() -> None:

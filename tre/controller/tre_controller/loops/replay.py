@@ -5,8 +5,9 @@ from typing import Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
-from tre_controller.loops.tick import LoopTickResult, SafeScaleController, run_planner_tick
+from tre_controller.loops.tick import LoopTickResult, PaperStateCache, SafeScaleController, run_planner_tick
 from tre_controller.planning.planner import Action, ClusterView
+from tre_controller.signals.trs import SignalState
 
 
 class _ReplaySafeScaleController(SafeScaleController, Protocol):
@@ -49,11 +50,20 @@ def run_tick_replay(
     safescale: SafeScaleController | None = None,
     signal_source: str = "zm",
     suppress_hot_proactive_probe: bool = False,
+    signal_state: SignalState | None = None,
+    paper_state_cache: PaperStateCache | None = None,
+    queue: object | None = None,
 ) -> TickReplayResult:
     """``safescale`` None = no SafeScale: every shrink that would start a probe is
     released immediately (urgent donor path, reason suffix ``_nosafescale``; since
-    2026-10-08, before it was dropped)."""
-    queue = ReplayQueue()
+    2026-10-08, before it was dropped).
+
+    ``signal_state`` / ``paper_state_cache`` (round 4): the controller's stateful
+    signal path - the O1 breakpoint window, the EMAs, the saturation tracker, the
+    missing-token fallback - kept across steps (and across calls, for a closed-loop
+    replay that calls this once per tick); None = stateless, as before. ``queue``: where
+    the actions go (default: a :class:`ReplayQueue` that records them)."""
+    queue = queue if queue is not None else ReplayQueue()
     results: list[LoopTickResult] = []
     actions: list[Action] = []
     events: list[str] = []
@@ -73,6 +83,8 @@ def run_tick_replay(
             signal_source=signal_source,
             suppress_hot_proactive_probe=suppress_hot_proactive_probe,
             safescale=safescale,
+            signal_state=signal_state,
+            paper_state_cache=paper_state_cache,
         )
         results.append(result)
         actions.extend(result.actions)

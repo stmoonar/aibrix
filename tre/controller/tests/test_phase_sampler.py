@@ -228,9 +228,11 @@ def test_relearn_drops_an_adapted_offset_back_to_the_floor() -> None:
     clock = Clock(BASE + 5_000)
     gateway = Gateway(clock, lag_ms=5_300)
     sampler = _sampler(clock, gateway, relearn_ms=3 * P)
-    _run(sampler, 2)
+    _run(sampler, 3)
     assert sampler.offset_ms == 5_500
-    _run(sampler)  # third cycle -> relearn
+    # Round 4: the relearn is due relearn_ms after the first cycle (controller clock),
+    # not every N cycles.
+    _run(sampler)
     assert sampler.offset_ms == 2_000
     gateway.lag_ms = 1_000  # gateway restarted with an earlier phase
     outcome = _run(sampler)[0]
@@ -244,8 +246,8 @@ def test_missing_tick_is_stale_previous_snapshot_is_kept_then_marked(caplog) -> 
     sampler = _sampler(clock, gateway, box, stale_hold_ms=2 * P)
     _run(sampler)
     good = box.get()
-    # the gateway never writes the next 3 end ticks -> 3 stale windows
-    gateway.skip = {BASE + 2 * P, BASE + 3 * P, BASE + 4 * P}
+    # the gateway never writes the next 4 end ticks -> 4 stale windows
+    gateway.skip = {BASE + 2 * P, BASE + 3 * P, BASE + 4 * P, BASE + 5 * P}
     with caplog.at_level(logging.WARNING, logger="tre_controller.metrics"):
         stale = _run(sampler, 3)
     assert [o.kind for o in stale] == ["stale"] * 3
@@ -254,12 +256,16 @@ def test_missing_tick_is_stale_previous_snapshot_is_kept_then_marked(caplog) -> 
     assert "metrics_window_stale" in caplog.text
     # retried until the next boundary was due, then gave up
     assert stale[0].attempts > 1
-    # hold for 2 windows: the very same (non-stale) snapshot object is served
+    # Round 4: the hold counts controller time from the first READ of the first stale
+    # window (end + offset), not from its give-up one period later: at the third
+    # give-up (3 P - offset after that read) the 2 P hold is over.
     assert sampler.consecutive_stale == 3
+    assert box.get().stale is True and box.get().ts_ms == good.ts_ms
+    assert _run(sampler)[0].kind == "stale"
     assert box.get().stale is True and box.get().ts_ms == good.ts_ms
     recovered = _run(sampler)[0]
     assert recovered.kind == "published" and sampler.consecutive_stale == 0
-    assert box.get().stale is False and box.get().ts_ms == BASE + 5 * P
+    assert box.get().stale is False and box.get().ts_ms == BASE + 6 * P
 
 
 def test_stale_hold_serves_the_identical_previous_snapshot() -> None:

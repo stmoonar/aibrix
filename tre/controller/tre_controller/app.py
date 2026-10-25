@@ -43,6 +43,7 @@ from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, Re
 from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
+from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
 from tre_controller.store.state_store import ControllerStateStore
 
@@ -239,8 +240,8 @@ def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClo
         redis_client,
         [spec.name for spec in deps.registry.models()],
         deps.signal_state,
-        # The stamp-lag fallback bound (2 x period) on the evidence period (O1's grid).
-        period_ms=int(getattr(cfg, "evidence_period_ms", breakpoint.grid_ms)),
+        # The probe watches instant docs: wait one instant period (+ 2 s) for a new one.
+        period_ms=int(getattr(cfg, "instant_sample_interval_ms", 10_000)),
         tolerance_ms=int(config.gateway_clock_tolerance_ms),
     )
 
@@ -323,13 +324,11 @@ def create_controller_dependencies(
         if share
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
-    breakpoint_config = BreakpointWindowConfig.from_registry(
-        registry, grid_ms=cfg.evidence_period_ms
-    )
+    breakpoint_config = BreakpointWindowConfig.from_registry(registry)
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
     )
-    saturation_config = SaturationRescueConfig.from_registry(registry, grid_ms=cfg.evidence_period_ms)
+    saturation_config = SaturationRescueConfig.from_registry(registry)
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
     )
@@ -337,11 +336,13 @@ def create_controller_dependencies(
     signal_state = SignalState(
         warmup_ms=cfg.signal_warmup_ms,
         # O1 breakpoint window (registry scaling.breakpoint_window /
-        # onset_warmup_guard / min_evidence_*), on the gateway grid.
+        # onset_warmup_guard / min_evidence_*), on observation times.
         breakpoint=breakpoint_config,
         # Onset saturation rescue (registry scaling.saturation_*).
         saturation=SaturationTracker(saturation_config),
     )
+    # Round 4: the SafeScale tail span source, bound once the state machine exists.
+    tail_span: list = []
     store = MetricsStore(
         metrics_redis_client,
         registry,
@@ -362,10 +363,13 @@ def create_controller_dependencies(
         schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
-        # O1: the grid-aligned suffix windows the breakpoint window decides on.
-        suffix_period_ms=cfg.evidence_period_ms if breakpoint_config.enabled else 0,
+        # O1 and the SafeScale tail: the suffix windows they decide on, aligned to the
+        # histogram docs (only the requested ones are built).
+        suffix_period_ms=cfg.evidence_period_ms,
         # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
         suffix_breakpoint=lambda model: signal_state.breakpoint_ms(model) if signal_state.o1_active else None,
+        # Round 4: and the SafeScale commit gate's tail suffix of a probing model.
+        suffix_tail=lambda model: tail_span[0](model) if tail_span else None,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -378,6 +382,8 @@ def create_controller_dependencies(
     # (remaining pods: probe pods and pods the fleet state reports asleep excluded),
     # anchored on Redis TIME of the metrics store; thresholds from registry safescale.
     safescale = SafeScaleStateMachine(
+        # Round 4: the Redis evidence path's doc grid (no decision rule reads it).
+        grid=EvidenceGrid(int(cfg.evidence_period_ms)),
         config=cfg.safescale,
         store=ControllerStateStore(redis_client),
         evidence=MetricsEvidenceReader(
@@ -410,6 +416,7 @@ def create_controller_dependencies(
         remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
     )
     safescale.restore()
+    tail_span.append(safescale.tail_span_ms)
     # 2026-09-29 B+D: the controller scrapes the probe's remaining pods itself
     # (pod IP from the SM fleet state, port = registry safescale.metrics_port).
     # Not with SafeScale off (TRE_ABLATION_DISABLE_SAFESCALE): no probe is judged.

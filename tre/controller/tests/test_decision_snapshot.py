@@ -82,7 +82,7 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
             "signal_full_window": None,
             "signal_breakpoint_ms": None,
             "signal_window_start_ms": None,
-            "signal_evidence_grids": None,
+            "signal_evidence_ms": None,
             "signal_hold_reason": None,
             "sample_quality_hold": None,
             "state": None,

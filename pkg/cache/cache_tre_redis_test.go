@@ -332,6 +332,9 @@ func TestTREBoundaryRetriedAfterExecFailure(t *testing.T) {
 	require.Equal(t, "500", cadence["instant_ms"])
 	require.Equal(t, "2000", cadence["evidence_ms"])
 	require.NotEmpty(t, cadence["written_ms"])
+	// Round 4: the round's instant stamp, written with its docs (the failed round's
+	// stamp never appears).
+	require.Equal(t, "1010500", cadence["last_round_ms"])
 }
 
 // Review round 3 (L3): a histogram doc that cannot be built (a NaN sum: json.Marshal

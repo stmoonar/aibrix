@@ -19,7 +19,6 @@ from tre_common.registry import (
 from tre_controller.loops.tick import run_planner_tick
 from tre_controller.planning.classify import ModelState
 from tre_controller.planning.planner import ClusterView, ScaleAction
-from tre_controller.signals.saturation import SaturationRescueConfig, SaturationSample, SaturationTracker
 from tre_controller.store.metrics_store import MetricsStore
 from tre_sm.allocator.slots import Binding, Slot
 
@@ -171,9 +170,10 @@ def test_h2_receivers_with_slow_scrapes_scale_up_by_the_normal_step():
              and a.delta > 0)
     assert up == 2
     assert not any(e.startswith("rescue_low_evidence_step:r:") for e in result.events)
-    # The saturation rescue's input: each pod's newest gauges, at the window end.
+    # The saturation rescue's input: each pod's newest gauges, observed (scraped_ms)
+    # just before the window end (round 4: the observation time, not the doc stamp).
     for pod in snapshot.models["r"].per_pod.values():
-        assert (pod.latest_instant_ms, pod.latest_waiting) == (END, 10.0)
+        assert (pod.latest_instant_ms, pod.latest_waiting) == (_slow(END), 10.0)
 
 
 def test_m1_a_serving_pod_without_any_doc_blocks_the_donor():
@@ -241,26 +241,6 @@ def test_a_lost_baseline_still_gives_the_true_token_rate(case):
     assert window.sample_incomplete_pods == (() if case == "start_doc_lost" else ("m-0",))
 
 
-@pytest.mark.parametrize("grid_ms, windows_to_fire", [(10_000, 2), (2_000, 10)])
-def test_saturation_confirm_needs_20s_of_evidence_at_any_cadence(grid_ms, windows_to_fire):
-    """The onset saturation confirm is a span (20 s), not "2 windows": at the 10 s grid
-    the 2nd full window fires (as before); at a 2 s grid the 10th, not the 2nd (two 30 s
-    windows 2 s apart are nearly the same evidence)."""
-    tracker = SaturationTracker(SaturationRescueConfig(grid_ms=grid_ms))
-    sample = SaturationSample(waiting=5.0, kv=0.5, pods=1, sample_ms=0, running=4.0)
-    fired_at = None
-    for k in range(1, 20):
-        verdict = tracker.observe(
-            "m", window_end_ms=END + k * grid_ms, routable=1, reason="numerator_zero", sample=sample
-        )
-        if verdict.fire:
-            fired_at = k
-            break
-    assert fired_at == windows_to_fire
-    # One window fewer would have spanned under 20 s.
-    assert (fired_at - 1) * grid_ms < 20_000 <= fired_at * grid_ms
-
-
 # --------------------------------------------------- review round 3, default 2 s period
 
 EVIDENCE_2S = 2_000
@@ -289,28 +269,45 @@ def test_queue_and_tokens_stay_on_one_pod_set_after_a_reset_or_a_lost_hist(case)
     assert window.avg_running == pytest.approx(sum(pod.avg_running for pod in window.per_pod.values()))
 
 
-def test_a_late_end_round_still_gives_a_fresh_snapshot():
-    """M4: the end round came ~300 ms late - its instant docs carry the next instant
-    stamp, so no instant doc sits at the window end - but its histogram docs are
-    stamped with the end boundary: the round was written, the snapshot is fresh. Without
-    the end boundary's histogram docs it is not."""
-    from tre_controller.loops.metrics_task import window_freshness
+def test_a_round_300_ms_late_gives_no_stale():
+    """Round 4: the end round came 300 ms late - its docs carry the next instant stamp,
+    so no instant doc sits at the window end (rounds 1-3 waited for that doc: the
+    window stayed stale for good). The gateway's last_round_ms (END + 500, written in
+    that round's MULTI) proves the window: the sampler publishes it on its first read,
+    no stale window, no retry. A last_round_ms before the end is not written yet."""
+    import asyncio
+
+    from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox, window_freshness
 
     redis = _Redis()
     for pod in ("m-0", "m-1"):
         _write_pod(redis, "m", pod, running=2, evidence=EVIDENCE_2S, missing={END})
-    snapshot = _store(redis, _registry("m"), evidence=EVIDENCE_2S).read_snapshot(
-        END - WINDOW, END, use_cache=False, start_exclusive=True)
-    assert END not in snapshot.models["m"].instant_ticks_ms
+    redis.hashes["tre:v2:gateway:cadence"] = {
+        "instant_ms": str(INSTANT), "evidence_ms": str(EVIDENCE_2S), "written_ms": str(END + 805),
+        "last_round_ms": str(END + INSTANT), "version": "t",
+    }
+    store = _store(redis, _registry("m"), evidence=EVIDENCE_2S, expected_cadence=(INSTANT, EVIDENCE_2S))
+    snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
+    assert END not in snapshot.models["m"].instant_ticks_ms and not snapshot.stale
     assert window_freshness(snapshot, window_end_ms=END, window_ms=WINDOW, period_ms=EVIDENCE_2S).fresh
 
-    redis = _Redis()
-    for pod in ("m-0", "m-1"):
-        _write_pod(redis, "m", pod, running=2, evidence=EVIDENCE_2S, hist_missing={END})
-    snapshot = _store(redis, _registry("m"), evidence=EVIDENCE_2S).read_snapshot(
-        END - WINDOW, END, use_cache=False, start_exclusive=True)
+    clock = [END + 1_000]
+
+    async def sleep(seconds):
+        clock[0] += int(seconds * 1000)
+
+    box = SnapshotBox()
+    sampler = PhaseAlignedSampler(store, box, window_ms=WINDOW, period_ms=EVIDENCE_2S, clock_ms=lambda: clock[0],
+                                  sleep=sleep)
+    sampler.last_end_ms = END - EVIDENCE_2S
+    outcome = asyncio.run(sampler.run_once())
+    assert (outcome.kind, outcome.window_end_ms, outcome.attempts) == ("published", END, 1)
+    assert sampler.consecutive_stale == 0 and box.get().ts_ms == END and not box.get().stale
+
+    redis.hashes["tre:v2:gateway:cadence"]["last_round_ms"] = str(END - INSTANT)
+    snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
     freshness = window_freshness(snapshot, window_end_ms=END, window_ms=WINDOW, period_ms=EVIDENCE_2S)
-    assert not freshness.fresh and freshness.reason == f"missing_end_round:{END}"
+    assert not freshness.fresh and freshness.reason.startswith(f"round_not_written:{END}")
 
 
 def test_a_suffix_flag_survives_the_serving_restriction_and_holds_the_donor():
@@ -334,7 +331,7 @@ def test_a_suffix_flag_survives_the_serving_restriction_and_holds_the_donor():
     assert [w.sample_incomplete_pods for w in snapshot.models["m"].suffix_windows] == [("m-0",)]
 
     state = SignalState(breakpoint=BreakpointWindowConfig(
-        enabled=True, onset_guard=False, grid_ms=EVIDENCE_2S, min_evidence_ms=4_000))
+        enabled=True, onset_guard=False, min_evidence_ms=4_000))
     state.observe_traffic("m", has_traffic=True, window_start_ms=bp - WINDOW, window_end_ms=bp)
     view = ClusterView(topology=registry.topology(), bindings=(
         _binding("m-0", "m", 0), _binding("m-1", "m", 1, awake=False)))

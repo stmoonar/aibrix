@@ -17,15 +17,15 @@ KEY = "tre:v2:gateway:cadence"
 @pytest.mark.parametrize(
     "declared, enforce, stale",
     [
-        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1030004", "version": "abc"}, True, False),
+        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1030004", "last_round_ms": "1030000",
+          "version": "abc"}, True, False),
         ({"instant_ms": "10000", "evidence_ms": "10000", "version": "old"}, True, True),
         (None, True, True),
         ({"instant_ms": "500", "evidence_ms": "2000"}, False, False),
-        # M5: declared for an older round: written_ms < window end - evidence period.
-        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1019999"}, True, True),
-        ({"instant_ms": "500", "evidence_ms": "10000"}, True, True),
+        # Round 4: a gateway image without last_round_ms cannot prove its rounds.
+        ({"instant_ms": "500", "evidence_ms": "10000", "written_ms": "1030004"}, True, True),
     ],
-    ids=["match", "mismatch", "missing", "mismatch_warn_mode", "stale_written_ms", "no_written_ms"],
+    ids=["match", "mismatch", "missing", "mismatch_warn_mode", "no_last_round"],
 )
 def test_a_cadence_mismatch_marks_the_snapshot_stale(declared, enforce, stale, caplog) -> None:
     redis = _Redis()
@@ -39,7 +39,10 @@ def test_a_cadence_mismatch_marks_the_snapshot_stale(declared, enforce, stale, c
         snapshot = store.read_snapshot(1_000_000, 1_030_000, use_cache=False, start_exclusive=True)
     assert snapshot.stale is stale
     assert (snapshot.stale_reason is None) is (not stale and enforce)
-    if declared is not None and declared.get("evidence_ms") == "10000" and declared.get("instant_ms") == "500" \
-            and stale:
-        assert snapshot.stale_reason == "gateway_cadence_stale"
+    if declared is not None and "last_round_ms" not in declared and declared.get("instant_ms") == "500" and stale:
+        assert snapshot.stale_reason == "gateway_cadence_no_round"
     assert ("GATEWAY CADENCE" in caplog.text) is (snapshot.stale_reason is not None)
+    # The round stamp travels with the snapshot: the sampler's freshness rule.
+    assert snapshot.gateway_last_round_ms == (
+        int(declared["last_round_ms"]) if declared and "last_round_ms" in declared else None
+    )

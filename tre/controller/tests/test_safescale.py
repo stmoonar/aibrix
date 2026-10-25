@@ -218,6 +218,9 @@ def test_safescale_restores_unresolved_probe_and_commits() -> None:
 
 
 def test_safescale_restored_tail_blocks_commit_on_prior_latency_violation() -> None:
+    # Round 4: the commit gate judges one span - the newest snapshot's tail. A restored
+    # (journalled) observation of that snapshot is judged; a re-read of the same snapshot
+    # after the restart does not replace it.
     unresolved = [
         {
             "model": "donor",
@@ -232,7 +235,7 @@ def test_safescale_restored_tail_blocks_commit_on_prior_latency_violation() -> N
         "probe-violation": [
             {
                 "last_observation": {
-                    "ts_ms": 20_000,
+                    "ts_ms": 61_000,
                     "ttft_p95_ms": 1200.0,
                     "tpot_p95_ms": 50.0,
                     "z_m": 1.4,
@@ -433,12 +436,14 @@ def test_rollback_hold_follows_evidence_not_time() -> None:
     machine.observe("donor", _gw(1_000, 0, 0, ttft_p95_ms=5_000.0), now_ms=1_000)
     machine.resolve("donor", status="rollback", reason="slo_violation", now_ms=1_000)
 
-    assert machine.rollback_retry_holds({"donor": (1.5, 3, 1_000)}) == {"donor": "no_new_window"}
+    assert machine.rollback_retry_holds({"donor": (1.5, 3, 1_000)}) == {"donor": "no_new_evidence"}
     # Long after the old 60 s, the same evidence still holds it ...
     assert machine.rollback_retry_holds({"donor": (1.6, 3, 600_000)}) == {"donor": "same_evidence"}
-    # ... a clearly higher Z (>= start + 0.25) or another routable count frees it at once.
-    assert machine.rollback_retry_holds({"donor": (1.75, 3, 11_000)}) == {}
-    assert machine.rollback_retry_holds({"donor": (1.5, 4, 11_000)}) == {}
+    # ... a clearly higher Z (>= start + 0.25) or another routable count frees it once
+    # it is observed over min_evidence_ms (20 s) after the rollback.
+    assert machine.rollback_retry_holds({"donor": (1.75, 3, 11_000)}) == {"donor": "no_new_evidence"}
+    assert machine.rollback_retry_holds({"donor": (1.75, 3, 21_000)}) == {}
+    assert machine.rollback_retry_holds({"donor": (1.5, 4, 21_000)}) == {}
     # A commit does not start a hold.
     machine.start_probe(model="other", pods=("pod-o",), now_ms=0)
     machine.resolve("other", status="commit", reason="formal_commit_gate_passed", now_ms=2_000)

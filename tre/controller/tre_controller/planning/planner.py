@@ -564,7 +564,7 @@ def build_plan(
     # metrics window still holds a breakpoint (traffic onset, routable-count change)
     # takes part in no scale-down - neither HIGH / IDLE donor nor middle-zone donor - until
     # a whole window lies after the breakpoint (scale-down stays cautious); as a receiver
-    # it acts once signal_warm (complete grids spanning min_evidence_ms after the breakpoint).
+    # it acts once signal_warm (min_evidence_ms of observations after the breakpoint).
     # Q3 (2026-10-06): an IDLE model whose whole current window is idle (``window_idle``:
     # tokens known and zero, no queue, every serving pod scraped - never a held context)
     # is exempt: no token at any replica count is the same evidence before and after
@@ -577,7 +577,7 @@ def build_plan(
     # 2026-10-07: no longer gated on ``o1_queue_rise`` (still computed, logged only):
     # it compares ``waiting`` of the pods in both samples, and after a wake the old pods'
     # waiting drains to 0 while running stays high, so it never held after a wake and
-    # the hold lasted 2 grids anyway. Without free capacity, or a LOW receiver: held.
+    # the hold lasted about 20 s anyway. Without free capacity, or a LOW receiver: held.
     # Only an O1 evidence hold is exempt (``_O1_EXEMPT_HOLD_REASONS``): a held context
     # (``tokens_missing``), a stale scrape or a hold fallback is not current evidence.
     warmup_suppressed: list[str] = []
@@ -588,7 +588,7 @@ def build_plan(
         ctx = model_contexts.get(item.model_name, {})
         if getattr(item, "saturation_rescue", False):
             # Onset saturation rescue: CRITICAL exactly because the TSS is not warm yet
-            # (its own consecutive-window confirmation replaces the warmup / dwell gates).
+            # (its own persistence span replaces the warmup / dwell gates).
             kept.append(item)
             continue
         if item.role == ModelRole.RECEIVER:
@@ -811,7 +811,7 @@ def build_plan(
             events.append(
                 f"saturation_rescue:{recv.model_name}:n={recv_pods}:target={desired}"
                 f":waiting={_num_text(ctx.get('saturation_waiting'))}:kv={_num_text(kv, 2)}"
-                f":reason={ctx.get('saturation_reason')}:ticks={ctx.get('saturation_ticks')}"
+                f":reason={ctx.get('saturation_reason')}:held_ms={ctx.get('saturation_held_ms')}"
                 f":planned_max={max(0, raw_need)}"
             )
             if raw_need <= 0:
@@ -2204,7 +2204,7 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
 #: The O1 evidence holds (``SignalState.effective_window`` reasons) a CRITICAL receiver
 #: on free capacity is exempt from (H3).
 _O1_EXEMPT_HOLD_REASONS = frozenset(
-    {"no_complete_grid", "no_suffix", "evidence_grids", "evidence_tokens", "evidence_requests"}
+    {"no_suffix", "evidence_span", "evidence_tokens", "evidence_requests"}
 )
 
 

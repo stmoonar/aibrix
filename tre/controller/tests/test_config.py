@@ -312,7 +312,9 @@ def test_evidence_period_and_spans_2s_cadence_and_deprecated_count_aliases(caplo
     spans (a deprecated count alias = N x 10 s, both names set = refused); the evidence
     period must be a multiple of the instant period."""
     cfg = ControllerConfig.from_env({"TRE_EVIDENCE_PERIOD_MS": "2000"})
-    assert (cfg.evidence_period_ms, cfg.metrics_phase_offset_ms, cfg.safescale.evidence_step_ms) == (2_000, 1_000, 2_000.0)
+    assert (cfg.evidence_period_ms, cfg.metrics_phase_offset_ms) == (2_000, 1_000)
+    # Round 4: SafeScale reads no evidence period (no ``evidence_step_ms``).
+    assert not hasattr(cfg.safescale, "evidence_step_ms")
     with caplog.at_level(logging.WARNING):
         legacy = ControllerConfig.from_env({"TRE_PAPER_STALE_MAX_WINDOWS": "5", "TRE_METRICS_STALE_HOLD_WINDOWS": "1"})
     assert (legacy.paper_stale_max_ms, legacy.metrics_stale_hold_ms) == (50_000, 10_000)

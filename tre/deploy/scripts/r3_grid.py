@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 from tre_common import slo_labels
-from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
+from tre_common.rediskeys import INSTANT_SAMPLE_INTERVAL_MS
 
 from scripts import openloop
 from scripts import prompt_corpus
@@ -504,6 +504,9 @@ def drive_cell(
                     "running": snap.get("running", 0.0),
                     "swapping": snap.get("swapping", 0.0),
                 }
+                if snap.get("age_ms") is not None:
+                    # Round 4: how old the oldest pod's sample was (now - scraped_ms).
+                    row["age_ms"] = snap["age_ms"]
                 if openloop.KV_CACHE_USAGE_KEY in snap:
                     # diagnostic (the pod sampler's mean over pods; None when no pod
                     # reported it); absent when the sampler does not read it
@@ -538,29 +541,18 @@ def estimate_capture_bytes(cells: list[GridCell], cell_seconds: float, assumed_r
     return int(total_requests * RAW_BYTES_PER_REQUEST)
 
 
-def live_instant_lookback_ms(redis_client) -> int:
-    """2 x the longest gateway period it declares (``tre:v2:gateway:cadence``: the
-    evidence period, a few seconds - review round 3, L6: a round late by up to one
-    evidence period is still found), else 2 x the 10 s grid of older gateways."""
-    from scripts import calibration_capture as capture
-
-    declared = capture.declared_cadence(redis_client) if redis_client is not None else {}
-    periods = [int(v) for v in (declared.get("instant_ms"), declared.get("evidence_ms")) if v and int(v) > 0]
-    return 2 * (max(periods) if periods else LEGACY_GRID_MS)
-
-
-def _make_live_instant_sampler(store, model: str, lookback_ms: int) -> Callable[[int], dict]:
+def _make_live_instant_sampler(store, model: str) -> Callable[[int], dict]:
     """Instant queue snapshot from the live MetricsStore, reusing its instant read seam.
 
-    Returns the LATEST scrape value (via store.read_latest_instant; None - no sample
-    row - when no pod has a doc in the lookback), not a windowed
-    average. The gateway writes the instant docs on a boundary-aligned ticker (its
-    declared instant period; 10 s before 2026-10-25), so a too narrow read misses the
-    current doc and records 0 (r3 SMOKE_FINDINGS defect 1). ``lookback_ms`` must be
-    >= ~2x that period (:func:`live_instant_lookback_ms`)."""
+    Returns the LATEST scrape value (via store.read_latest_instant: each pod's newest
+    doc at or before ``now``, with ``age_ms``; None - no sample row - when no pod has a
+    doc), not a windowed average. Round 4: no lookback to size against the gateway's
+    period (a too narrow read missed the current doc and recorded 0, r3 SMOKE_FINDINGS
+    defect 1; "2 x the declared period" still missed a late round): the row carries the
+    sample's age instead."""
 
     def sample(now: int) -> dict:
-        return store.read_latest_instant(model, now, lookback_ms)
+        return store.read_latest_instant(model, now)
 
     return sample
 
@@ -771,7 +763,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         print(f"sidecar: {len(endpoints)} pod /metrics endpoint(s) @ {args.instant_sample_ms}ms"
               + ("" if recorder is None else f"; vLLM metrics -> {layout.vllm_metrics_dir}"))
     else:
-        sampler = _make_live_instant_sampler(store, args.model, live_instant_lookback_ms(redis_client))
+        sampler = _make_live_instant_sampler(store, args.model)
     if layout is not None:
         from scripts import calibration_capture as capture
 
@@ -1629,10 +1621,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         schema=args.metrics_schema,
         min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard
     )
-    # Freshness lookback = 2x the gateway's instant period so the last-written doc is
-    # always in range even with scrape/write lag (r3 SMOKE_FINDINGS defect 1);
-    # read_latest_instant then takes the freshest doc, not a lookback-wide average.
-    instant_sampler = _make_live_instant_sampler(store, args.model, live_instant_lookback_ms(redis_client))
+    # read_latest_instant takes each pod's newest doc (no lookback) and reports its age.
+    instant_sampler = _make_live_instant_sampler(store, args.model)
     run_prompt_preflight(args)
 
     if args.schedule is not None:

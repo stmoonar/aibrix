@@ -98,6 +98,9 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
     | H3 `QUEUE_SAMPLE_HISTORY = 8` | `QUEUE_SAMPLE_HISTORY_MS = 80000` | samples newer than newest − span |
     | SafeScale early commit `grids × step` | `early_commit_min_evidence_ms` (= `min_evidence_ms`) | newest window end − post-hide start ≥ span |
 
+    Round 4 replaced the "evaluated as" column with observation-time rules and changed
+    the alias conversion: see "Evidence, not ticks (round 4)" below.
+
     `gateway_clock` `resume_after` is a count of clock checks, not of windows:
     unchanged. The clock-lag fallback bound stays 2 × evidence period (L1 not changed:
     the main path is the `written_ms` offset, and a tighter bound would suspend O1 on a
@@ -179,11 +182,12 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
   (`InstantSpool`) and a backfill merges the earlier dump's instant rows instead of
   requiring a superset; `head_within_retention` needs the spool's coverage for cells
   longer than the instant retention.
-- **Freshness (M4).** A window is written when any pod has its end-boundary histogram
+- **Freshness (M4; replaced in round 4 by `last_round_ms >= end`).** A window is written when any pod has its end-boundary histogram
   doc (written in one MULTI, retried until EXEC succeeds); a round a few hundred ms late
   never gets an instant doc at the end (nearest-boundary rounding) and no longer leaves
   the window stale. Without histogram ticks (v1) the end instant tick decides.
-- **Fresh cadence hash (M5).** `written_ms >= window_end - evidence period` (both gateway
+- **Fresh cadence hash (M5; round 4 moved it to the sampler: a late `last_round_ms` is
+  retried and held like any late round).** `written_ms >= window_end - evidence period` (both gateway
   clock), else `gateway_cadence_stale` (snapshot stale, error logged on change).
 - **L1** `restrict_to_serving` re-derives only the pod aggregates and keeps the store's
   flags (full window and O1 suffixes). **L2** `runTRERound()` is the loop's and the
@@ -192,8 +196,116 @@ shrink. v2 had the same shape: the window was "complete" when every tick appeare
   stored and read under one per-pod lock, stamped at the store; an older overlapping
   fetch is dropped. **L5** `min_evidence_requests` and the low-evidence step count the
   observed requests (`request_count_observed`), not the span-scaled ones. **L6** the
-  r3 live sampler looks back 2 x the declared evidence period and records no sample
-  when nothing is found (`read_latest_instant` -> None). **L7** default read offset
+  r3 live sampler records no sample when nothing is found (`read_latest_instant` ->
+  None); round 4 removed its lookback (each pod's newest doc, with `age_ms`). **L7** default read offset
   `min(2 s, period / 2)` everywhere.
 - **Not converted yet:** the tick-counted rules (saturation confirm, breakpoint hold,
-  SafeScale tail statistics) - see the evidence-not-ticks redesign.
+  SafeScale tail statistics) - done in round 4, next section.
+
+## Evidence, not ticks (round 4)
+
+Design note `docs/evidence-not-ticks-20261025.md` (local workspace), approved 10-25,
+SafeScale tail "one span, one value" included. Three review rounds found the same bug
+class: a rule written as "N ticks / windows" changes meaning when the period changes,
+and a mechanical N → N × 10 s change only moves the constant.
+
+**Principle.** Time in a rule is observation time (gateway `scraped_ms`), never grid
+time (doc boundaries). Overlapping 30 s windows are not independent evidence; only
+requests are independent events. The evidence period is a storage detail: `store/`, the
+sampler (`loops/metrics_task.py`), `gateway_cadence.py` and `store/evidence_grid.py` (the
+SafeScale Redis evidence path, which must pick histogram docs) may read it; the
+decision layer may not. Guard test `controller/tests/test_no_period_in_decision_layer.py`
+forbids `grid_ms|evidence_period|period_ms|EVIDENCE_PERIOD_MS|INSTANT_SAMPLE_INTERVAL_MS|
+SCRAPE_INTERVAL_MS|streak|consecutive|n_windows|grids` in `signals/`, `planning/`,
+`loops/tick.py`, `rescue_task.py`, `fairness_task.py` (comments included).
+
+**Mechanism.**
+
+- `tre_common.metrics_schema.Observed(t_first_ms, t_last_ms, n_obs, requests, flags)` on
+  every pod window, model window and suffix window, filled by the store: `t_first` = the
+  `scraped_ms` of the token baseline doc, `t_last` = the newest instant `scraped_ms`,
+  `n_obs` = distinct instant `scraped_ms`, `requests` unscaled. `merge` is
+  order-independent (min / max / min / sum / union). `observed_of()` falls back to the
+  window bounds for synthetic, v1 and offline windows.
+- `tre_common.persistence`: `Persistence(span_ms).observe(t_obs, holds)` (a re-read of
+  the same or an older observation changes nothing; false resets; fires when
+  `t_last_true - t_first_true + 1 s >= span`), `span_reaches`, `fresh(now, t_last,
+  max_age)`. `SPAN_TOLERANCE_MS` = 1 s: the fetch jitter, well below any period.
+- The gateway writes `last_round_ms` (the round's instant stamp) into
+  `tre:v2:gateway:cadence` in the round's MULTI (`pkg/cache/cache_tre_redis.go`).
+
+**Rule inventory** (kind: (a) evidence amount, (b) persistence, (c) freshness, (d)
+statistic gate).
+
+| rule | kind | before | now | where |
+|---|---|---|---|---|
+| sampler: window written | c | the doc stamped exactly `end` exists (a round 250 ms late = stale) | `last_round_ms >= end`; a hash without it = `gateway_cadence_no_round` (stale) | `loops/metrics_task.py` `window_freshness`, `gateway_cadence.py` `cadence_problem` |
+| sampler: stale hold | c | from the controller time the first stale window was given up (one period after its read) | from the first read of the first stale window | `metrics_task.py` `_mark_stale` / `_stale_for_ms` |
+| sampler: phase relearn | - | every N sampled windows | every `relearn_ms` of controller time | `metrics_task.py` `run_once` |
+| O1 evidence | a | complete post-breakpoint grids × grid >= 20 s | `Observed` span of the suffix (smallest suffix start >= breakpoint) >= `min_evidence_ms`, and requests >= `min_evidence_requests`; reasons `no_suffix` / `evidence_span` / `evidence_tokens` / `evidence_requests` | `signals/trs.py` `effective_window` |
+| O1 hold limit | b | held windows, first one counted as one grid | `Persistence(breakpoint_hold_max_ms)` on the window's newest observation | `trs.py` `note_hold`, `tick.py` |
+| saturation confirm | b | `+grid` for the first full window, `fresh_after = end - grid` | `Persistence(saturation_confirm_ms)` on the sample's observation time | `signals/saturation.py` `observe` |
+| SafeScale retry after a rollback | a | any window ending after the rollback | observations spanning `early_commit_min_evidence_ms` (20 s) after it (`no_new_evidence`), then Z / routable as before | `planning/safescale.py` `rollback_retry_holds` |
+| SafeScale early commit | a | post-hide grids of the newest window | newest observation − hide confirmation >= the span | `safescale.py` `_try_early_commit` |
+| SafeScale commit-gate tail | d | min Z / max KV / any latency over the last `max(2, ceil(hq × N))` snapshot observations | one value per quantity over one span: the newest snapshot's tail suffix (start `floor(end - hq × W)`), raw TSS / Z, time-weighted KV of the remaining pods, its p95s | `safescale.py` `_summarize_tail`, `loops/safescale_task.py` `_tail_terms`, store `suffix_tail` |
+| SafeScale immediate rollback | d | every snapshot whose window follows the hide | only windows that do not overlap a window already judged | `safescale.py` `_instant_violation` |
+| H3 queue samples | a | `fresh_after = end - grid` | the sample's observation time after the breakpoint | `tick.py` `_queue_sample` |
+| I3 current pods | c | scraped within one evidence period | `fresh(end, scraped, 4 × instant period)` | `store/metrics_store.py` |
+| gateway clock (O1 same-clock check) | c | `written_ms` offset, else a doc-stamp lag bounded by 2 × period | `written_ms` offset only; the probe key is the pod with the newest doc; no measurement = no verdict; liveness is the sampler's | `gateway_clock.py` |
+| r3 live sampler | c | lookback 2 × declared period | each pod's newest doc at or before now, with `age_ms` | `metrics_store.py` `read_latest_instant`, `deploy/scripts/r3_grid.py` |
+| rescue `need` count | - | carried, unused | removed | `tick.py` |
+
+**Deprecated count aliases** (`common/tre_common/registry.py` `_scaling_span_ms`): read
+as `(N - 1) × 10 s` for the persistence rules (the first window starts the span; it is
+not one grid of evidence) and `N × 10 s` for `min_evidence_grids`. So the live
+`breakpoint_hold_max_windows: 6` is 50 s (was read as 60 s in round 2) and
+`saturation_consecutive_ticks: 2` is 10 s (was 20 s). The new defaults are
+`breakpoint_hold_max_ms: 50000`, `saturation_confirm_ms: 10000`: today's behaviour at
+10 s. `breakpoint_hold_max_windows: 1` is refused (a 0 s hold limit).
+
+**Behaviour change at 10 s too (SafeScale tail).** The commit gate's Z and KV used to
+be the min / max over 2-3 overlapping snapshot observations; now they are one value on
+one span. At 10 s this is usually less strict than before (one dip in one of the overlapping
+windows no longer fails the gate), at 2 s it no longer gets five times the chances to
+dip. The latency gate of the live controller (direct evidence) is unchanged.
+
+**Tests.**
+
+- `common/tests/test_persistence.py`: a verdict does not change when observations are
+  thinned (seeded random timelines); the fire time moves by at most the sampling gap
+  (0.5-10 s periods); a re-read is not new evidence; `Observed.merge` does not depend on
+  the pod order.
+- `controller/tests/test_period_invariance_20261025.py` with the renderer
+  `controller/tests/period_sim.py`: three closed-loop scenarios (onset spike with a
+  gateway stall; HIGH shrink with two committing probes; rollback, held by the same
+  evidence, then a retry that commits) through the real store, sampler, planner loops
+  (`loops/replay.py` now keeps `signal_state` / `paper_state_cache` across calls) and
+  SafeScale, at P = 2 / 5 / 10 s. The probe verdicts are identical; each key event's
+  delay from its cause is within 10 s + 5 s (one period of the coarser run plus one
+  rescue tick) of the 10 s run's; O1 warms >= 20 s after a routable change, saturation
+  fires on >= 10 s of full observations, at every period; no stale snapshot without a
+  stall. Delays (s) seen:
+
+  | event (cause) | 2 s | 5 s | 10 s |
+  |---|---|---|---|
+  | saturation rescue (onset) | 15 | 15 | 15 |
+  | first CRITICAL scale-up (onset) | 25 | 30 | 35 |
+  | O1 warm (last routable change) | 29.75 | 29.75 | 39.75 |
+  | first stale snapshot (stall start) | 22 | 25 | 30 |
+  | shrink probes: start / verdict (start) | 35, 70 / 21, 40 | 35, 75 / 17, 37 | 35, 75 / 17, 37 |
+  | retry: verdicts (start) | 21, 31, 41 | 17, 27, 38 | 17, 27, 37 |
+
+  The test found the stale-hold start: from the give-up time the 10 s run was 40 s
+  (16 s more than at 2 s); from the first read it is 30 s.
+- `controller/tests/test_instant_sampling_20261025.py`: a round 300 ms late gives no
+  stale window; `test_o1_breakpoint_window_20261001.py`: leftover docs of a model that is
+  down do not suspend O1.
+
+**What still depends on the period, by design.** Data age: a window is read one
+period plus the offset after its end. A suffix starts at a histogram doc, so up to one
+period of post-breakpoint data is not used (`ceil`). The sampler retries a missing
+window until the next boundary. Each is at most one period. In the renderer (and in
+offline constructions without direct evidence) a probe's deadline runs on the snapshot
+clock (`now_ms = snapshot.ts_ms`), so at 10 s a probe is judged about one period of
+wall time sooner after its hide than at 2 s; the live controller's direct evidence
+runs on the controller clock from the hide confirmation.

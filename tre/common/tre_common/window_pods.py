@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Collection, Mapping, Optional
 
-from tre_common.metrics_schema import ModelWindowMetrics, P95Rule, PodWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, Observed, P95Rule, PodWindowMetrics
 from tre_common.percentile import histogram_percentile
 
 
@@ -124,6 +124,7 @@ def aggregate_pods(
         request_count_observed=_sum_optional([pod.request_count_observed for pod in pods]),
         token_counter_reset=any(pod.token_counter_reset for pod in pods),
         instant_ticks_ms=tuple(sorted({tick for pod in pods for tick in pod.instant_ticks_ms})),
+        observed=Observed.merge(pod.observed for pod in pods),
         p95_rule=p95_rule,
     )
 
@@ -134,6 +135,7 @@ _POD_AGGREGATES = (
     "prompt_tokens", "generation_tokens", "avg_waiting", "avg_running", "avg_swapping",
     "kv_cache_hit_rate", "ttft_p95_ms", "tpot_p95_ms", "e2e_p95_ms", "routable_pods",
     "assigned_replicas", "per_pod", "request_count", "request_count_observed", "token_counter_reset",
+    "observed",
 )
 
 
@@ -174,7 +176,11 @@ def restrict_to_serving(
                 metrics.model, metrics.window_start_ms, metrics.window_end_ms, kept,
                 p95_rule=metrics.p95_rule,
             )
+            flags = metrics.observed.flags if metrics.observed is not None else frozenset()
             metrics = replace(metrics, **{name: getattr(agg, name) for name in _POD_AGGREGATES})
+            if metrics.observed is not None and flags:
+                # The store's flags are kept as read (as sample_incomplete_pods).
+                metrics = replace(metrics, observed=replace(metrics.observed, flags=metrics.observed.flags | flags))
     return replace(
         metrics,
         routable_pods=int(routable_pods),

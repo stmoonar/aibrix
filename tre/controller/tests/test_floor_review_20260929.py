@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -76,15 +77,18 @@ def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
     machine.start_probe(model="donor", pods=("donor-0",), now_ms=100_000)  # hide at 100 s
     assert machine.observe("donor", _obs(110_000), now_ms=110_000).reason == "probe_pending"
     assert machine.observe("donor", _obs(120_000), now_ms=120_000).reason == "probe_pending"
-    decision = machine.observe("donor", _obs(130_000), now_ms=130_000)
+    # Round 4: the gate judges ONE span, the newest snapshot's tail suffix (the store
+    # builds it at floor(end - hq x W); here it starts 5 s before the hide).
+    newest = replace(_obs(130_000), tail_start_ms=95_000, tail_z_m=2.0, tail_has_traffic=True,
+                     tail_ttft_p95_ms=100.0, tail_tpot_p95_ms=10.0)
+    decision = machine.observe("donor", newest, now_ms=130_000)
 
     assert decision.status == "commit"  # the audit never changes the criterion
-    # hq 0.5 of 3 observations -> the last 2 are judged: windows [90, 120] s and
-    # [100, 130] s -> pre-hide shares 10/30 and 0/30.
+    # The tail [95, 130] s -> pre-hide share 5/35.
     expected = {
-        "tail_pre_hide_fraction_mean": pytest.approx(1 / 6),
-        "tail_pre_hide_fraction_max": pytest.approx(1 / 3),
-        "tail_observation_count": 2,
+        "tail_pre_hide_fraction_mean": pytest.approx(1 / 7),
+        "tail_pre_hide_fraction_max": pytest.approx(1 / 7),
+        "tail_observation_count": 1,
     }
     probe = machine.active_probe("donor")
     for record in (decision.details, probe.terminal_details, probe.window_terms, probe.terminal_details["tail"]):
@@ -92,10 +96,11 @@ def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
     # Persisted with the decision (committing record) and the observation journal.
     machine.mark_committing("donor", status="commit", reason=decision.reason, now_ms=130_000)
     saved = store.records[probe.request_id]
-    assert saved["terminal_details"]["tail_pre_hide_fraction_max"] == pytest.approx(1 / 3)
-    assert saved["window_terms"]["tail_observation_count"] == 2
+    assert saved["terminal_details"]["tail_pre_hide_fraction_max"] == pytest.approx(1 / 7)
+    assert saved["window_terms"]["tail_observation_count"] == 1
     journal = store.journal[probe.request_id][-1]["last_observation"]
-    assert (journal["window_start_ms"], journal["window_end_ms"]) == (100_000, 130_000)
+    assert (journal["window_start_ms"], journal["window_end_ms"], journal["tail_start_ms"]) == (
+        100_000, 130_000, 95_000)
 
 
 def test_observations_carry_the_metrics_window_they_read() -> None:

@@ -251,10 +251,14 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (
 	if writeV2 && pipe.Len() > 0 && c.treCadence.instant > 0 {
 		// Declared cadence (review round 1, M4/L6): the controller compares it with its
 		// own periods on every snapshot read (no inference from doc spacing).
+		// last_round_ms (round 4) = this round's instant stamp, in the round's MULTI:
+		// the controller's sampler takes a window ending at E as written once
+		// last_round_ms >= E.
 		pipe.HSet(ctx, treV2CadenceKey,
 			"instant_ms", c.treCadence.instant.Milliseconds(),
 			"evidence_ms", c.treCadence.evidence.Milliseconds(),
 			"written_ms", treWallClockMS(),
+			"last_round_ms", round.instantStamp,
 			"version", treGatewayVersion())
 		pipe.Expire(ctx, treV2CadenceKey, treV2FallbackTTL)
 	}

@@ -127,7 +127,7 @@ class _Queue:
 
 def _state(**config) -> SignalState:
     return SignalState(
-        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=2 * GRID),
+        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, min_evidence_ms=2 * GRID),
         saturation=SaturationTracker(SaturationRescueConfig(**config)),
     )
 
@@ -169,10 +169,10 @@ def test_numerator_zero_and_waiting_on_two_windows_is_critical():
     first = _tick(state, _window(e1, [IDLE, STARTING, STARTING], (6.0, 0.5)), awake=1, queue=queue)
     assert not first.actions
     assert first.classifications["m"].state != ModelState.CRITICAL
-    assert any(e.startswith("saturation_pending:m:1/2:reason=numerator_zero:waiting=6") for e in first.events)
+    assert any(e.startswith("saturation_pending:m:held_ms=0/10000:reason=numerator_zero:waiting=6") for e in first.events)
     # A re-read of the same window (second rescue tick) does not count again.
     again = _tick(state, _window(e1, [IDLE, STARTING, STARTING], (6.0, 0.5)), awake=1, queue=queue)
-    assert not again.actions and again.model_contexts["m"]["saturation_ticks"] == 1
+    assert not again.actions and again.model_contexts["m"]["saturation_held_ms"] == 0
 
     second = _tick(state, _window(e2, [STARTING, STARTING, STARTING], (6.0, 0.5)), awake=1, queue=queue)
     cls = second.classifications["m"]
@@ -180,10 +180,10 @@ def test_numerator_zero_and_waiting_on_two_windows_is_critical():
     assert _planned(second) == 1  # n = 1 -> target 2
     assert [a.reason for a in _ups(second.actions)] == ["critical_sleeping_capacity"]
     event = next(e for e in second.events if e.startswith("saturation_rescue:m:"))
-    assert event.startswith("saturation_rescue:m:n=1:target=2:waiting=6:kv=0.50:reason=numerator_zero:ticks=2")
+    assert event.startswith("saturation_rescue:m:n=1:target=2:waiting=6:kv=0.50:reason=numerator_zero:held_ms=10000")
     assert any(e.startswith("rescue_target:m:n=1:z=none:desired=2:covered=1:planned=1") for e in second.events)
     states = _model_states(second.model_contexts, second.classifications, _snap(_window(e2, [IDLE] * 3, (0, 0))))
-    assert states["m"]["saturation_rescue"] is True and states["m"]["saturation_ticks"] == 2
+    assert states["m"]["saturation_rescue"] is True and states["m"]["saturation_held_ms"] == 1 * GRID
     assert states["m"]["saturation_reason"] == "numerator_zero" and states["m"]["saturation_waiting"] == 6.0
     # The second rescue tick of the same window plans nothing more.
     assert not _tick(state, _window(e2, [STARTING] * 3, (6.0, 0.5)), awake=1, queue=queue).actions
@@ -194,9 +194,9 @@ def test_one_saturated_window_does_not_trigger():
     _tick(state, _window(BASE + 3 * GRID, [IDLE, IDLE, STARTING], (6.0, 0.5)), awake=1)
     # The next window drains (nothing waiting, KV low): the count restarts.
     calm = _tick(state, _window(BASE + 4 * GRID, [IDLE, STARTING, LONG_ONE], (0.0, 0.2)), awake=1)
-    assert not calm.actions and calm.model_contexts["m"]["saturation_ticks"] == 0
+    assert not calm.actions and calm.model_contexts["m"]["saturation_held_ms"] is None
     again = _tick(state, _window(BASE + 5 * GRID, [STARTING, LONG_ONE, STARTING], (6.0, 0.5)), awake=1)
-    assert not again.actions and again.model_contexts["m"]["saturation_ticks"] == 1
+    assert not again.actions and again.model_contexts["m"]["saturation_held_ms"] == 0
 
 
 def test_numerator_zero_single_long_request_stays_healthy():
@@ -208,7 +208,7 @@ def test_numerator_zero_single_long_request_stays_healthy():
         assert not result.actions
         assert result.classifications["m"].state != ModelState.CRITICAL
         assert not result.classifications["m"].saturation_rescue
-        assert result.model_contexts["m"]["saturation_ticks"] == 0
+        assert result.model_contexts["m"]["saturation_held_ms"] is None
         assert result.model_contexts["m"]["saturation_reason"] == "numerator_zero"
 
 
@@ -217,7 +217,7 @@ def test_disabled_keeps_the_tss_rules():
     registry = _registry(saturation_rescue=False)  # read every tick from the registry
     for i in range(3, 7):
         result = _tick(state, _window(BASE + i * GRID, [STARTING] * 3, (50.0, 1.0)), awake=1, registry=registry)
-        assert not result.actions and "saturation_ticks" not in result.model_contexts["m"]
+        assert not result.actions and "saturation_held_ms" not in result.model_contexts["m"]
 
 
 # ------------------------------------------------------------------ O1 hold
@@ -225,18 +225,18 @@ def test_disabled_keeps_the_tss_rules():
 
 def test_o1_hold_with_full_kv_triggers():
     """First completions: the onset is a breakpoint, O1 holds the model for two grids
-    (no_complete_grid, evidence_grids); KV >= 0.9 on both -> rescue on the second. The
+    (no_suffix, evidence_span); KV >= 0.9 on both -> rescue on the second. The
     first tick takes one free GPU through the CRITICAL free-capacity exemption (2026-10-07)."""
     state = _state()
     e1, e2 = BASE + 3 * GRID, BASE + 4 * GRID
     first = _tick(state, _window(e1, [IDLE, IDLE, BURST], (0.0, 0.95)), awake=1)
-    assert first.model_contexts["m"]["signal_hold_reason"] == "no_complete_grid"
+    assert first.model_contexts["m"]["signal_hold_reason"] == "no_suffix"
     assert first.model_contexts["m"]["saturation_reason"] == "o1_hold" and _planned(first) == 1
-    assert any(e.startswith("receiver_o1_exempt_free_gpu:m:no_complete_grid:") for e in first.events)
+    assert any(e.startswith("receiver_o1_exempt_free_gpu:m:no_suffix:") for e in first.events)
     second = _tick(state, _window(e2, [IDLE, BURST, BURST], (0.0, 0.95)), awake=1)
-    assert second.model_contexts["m"]["signal_hold_reason"] == "evidence_grids"
+    assert second.model_contexts["m"]["signal_hold_reason"] == "evidence_span"
     assert second.classifications["m"].saturation_rescue and _planned(second) == 1
-    assert any(":reason=o1_hold:ticks=2" in e for e in second.events if e.startswith("saturation_rescue:m:"))
+    assert any(":reason=o1_hold:held_ms=10000" in e for e in second.events if e.startswith("saturation_rescue:m:"))
 
 
 def test_after_o1_releases_the_tss_decides_alone():
@@ -248,7 +248,7 @@ def test_after_o1_releases_the_tss_decides_alone():
     for i in range(5, 8):
         result = _tick(state, _window(BASE + i * GRID, [HEALTHY] * 3, (0.0, 0.97)), awake=1)
         ctx = result.model_contexts["m"]
-        assert ctx["signal_warm"] is True and ctx["saturation_reason"] is None and ctx["saturation_ticks"] == 0
+        assert ctx["signal_warm"] is True and ctx["saturation_reason"] is None and ctx["saturation_held_ms"] is None
         assert not result.actions and not result.classifications["m"].saturation_rescue
 
 
@@ -277,11 +277,11 @@ def test_bounded_doubling_needs_two_fresh_windows_after_each_step():
     assert _planned(step1) == 1  # 1 -> 2
     assert not tick(5, 1).actions  # the wake has not landed yet: no counting
     landed = tick(6, 2)  # routable 2 seen on this window: its sample may predate it
-    assert not landed.actions and landed.model_contexts["m"]["saturation_ticks"] == 0
+    assert not landed.actions and landed.model_contexts["m"]["saturation_held_ms"] is None
     assert "saturation_step_landed:m:1->2" in landed.events
     assert landed.model_contexts["m"]["saturation_count_after"] == BASE + 6 * GRID
     once = tick(7, 2)
-    assert not once.actions and once.model_contexts["m"]["saturation_ticks"] == 1
+    assert not once.actions and once.model_contexts["m"]["saturation_held_ms"] == 0
     step2 = tick(8, 2)
     assert _planned(step2) == 2  # 2 -> 4
     assert any(e.startswith("saturation_rescue:m:n=2:target=4") for e in step2.events)
@@ -322,15 +322,17 @@ def test_await_releases_after_a_step_that_never_lands():
     sample = SaturationSample(waiting=5.0, kv=0.5, pods=1, sample_ms=0)
 
     def obs(i):
-        return tracker.observe("m", window_end_ms=i * GRID, routable=1, reason="numerator_zero", sample=sample)
+        # Round 4: each window's sample is a new observation (the span runs on it).
+        return tracker.observe("m", window_end_ms=i * GRID, routable=1, reason="numerator_zero",
+                               sample=replace(sample, sample_ms=i * GRID))
 
     obs(1)
     assert obs(2).fire
     tracker.note_step("m", window_end_ms=2 * GRID, routable=1)
     assert not obs(3).fire and obs(3).awaiting_step
-    assert obs(4).ticks == 0
-    assert obs(5).ticks == 0  # timeout reached on this window: counting restarts after it
-    assert obs(6).ticks == 1 and obs(7).fire
+    assert obs(4).held_ms is None
+    assert obs(5).held_ms is None  # timeout reached on this window: counting restarts after it
+    assert obs(6).held_ms == 0 and obs(7).fire
 
 
 # ------------------------------------------------------------ capacity order
@@ -386,7 +388,9 @@ def test_a_saturation_receiver_is_not_dropped_as_incomplete():
 # ------------------------------------------------------------- sample / store
 
 
-def test_sample_uses_routable_pods_latest_values_and_skips_stale_or_hidden():
+def test_sample_uses_routable_pods_latest_values_and_skips_hidden():
+    # Round 4: every pod in the window counts with its newest sample (no freshness gate:
+    # the store leaves frozen pods out); after_ms keeps those observed after an event.
     end = BASE + 3 * GRID
     pods = {
         "a": _pod("a", end, [STARTING] * 3, (0.0, 0.95), end - W),
@@ -395,9 +399,11 @@ def test_sample_uses_routable_pods_latest_values_and_skips_stale_or_hidden():
         "old": replace(_pod("old", end, [STARTING] * 3, (9.0, 1.0), end - W), latest_instant_ms=end - 2 * GRID),
     }
     window = aggregate_pods("m", end - W, end, pods)
-    sample = saturation_sample(window, hidden_pods={"h"}, fresh_after_ms=end - GRID)
-    assert sample.pods == 2 and sample.waiting == 3.0 and sample.kv == pytest.approx(0.9)
-    assert saturation_sample(aggregate_pods("m", end - W, end, {}), fresh_after_ms=end - GRID) is None
+    sample = saturation_sample(window, hidden_pods={"h"})
+    assert sample.pods == 3 and sample.waiting == 12.0 and sample.sample_ms == end
+    after = saturation_sample(window, hidden_pods={"h"}, after_ms=end - GRID)
+    assert after.pods == 2 and after.waiting == 3.0 and after.kv == pytest.approx(0.9)
+    assert saturation_sample(aggregate_pods("m", end - W, end, {})) is None
 
 
 def test_store_carries_each_pods_newest_instant_sample():
@@ -434,25 +440,27 @@ def test_store_carries_each_pods_newest_instant_sample():
 def test_scaling_config_defaults_and_validation():
     defaults = parse_scaling_config({})
     assert (defaults.saturation_rescue, defaults.saturation_kv_threshold, defaults.saturation_confirm_ms,
-            defaults.saturation_max_step_factor) == (True, 0.9, 20_000, 2.0)
+            defaults.saturation_max_step_factor) == (True, 0.9, 10_000, 2.0)
     custom = parse_scaling_config({"saturation_rescue": False, "saturation_kv_threshold": 0.95,
                                    "saturation_confirm_ms": 30_000, "saturation_max_step_factor": 1.5})
     assert (custom.saturation_rescue, custom.saturation_kv_threshold, custom.saturation_confirm_ms,
             custom.saturation_max_step_factor) == (False, 0.95, 30_000, 1.5)
-    # 2026-10-25: the deprecated count key reads as N x 10 s.
-    assert parse_scaling_config({"saturation_consecutive_ticks": 3}).saturation_confirm_ms == 30_000
+    # Round 4: the deprecated count key (N windows in a row) reads as (N - 1) x 10 s.
+    assert parse_scaling_config({"saturation_consecutive_ticks": 3}).saturation_confirm_ms == 20_000
+    assert parse_scaling_config({"saturation_consecutive_ticks": 1}).saturation_confirm_ms == 0
+    assert parse_scaling_config({"saturation_confirm_ms": 0}).saturation_confirm_ms == 0
     for bad in ({"saturation_rescue": "yes"}, {"saturation_kv_threshold": 0}, {"saturation_kv_threshold": 1.5},
                 {"saturation_kv_threshold": True}, {"saturation_kv_threshold": "x"},
-                {"saturation_confirm_ms": 0}, {"saturation_consecutive_ticks": 1.5},
+                {"saturation_confirm_ms": -1}, {"saturation_consecutive_ticks": 1.5},
                 {"saturation_max_step_factor": 0.5}, {"saturation_max_step_factor": float("nan")}):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
     registry = _registry(saturation_kv_threshold=0.8, saturation_confirm_ms=30_000, saturation_max_step_factor=3)
-    config = SaturationRescueConfig.from_registry(registry, grid_ms=GRID)
+    config = SaturationRescueConfig.from_registry(registry)
     assert (config.enabled, config.kv_threshold, config.confirm_ms, config.max_step_factor) == (True, 0.8, 30_000, 3.0)
-    assert config.grid_ms == GRID and config.await_timeout_ms == 30_000
+    assert config.await_timeout_ms == 30_000
     assert _scaling_options(registry)["saturation_max_step_factor"] == 3.0
-    assert not SaturationRescueConfig.from_registry(_registry(saturation_rescue=False), grid_ms=GRID).enabled
+    assert not SaturationRescueConfig.from_registry(_registry(saturation_rescue=False)).enabled
 
 
 # ------------------------------------- partial_max_step wiring (2026-10-02 check)
@@ -466,7 +474,7 @@ def test_partial_max_step_is_wired_from_the_registry_through_the_tick():
     completed requests in the 20 s suffix -> planned 2 is the uncapped case)."""
 
     def run(requests_per_grid: float) -> int:
-        state = SignalState(breakpoint=BreakpointWindowConfig(enabled=True, grid_ms=GRID, min_evidence_ms=2 * GRID,
+        state = SignalState(breakpoint=BreakpointWindowConfig(enabled=True, min_evidence_ms=2 * GRID,
                                                               min_evidence_requests=3))
         registry = _registry(rescue_max_step_pods=4, breakpoint_partial_max_step=1,
                              breakpoint_lowevidence_requests=10, saturation_rescue=False)
@@ -522,7 +530,7 @@ def test_o1_hold_after_a_foreign_breakpoint_never_triggers(before, after):
     assert any(e.startswith("saturation_reset_external:m:") for e in held[0].events)
     for result in held:
         ctx = result.model_contexts["m"]
-        assert ctx["saturation_reason"] is None and ctx["saturation_ticks"] == 0
+        assert ctx["saturation_reason"] is None and ctx["saturation_held_ms"] is None
         assert not result.classifications["m"].saturation_rescue
         assert not any(e.startswith(("saturation_rescue:", "saturation_pending:")) for e in result.events)
 
@@ -532,13 +540,14 @@ def test_an_idle_window_reopens_the_o1_hold_path():
     full = SaturationSample(waiting=5.0, kv=0.5, pods=1, sample_ms=0, running=10.0)
 
     def obs(i, reason, *, warm=False, idle=False):
-        return tracker.observe("m", window_end_ms=i * GRID, routable=1, reason=reason, sample=full,
+        return tracker.observe("m", window_end_ms=i * GRID, routable=1, reason=reason,
+                               sample=replace(full, sample_ms=i * GRID),
                                tss_warm=warm, idle=idle)
 
     obs(1, None, warm=True)
-    assert obs(2, "o1_hold").reason is None and obs(3, "o1_hold").ticks == 0  # closed
-    assert obs(4, "numerator_zero").ticks == 1  # numerator zero stays eligible
-    assert obs(5, "numerator_zero", idle=True).ticks == 2  # idle window: open again
+    assert obs(2, "o1_hold").reason is None and obs(3, "o1_hold").held_ms is None  # closed
+    assert obs(4, "numerator_zero").held_ms == 0  # numerator zero stays eligible
+    assert obs(5, "numerator_zero", idle=True).held_ms == 1 * GRID  # idle window: open again
     assert obs(6, "o1_hold").fire
 
 
@@ -560,7 +569,7 @@ def test_backlog_on_the_old_pod_does_not_confirm_the_next_step():
     idle_new = {"m-0": (50.0, 0.98), "m-1": (0.0, 0.1)}
     for i in (7, 8, 9):
         result = tick(i, 2, idle_new)
-        assert not result.actions and result.model_contexts["m"]["saturation_ticks"] == 0
+        assert not result.actions and result.model_contexts["m"]["saturation_held_ms"] is None
         assert result.model_contexts["m"]["saturation_waiting"] == 50.0  # the sum alone would say full
     busy_new = {"m-0": (50.0, 0.98), "m-1": (4.0, 0.5)}
     assert not tick(10, 2, busy_new).actions
@@ -573,7 +582,7 @@ def test_single_long_request_filling_the_kv_cache_does_not_trigger():
     state = _state()
     for i in range(3, 8):
         result = _tick(state, _window(BASE + i * GRID, [LONG_ONE] * 3, (0.0, 0.97)), awake=1)
-        assert not result.actions and result.model_contexts["m"]["saturation_ticks"] == 0
+        assert not result.actions and result.model_contexts["m"]["saturation_held_ms"] is None
     tracker = SaturationTracker()
     one = SaturationSample(waiting=0.0, kv=0.97, pods=1, sample_ms=0, running=1.0)
     assert not tracker.engine_full(one)
@@ -584,10 +593,10 @@ def test_single_long_request_filling_the_kv_cache_does_not_trigger():
 def test_external_routable_change_restarts_the_count():
     tracker = SaturationTracker()
     full = SaturationSample(waiting=5.0, kv=0.5, pods=1, sample_ms=0, running=10.0)
-    assert tracker.observe("m", window_end_ms=GRID, routable=2, reason="numerator_zero", sample=full).ticks == 1
+    assert tracker.observe("m", window_end_ms=GRID, routable=2, reason="numerator_zero", sample=full).held_ms == 0
     changed = tracker.observe("m", window_end_ms=2 * GRID, routable=1, reason="numerator_zero", sample=full)
-    assert changed.ticks == 0 and changed.events == ("saturation_reset_external:m:2->1",)
-    assert tracker.observe("m", window_end_ms=3 * GRID, routable=1, reason="numerator_zero", sample=full).ticks == 1
+    assert changed.held_ms is None and changed.events == ("saturation_reset_external:m:2->1",)
+    assert tracker.observe("m", window_end_ms=3 * GRID, routable=1, reason="numerator_zero", sample=full).held_ms == 0
 
 
 def test_receiver_order_tss_critical_first_then_waiting_per_replica():
@@ -626,7 +635,7 @@ def test_observe_mode_step_is_unconfirmed_and_counting_restarts():
     assert _planned(results[4]) == 1  # submitted; the queue drops it in observe mode
     assert not results[5].actions and results[5].model_contexts["m"]["saturation_awaiting_step"] is True
     assert any(e.startswith("saturation_step_unconfirmed:m:n=1:waited_ms=30000") for e in results[7].events)
-    assert not results[8].actions and results[8].model_contexts["m"]["saturation_ticks"] == 1
+    assert not results[8].actions and results[8].model_contexts["m"]["saturation_held_ms"] == 0
     assert _planned(results[9]) == 1
 
 
@@ -675,7 +684,7 @@ def test_a_step_whose_dispatch_added_nothing_is_released_at_once():
     again = tick(4)  # second tick on the same window
     assert "saturation_step_failed:m:n=1" in again.events
     assert again.model_contexts["m"]["saturation_awaiting_step"] is False
-    assert tick(5).model_contexts["m"]["saturation_ticks"] == 1
+    assert tick(5).model_contexts["m"]["saturation_held_ms"] == 0
     assert _planned(tick(6)) == 1  # the fallback alone would still wait (unconfirmed at 7)
 
 
@@ -718,12 +727,12 @@ def test_probe_preemption_covers_the_step_and_its_unhide_lands_it():
 
 def test_config_is_read_from_the_registry_every_tick():
     state = _state()
-    registry = _registry(saturation_confirm_ms=30_000)
+    registry = _registry(saturation_confirm_ms=20_000)
     sat = [STARTING] * 3
     planned = [_planned(_tick(state, _window(BASE + i * GRID, sat, (8.0, 0.6)), awake=1, registry=registry))
                for i in (3, 4, 5)]
-    assert planned == [0, 0, 1]
-    assert state.saturation.config.confirm_ms == 30_000
+    assert planned == [0, 0, 1]  # full from the first to the third window: 20 s
+    assert state.saturation.config.confirm_ms == 20_000
     with pytest.raises(ValueError):
         parse_scaling_config({"saturation_max_step_factor": 4.5})
     assert parse_scaling_config({"saturation_max_step_factor": 4}).saturation_max_step_factor == 4.0
@@ -753,7 +762,7 @@ def test_a_step_landing_in_parts_is_the_steps_own():
     idle_new = PodSample("c", 0.0, 0.1, 3.0)
 
     def obs(i, routable, pods, reason="o1_hold", warm=False):
-        sample = SaturationSample(waiting=sum(p.waiting for p in pods), kv=0.7, pods=len(pods), sample_ms=0,
+        sample = SaturationSample(waiting=sum(p.waiting for p in pods), kv=0.7, pods=len(pods), sample_ms=i * GRID,
                                   running=sum(p.running for p in pods), per_pod=tuple(pods))
         return tracker.observe("m", window_end_ms=i * GRID, routable=routable, reason=reason, sample=sample,
                                tss_warm=warm)
@@ -768,13 +777,13 @@ def test_a_step_landing_in_parts_is_the_steps_own():
     # The chain is intact: an O1 hold (caused by the step) stays eligible.
     assert second.reason == "o1_hold" and obs(4, 4, old + (idle_new,)).reason == "o1_hold"
     busy = (PodSample("c", 3.0, 0.5, 30.0), PodSample("d", 2.0, 0.5, 30.0))
-    assert obs(5, 4, old + busy).ticks == 1 and obs(6, 4, old + busy).fire
+    assert obs(5, 4, old + busy).held_ms == 0 and obs(6, 4, old + busy).fire
     # Above the target or down: external.
     assert obs(7, 6, old + busy).events == ("saturation_reset_external:m:4->6",)
 
 
 def test_step_pods_come_from_the_fleet_view_not_the_fresh_samples():
-    """P2-2: an old pod whose sample was stale at the decision is not an added pod later."""
+    """P2-2: an old pod without a sample at the decision is not an added pod later."""
     state = _state()
     queue = _Queue()
     registry = _registry(max_awake=8)
@@ -782,8 +791,9 @@ def test_step_pods_come_from_the_fleet_view_not_the_fresh_samples():
 
     def window(i, awake, latest_by_pod=None, stale=()):
         w = _window(BASE + i * GRID, sat, (8.0, 0.6), awake=awake, latest_by_pod=latest_by_pod)
-        per_pod = {name: (replace(pod, latest_instant_ms=w.window_end_ms - 3 * GRID) if name in stale else pod)
-                   for name, pod in w.per_pod.items()}
+        # Round 4: a pod not observed in the window is left out by the store (I3); the
+        # saturation sample has no freshness gate of its own.
+        per_pod = {name: pod for name, pod in w.per_pod.items() if name not in stale}
         return replace(w, per_pod=per_pod)
 
     def tick(i, awake, **kw):
@@ -810,8 +820,9 @@ def test_an_added_pod_without_a_fresh_sample_blocks_the_next_step():
 
     def tick(i, awake, stale=()):
         w = _window(BASE + i * GRID, sat, (8.0, 0.6), awake=awake)
-        per_pod = {name: (replace(pod, latest_instant_ms=w.window_end_ms - 3 * GRID) if name in stale else pod)
-                   for name, pod in w.per_pod.items()}
+        # Round 4: a pod not observed in the window is left out by the store (I3); the
+        # saturation sample has no freshness gate of its own.
+        per_pod = {name: pod for name, pod in w.per_pod.items() if name not in stale}
         return _tick(state, replace(w, per_pod=per_pod), awake=awake, queue=queue, registry=registry)
 
     tick(3, 1)
@@ -820,7 +831,7 @@ def test_an_added_pod_without_a_fresh_sample_blocks_the_next_step():
     for i in (6, 7, 8):
         result = tick(i, 3, stale=("m-2",))
         assert not _ups(result.actions)
-        assert result.model_contexts["m"]["saturation_ticks"] == 0
+        assert result.model_contexts["m"]["saturation_held_ms"] is None
     tick(9, 3)
     assert _planned(tick(10, 3)) > 0
 
@@ -843,7 +854,7 @@ def test_o1_resume_after_a_suspension_does_not_reopen_the_hold_path():
     model stays out of the saturation path."""
     state = SignalState(
         warmup_ms=0,
-        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=2 * GRID),
+        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, min_evidence_ms=2 * GRID),
         saturation=SaturationTracker(),
     )
     state.suspend_breakpoint_window("gateway_clock")
@@ -855,5 +866,5 @@ def test_o1_resume_after_a_suspension_does_not_reopen_the_hold_path():
         held = _tick(state, _window(BASE + i * GRID, [WARM] * 3, (20.0, 0.95)), awake=1)
         ctx = held.model_contexts["m"]
         assert ctx["signal_warm"] is False  # the resume's onset holds it
-        assert ctx["saturation_reason"] is None and ctx["saturation_ticks"] == 0
+        assert ctx["saturation_reason"] is None and ctx["saturation_held_ms"] is None
         assert not held.classifications["m"].saturation_rescue

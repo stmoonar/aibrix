@@ -78,12 +78,11 @@ class SafeScaleConfig:
     # None = no ceiling and no deadline extension (direct constructions only).
     window_ceiling_ms: float | None = 60_000.0
     # Registry safescale.slo_mode (labels | fixed), min_commit_samples and
-    # evidence_clock_tolerance_s (ms here); evidence_step_ms = the gateway write period
-    # (one deadline extension while the evidence has fewer than min_commit_samples).
+    # evidence_clock_tolerance_s (ms here). Round 4: no evidence period here - the Redis
+    # evidence path's doc grid is the store's (store.evidence_grid.EvidenceGrid).
     slo_mode: str = "labels"
     min_commit_samples: int = 20
     evidence_clock_tolerance_ms: float = 20_000.0
-    evidence_step_ms: float = 10_000.0
     # Registry safescale.evidence_source / evidence_poll_s / scrape_timeout_s /
     # metrics_port (2026-09-29 B+D). The registry default is "direct"; the dataclass
     # default "redis" keeps direct constructions (tests, offline replays without pod
@@ -114,10 +113,11 @@ class SafeScaleConfig:
     donor_min_requests: float = 20.0
     # Timer cleanup (registry safescale.rollback_retry_z_margin): after a capacity
     # rollback (SLO violation, formal commit gate, donor health) the next receiver-less
-    # HIGH probe of the model needs a metrics window ending after the rollback AND either
+    # HIGH probe of the model needs early_commit_min_evidence_ms of observations after the
+    # rollback (round 4; any window ending after it before) AND either
     # a routable count different from the one the failed probe started from or a Z at
     # least this much above the Z that started it. Other rollbacks (evidence gaps,
-    # maintenance, observe mode, hide failures) need the new window only.
+    # maintenance, observe mode, hide failures) need the new evidence only.
     rollback_retry_z_margin: float = 0.25
     # Timer cleanup (registry safescale.early_commit): a direct-evidence probe commits
     # before its deadline once min_commit_samples requests are judged, every commit gate
@@ -125,10 +125,10 @@ class SafeScaleConfig:
     # instances and vLLM running + waiting) and the evidence floor holds. Rollbacks
     # unchanged.
     early_commit: bool = True
-    # Q4 (2026-10-06), the single evidence floor: complete post-hide gateway grids the
-    # newest snapshot window must hold, as a span = registry scaling.min_evidence_ms (O1's
-    # warm rule; no separate safescale key), and at least the donor's p95 e2e since the
-    # hide confirmation. No W / 2 term, no separate minimum observation time.
+    # Q4 (2026-10-06), the single evidence floor = registry scaling.min_evidence_ms (O1's
+    # warm rule; no separate safescale key): round 4, the observed span after the hide
+    # confirmation (early commit, with at least the donor's p95 e2e since it) and after a
+    # rollback (the retry hold). No W / 2 term, no separate minimum observation time.
     early_commit_min_evidence_ms: float = 20_000.0
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
@@ -332,7 +332,6 @@ class ControllerConfig:
             slo_mode=safescale_registry.slo_mode,
             min_commit_samples=int(safescale_registry.min_commit_samples),
             evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
-            evidence_step_ms=float(evidence_period_ms),
             evidence_source=safescale_registry.evidence_source,
             evidence_poll_ms=float(safescale_registry.evidence_poll_s) * 1000.0,
             scrape_timeout_s=float(safescale_registry.scrape_timeout_s),

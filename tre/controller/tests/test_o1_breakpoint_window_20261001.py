@@ -28,6 +28,7 @@ from tre_common.registry import (
     load_registry,
     parse_scaling_config,
 )
+from tre_controller.gateway_clock import GatewayClockMonitor
 from tre_controller.loops.model_state_box import UNCONFIRMED, ModelStateBox
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.loops.tick import _model_contexts, _rescue_bases, breakpoint_observation
@@ -40,7 +41,7 @@ from tre_sm.allocator.slots import Binding, Slot
 GRID = 10_000
 W = 30_000
 THETA = 100.0
-O1 = BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=2 * GRID)
+O1 = BreakpointWindowConfig(enabled=True, onset_guard=False, min_evidence_ms=2 * GRID)
 
 
 # ------------------------------------------------------------------- fixtures
@@ -243,14 +244,14 @@ def test_onset_first_grids_then_scaled_suffix_matches_the_steady_value():
     onset = base + 4 * GRID  # first window with traffic
     by_end = dict(seen)
     first = by_end[onset]
-    assert first["signal_warm"] is False and first["signal_hold_reason"] == "no_complete_grid"
-    assert first["signal_breakpoint_ms"] == onset and first["signal_evidence_grids"] == 0
+    assert first["signal_warm"] is False and first["signal_hold_reason"] == "no_suffix"
+    assert first["signal_breakpoint_ms"] == onset and first["signal_evidence_ms"] == 0
     one = by_end[onset + GRID]
-    assert one["signal_warm"] is False and one["signal_hold_reason"] == "evidence_grids"
-    assert one["signal_evidence_grids"] == 1
+    assert one["signal_warm"] is False and one["signal_hold_reason"] == "evidence_span"
+    assert one["signal_evidence_ms"] == 1 * GRID
     two = by_end[onset + 2 * GRID]
     assert two["signal_warm"] is True and two["signal_full_window"] is False
-    assert two["signal_window_start_ms"] == onset and two["signal_evidence_grids"] == 2
+    assert two["signal_window_start_ms"] == onset and two["signal_evidence_ms"] == 2 * GRID
     # numerator 2 grids x 40 scaled x 1.5 = 120, Q = qmin -> raw 120, Z 1.2 = steady state.
     assert two["trs_raw"] == pytest.approx(120.0) and two["z_m"] == pytest.approx(1.2)
     three = by_end[onset + 3 * GRID]  # the grid holding the onset left the window: full
@@ -288,7 +289,7 @@ def test_routable_change_dated_by_the_done_hint_and_its_grid_excluded():
     assert state.note_routable("m", 3, observed_ms=120_000, done_hints=(113_500, 90_000)) == 114_500
     window = replace(_window(140_000, [TRICKLE] * 3, routable=3))
     eff = state.effective_window("m", window)
-    assert eff.start_ms == 120_000 and eff.grids == 2 and eff.warm and not eff.full
+    assert eff.start_ms == 120_000 and eff.evidence_ms == 2 * GRID and eff.warm and not eff.full
     # An unexplained change (no hint after the previous observation) -> the observation time.
     assert state.note_routable("m", 2, observed_ms=130_000, done_hints=(113_500,)) == 131_000
     # Re-reads of the same view are idempotent; an older view is ignored (review P3).
@@ -418,9 +419,9 @@ def test_scale_up_restarts_the_ema_and_holds_scale_downs_for_a_whole_window():
         contexts[end] = ctx["m"]
     # Seen in the view fetched at base+23 s, dated by the done time (after the previous fetch).
     assert contexts[base + 2 * GRID]["signal_breakpoint_ms"] == done + O1.margin_ms
-    assert contexts[base + 2 * GRID]["signal_hold_reason"] == "no_complete_grid"
-    assert contexts[base + 3 * GRID]["signal_hold_reason"] == "no_complete_grid"  # (20, 30] holds it
-    assert contexts[base + 4 * GRID]["signal_hold_reason"] == "evidence_grids"
+    assert contexts[base + 2 * GRID]["signal_hold_reason"] == "no_suffix"
+    assert contexts[base + 3 * GRID]["signal_hold_reason"] == "no_suffix"  # (20, 30] holds it
+    assert contexts[base + 4 * GRID]["signal_hold_reason"] == "evidence_span"
     warm = contexts[base + 5 * GRID]
     assert warm["signal_warm"] is True and warm["signal_full_window"] is False
     assert warm["signal_window_start_ms"] == base + 3 * GRID
@@ -433,7 +434,7 @@ def test_min_evidence_requests():
     state = SignalState(breakpoint=cfg)
     state.observe_traffic("m", has_traffic=True, window_start_ms=0, window_end_ms=30_000)  # onset 30 s
     eff = state.effective_window("m", replace(_window(50_000, [IDLE, TRICKLE, TRICKLE])))
-    assert eff.grids == 2 and not eff.warm and eff.reason == "evidence_requests"  # 20 < 25
+    assert eff.evidence_ms == 2 * GRID and not eff.warm and eff.reason == "evidence_requests"  # 20 < 25
     eff = state.effective_window("m", _window(50_000, [IDLE, BURST, BURST]))
     assert eff.warm
 
@@ -491,7 +492,7 @@ def test_warm_receiver_on_a_partial_window_scales_up():
 
 def test_model_state_box_marks_held_signals_unconfirmed():
     box = ModelStateBox(now_ms=lambda: 0)
-    box.update({"m": _cls("m", ModelState.HIGH, 2.0)}, {"m": {"signal_hold_reason": "evidence_grids"}}, ts_ms=0)
+    box.update({"m": _cls("m", ModelState.HIGH, 2.0)}, {"m": {"signal_hold_reason": "evidence_span"}}, ts_ms=0)
     assert box.get() == {"m": UNCONFIRMED}
 
 
@@ -557,14 +558,14 @@ def test_trickle_from_idle_never_scales_and_a_burst_scales_after_two_grids():
     assert o1 and o1[0] == (onset, 1) and all(n == 1 for _, n in o1)
     assert legacy and legacy[0][0] == onset + 3 * GRID  # the whole window after the onset
     # The fallback switch restores the pre-O1 behaviour exactly.
-    fallback = BreakpointWindowConfig(enabled=False, onset_guard=True, grid_ms=GRID)
+    fallback = BreakpointWindowConfig(enabled=False, onset_guard=True)
     assert _run(SignalState(warmup_ms=-1, breakpoint=fallback), burst, registry) == legacy
     assert _run(SignalState(warmup_ms=-1, breakpoint=fallback), trickle, registry) == []
     # Review P2-b: turning O1 off alone keeps the onset guard (never both off).
-    off = BreakpointWindowConfig(enabled=False, onset_guard=False, grid_ms=GRID)
+    off = BreakpointWindowConfig(enabled=False, onset_guard=False)
     assert _run(SignalState(warmup_ms=-1, breakpoint=off), burst, registry) == legacy
     assert _run(SignalState(warmup_ms=-1, breakpoint=off), trickle, registry) == []
-    assert BreakpointWindowConfig.from_registry(_registry(breakpoint_window=False), grid_ms=GRID).enabled is False
+    assert BreakpointWindowConfig.from_registry(_registry(breakpoint_window=False)).enabled is False
 
 
 # ----------------------------------------------------------------- registry
@@ -587,10 +588,10 @@ def test_scaling_registry_o1_keys():
                 {"breakpoint_window": "yes"}, {"min_evidence_grids": True}):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
-    built = BreakpointWindowConfig.from_registry(_registry(min_evidence_ms=30_000), grid_ms=GRID)
-    assert built == BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_ms=30_000)
+    built = BreakpointWindowConfig.from_registry(_registry(min_evidence_ms=30_000))
+    assert built == BreakpointWindowConfig(enabled=True, onset_guard=False, min_evidence_ms=30_000)
     # A registry without a scaling section (older loaders / fakes): the O1 defaults.
-    assert BreakpointWindowConfig.from_registry(object(), grid_ms=GRID).enabled is True
+    assert BreakpointWindowConfig.from_registry(object()).enabled is True
 
 
 def test_onset_guard_switch_composes_with_o1():
@@ -629,11 +630,11 @@ def test_shipped_registry_enables_o1_with_the_default_evidence():
     scaling = load_registry().scaling()
     assert scaling.breakpoint_window is True and scaling.onset_warmup_guard is False
     assert scaling.min_evidence_ms == 20_000 and scaling.min_evidence_requests == 3
-    assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_ms == 60_000
+    assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_ms == 50_000
     assert scaling.breakpoint_lowevidence_requests == 10
     assert scaling.gateway_clock_tolerance_ms == 2000 and scaling.gateway_clock_check_s == 60
     assert json.dumps(sorted(ScalingRegistryConfig.__dataclass_fields__))  # serialisable names
-    assert math.isfinite(BreakpointWindowConfig().grid_ms)
+    assert BreakpointWindowConfig().hold_max_ms == scaling.breakpoint_hold_max_ms
 
 
 def test_freeze_snapshot_freezes_the_suffix_pods():
@@ -660,10 +661,10 @@ def test_freeze_snapshot_freezes_the_suffix_pods():
 
 def test_partial_window_needs_three_completed_requests_by_default():
     """P2-1: tokens count at completion - one short request done in 20 s is no evidence."""
-    state = SignalState(breakpoint=BreakpointWindowConfig(grid_ms=GRID))
+    state = SignalState(breakpoint=BreakpointWindowConfig())
     state.observe_traffic("m", has_traffic=True, window_start_ms=0, window_end_ms=30_000)
     thin = state.effective_window("m", _window(50_000, [IDLE, (64.0, 3.0, 0.0, 1.0), (0.0, 3.0, 0.0, 0.0)]))
-    assert thin.grids == 2 and not thin.warm and thin.reason == "evidence_requests"
+    assert thin.evidence_ms == 2 * GRID and not thin.warm and thin.reason == "evidence_requests"
     assert state.effective_window("m", _window(50_000, [IDLE, TRICKLE, TRICKLE])).warm
 
 
@@ -705,7 +706,7 @@ def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
     """0.1-0.3 rps with long requests: the 20 s suffix holds 3-9 completions; a short one
     done and long ones running reads Z far below tau_crit - the rescue adds +1, not +4."""
     registry = _registry(10_000.0, rescue_max_step_pods=4)
-    state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(grid_ms=GRID))
+    state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig())
     thin = (12.0, 4.0, 2.0, 2.0)  # 2 short completions per grid, 4 long requests running
     queue = _Queue()
     for i in range(2, 6):
@@ -717,7 +718,7 @@ def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
     assert ups and all(a.delta == 1 for a in ups)
     # A deep overload (Z = 0.10) with 10+ completions in the suffix: the whole deficit.
     DEEP = (1000.0, 30.0, 100.0, 100.0)
-    state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(grid_ms=GRID))
+    state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig())
     queue = _Queue()
     for i in range(2, 6):
         end = 1_000_000 + (i + 1) * GRID
@@ -761,31 +762,32 @@ def test_hint_only_dates_a_change_in_its_own_direction():
     assert state.note_routable("m", 3, observed_ms=130_000, done_hints=(125_000,)) == 126_000  # unknown sign
 
 
+class _WritingGateway:
+    """Writes one instant doc every 10 s at its own clock (controller clock + offset),
+    with ``written_ms``."""
+
+    def __init__(self, clock, offset_ms=0, *, writing=True):
+        self.clock, self.offset, self.writing, self.frozen = clock, offset_ms, writing, None
+
+    def smembers(self, key):
+        return {b"default/pod-a"} if key.endswith(":m") else set()
+
+    def zrange(self, key, start, end, withscores=False):
+        gw_now = self.clock["ms"] + self.offset
+        boundary = gw_now // GRID * GRID if self.writing else self.frozen
+        return [(json.dumps({"timestamp": boundary, "written_ms": boundary}).encode(), float(boundary))]
+
+
 def test_gateway_clock_check_suspends_and_resumes_o1():
-    from tre_controller.gateway_clock import GatewayClockMonitor, evaluate_clock
+    now = {"ms": 1_000_000 + 4_321}
 
-    assert evaluate_clock(100_000, 95_000, period_ms=GRID, tolerance_ms=2_000).ok
-    assert evaluate_clock(100_000, None, period_ms=GRID, tolerance_ms=2_000).ok
-    assert evaluate_clock(100_000, 110_000, period_ms=GRID, tolerance_ms=2_000).reason == "gateway_ahead"
-    assert evaluate_clock(100_000, 70_000, period_ms=GRID, tolerance_ms=2_000).reason == "gateway_behind_or_stalled"
-    assert evaluate_clock(100_000, 101_500, period_ms=GRID, tolerance_ms=2_000).ok
+    def sleep(seconds):
+        now["ms"] += int(seconds * 1000)
 
-    class _Redis:
-        def __init__(self):
-            self.newest = 0
-
-        def smembers(self, key):
-            return {b"default/pod-a"} if key.endswith(":m") else set()
-
-        def zrange(self, key, start, end, withscores=False):
-            return [(b"doc", float(self.newest))]
-
-    redis = _Redis()
-    now = {"ms": 1_000_000}
+    gateway = _WritingGateway(now, 160_000)  # the gateway runs 160 s ahead (75 vs 76)
     state = SignalState(warmup_ms=-1, breakpoint=O1)
-    monitor = GatewayClockMonitor(redis, ["m"], state, period_ms=GRID, tolerance_ms=2_000,
-                                  resume_after=2, clock_ms=lambda: now["ms"])
-    redis.newest = 1_000_000 + 160_000  # the gateway runs 160 s ahead (75 vs 76)
+    monitor = GatewayClockMonitor(gateway, ["m"], state, period_ms=GRID, tolerance_ms=2_000,
+                                  resume_after=2, clock_ms=lambda: now["ms"], sleep_s=sleep)
     assert not monitor.check().ok and state.breakpoint_window_suspended == "gateway_clock:gateway_ahead"
     # Suspended: whole windows, the onset guard, an event every tick.
     state.observe_traffic("m", has_traffic=True, window_start_ms=1_000_000, window_end_ms=1_030_000)
@@ -793,10 +795,34 @@ def test_gateway_clock_check_suspends_and_resumes_o1():
     assert state.onset_guard_applies()
     _ctx, events = _model_contexts(_snap(_window(1_040_000, [IDLE, BURST, BURST])), _registry(), signal_state=state)
     assert "breakpoint_window_suspended:gateway_clock:gateway_ahead" in events
-    redis.newest = now["ms"] - 4_000
+    gateway.offset = 0
     assert monitor.check().ok and state.breakpoint_window_suspended is not None  # 1 good check
     assert monitor.check().ok and state.breakpoint_window_suspended is None  # resumed after 2
     assert not state.onset_guard_applies()
+
+
+def test_leftover_docs_of_models_that_are_down_do_not_suspend_o1():
+    """Round 4: every model is down, only leftover docs remain (no new doc is written).
+    No measurement -> no verdict: O1 stays active (the removed stamp-lag fallback read
+    the old docs as a stalled gateway and suspended O1), and a suspended O1 does not
+    resume on such a reading either."""
+    now = {"ms": 2_000_000}
+
+    def sleep(seconds):
+        now["ms"] += int(seconds * 1000)
+
+    gateway = _WritingGateway(now, writing=False)
+    gateway.frozen = 1_000_000  # written 1000 s ago
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    monitor = GatewayClockMonitor(gateway, ["m"], state, period_ms=GRID, tolerance_ms=2_000,
+                                  clock_ms=lambda: now["ms"], sleep_s=sleep)
+    reading = monitor.check()
+    assert reading.ok and reading.reason == "no_measurement"
+    assert state.breakpoint_window_suspended is None and state.o1_active
+    state.suspend_breakpoint_window("gateway_clock:gateway_ahead")
+    for _ in range(4):
+        monitor.check()
+    assert state.breakpoint_window_suspended == "gateway_clock:gateway_ahead"
 
 
 def test_gateway_clock_task_is_wired_only_with_o1_and_a_redis_store():
@@ -820,10 +846,10 @@ def test_gateway_clock_task_is_wired_only_with_o1_and_a_redis_store():
 def test_held_receiver_event_names_the_hold_reason():
     cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
     ctx = {"m": {"assigned_replicas": 1, "routable_pods": 1, "signal_warm": False,
-                 "signal_full_window": False, "signal_hold_reason": "evidence_grids"}}
+                 "signal_full_window": False, "signal_hold_reason": "evidence_span"}}
     plan = build_plan(model_contexts=ctx, classifications=[_cls("m", ModelState.CRITICAL, 0.5)],
                       model_replicas={"m": 1}, idle_gpus=0, cfg=cfg)  # no free GPU: held
-    assert "receiver_held_breakpoint_window:m:evidence_grids" in plan.events
+    assert "receiver_held_breakpoint_window:m:evidence_span" in plan.events
     assert not any(e.startswith("receiver_suppressed_signal_warmup") for e in plan.events)
 
 
@@ -849,7 +875,7 @@ def test_safescale_observation_in_fallback_mode_equals_legacy_bitwise():
 
     registry = _registry(10_000.0)
     legacy = SignalState(warmup_ms=-1)
-    off = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(enabled=False, grid_ms=GRID))
+    off = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(enabled=False))
     pattern = [IDLE, IDLE, IDLE, TRICKLE, BURST, BURST, (900.0, 7.0, 1.0, 40.0), IDLE, IDLE, IDLE, BURST, BURST]
     for i in range(2, len(pattern)):
         end = 1_000_000 + (i + 1) * GRID
@@ -894,7 +920,7 @@ def test_c1_settle_without_o1_or_while_suspended_is_c1_alone():
     pattern = [BURST] * 9
     routables = [1, 1, 2, 2, 2, 2, 2, 2, 2]
     c1_alone = _c1_run(lambda: SignalState(warmup_ms=-1), registry, pattern=pattern, routables=routables)
-    fallback = _c1_run(lambda: SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(enabled=False, grid_ms=GRID)),
+    fallback = _c1_run(lambda: SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(enabled=False)),
                        registry, pattern=pattern, routables=routables)
 
     def suspended():
@@ -963,8 +989,9 @@ def test_gateway_clock_measures_the_offset_from_written_ms():
         assert (state.breakpoint_window_suspended is None) is ok
 
 
-def test_gateway_clock_falls_back_to_stamp_lag_without_written_ms():
-    from tre_controller.gateway_clock import GatewayClockMonitor
+def test_gateway_clock_gives_no_verdict_without_written_ms():
+    """Round 4: docs without written_ms (a gateway before 2026-10-01) give no
+    measurement and no verdict (no stamp-lag fallback)."""
 
     class _OldGateway:
         def smembers(self, key):
@@ -976,7 +1003,8 @@ def test_gateway_clock_falls_back_to_stamp_lag_without_written_ms():
     state = SignalState(warmup_ms=-1, breakpoint=O1)
     monitor = GatewayClockMonitor(_OldGateway(), ["m"], state, period_ms=GRID, tolerance_ms=2_000,
                                   clock_ms=lambda: 1_000_000, sleep_s=lambda _s: None)
-    assert monitor.check().reason == "gateway_ahead"
+    reading = monitor.check()
+    assert reading.ok and reading.reason == "no_written_ms" and state.breakpoint_window_suspended is None
 
 
 # ------------------------------------------------- Q3: IDLE donors (2026-10-06)

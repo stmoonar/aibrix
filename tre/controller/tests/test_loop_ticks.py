@@ -826,8 +826,8 @@ def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
 
     held = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
     assert not any(isinstance(a, HideAction) for a in held.actions)
-    # The snapshot window (end 60 s) predates the rollback at 90 s.
-    assert "safescale_rollback_hold:hot:no_new_window" in held.events
+    # The snapshot's observations (up to 60 s) predate the rollback at 90 s.
+    assert "safescale_rollback_hold:hot:no_new_evidence" in held.events
     later = MetricsSnapshot(
         ts_ms=200_000, stale=False, models={"hot": replace(snapshot.models["hot"], window_start_ms=100_000,
                                                             window_end_ms=160_000)},
