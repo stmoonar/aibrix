@@ -18,7 +18,7 @@ Round 4: no measurement, no verdict. The former fallback (``now`` minus the newe
 stamp, bounded by ``2 x period + tolerance``) is gone: it only guarded against signal
 lag with a fixed span, and it read leftover docs as a stalled clock - with every model
 down, the old docs suspended O1. Gateway liveness is the sampler's business
-(``last_round_ms``, stale snapshots).
+(``last_hist_ms``, stale snapshots).
 
 On a violation O1 is suspended (``SignalState.suspend_breakpoint_window``: whole
 windows, the ADR-0013 onset guard) until ``resume_after`` consecutive good checks.

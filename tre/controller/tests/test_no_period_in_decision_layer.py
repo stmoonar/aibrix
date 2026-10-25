@@ -3,7 +3,10 @@ decision layer reads observation-time spans, never the evidence period or a coun
 windows / ticks.
 
 The evidence period is a storage detail (``store/``, the sampler in
-``loops/metrics_task.py``, ``store/evidence_grid.py`` for the SafeScale Redis path). A
+``loops/metrics_task.py``, ``store/evidence_grid.py`` for the SafeScale Redis path).
+``planning/safescale.py`` holds an ``EvidenceGrid`` object (``self._grid``) and asks it
+for doc boundaries only - the first doc after the hide, the next doc after the newest
+evidence (wait for a NEW snapshot) - never for the period as a span of evidence. A
 rule that counts windows or ticks, or that reads the period, changes its meaning when
 the period changes (10 s -> 2 s made "2 consecutive windows" mean 2 s instead of 10 s).
 The whole file text is checked, comments included: a comment that explains a rule in
@@ -21,6 +24,8 @@ DECISION_LAYER = (
     PACKAGE / "loops" / "tick.py",
     PACKAGE / "loops" / "rescue_task.py",
     PACKAGE / "loops" / "fairness_task.py",
+    # Round 5 (L4): the SafeScale observation task (tail terms, observation fields).
+    PACKAGE / "loops" / "safescale_task.py",
 )
 FORBIDDEN = re.compile(
     r"grid_ms|evidence_period|period_ms|EVIDENCE_PERIOD_MS|INSTANT_SAMPLE_INTERVAL_MS"

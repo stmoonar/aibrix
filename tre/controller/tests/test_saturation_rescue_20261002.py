@@ -389,14 +389,17 @@ def test_a_saturation_receiver_is_not_dropped_as_incomplete():
 
 
 def test_sample_uses_routable_pods_latest_values_and_skips_hidden():
-    # Round 4: every pod in the window counts with its newest sample (no freshness gate:
-    # the store leaves frozen pods out); after_ms keeps those observed after an event.
+    # Each routable pod counts with its newest sample; round 5 (M2): a sample that is not
+    # current (the store's producer-cadence rule) does not count; after_ms keeps those
+    # observed after an event.
     end = BASE + 3 * GRID
     pods = {
         "a": _pod("a", end, [STARTING] * 3, (0.0, 0.95), end - W),
         "b": _pod("b", end, [STARTING] * 3, (3.0, 0.85), end - W),
         "h": _pod("h", end, [STARTING] * 3, (40.0, 1.0), end - W),
         "old": replace(_pod("old", end, [STARTING] * 3, (9.0, 1.0), end - W), latest_instant_ms=end - 2 * GRID),
+        "frozen": replace(_pod("frozen", end, [STARTING] * 3, (30.0, 1.0), end - W),
+                          latest_instant_ms=end - 29_000, latest_current=False),
     }
     window = aggregate_pods("m", end - W, end, pods)
     sample = saturation_sample(window, hidden_pods={"h"})
@@ -432,6 +435,10 @@ def test_store_carries_each_pods_newest_instant_sample():
     assert metrics.latest_waiting == 30.0 and metrics.latest_running == 3.0
     assert metrics.latest_gpu_cache == pytest.approx(0.9) and metrics.latest_instant_ms == 30_000
     assert metrics.avg_waiting == pytest.approx(20.0)  # the window mean is unchanged
+    assert metrics.latest_current  # observed at the window end
+    # Round 5 (M2): read 4 instant periods + 1 ms after its newest sample, not current.
+    later = store.read_model_window("dsqwen-7b", 0, 30_000 + 4 * GRID + 1, use_cache=False, start_exclusive=True)
+    assert later.per_pod["pod-a"].latest_instant_ms == 30_000 and not later.per_pod["pod-a"].latest_current
 
 
 # ------------------------------------------------------------------- config

@@ -11,7 +11,7 @@ from tre_common.persistence import fresh
 from tre_common.gateway_inflight import instance_max_age_ms, live_gateway_instances, pod_inflight
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import GATEWAY_CADENCE_KEY, hist_key, inst_key, pods_key
-from tre_controller.gateway_cadence import cadence_problem, last_round_ms
+from tre_controller.gateway_cadence import cadence_problem, last_hist_ms
 from tre_common.tss import window_is_idle
 from tre_common.vllm_metrics import doc_lookup
 from tre_common.window_pods import aggregate_pods
@@ -43,6 +43,10 @@ INSTANT_METRICS = {
 #: lookback, a stalled gateway); its rate is still computed over the real span.
 MIN_TOKEN_SPAN_FACTOR = 0.67
 MAX_TOKEN_SPAN_FACTOR = 1.5
+#: A pod's newest instant sample is current when it was observed at most this many
+#: instant sample periods before the window end (round 4/5: I3 current pods and the
+#: saturation sample; the producer's cadence, not the evidence period).
+CURRENT_SAMPLE_PERIODS = 4
 
 LEGACY_HIST_PREFIX = "aibrix:pod_histogram_metrics_"
 LEGACY_INST_PREFIX = "aibrix:pod_instant_metrics_"
@@ -120,9 +124,10 @@ class MetricsStore:
         # breakpoint). None = every grid-aligned suffix (offline tools, tests). A
         # breakpoint first seen after the read gets its suffix with the next snapshot.
         self._suffix_breakpoint = suffix_breakpoint
-        # Round 4 (the SafeScale commit gate's tail, one value over one span): model ->
-        # the span (ms) its probe's tail covers (None: no probe). The suffix starting at
-        # the last boundary at or before ``end - span`` is built too.
+        # Round 5 (the SafeScale commit gate's tail, one value over the post-hide span):
+        # model -> its probe's post-hide start (gateway doc domain; None: no probe). The
+        # suffix starting at the first boundary at or after it is built too (a start at
+        # or before the window start: the whole window is post-hide, no suffix needed).
         self._suffix_tail = suffix_tail
         # P3-2: gateway plugin instance liveness (the registry's SM instance staleness).
         self._gateway_instance_max_age_ms = instance_max_age_ms(registry)
@@ -177,7 +182,7 @@ class MetricsStore:
             models=models,
             stale=bool(problem) and self._cadence_enforce,
             stale_reason=problem,
-            gateway_last_round_ms=last_round_ms(cadence_raw) if self._expected_cadence is not None else None,
+            gateway_last_hist_ms=last_hist_ms(cadence_raw) if self._expected_cadence is not None else None,
         )
 
     def _fetch_v2(
@@ -221,7 +226,7 @@ class MetricsStore:
         """The gateway's declared cadence (``raw``: the hash read with the snapshot)
         against ``expected_cadence`` (None: no check or it is fine). Logged as an error
         when it changes. Round 4: the hash's freshness is the sampler's rule
-        (``last_round_ms`` >= the window end), not a declaration problem."""
+        (``last_hist_ms`` >= the window end), not a declaration problem."""
         if self._expected_cadence is None:
             return None
         instant_ms, evidence_ms = self._expected_cadence
@@ -361,7 +366,6 @@ class MetricsStore:
             instant_ticks_ms=tuple(sorted(all_ticks)),
             sample_incomplete_pods=incomplete_pods,
             scrape_fresh=scrape_fresh,
-            observed=_with_flags(model_metrics.observed, set(incomplete_pods) | set(stale_pods)),
         )
         if stale_pods or incomplete_pods:
             # The gateway in-flight count of every pod whose data is doubtful (I3 or
@@ -375,7 +379,7 @@ class MetricsStore:
         # nothing in flight on it at the gateway (the tick decides on both). Round 4:
         # "recently" = at most 4 instant sample periods before the window end (the
         # producer's cadence, not the evidence period).
-        current_max_age_ms = 4 * int(self._instant_sample_interval_ms)
+        current_max_age_ms = self._current_max_age_ms()
         model_metrics = replace(
             model_metrics,
             scrape_current_pods=frozenset(
@@ -429,9 +433,9 @@ class MetricsStore:
     def _suffix_starts(self, model: str, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
         """Gateway boundaries strictly inside an aligned window (O1 suffix starts) - with
         a breakpoint source only the one O1 would decide on (the first boundary at or
-        after the breakpoint) plus, with a tail source, the SafeScale tail's (the last
-        boundary at or before ``end - span``); () when suffixes are off or the window is
-        not on the suffix grid."""
+        after the breakpoint) plus, with a tail source, the SafeScale tail's (round 5: the
+        first boundary at or after the probe's post-hide start, gateway doc domain); ()
+        when suffixes are off or the window is not on the suffix grid."""
         period = self._suffix_period_ms
         if period <= 0 or window_start_ms % period or window_end_ms % period:
             return ()
@@ -446,12 +450,12 @@ class MetricsStore:
         if point is not None:
             starts.add(-(-int(point) // period) * period)  # first grid boundary >= the breakpoint
         try:
-            span = self._suffix_tail(model) if self._suffix_tail is not None else None
-        except Exception:  # noqa: BLE001 - no tail suffix: the gate reads the whole window
-            LOG.warning("SafeScale tail: span of %s unreadable", model, exc_info=True)
-            span = None
-        if span:
-            starts.add((int(window_end_ms) - int(span)) // period * period)
+            tail = self._suffix_tail(model) if self._suffix_tail is not None else None
+        except Exception:  # noqa: BLE001 - no tail suffix: the gate finds no tail evidence
+            LOG.warning("SafeScale tail: post-hide start of %s unreadable", model, exc_info=True)
+            tail = None
+        if tail is not None:
+            starts.add(-(-int(tail) // period) * period)  # first grid boundary >= the post-hide start
         return tuple(sorted(start for start in starts if window_start_ms < start < window_end_ms))
 
     def read_latest_instant(
@@ -823,7 +827,7 @@ class MetricsStore:
         if metrics is None:
             return None, False
         if not self._read_instant:
-            return replace(metrics, observed=_pod_observed(metrics, hist_docs, inst_docs, read_start_ms, False)), False
+            return replace(metrics, observed=_pod_observed(hist_docs, inst_docs, read_start_ms)), False
         if reset:
             metrics = replace(metrics, token_counter_reset=True)
         window_ms = int(window_end_ms) - int(span_start_ms)
@@ -851,9 +855,19 @@ class MetricsStore:
         if coverage + 1e-9 < self._min_sample_ratio * (window_ms / self._instant_sample_interval_ms):
             flagged = True
         metrics = replace(
-            metrics, observed=_pod_observed(metrics, hist_docs, inst_docs, read_start_ms, flagged or reset)
+            metrics,
+            observed=_pod_observed(hist_docs, inst_docs, read_start_ms),
+            # Round 5 (M2): the newest instant sample is current only within the
+            # producer's cadence of the window end - the scrape_current_pods rule.
+            latest_current=fresh(int(window_end_ms), metrics.latest_instant_ms, self._current_max_age_ms()),
         )
         return metrics, flagged or reset
+
+    def _current_max_age_ms(self) -> int:
+        """How old a pod's newest sample may be and still be current (scrape_current_pods,
+        the saturation sample): ``CURRENT_SAMPLE_PERIODS`` instant periods - the
+        producer's cadence, never the evidence period."""
+        return CURRENT_SAMPLE_PERIODS * int(self._instant_sample_interval_ms)
 
     def _instant_avg_optional(self, model: str, metric: str, docs: list[dict[str, Any]]) -> float | None:
         """Mean of the gauge over the samples that actually carry it; None when none
@@ -1003,46 +1017,23 @@ def _token_span_ms(hist_docs: list[dict[str, Any]], read_start_ms: int) -> int |
     return last - first
 
 
-def _with_flags(observed: Observed | None, pods: set[str]) -> Observed | None:
-    if observed is None or not pods:
-        return observed
-    return replace(observed, flags=observed.flags | frozenset(pods))
-
-
 def _suffix_with_flags(metrics: ModelWindowMetrics, pods: set[str]) -> ModelWindowMetrics:
-    return replace(
-        metrics, sample_incomplete_pods=tuple(sorted(pods)), observed=_with_flags(metrics.observed, pods)
-    )
+    return replace(metrics, sample_incomplete_pods=tuple(sorted(pods)))
 
 
-def _pod_observed(
-    metrics: PodWindowMetrics,
-    hist_docs: list[dict[str, Any]],
-    inst_docs: list[dict[str, Any]],
-    read_start_ms: int,
-    flagged: bool,
-) -> Observed:
+def _pod_observed(hist_docs: list[dict[str, Any]], inst_docs: list[dict[str, Any]], read_start_ms: int) -> Observed:
     """One pod's :class:`Observed` (round 4): from the observation of the token
     baseline (the first histogram doc the deltas start from; else the first
-    observation in the window) to the newest one; ``n_obs`` = distinct observations of
-    its instant docs (of its histogram docs without instant reads)."""
+    observation in the window) to the newest one."""
     hist = [doc for doc in hist_docs if isinstance(doc.get("model_histogram_metrics"), dict)]
     in_window = [
         doc for doc in (*hist_docs, *inst_docs) if _number(doc.get("timestamp"), 0.0) >= read_start_ms
     ]
     seen = sorted({value for value in (_scraped_at(doc) for doc in in_window) if value is not None and value >= 0})
-    counted = inst_docs if inst_docs else [doc for doc in hist if _number(doc.get("timestamp"), 0.0) >= read_start_ms]
-    n_obs = len({value for value in (_scraped_at(doc) for doc in counted) if value is not None and value >= read_start_ms})
     first = _scraped_at(hist[0]) if hist else None
     if first is None or first < 0:
         first = seen[0] if seen else None
-    return Observed(
-        t_first_ms=first,
-        t_last_ms=seen[-1] if seen else None,
-        n_obs=n_obs,
-        requests=metrics.request_count_observed,
-        flags=frozenset({metrics.pod}) if flagged else frozenset(),
-    )
+    return Observed(t_first_ms=first, t_last_ms=seen[-1] if seen else None)
 
 
 #: The token counters whose decrease marks an engine restart (counter reset).

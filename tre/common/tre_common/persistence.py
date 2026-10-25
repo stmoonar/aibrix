@@ -29,10 +29,12 @@ def span_reaches(span_ms: int, need_ms: int, *, tolerance_ms: int = SPAN_TOLERAN
 class Persistence:
     """A condition that has held for ``span_ms`` of observation time.
 
-    ``observe(t, holds)``: ``t`` is the observation time the verdict is about. The
-    same or an older ``t`` again (a re-read of one snapshot, a window whose newest
-    observation did not move) returns the last result and changes nothing; ``holds``
-    False resets. True once ``t_last_true - t_first_true`` reaches ``span_ms``
+    ``observe(t, holds)``: ``t`` is the observation time the verdict is about.
+    ``holds`` False always resets (round 5: also at a ``t`` already seen - a re-read
+    whose verdict turned false must not keep an earlier span alive). A true
+    observation at the same or an older ``t`` (a re-read of one snapshot, a window
+    whose newest observation did not move) returns the last result and changes
+    nothing. True once ``t_last_true - t_first_true`` reaches ``span_ms``
     (:func:`span_reaches`); ``span_ms`` 0 = on the first true observation."""
 
     def __init__(self, span_ms: int, *, tolerance_ms: int = SPAN_TOLERANCE_MS) -> None:
@@ -52,13 +54,14 @@ class Persistence:
 
     def observe(self, t_obs_ms: int, holds: bool) -> bool:
         t = int(t_obs_ms)
-        if self._last_t is not None and t <= self._last_t:
-            return self._result
-        self._last_t = t
         if not holds:
+            self._last_t = t if self._last_t is None else max(self._last_t, t)
             self.first_ms = self.last_ms = None
             self._result = False
             return False
+        if self._last_t is not None and t <= self._last_t:
+            return self._result
+        self._last_t = t
         if self.first_ms is None:
             self.first_ms = t
         self.last_ms = t

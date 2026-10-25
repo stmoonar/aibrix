@@ -176,11 +176,7 @@ def restrict_to_serving(
                 metrics.model, metrics.window_start_ms, metrics.window_end_ms, kept,
                 p95_rule=metrics.p95_rule,
             )
-            flags = metrics.observed.flags if metrics.observed is not None else frozenset()
             metrics = replace(metrics, **{name: getattr(agg, name) for name in _POD_AGGREGATES})
-            if metrics.observed is not None and flags:
-                # The store's flags are kept as read (as sample_incomplete_pods).
-                metrics = replace(metrics, observed=replace(metrics.observed, flags=metrics.observed.flags | flags))
     return replace(
         metrics,
         routable_pods=int(routable_pods),

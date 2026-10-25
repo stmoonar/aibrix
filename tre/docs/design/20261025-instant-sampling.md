@@ -309,3 +309,75 @@ offline constructions without direct evidence) a probe's deadline runs on the sn
 clock (`now_ms = snapshot.ts_ms`), so at 10 s a probe is judged about one period of
 wall time sooner after its hide than at 2 s; the live controller's direct evidence
 runs on the controller clock from the hide confirmation.
+
+## Review round 5
+
+An independent review of round 4 (`dd004d3c`). What changed, superseding the round-4
+text above where they differ:
+
+- **Window written = the histogram boundary (L2).** The cadence hash carries
+  `last_hist_ms` (`pkg/cache/cache_tre_redis.go`): the newest histogram boundary whose
+  docs were ALL built, written in the round's MULTI only then (`histOK`). The former
+  `last_round_ms` moved every instant round even when the boundary's histogram docs
+  failed. Freshness: a window ending at `E` is complete once `last_hist_ms >= E`; a
+  hash without it is `gateway_cadence_no_hist` (stale). Trade-off: a pod whose doc can
+  never be built keeps every window stale (fail-closed).
+- **Persistence (L3).** A false verdict always resets, also at an observation time
+  already seen; only repeated true verdicts at an old time are skipped.
+- **`Observed` (L5)** is `(t_first_ms, t_last_ms)` only; counts and flags live on the
+  window (`request_count_observed`, `sample_incomplete_pods`).
+- **Saturation sample freshness (M2).** The store marks each pod window
+  `latest_current = fresh(end, latest_instant_ms, 4 x instant period)` (the
+  `scrape_current_pods` rule, bound to the producer cadence); `saturation_sample` skips
+  pods that are not current, and an added pod without a current sample is not full.
+- **SafeScale commit-gate tail (H1).** The tail is the post-hide span of the newest
+  snapshot: the store builds the suffix from the first doc boundary at or after
+  `SafeScaleStateMachine.tail_start_ms` (= `_post_hide_start`: the first gateway
+  boundary after the newest doc at the confirmed hide; the planned start without an
+  evidence source) - the whole window once the hide precedes it. One value per
+  quantity; plus `tail_observed_ms` (observed span) and `tail_requests` (requests of the
+  remaining pods). Evidence floor: no traffic, or `min_commit_samples` requests, or a
+  whole-window tail (the planner's own evidence unit: a sliding window gains no
+  requests by waiting - holding a low-rate model to the floor would only push every
+  probe to the ceiling). Below it the gate extends (`tail_low_evidence`), up to the W
+  ceiling, where it judges what there is and records `tail_low_evidence`. The N2
+  startup warning (tail observations wholly post-hide) is gone with the `hq x W` span.
+- **Early-commit floor (M1).** `newest observation - _post_hide_start`: both on the
+  gateway clock; before, the gateway `scraped_ms` minus the controller-clock
+  confirmation (off by the node skew).
+- **Immediate rollback (L1).** On every new snapshot, one value over the post-hide span
+  `[S, E]` (the tail p95s, max of per-pod and pooled), once it holds
+  `min_commit_samples` requests - the direct path's rule. The round-4 non-overlap
+  filter is gone.
+- **Guard (L4).** `loops/safescale_task.py` is in the guarded decision layer.
+  `planning/safescale.py` keeps an `EvidenceGrid` object and asks it for doc
+  boundaries only (`evidence_start`, `next_after` for "the next snapshot", `floor` of
+  the Redis-path window base), never for the period as a span of evidence.
+- **Tests (M3).** `period_sim` completes requests in whole numbers (Poisson, seeded by
+  pod and time), can shift every gateway stamp (`gateway_offset_ms`) and can run the
+  direct evidence path (the real `DirectEvidenceCollector` on sim pods, early commit).
+  New scenarios: `hold` (a TPOT threshold the probe breaks; d stays HIGH; O1 off, so
+  only the rollback-retry floor holds the retry) and `direct` (gateway clock 4 s
+  ahead). New per-run ground-truth test: each rule's delay from its cause is within
+  `[span - 1 s, span + P + tick + 1 s]` (saturation 10 s, stale 20 s, retry floor 20 s,
+  early commit 20 s + the 4 s offset). `controller/tests/test_safescale_tail_20261026.py`:
+  the tail request floor extends instead of failing; the immediate rollback judges the
+  post-hide span of an overlapping, pre-hide-starting window once 20 requests are in it.
+  Mutations run on a throwaway copy: Persistence made count-based, the retry floor
+  reverted, the early-commit floor on the controller clock, the immediate-rollback floor
+  removed, the tail floor removed - each fails at least one test.
+
+  Delays (s) seen (round 5):
+
+  | rule (cause) | 2 s | 5 s | 10 s |
+  |---|---|---|---|
+  | saturation rescue (onset) | 15 | 15 | 15 |
+  | first stale snapshot (stall start) | 22 | 25 | 30 |
+  | retry floor: first hold other than `no_new_evidence` (rollback tick) | 19 | 23 | 23 |
+  | direct early commit (hide; gateway 4 s ahead) | 26.75, 27.75 | 26.75, 26.75 | 26.75, 26.75 |
+
+**Still period-dependent (each at most one period):** the tail and the early-commit
+floor start at the first doc boundary after the hide (0..P after it); the Redis-path
+window base is `floor(confirmation)` on the doc grid, and its extension / wait steps are
+"the next doc boundary" (wait for a new snapshot); data age (a window is read one
+period plus the offset after its end).

@@ -205,22 +205,6 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
         ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
 
 
-def test_safescale_short_floor_warns_instead_of_refusing_to_start(caplog) -> None:
-    # N2 (tail observations fully post-hide) needs W_floor*(1-hq) >= metrics window +
-    # refresh + read offset = 42000 by default; the 20 s floor cannot satisfy it, so the
-    # guard only warns (v1 ran a 15 s floor the same way).
-    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
-        config = ControllerConfig.from_env({})
-    assert config.safescale.min_window_ms == 20_000.0
-    assert any("SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage() and "min_window_ms=20000.0" in r.getMessage()
-               for r in caplog.records)
-    # A floor that satisfies the invariant (56000*0.75 = 42000) loads without the warning.
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
-        ControllerConfig.from_env({"SAFE_SCALE_WINDOW_FLOOR_MS": "56000"})
-    assert not [r for r in caplog.records if "SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage()]
-
-
 def test_safescale_window_defaults_and_env_parsing() -> None:
     # A6: W = max(2 * p95_e2e, 20 s), no ceiling, no default/fallback/decode terms.
     safescale = ControllerConfig.from_env({}).safescale

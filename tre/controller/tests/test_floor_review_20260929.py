@@ -77,10 +77,12 @@ def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
     machine.start_probe(model="donor", pods=("donor-0",), now_ms=100_000)  # hide at 100 s
     assert machine.observe("donor", _obs(110_000), now_ms=110_000).reason == "probe_pending"
     assert machine.observe("donor", _obs(120_000), now_ms=120_000).reason == "probe_pending"
-    # Round 4: the gate judges ONE span, the newest snapshot's tail suffix (the store
-    # builds it at floor(end - hq x W); here it starts 5 s before the hide).
+    # The gate judges ONE span, the newest snapshot's tail (round 5: the store starts it
+    # at the post-hide start; a synthetic one starting 5 s before the hide here, to see
+    # the audit), with enough requests in it (round 5 H1 floor).
     newest = replace(_obs(130_000), tail_start_ms=95_000, tail_z_m=2.0, tail_has_traffic=True,
-                     tail_ttft_p95_ms=100.0, tail_tpot_p95_ms=10.0)
+                     tail_ttft_p95_ms=100.0, tail_tpot_p95_ms=10.0, tail_requests=25.0,
+                     tail_observed_ms=35_000)
     decision = machine.observe("donor", newest, now_ms=130_000)
 
     assert decision.status == "commit"  # the audit never changes the criterion
@@ -111,7 +113,10 @@ def test_observations_carry_the_metrics_window_they_read() -> None:
 
     queue = ObservationQueue()
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5)
+        # Round 5: no post-hide suffix in this window, so only the W ceiling (= the floor
+        # here) judges it - on the whole window, flagged tail_low_evidence.
+        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5,
+                               window_ceiling_ms=1000.0)
     )
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=45_000)  # hide 45 s into the window
     result = run_safescale_observation_tick(

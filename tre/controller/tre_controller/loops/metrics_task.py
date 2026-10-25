@@ -146,14 +146,15 @@ def window_freshness(
 ) -> WindowFreshness:
     """Whether the gateway has written the window's end round.
 
-    Round 4 (docs/design/20261025-instant-sampling.md "Evidence, not ticks"): the
-    gateway's ``last_round_ms`` (the instant stamp of its newest round, written in that
-    round's MULTI; ``MetricsSnapshot.gateway_last_round_ms``) is at or after the window
-    end. A round a few hundred ms late is stamped with the next instant boundary - it
-    still proves the window, where "a doc stamped exactly ``end`` exists" (rounds 1-3)
-    did not. Per-pod completeness is the store's flag (``sample_incomplete_pods``).
+    Round 5 (docs/design/20261025-instant-sampling.md "Evidence, not ticks"): the
+    gateway's ``last_hist_ms`` (the histogram boundary of its newest round whose
+    histogram docs were all built, written in that round's MULTI;
+    ``MetricsSnapshot.gateway_last_hist_ms``) is at or after the window end. A round a
+    few hundred ms late still writes boundary ``end`` and proves the window, where "an
+    instant doc stamped exactly ``end`` exists" (rounds 1-3) did not; an instant-only
+    round (round 4's ``last_round_ms``) does not. Per-pod completeness is the store's flag (``sample_incomplete_pods``).
 
-    Without ``last_round_ms`` (a store that does not read the cadence: v1 schema,
+    Without ``last_hist_ms`` (a store that does not read the cadence: v1 schema,
     offline tools) the end instant tick decides, pooled over every pod: a window with
     no tick at all is reported fresh with reason ``no_ticks`` (nothing serving, or the
     store reports no ticks; the sampler decides what that means). ``period_ms`` is kept
@@ -172,10 +173,10 @@ def window_freshness(
         )
     )
     expected = (end,)
-    last_round = getattr(snapshot, "gateway_last_round_ms", None)
-    if last_round is not None:
-        if int(last_round) < end:
-            return WindowFreshness(False, ticks, expected, f"round_not_written:{end}:last_round={int(last_round)}")
+    last_hist = getattr(snapshot, "gateway_last_hist_ms", None)
+    if last_hist is not None:
+        if int(last_hist) < end:
+            return WindowFreshness(False, ticks, expected, f"hist_not_written:{end}:last_hist={int(last_hist)}")
         return WindowFreshness(True, ticks, expected)
     if not ticks:
         return WindowFreshness(True, ticks, expected, "no_ticks")

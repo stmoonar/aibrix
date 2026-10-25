@@ -342,7 +342,7 @@ def create_controller_dependencies(
         saturation=SaturationTracker(saturation_config),
     )
     # Round 4: the SafeScale tail span source, bound once the state machine exists.
-    tail_span: list = []
+    tail_start: list = []
     store = MetricsStore(
         metrics_redis_client,
         registry,
@@ -368,8 +368,8 @@ def create_controller_dependencies(
         suffix_period_ms=cfg.evidence_period_ms,
         # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
         suffix_breakpoint=lambda model: signal_state.breakpoint_ms(model) if signal_state.o1_active else None,
-        # Round 4: and the SafeScale commit gate's tail suffix of a probing model.
-        suffix_tail=lambda model: tail_span[0](model) if tail_span else None,
+        # Round 5: and the SafeScale commit gate's tail - the post-hide suffix of a probing model.
+        suffix_tail=lambda model: tail_start[0](model) if tail_start else None,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -416,7 +416,7 @@ def create_controller_dependencies(
         remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
     )
     safescale.restore()
-    tail_span.append(safescale.tail_span_ms)
+    tail_start.append(safescale.tail_start_ms)
     # 2026-09-29 B+D: the controller scrapes the probe's remaining pods itself
     # (pod IP from the SM fleet state, port = registry safescale.metrics_port).
     # Not with SafeScale off (TRE_ABLATION_DISABLE_SAFESCALE): no probe is judged.

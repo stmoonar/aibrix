@@ -161,10 +161,12 @@ def saturation_sample(
 ) -> SaturationSample | None:
     """Sum of ``num_requests_waiting`` / running and mean KV-cache fill over the routable
     pods (``metrics.per_pod`` of the serving window minus hidden probe pods), each pod's
-    newest instant sample in the window, plus the per-pod samples. Round 4: no freshness
-    gate here (a pod in the window was observed in it - the store leaves frozen pods
-    out); ``after_ms`` keeps only samples observed after a reference event (H3: the
-    breakpoint). None: no pod with a sample."""
+    newest instant sample in the window, plus the per-pod samples. Round 5 (M2): only
+    current samples (``PodWindowMetrics.latest_current``: observed within the producer's
+    cadence of the window end, the store's rule) - a pod last scraped 29 s ago is not
+    full now; an added pod without a current sample is unknown, so not full
+    (``_added_pods_full``). ``after_ms`` keeps only samples observed after a reference
+    event (H3: the breakpoint). None: no pod with a sample."""
     hidden = set(hidden_pods)
     per_pod: list[PodSample] = []
     newest = None
@@ -174,6 +176,8 @@ def saturation_sample(
             continue
         stamp = getattr(pod, "latest_instant_ms", None)
         if stamp is None or (after_ms is not None and int(stamp) <= int(after_ms)):
+            continue
+        if getattr(pod, "latest_current", True) is False:
             continue
         kv = getattr(pod, "latest_gpu_cache", None)
         per_pod.append(

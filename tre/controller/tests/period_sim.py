@@ -1,23 +1,30 @@
 """Closed-loop scenario renderer for the period-invariance test (round 4,
 docs/design/20261025-instant-sampling.md "Evidence, not ticks").
 
-One scenario - the demand of each model over time, gateway stalls - is rendered into
-gateway docs at a given evidence period P (instant docs every 0.5 s, histogram docs
-every P, ``scraped_ms`` 50 ms before the write, the cadence hash with ``last_round_ms``)
-and run through the real controller path: MetricsStore -> PhaseAlignedSampler -> the
-rescue (5 s) / fairness (10 s) planner ticks (``loops/replay.py``, one SignalState and
-PaperStateCache per run) -> SafeScale observation ticks (2 s). A mock SM applies every
+One scenario - the demand of each model over time, gateway stalls, a gateway clock
+offset - is rendered into gateway docs at a given evidence period P (instant docs every
+0.5 s, histogram docs every P, ``scraped_ms`` 50 ms before the write, the cadence hash
+with ``last_hist_ms``; every gateway stamp on the gateway clock = controller clock +
+``gateway_offset_ms``) and run through the real controller path: MetricsStore ->
+PhaseAlignedSampler -> the rescue (5 s) / fairness (10 s) planner ticks
+(``loops/replay.py``, one SignalState and PaperStateCache per run) -> SafeScale
+observation ticks (2 s; with ``direct``, the direct evidence path: the real
+DirectEvidenceCollector scraping the sim pods, early commit on). A mock SM applies every
 action at once (relay, wake, sleep, hide, unhide), so the load follows the decisions.
 
 The engine model is deliberately simple: a pod's concurrency is the model's demand
 split over its routable pods; up to 16 run, the rest wait; per-request decode speed
-falls with the batch; TTFT grows with the queue.
+falls with the batch; TTFT grows with the queue. Round 5 (M3): requests complete in
+whole numbers (Poisson per 0.5 s step, seeded by pod and time: the same world at every
+period until the decisions differ).
 """
 from __future__ import annotations
 
 import asyncio
 import bisect
 import json
+import math
+import random
 from types import SimpleNamespace
 from dataclasses import dataclass, field, replace
 
@@ -29,6 +36,8 @@ from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import PaperStateCache
 from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
+from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
+from tre_controller.planning.safescale_evidence import HideAnchor
 from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.store.evidence_grid import EvidenceGrid
@@ -71,6 +80,14 @@ class Scenario:
     awake: tuple[str, str, str, str]
     duration_s: float
     stalls: tuple[tuple[float, float], ...] = ()
+    #: Gateway clock - controller clock (a multiple of the 0.5 s instant step).
+    gateway_offset_ms: int = 0
+    #: SafeScale on the direct evidence path (early commit on).
+    direct: bool = False
+    #: O1 (``scaling.breakpoint_window``) on.
+    o1: bool = True
+    #: SafeScale's TPOT p95 threshold (config mode).
+    tpot_slo_ms: float = 100.0
 
     def concurrency(self, model: str, t_s: float) -> float:
         steps = self.demand.get(model, ())
@@ -186,21 +203,38 @@ class Sim:
         self.rescue_ms = int(cfg.rescue_interval_s * 1000)
         self.fairness_ms = int(cfg.fairness_interval_s * 1000)
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
+        self.offset = int(scenario.gateway_offset_ms)
+        breakpoint = BreakpointWindowConfig.from_registry(self.registry)
         self.signal_state = SignalState(
             warmup_ms=cfg.signal_warmup_ms,
-            breakpoint=BreakpointWindowConfig.from_registry(self.registry),
+            breakpoint=breakpoint if scenario.o1 else replace(breakpoint, enabled=False),
             saturation=SaturationTracker(SaturationRescueConfig.from_registry(self.registry)),
         )
-        self.safescale = SafeScaleStateMachine(
-            config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0), grid=EvidenceGrid(self.period),
-        )
+        slo = dict(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=float(scenario.tpot_slo_ms))
+        self.collector = None
+        if scenario.direct:
+            self.safescale = SafeScaleStateMachine(
+                config=SafeScaleConfig(**slo, evidence_source="direct", early_commit=True, baseline_delay_ms=0.0,
+                                       min_window_ms=60_000.0, window_ceiling_ms=90_000.0),
+                grid=EvidenceGrid(self.period), evidence=_SimEvidence(self), wall_clock_ms=lambda: self.now,
+            )
+            self.collector = DirectEvidenceCollector(
+                self.safescale, _SimScraper(self),
+                lambda model, exclude: {p.name: p.name for p in self.pods
+                                        if p.model == model and p.awake and not p.hidden and p.name not in exclude},
+                urls=lambda model, pods: {name: name for name in pods},
+                poll_ms=float(self.poll_ms), clock_ms=lambda: self.now, hidden_scrape=True,
+                gateway_inflight=lambda pods: 0.0,  # the mock SM drains a hidden pod at once
+            )
+        else:
+            self.safescale = SafeScaleStateMachine(config=SafeScaleConfig(**slo), grid=EvidenceGrid(self.period))
         self.store = MetricsStore(
             self.redis, self.registry, instant_sample_interval_ms=INSTANT, evidence_period_ms=self.period,
             expected_cadence=(INSTANT, self.period), cadence_enforce=True,
             min_sample_ratio=float(self.registry.scaling().sample_min_ratio or 0.0),
             suffix_period_ms=self.period,
             suffix_breakpoint=lambda m: self.signal_state.breakpoint_ms(m) if self.signal_state.o1_active else None,
-            suffix_tail=self.safescale.tail_span_ms,
+            suffix_tail=self.safescale.tail_start_ms,
         )
         self.box = SnapshotBox()
         self.queue = _Queue(self)
@@ -238,7 +272,8 @@ class Sim:
                     pod.busy_since = ts
                 # The first requests of a busy period complete only after one e2e.
                 warm = pod.busy_since is not None and ts - pod.busy_since >= 1000.0 * out / speed
-                done = running * speed / out * dt if warm else 0.0
+                rng = random.Random(f"{pod.name}:{ts}")
+                done = float(_poisson(rng, running * speed / out * dt)) if warm else 0.0
                 pod.count += done
                 pod.gen += done * out
                 ttft = 0.08 + 0.25 * waiting
@@ -250,6 +285,7 @@ class Sim:
                 pod.gauges = (running, waiting, min(1.0, (running + 4.0 * waiting) / 18.0))
         if self._stalled(ts):
             return
+        ts = ts + self.offset  # every gateway stamp is on the gateway clock
         for pod in self.pods:
             base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod.name, "scraped_ms": ts - 50}
             running, waiting, kv = pod.gauges
@@ -265,10 +301,11 @@ class Sim:
                     f"{pod.model}/time_per_output_token_seconds": _hist(pod.gen, pod.gen / 150.0, TPOT_BOUNDS, pod.tpot),
                     f"{pod.model}/e2e_request_latency_seconds": _hist(pod.count, pod.e2e_sum, E2E_BOUNDS, pod.e2e),
                 }}, ts)
-        self.redis.hashes["tre:v2:gateway:cadence"] = {
-            "instant_ms": str(INSTANT), "evidence_ms": str(self.period), "written_ms": str(ts + 5),
-            "last_round_ms": str(ts), "version": "sim",
-        }
+        cadence = self.redis.hashes.setdefault("tre:v2:gateway:cadence", {})
+        cadence.update({"instant_ms": str(INSTANT), "evidence_ms": str(self.period), "written_ms": str(ts + 5),
+                        "version": "sim"})
+        if ts % self.period == 0:
+            cadence["last_hist_ms"] = str(ts)  # the boundary's histogram docs are written
 
     def view(self) -> ClusterView:
         bindings = tuple(
@@ -317,6 +354,9 @@ class Sim:
             for name in action.pods:
                 self._pod(name).hidden = True
             self.run.events.append((t, f"hide:{action.model}"))
+            if self.collector is not None:
+                # The SM confirmed the hide (ActionQueue on_hide_done): anchor + baseline.
+                self.collector.on_hide_done(action.model, tuple(action.pods))
         elif isinstance(action, UnhideAction):
             for name in set(action.pods) - set(action.keep_hidden):
                 self._pod(name).hidden = False
@@ -324,7 +364,7 @@ class Sim:
 
     # ---------------------------------------------------------------- the controller
 
-    def _tick(self, t: int) -> None:
+    async def _tick(self, t: int) -> None:
         snapshot = self.box.get()
         if snapshot is None:
             return
@@ -333,9 +373,10 @@ class Sim:
                 self.run.events.append((t, "stale"))
             return
         if (t - T0) % self.poll_ms == 0:
+            polls = await self.collector.poll() if self.collector is not None else None
             result = run_safescale_observation_tick(
                 snapshot, queue=self.queue, registry=self.registry, safescale=self.safescale,
-                signal_state=self.signal_state, cluster_view=self.view(),
+                signal_state=self.signal_state, cluster_view=self.view(), direct_polls=polls,
             )
             for event in result.events:
                 self.run.events.append((t, event))
@@ -357,17 +398,30 @@ class Sim:
                     # O1: the reason the model's window decides nothing (None = it decides).
                     self.run.events.append((t, f"hold:{model}:{context.get('signal_hold_reason')}"))
 
-    def _advance(self, until: int) -> None:
+    async def _advance(self, until: int) -> None:
         while self.now < until:
             self.now += 250
             if self.now % INSTANT == 0 and self.now > self.rendered:
                 self._render(self.now)
                 self.rendered = self.now
             if self.now % 1000 == 250:
-                self._tick(self.now - 250)
+                await self._tick(self.now - 250)
+            if self.collector is not None:
+                for _ in range(4):  # let the baseline task of a hide just confirmed run now
+                    await asyncio.sleep(0)
 
     async def _sleep(self, seconds: float) -> None:
-        self._advance(self.now + int(round(seconds * 1000)))
+        await self._advance(self.now + int(round(seconds * 1000)))
+
+    def pod_scrape(self, name: str) -> PodScrape:
+        """A direct /metrics read of a sim pod (controller clock)."""
+        pod = self._pod(name)
+        running, waiting, kv = pod.gauges
+        return PodScrape(
+            ts_ms=self.now, started_ms=self.now, ttft=_cumulative(pod.count, TTFT_BOUNDS, pod.ttft),
+            tpot=_cumulative(pod.gen, TPOT_BOUNDS, pod.tpot), prompt=(pod.count * PROMPT_TOKENS, pod.count),
+            kv_cache=kv, awake=pod.awake, in_flight=running + waiting,
+        )
 
     def go(self) -> Run:
         for ts in range(self.rendered + INSTANT, T0 + 1, INSTANT):
@@ -381,6 +435,55 @@ class Sim:
 
         asyncio.run(main())
         return self.run
+
+
+class _SimScraper:
+    def __init__(self, sim: Sim) -> None:
+        self._sim = sim
+
+    async def scrape(self, targets, *, model_name=None):
+        return {name: self._sim.pod_scrape(name) for name in targets}
+
+
+class _SimEvidence:
+    """The hide anchor of the direct path (``MetricsEvidenceReader.hide_anchor``):
+    Redis TIME (the gateway node's clock here) and the model's newest histogram doc
+    stamp (gateway clock), with the controller clock beside them."""
+
+    def __init__(self, sim: Sim) -> None:
+        self._sim = sim
+
+    def hide_anchor(self, model: str) -> HideAnchor:
+        sim = self._sim
+        newest = None
+        for pod in (p for p in sim.pods if p.model == model):
+            docs = sim.redis.zrevrangebyscore(f"tre:v2:hist:default/{pod.name}", float("inf"), float("-inf"), 0, 1)
+            if docs:
+                stamp = int(json.loads(docs[0])["timestamp"])
+                newest = stamp if newest is None else max(newest, stamp)
+        return HideAnchor(ts_ms=sim.now + sim.offset, source="redis_time", newest_doc_ts_ms=newest,
+                          controller_ts_ms=sim.now)
+
+    def read(self, model, *, start_ms, end_ms, exclude_pods):  # the Redis path only
+        raise AssertionError("the direct path never reads the Redis evidence")
+
+
+def _poisson(rng: random.Random, lam: float) -> int:
+    if lam <= 0.0:
+        return 0
+    limit, k, product = math.exp(-lam), 0, rng.random()
+    while product > limit:
+        k += 1
+        product *= rng.random()
+    return k
+
+
+def _cumulative(count: float, bounds: tuple[float, ...], buckets: list) -> Hist:
+    running, out = 0.0, []
+    for bound, n in zip((*bounds, float("inf")), buckets):
+        running += n
+        out.append((float(bound), running))
+    return Hist(count=float(count), buckets=tuple(out))
 
 
 def _hist(count: float, sum_: float, bounds: tuple[float, ...], buckets: list | None = None) -> dict:

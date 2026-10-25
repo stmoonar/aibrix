@@ -87,13 +87,14 @@ def test_commits_at_the_first_poll_that_meets_every_condition():
     h.start()
     at, decision = _first_terminal(h, HIDE + LONG_W)
     # Polls every 2 s from 105 s: 20 samples are there early; the newest snapshot's
-    # newest observation (130 s) is 27 s after the hide confirmation (103 s) - >= the 20 s
-    # min_evidence_ms - from the 131 s poll (at 121 s it is 17 s), and one p95 e2e has
-    # long passed (Q4: no W / 2 term) -> the 131 s poll.
+    # newest observation (130 s) is 20 s after the post-hide start (110 s: the first
+    # gateway boundary after the newest doc at the hide, 100 s; round 5 M1 - the gateway
+    # clock, not the controller-clock confirmation) - >= the 20 s min_evidence_ms - from
+    # the 131 s poll (at 121 s it is 10 s), and one p95 e2e has long passed -> 131 s.
     assert (at, decision.status, decision.reason) == (131_000, "commit", "formal_commit_gate_passed")
     early = decision.details["early_commit"]
     assert early["elapsed_ms"] == 28_000 and early["min_elapsed_ms"] < 28_000 and early["samples"] >= 20
-    assert early["post_hide_observed_ms"] == 27_000
+    assert early["post_hide_observed_ms"] == 20_000
     assert early["planned_deadline_ms"] == HIDE + LONG_W
     assert (early["hidden_in_flight"], early["gateway_in_flight"]) == (0.0, 0.0)
     assert decision.commands[0].kind == "scale_down" and decision.commands[0].pods == ("m-1",)

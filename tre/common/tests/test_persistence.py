@@ -68,6 +68,17 @@ def test_a_re_read_of_the_same_observation_is_not_new_evidence():
     assert rule.observe(SPAN, True) is True
 
 
+def test_a_false_verdict_resets_even_at_an_observation_time_already_seen():
+    # Round 5 (L3): the same snapshot re-read once its verdict turned false (another
+    # gate closed) must not keep the earlier span alive.
+    rule = Persistence(SPAN)
+    assert rule.observe(0, True) is False
+    assert rule.observe(SPAN - 2_000, True) is False
+    assert rule.observe(SPAN - 2_000, False) is False
+    assert rule.held_ms == 0
+    assert rule.observe(SPAN, True) is False  # a new span starts here
+
+
 def test_a_pod_set_observation_does_not_depend_on_the_pod_order():
     for seed in range(200):
         rng = random.Random(seed)
@@ -75,9 +86,6 @@ def test_a_pod_set_observation_does_not_depend_on_the_pod_order():
             None if rng.random() < 0.1 else Observed(
                 t_first_ms=None if rng.random() < 0.1 else rng.randrange(0, 50_000),
                 t_last_ms=None if rng.random() < 0.1 else rng.randrange(50_000, 100_000),
-                n_obs=rng.randrange(0, 60),
-                requests=None if rng.random() < 0.2 else float(rng.randrange(0, 500)),
-                flags=frozenset(rng.sample(["a", "b", "c", "d"], rng.randrange(0, 3))),
             )
             for _ in range(rng.randrange(1, 8))
         ]

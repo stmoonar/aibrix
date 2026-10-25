@@ -16,12 +16,13 @@ snapshot stale (TRE_GATEWAY_INTERVAL_CHECK=fail, the default) or only logs (warn
 replaces the former inference from doc spacing, which was startup-only and failed on
 the mixed stamps of a gateway upgrade.
 
-Round 4 (docs/design/20261025-instant-sampling.md "Evidence, not ticks"): the hash
-also carries ``last_round_ms``, the instant stamp of the round whose MULTI wrote it. It
-is the gateway's liveness evidence: the phase-aligned sampler takes a window ending at
-``E`` as complete once ``last_round_ms >= E`` (a round late by a few hundred ms is
-stamped with the next instant boundary and still proves it). A declaration without the
-field (a gateway image before round 4) is ``gateway_cadence_no_round``. (Round 3 M5
+Round 5 (docs/design/20261025-instant-sampling.md "Evidence, not ticks"): the hash
+also carries ``last_hist_ms``, the histogram boundary of the newest round whose
+histogram docs were all built, written in that round's MULTI. It is the gateway's
+liveness evidence: the phase-aligned sampler takes a window ending at ``E`` as complete
+once ``last_hist_ms >= E`` (a round a few hundred ms late still writes boundary ``E``;
+an instant-only round does not move it). A declaration without the field (a gateway
+image before round 5) is ``gateway_cadence_no_hist``. (Round 3 M5
 compared ``written_ms`` with the window end here; that freshness rule moved to the
 sampler, so a late gateway is retried and held like any late round instead of marking
 the snapshot stale on the spot.)
@@ -42,19 +43,19 @@ def _int(raw: Mapping[str, Any], key: str) -> int | None:
         return None
 
 
-#: The problem code of a declaration without ``last_round_ms`` (round 4).
-CADENCE_NO_ROUND = "gateway_cadence_no_round"
+#: The problem code of a declaration without ``last_hist_ms`` (round 5).
+CADENCE_NO_HIST = "gateway_cadence_no_hist"
 
 
-def last_round_ms(raw: Mapping[Any, Any] | None) -> int | None:
-    """``last_round_ms`` of the declaration (None: absent / unreadable)."""
+def last_hist_ms(raw: Mapping[Any, Any] | None) -> int | None:
+    """``last_hist_ms`` of the declaration (None: absent / unreadable)."""
     declared = {_text(key): value for key, value in (raw or {}).items()}
-    return _int(declared, "last_round_ms")
+    return _int(declared, "last_hist_ms")
 
 
 def cadence_problem(raw: Mapping[Any, Any] | None, *, instant_ms: int, evidence_ms: int) -> str | None:
     """None when the declared cadence equals the controller's periods and carries the
-    gateway's ``last_round_ms``, else why not."""
+    gateway's ``last_hist_ms``, else why not."""
     declared = {_text(key): value for key, value in (raw or {}).items()}
     if not declared:
         return "gateway_cadence_missing"
@@ -66,6 +67,6 @@ def cadence_problem(raw: Mapping[Any, Any] | None, *, instant_ms: int, evidence_
             f" != controller TRE_INSTANT_SAMPLE_INTERVAL_MS={int(instant_ms)}"
             f" TRE_EVIDENCE_PERIOD_MS={int(evidence_ms)}"
         )
-    if _int(declared, "last_round_ms") is None:
-        return CADENCE_NO_ROUND
+    if _int(declared, "last_hist_ms") is None:
+        return CADENCE_NO_HIST
     return None

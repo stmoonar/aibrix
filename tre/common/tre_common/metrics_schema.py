@@ -14,19 +14,16 @@ class Observed:
 
     * ``t_first_ms``: where the window's evidence starts - the observation of the token
       baseline (the histogram doc the deltas start from), else the first observation;
-    * ``t_last_ms``: the newest observation in the window;
-    * ``n_obs``: distinct observation times in the window;
-    * ``requests``: completed requests observed (histogram count delta, unscaled);
-    * ``flags``: pods whose evidence is doubtful (the store's donor-gate flag).
+    * ``t_last_ms``: the newest observation in the window.
+
+    (Round 5: only what a decision reads. Observation counts, request counts and flags
+    live on the window itself - ``request_count_observed``, ``sample_incomplete_pods``.)
 
     The evidence period is a storage detail: a decision rule reads spans of these
     times (``t_last - t_ref``), never a count of windows. None = unknown."""
 
     t_first_ms: int | None = None
     t_last_ms: int | None = None
-    n_obs: int = 0
-    requests: float | None = None
-    flags: frozenset[str] = frozenset()
 
     @property
     def span_ms(self) -> int:
@@ -49,21 +46,16 @@ class Observed:
 
     @classmethod
     def merge(cls, items: Iterable["Observed | None"]) -> "Observed | None":
-        """The observation of several pods together: earliest start, newest end, the
-        fewest observations, the requests summed, the flags united. Order-independent;
-        None when no item is known."""
+        """The observation of several pods together: earliest start, newest end.
+        Order-independent; None when no item is known."""
         known = [item for item in items if item is not None]
         if not known:
             return None
         firsts = [item.t_first_ms for item in known if item.t_first_ms is not None]
         lasts = [item.t_last_ms for item in known if item.t_last_ms is not None]
-        requests = [item.requests for item in known if item.requests is not None]
         return cls(
             t_first_ms=min(firsts) if firsts else None,
             t_last_ms=max(lasts) if lasts else None,
-            n_obs=min(item.n_obs for item in known),
-            requests=sum(requests) if requests else None,
-            flags=frozenset().union(*(item.flags for item in known)),
         )
 
 
@@ -137,6 +129,11 @@ class PodWindowMetrics:
     latest_running: float | None = field(default=None, compare=False)
     latest_gpu_cache: float | None = field(default=None, compare=False)
     latest_instant_ms: int | None = field(default=None, compare=False)
+    #: Round 5 (M2): the newest sample is current - observed within the producer's
+    #: cadence of the window end (the store's ``scrape_current_pods`` rule). A stale one
+    #: is not a sample of the engine now (saturation rescue). True for windows the store
+    #: did not build (synthetic / offline).
+    latest_current: bool = field(default=True, compare=False)
     #: Round 4: the pod's observation of the window (:class:`Observed`); None = not
     #: read on the observation clock (v1 schema, offline / synthetic windows).
     observed: Observed | None = field(default=None, compare=False)
@@ -226,11 +223,11 @@ class MetricsSnapshot:
     stale: bool
     #: Why the store marked the snapshot stale (e.g. a gateway cadence mismatch).
     stale_reason: str | None = field(default=None, compare=False)
-    #: Round 4: the stamp of the newest round the gateway wrote (``last_round_ms`` of
-    #: ``tre:v2:gateway:cadence``, written in the round's MULTI). The sampler's
+    #: Round 5: the newest histogram boundary the gateway wrote completely
+    #: (``last_hist_ms`` of ``tre:v2:gateway:cadence``, in the round's MULTI). The sampler's
     #: freshness rule: a window ending at ``E`` is complete once this is >= ``E``.
     #: None = not read (no cadence check, v1 schema, offline).
-    gateway_last_round_ms: int | None = field(default=None, compare=False)
+    gateway_last_hist_ms: int | None = field(default=None, compare=False)
 
 
 def observed_requests(metrics: Any) -> float | None:
@@ -247,9 +244,4 @@ def observed_of(metrics: Any) -> Observed:
     observed = getattr(metrics, "observed", None)
     if observed is not None:
         return observed
-    return Observed(
-        t_first_ms=int(metrics.window_start_ms),
-        t_last_ms=int(metrics.window_end_ms),
-        n_obs=0,
-        requests=observed_requests(metrics),
-    )
+    return Observed(t_first_ms=int(metrics.window_start_ms), t_last_ms=int(metrics.window_end_ms))

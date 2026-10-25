@@ -76,13 +76,19 @@ class ProbeObservation:
     #: Round 4: the window's newest observation (gateway ``scraped_ms``; the evidence
     #: spans after the hide / a rollback are measured to it). None = unknown.
     observed_ms: int | None = None
-    #: Round 4 (the commit gate's tail, one value over one span): the snapshot's
-    #: suffix window from ``tail_start_ms`` to its end, the latest ``hq x W`` of the
-    #: probe (the store aligns the start to its docs, at or before ``end - hq x W``):
-    #: its raw Z (no EMA, numerator scaled to a whole window), traffic, the remaining
-    #: pods' time-weighted KV-cache fill and its latency p95s. ``tail_start_ms`` None =
-    #: no tail suffix in the snapshot (the gate then reads the whole window).
+    #: Round 5 (H1; the commit gate's tail, one value over one span): the post-hide
+    #: part of the snapshot's window - from ``tail_start_ms`` (the first gateway doc
+    #: boundary at or after the probe's post-hide start; the window start once the hide
+    #: precedes the window) to its end: its raw Z (no EMA, numerator scaled to a whole
+    #: window), traffic, the remaining pods' time-weighted KV-cache fill and its latency
+    #: p95s; and its evidence - ``tail_observed_ms`` (observed span, gateway
+    #: ``scraped_ms``) and ``tail_requests`` (requests the remaining pods completed in
+    #: it; None = unknown: a synthetic window without counts). ``tail_start_ms`` None =
+    #: no probe tail asked (offline / direct constructions: the gate reads the whole
+    #: window); ``tail_observed_ms`` None = the snapshot has no post-hide span yet.
     tail_start_ms: int | None = None
+    tail_requests: float | None = None
+    tail_observed_ms: int | None = None
     tail_z_m: float | None = None
     tail_has_traffic: bool = False
     tail_gpu_cache: float | None = None
@@ -238,6 +244,14 @@ class ProbeTailSummary:
     #: precedes the hide (mean and max of one value).
     pre_hide_fraction_mean: float | None = None
     pre_hide_fraction_max: float | None = None
+    #: Round 5 (H1): the tail carries enough evidence for its Z - no traffic, at least
+    #: ``min_commit_samples`` requests completed by the remaining pods in it, or a tail
+    #: that is a whole metrics window (the hide precedes the window).
+    #: False = too few (or no post-hide span yet): the gate waits / extends instead of
+    #: failing on a noisy Z; at the W ceiling it judges what there is (counted apart).
+    evidence_ok: bool = True
+    tail_requests: float | None = None
+    tail_observed_ms: int | None = None
 
 
 class SafeScaleStateMachine:
@@ -904,8 +918,10 @@ class SafeScaleStateMachine:
     ) -> SafeScaleDecision | None:
         """The formal commit gate (v1 _tail_summary_allows_commit) at the deadline.
 
-        Z comes from the tail span of the newest snapshot (round 4: the latest
-        ``hq x W``, one value - :func:`_summarize_tail`). The latency check (and, on the direct path, the KV-cache fill) reads the direct
+        Z comes from the tail of the newest snapshot (round 5: its post-hide span, up
+        to one metrics window, one value - :func:`_summarize_tail`); with fewer than
+        ``min_commit_samples`` requests in it the gate extends (to the W ceiling)
+        instead of judging a noisy Z. The latency check (and, on the direct path, the KV-cache fill) reads the direct
         scrape window (:meth:`_direct_outcome`), else the post-hide Redis evidence window
         (:meth:`_evidence_outcome`) when an evidence source is wired; without either
         (direct constructions) it reads the tail snapshots, as before 2026-09-29.
@@ -925,6 +941,7 @@ class SafeScaleStateMachine:
             thresholds=lambda observation: self._thresholds_for(model, observation.mean_prompt_tokens),
             judge_latency=not (evidence_mode or direct_live),
             hide_ts_ms=self._hide_reference_ms(probe),
+            min_requests=float(getattr(self._config, "min_commit_samples", 20) or 0),
         )
         newest = _newest_observation(probe)
         tail_audit = {
@@ -932,12 +949,16 @@ class SafeScaleStateMachine:
             "tail_pre_hide_fraction_mean": summary.pre_hide_fraction_mean,
             "tail_pre_hide_fraction_max": summary.pre_hide_fraction_max,
             "tail_observation_count": summary.tail_count,
-            # Round 4: the tail span the gate judged (one value over one span).
+            # Round 5: the tail span the gate judged (one value over one span) and its
+            # evidence (observed span, completed requests, the floor).
             "tail_start_ms": None if newest is None else (
                 newest.tail_start_ms if newest.tail_start_ms is not None else newest.window_start_ms
             ),
             "tail_end_ms": None if newest is None else newest.window_end_ms,
-            "tail_span_ms": self.tail_span_ms(model),
+            "tail_observed_ms": summary.tail_observed_ms,
+            "tail_requests": summary.tail_requests,
+            "tail_min_requests": int(getattr(self._config, "min_commit_samples", 20) or 0),
+            "tail_evidence_ok": summary.evidence_ok,
             "z_source": "redis_snapshot_tail",
             "z_ts_ms": _latest_window_end(probe),
             # Both KV sources are recorded; the gate uses kv_source.
@@ -1010,12 +1031,28 @@ class SafeScaleStateMachine:
                 "extensions": probe.extensions,
                 "clamped": bool(probe.window_terms.get("clamped")),
             }
+        tail_low_evidence = False
+        if not idle and summary.latency_ok and not summary.evidence_ok:
+            # Round 5 (H1): a tail shorter than one metrics window with too few post-hide
+            # requests for its Z - insufficient evidence, not a failure: extend (the next
+            # snapshot covers more), up to the W ceiling; there the Z is judged on what
+            # there is and counted apart.
+            if early is not None:
+                return None
+            if probe.deadline_ms < _deadline_cap(probe, self._config):
+                return self._extend(
+                    probe, {**tail_audit, **latency_audit, "extend_reason": "tail_low_evidence"},
+                    direct_now_ms=int(wall_now_ms or now_ms) if (self._direct_mode and direct_live) else None,
+                )
+            tail_low_evidence = True
         failures = () if idle else tail_gate_failures(
             summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
         )
         if early is not None and failures:
             return None
         audit = {**tail_audit, **latency_audit}
+        if tail_low_evidence:
+            audit["tail_low_evidence"] = True
         if early is not None:
             audit["early_commit"] = {key: value for key, value in early.items() if key != "deadline_ms"}
         details: dict[str, Any] = {
@@ -1419,8 +1456,9 @@ class SafeScaleStateMachine:
         plugin instances and vLLM running + waiting both known and 0 - and (d) one
         evidence floor: the newest snapshot window was observed for
         ``early_commit_min_evidence_ms`` (= ``scaling.min_evidence_ms``, the O1 warm
-        rule) after the hide confirmation (round 4: its newest observation minus the
-        confirmation, not a count of post-hide doc boundaries) AND at least the donor's
+        rule) after the hide (round 5: its newest observation minus the first gateway
+        doc boundary after the hide, both on the gateway clock; not a count of post-hide
+        doc boundaries) AND at least the donor's
         p95 end-to-end latency passed since the hide confirmation (the remaining pods'
         concurrency needs about one e2e to settle). No fixed share of W and no separate
         minimum observation time.
@@ -1455,16 +1493,19 @@ class SafeScaleStateMachine:
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
         if not window.p95_available or window.judged_count < max(1, min_samples):
             return None
-        # O1-style warm tail (round 4): the newest snapshot window's newest observation
-        # lies ``min_evidence_ms`` after the hide confirmation (observation time).
-        confirmed = _hide_confirm_ms(probe)
+        # O1-style warm tail (round 5, M1: one clock domain): the newest snapshot
+        # window's newest observation (gateway ``scraped_ms``) lies ``min_evidence_ms``
+        # after the post-hide start - the first gateway doc boundary after the hide
+        # (:meth:`_post_hide_start`, gateway clock too), never the controller-clock
+        # confirmation (the two clocks differ by the node skew).
+        start = self._post_hide_start(probe)
         newest = _newest_observation(probe)
         observed = newest.observed_ms if newest is not None and newest.observed_ms is not None else (
             newest.window_end_ms if newest is not None else None
         )
-        if confirmed is None or observed is None:
+        if start is None or observed is None:
             return None
-        post_hide_ms = int(observed) - int(confirmed)
+        post_hide_ms = int(observed) - int(start)
         if not span_reaches(post_hide_ms, min_evidence_ms):
             return None
         drained = _hidden_drained(probe, poll)
@@ -1574,31 +1615,34 @@ class SafeScaleStateMachine:
         return replace(decision, details={**decision.details, **record})
 
     def _instant_violation(self, probe: SafeScaleProbe, observation: ProbeObservation) -> dict[str, Any] | None:
-        """The immediate SLO rollback of one snapshot, judged only when its whole
-        window follows the hide: its baseline doc is stamped at or after the first
-        gateway boundary after the hide (window_start_ms >= S). Round 4: and only on
-        windows that do not overlap a window already judged (rule (d): overlapping
-        windows are not independent evidence; at a 2 s evidence period five times as
-        many overlapping snapshots would get a chance to trip it). None = no violation /
-        not judged (pre-hide or overlapping window, unknown window, hide unconfirmed)."""
+        """The immediate SLO rollback, judged on every new snapshot (round 5, L1): one
+        value over the post-hide span ``[S, E]`` of the snapshot - its tail
+        (:attr:`ProbeObservation.tail_start_ms`, from the first gateway doc boundary
+        after the hide; at most one window) - once ``min_commit_samples`` requests of
+        the remaining pods completed in it, like the direct path's rule. A snapshot
+        without a tail asked (offline / direct constructions) is judged on its whole
+        window once that follows the hide (window_start_ms >= S). None = no violation /
+        not judged (no post-hide span or too few requests yet, hide unconfirmed)."""
         hide_ts = self._post_hide_start(probe)
-        start = observation.window_start_ms
-        if hide_ts is None or start is None or int(start) < int(hide_ts):
+        if hide_ts is None:
             return None
-        judged_until: int | None = None
-        for seen in probe.observations:
-            if seen is observation or seen.window_start_ms is None or seen.window_end_ms is None:
-                continue
-            if int(seen.window_start_ms) < int(hide_ts) or int(seen.window_end_ms) >= int(observation.window_end_ms or 0):
-                continue
-            if judged_until is None or int(seen.window_start_ms) >= judged_until:
-                judged_until = int(seen.window_end_ms)
-        if judged_until is not None and int(start) < judged_until:
-            return None
+        if observation.tail_start_ms is not None:
+            start = observation.tail_start_ms
+            if observation.tail_observed_ms is None or int(start) < int(hide_ts):
+                return None
+            min_samples = int(getattr(self._config, "min_commit_samples", 20) or 0)
+            requests = observation.tail_requests
+            if min_samples > 0 and requests is not None and float(requests) < min_samples:
+                return None
+            ttft, tpot = observation.tail_ttft_p95_ms, observation.tail_tpot_p95_ms
+        else:
+            start = observation.window_start_ms
+            if start is None or int(start) < int(hide_ts):
+                return None
+            # max(per pod, pooled), as the deadline gate judges (2026-09-29 review P3).
+            ttft = _max_present(observation.ttft_p95_ms, observation.pooled_ttft_p95_ms)
+            tpot = _max_present(observation.tpot_p95_ms, observation.pooled_tpot_p95_ms)
         thresholds = self._thresholds_for(probe.model, observation.mean_prompt_tokens)
-        # max(per pod, pooled), as the deadline gate judges (2026-09-29 review P3).
-        ttft = _max_present(observation.ttft_p95_ms, observation.pooled_ttft_p95_ms)
-        tpot = _max_present(observation.tpot_p95_ms, observation.pooled_tpot_p95_ms)
         metrics = _latency_violations(ttft, tpot, thresholds)
         if not metrics:
             return None
@@ -1612,9 +1656,10 @@ class SafeScaleStateMachine:
             "ttft_threshold_ms": thresholds["ttft_ms"],
             "tpot_threshold_ms": thresholds["tpot_ms"],
             "threshold_mode": thresholds["mode"],
-            "window_start_ms": observation.window_start_ms,
+            "window_start_ms": int(start),
             "window_end_ms": observation.window_end_ms,
             "evidence_start_ms": hide_ts,
+            "tail_requests": observation.tail_requests,
         }
 
     def _post_hide_start(self, probe: SafeScaleProbe) -> int | None:
@@ -1633,16 +1678,18 @@ class SafeScaleStateMachine:
             return confirmed if confirmed is not None else int(probe.start_ms)
         return self._post_hide_start(probe)
 
-    def tail_span_ms(self, model: str) -> int | None:
-        """Round 4: the span the commit gate's tail covers for ``model``'s probe -
-        ``hq x W`` (hq >= 1 is a span in windows: 1 x W). None without a probing probe.
-        The metrics store builds the snapshot suffix starting at or before
-        ``end - span`` (``MetricsStore(suffix_tail=...)``)."""
+    def tail_start_ms(self, model: str) -> int | None:
+        """Round 5 (H1): where the commit gate's tail of ``model``'s probe starts - the
+        post-hide start (:meth:`_post_hide_start`: the first gateway doc boundary after
+        the confirmed hide, gateway clock; the planned start without an evidence
+        source). The metrics store builds the snapshot suffix from the first doc
+        boundary at or after it (``MetricsStore(suffix_tail=...)``); once the hide
+        precedes the window the whole window is the tail. None without a probing probe
+        or before the hide is confirmed (no post-hide evidence yet)."""
         probe = self._probes.get(model)
-        if probe is None or probe.status != "probing" or not probe.window_ms:
+        if probe is None or probe.status != "probing":
             return None
-        hq = float(getattr(self._config, "hq", 0.25) or 0.25)
-        return max(1, int(float(probe.window_ms) * (hq if hq < 1.0 else 1.0)))
+        return self._post_hide_start(probe)
 
     def _thresholds_for(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
         if self._thresholds is not None:
@@ -2106,26 +2153,32 @@ def _summarize_tail(
     thresholds: Callable[[ProbeObservation], dict[str, Any]] | None = None,
     judge_latency: bool = True,
     hide_ts_ms: int | None = None,
+    min_requests: float = 0.0,
 ) -> ProbeTailSummary:
     """The commit gate's tail: ONE span, ONE value per quantity (round 4, rule (d) of
     docs/design/20261025-instant-sampling.md "Evidence, not ticks").
 
-    The span is the newest snapshot's tail suffix, the probe's latest ``hq x W``
-    (:attr:`ProbeObservation.tail_start_ms`): its raw Z, traffic, the remaining pods'
-    time-weighted KV-cache fill and - with ``judge_latency`` (no evidence source) - its
-    latency p95s against ``thresholds(observation)`` or the fixed ``*_slo_ms`` values.
-    A snapshot without the tail suffix (a store that does not build it: offline /
-    direct constructions) is judged on its whole window instead.
+    The span is the newest snapshot's post-hide tail (round 5,
+    :attr:`ProbeObservation.tail_start_ms` to the window end, at most one window): its
+    raw Z, traffic, the remaining pods' time-weighted KV-cache fill and - with
+    ``judge_latency`` (no evidence source) - its latency p95s against
+    ``thresholds(observation)`` or the fixed ``*_slo_ms`` values. ``evidence_ok``: no
+    traffic, at least ``min_requests`` requests completed in the tail, or a tail that is
+    the whole window (one metrics window of post-hide evidence: the planner's unit). A snapshot
+    without a tail asked (offline / direct constructions) is judged on its whole window
+    (evidence_ok); one whose post-hide span is not built yet carries no tail evidence
+    (evidence_ok False; its whole window stands in at the W ceiling).
 
     Until round 4 the tail was the last ``max(2, ceil(hq x N))`` snapshot observations,
     Z = their min and KV = their max: overlapping 30 s windows are not independent, and
     at a 2 s evidence period five times as many of them got a chance to dip. ``hq`` is
-    kept for the call sites (the span is :meth:`SafeScaleStateMachine.tail_span_ms`)."""
+    kept for the call sites (the start is :meth:`SafeScaleStateMachine.tail_start_ms`)."""
     observations = probe.observations
     if not observations:
         return ProbeTailSummary(latency_ok=True, z_min=None, has_traffic=False, sample_count=0, tail_count=0)
     newest = max(observations, key=_observation_key)
-    if newest.tail_start_ms is not None:
+    has_tail = newest.tail_start_ms is not None and newest.tail_observed_ms is not None
+    if has_tail:
         z, has_traffic, kv = newest.tail_z_m, newest.tail_has_traffic, newest.tail_gpu_cache
         ttft, tpot, start = newest.tail_ttft_p95_ms, newest.tail_tpot_p95_ms, newest.tail_start_ms
     else:
@@ -2146,6 +2199,16 @@ def _summarize_tail(
     z_min = float(z) if z is not None else None
     if z_min is None and not has_traffic:
         z_min = float("inf")
+    if has_tail:
+        # Enough: no traffic, the request floor, or a tail that is a whole metrics window
+        # (the planner's own evidence unit - a sliding window gains no requests by waiting).
+        requests = newest.tail_requests
+        whole = newest.window_start_ms is not None and int(newest.tail_start_ms) <= int(newest.window_start_ms)
+        evidence_ok = not has_traffic or requests is None or whole or float(requests) >= float(min_requests)
+    else:
+        # No tail asked (offline / direct constructions): the whole window, as before.
+        # A tail asked but not built yet: no post-hide evidence.
+        evidence_ok = newest.tail_start_ms is None
     span = ProbeObservation(ts_ms=newest.ts_ms, window_start_ms=start, window_end_ms=newest.window_end_ms)
     pre_hide = tail_pre_hide_stats((span,), hide_ts_ms=int(probe.start_ms if hide_ts_ms is None else hide_ts_ms))
     return ProbeTailSummary(
@@ -2157,6 +2220,9 @@ def _summarize_tail(
         gpu_cache_max=float(kv) if kv is not None else None,
         pre_hide_fraction_mean=pre_hide["tail_pre_hide_fraction_mean"],
         pre_hide_fraction_max=pre_hide["tail_pre_hide_fraction_max"],
+        evidence_ok=evidence_ok,
+        tail_requests=newest.tail_requests if has_tail else None,
+        tail_observed_ms=newest.tail_observed_ms if has_tail else None,
     )
 
 
@@ -2231,6 +2297,8 @@ def _tail_record(summary: ProbeTailSummary) -> dict[str, Any]:
         "tail_pre_hide_fraction_mean": summary.pre_hide_fraction_mean,
         "tail_pre_hide_fraction_max": summary.pre_hide_fraction_max,
         "tail_observation_count": summary.tail_count,
+        "tail_requests": summary.tail_requests,
+        "tail_evidence_ok": summary.evidence_ok,
     }
 
 
@@ -2304,6 +2372,8 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "pooled_tpot_p95_ms": observation.pooled_tpot_p95_ms,
         "observed_ms": observation.observed_ms,
         "tail_start_ms": observation.tail_start_ms,
+        "tail_requests": observation.tail_requests,
+        "tail_observed_ms": observation.tail_observed_ms,
         "tail_z_m": observation.tail_z_m,
         "tail_has_traffic": observation.tail_has_traffic,
         "tail_gpu_cache": observation.tail_gpu_cache,
@@ -2440,6 +2510,8 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         pooled_tpot_p95_ms=_optional_float(raw.get("pooled_tpot_p95_ms")),
         observed_ms=_optional_int(raw.get("observed_ms")),
         tail_start_ms=_optional_int(raw.get("tail_start_ms")),
+        tail_requests=_optional_float(raw.get("tail_requests")),
+        tail_observed_ms=_optional_int(raw.get("tail_observed_ms")),
         tail_z_m=_optional_float(raw.get("tail_z_m")),
         tail_has_traffic=bool(raw.get("tail_has_traffic", False)),
         tail_gpu_cache=_optional_float(raw.get("tail_gpu_cache")),

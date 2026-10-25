@@ -272,9 +272,10 @@ def test_queue_and_tokens_stay_on_one_pod_set_after_a_reset_or_a_lost_hist(case)
 def test_a_round_300_ms_late_gives_no_stale():
     """Round 4: the end round came 300 ms late - its docs carry the next instant stamp,
     so no instant doc sits at the window end (rounds 1-3 waited for that doc: the
-    window stayed stale for good). The gateway's last_round_ms (END + 500, written in
-    that round's MULTI) proves the window: the sampler publishes it on its first read,
-    no stale window, no retry. A last_round_ms before the end is not written yet."""
+    window stayed stale for good). That round still wrote the END histogram boundary;
+    the gateway's last_hist_ms (END, in that round's MULTI) proves the window: the
+    sampler publishes it on its first read, no stale window, no retry. Round 5: an older
+    last_hist_ms (only instant rounds after it) does not."""
     import asyncio
 
     from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox, window_freshness
@@ -284,7 +285,7 @@ def test_a_round_300_ms_late_gives_no_stale():
         _write_pod(redis, "m", pod, running=2, evidence=EVIDENCE_2S, missing={END})
     redis.hashes["tre:v2:gateway:cadence"] = {
         "instant_ms": str(INSTANT), "evidence_ms": str(EVIDENCE_2S), "written_ms": str(END + 805),
-        "last_round_ms": str(END + INSTANT), "version": "t",
+        "last_hist_ms": str(END), "version": "t",
     }
     store = _store(redis, _registry("m"), evidence=EVIDENCE_2S, expected_cadence=(INSTANT, EVIDENCE_2S))
     snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
@@ -304,10 +305,10 @@ def test_a_round_300_ms_late_gives_no_stale():
     assert (outcome.kind, outcome.window_end_ms, outcome.attempts) == ("published", END, 1)
     assert sampler.consecutive_stale == 0 and box.get().ts_ms == END and not box.get().stale
 
-    redis.hashes["tre:v2:gateway:cadence"]["last_round_ms"] = str(END - INSTANT)
+    redis.hashes["tre:v2:gateway:cadence"]["last_hist_ms"] = str(END - EVIDENCE_2S)
     snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
     freshness = window_freshness(snapshot, window_end_ms=END, window_ms=WINDOW, period_ms=EVIDENCE_2S)
-    assert not freshness.fresh and freshness.reason.startswith(f"round_not_written:{END}")
+    assert not freshness.fresh and freshness.reason.startswith(f"hist_not_written:{END}")
 
 
 def test_a_suffix_flag_survives_the_serving_restriction_and_holds_the_donor():

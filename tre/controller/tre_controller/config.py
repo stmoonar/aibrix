@@ -356,35 +356,9 @@ class ControllerConfig:
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
-        # N2 invariant (plan 15 §6 N2): the SafeScale commit gate only inspects the tail (hq
-        # fraction) of the probe observations; a tail observation starts at W*(1-hq) after
-        # the hide and reads a metrics window ending up to one refresh period + the read
-        # offset earlier and spanning metrics_window_ms. Fully post-hide tails would need
-        # W_floor*(1-hq) >= metrics_window + refresh + offset (30 + 10 + 2 s today). With
-        # the 20 s floor this does not hold for short probes, so it is only a warning
-        # (v1, floor 15 s, ran the same way): the tail observations of a short probe read
-        # windows that partly precede the hide. Checked on the FLOOR min_window_ms.
-        if safescale.hq < 1.0:
-            tail_span_ms = safescale.hq * safescale.min_window_ms
-        else:
-            tail_span_ms = safescale.hq * safescale.probe_poll_seconds * 1000.0
-        if metrics_refresh_mode == "phase_aligned":
-            refresh_ms = float(evidence_period_ms)
-            read_offset_ms = float(metrics_phase_offset_ms)
-        else:
-            refresh_ms = _get_positive_float(values, "TRE_METRICS_REFRESH_INTERVAL_SECONDS", 5.0) * 1000.0
-            read_offset_ms = 0.0
-        required_ms = metrics_window_ms + refresh_ms + read_offset_ms
-        if safescale.min_window_ms - tail_span_ms < required_ms:
-            LOG.warning(
-                "SAFE_SCALE_MIN_WINDOW_MS minus the commit-gate tail span is below "
-                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset: the Z / KV-cache tail "
-                "of a probe as short as the floor reads metrics windows that partly precede the "
-                "hide (as in v1, floor 15 s); the latency check reads the post-hide evidence "
-                f"window and is unaffected (min_window_ms={safescale.min_window_ms}, hq={safescale.hq}, "
-                f"metrics_window_ms={metrics_window_ms}, refresh_ms={refresh_ms}, "
-                f"read_offset_ms={read_offset_ms})"
-            )
+        # Round 5: the former N2 warning (a commit-gate tail of hq x W could read metrics
+        # windows that partly precede the hide) is gone - the tail is the post-hide
+        # suffix of the newest window (``SafeScaleStateMachine.tail_start_ms``).
 
         return cls(
             redis_url=redis_url,
