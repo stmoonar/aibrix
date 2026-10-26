@@ -1,0 +1,116 @@
+# 2026-10-26 TRE rerun after hazard (d) (rollback hold vetoed relays to receivers under receiverless_shrink; local
+# docs/smoke-v2-20261026-findings.md): controller 20261026-11cb2166. Baseline arms of campaign-v2-20261026 stay valid
+# (controller observes in those arms).
+# Tight_pool seeds 2 and 3, all 4 arms (plan: after the main 28 runs; the user may veto).
+# NOTE: results_root, the trace / config roots and the other absolute paths below are site-specific; edit them for another cluster.
+# v2 four-arm campaign (user decisions 10-26, docs campaign-v2-20261026-plan.md): 7 traces x seed 1 x 4 arms = 28 runs.
+# Arms: TRE with SafeScale only for a HIGH shrink without receiver (TRE_SAFESCALE_SCOPE=receiverless_shrink, user 10-26;
+# controller setting from fix/v2-sampling-20261025, everything else immediate; restored to unset = all after the arm),
+# TokenScale (paper cells), PreServe (faithful, mLSTM + load errors: label PreServe, not the oracle), APA.
+# Chiron is not run. Arm order inside a trace: Williams Latin-square row, rotated per trace (with 4 arms and 7 traces
+# every arm is first at least once; recorded per arm in campaign_manifest.json).
+#
+# Trace set: ONE setting each, switchable without editing this file (defaults below):
+#   CAMPAIGN_TRACE_ROOT   <root>/<trace>/seed<k>/{traces_tre.effective.json, manifest.json}
+#   CAMPAIGN_CONFIG_ROOT  <root>/<trace>/config.yaml (loadgen configs of that set; the dry-run warns when a config's
+#                         duration_seconds differs from the trace manifest's duration_s). Default: the repo's
+#                         loadgen_v1/configs/traces_v2, regenerated in place for the 720 s set (feat/traces-720-20261026)
+#   CAMPAIGN_TIGHT_POOL   name of the tight-pool trace (default Tight_pool; the 1200 s T7_tight_pool configs are gone)
+#   CAMPAIGN_DECISION_POINTS  report decision-point file for that set (default eval/configs/t7-decision-points.yaml,
+#                         the Tight_pool decision points; applies_to matches "tight" only)
+#
+#   CAMPAIGN_TRACE_ROOT=... CAMPAIGN_CONFIG_ROOT=... tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-v2-20261026.yaml --dry-run --probe
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-v2-20261026.yaml > /data/nfs_shared_data/xxy/campaign-v2-20261026.out 2>&1 &
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/<arm>      # after run 1, then every 50 min
+#
+# Before the real run (AGENTS.md "部署与合并流程" rule 6): the images on the cluster, this runner and the client must
+# be at shas that are in main and pushed; the dry-run warns when they are not. BL_CM_FILE must hold the frozen
+# policy ConfigMaps of the ported baselines (feat/bl-v1-port-20261026) once merged.
+name: campaign-v2-20261026-tp-seeds
+round: campaign-v2-20261026-tp-seeds           # exclusive-window marker: "validation <start> <end> round=campaign-v2-20261026-tp-seeds"
+results_root: /data/nfs_shared_data/xxy/campaign-v2-20261026-tp-seeds
+trace_root: ${CAMPAIGN_TRACE_ROOT}
+loadgen_config_root: ${CAMPAIGN_CONFIG_ROOT}
+seed: 1
+arms: [tre-ss-receiverless, tokenscale, preserve, apa]
+order: williams
+max_attempts: 2                     # a failed / invalid arm gets one retry after a full reset
+gap_s: 0
+# per arm: trace (720 s) + overhead. e1-envoy4: median wall - trace = 346 s; minus ~70 s saved by this runner
+# (no gateway rollouts between arms, one controller restart per arm) -> ~280 s; report ~150 s.
+eta: {overhead_s: 280, report_s: 150}
+
+env:
+  CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
+  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2}"
+  CAMPAIGN_TIGHT_POOL: "${CAMPAIGN_TIGHT_POOL:-Tight_pool}"
+  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-${TRE_REPO}/eval/configs/t7-decision-points.yaml}"
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"               # the event stream stays on between arms (every arm wants it): no gateway rollouts
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  # post-run check (first_run_check.py, run_check.json): expected periods and limits
+  RUN_CHECK_CONTROLLER_TICK_S: "5"  # controller fast loop (TRE_RESCUE_INTERVAL_SECONDS)
+  RUN_CHECK_BASELINE_TICK_S: "5"    # baseline scaler tick (TRE_BL_TICK_S, 5 s from feat/bl-v1-port-20261026)
+  RUN_CHECK_COVERAGE_MIN: "0.9"     # ticks during the load >= 0.9 x load / tick
+  RUN_CHECK_FROZEN_MAX: "0.05"      # PreServe frozen-tick share, when the policy reports it
+
+arm_defs:
+  tre-ss-receiverless:
+    base: tre
+    label: TRE-SS-receiverless
+    # the startup line ablation_switches must log safescale_scope=receiverless_shrink (ablation_switches.json
+    # keeps the effective values); a controller image without the setting refuses the arm (exit 4)
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  preserve:
+    base: preserve
+    label: PreServe                 # faithful (mLSTM, load errors), not the oracle
+    policy: {tier1: mlstm}          # history before t0: pre_t0.json next to a synthetic trace, else preserve.history_root
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
+  trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
+  match_parts: 3                    # mlstm needs >= 3 (<trace>/seed<k>/<file>: trace name + history)
+  # Real_* history (tools/preserve_history real): <history_root>/<trace>/seed<k>/preserve_history.json
+  history_root: /data/nfs_shared_data/xxy/bl-history-20261026
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${CAMPAIGN_DECISION_POINTS}   # Tight_pool (720 s) decision points; empty: none
+  ref: tre-ss-receiverless
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: ${CAMPAIGN_TIGHT_POOL}
+    seed: 2
+  - trace: ${CAMPAIGN_TIGHT_POOL}
+    seed: 3
