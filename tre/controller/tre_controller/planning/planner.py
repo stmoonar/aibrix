@@ -669,7 +669,18 @@ def build_plan(
             return True
         # One rule for every donor probe (HIGH, middle zone, same-slot shrink): a model
         # whose last probe rolled back is probed again only on new evidence.
-        return rollback_held(donor.model_name)
+        return donor_rollback_held(donor.model_name)
+
+    def donor_rollback_held(model: str) -> bool:
+        # Scope of the rollback hold (2026-10-26, Tight_pool hazard (d)): it judged one
+        # decision - "a probe that hides a replica of this model is safe on this
+        # evidence" - and blocks only a retry of that decision. With every probe on
+        # (scope ``all``) a donor for a receiver is itself such a probe: held. When a
+        # donor for a receiver is an immediate relay (``release_without_safescale``:
+        # scope ``receiverless_shrink``; scope ``off`` has no holds), it is a different
+        # decision - a LOW / CRITICAL receiver in need - and the hold does not apply.
+        # The receiver-less HIGH probe stays held in every scope (high_models loop).
+        return not cfg.release_without_safescale and rollback_held(model)
 
     def rollback_held(model: str) -> bool:
         if model not in probe_backoff_models:
@@ -914,7 +925,7 @@ def build_plan(
                         # A donor whose last probe rolled back waits for new evidence.
                         inflight_models=(
                             inflight_models | cooldown.down_blocked() | slot_shrink_donors
-                            | {item.model_name for item in high_models if rollback_held(item.model_name)}
+                            | {item.model_name for item in high_models if donor_rollback_held(item.model_name)}
                         ),
                         planned_deltas=deltas,
                         taken_serve_ids=occupancy.released_donor_ids() if occupancy is not None else set(),

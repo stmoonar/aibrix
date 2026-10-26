@@ -160,3 +160,39 @@ def test_registry_margin_key():
     for bad in (-0.1, "x", True, float("nan")):
         with pytest.raises(ValueError):
             parse_safescale_config({"rollback_retry_z_margin": bad})
+
+
+def test_a_rollback_hold_blocks_probes_not_an_immediate_relay_to_a_receiver():
+    # Tight_pool s1 hazard (d), 2026-10-26: a receiver-less probe of "donor" rolled back
+    # (hold active). Under scope receiverless_shrink a donor for a CRITICAL receiver is an
+    # immediate relay - a different decision - so the hold does not veto it; a retry of
+    # the receiver-less probe stays held. Under scope all the relay is a probe: held.
+    from tre_controller.planning.planner import TransferIntent
+
+    from test_b8_observe_probes import _probe_snapshot
+
+    registry = _registry_with_models("critical", "donor")
+    machine = _rolled_back(_machine(), z=99.0, routable=2, now_ms=5_000)
+    snapshot = _probe_snapshot()
+    donor = _metrics_with_pods("donor", generation=200.0, waiting=0.0, running=1.0, pods=("donor-a", "donor-b"))
+    snapshot = replace(snapshot, models={**snapshot.models, "donor": donor})
+
+    queue = FakeQueue()
+    relay = run_rescue_tick(snapshot, queue=queue, registry=registry, safescale=machine,
+                            safescale_scope="receiverless_shrink")
+    assert relay.classifications["critical"].state.value == "critical"
+    assert queue.submitted == [
+        (TransferIntent("donor", "critical", 1, "critical_high_donor_safescale_nosafescale", "rescue"),)
+    ]
+
+    alone = replace(snapshot, models={"donor": donor})
+    held = run_rescue_tick(alone, queue=FakeQueue(), registry=_registry_with_models("donor"),
+                           safescale=machine, safescale_scope="receiverless_shrink")
+    assert held.classifications["donor"].state.value == "high"
+    assert machine.active_probe("donor") is None
+    assert any(event.startswith("safescale_rollback_hold:donor:") for event in held.events)
+
+    probe = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=machine, safescale_scope="all")
+    assert machine.active_probe("donor") is None
+    assert not any(isinstance(a, HideAction) for a in probe.actions)
+    assert any(event.startswith("safescale_rollback_hold:donor:") for event in probe.events)
