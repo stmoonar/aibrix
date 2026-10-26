@@ -181,9 +181,12 @@ def test_a_rollback_hold_blocks_probes_not_an_immediate_relay_to_a_receiver():
     relay = run_rescue_tick(snapshot, queue=queue, registry=registry, safescale=machine,
                             safescale_scope="receiverless_shrink")
     assert relay.classifications["critical"].state.value == "critical"
-    assert queue.submitted == [
-        (TransferIntent("donor", "critical", 1, "critical_high_donor_safescale_nosafescale", "rescue"),)
-    ]
+    [(relay_intent,)] = queue.submitted
+    assert isinstance(relay_intent, TransferIntent)
+    assert (relay_intent.donor_model, relay_intent.receiver_model, relay_intent.reason) == (
+        "donor", "critical", "critical_high_donor_safescale_nosafescale"
+    )
+    assert "safescale_rollback_hold_relay_ok:donor" in relay.events
 
     alone = replace(snapshot, models={"donor": donor})
     held = run_rescue_tick(alone, queue=FakeQueue(), registry=_registry_with_models("donor"),

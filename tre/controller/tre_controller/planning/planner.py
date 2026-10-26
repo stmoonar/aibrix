@@ -509,8 +509,10 @@ def build_plan(
     preemptible_models = preemptible_models or set()
     # Models whose last SafeScale probe rolled back and whose signal does not show new
     # evidence yet (timer cleanup 2026-10-02, replaces the A13 60 s backoff): model ->
-    # hold reason (a plain set = reason "evidence"). No new probe of a HIGH donor
-    # (receiver-less or for a receiver, F1-B).
+    # hold reason (a plain set = reason "evidence"). No new probe of the model as donor
+    # (receiver-less or for a receiver, F1-B). Scope dependent (2026-10-26): with
+    # ``release_without_safescale`` a donor for a receiver is an immediate relay, not a
+    # probe, and is not held; only the receiver-less HIGH probe is.
     probe_backoff_models = (
         dict(probe_backoff_models)
         if isinstance(probe_backoff_models, Mapping)
@@ -687,6 +689,12 @@ def build_plan(
             return False
         _event_once(events, f"safescale_rollback_hold:{model}:{probe_backoff_models[model]}")
         return True
+
+    def note_relay_past_hold(model: str, gained: int) -> None:
+        # An immediate relay took a donor whose probe rollback hold would have vetoed it
+        # before 2026-10-26 (hazard (d)) - logged so a rerun shows where that happened.
+        if gained > 0 and cfg.release_without_safescale and model in probe_backoff_models:
+            _event_once(events, f"safescale_rollback_hold_relay_ok:{model}")
 
     def low_need(recv: ModelClassification) -> tuple[int, int] | None:
         """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
@@ -922,7 +930,9 @@ def build_plan(
                         # machine is keyed by model): a donor already shrunk for an earlier
                         # receiver this tick cannot start a second probe, and gives nothing
                         # else this plan (the immediate loop below takes IDLE donors only).
-                        # A donor whose last probe rolled back waits for new evidence.
+                        # A donor whose last probe rolled back waits for new evidence
+                        # while this shrink is a probe (scope ``all``); as an immediate
+                        # relay (``release_without_safescale``) it is not held.
                         inflight_models=(
                             inflight_models | cooldown.down_blocked() | slot_shrink_donors
                             | {item.model_name for item in high_models if donor_rollback_held(item.model_name)}
@@ -932,6 +942,7 @@ def build_plan(
                         source_loop="rescue",
                     )
                     if same_slot_shrink is not None:
+                        note_relay_past_hold(same_slot_shrink.donor, 1)
                         # t1: this IS a legitimate scale-down probe on a hot (HIGH) donor, but
                         # it is demand-driven preemption -- a CRITICAL receiver blocked on a
                         # fragmented TP slot and no idle capacity. Keep it (the suppress-hot
@@ -1114,6 +1125,7 @@ def build_plan(
                             view=cluster_view,
                             relay_holds=relay_holds,
                         )
+                        note_relay_past_hold(middle.model_name, gained)
                     else:
                         gained = _plan_middle_zone_probe(
                             actions,
@@ -1404,7 +1416,7 @@ def build_plan(
                 else "low_fairness_middle_zone_safescale"
             )
             if cfg.release_without_safescale:
-                needed -= _plan_transfer_intent(
+                gained = _plan_transfer_intent(
                     actions,
                     deltas,
                     occupancy,
@@ -1418,6 +1430,8 @@ def build_plan(
                     view=cluster_view,
                     relay_holds=relay_holds,
                 )
+                needed -= gained
+                note_relay_past_hold(middle.model_name, gained)
                 continue
             needed -= _plan_middle_zone_probe(
                 actions,

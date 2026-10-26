@@ -705,10 +705,12 @@ def _unresolved_probes(safescale: SafeScaleController | None) -> tuple:
 def _probe_backoff_models(
     safescale: SafeScaleController | None, snapshot: MetricsSnapshot, contexts: dict[str, dict]
 ) -> dict[str, str]:
-    """Models whose receiver-less HIGH probe is held after a rollback -> why
+    """Models held as a probe donor after a rollback -> why
     (``SafeScaleStateMachine.rollback_retry_holds``, timer cleanup 2026-10-02): the
     decision window's Z, routable count and newest observation (round 4: the observed
-    span after the rollback is the evidence a retry needs)."""
+    span after the rollback is the evidence a retry needs). The planner applies it to
+    every donor probe; under scope ``receiverless_shrink`` that is only the
+    receiver-less HIGH probe (relays to a receiver are immediate and not held)."""
     holds = getattr(safescale, "rollback_retry_holds", None)
     if not callable(holds):
         return {}
