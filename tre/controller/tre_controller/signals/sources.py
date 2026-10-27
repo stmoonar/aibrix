@@ -1,5 +1,12 @@
 """Control signals the classifier can run on: TSS (``zm``) and the ablation arms.
 
+Sources (``TRE_SIGNAL_SOURCE``): ``zm`` (TSS), the v1 ablation signals ``queue_len`` /
+``ttft_mean`` / ``kv_usage`` (definitions in :mod:`tre_common.alt_signals`), the plan
+section 6.9 rates ``decode_tps`` / ``prefill_tps``, and ``latency_p95`` (worst p95/SLO
+ratio; not fitted, not v1's latency signal - not used by the ablation). ``ttft_mean`` and
+``kv_usage`` are built from the per-pod window data and are unknown unless every routable
+replica reported (:func:`_serving_pods`).
+
 Every alternative signal goes through :func:`_thresholded_signal`: its raw value comes
 from :mod:`tre_common.alt_signals` (the same function the offline fit uses), is smoothed
 there by the shared wall-clock EMA (:func:`tre_common.tss.signal_ema`, the registry's
@@ -16,11 +23,13 @@ from typing import TYPE_CHECKING
 from tre_common.alt_signals import (
     EPS,
     Z_MAX,
+    kv_headroom,
     normalize_signal_value,
     queue_len_per_replica,
     token_rate_per_replica,
+    ttft_mean_value,
 )
-from tre_common.metrics_schema import ModelWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import AltThreshold, ModelSpec
 from tre_common.tss import DEFAULT_EMA_TAU_MS, window_is_idle
 
@@ -29,7 +38,10 @@ if TYPE_CHECKING:  # pragma: no cover
 
 SignalSource = str
 
-__all__ = ["EPS", "Z_MAX", "SignalValue", "get_signal", "normalize_signal", "per_replica_token_rate"]
+__all__ = [
+    "EPS", "Z_MAX", "SignalValue", "get_signal", "model_kv_usage_sum", "model_mean_ttft_ms",
+    "normalize_signal", "per_replica_token_rate",
+]
 
 
 @dataclass(frozen=True)
@@ -71,9 +83,79 @@ def get_signal(
             metrics, spec, source, per_replica_token_rate(metrics, metrics.prompt_tokens),
             f"{source}_counter_missing", f"{source}_threshold_missing", signal_state,
         )
-    if source == "kv_cache":
-        return _kv_cache_signal(metrics)
+    if source == "ttft_mean":
+        pods = _serving_pods(metrics)
+        if pods is None:
+            return SignalValue(source, raw_value=None, z_m=None, unavailable_reason="ttft_mean_missing")
+        mean_ms = model_mean_ttft_ms(pods)
+        if mean_ms is _MISSING:
+            return SignalValue(source, raw_value=None, z_m=None, unavailable_reason="ttft_mean_missing")
+        raw = ttft_mean_value(mean_ms)
+        if raw is None:
+            # Fresh pods, no first token in the window: hold the last EMA (v1), bounded
+            # by the EMA's own gap / idle rules (SignalState.held_signal).
+            return _held_signal(metrics, spec, source, "ttft_mean_no_sample", signal_state)
+        return _thresholded_signal(metrics, spec, source, raw, "ttft_mean_missing", "ttft_mean_threshold_missing", signal_state)
+    if source == "kv_usage":
+        pods = _serving_pods(metrics)
+        usage_sum = None if pods is None else model_kv_usage_sum(pods)
+        raw = kv_headroom(usage_sum, metrics.routable_pods)
+        return _thresholded_signal(metrics, spec, source, raw, "kv_usage_missing", "kv_usage_threshold_missing", signal_state)
     raise ValueError(f"unsupported signal source: {source}")
+
+
+#: ``model_mean_ttft_ms`` result when some serving pod's TTFT histogram was not read.
+_MISSING = object()
+
+
+def _serving_pods(metrics: ModelWindowMetrics) -> list[PodWindowMetrics] | None:
+    """The pods of a serving window whose data the model-level ttft_mean / kv_usage are
+    built from, or None when the window cannot speak for every routable replica (fail
+    closed: unknown, never healthy or idle).
+
+    ``metrics`` is the serving window (``restrict_to_serving``: sleeping pods dropped,
+    ``routable_pods`` = the fleet state's serving count). The store leaves a pod without
+    a sample in the window out of ``per_pod`` (``scrape_stale_pods``), so fewer pods than
+    routable replicas means a serving replica is unknown. Hidden-but-awake pods (a
+    SafeScale probe) stay in the window, as in the queue sum.
+    """
+    routable = int(metrics.routable_pods or 0)
+    pods = list((metrics.per_pod or {}).values())
+    if routable < 1 or len(pods) < routable:
+        return None
+    return pods
+
+
+def model_mean_ttft_ms(pods: list[PodWindowMetrics]) -> float | None | object:
+    """Model window mean TTFT (ms): the pods' histogram means pooled by their first-token
+    counts (sum of sums / sum of counts, v1 D38). None = no first token in the window;
+    :data:`_MISSING` = some pod's TTFT histogram was not read."""
+    total_ms = 0.0
+    count = 0.0
+    for pod in pods:
+        n = pod.ttft_count
+        if n is None or not math.isfinite(float(n)) or float(n) < 0.0:
+            return _MISSING
+        if float(n) == 0.0:
+            continue
+        avg = pod.ttft_avg_ms
+        if avg is None or not math.isfinite(float(avg)):
+            return _MISSING
+        total_ms += float(avg) * float(n)
+        count += float(n)
+    return total_ms / count if count > 0.0 else None
+
+
+def model_kv_usage_sum(pods: list[PodWindowMetrics]) -> float | None:
+    """Sum of the pods' window-mean KV-cache fill (v1 ``avg_gpu_cache``); None when a pod
+    did not report it (unknown, never 0)."""
+    total = 0.0
+    for pod in pods:
+        usage = pod.gpu_cache_usage
+        if usage is None or not math.isfinite(float(usage)):
+            return None
+        total += float(usage)
+    return total
 
 
 def _latency_signal(metrics: ModelWindowMetrics, spec: ModelSpec) -> SignalValue:
@@ -150,17 +232,35 @@ def _thresholded_signal(
     return SignalValue(source, raw_value=raw_value, z_m=z_m)
 
 
+def _held_signal(
+    metrics: ModelWindowMetrics,
+    spec: ModelSpec,
+    source: str,
+    no_sample_reason: str,
+    signal_state: "SignalState | None",
+) -> SignalValue:
+    """A window without a sample of ``source``: the last smoothed value, normalised, or
+    unavailable when there is none (no state, no smoothing, or the EMA was cleared)."""
+    tau_ms = alt_signal_tau_ms(spec)
+    held = None
+    if signal_state is not None and tau_ms is not None:
+        held = signal_state.held_signal(
+            spec.name, source, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
+            window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+            idle=window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
+        )
+    if held is None:
+        return SignalValue(source, raw_value=None, z_m=None, unavailable_reason=no_sample_reason)
+    z_m = normalize_signal(held, spec.alt_thresholds.get(source))
+    if z_m is None:
+        return SignalValue(source, raw_value=held, z_m=None, unavailable_reason=f"{source}_threshold_missing")
+    return SignalValue(source, raw_value=held, z_m=z_m)
+
+
 def normalize_signal(value: float | int | None, threshold: AltThreshold | None) -> float | None:
     if threshold is None:
         return None
     return normalize_signal_value(value, threshold.theta, threshold.direction)
-
-
-def _kv_cache_signal(metrics: ModelWindowMetrics) -> SignalValue:
-    hit_rate = _bounded_unit(metrics.kv_cache_hit_rate)
-    if hit_rate is None:
-        return SignalValue("kv_cache", raw_value=None, z_m=None, unavailable_reason="kv_cache_missing")
-    return SignalValue("kv_cache", raw_value=hit_rate, z_m=hit_rate / 0.5)
 
 
 def _positive_float(value: float | int | None) -> float | None:
@@ -171,11 +271,3 @@ def _positive_float(value: float | int | None) -> float | None:
         return None
     return parsed
 
-
-def _bounded_unit(value: float | int | None) -> float | None:
-    if value is None:
-        return None
-    parsed = float(value)
-    if math.isnan(parsed) or math.isinf(parsed):
-        return None
-    return min(1.0, max(0.0, parsed))

@@ -209,7 +209,6 @@ def test_create_controller_dependencies_can_split_metrics_redis_from_state_redis
             "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
             "TRE_REDIS_URL": "redis://state:6379/0",
             "TRE_METRICS_REDIS_URL": "redis://metrics:6379/0",
-            "TRE_METRICS_SCHEMA": "v1",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
         }
     )
@@ -223,7 +222,7 @@ def test_create_controller_dependencies_can_split_metrics_redis_from_state_redis
     deps = create_controller_dependencies(cfg, redis_client_factory=factory)
 
     assert deps.store._redis is created["redis://metrics:6379/0"]
-    assert deps.store._schema == "v1"
+    assert deps.store._schema == "v2"
     assert deps.decision_writer._redis is created["redis://state:6379/0"]
     assert deps.safescale._store._redis is created["redis://state:6379/0"]
 

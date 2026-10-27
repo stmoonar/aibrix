@@ -99,7 +99,12 @@ data:
         lambda_wait: 2.375
         qmin: 1.0
         ema_alpha: 0.632121
-        theta_m: 771.0746050443564
+        # 2026-10-28 PROVISIONAL (unit conversion, NOT a calibration): 771.0746050443564 (fitted on
+        # completion histograms, 30 s windows) x 20/30 x 0.995 (step-counter / completion
+        # numerator, steady-state median, offline replay 2026-10-27). tau_* unchanged. Replace with
+        # the recalibration freeze (tre/docs/design/20261028-tss-step-counters.md) before any
+        # data-producing run.
+        theta_m: 511.4794880127564
         tau_crit: 0.63
         tau_low: 1.0
         tau_high: 1.86
@@ -107,6 +112,10 @@ data:
         epsat: 0.05
         hsat: 3
         ema_tau_ms: 10000
+        # What theta_m was fitted on (tre_common.tss.theta_basis_errors): the controller refuses
+        # to start unless numerator == step_counters and theta_window_ms == TRE_METRICS_WINDOW_MS.
+        numerator: step_counters
+        theta_window_ms: 20000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -172,7 +181,12 @@ data:
         lambda_wait: 2.5
         qmin: 1.0
         ema_alpha: 0.632121
-        theta_m: 674.210074236801
+        # 2026-10-28 PROVISIONAL (unit conversion, NOT a calibration): 674.210074236801 (fitted on
+        # completion histograms, 30 s windows) x 20/30 x 0.994 (step-counter / completion
+        # numerator, steady-state median, offline replay 2026-10-27). tau_* unchanged. Replace with
+        # the recalibration freeze (tre/docs/design/20261028-tss-step-counters.md) before any
+        # data-producing run.
+        theta_m: 446.77654252758686
         tau_crit: 0.54
         tau_low: 1.0
         tau_high: 1.9
@@ -180,6 +194,10 @@ data:
         epsat: 0.05
         hsat: 3
         ema_tau_ms: 10000
+        # What theta_m was fitted on (tre_common.tss.theta_basis_errors): the controller refuses
+        # to start unless numerator == step_counters and theta_window_ms == TRE_METRICS_WINDOW_MS.
+        numerator: step_counters
+        theta_window_ms: 20000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -252,7 +270,12 @@ data:
         lambda_wait: 2.25
         qmin: 1.0
         ema_alpha: 0.632121
-        theta_m: 642.6049429483861
+        # 2026-10-28 PROVISIONAL (unit conversion, NOT a calibration): 642.6049429483861 (fitted on
+        # completion histograms, 30 s windows) x 20/30 x 1.013 (step-counter / completion
+        # numerator, steady-state median, offline replay 2026-10-27). tau_* unchanged. Replace with
+        # the recalibration freeze (tre/docs/design/20261028-tss-step-counters.md) before any
+        # data-producing run.
+        theta_m: 433.97253813781003
         tau_crit: 0.64
         tau_low: 1.0
         tau_high: 2.02
@@ -260,6 +283,10 @@ data:
         epsat: 0.05
         hsat: 3
         ema_tau_ms: 10000
+        # What theta_m was fitted on (tre_common.tss.theta_basis_errors): the controller refuses
+        # to start unless numerator == step_counters and theta_window_ms == TRE_METRICS_WINDOW_MS.
+        numerator: step_counters
+        theta_window_ms: 20000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -636,7 +663,7 @@ data:
       # completed (the EMA'd Z lags the window). 0 = the window start alone.
       rescue_settle_ema_k: 2.0
       # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
-      # ADR-0015): a model decides on the part of its 30 s metrics window after its last
+      # ADR-0015): a model decides on the part of its metrics window (TRE_METRICS_WINDOW_MS) after its last
       # breakpoint (traffic onset, routable replica-count change), the histogram docs after
       # it only (the evidence period holding the breakpoint excluded), the TSS numerator
       # scaled to a whole window and the EMA restarted at the breakpoint. Scale-ups act once
@@ -650,9 +677,15 @@ data:
       onset_warmup_guard: false
       # Observed span after the breakpoint (ms, gateway scraped_ms) before a scale-up
       # decision (min_evidence_grids: N is a deprecated alias = N x 10 s).
+      # NOTE (2026-10-28): a suffix is strictly shorter than the window, so with the 20 s
+      # window a value >= 20000 is never reached by a suffix: the model waits for the first
+      # whole window after the breakpoint (about the same 20-22 s as before). Kept as is
+      # pending a user decision (docs/design/20261028-tss-step-counters.md).
       min_evidence_ms: 20000
-      # Completed requests the post-breakpoint window also needs (0 = off). Tokens count
-      # at completion: one short request done while long ones run reads Z ~ 5 %.
+      # Completed requests the post-breakpoint window also needs (0 = off). Added when the
+      # TSS counted tokens at completion (one short request done while long ones run read
+      # Z ~ 5 %); the step-counter numerator (2026-10-28) no longer needs it - kept pending a
+      # user decision.
       min_evidence_requests: 3
       # Added to a routable-count change time: the SM writes the routable label before it
       # answers, the gateway applies it via its pod informer shortly after.
@@ -673,15 +706,15 @@ data:
       gateway_clock_tolerance_ms: 2000
       gateway_clock_check_s: 60
       # Onset saturation rescue (design docs/design/20261002-saturation-onset-rescue.md):
-      # while a model's TSS cannot decide yet - its window numerator is zero (tokens count at
-      # request completion, so nothing has completed) or the O1 evidence gate above still
+      # while a model's TSS cannot decide yet - its window numerator is zero (since 2026-10-28
+      # the step counters: no token processed in the window) or the O1 evidence gate above still
       # holds it - a model whose engines are full on every metrics window from the first
       # full observation to the newest one for saturation_confirm_ms (ms, 0 = the first
       # full window) is a CRITICAL receiver of the fast loop
       # (saturation_consecutive_ticks: N = deprecated alias, (N - 1) x 10 s). "Full" = vLLM
       # num_requests_waiting summed over its routable pods > 0, or their mean KV-cache fill
       # >= saturation_kv_threshold with >= 2 requests running, both from the latest gateway
-      # sample (not the 30 s mean). Not full (one long request running, even one that fills
+      # sample (not the window mean). Not full (one long request running, even one that fills
       # the KV cache alone) keeps the TSS verdict (no receiver). An O1 hold only counts for
       # the traffic onset or the rescue's own steps (not after a C1 / donor / SafeScale change
       # once the TSS was warm).

@@ -184,7 +184,10 @@ def _write_pod(redis, model: str, pod: str, *, gen_per_grid: float, running: flo
         if scraped_ms is not None:
             base["scraped_ms"] = min(scraped_ms, ts)
         n = 100 + 10 * frozen_at
-        redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_histogram_metrics": {
+        redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_counter_metrics": {
+            f"{model}/prompt_tokens_total": 5_000.0 + prompt_per_grid * frozen_at,
+            f"{model}/generation_tokens_total": gen_per_grid * frozen_at,
+        }, "model_histogram_metrics": {
             f"{model}/request_prompt_tokens": {"sum": 5_000.0 + prompt_per_grid * frozen_at, "count": n, "buckets": {"+Inf": n}},
             f"{model}/request_generation_tokens": {"sum": gen_per_grid * frozen_at, "count": n, "buckets": {"+Inf": n}},
         }}, ts)
@@ -208,7 +211,9 @@ def test_frozen_scrape_is_unknown_not_a_zero_token_window(gateway_writes_scraped
         base = {"timestamp": ts, "written_ms": ts + 300, "pod_name": "m-0"}
         if gateway_writes_scraped_ms:
             base["scraped_ms"] = end - 35_000  # last successful fetch: before the window
-        redis.zadd("tre:v2:hist:" + pod, {**base, "model_histogram_metrics": {
+        redis.zadd("tre:v2:hist:" + pod, {**base, "model_counter_metrics": {
+            "m/prompt_tokens_total": 5_000, "m/generation_tokens_total": 20_000,
+        }, "model_histogram_metrics": {
             "m/request_prompt_tokens": {"sum": 5_000, "count": 40, "buckets": {"+Inf": 40}},
             "m/request_generation_tokens": {"sum": 20_000, "count": 40, "buckets": {"+Inf": 40}},
         }}, ts)

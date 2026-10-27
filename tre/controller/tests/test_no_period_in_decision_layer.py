@@ -30,6 +30,9 @@ DECISION_LAYER = (
 FORBIDDEN = re.compile(
     r"grid_ms|evidence_period|period_ms|EVIDENCE_PERIOD_MS|INSTANT_SAMPLE_INTERVAL_MS"
     r"|SCRAPE_INTERVAL_MS|streak|consecutive|n_windows|grids"
+    # 2026-10-28: nor the configured window length - a rule reads its window's own
+    # bounds (window_end_ms - window_start_ms), so 30 s -> 20 s needs no decision edit.
+    r"|metrics_window|METRICS_WINDOW"
 )
 
 

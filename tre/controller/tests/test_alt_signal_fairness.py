@@ -109,7 +109,7 @@ def test_online_and_offline_alt_signals_share_one_tau_ema(tmp_path: Path) -> Non
         again = get_signal(metrics, _spec(), "queue_len", trs_z_m=None, signal_state=state).raw_value
         assert again == value
         online.append(value)
-    # The EMA really smooths (and a zero advanced it: the 6th value is below the 5th).
+    # The EMA really smooths (and an empty queue advanced it: the 6th value is below the 5th).
     assert online[3] < 36.0 and online[5] < online[4] and online[5] > 0.0
 
     path = tmp_path / "w.csv"
@@ -136,4 +136,4 @@ def test_online_and_offline_alt_signals_share_one_tau_ema(tmp_path: Path) -> Non
         path, latency_slo_ms={"ttft_p95": 500.0, "tpot_p95": 75.0},
         signal_transform=alt_signal_transform("queue_len"),
     )]
-    assert raw == [r + w for r, w in _SERIES]
+    assert raw == [max(r + w, 1.0) for r, w in _SERIES]  # v1 floor: 1 request per replica

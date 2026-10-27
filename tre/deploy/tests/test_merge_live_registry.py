@@ -57,3 +57,24 @@ def test_cli_writes_a_valid_registry(tmp_path):
     out = tmp_path / "merged.yaml"
     assert mlr.main(["--live", str(live_path), "--release", str(release_path), "--out", str(out)]) == 0
     assert yaml.safe_load(out.read_text(encoding="utf-8")) == yaml.safe_load(release_path.read_text(encoding="utf-8"))
+
+
+def test_live_theta_without_basis_stamps_keeps_its_true_basis():
+    # H1 (10-28): a live theta_m fitted before the stamps is a completion / 30 s theta; the
+    # release stamps (step_counters / 20000) must not relabel it, else the new controller
+    # starts with every Z off by ~x1.5 instead of refusing.
+    release = _release()
+    live = copy.deepcopy(release)
+    for model in live["models"]:
+        model["trs"].pop("numerator", None)
+        model["trs"].pop("theta_window_ms", None)
+        model["trs"]["theta_m"] = 321.0
+    merged, report = mlr.merge(live, release)
+    for model in merged["models"]:
+        assert model["trs"]["theta_m"] == 321.0
+        assert model["trs"]["numerator"] == "completion_histograms"
+        assert model["trs"]["theta_window_ms"] == 30000
+    assert any(line.startswith("WARN") and "trs.numerator" in line for line in report)
+    # a stamped live theta keeps its own stamps
+    stamped, _ = mlr.merge(release, release)
+    assert stamped["models"] == release["models"]

@@ -7,8 +7,19 @@ Plan 2026-09-21 §6.4 (unified definition)::
 * ``r_p`` - prefill tokens per window that MISSED the prefix cache
   (``prompt_tokens * (1 - kv_cache_hit_rate)``);
 * ``r_d`` - generated tokens per window (``generation_tokens``);
-* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (30 s online and offline), so the
-  numerator is a **window token total**, the convention main and v1 always used;
+* **numerator source** (2026-10-28, user decision; design
+  ``docs/design/20261028-tss-step-counters.md``): vLLM's per-step counters
+  ``vllm:prompt_tokens_total`` / ``vllm:generation_tokens_total`` - the tokens the engine
+  PROCESSED in the window (generated tokens every step, prompt tokens at the first token),
+  their delta over the observed span scaled to the window. Before: the
+  ``request_*_tokens`` histogram sums, i.e. the tokens of the requests that COMPLETED in
+  the window (:data:`NUMERATOR_COMPLETION_HISTOGRAMS`; offline only, to reproduce old
+  freezes);
+* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (20 s since 2026-10-28, 30 s
+  before), so the numerator is a **window token total**, the convention main and v1
+  always used - theta is therefore tied to the window length and to the numerator
+  source: the registry stamps both per model (``trs.numerator``, ``trs.theta_window_ms``)
+  and the controller refuses to start on a mismatch (:func:`theta_basis_errors`);
 * ``A`` / ``W`` - running / waiting requests, the window mean of the instant samples;
 * ``w_q`` is the registry's ``lambda_wait``; ``qmin`` (1.0) is a numerical guard only;
 * the assigned/routable replica correction stays a multiplicative factor applied by the
@@ -17,8 +28,9 @@ Plan 2026-09-21 §6.4 (unified definition)::
 Changes against the v1/v2 code formula, all deliberate:
 
 * the numerator stays a **window total** (tokens per window, window =
-  ``TRE_METRICS_WINDOW_MS``), not a rate. The window is 30 s on every path, so Z is
-  identical under either convention; only theta's magnitude differs (x window seconds).
+  ``TRE_METRICS_WINDOW_MS``), not a rate. Online and in the fit the window is the same,
+  so Z is identical under either convention; only theta's magnitude differs (x window
+  seconds).
   A rate-valued numerator was tried on 2026-09-22 (commit 22b59f96) and reverted by user
   decision; :func:`convert_window_total_theta` remains to express a theta in rate units;
 * ``swapping`` is gone from the denominator (vLLM v1 never swaps; a non-zero value is
@@ -33,7 +45,9 @@ The EMA is a wall-clock time-constant EMA, ``alpha_k = 1 - exp(-dt_k / tau)``
 (``tre_controller.signals.trs.TRSComputer``) and offline
 (``tre_calibration.dataset`` recompute, ``tre_calibration.signals``).
 
-**Idle-gap reset** (:class:`TssEma`): when a sample arrives more than one metrics window
+**Idle-gap reset** (:class:`TssEma`; its threshold follows the window: 20 s since
+2026-10-28; tau itself is a separate registry value, ``trs.ema_tau_ms``, 10 s, unchanged):
+when a sample arrives more than one metrics window
 after the last sample that advanced the EMA (``window_end_ms - last_ms > window_ms``), the
 EMA is cleared first, so a traffic period never inherits the previous period's value
 (it would otherwise survive with weight ``exp(-gap/tau)``). ``window_ms`` is the sample's
@@ -57,9 +71,33 @@ TSS_UNITS = "decode-equivalent tokens per metrics window (TRE_METRICS_WINDOW_MS)
 #: EMA time constant the plan fixes (§6.5: tau is designed, not fitted).
 DEFAULT_EMA_TAU_MS = 20_000.0
 
-#: Online metrics window the v2 theta values are expressed at (TRE_METRICS_WINDOW_MS,
-#: deploy/overlays/tre-v2/controller.yaml). Used only to express theta in rate units.
-V2_WINDOW_MS = 30_000.0
+#: Numerator sources a theta can be fitted on (registry ``trs.numerator``).
+NUMERATOR_STEP_COUNTERS = "step_counters"
+NUMERATOR_COMPLETION_HISTOGRAMS = "completion_histograms"
+#: The numerator the online controller computes (``MetricsStore``).
+TSS_NUMERATOR = NUMERATOR_STEP_COUNTERS
+
+
+def theta_basis_errors(models: Iterable[object], *, window_ms: float, numerator: str = TSS_NUMERATOR) -> list[str]:
+    """Why the registry's thetas do not fit this controller, one line per model (empty:
+    they fit). A theta is a window token total of one numerator source, so it is only
+    valid on the window and the numerator it was fitted on: each model's ``trs`` must
+    stamp ``numerator`` == ``numerator`` and ``theta_window_ms`` == ``window_ms``. A
+    missing stamp is a mismatch (a registry from before 2026-10-28: completion
+    histograms, 30 s). Restarting a new controller on old thetas would shift every Z by
+    the window ratio; the atomic release (thetas + stamps + controller) is the fix."""
+    errors: list[str] = []
+    for spec in models:
+        trs = getattr(spec, "trs", None)
+        name = getattr(spec, "name", "?")
+        stamp_numerator = getattr(trs, "numerator", None)
+        stamp_window = getattr(trs, "theta_window_ms", None)
+        if stamp_numerator != numerator or stamp_window is None or float(stamp_window) != float(window_ms):
+            errors.append(
+                f"{name}: trs.numerator={stamp_numerator!r} trs.theta_window_ms={stamp_window!r}, "
+                f"controller computes numerator={numerator!r} on TRE_METRICS_WINDOW_MS={int(window_ms)}"
+            )
+    return errors
 
 _warned: set[str] = set()
 
@@ -295,7 +333,7 @@ def smooth_series(
     ]
 
 
-def convert_window_total_theta(theta_total: float, window_ms: float = V2_WINDOW_MS) -> float:
+def convert_window_total_theta(theta_total: float, window_ms: float) -> float:
     """theta in window-total units (the published convention) -> the same threshold in
     rate units (theta / window_s). Z is identical under both conventions; this is only for
     reporting / comparing against a rate-valued definition (e.g. the paper's r = tokens/s)."""
@@ -304,10 +342,13 @@ def convert_window_total_theta(theta_total: float, window_ms: float = V2_WINDOW_
 
 __all__: Iterable[str] = (
     "DEFAULT_EMA_TAU_MS",
+    "NUMERATOR_COMPLETION_HISTOGRAMS",
+    "NUMERATOR_STEP_COUNTERS",
+    "TSS_NUMERATOR",
     "TSS_UNITS",
     "TssEma",
     "TssTerms",
-    "V2_WINDOW_MS",
+    "theta_basis_errors",
     "convert_window_total_theta",
     "ema_alpha",
     "ema_step",

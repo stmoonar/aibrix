@@ -122,6 +122,7 @@ def aggregate_pods(
         per_pod=dict(per_pod),
         request_count=_sum_optional([pod.request_count for pod in pods]),
         request_count_observed=_sum_optional([pod.request_count_observed for pod in pods]),
+        completed_prompt_tokens=_sum_optional([pod.completed_prompt_tokens for pod in pods]),
         token_counter_reset=any(pod.token_counter_reset for pod in pods),
         instant_ticks_ms=tuple(sorted({tick for pod in pods for tick in pod.instant_ticks_ms})),
         observed=Observed.merge(pod.observed for pod in pods),
@@ -134,7 +135,8 @@ def aggregate_pods(
 _POD_AGGREGATES = (
     "prompt_tokens", "generation_tokens", "avg_waiting", "avg_running", "avg_swapping",
     "kv_cache_hit_rate", "ttft_p95_ms", "tpot_p95_ms", "e2e_p95_ms", "routable_pods",
-    "assigned_replicas", "per_pod", "request_count", "request_count_observed", "token_counter_reset",
+    "assigned_replicas", "per_pod", "request_count", "request_count_observed", "completed_prompt_tokens",
+    "token_counter_reset",
     "observed",
 )
 

@@ -15,6 +15,16 @@
 # bands), lambda / w_p by v1's selection. QUEUE_ESTIMATOR=live_grid_sum_over_expected with
 # FIT_METHOD=ba_argmax_quantile_grid rebuilds the 2026-10-05 freeze's chain.
 #
+# TSS numerator and window (user decision 2026-10-28): the defaults fit theta on the
+# vLLM step counters (NUMERATOR=vllm_counter, scripts.l3_numerator: the online rule, the
+# counter rate over the observed span as a window total) on 20 s windows (WINDOW_MS=20000);
+# the freeze stamps trs.numerator = step_counters and trs.theta_window_ms = 20000. The
+# 2026-10-25 freeze (live until the switch) is reproduced with NUMERATOR=gateway
+# WINDOW_MS=30000 (completion-counted histograms on 30 s windows; the queue / fit method
+# defaults above are that freeze's). WINDOW_MS / STEP_MS go to the dataset builder and to
+# every dline_refit fit stage (alpha / wp / final; the freeze records them and refuses
+# datasets cut with another window).
+#
 #   run_freeze_m2.sh            (configuration from the environment; nothing site-specific here)
 #
 # Environment:
@@ -25,6 +35,9 @@
 #   H2_STAGES         "run1 run2"   stages whose sealed split joins H2 (D16)
 #   TRAIN_STAGES      "supp p1"     further training stages
 #   STAGE_OVERRIDES   "dsqwen-14b:run2=run2b dsqwen-7b:p1=p1r2"  per-model stage renames
+#   NUMERATOR         vllm_counter  TSS numerator (scripts.l3_numerator.NUMERATOR_CHOICES: gateway | vllm_counter)
+#   WINDOW_MS         20000         metrics window of the datasets and the fit (theta is a window total)
+#   STEP_MS           10000         re-window step of the datasets and the fit (the EMA dt_ref stays 10 s)
 #   QUEUE_ESTIMATOR   raw_mean      (scripts.rewindow_from_raw.QUEUE_ESTIMATORS)
 #   FIT_METHOD        m2_unique_grid_plateau_midpoint  (tre_calibration.fit.FIT_METHODS)
 #   LAMBDA_METHOD     v1            PUBLISH_TAU_S 10   ATTRIBUTION hybrid
@@ -44,6 +57,9 @@ TRE="$(cd "$HERE/../../.." && pwd)"
 : "${H2_STAGES:=run1 run2}"
 : "${TRAIN_STAGES:=supp p1}"
 : "${STAGE_OVERRIDES:=dsqwen-14b:run2=run2b dsqwen-7b:p1=p1r2}"
+: "${NUMERATOR:=vllm_counter}"
+: "${WINDOW_MS:=20000}"
+: "${STEP_MS:=10000}"
 : "${QUEUE_ESTIMATOR:=raw_mean}"
 : "${FIT_METHOD:=m2_unique_grid_plateau_midpoint}"
 : "${LAMBDA_METHOD:=v1}"
@@ -58,6 +74,8 @@ TRE="$(cd "$HERE/../../.." && pwd)"
 : "${ACCEPT_DWELL:=1}"
 
 case "$MODE" in dev|final) ;; *) echo "MODE must be dev or final, got $MODE" >&2; exit 2 ;; esac
+case "$NUMERATOR" in gateway|vllm_counter) ;; *) echo "NUMERATOR must be gateway or vllm_counter, got $NUMERATOR" >&2; exit 2 ;; esac
+case "$WINDOW_MS$STEP_MS" in *[!0-9]*) echo "WINDOW_MS / STEP_MS must be integers (ms)" >&2; exit 2 ;; esac
 [ -d "$CALIB_ROOT" ] || { echo "CALIB_ROOT $CALIB_ROOT is not a directory" >&2; exit 2; }
 if [ -e "$OUT_DIR" ] && [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
   echo "OUT_DIR $OUT_DIR is not empty: a freeze run never reuses an output directory" >&2; exit 2
@@ -85,6 +103,7 @@ PY=(nice -n "$NICE" python3)
 {
   echo "mode=$MODE"; git -C "$TRE" rev-parse HEAD; echo "dirty:"; echo "$DIRTY"
   echo "calib_root=$CALIB_ROOT"; echo "queue_estimator=$QUEUE_ESTIMATOR fit_method=$FIT_METHOD"
+  echo "numerator=$NUMERATOR window_ms=$WINDOW_MS step_ms=$STEP_MS"
   echo "lambda_method=$LAMBDA_METHOD publish_tau_s=$PUBLISH_TAU_S attribution=$ATTRIBUTION"
   echo "models=$MODELS h2=$H2_STAGES train=$TRAIN_STAGES overrides=$STAGE_OVERRIDES"
   sha256sum "$LABEL_REGISTRY"; date -u +%FT%TZ
@@ -100,10 +119,11 @@ build() {  # build <stage> <model> <run dir>
   local out="$DS/$1/$2/dataset_$ATTRIBUTION"
   mkdir -p "$(dirname "$out")"
   if "${PY[@]}" -m scripts.calibration_dataset "$3" --out-dir "$out" --attribution "$ATTRIBUTION" \
-       --label-registry "$LABEL_REGISTRY" --queue-estimator "$QUEUE_ESTIMATOR" > "$LOG/dataset.$1.$2.log" 2>&1
+       --label-registry "$LABEL_REGISTRY" --queue-estimator "$QUEUE_ESTIMATOR" \
+       --numerator "$NUMERATOR" --window-ms "$WINDOW_MS" --step-ms "$STEP_MS" > "$LOG/dataset.$1.$2.log" 2>&1
   then echo "dataset $1 $2 ok"; else echo "dataset $1 $2 FAILED"; return 1; fi
 }
-export -f build; export DS LOG ATTRIBUTION LABEL_REGISTRY QUEUE_ESTIMATOR NICE
+export -f build; export DS LOG ATTRIBUTION LABEL_REGISTRY QUEUE_ESTIMATOR NICE NUMERATOR WINDOW_MS STEP_MS
 printf '%s\n' "${jobs[@]}" | xargs -P "$JOBS" -L 1 bash -c 'PY=(nice -n "$NICE" python3); build "$@"' _ \
   || { echo "a dataset build failed (see $LOG)" >&2; exit 1; }
 
@@ -112,7 +132,8 @@ fit_one() {  # fit_one <model>
   local m=$1 F="$FIT/$m/fit" O="$FIT/refit" st args=()
   for st in $H2_STAGES; do args+=(--h2-dataset "$(stage_for "$m" "$st")=$DS/$(stage_for "$m" "$st")/$m/dataset_$ATTRIBUTION"); done
   for st in $TRAIN_STAGES; do args+=(--dataset "$(stage_for "$m" "$st")=$DS/$(stage_for "$m" "$st")/$m/dataset_$ATTRIBUTION"); done
-  local c=(--model "$m" --arm primary --fit-dir "$F" --registry "$LABEL_REGISTRY")
+  local c=(--model "$m" --arm primary --fit-dir "$F" --registry "$LABEL_REGISTRY"
+           --window-ms "$WINDOW_MS" --step-ms "$STEP_MS")
   "${PY[@]}" -m scripts.dline_refit trainset --train-dynamic --fit-dir "$F" --model "$m" \
       --queue-estimator "$QUEUE_ESTIMATOR" "${args[@]}" || return 1
   "${PY[@]}" -m scripts.dline_refit alpha "${c[@]}" --out-dir "$O" --publish-tau-s "$PUBLISH_TAU_S" || return 1

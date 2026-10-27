@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
+from tre_common.alt_signals import alt_basis_errors
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 #: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
@@ -38,13 +39,17 @@ def _warn_removed_env(values: Mapping[str, str]) -> None:
                 "tre:v2:controller:mode only; remove it from the Deployment", name, values.get(name)
             )
 
+#: ``TRE_SIGNAL_SOURCE`` values (``tre_controller.signals.sources``). Every source in
+#: ``EXPECTED_SIGNAL_DIRECTIONS`` is a fitted alternative signal: the controller refuses
+#: to start on it unless every model carries its fitted theta AND band margins.
 SIGNAL_SOURCES = {
     "zm",
     "latency_p95",
     "queue_len",
+    "ttft_mean",
+    "kv_usage",
     "decode_tps",
     "prefill_tps",
-    "kv_cache",
 }
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
 WINDOW_MODES = {"tumbling", "sliding"}
@@ -276,7 +281,6 @@ class ControllerConfig:
         signal_source = _get_str(values, "TRE_SIGNAL_SOURCE", "zm")
         if signal_source not in SIGNAL_SOURCES:
             raise ValueError(f"TRE_SIGNAL_SOURCE must be one of {sorted(SIGNAL_SOURCES)}")
-        _validate_signal_thresholds(registry_path, signal_source)
 
         metrics_schema = _get_str(values, "TRE_METRICS_SCHEMA", "v2")
         if metrics_schema not in METRICS_SCHEMAS:
@@ -358,7 +362,11 @@ class ControllerConfig:
             ),
         )
 
-        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
+        # 2026-10-28 (user decision): 20 s (was 30 s). The registry's thetas are window
+        # token totals fitted on one window: their trs.theta_window_ms must equal this
+        # (checked at start, tre_common.tss.theta_basis_errors).
+        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 20_000)
+        _validate_signal_thresholds(registry_path, signal_source, window_ms=metrics_window_ms)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
         # Round 5: the former N2 warning (a commit-gate tail of hq x W could read metrics
@@ -555,12 +563,21 @@ def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
         return SafeScaleRegistryConfig()
 
 
-def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
+def _validate_signal_thresholds(registry_path: str, signal_source: str, *, window_ms: float) -> None:
+    """A fitted alternative signal runs only on its own fitted theta and band margins.
+
+    Every model needs ``alt_thresholds.<signal>`` with a positive theta, the expected
+    direction and both ``delta_crit`` / ``delta_high``: a missing margin would otherwise
+    fall back to the plan defaults 0.2 / 0.25 (``AltThreshold.bands``) and the arm would
+    run on bands nobody fitted. And the ``basis`` stamp must name the signal definition
+    this controller computes and its metrics window (``alt_basis_errors``).
+    """
     expected_direction = EXPECTED_SIGNAL_DIRECTIONS.get(signal_source)
     if expected_direction is None:
         return
     registry = load_registry(registry_path)
     missing = []
+    missing_bands = []
     invalid_direction = []
     for model in registry.models():
         threshold = model.alt_thresholds.get(signal_source)
@@ -568,10 +585,24 @@ def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
             missing.append(model.name)
         elif threshold.direction != expected_direction:
             invalid_direction.append(model.name)
+        elif threshold.delta_crit is None or threshold.delta_high is None:
+            missing_bands.append(model.name)
     if missing:
         raise ValueError(
             f"TRE_SIGNAL_SOURCE={signal_source} requires fitted alt_thresholds for every model; "
             f"missing={sorted(missing)}"
+        )
+    if missing_bands:
+        raise ValueError(
+            f"TRE_SIGNAL_SOURCE={signal_source} requires fitted alt_thresholds.{signal_source}"
+            f".delta_crit and .delta_high for every model (no default bands); "
+            f"missing={sorted(missing_bands)}"
+        )
+    basis_errors = alt_basis_errors(registry.models(), signal_source, window_ms=window_ms)
+    if basis_errors:
+        raise ValueError(
+            f"TRE_SIGNAL_SOURCE={signal_source}: alt_thresholds basis does not match this controller "
+            f"(refit / publish theta with its basis stamp): {'; '.join(basis_errors)}"
         )
     if invalid_direction:
         raise ValueError(

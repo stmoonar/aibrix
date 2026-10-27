@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tre_common.alt_signals import queue_len_per_replica
+from tre_common.alt_signals import token_rate_per_replica
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.window_pods import restrict_to_serving
 from tre_controller.loops.rescue_task import run_rescue_tick
@@ -57,7 +57,9 @@ def _pod_docs(redis: _Redis, pod: str, *, busy: bool) -> None:
             "m/num_requests_waiting": 1.0 if busy else 0.0,
         }})
         gen = 50.0 * k if busy else 777.0  # a sleeping pod's counters are flat (stale total)
-        redis.add(f"tre:v2:hist:default/{pod}", tick, {"pod_name": pod, "model_histogram_metrics": {
+        redis.add(f"tre:v2:hist:default/{pod}", tick, {"pod_name": pod, "model_counter_metrics": {
+            "m/generation_tokens_total": gen, "m/prompt_tokens_total": gen / 5,
+        }, "model_histogram_metrics": {
             "m/request_generation_tokens": {"sum": gen, "count": k if busy else 9, "buckets": {}},
             "m/request_prompt_tokens": {"sum": gen / 5, "count": k if busy else 9, "buckets": {}},
         }})
@@ -90,8 +92,8 @@ def test_raw_window_counts_sleeping_pods() -> None:
     assert (raw.generation_tokens, raw.avg_running, raw.avg_waiting) == (
         alone.generation_tokens, alone.avg_running, alone.avg_waiting)
     # ... but anything per replica is divided by 8 instead of 1
-    assert queue_len_per_replica(raw.avg_running, raw.avg_waiting, raw.routable_pods) == pytest.approx(
-        queue_len_per_replica(alone.avg_running, alone.avg_waiting, alone.routable_pods) / 8)
+    assert token_rate_per_replica(raw.generation_tokens, 30_000, raw.routable_pods) == pytest.approx(
+        token_rate_per_replica(alone.generation_tokens, 30_000, alone.routable_pods) / 8)
 
 
 def test_restrict_to_serving_equals_the_awake_pod_alone() -> None:

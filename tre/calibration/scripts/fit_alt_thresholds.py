@@ -37,10 +37,13 @@ from xml.etree import ElementTree as ET
 import yaml
 
 from tre_calibration.alt_signals import (
+    ALT_DELTA_CRIT_GRID,
+    ALT_DELTA_HIGH_GRID,
     alt_signal_direction,
     alt_signal_names,
     threshold_curve,
 )
+from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
 from tre_calibration.fit import (
     DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
     DEFAULT_MIN_HEALTHY_RECALL,
@@ -78,6 +81,21 @@ def _report_label_def(label_defs: dict[str, LabelDefinition]) -> dict[str, Any]:
     if len(unique) == 1:
         return next(iter(dicts.values()))
     return {"mode": "per_model", "per_model": dicts}
+
+
+def csv_window_ms(path: Path) -> float:
+    """The one metrics window (ms) of a fitting CSV's rows - the basis stamp's
+    ``window_ms``; mixed windows are an error (theta is fitted on one window)."""
+    widths: set[float] = set()
+    with Path(path).open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                widths.add(float(row["window_end_ms"]) - float(row["window_start_ms"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if len(widths) != 1:
+        raise SystemExit(f"{path}: expected one window length, found {sorted(widths)}")
+    return next(iter(widths))
 
 
 def fit_model(
@@ -142,7 +160,15 @@ def fit_model(
                 "direction": spec.direction,
                 "delta_crit": float(published["delta_crit"]),
                 "delta_high": float(published["delta_high"]),
+                # What theta was fitted on (tre_common.alt_signals.alt_basis_errors): the
+                # controller starts an alt arm only on this stamp.
+                "basis": {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": int(csv_window_ms(input_path))},
             }
+        },
+        # A band on its grid's top edge has its optimum outside the searched range.
+        "band_at_grid_edge": {
+            "delta_crit": float(published["delta_crit"]) >= ALT_DELTA_CRIT_GRID[-1],
+            "delta_high": float(published["delta_high"]) >= ALT_DELTA_HIGH_GRID[-1],
         },
         "theta_criterion": criterion,
         "fit": merged["fit"],
@@ -377,6 +403,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "warnings": warnings,
         "fit_config": {
             "pipeline": "scripts.theta_verdict.verdict_report",
+            "delta_grids": {"delta_crit": [ALT_DELTA_CRIT_GRID[0], ALT_DELTA_CRIT_GRID[-1], 0.01],
+                            "delta_high": [ALT_DELTA_HIGH_GRID[0], ALT_DELTA_HIGH_GRID[-1], 0.01]},
             "label_lambda_wait": args.label_lambda_wait,
             "ema_tau_ms": args.ema_tau_ms,
             "n_resamples": args.n_resamples,
@@ -433,7 +461,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{model}: theta={threshold['theta']:.6f} delta_crit={threshold['delta_crit']:.3f} "
             f"delta_high={threshold['delta_high']:.3f} direction={threshold['direction']} "
             f"criterion={args.theta_criterion} auroc={payload['ranking']['auroc']:.3f} "
-            f"inert={payload['ranking']['inert']} windows={payload['window_count']}"
+            f"inert={payload['ranking']['inert']} windows={payload['window_count']} "
+            f"edge={payload['band_at_grid_edge']}"
         )
     return 0
 

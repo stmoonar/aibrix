@@ -1539,7 +1539,9 @@ def fit_plan(
     return plan
 
 
-#: The alternative signals of the ablation (tre_calibration.alt_signals.ALT_SIGNALS).
+#: The plan 6.9 alternative signals this campaign step fits (a subset of
+#: tre_calibration.alt_signals.ALT_SIGNALS; the v1 signals ttft_mean / kv_usage need the
+#: standard dataset columns of scripts.alt_signal_columns and are fitted from there).
 ALT_SIGNALS = ("queue_len", "decode_tps", "prefill_tps")
 
 

@@ -1,7 +1,8 @@
 """The alternative signals TSS is compared against in the signal ablation.
 
 The ablation asks whether TSS separates healthy from violating windows better than the
-obvious cheaper signals: queue length and the per-replica completed-token rates. That
+obvious cheaper signals: v1's queue length, server-side mean TTFT and KV-cache headroom
+(``queue_len`` / ``ttft_mean`` / ``kv_usage``), and the per-replica token rates. That
 question is only answerable if every signal was thresholded by the *same* criterion --
 otherwise the comparison measures the criteria. So this module owns nothing but the
 per-signal facts (which column, which orientation) and hands the actual fitting to
@@ -9,10 +10,17 @@ per-signal facts (which column, which orientation) and hands the actual fitting 
 for TSS.
 
 Orientation matters here and is the one place the signals genuinely differ from TSS.
-TSS is ``higher_is_healthier``: a large score means headroom. Queue length and the token
-rates are pressure signals -- across an R3 load scan a larger value means the replica is
-closer to saturation -- so they are ``lower_is_healthier``. Thresholds stay in raw signal
-units; no reciprocal transform is written into the registry.
+TSS is ``higher_is_healthier``: a large score means headroom; so is ``kv_usage`` (the
+KV-cache headroom ``1 - usage``). Queue length, mean TTFT and the token rates are
+pressure signals -- across an R3 load scan a larger value means the replica is closer to
+saturation -- so they are ``lower_is_healthier``. Thresholds stay in raw signal units; no
+reciprocal transform is written into the registry.
+
+``ttft_mean`` and ``kv_usage`` are read from window columns the dataset builder derives
+from the 1 Hz per-pod vLLM capture (``scripts.alt_signal_columns``):
+``ttft_server_mean_ms`` (pooled TTFT histogram mean) and ``kv_cache_usage_sum`` /
+``kv_cache_pods`` (sum of the awake pods' window-mean KV fill, and their number). An empty
+column is no value (the window is not used), never zero.
 """
 from __future__ import annotations
 
@@ -21,7 +29,13 @@ from collections import Counter
 from typing import Any, Callable, Mapping, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
-from tre_common.alt_signals import queue_len_per_replica, token_rate_per_replica
+from tre_common.alt_signals import (
+    Z_MAX,
+    kv_headroom,
+    queue_len_per_replica,
+    token_rate_per_replica,
+    ttft_mean_value,
+)
 from tre_calibration.fit import (
     BalancedAccuracyThetaFit,
     ReliabilityThetaFit,
@@ -34,9 +48,32 @@ from tre_calibration.fit import (
 #: hardcoded; the fit reports balanced accuracy in both directions (plan §6.9).
 ALT_SIGNALS: Mapping[str, tuple[str | None, str]] = {
     "queue_len": (None, "lower_is_healthier"),
+    "ttft_mean": (None, "lower_is_healthier"),
+    "kv_usage": (None, "higher_is_healthier"),
     "decode_tps": (None, "lower_is_healthier"),
     "prefill_tps": (None, "lower_is_healthier"),
 }
+
+#: Band-margin grids of every alternative signal (the one definition; ``theta_verdict``
+#: ``SignalSpec.band_kwargs`` passes them to ``fit_delta_margins`` for the merged fit and
+#: the bootstrap). Wider than the TSS defaults (0..0.5 / 0..2), whose edges the
+#: 2026-10-28 offline fit hit (ttft_mean delta_crit, queue_len delta_high): they span
+#: everything the classifier can use - ``tau_crit = 1 - delta_crit`` must stay > 0
+#: (registry: delta_crit < 1), and ``z`` is capped at ``Z_MAX``, so a ``delta_high`` above
+#: ``Z_MAX - 1`` can never fire.
+ALT_DELTA_CRIT_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(100))
+ALT_DELTA_HIGH_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(int(round((Z_MAX - 1.0) * 100)) + 1))
+
+
+def alt_signal_band_grids() -> dict[str, tuple[float, ...]]:
+    """``fit_delta_margins`` grid keywords of the alternative signals."""
+    return {"delta_crit_grid": ALT_DELTA_CRIT_GRID, "delta_high_grid": ALT_DELTA_HIGH_GRID}
+
+
+#: Window columns of the v1 signals (written by ``scripts.alt_signal_columns``).
+TTFT_MEAN_COLUMN = "ttft_server_mean_ms"
+KV_USAGE_SUM_COLUMN = "kv_cache_usage_sum"
+KV_PODS_COLUMN = "kv_cache_pods"
 
 #: Which token counter each rate signal is computed from.
 _TOKEN_COLUMN = {
@@ -107,6 +144,18 @@ def alt_signal_transform(signal: str) -> Callable[[Mapping[str, Any]], float | N
             )
 
         return queue
+    if signal == "ttft_mean":
+
+        def ttft(row: Mapping[str, Any]) -> float | None:
+            return ttft_mean_value(_row_float(row, TTFT_MEAN_COLUMN))
+
+        return ttft
+    if signal == "kv_usage":
+
+        def kv(row: Mapping[str, Any]) -> float | None:
+            return kv_headroom(_row_float(row, KV_USAGE_SUM_COLUMN), _row_float(row, KV_PODS_COLUMN))
+
+        return kv
     return per_replica_token_rate_transform(signal)
 
 

@@ -61,6 +61,7 @@ from tre_common import slo_labels
 from scripts.rewindow_from_raw import LIVE_GRID_MS
 
 from scripts import adaptive_boundary as boundary
+from scripts import alt_signal_columns
 from scripts import calibration_capture as capture
 from scripts import l3_numerator as l3
 from scripts import gen_calibration_schedules as gen
@@ -82,8 +83,10 @@ README = "DATASET.md"
 #: 1: 30 s / 5 s free-phase windows, one fixed label (2026-09-23 main line).
 #: 2: 30 s / 10 s grid-aligned windows (D8), three label arms (D6'), ttft_len_samples.
 FORMAT_REVISION = 2
-#: The fitting windows of revision 2 (plan 2026-09-21 §6.11 D8).
-DEFAULT_WINDOW_MS = 30_000
+#: The fitting windows of revision 2 (plan 2026-09-21 §6.11 D8). The default window is
+#: the controller's (TRE_METRICS_WINDOW_MS, 20 s since 2026-10-28); 30 s reproduces the
+#: freezes before it (--window-ms 30000).
+DEFAULT_WINDOW_MS = 20_000
 DEFAULT_STEP_MS = 10_000
 DEFAULT_WINDOW_ALIGN = rewindow_from_raw.WINDOW_ALIGN_GRID
 
@@ -103,7 +106,9 @@ IDENTITY_COLUMNS = [
     "model", "shape", "primitive", "stage", "rho", "cell_id", "attempt", "split",
     "cell_status", "role", "rho_factor", "replicate", "possibly_contaminated",
 ]
-WINDOW_COLUMNS = IDENTITY_COLUMNS + ["in_warmup"] + list(r3_grid.CSV_COLUMNS)
+#: ``alt_signal_columns.COLUMNS``: the v1 ablation signals' inputs (ttft_mean, kv_usage)
+#: from the 1 Hz per-pod capture; empty when the cell has none.
+WINDOW_COLUMNS = IDENTITY_COLUMNS + ["in_warmup"] + list(r3_grid.CSV_COLUMNS) + list(alt_signal_columns.COLUMNS)
 #: Extra window columns of an L3 dataset (``--numerator vllm_counter``): the numerator's
 #: source and the gateway numerator's two totals of the same window, for comparison.
 #: ``prompt_tokens_total`` / ``generation_tokens_total`` (and ``trs``) are L3's there.
@@ -854,7 +859,9 @@ def build_dataset(
     if l3_mode and numerator_doc["windows_void"]:
         discrepancies.append(
             f"L3 numerator: {sum(numerator_doc['windows_void'].values())} window(s) of non-void attempts "
-            f"dropped ({numerator_doc['windows_void']}); see manifest numerator")
+            f"dropped ({numerator_doc['windows_void']}; the online controller would have used "
+            f"{sum(numerator_doc['windows_void_online_used'].values())} of them: "
+            f"{numerator_doc['windows_void_online_used']}); see manifest numerator")
     if reissue_summary["excluded"]:
         discrepancies.append(
             f"reissue check: {len(reissue_summary['excluded'])} attempt(s) excluded as void "
@@ -901,6 +908,8 @@ def build_dataset(
         # The TSS numerator of the signal columns (scripts.l3_numerator); dline_refit
         # trainset / freeze / accept refuse to mix two.
         "numerator": numerator_doc,
+        # The v1 ablation signals' columns (ttft_mean / kv_usage inputs) and their void counts.
+        "alt_signal_columns": {**alt_signal_columns.rule(), **alt_columns_summary(manifest_cells)},
         # The queue estimator of avg_running / avg_waiting (absent = before 2026-10-25:
         # live_grid_sum_over_expected); dline_refit trainset / freeze / accept carry it.
         "queue_estimator": settings.queue_estimator_record(),
@@ -1155,6 +1164,12 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             "expected_prompt_tokens": record.get("expected_prompt_tokens"),
         })
     written = l3_rows if settings.numerator == l3.NUMERATOR_VLLM_COUNTER else windows
+    alt_columns = None
+    if written and status != STATUS_VOID and attempt.stem:
+        # Same windows; only the v1 ablation signals' inputs are added (scripts.alt_signal_columns).
+        alt_columns = alt_signal_columns.columns_for_cell(attempt.campaign, attempt.stem)
+        for row in written:
+            row.update(alt_columns(int(row["window_start_ms"]), int(row["window_end_ms"])))
     window_rows = (
         [{**identity, "in_warmup": in_warmup(row["window_start_ms"]), **row} for row in written]
         if status != STATUS_VOID else []
@@ -1233,6 +1248,8 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
     manifest_cell["online_csv_parity"] = online_parity
     if settings.numerator == l3.NUMERATOR_VLLM_COUNTER:
         manifest_cell["numerator"] = numerator_cell
+    if alt_columns is not None:
+        manifest_cell["alt_signal_columns"] = alt_columns.summary()
     return {"cell": cell_row, "manifest": manifest_cell,
             "windows": window_rows, "requests": request_rows}
 
@@ -1252,14 +1269,19 @@ def l3_windows(attempt: Attempt, windows: Sequence[dict], labelled, settings: Se
         row["prompt_tokens_gateway"] = g.get("prompt_tokens_total")
         row["generation_tokens_gateway"] = g.get("generation_tokens_total")
     void: dict[str, int] = {}
+    online_used: dict[str, int] = {}
     for key in gateway:
         status = source.status.get(key) or "not_asked"
         if status != l3.STATUS_OK:
             void[status] = void.get(status, 0) + 1
+            if key in source.online_used:
+                online_used[status] = online_used.get(status, 0) + 1
     summary = source.summary()
     return rows, {"pods": summary["pods"], "missing_pods": summary["missing_pods"],
                   "windows_labelled": len(gateway), "windows_kept": len(rows),
-                  "windows_void": dict(sorted(void.items()))}
+                  "windows_void": dict(sorted(void.items())),
+                  # review M2 (10-28): voided here, used online (selection-bias visibility)
+                  "windows_void_online_used": dict(sorted(online_used.items()))}
 
 
 def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dict:
@@ -1268,6 +1290,7 @@ def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dic
         return {}
     kept = labelled = 0
     void: dict[str, int] = {}
+    online_used: dict[str, int] = {}
     no_metrics = []
     for c in manifest_cells:
         rec = c.get("numerator")
@@ -1277,11 +1300,26 @@ def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dic
         labelled += rec["windows_labelled"]
         for k, v in rec["windows_void"].items():
             void[k] = void.get(k, 0) + v
+        for k, v in (rec.get("windows_void_online_used") or {}).items():
+            online_used[k] = online_used.get(k, 0) + v
         if not rec["pods"] or rec["missing_pods"]:
             no_metrics.append({k: c.get(k) for k in ("model", "cell_id", "attempt")}
                               | {"missing_pods": rec["missing_pods"]})
     return {"windows_labelled": labelled, "windows_kept": kept, "windows_void": dict(sorted(void.items())),
+            "windows_void_online_used": dict(sorted(online_used.items())),
             "attempts_without_metrics": no_metrics}
+
+
+def alt_columns_summary(manifest_cells: Sequence[dict]) -> dict:
+    """The manifest's per-status window counts of the v1 ablation columns."""
+    windows: dict[str, int] = {}
+    for c in manifest_cells:
+        rec = c.get("alt_signal_columns")
+        if not rec or c.get("status") == STATUS_VOID:
+            continue
+        for k, v in rec["windows"].items():
+            windows[k] = windows.get(k, 0) + v
+    return {"windows": dict(sorted(windows.items()))}
 
 
 #: ``online_csv_parity`` values in the manifest.

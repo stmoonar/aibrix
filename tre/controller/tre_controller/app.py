@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.gateway_inflight import instance_max_age_ms
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
+from tre_common.tss import theta_basis_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
@@ -305,6 +306,21 @@ def create_controller_dependencies(
     sm_transport: AsyncTransport | None = None,
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
+    # 2026-10-28 (review L4): the v1 legacy schema has no step counters and no span
+    # scaling - every model's tokens would be unknown. Refuse it at start.
+    if cfg.metrics_schema != "v2":
+        raise ValueError(
+            f"controller configuration: TRE_METRICS_SCHEMA={cfg.metrics_schema!r} is not supported "
+            "(the TSS numerator needs the v2 schema's step counters)"
+        )
+    # 2026-10-28: thetas are window token totals of one numerator source - refuse to run
+    # on thetas fitted for another window or numerator (an old registry with a new image).
+    basis_errors = theta_basis_errors(registry.models(), window_ms=float(cfg.metrics_window_ms))
+    if basis_errors:
+        raise ValueError(
+            "controller configuration: registry thetas were not fitted on this controller's TSS "
+            "(publish the recalibrated trs with the image): " + "; ".join(basis_errors)
+        )
     injected_redis_client = redis_client is not None
     redis_timeout_s = float(getattr(cfg, "redis_socket_timeout_s", 0.0) or 0.0)
     redis_client = (
@@ -333,6 +349,7 @@ def create_controller_dependencies(
         json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
     )
     scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
+    o1_suffix_can_warm = int(cfg.metrics_window_ms) > int(breakpoint_config.min_evidence_ms)
     signal_state = SignalState(
         warmup_ms=cfg.signal_warmup_ms,
         # O1 breakpoint window (registry scaling.breakpoint_window /
@@ -367,7 +384,12 @@ def create_controller_dependencies(
         # histogram docs (only the requested ones are built).
         suffix_period_ms=cfg.evidence_period_ms,
         # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
-        suffix_breakpoint=lambda model: signal_state.breakpoint_ms(model) if signal_state.o1_active else None,
+        # 2026-10-28 (review L1): a suffix is strictly shorter than the window, so with
+        # window <= min_evidence_ms O1 can never warm on one - not built then (the
+        # model waits for a whole window either way; hold reason no_suffix).
+        suffix_breakpoint=lambda model: (
+            signal_state.breakpoint_ms(model) if signal_state.o1_active and o1_suffix_can_warm else None
+        ),
         # Round 5: and the SafeScale commit gate's tail - the post-hide suffix of a probing model.
         suffix_tail=lambda model: tail_start[0](model) if tail_start else None,
     )

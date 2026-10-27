@@ -151,6 +151,17 @@ var treInstantMetricNames = map[string]struct{}{
 	metrics.RealtimeNormalizedPendings: {},
 }
 
+// TRE (2026-10-28, design tre/docs/design/20261028-tss-step-counters.md): vLLM's
+// per-step token counters, written on the histogram docs (same boundary, same
+// scraped_ms) under "model_counter_metrics". They are the TSS numerator: the
+// controller divides their delta between two docs by the docs' scraped_ms span.
+// vLLM adds generated tokens every engine step and prompt tokens at the first token
+// (chunked prefill and preemption recompute are not counted twice).
+var treCounterMetricNames = map[string]struct{}{
+	metrics.PromptTokenTotal:     {},
+	metrics.GenerationTokenTotal: {},
+}
+
 var treHistogramMetricNames = map[string]struct{}{
 	metrics.TimeToFirstTokenSeconds:   {},
 	metrics.TimePerOutputTokenSeconds: {},
@@ -208,8 +219,8 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (
 		// failed scrape keeps the old metrics and does not advance it, so the controller
 		// can tell stale metrics from fresh ones. Read with the metrics under the pod's
 		// scrape lock (review round 3, L4): the stamp always belongs to these values.
-		var instantMetrics, histogramMetrics map[string]any
-		var instantModels, histogramModels map[string]struct{}
+		var instantMetrics, histogramMetrics, counterMetrics map[string]any
+		var instantModels, histogramModels, counterModels map[string]struct{}
 		metaPod.readScrape(func(scrapedMS int64, ok bool) {
 			if ok {
 				base["scraped_ms"] = scrapedMS
@@ -217,8 +228,10 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (
 			instantMetrics, instantModels = collectTREInstantMetrics(metaPod)
 			if round.histStamp != 0 {
 				histogramMetrics, histogramModels = collectTREHistogramMetrics(metaPod)
+				counterMetrics, counterModels = collectTRECounterMetrics(metaPod)
 			}
 		})
+		histogramModels = unionStringSets(histogramModels, counterModels)
 
 		if len(instantMetrics) > 0 {
 			doc := cloneMetricEnvelope(base)
@@ -229,10 +242,13 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, round treRound) (
 				firstErr = err
 			}
 		}
-		if len(histogramMetrics) > 0 {
+		if len(histogramMetrics) > 0 || len(counterMetrics) > 0 {
 			doc := cloneMetricEnvelope(base)
 			doc["timestamp"] = round.histStamp
 			doc["model_histogram_metrics"] = histogramMetrics
+			if len(counterMetrics) > 0 {
+				doc["model_counter_metrics"] = counterMetrics
+			}
 			if err := queueTREMetricDocument(ctx, pipe, podKey, round.histStamp, doc, true, legacyRound, writeV2); err != nil {
 				// Round 6 (M2): this pod's doc only; the boundary still advances.
 				klog.ErrorS(err, "TRE histogram doc skipped", "pod", podKey, "boundary", round.histStamp)
@@ -376,6 +392,36 @@ func collectTREInstantMetrics(metaPod *Pod) (map[string]any, map[string]struct{}
 			return true
 		}
 		values[key] = simpleValue.GetSimpleValue()
+		models[model] = struct{}{}
+		return true
+	})
+	return values, models
+}
+
+// collectTRECounterMetrics returns the pod's token counters (treCounterMetricNames) by
+// "<model>/<metric>". A non-finite value is left out: the controller reads a pod
+// without the counter as unknown (never as zero).
+func collectTRECounterMetrics(metaPod *Pod) (map[string]any, map[string]struct{}) {
+	values := make(map[string]any)
+	models := make(map[string]struct{})
+	metaPod.ModelMetrics.Range(func(key string, metricValue metrics.MetricValue) bool {
+		model, metricName, ok := splitPodModelMetricKey(key)
+		if !ok {
+			return true
+		}
+		if _, wanted := treCounterMetricNames[metricName]; !wanted {
+			return true
+		}
+		simpleValue, ok := metricValue.(*metrics.SimpleMetricValue)
+		if !ok {
+			return true
+		}
+		value := simpleValue.GetSimpleValue()
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			klog.V(1).InfoS("TRE token counter with a non-finite value left out", "pod", metaPod.Name, "metric", key)
+			return true
+		}
+		values[key] = value
 		models[model] = struct{}{}
 		return true
 	})

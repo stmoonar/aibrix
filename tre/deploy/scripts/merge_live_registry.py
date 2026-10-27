@@ -30,9 +30,19 @@ from typing import Any
 
 import yaml
 
+from tre_common.tss import NUMERATOR_COMPLETION_HISTOGRAMS
+
 #: Per-model keys params_set.py may edit (deploy/scripts/registry_params.py).
 TUNABLE_SECTIONS = ("trs", "slo")
 TUNABLE_KEYS = ("min_replicas", "max_awake_replicas")
+
+#: The theta basis stamps (tre_common.tss.theta_basis_errors) are part of theta: a theta is a
+#: window token total of one numerator source. A live theta_m without stamps predates them
+#: (2026-10-28) and was fitted on the completion histograms over 30 s windows. Its stamps are
+#: that truthful basis, never the release file's, so a controller computing another basis
+#: refuses to start until a theta fitted on its basis is published.
+THETA_BASIS_STAMPS = ("numerator", "theta_window_ms")
+LEGACY_THETA_BASIS = {"numerator": NUMERATOR_COMPLETION_HISTOGRAMS, "theta_window_ms": 30000}
 
 
 def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -51,6 +61,18 @@ def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any]
                 if target.get(key) != value:
                     report.append(f"{name}: {section}.{key} live {value!r} kept (release {target.get(key)!r})")
                 target[key] = value
+        live_trs = src.get("trs") or {}
+        if "theta_m" in live_trs:
+            target = model.setdefault("trs", {})
+            for key in THETA_BASIS_STAMPS:
+                if key not in live_trs:
+                    value = LEGACY_THETA_BASIS[key]
+                    if target.get(key) != value:
+                        report.append(
+                            f"WARN {name}: trs.{key} {value!r} (live theta_m has no stamp: fitted before the "
+                            f"stamps, on that basis; release {target.get(key)!r} not applied to it)"
+                        )
+                    target[key] = value
         for signal, fields in (src.get("alt_thresholds") or {}).items():
             target = model.setdefault("alt_thresholds", {}).setdefault(signal, {})
             for key, value in (fields or {}).items():

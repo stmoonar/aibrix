@@ -412,9 +412,15 @@ def test_snapshot_observations_carry_their_mean_prompt_length() -> None:
         model="donor", window_start_ms=0, window_end_ms=30_000, prompt_tokens=6_000.0, generation_tokens=10.0,
         avg_waiting=0.0, avg_running=1.0, avg_swapping=0.0, kv_cache_hit_rate=0.0, ttft_p95_ms=1.0,
         tpot_p95_ms=1.0, e2e_p95_ms=1.0, routable_pods=1, assigned_replicas=1, per_pod={}, request_count=4.0,
+        completed_prompt_tokens=6_000.0,
     )
     observation = _observation_from_metrics(30_000, window, _registry().model("donor"), "zm")
     assert observation.mean_prompt_tokens == 1_500.0
+    # 2026-10-28: the mean length comes from the completed requests, never from the TSS
+    # step-counter total (prompt_tokens): without the histogram sum it is unknown.
+    from dataclasses import replace as _replace
+    unknown = _observation_from_metrics(30_000, _replace(window, completed_prompt_tokens=None), _registry().model("donor"), "zm")
+    assert unknown.mean_prompt_tokens is None
 
 
 # ============================================================ 2+5. the real reader (fake redis)
@@ -444,6 +450,7 @@ class DocRedis:
         doc = {
             "pod_name": pod,
             "timestamp": ts,
+            "model_counter_metrics": {f"{model}/prompt_tokens_total": prompt, f"{model}/generation_tokens_total": 0.0},
             "model_histogram_metrics": {
                 f"{model}/request_prompt_tokens": {"sum": prompt, "count": count, "buckets": {"+Inf": count}},
                 f"{model}/time_to_first_token_seconds": {
@@ -478,8 +485,9 @@ def _history(redis: DocRedis, *, skip: tuple[int, ...] = ()) -> None:
 
 
 def _reader(redis: DocRedis) -> MetricsEvidenceReader:
+    # as the controller builds it (app.py): latency histograms only, no instant docs
     store = MetricsStore(redis, _slo_registry(), instant_sample_interval_ms=10_000, min_latency_samples=10,
-                         histogram_lookback_ms=0)
+                         histogram_lookback_ms=0, read_instant=False)
     return MetricsEvidenceReader(store, redis_client=redis, sleeping_pods=lambda model: {"m-2"})
 
 

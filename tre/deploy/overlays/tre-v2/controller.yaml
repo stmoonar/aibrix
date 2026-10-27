@@ -110,8 +110,13 @@ spec:
             # (onset->first non-null z_m) P50=11.0s P95=12.7s max=14.9s <= 35s target -> W
             # authoritative at 30000. Evidence: docs/refactor/p11_evidence/s1_shortwindow_20260708/.
             # This is the single window S1.4 / R3 theta_m refit must use.
+            # 2026-10-28 (user decision, design docs/design/20261028-tss-step-counters.md):
+            # 20 s with the step-counter TSS numerator (the counters have no completion
+            # noise, so a shorter window stays usable). Every model's registry
+            # trs.theta_window_ms must equal this - the controller refuses to start
+            # otherwise (thetas are window token totals).
             - name: TRE_METRICS_WINDOW_MS
-              value: "30000"
+              value: "20000"
             # SafeScale latency thresholds come from the registry (safescale.slo_mode,
             # 2026-09-29): SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS are
             # optional overrides and deliberately NOT set here. (Older images default

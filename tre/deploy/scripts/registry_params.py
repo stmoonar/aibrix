@@ -19,7 +19,9 @@ from typing import Any, Callable
 
 import yaml
 
+from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS, Z_MAX
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
+from tre_common.tss import NUMERATOR_COMPLETION_HISTOGRAMS, NUMERATOR_STEP_COUNTERS
 
 # field -> (min, max, kind, min_exclusive, max_exclusive)
 _TRS_BOUNDS: dict[str, tuple] = {
@@ -35,12 +37,21 @@ _TRS_BOUNDS: dict[str, tuple] = {
     "ema_alpha": (0, 1, "float", True, True),
     "epsat": (0, 0.5, "float", True, True),
     "hsat": (1, 20, "int", False, False),
+    # 2026-10-28: what theta was fitted on (tre_common.tss.theta_basis_errors). Published
+    # with theta in the same --apply; the controller refuses to start on a mismatch.
+    "theta_window_ms": (1000, 120000, "int", False, False),
+    "numerator": ((NUMERATOR_STEP_COUNTERS, NUMERATOR_COMPLETION_HISTOGRAMS), None, "enum", False, False),
 }
 _ALT_THRESHOLD_BOUNDS = (0, 1_000_000_000, "float", True, False)
 _ALT_DELTA_BOUNDS = {
     "delta_crit": (0.0, 1.0, "float", False, True),
-    "delta_high": (0.0, 5.0, "float", False, False),
+    # z is capped at Z_MAX (tre_common.alt_signals): a band above Z_MAX - 1 never fires.
+    # The alt fit searches the same range (tre_calibration.alt_signals ALT_DELTA_HIGH_GRID).
+    "delta_high": (0.0, Z_MAX - 1.0, "float", False, False),
 }
+#: alt_thresholds.<signal>.basis.<field> (tre_common.alt_signals.alt_basis_errors): what
+#: theta was fitted on; published with theta, checked by the controller at start.
+_ALT_BASIS_WINDOW_BOUNDS = (1000, 120000, "int", False, False)
 
 _SLO_BOUNDS: dict[str, tuple] = {
     "ttft_p95_ms": (50, 5000, "float", False, False),
@@ -100,6 +111,15 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
             }
             for field, spec in _ALT_DELTA_BOUNDS.items():
                 editable[f"alt_thresholds.{signal}.{field}"] = _field_view(threshold.get(field), spec)
+            basis = threshold.get("basis") or {}
+            editable[f"alt_thresholds.{signal}.basis.definition"] = {
+                "value": basis.get("definition"),
+                "type": "enum",
+                "choices": [ALT_SIGNAL_DEFINITIONS.get(signal)],
+            }
+            editable[f"alt_thresholds.{signal}.basis.window_ms"] = _field_view(
+                basis.get("window_ms"), _ALT_BASIS_WINDOW_BOUNDS
+            )
         for field, spec in _SLO_BOUNDS.items():
             editable[f"slo.{field}"] = _field_view(slo.get(field), spec)
         for field, spec in _TOP_BOUNDS.items():
@@ -122,6 +142,8 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
 
 def _field_view(value: Any, spec: tuple) -> dict[str, Any]:
     lo, hi, kind, lo_ex, hi_ex = spec
+    if kind == "enum":
+        return {"value": value, "type": "enum", "choices": list(lo)}
     return {"value": value, "min": lo, "max": hi, "type": kind, "min_exclusive": lo_ex, "max_exclusive": hi_ex}
 
 
@@ -209,7 +231,7 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
         if not isinstance(raw, dict):
             errors.append({"model": model, "field": key, "error": "not_an_object"})
             continue
-        unknown = sorted(set(raw) - {"theta", "direction", *_ALT_DELTA_BOUNDS})
+        unknown = sorted(set(raw) - {"theta", "direction", "basis", *_ALT_DELTA_BOUNDS})
         for field in unknown:
             errors.append({"model": model, "field": f"{key}.{field}", "error": "unknown_field"})
         threshold = target.setdefault(signal, {})
@@ -222,6 +244,8 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
                 value = _coerce(raw[field], spec, model, f"{key}.{field}", errors)
                 if value is not None:
                     threshold[field] = value
+        if "basis" in raw:
+            _apply_alt_basis(threshold, raw["basis"], signal, model, errors)
         if "direction" in raw:
             direction = str(raw["direction"])
             if direction != expected_direction:
@@ -237,8 +261,34 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
                 threshold["direction"] = direction
 
 
+def _apply_alt_basis(threshold: dict, raw: Any, signal: str, model: str, errors: list) -> None:
+    key = f"alt_thresholds.{signal}.basis"
+    if not isinstance(raw, dict):
+        errors.append({"model": model, "field": key, "error": "not_an_object"})
+        return
+    for field in sorted(set(raw) - {"definition", "window_ms"}):
+        errors.append({"model": model, "field": f"{key}.{field}", "error": "unknown_field"})
+    basis = threshold.setdefault("basis", {})
+    if "definition" in raw:
+        expected = ALT_SIGNAL_DEFINITIONS.get(signal)
+        if raw["definition"] != expected:
+            errors.append({"model": model, "field": f"{key}.definition", "error": "invalid_definition",
+                           "expected": expected})
+        else:
+            basis["definition"] = expected
+    if "window_ms" in raw:
+        value = _coerce(raw["window_ms"], _ALT_BASIS_WINDOW_BOUNDS, model, f"{key}.window_ms", errors)
+        if value is not None:
+            basis["window_ms"] = value
+
+
 def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
     lo, hi, kind, lo_ex, hi_ex = spec
+    if kind == "enum":
+        if raw in lo:
+            return raw
+        errors.append({"model": model, "field": key, "error": "not_a_choice", "choices": list(lo)})
+        return None
     if isinstance(raw, bool):  # YAML true/false would coerce to 1/0
         errors.append({"model": model, "field": key, "error": f"not_a_{kind}"})
         return None
@@ -303,7 +353,8 @@ _SECTIONS = ("trs", "slo")
 def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
     """``["<model>.<path>=<value>", ...]`` -> the ``edits`` mapping of apply_and_validate.
 
-    <path> is ``trs.<f>``, ``slo.<f>``, ``alt_thresholds.<signal>.<f>`` or a top-level
+    <path> is ``trs.<f>``, ``slo.<f>``, ``alt_thresholds.<signal>.<f>``,
+    ``alt_thresholds.<signal>.basis.{definition,window_ms}`` or a top-level
     replica bound. The model is matched by the longest registry name that prefixes the
     key (names may contain dots). VALUE is parsed as YAML. Raises ParamValidationError
     for a malformed item, an unknown model or a path outside the editable shapes (locked
@@ -326,6 +377,9 @@ def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
             changes.setdefault(path[0], {})[path[1]] = value
         elif len(path) == 3 and path[0] == "alt_thresholds":
             changes.setdefault("alt_thresholds", {}).setdefault(path[1], {})[path[2]] = value
+        elif len(path) == 4 and path[0] == "alt_thresholds" and path[2] == "basis":
+            (changes.setdefault("alt_thresholds", {}).setdefault(path[1], {})
+             .setdefault("basis", {}))[path[3]] = value
         elif len(path) == 1 and (path[0] in _TOP_BOUNDS or path[0] in _LOCKED):
             changes[path[0]] = value
         else:

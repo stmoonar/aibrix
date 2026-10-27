@@ -248,8 +248,10 @@ class MetricsEvidenceReader:
             ttft_p95_ms=_max_present([*(pod.ttft_p95_ms for pod in pods.values()), pooled_ttft]),
             tpot_p95_ms=_max_present([*(pod.tpot_p95_ms for pod in pods.values()), pooled_tpot]),
             ttft_count=total,
-            prompt_tokens=_sum_present(getattr(pod, "prompt_tokens", None) for pod in pods.values()),
-            prompt_count=_sum_present(getattr(pod, "request_count", None) for pod in pods.values()),
+            # Mean prompt length of the completed requests (2026-10-28: the histogram
+            # sum, not the TSS step-counter total ``prompt_tokens``).
+            prompt_tokens=_sum_present(getattr(pod, "completed_prompt_tokens", None) for pod in pods.values()),
+            prompt_count=_sum_present(getattr(pod, "request_count_observed", None) for pod in pods.values()),
             first_doc_ts_ms=first_docs,
             judged_count=float(judged),
             last_doc_ts_ms=last_docs,

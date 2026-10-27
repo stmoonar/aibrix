@@ -165,7 +165,7 @@ def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None
     ]) == 0
     report = yaml.safe_load(out.read_text())
     entry = report["models"][MODEL]["alt_thresholds"]["decode_tps"]
-    assert set(entry) == {"theta", "direction", "delta_crit", "delta_high"}
+    assert set(entry) == {"theta", "direction", "delta_crit", "delta_high", "basis"}
     assert report["fit_config"]["pipeline"] == "scripts.theta_verdict.verdict_report"
     verdict = json.loads((tmp_path / f"{MODEL}_verdict_decode_tps.json").read_text())
     assert verdict["published"]["theta_m"] == entry["theta"]

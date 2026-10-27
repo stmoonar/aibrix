@@ -243,7 +243,10 @@ def test_freeze_writes_one_self_hashed_read_only_document(tmp_path) -> None:
                               "tau_s": 10.0, "alpha": dl.alpha_of(10.0), "lambda_wait": 1.0,
                               "delta_crit": pytest.approx(1 - TAU_CRIT), "delta_high": 0.59, "tau_crit": TAU_CRIT,
                               "tau_high": 1.59}
-    assert e["registry"] == {"ema_tau_ms": 10_000.0, "ema_alpha": round(dl.alpha_of(10.0), 6)}
+    assert e["registry"]["ema_tau_ms"] == 10_000.0 and e["registry"]["ema_alpha"] == round(dl.alpha_of(10.0), 6)
+    # the stamps the controller checks: the training numerator and the window theta is a total of
+    assert e["registry"]["numerator"] == "completion_histograms"
+    assert e["registry"]["theta_window_ms"] == int(e["windowing"]["window_ms"])
     assert e["stop_rule"]["satisfied"] and e["train_ba_at_published"] == TRAIN_BA
     # a dataset without a load-path record predates it: English prompts, no routing header
     assert e["prompt_corpus"] == {"corpus_lang": "en", "zh_ratio": 0.0} and e["routing_strategy"] is None

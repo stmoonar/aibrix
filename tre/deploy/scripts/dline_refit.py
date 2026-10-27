@@ -138,6 +138,12 @@ Windowing: ``--window-ms`` / ``--step-ms`` / ``--dt-ref-s`` / ``--horizon-ms`` /
 wp and final, recorded as ``windowing`` in their outputs and in the freeze (revision 2),
 and accept reads them from the freeze - except ``--dwell-windows``, which for accept is
 the B' gate's dwell (default :data:`ONLINE_DWELL_WINDOWS`).
+The fit stages' window is the training datasets' window (theta is a window total): trainset
+refuses datasets cut with two windows, freeze refuses datasets cut with another window / step
+than final ran with, accept an M dataset cut with another than the freeze's. The freeze's
+``registry`` block carries the stamps the controller checks at start, ``numerator``
+(``step_counters`` / ``completion_histograms``, :data:`scripts.l3_numerator.REGISTRY_NUMERATOR`)
+and ``theta_window_ms``.
 
 Labels are ``tre_common.slo_labels``: ``primary`` is the D6' slowdown label of the
 registry profile (``max(500 ms, 5 * idle TTFT(L))``, TPOT 75 ms, >= 20 completions),
@@ -191,7 +197,12 @@ TRIM_RAMP_WINDOWS = 1
 #: ``--dt-ref-s`` / ``--horizon-ms`` / ``--dwell-windows``, thread the values explicitly
 #: (no module state changes), record them as ``windowing`` in their outputs, and the
 #: freeze carries them to ``accept``: a different window only needs an offline re-run.
-WINDOW_MS = 30_000.0
+#: WINDOW_MS = the controller's TRE_METRICS_WINDOW_MS (20 s since 2026-10-28).
+WINDOW_MS = 20_000.0
+#: The window of every stage output / freeze written before the windowing record
+#: (2026-09-30) and the default until 2026-10-28: :func:`windowing_of` reads a record
+#: without ``window_ms`` as this, never as the current default.
+LEGACY_WINDOW_MS = 30_000.0
 STEP_MS = 10_000.0
 WINDOWING_KEYS = ("window_ms", "step_ms", "dt_ref_s", "horizon_ms", "dwell_windows")
 #: Verdict resamples: the w_p grid, the lambda check, the final verdict.
@@ -445,6 +456,24 @@ def dataset_numerator(directory: Path) -> str:
     return str((doc.get("numerator") or {}).get("source") or l3.NUMERATOR_GATEWAY)
 
 
+def dataset_windowing(directory: Path) -> Optional[dict[str, float]]:
+    """``{"window_ms", "step_ms"}`` a standard dataset was cut with (its manifest's
+    ``windowing``); None without a manifest or the record (nothing to compare)."""
+    try:
+        rec = json.loads((Path(directory) / DATASET_MANIFEST).read_text(encoding="utf-8")).get("windowing") or {}
+    except (OSError, ValueError):
+        return None
+    if rec.get("window_ms") is None or rec.get("step_ms") is None:
+        return None
+    return {"window_ms": float(rec["window_ms"]), "step_ms": float(rec["step_ms"])}
+
+
+def windowing_mismatch(recorded: Mapping[str, Any], cut: Optional[Mapping[str, Any]]) -> bool:
+    """Whether a dataset cut with ``cut`` (:func:`dataset_windowing`) differs from the
+    stage windowing ``recorded`` in window length or step (None = unknown: no mismatch)."""
+    return cut is not None and any(float(recorded[k]) != float(cut[k]) for k in ("window_ms", "step_ms"))
+
+
 def dataset_queue_estimator(directory: Path) -> str:
     """The queue estimator a standard dataset's ``avg_running`` / ``avg_waiting`` were
     built with (its manifest's ``queue_estimator.name``,
@@ -563,6 +592,11 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
         # one theta, one label: completion and hybrid label a window's requests differently
         raise TrainingSetError(f"the datasets were built with different label attributions {attributions}; "
                                "rebuild them with one calibration_dataset --attribution")
+    cuts = {s.name: dataset_windowing(s.directory) for s in sources}
+    if len({tuple(sorted(c.items())) for c in cuts.values() if c is not None}) > 1:
+        # one theta, one window: the TSS numerator is a window total, theta scales with the window
+        raise TrainingSetError(f"the datasets were cut with different windows {cuts}; rebuild them with one "
+                               "calibration_dataset --window-ms / --step-ms")
     estimators = {s.name: dataset_queue_estimator(s.directory) for s in sources}
     if len(set(estimators.values())) > 1:
         # one theta, one queue: the estimators read the same window's queue differently
@@ -716,7 +750,7 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             "windows_csv_sha256": sha256_file(s.windows),
             "manifest_sha256": sha256_file(man) if man.exists() else None, "format_revision": rev,
             "numerator": numerators[s.name], "attribution": attributions[s.name],
-            "queue_estimator": estimators[s.name],
+            "queue_estimator": estimators[s.name], "windowing": cuts[s.name],
         })
     doc = {
         "what": ("D16 training set: the constant-load cells of the sources (theta is fitted on these only)"
@@ -870,13 +904,15 @@ def windowing(*, window_ms: float = WINDOW_MS, step_ms: float = STEP_MS, dt_ref_
 
 
 DEFAULT_WINDOWING = windowing()
+#: The windowing of documents that predate the record (see :data:`LEGACY_WINDOW_MS`).
+LEGACY_WINDOWING = windowing(window_ms=LEGACY_WINDOW_MS)
 
 
 def windowing_of(doc: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     """The windowing a stage output / freeze entry recorded; the defaults for keys (or a
     whole block) an older document does not carry - the D22 freeze predates the record."""
     rec = (doc or {}).get("windowing") or {}
-    return {k: rec.get(k, DEFAULT_WINDOWING[k]) for k in WINDOWING_KEYS}
+    return {k: rec.get(k, LEGACY_WINDOWING[k]) for k in WINDOWING_KEYS}
 
 
 def alpha_of(tau_s: float, dt_ref_s: float = DT_REF_S) -> float:
@@ -1633,7 +1669,7 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
 # compares, never writing next to the freeze.
 
 #: 2 (2026-09-30): each model entry records its ``windowing``. Revision 1 freezes (the
-#: D22 one) still verify and accept: their windowing is :data:`DEFAULT_WINDOWING`.
+#: D22 one) still verify and accept: their windowing is :data:`LEGACY_WINDOWING`.
 #: 3 (2026-10-03): each model entry seals its B' severity cut (``b_prime``) and the
 #: document the B' gate (``b_prime_gate``). Older freezes accept only with an explicit
 #: ``--b-prime-thresholds`` file.
@@ -1677,7 +1713,15 @@ B_RECALL_CI_LOW_MIN = 0.75
 B_FALSE_ALARM_MAX = 0.05
 B_FALSE_ALARM_CI_HIGH_MAX = 0.08
 ALL_VIOLATING_RECALL_TARGET = 0.70
+#: Overlapping windows per independent one at the default windowing (30 s / 10 s);
+#: accept uses :func:`windows_per_independent` of the frozen windowing.
 WINDOWS_PER_INDEPENDENT = 3
+
+
+def windows_per_independent(win: Mapping[str, Any]) -> float:
+    """Sliding windows per disjoint one: window / step (>= 1)."""
+    return max(1.0, float(win["window_ms"]) / float(win["step_ms"]))
+
 ACCEPT_RESAMPLES = 1000
 #: The dwell accept applies when the freeze records no windowing (revision 1, e.g. D22).
 ACCEPT_DWELL_WINDOWS = DWELL_WINDOWS
@@ -1906,10 +1950,25 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                 check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
             except SystemExit as exc:
                 problems.append(f"training inputs: {exc}")
+            if "windowing" in fin:
+                # theta is a window total: fitted on windows of one length, published for it
+                for src in man_doc.get("sources") or []:
+                    if windowing_mismatch(win, src.get("windowing")):
+                        problems.append(f"dataset {src.get('run')} was cut with {src.get('windowing')} but the fit "
+                                        f"stages ran with window_ms {win['window_ms']:g} / step_ms "
+                                        f"{win['step_ms']:g}: rerun alpha / wp / final with its --window-ms / "
+                                        "--step-ms")
             ts_attr = str(man_doc.get("attribution") or ATTRIBUTION_COMPLETION)
             if label_attribution(ver.get("label_def")) != ts_attr:
                 problems.append(f"the fitted label's attribution {label_attribution(ver.get('label_def'))!r} != the "
                                 f"training datasets' {ts_attr!r} (trainset.json): rerun the fit stages")
+    from scripts.l3_numerator import registry_numerator
+
+    numerator = man_doc.get("numerator") or "gateway"
+    try:
+        numerator_stamp = registry_numerator(numerator)
+    except ValueError as exc:
+        problems.append(f"trainset.json: {exc}")
     if problems:
         return None, problems
     # B' (2026-10-03): the severity cut, from these training windows only, sealed now -
@@ -1933,7 +1992,10 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
             "lambda_wait": fin["lambda_wait"], "delta_crit": fin["delta_crit"], "delta_high": fin["delta_high"],
             "tau_crit": fin["tau_crit"], "tau_high": pub.get("tau_high"),
         },
-        "registry": dict(alpha["published_registry_fields"]),
+        # trs fields to publish; numerator / theta_window_ms are the stamps the controller
+        # checks at start (the numerator it computes, its TRE_METRICS_WINDOW_MS)
+        "registry": {**dict(alpha["published_registry_fields"]), "numerator": numerator_stamp,
+                     "theta_window_ms": int(win["window_ms"])},
         "windowing": {**win, "source": ("final.json" if "windowing" in fin
                                         else "defaults: final.json predates the windowing record")},
         "train_ba_at_published": fin.get("train_ba_at_published"),
@@ -1961,7 +2023,7 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         "api": next(iter(load_paths.values()))["api"],
         # The TSS numerator the training windows carried (scripts.l3_numerator; absent in
         # older freezes = gateway). accept refuses an M dataset built with another.
-        "numerator": man_doc.get("numerator") or "gateway",
+        "numerator": numerator,
         "b_prime": b_prime_rec,
         # revision 4 (2026-10-05)
         "label_attribution": label_attribution(ver["label_def"]),
@@ -2484,7 +2546,7 @@ def acceptance_criteria(entry: Mapping[str, Any], h: Mapping[str, Any], boot: Ma
                                        "met": all_rec is not None and all_rec >= ALL_VIOLATING_RECALL_TARGET,
                                        "ci95": ci["critical_recall_of_violating"], "gating": False}},
         "C": {"gating": False, "critical_recall_ttft_only": ttft["critical_recall"], "windows": ttft["windows"],
-              "independent_windows": ttft["windows"] / WINDOWS_PER_INDEPENDENT,
+              "independent_windows": ttft["windows"] / windows_per_independent(windowing_of(entry)),
               "ci95": ci["critical_recall_ttft_only"]},
         "D": {"passed": stop.get("satisfied") is True, "stop_rule_satisfied": stop.get("satisfied"),
               "reasons": stop.get("reasons"), "ci_half_frac": half, "publish_rate": entry.get("publish_rate"),
@@ -2777,6 +2839,15 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
             problems.append(f"dataset {s.name} ({s.directory}) was built with the {have!r} TSS numerator; the "
                             f"freeze fitted {wrong} with {sorted({frozen_numerators[m_] for m_ in wrong})} "
                             "(rebuild it with calibration_dataset --numerator)")
+    frozen_win = {m_: windowing_of(e) for m_, e in sorted(doc["models"].items())
+                  if (e.get("windowing") or {}).get("source") == "final.json"}
+    for s in sources:
+        have = dataset_windowing(s.directory)
+        wrong = sorted(m_ for m_, w in frozen_win.items() if windowing_mismatch(w, have))
+        if wrong:
+            problems.append(f"dataset {s.name} ({s.directory}) was cut with {have}; the freeze fitted {wrong} on "
+                            f"{sorted({(frozen_win[m_]['window_ms'], frozen_win[m_]['step_ms']) for m_ in wrong})} "
+                            "(window_ms, step_ms) windows (rebuild it with calibration_dataset --window-ms / --step-ms)")
     from scripts.rewindow_from_raw import QUEUE_ESTIMATOR_UNRECORDED
 
     frozen_q = {m_: str(((e.get("methods") or {}).get("queue_estimator") or {}).get("name")
@@ -3008,6 +3079,7 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                                     "gating": False}
     wins = {model: windowing_of(e) for model, e in doc["models"].items()}
     dwells = {model: w["dwell_windows"] for model, w in wins.items()}
+    per_independent = {model: windows_per_independent(w) for model, w in sorted(wins.items())}
     steps = {w["step_ms"] for w in wins.values()}
     step_bin = steps.pop() if len(steps) == 1 else STEP_MS
     pooled = ranking.ranking_disclosure(records, n_resamples=n_resamples, seed=seed,
@@ -3041,7 +3113,9 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                              "false_alarm_max": B_FALSE_ALARM_MAX,
                              "false_alarm_ci_high_max": B_FALSE_ALARM_CI_HIGH_MAX,
                              "all_violating_recall_target": ALL_VIOLATING_RECALL_TARGET},
-                       "C": {"windows_per_independent": WINDOWS_PER_INDEPENDENT},
+                       "C": {"windows_per_independent": (
+                           next(iter(set(per_independent.values()))) if len(set(per_independent.values())) == 1
+                           else per_independent)},
                        "accept_gate": {**gate, "verdict_rule": VERDICT_RULE},
                        "dwell_windows": (next(iter(set(dwells.values()))) if len(set(dwells.values())) == 1
                                          else dict(sorted(dwells.items())))},

@@ -115,7 +115,8 @@ class TRSInput:
     """Inputs of one window's TSS (the unified definition, ``tre_common.tss``).
 
     ``prompt_tokens_total`` / ``generation_tokens_total`` are window totals and the TSS
-    numerator is that total (tokens per window, window = TRE_METRICS_WINDOW_MS).
+    numerator is that total (tokens per window, the window's own length; 2026-10-28: from
+    vLLM's step counters, ``tre_common.tss``).
     ``window_ms`` is the window duration; it only drives the EMA idle-gap reset (``None``
     disables it). ``avg_swapping`` and ``w_d`` are carried for schema compatibility and are
     ignored by the formula (a non-zero swapping / a w_d != 1 is logged once).
@@ -484,6 +485,30 @@ class SignalState:
             ema = signal_ema(tau_ms)
             self._signal_ema[key] = ema
         return ema.update(raw, window_end_ms, window_ms, idle)
+
+    def held_signal(
+        self,
+        model: str,
+        source: str,
+        *,
+        window_end_ms: int,
+        tau_ms: float,
+        window_ms: float | None = None,
+        idle: bool = False,
+    ) -> float | None:
+        """The last smoothed value of an alternative signal for a window that has no
+        sample of it (ttft_mean: no first token in the window), or None.
+
+        v1 held the last EMA in such a window. Here the window goes through the same
+        ``TssEma`` rules as a sample (``update(None, ...)``): an idle window or a gap of
+        more than one metrics window since the last sample clears the EMA, so a value is
+        held for at most one window and is then unknown, never a stale healthy value.
+        """
+        ema = self._signal_ema.get((model, source))
+        if ema is None or ema.tau_ms != float(tau_ms):
+            return None
+        ema.update(None, window_end_ms, window_ms, idle)
+        return ema.value
 
     def reset_ema(self, model: str) -> None:
         """Clear every EMA of ``model`` (TSS and alternative signals) - the idle reset."""

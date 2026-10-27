@@ -19,8 +19,8 @@ from scripts import l3_numerator as l3
 PROMPT_RATE, GEN_RATE = 1024.0, 512.0  # tokens per second of one pod
 
 
-def _pod(samples, errors=()) -> l3.PodCounters:
-    return l3.PodCounters("ns/p", [(t, p, g) for t, p, g in samples], list(errors))
+def _pod(samples) -> l3.PodCounters:
+    return l3.PodCounters("ns/p", [(t, p, g) for t, p, g in samples])
 
 
 def _steady(t0: int, t1: int, *, reset_at: int | None = None, skip=()) -> list:
@@ -36,24 +36,66 @@ def _steady(t0: int, t1: int, *, reset_at: int | None = None, skip=()) -> list:
     return out
 
 
-def test_window_deltas_sum_pods_and_void_resets_holes_and_failed_scrapes() -> None:
+def test_window_deltas_sum_pods_and_void_resets_and_long_holes() -> None:
     a, b = _pod(_steady(0, 120_000)), _pod(_steady(0, 120_000))
     src = l3.CounterTokenSource([a, b])
     # (30 s, 60 s]: boundary samples at 29.001 / 59.001 s -> exactly 30 s of counting, x 2 pods
     assert src(30_000, 60_000) == (2 * 30 * PROMPT_RATE, 2 * 30 * GEN_RATE)
     reset = _pod(_steady(0, 120_000, reset_at=45_500))
     hole = _pod(_steady(0, 120_000, skip={40_001, 41_001}))
-    failed = _pod(_steady(0, 120_000), errors=[50_500])
+    long_hole = _pod(_steady(0, 120_000, skip=set(range(40_001, 52_001, 1000))))
     assert reset.window_delta(30_000, 60_000)[0] == l3.STATUS_RESET
     assert reset.window_delta(60_000, 90_000)[0] == l3.STATUS_OK  # after the reset: fine again
-    assert hole.window_delta(30_000, 60_000)[0] == l3.STATUS_GAP
-    assert failed.window_delta(30_000, 60_000)[0] == l3.STATUS_GAP
+    # 2026-10-28: a short interior hole (a failed scrape) does not bias the delta (only
+    # the boundary samples are read, as online); a hole long enough to hide a restart does.
+    assert hole.window_delta(30_000, 60_000) == (l3.STATUS_OK, 30 * PROMPT_RATE, 30 * GEN_RATE)
+    assert long_hole.window_delta(30_000, 60_000)[0] == l3.STATUS_GAP
     assert a.window_delta(130_000, 160_000)[0] == l3.STATUS_NO_SAMPLE  # past the capture
     src = l3.CounterTokenSource([a, reset])
     assert src(30_000, 60_000) is None  # one void pod voids the model's window
     assert src(60_000, 90_000) == (60 * PROMPT_RATE, 60 * GEN_RATE)
     assert src.counts == {l3.STATUS_RESET: 1, l3.STATUS_OK: 1}
     assert l3.CounterTokenSource([a], missing_pods=["ns/gone"])(60_000, 90_000) is None
+
+
+def _linear(times, prompt_rate=PROMPT_RATE, gen_rate=GEN_RATE) -> list:
+    """Samples at ``times`` of counters growing exactly at the rates (per second)."""
+    return [(t, prompt_rate * t / 1000.0, gen_rate * t / 1000.0) for t in times]
+
+
+@pytest.mark.parametrize("phase", [1, 250, 999])
+def test_window_value_is_the_rate_over_the_observed_span_as_a_window_total(phase) -> None:
+    # the online rule: (v(end sample) - v(start sample)) * window / span of the two samples
+    times = [phase + 1000 * k for k in range(60)]
+    late = [t for t in times if t != max(t for t in times if t <= 40_000)]  # end sample 1-2 s old
+    for samples in (times, late):
+        pod = _pod(_linear(samples))
+        status, p, g = pod.window_delta(20_000, 40_000)
+        assert status == l3.STATUS_OK
+        # a constant rate gives rate x window whatever the sample phase or a stale end sample
+        assert p == pytest.approx(20 * PROMPT_RATE) and g == pytest.approx(20 * GEN_RATE)
+    t0 = max(t for t in late if t <= 20_000)
+    t1 = max(t for t in late if t <= 40_000)
+    assert t1 - t0 != 20_000  # the raw delta alone would be off by the span error
+    # one sample serves both boundaries (window shorter than the sample spacing): no rate
+    assert _pod(_linear([0, 1000])).window_delta(100, 900)[0] == l3.STATUS_NO_SAMPLE
+
+
+def test_a_missing_counter_or_a_reset_voids_the_window_never_zero() -> None:
+    samples = _linear(range(1, 60_000, 1000))
+    missing = _pod([(t, p, None if 25_000 < t < 27_000 else g) for t, p, g in samples])
+    src = l3.CounterTokenSource([missing])
+    assert src(20_000, 40_000) is None and src.counts[l3.STATUS_MISSING_SERIES] == 1
+    assert src(40_000, 60_000) is not None
+    reset = _pod([(t, (p if t < 30_000 else p - 30 * PROMPT_RATE), g) for t, p, g in samples])
+    assert reset.window_delta(20_000, 40_000)[0] == l3.STATUS_RESET
+
+
+def test_registry_stamp_of_each_numerator() -> None:
+    assert l3.registry_numerator(l3.NUMERATOR_VLLM_COUNTER) == "step_counters"
+    assert l3.registry_numerator(l3.NUMERATOR_GATEWAY) == "completion_histograms"
+    with pytest.raises(ValueError):
+        l3.registry_numerator("bogus")
 
 
 def _write_pod_file(path: Path, samples) -> None:
@@ -82,10 +124,15 @@ def _rows(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def man_online_used(out: Path) -> dict:
+    return json.loads((out / "manifest.json").read_text())["numerator"]["windows_void_online_used"]
+
+
 def test_the_l3_dataset_changes_only_the_numerator_and_counts_what_it_drops(tmp_path) -> None:
     root = _l3_run(tmp_path)
-    gw = dataset.build_dataset(root)
-    out = dataset.build_dataset(root, overrides={"numerator": l3.NUMERATOR_VLLM_COUNTER})
+    cut30 = {"window_ms": 30_000}  # the fixture's counts are for 30 s / 10 s windows
+    gw = dataset.build_dataset(root, overrides=cut30)
+    out = dataset.build_dataset(root, overrides={**cut30, "numerator": l3.NUMERATOR_VLLM_COUNTER})
     assert gw == root / "dataset" and out == root / "dataset_l3"
     gw_rows, l3_rows = _rows(gw / "windows.csv"), _rows(out / "windows.csv")
     assert list(gw_rows[0]) == dataset.WINDOW_COLUMNS  # the default is unchanged
@@ -109,6 +156,10 @@ def test_the_l3_dataset_changes_only_the_numerator_and_counts_what_it_drops(tmp_
     s1_cell = next(c for c in man["cells"] if c["cell_id"] == "i256_o128_c95")
     s1_gw = [r for r in gw_rows if r["cell_id"] == "i256_o128_c95"]
     assert s1_cell["numerator"]["windows_void"].get(l3.STATUS_RESET) == 3
+    # M2 (10-28): of those, the online controller would have used the one whose post-reset
+    # span reaches 0.67 windows ((+60, +90]: 23 s) - counted, not kept
+    assert s1_cell["numerator"]["windows_void_online_used"] == {l3.STATUS_RESET: 1}
+    assert man_online_used(out) == {l3.STATUS_RESET: 1}
     assert s1_cell["numerator"]["windows_kept"] == len(s1) == len(s1_gw) - 3 - s1_cell["numerator"][
         "windows_void"].get(l3.STATUS_NO_SAMPLE, 0)
     assert man["numerator"]["source"] == l3.NUMERATOR_VLLM_COUNTER
@@ -130,10 +181,47 @@ def test_trainset_refuses_datasets_of_two_numerators(tmp_path) -> None:
 def test_an_l3_freeze_is_accepted_only_on_an_l3_m_dataset(tmp_path, capsys) -> None:
     w = base._world(tmp_path, train_manifest={"numerator": {"source": l3.NUMERATOR_VLLM_COUNTER}})
     assert base._freeze(w) == 0
-    assert dl.verify_freeze(w["freeze"])["models"][base.MODEL]["numerator"] == l3.NUMERATOR_VLLM_COUNTER
+    entry = dl.verify_freeze(w["freeze"])["models"][base.MODEL]
+    assert entry["numerator"] == l3.NUMERATOR_VLLM_COUNTER
+    assert entry["registry"]["numerator"] == "step_counters"
     man = base._seal(w)
     base._refused(w, man, capsys, "TSS numerator")  # M was built with the gateway numerator
     mman = w["mdir"] / "manifest.json"
     mman.write_text(json.dumps({**json.loads(mman.read_text()),
                                 "numerator": {"source": l3.NUMERATOR_VLLM_COUNTER}}))
     assert base._accept(w, man) == 0
+
+
+def _fit_window(w: dict, window_ms: float) -> None:
+    """The fit stages' recorded windowing (final.json; the fixture's alpha / wp carry none)."""
+    path = w["out"] / base.MODEL / base.ARM / "final.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "windowing": dl.windowing(window_ms=window_ms)}))
+
+
+def test_the_freeze_takes_the_datasets_window_and_stamps_it(tmp_path, capsys) -> None:
+    cut20 = {"windowing": {"window_ms": 20_000, "step_ms": 10_000}}
+    w = base._world(tmp_path, train_manifest={"numerator": {"source": l3.NUMERATOR_VLLM_COUNTER}, **cut20})
+    _fit_window(w, 30_000)  # the fit stages left at the 30 s default: refused, nothing written
+    assert base._freeze(w) == dl.EXIT_REFUSED
+    assert "rerun alpha / wp / final" in capsys.readouterr().out and not w["freeze"].exists()
+    _fit_window(w, 20_000)
+    assert base._freeze(w) == 0
+    entry = dl.verify_freeze(w["freeze"])["models"][base.MODEL]
+    assert entry["registry"]["theta_window_ms"] == 20_000 and entry["registry"]["numerator"] == "step_counters"
+    # an M dataset cut with another window than the freeze's is refused at accept
+    man = base._seal(w)
+    mman = w["mdir"] / "manifest.json"
+    mman.write_text(json.dumps({**json.loads(mman.read_text()), "numerator": {"source": l3.NUMERATOR_VLLM_COUNTER},
+                                "windowing": {"window_ms": 30_000, "step_ms": 10_000}}))
+    base._refused(w, man, capsys, "was cut with")
+
+
+def test_trainset_refuses_datasets_of_two_windows(tmp_path) -> None:
+    root = _l3_run(tmp_path)
+    d30 = dataset.build_dataset(root, out_dir=tmp_path / "d30", overrides={"window_ms": 30_000})
+    d20 = dataset.build_dataset(root, out_dir=tmp_path / "d20", overrides={"window_ms": 20_000})
+    assert json.loads((d20 / "manifest.json").read_text())["windowing"]["window_ms"] == 20_000
+    sources = [dl.DatasetSource.parse(f"a={d30}", sealed_to_h2=True),
+               dl.DatasetSource.parse(f"b={d20}", sealed_to_h2=True)]
+    with pytest.raises(dl.TrainingSetError, match="different windows"):
+        dl.build_training_set(sources, tmp_path / "fit")

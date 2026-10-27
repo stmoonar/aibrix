@@ -2262,7 +2262,7 @@ def tail_pre_hide_stats(
     For each tail observation (the ``hq`` tail :func:`_summarize_tail` hands to the
     commit gate) its pre-hide share is ``max(0, hide_ts - window_start) / window_len``,
     capped at 1, where ``[window_start, window_end]`` is the metrics window that
-    observation read (``ModelWindowMetrics``; sliding window of TRE_METRICS_WINDOW_MS
+    observation read (``ModelWindowMetrics``; the sliding metrics window
     ending at the snapshot's read boundary - the refresh period and read offset are
     therefore already in ``window_start``) and ``hide_ts`` is the probe's ``start_ms``:
     the snapshot time the probe (and its hide) was planned at. The hide reaches the

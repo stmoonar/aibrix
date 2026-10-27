@@ -169,6 +169,12 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 | `p95_ttft_server_ms` | ms | **服务端** vLLM 直方图 p95（redis 读回，分桶上界）。仅诊断，任何标签/拟合都不读它；由数据集转换重算时为空（只有在线 CSV 里有） |
 | `p95_tpot_server_ms` | ms | 同上，TPOT（按 token 间隔计，含单 token 卡顿） |
 | `p95_e2e_server_ms` | ms | 同上，端到端 |
+| `ttft_server_mean_ms` | ms | 2026-10-28 起：v1 消融信号 `ttft_mean` 的输入。各 pod 1 Hz 抓取的 `vllm:time_to_first_token_seconds` 在窗口两端边界样本（≤ 2 s 旧）之间的 `_sum` 差之和 ÷ `_count` 差之和（按首 token 数加权）；窗口内没有首 token 时为空。规则见 `scripts/alt_signal_columns.py` |
+| `ttft_server_count` | 个 | 同上，`_count` 差之和（窗口内首 token 数；0 = 没有首 token） |
+| `kv_cache_usage_sum` | 0..N | v1 消融信号 `kv_usage` 的输入：醒着的 pod 在 `(start, end]` 内 `vllm:kv_cache_usage_perc` 样本均值之和；`kv_usage` = max(1 − min(1, 和 / pod 数), 0.001) |
+| `kv_cache_pods` | 个 | 上面求和的醒着 pod 数 |
+
+这四列在没有 1 Hz 抓取、某个 pod 缺文件、边界样本缺失、计数器回退等情况下全部为空（未知，不是 0）；各原因的窗口数记在 manifest `alt_signal_columns.windows`。
 
 **L3 数据集**（`calibration_dataset --numerator vllm_counter`，默认目录 `dataset_l3/`）：`prompt_tokens_total` / `generation_tokens_total` / `trs` 换成各 pod vLLM 计数器 `vllm:prompt_tokens_total` / `vllm:generation_tokens_total` 在窗口内的增量之和（引擎**处理**的 token，不是完成请求的 token；规则见 `scripts/l3_numerator.py`）；作废窗口（重置、1 Hz 空洞、缺样本）不写入，按原因计数在 manifest `numerator`。另加三列：
 
