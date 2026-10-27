@@ -168,6 +168,10 @@ class OperationHandle:
         #: Details that stay on the record whatever the phase (``note``): what the
         #: operation changed (binding, placement, phase durations, error code).
         self._notes: dict = {}
+        #: When the caller asked for the writer lock and how long it waited
+        #: (``started_at`` = acquired); set by :meth:`OperationCoordinator.acquire`.
+        self.requested_at: str | None = None
+        self.lock_wait_ms: int | None = None
         self._phase = "acquired"
         self._phase_details: dict | None = None
         self._lost = threading.Event()
@@ -252,6 +256,9 @@ class OperationHandle:
             "started_at": self.started_at,
             "updated_at": now,
         }
+        if self.lock_wait_ms is not None:
+            record["requested_at"] = self.requested_at
+            record["lock_wait_ms"] = self.lock_wait_ms
         merged = {**self._notes, **(details or {})}
         if merged:
             record["details"] = merged
@@ -378,13 +385,17 @@ class OperationCoordinator:
         if actor and "actor" not in (request or {}):
             request = {**(request or {}), "actor": actor}
         wait_s = max(0.0, float(wait_s))
-        deadline = time.monotonic() + wait_s
+        requested_at = _utc_now()
+        requested = time.monotonic()
+        deadline = requested + wait_s
         ticket = uuid4().hex if wait_s > 0 else ""
         try:
             while True:
                 try:
                     handle = self._acquire_once(kind, request=request, ticket=ticket)
                     ticket = ""  # dequeued by the script
+                    handle.requested_at = requested_at
+                    handle.lock_wait_ms = int(round((time.monotonic() - requested) * 1000))
                     return handle
                 except OperationBusy:
                     remaining = deadline - time.monotonic()

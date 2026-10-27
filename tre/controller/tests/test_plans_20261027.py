@@ -236,3 +236,24 @@ def test_a_rescue_replaces_only_the_fairness_member_of_a_pending_plan():
     rescue = queue.submit((ScaleAction("m", 1, "critical_sleeping_capacity", "rescue"),))
     assert rescue.accepted == 1 and rescue.replaced == (("m", "fairness"),)
     assert [(item.action.model, item.action.delta) for item in queue.pending_actions()] == [("n", 1), ("m", 1)]
+
+
+def test_a_rescue_member_on_a_busy_model_is_not_fused():
+    """Review 2026-10-28: a rescue member whose model a running action holds (the
+    rescue path skips the inflight check) made the whole fused plan wait for it; it
+    stays its own queued action and the free members form the plan."""
+    queue = ActionQueue(PlanSM({"8b": 1, "n": 1, "m": 1}))
+    running = queue._queued(ScaleAction("8b", 1, "low_sleeping_capacity", "fairness"))
+    queue._running[object()] = running  # a dispatch of 8b in progress
+    queue._inflight.update(running.models)
+
+    queue.submit((
+        ScaleAction("8b", 1, "critical_sleeping_capacity", "rescue"),
+        ScaleAction("n", 1, "critical_sleeping_capacity", "rescue"),
+        ScaleAction("m", 1, "critical_sleeping_capacity", "rescue"),
+    ))
+
+    pending = queue.pending_actions()
+    assert [type(item.action).__name__ for item in pending] == ["ScaleAction", "PlanBatch"]
+    assert pending[0].action.model == "8b"
+    assert [member.model for member in pending[1].action.members] == ["n", "m"]

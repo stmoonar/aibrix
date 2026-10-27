@@ -60,11 +60,12 @@ by the controller and the service-manager).
   invalid. One check is the worst-case duration of one SM call as its client
   sees it (whole-lock, `ServiceManagerConfig.worst_case_sleep_call_s`):
   `writer_lock_wait_s` + the longest writer-lock hold (a plan: selection 26 s +
-  wave 1 108 s + wave 2 55 s + one compensating sleep 108 s + the observed
-  refresh 12 s + 2 s) + `sleep.io_margin_s` = 30 + 311 + 2 = 343 s with the shipped
-  values; it must be below `service_manager.api_call_timeout_s` (360 s). The
-  formula is in `tre_common/registry.py`, the numbers in
-  `docs/design/20261002-sm-wholelock.md` section 5.
+  wave 1 108 s + its wake annotation 14 s + wave 2 55 s + one compensating sleep
+  108 s + the observed refresh 12 s + 2 s) + `sleep.io_margin_s` = 30 + 325 + 2 =
+  357 s with the shipped values; it must be below
+  `service_manager.api_call_timeout_s` (360 s). The formula is in
+  `tre_common/registry.py`, the numbers in `docs/design/20261027-sm-plans.md`
+  section 6.
 - The controller uses `service_manager.api_call_timeout_s` as its timeout for
   slow service-manager calls, unless `TRE_SM_SLOW_TIMEOUT_SECONDS` overrides it.
   It refuses to start when that timeout does not exceed the same worst case.
@@ -243,8 +244,10 @@ rollback) or whose `/is_sleeping` is not a clear "awake".
   donor by the SM `floor_headroom`. `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` was removed
   (a set value is logged once and ignored, never validated); registry
   `placement.wake_cooldown` is only the service-manager's advisory `retry_after_s`
-  (the controller has no wake cooldown) - see `docs/design/20261002-controller-transfer.md`. The controller
-  of this change needs a service-manager with `POST /v2/transfers` (same rollout).
+  (the controller has no wake cooldown) - see `docs/design/20261002-controller-transfer.md`.
+  Since 2026-10-27 relays and every other power change go through `POST /v2/plans`
+  (`/v2/transfers` was removed; design `docs/design/20261027-sm-plans.md`): the
+  controller of that change needs a service-manager with `/v2/plans` (same rollout).
 
 ### SafeScale probe window (controller env)
 

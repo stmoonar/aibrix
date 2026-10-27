@@ -15,6 +15,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -66,12 +67,14 @@ class BlockingCoordinator:
 
     @contextmanager
     def operation(self, kind, *, request=None, wait_s=0.0):
+        requested = time.monotonic()
         if not self._lock.acquire(blocking=False):
             self.waiting.set()
             if not self._lock.acquire(timeout=max(0.01, float(wait_s))):
                 raise OperationBusy(f"held by {self.active}")
         self.kinds.append(kind)
         handle = FakeHandle(f"{kind}-{len(self.kinds)}")
+        handle.lock_wait_ms = int(round((time.monotonic() - requested) * 1000))  # as the real coordinator
         self.handles.append((kind, handle))
         self.active = {"operation_id": handle.operation_id, "kind": kind, "status": "running"}
         token = _CURRENT_OPERATION.set(handle)
@@ -97,7 +100,7 @@ class BlockingCoordinator:
         return []
 
 
-def _registry(*, d_min=0):
+def _registry(*, d_min=0, extra_models=()):
     topology = ClusterTopology(
         nodes=(NodeSpec("node-a", 4, ((0, 1), (2, 3)), ("GPU-0", "GPU-1", "GPU-2", "GPU-3")),)
     )
@@ -106,6 +109,7 @@ def _registry(*, d_min=0):
         ModelSpec("r", "/r", 1, 0, 4, "image", SLO, trs()),
         ModelSpec("x", "/x", 1, 0, 4, "image", SLO, trs()),
         ModelSpec("t", "/t", 2, 0, 2, "image", SLO, trs()),
+        *(ModelSpec(name, f"/{name}", 1, 0, 4, "image", SLO, trs()) for name in extra_models),
     ]
     return Registry(topology, models, service_manager=ServiceManagerConfig(sleep=policy()))
 
@@ -124,9 +128,9 @@ DEFAULT_PODS = (
 
 
 class World:
-    def __init__(self, pods=DEFAULT_PODS, *, d_min=0):
+    def __init__(self, pods=DEFAULT_PODS, *, d_min=0, extra_models=()):
         self.redis = FakeRedis()
-        self.registry = _registry(d_min=d_min)
+        self.registry = _registry(d_min=d_min, extra_models=extra_models)
         self.ip_of, self.gpus_of_ip, snapshots = {}, {}, []
         for index, (name, model, gpus, state) in enumerate(pods, start=1):
             ip = f"10.0.0.{index}"

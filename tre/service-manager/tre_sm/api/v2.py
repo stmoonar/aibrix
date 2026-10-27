@@ -290,6 +290,11 @@ class ServiceManagerV2:
         self._wake_executor = ThreadPoolExecutor(
             max_workers=max(WAKE_WORKERS, _topology_gpu_count(registry)), thread_name_prefix="wake"
         )
+        #: Writer-lock holds of THIS process in progress (:meth:`_writer`): the
+        #: shutdown waits for them (a plan's waves and settlement) before it
+        #: stops the wake executor (review 2026-10-28).
+        self._holds = threading.Condition()
+        self._holds_active = 0
         #: P2-8 / P1-3: starting lease binding id -> (monotonic time this SM first
         #: saw it, restart count of its Pod then).
         self._placeholder_seen: dict[str, tuple[float, int]] = {}
@@ -855,8 +860,17 @@ class ServiceManagerV2:
             request=request,
             wait_s=self._sm_config.writer_lock_wait_s if wait_s is None else wait_s,
         ) as operation:
-            operation.advance("executing")
-            yield operation
+            with self._holds:
+                self._holds_active += 1
+            try:
+                # ``executing`` carries the lock wait (requested_at, lock_wait_ms)
+                # the coordinator measured, for the queueing after deployment.
+                operation.advance("executing")
+                yield operation
+            finally:
+                with self._holds:
+                    self._holds_active -= 1
+                    self._holds.notify_all()
 
     @contextmanager
     def _desired_guard(self, binding_ids=None, *, reason: str):
@@ -1629,14 +1643,26 @@ class ServiceManagerV2:
         return self._sm_config.shutdown_timeout_s()
 
     def shutdown(self, *, timeout_s: float) -> bool:
-        """begin_shutdown, then wait (bounded) until every sleep has finished or
+        """begin_shutdown, then wait (bounded by ``timeout_s`` in all) until the
+        writer-lock holds of this process have ended - a plan finishes its waves
+        and its settlement, its wakes still run in parallel on the wake executor,
+        which is stopped only after them - and every sleep has finished or
         rolled back. True when idle."""
+        deadline = time.monotonic() + timeout_s
         self.begin_shutdown()
         self._admission_executor.shutdown(wait=False, cancel_futures=True)
-        self._wake_executor.shutdown(wait=False, cancel_futures=False)
+        with self._holds:
+            while self._holds_active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._holds.wait(remaining)
+            holds_done = self._holds_active == 0
+        if holds_done:
+            self._wake_executor.shutdown(wait=False, cancel_futures=False)
         if self._sleep_primitive is None:
-            return True
-        return self._sleep_primitive.wait_idle(timeout_s)
+            return holds_done
+        return self._sleep_primitive.wait_idle(max(0.0, deadline - time.monotonic())) and holds_done
 
     def start_fleet_repair(
         self,
@@ -3678,7 +3704,11 @@ class ServiceManagerV2:
             return
         try:
             futures = [self._wake_executor.submit(self._run_one_wake, ticket) for ticket in tickets]
-        except RuntimeError:  # executor shut down (SIGTERM): run them one by one
+        except RuntimeError:
+            # The executor is stopped only once no writer-lock hold of this process
+            # is left (shutdown), or after the shutdown wait ran out: run them one
+            # by one rather than not at all (never during a plan in time).
+            LOG.warning("wake executor stopped: %d wakes run one by one", len(tickets))
             for ticket in tickets:
                 self._run_one_wake(ticket)
             return
@@ -4370,6 +4400,12 @@ class ServiceManagerV2:
             raise ValueError("a plan needs at least one sleep or wake item")
         seen: set[str] = set()
 
+        def unique(values, what: str) -> None:
+            # A pod named twice would get two parallel /sleep (or /wake_up) calls.
+            values = list(values or ())
+            if len(set(values)) != len(values):
+                raise ValueError(f"{what}: duplicate entries {sorted({v for v in values if values.count(v) > 1})}")
+
         def claim(model: str, what: str) -> None:
             self._registry.model(model)  # KeyError: unknown model (400)
             if model in seen:
@@ -4383,6 +4419,7 @@ class ServiceManagerV2:
                 raise ValueError(f"sleep item of {item.model}: exactly one of pods / at_most")
             if item.pods is not None and not item.pods:
                 raise ValueError(f"sleep item of {item.model}: pods must not be empty")
+            unique(item.pods, f"sleep item of {item.model}: pods")
             if item.at_most is not None and item.at_most < 0:
                 raise ValueError(f"sleep item of {item.model}: at_most must be non-negative")
         for item in wakes:
@@ -4391,6 +4428,9 @@ class ServiceManagerV2:
                 raise ValueError(f"wake item of {item.model}: exactly one of at_least / pods")
             if item.pods is not None and not item.pods:
                 raise ValueError(f"wake item of {item.model}: pods must not be empty")
+            unique(item.pods, f"wake item of {item.model}: pods")
+            unique(item.hints, f"wake item of {item.model}: hints")
+            unique(item.avoid_gpus, f"wake item of {item.model}: avoid_gpus")
             if item.at_least is not None and item.at_least < 0:
                 raise ValueError(f"wake item of {item.model}: at_least must be non-negative")
             for donor in item.donors:
@@ -4409,6 +4449,10 @@ class ServiceManagerV2:
         is in the returned run."""
         started = time.monotonic()
         run = _PlanRun(plan=plan)
+        # Queueing before this hold (POST /v2/plans and the wrappers alike).
+        lock_wait_ms = getattr(current_operation(), "lock_wait_ms", None)
+        if isinstance(lock_wait_ms, int):
+            run.phases_ms["lock_wait"] = lock_wait_ms
         _log_event(
             "plan_start", plan_id=plan.plan_id,
             sleeps=[_plan_item_brief(item) for item in plan.sleeps],
@@ -4439,9 +4483,10 @@ class ServiceManagerV2:
         for item in [*plan.sleeps, *plan.wakes]:
             for name in item.pods or ():
                 binding = by_name.get(name)
-                if binding is None:
-                    raise ValueError(f"unknown binding: {name}")
-                if binding.model != item.model:
+                # An unknown name (a pod replaced since the caller's view) is the
+                # item's refusal ``pod_not_found`` (selection); only a pod of
+                # another model is a malformed request (400).
+                if binding is not None and binding.model != item.model:
                     raise ValueError(f"pod {name} is a replica of {binding.model}, not {item.model}")
         physical = self._sleep_primitive is not None and self._physical_wake_capable()
         leases = self._active_leases()
@@ -4469,6 +4514,8 @@ class ServiceManagerV2:
         if self._floor_enforced() and sleep_models:
             try:
                 transient = self._transient_lease_ids()
+                # The plan sleeps' floor guard reads the same view (one LIST per hold).
+                run.floor_view = (snapshots, transient)
                 for model in sleep_models:
                     floors[model] = (
                         self._model_floor(model),
@@ -4553,13 +4600,33 @@ class ServiceManagerV2:
                         binding_id=binding.binding_id, blocking_binding_id=sleeper_id,
                     )
             conflict = self._plan_resident_veto(binding, sleeping_ids, probed())
-            if conflict is None:
-                # The wake gate is answered in this hold: the probe found every
-                # third resident asleep, the sleep primitive confirms every plan
-                # sleep on these GPUs before the wake is prepared (gpu-truth is
-                # untrusted after those power changes anyway).
-                run.gates[binding.binding_id] = {"truth_source": "plan_probe", "truth_age_s": None}
-            return conflict
+            if conflict is not None:
+                return conflict
+            # The wake gate is answered in this hold: the probe found every
+            # third resident asleep, the sleep primitive confirms every plan
+            # sleep on these GPUs before the wake is prepared (gpu-truth is
+            # untrusted after those power changes anyway).
+            gate = {"truth_source": "plan_probe", "truth_age_s": None}
+            held = {
+                int(gpu)
+                for sleeper_id in sleeping_ids
+                if (sleeper := by_id.get(sleeper_id)) is not None and _slots_overlap(sleeper.slot, binding.slot)
+                for gpu in sleeper.slot.gpu_ids
+            }
+            free = tuple(int(gpu) for gpu in binding.slot.gpu_ids if int(gpu) not in held)
+            if free:
+                # R1: the GPUs no plan sleep frees (a TP=2 receiver over one plan
+                # sleep and one free GPU) get the wake gate a wave-1 wake gets
+                # (gpu-truth memory, else the same probe round), review 2026-10-28.
+                part = replace(binding, slot=Slot(node, free))
+                try:
+                    free_gate = self._ensure_wake_headroom(part, residents_of=residents_of) or {}
+                except WakeConflict as exc:
+                    return exc
+                gate = {**gate, "truth_source": f"plan_probe+{free_gate.get('truth_source') or 'none'}",
+                        "truth_age_s": free_gate.get("truth_age_s")}
+            run.gates[binding.binding_id] = gate
+            return None
 
         def blocker(binding: Binding, planning: list[Binding], ignored: frozenset[str]):
             try:
@@ -4678,91 +4745,102 @@ class ServiceManagerV2:
 
         phase = time.monotonic()
         wave1 = self._prepare_plan_wakes(run, [(c, p) for c, p in picks if p.wave == 1], before)
+        wave2: list[_WakeTicket] = []
+        try:
+            def sleep_group(group):
+                path, targets = group
+                try:
+                    return primitive.sleep(targets, path=path, journal_extra=journal_extra, keep_journal=True), None
+                except SleepFailed as exc:
+                    return list(exc.outcomes or []), exc
+                except Exception as exc:  # noqa: BLE001 - nothing of this group was sent
+                    return [], exc
 
-        def sleep_group(group):
-            path, targets = group
-            try:
-                return primitive.sleep(targets, path=path, journal_extra=journal_extra, keep_journal=True), None
-            except SleepFailed as exc:
-                return list(exc.outcomes or []), exc
-            except Exception as exc:  # noqa: BLE001 - nothing of this group was sent
-                return [], exc
+            def sleep_phase():
+                token = _FLOOR_LIVE_VIEW.set(run.floor_view)
+                try:
+                    return _parallel(sleep_group, group_items)
+                finally:
+                    _FLOOR_LIVE_VIEW.reset(token)
 
-        def sleep_phase():
-            return _parallel(sleep_group, group_items)
+            def wake_phase():
+                try:
+                    self._run_wakes(wave1)
+                except Exception as exc:  # noqa: BLE001 - recorded per ticket
+                    for ticket in wave1:
+                        if not ticket.woke and ticket.exception is None:
+                            ticket.exception = exc
+                return None
 
-        def wake_phase():
-            try:
-                self._run_wakes(wave1)
-            except Exception as exc:  # noqa: BLE001 - recorded per ticket
-                for ticket in wave1:
-                    if not ticket.woke and ticket.exception is None:
-                        ticket.exception = exc
-            return None
+            if operation is not None and (group_items or wave1):
+                operation.advance("plan_wave1", details={
+                    "sleeps": [t.binding.serve_id for _p, ts in group_items for t in ts],
+                    "wakes": [t.binding.serve_id for t in wave1],
+                })
+            # Thread A sleeps (hide, ack, /sleep, confirm - no store / lease / desired
+            # write), thread B wakes on free GPUs: different GPUs (selection).
+            phases = [fn for fn, todo in ((sleep_phase, group_items), (wake_phase, wave1)) if todo]
+            results = _parallel(lambda fn: fn(), phases)
+            sleep_results = results.get(id(sleep_phase)) or {}
+            for group in group_items:
+                _path, targets = group
+                outcomes, error = sleep_results.get(id(group), ([], None))
+                recorded = True
+                try:
+                    self._record_sleep_outcomes(targets, outcomes, update_store=True, desired_sleeping=True)
+                    primitive.end_journal(outcomes)
+                except Exception as exc:  # noqa: BLE001 - journals kept; raised after the settlement
+                    LOG.exception("recording the plan sleeps %s failed", [t.binding.serve_id for t in targets])
+                    run.fatal = run.fatal or exc
+                    error = error or exc
+                    recorded = False
+                by_id = {item.get("binding_id"): item for item in outcomes}
+                group_ids = frozenset(t.binding.binding_id for t in targets)
+                for target in targets:
+                    binding_id = target.binding.binding_id
+                    run.sleep_groups[binding_id] = group_ids
+                    outcome = by_id.get(binding_id)
+                    if outcome is not None:
+                        run.sleep_outcomes[binding_id] = outcome
+                    if recorded and outcome is not None and outcome.get("status") == STATUS_SLEPT:
+                        run.slept.add(binding_id)
+                    elif error is not None:
+                        run.sleep_errors[binding_id] = error
+            self._record_wakes(wave1, update_store=True)
+            run.phases_ms["wave1"] = _elapsed_ms(phase)
 
-        if operation is not None and (group_items or wave1):
-            operation.advance("plan_wave1", details={
-                "sleeps": [t.binding.serve_id for _p, ts in group_items for t in ts],
-                "wakes": [t.binding.serve_id for t in wave1],
-            })
-        # Thread A sleeps (hide, ack, /sleep, confirm - no store / lease / desired
-        # write), thread B wakes on free GPUs: different GPUs (selection).
-        phases = [fn for fn, todo in ((sleep_phase, group_items), (wake_phase, wave1)) if todo]
-        results = _parallel(lambda fn: fn(), phases)
-        sleep_results = results.get(id(sleep_phase)) or {}
-        for group in group_items:
-            _path, targets = group
-            outcomes, error = sleep_results.get(id(group), ([], None))
-            recorded = True
-            try:
-                self._record_sleep_outcomes(targets, outcomes, update_store=True, desired_sleeping=True)
-                primitive.end_journal(outcomes)
-            except Exception as exc:  # noqa: BLE001 - journals kept; raised after the settlement
-                LOG.exception("recording the plan sleeps %s failed", [t.binding.serve_id for t in targets])
-                run.fatal = run.fatal or exc
-                error = error or exc
-                recorded = False
-            by_id = {item.get("binding_id"): item for item in outcomes}
-            for target in targets:
-                binding_id = target.binding.binding_id
-                outcome = by_id.get(binding_id)
-                if outcome is not None:
-                    run.sleep_outcomes[binding_id] = outcome
-                if recorded and outcome is not None and outcome.get("status") == STATUS_SLEPT:
-                    run.slept.add(binding_id)
-                elif error is not None:
-                    run.sleep_errors[binding_id] = error
-        self._record_wakes(wave1, update_store=True)
-        run.phases_ms["wave1"] = _elapsed_ms(phase)
-
-        phase = time.monotonic()
-        ready = []
-        for choice, pick in picks:
-            if pick.wave != 2:
-                continue
-            missing = [dep for dep in pick.depends_on if dep not in run.slept]
-            if missing:
-                binding = pick.binding
-                run.pick_errors[binding.binding_id] = WakeConflict(
-                    f"{binding.serve_id}: the plan sleep of {missing} on its GPUs did not complete",
-                    reason="donor_sleep_failed", node=binding.slot.node, gpus=binding.slot.gpu_ids,
-                    binding_id=binding.binding_id, blocking_binding_id=missing[0],
-                )
-                continue
-            ready.append((choice, pick))
-        wave2 = self._prepare_plan_wakes(run, ready, before)
-        if wave2:
-            if operation is not None:
-                operation.advance("plan_wave2", details={"wakes": [t.binding.serve_id for t in wave2]})
-            self._run_wakes(wave2)
-            self._record_wakes(wave2, update_store=True)
-        run.phases_ms["wave2"] = _elapsed_ms(phase)
-
-        phase = time.monotonic()
-        tickets = wave1 + wave2
-        self._finish_wakes(tickets, restore_desired=True)
-        self._note_wake_details(tickets)
-        run.phases_ms["settle"] = _elapsed_ms(phase)
+            phase = time.monotonic()
+            ready = []
+            for choice, pick in picks:
+                if pick.wave != 2:
+                    continue
+                missing = [dep for dep in pick.depends_on if dep not in run.slept]
+                if missing:
+                    binding = pick.binding
+                    run.pick_errors[binding.binding_id] = WakeConflict(
+                        f"{binding.serve_id}: the plan sleep of {missing} on its GPUs did not complete",
+                        reason="donor_sleep_failed", node=binding.slot.node, gpus=binding.slot.gpu_ids,
+                        binding_id=binding.binding_id, blocking_binding_id=missing[0],
+                    )
+                    continue
+                ready.append((choice, pick))
+            wave2 = self._prepare_plan_wakes(run, ready, before)
+            if wave2:
+                if operation is not None:
+                    operation.advance("plan_wave2", details={"wakes": [t.binding.serve_id for t in wave2]})
+                self._run_wakes(wave2)
+                self._record_wakes(wave2, update_store=True)
+            run.phases_ms["wave2"] = _elapsed_ms(phase)
+        finally:
+            # The ONE deferred settlement runs whatever raised after the wave-1
+            # prepare (a lost fence, Redis): every prepared ticket of both waves
+            # is settled and its journal entry ended or left to the recovery
+            # (review 2026-10-28).
+            phase = time.monotonic()
+            tickets = wave1 + wave2
+            self._finish_wakes(tickets, restore_desired=True)
+            self._note_wake_details(tickets)
+            run.phases_ms["settle"] = _elapsed_ms(phase)
 
     def _prepare_plan_wakes(self, run: "_PlanRun", picks, before: dict) -> list["_WakeTicket"]:
         """The prepare of a wave's picks (account and gate already decided in this
@@ -4791,7 +4869,12 @@ class ServiceManagerV2:
                     binding, None, check_account=False, previous_desired=before.get(binding.binding_id),
                     placement=placement, gate=gate, pods=run.pods,
                 )
-            except (WakeConflict, GpuLeaseConflict, ValueError) as exc:
+            except Exception as exc:  # noqa: BLE001 - a refusal or a Redis error: this pick only
+                # The prepare raises without side effects (its journal entry ends
+                # when the lease cannot be taken); the other picks go on and the
+                # tickets already prepared are settled at the end (review 2026-10-28).
+                if not isinstance(exc, (WakeConflict, GpuLeaseConflict, ValueError)):
+                    LOG.exception("preparing the plan wake of %s failed", binding.binding_id)
                 run.pick_errors[binding.binding_id] = exc
                 continue
             ticket.hinted = pick.hinted
@@ -4864,12 +4947,19 @@ class ServiceManagerV2:
         (``_error``: the exception, ``_tickets``, ``_check``), see :meth:`_plan_response`."""
         selection = run.selection
         final = self._store.load().bindings
+
+        def awake_count(books, model: str) -> int:
+            return sum(1 for b in books if b.model == model and b.awake)
+
         sleeps: list[dict] = []
         for choice in selection.sleeps:
             item = choice.item
             entry: dict = {
                 "index": choice.index, "model": item.model, "reason": item.reason,
                 "sleep_path": item.sleep_path, "taken": 0, "clamped_by_floor": choice.clamped,
+                # As wake items: a caller reads ``reached`` of a scale-down here.
+                "awake_before": awake_count(run.bindings.values(), item.model),
+                "awake_after": awake_count(final, item.model),
                 "outcomes": [], "_check": choice.floor_check,
                 "_members": list(choice.members),
             }
@@ -4889,10 +4979,9 @@ class ServiceManagerV2:
             entry["taken"] = sum(1 for b in choice.members if b.binding_id in run.slept)
             failed = [b for b in choice.members if b.binding_id not in run.slept]
             if failed:
-                error = run.sleep_errors.get(failed[0].binding_id) or SleepFailed(
-                    f"sleep of {failed[0].serve_id} did not complete", outcomes=entry["outcomes"]
-                )
-                entry.update(status="failed", _error=error, not_executed=entry["taken"] == 0)
+                # ``not_executed`` only for a refused item: a failed sleep may
+                # have hidden a pod (``unconfirmed``) - its outcome says so.
+                entry.update(status="failed", _error=self._sleep_item_error(run, choice, failed, entry["outcomes"]))
             elif choice.clamped:
                 entry["status"] = "clamped"
             elif not choice.members:
@@ -4960,6 +5049,36 @@ class ServiceManagerV2:
             wakes.append(entry)
         return sleeps, wakes
 
+    def _sleep_item_error(self, run: "_PlanRun", choice, failed: list[Binding], outcomes: list[dict]) -> BaseException:
+        """Why THIS sleep item failed. The sleeps of one sleep path run as one
+        primitive call (in parallel), whose error may name another item's pod:
+        the item's own error comes from its own outcomes (review 2026-10-28).
+        The call's error is kept as is when every pod of that call is this
+        item's (a one-item plan: the wrappers raise it unchanged)."""
+        error = run.sleep_errors.get(failed[0].binding_id)
+        members = {b.binding_id for b in choice.members}
+        group = run.sleep_groups.get(failed[0].binding_id, frozenset())
+        if error is not None and group <= members:
+            return error
+        bad = next((o for o in outcomes if o.get("status") != STATUS_SLEPT), None)
+        if bad is not None:
+            detail = f"sleep of {bad.get('serve_id')}: {bad.get('status')}"
+            if bad.get("reason"):
+                detail += f" ({bad.get('reason')})"
+        elif error is not None:
+            # Nothing of the call was sent (its floor guard, a shutdown, ...).
+            detail = (f"sleep of {failed[0].serve_id} not sent: the {choice.item.sleep_path} sleep call "
+                      f"failed ({type(error).__name__}: {error})")
+            if not isinstance(error, SleepFailed):
+                return error
+        else:
+            detail = f"sleep of {failed[0].serve_id} did not complete"
+        failure = type(error)(detail, outcomes=outcomes) if isinstance(error, SleepFailed) else SleepFailed(
+            detail, outcomes=outcomes
+        )
+        failure.__cause__ = error
+        return failure
+
     def _plan_response(self, run: "_PlanRun") -> dict:
         """The ``POST /v2/plans`` response (design section 3) and the
         ``plan_item_refused`` / ``plan_done`` events."""
@@ -5003,6 +5122,7 @@ class ServiceManagerV2:
         _log_event(
             "plan_done", level=logging.INFO if status in ("done", "noop") else logging.WARNING,
             plan_id=run.plan.plan_id, status=status, phases_ms=dict(run.phases_ms),
+            items=len(out_sleeps) + len(out_wakes), lock_wait_ms=run.phases_ms.get("lock_wait"),
             sleeps=[(item["model"], item["status"], item["taken"]) for item in out_sleeps],
             wakes=[(item["model"], item["status"], len(item["woke"])) for item in out_wakes],
         )
@@ -5785,9 +5905,34 @@ class ServiceManagerV2:
         for target in targets:
             by_model.setdefault(target.binding.model, set()).add(target.binding.binding_id)
         notes = _FLOOR_EVENT_NOTES.get()
+        # The routable views of every model of the call from ONE read (2026-10-28,
+        # review: one Pod LIST per model made the hold grow with the models): a
+        # plan hands over the Pods and leases its selection read in this hold
+        # (:data:`_FLOOR_LIVE_VIEW`), anything else lists once here.
+        view = _FLOOR_LIVE_VIEW.get()
+        view_error: BaseException | None = None
+        if view is None:
+            try:
+                lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
+                live = list(lister()) if self._runtime_ops is not None and callable(lister) else None
+                view = (live, self._transient_lease_ids())
+            except Exception as exc:  # noqa: BLE001 - per model below (exempt paths skip)
+                view_error = exc
+        books = self._store.load().bindings
         for model, binding_ids in sorted(by_model.items()):
             try:
-                check = self._floor_check(model, binding_ids)
+                if view_error is not None:
+                    raise WakeConflict(
+                        f"replica floor of {model}: the routable view cannot be read "
+                        f"({type(view_error).__name__}: {view_error}); nothing changed",
+                        reason="routable_unknown",
+                    ) from view_error
+                live, transient = view
+                check = check_floor(
+                    model, self._model_floor(model),
+                    self._routable_binding_ids(model, books, live=live, transient=transient),
+                    binding_ids,
+                )
             except WakeConflict as exc:
                 if path in EXEMPT_PATHS or path in MAKEUP_PATHS:
                     LOG.warning("floor check of %s skipped for path %s: %s", model, path, exc)
@@ -6899,6 +7044,8 @@ class _PlanRun:
     #: Sleep primitive outcome / error of every plan sleep, by binding id.
     sleep_outcomes: dict = field(default_factory=dict)
     sleep_errors: dict = field(default_factory=dict)
+    #: Binding id -> the binding ids of its sleep primitive call (one per path).
+    sleep_groups: dict = field(default_factory=dict)
     #: Plan sleeps recorded asleep (books written).
     slept: set = field(default_factory=set)
     #: Wake tickets of the picks, by binding id; picks never prepared -> error.
@@ -6908,6 +7055,9 @@ class _PlanRun:
     books_woken: set = field(default_factory=set)
     phases_ms: dict = field(default_factory=dict)
     version: int | None = None
+    #: (Pod snapshots, transient-lease ids) of the selection: the floor guard
+    #: of the plan's sleeps reuses them (:data:`_FLOOR_LIVE_VIEW`).
+    floor_view: tuple | None = None
     #: A books write failed mid-plan (journals kept): raised after the settlement.
     fatal: BaseException | None = None
     #: (sleep results, wake results) of :meth:`ServiceManagerV2._plan_results`.
@@ -7472,6 +7622,12 @@ _FLOOR_EXTRA_ROUTABLE: contextvars.ContextVar[frozenset] = contextvars.ContextVa
 #: sleep's floor check (why no make-up happened). Never mutated in place.
 _FLOOR_EVENT_NOTES: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "tre_sm_floor_event_notes", default={}
+)
+#: (Pod snapshots or None = no live view, transient-lease ids) a plan read in its
+#: selection, for the floor guard of the plan's own sleeps in the same hold (no
+#: second Pod LIST; ServiceManagerV2._sleep_floor_guard). None = read there.
+_FLOOR_LIVE_VIEW: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
+    "tre_sm_floor_live_view", default=None
 )
 #: Binding ids whose observed refresh is deferred to the end of the hold
 #: (ServiceManagerV2._deferred_refresh); None = refresh at once.

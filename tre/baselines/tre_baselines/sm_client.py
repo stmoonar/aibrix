@@ -474,11 +474,13 @@ class Completed:
     #: This model's answer: its plan item, or the whole-plan answer (no items).
     result: SMResult
     submitted_seq: int
-    #: Scale-up only: the awake count it started from - the item's ``awake_before`` (the
-    #: SM's count under the lock), else the count the decision saw.
+    #: The awake count it started from - the item's ``awake_before`` (the SM's count
+    #: under the lock), else the count the decision saw (scale-up; None for a
+    #: scale-down without an item).
     start: Optional[int] = None
-    #: Scale-up only: the awake count after the plan (the item's ``awake_after``); None
-    #: when the plan gave no item (dropped, whole-plan refusal, transport error).
+    #: The awake count after the plan (the item's ``awake_after``; sleep items carry it
+    #: too since 2026-10-28); None when the plan gave no item (dropped, whole-plan
+    #: refusal, transport error).
     reached: Optional[int] = None
     plan_id: Optional[str] = None
     #: Items in the plan this decision went out with.
@@ -486,8 +488,11 @@ class Completed:
 
     @property
     def progressed(self) -> bool:
-        """At least one replica was added (the SM state changed because of us)."""
-        return self.reached is not None and self.start is not None and self.reached > self.start
+        """At least one replica was added (scale-up) or put to sleep (scale-down): the
+        SM state changed because of us."""
+        if self.reached is None or self.start is None:
+            return False
+        return self.reached > self.start if self.direction == "up" else self.reached < self.start
 
     @property
     def partial_fill(self) -> bool:
@@ -497,8 +502,9 @@ class Completed:
     def as_dict(self) -> dict[str, Any]:
         out = {"direction": self.direction, "target": self.target, **self.result.as_dict(),
                "plan_id": self.plan_id, "plan_size": self.plan_size}
+        out.update(start=self.start, reached=self.reached)
         if self.direction == "up":
-            out.update(start=self.start, reached=self.reached, partial_fill=self.partial_fill)
+            out["partial_fill"] = self.partial_fill
         return out
 
 
@@ -642,12 +648,11 @@ class Dispatcher:
         out: list[Completed] = []
         for model in models:
             job, result = jobs[model], answers[model]
-            start = reached = None
-            if job.direction == "up":
-                raw = result.raw if isinstance(result.raw, dict) else {}
-                before, after = raw.get("awake_before"), raw.get("awake_after")
-                start = before if isinstance(before, int) else job.start
-                reached = after if isinstance(after, int) else None
+            # Wake and sleep items both carry awake_before / awake_after.
+            raw = result.raw if isinstance(result.raw, dict) else {}
+            before, after = raw.get("awake_before"), raw.get("awake_after")
+            start = before if isinstance(before, int) else job.start
+            reached = after if isinstance(after, int) else None
             done = Completed(model, job.direction, job.target, items[model], result, job.seq,
                              start=start, reached=reached, plan_id=plan_id, plan_size=len(models))
             if done.partial_fill:

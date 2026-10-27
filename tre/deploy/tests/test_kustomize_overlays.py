@@ -91,7 +91,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     sm_config = load_registry(str(DEPLOY_ROOT / "registry.yaml")).service_manager()
     grace = sm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
     # Review 2 P2-2: the SIGTERM wait is computed from the same time budget
-    # (2026-10-27: a plan's worst hold, 311 + 2 = 313 s -> grace 330).
+    # (2026-10-28: a plan's worst hold, 325 + 2 = 327 s -> grace 330).
     assert grace > sm_config.shutdown_timeout_s()
     assert sm_config.shutdown_timeout_s() == sm_config.worst_case_plan_lock_s() + sm_config.sleep.io_margin_s
     assert sm_container["readinessProbe"]["httpGet"] == {

@@ -139,18 +139,19 @@ def test_worst_case_lock_holds_and_the_call_bound_fit_the_api_call_timeout():
     # 2 x 5 + ONE compensating sleep 108 (whatever the number of failed wakes) +
     # 4 Kubernetes calls x 7 + io 2.
     assert config.worst_case_wake_lock_s() == 5 + 10 + 2 * 5 + 108 + 4 * 7 + 2 == 163
-    # A plan (2026-10-27): selection 5 + 3 x 7, wave 1 max(108, wake wave 55),
-    # wave 2 55, ONE deferred compensating sleep 108, refresh 7 + 5, io 2.
+    # A plan (2026-10-27): selection 5 + 3 x 7, wave 1 max(108, wake wave 55) + the
+    # wave-1 awake annotation after the join 2 x 7 (2026-10-28), wave 2 55, ONE
+    # deferred compensating sleep 108, refresh 7 + 5, io 2.
     assert config.worst_case_wake_core_s() == 5 + 10 + 2 * 5 + 4 * 7 + 2 == 55
-    assert config.worst_case_plan_lock_s() == (5 + 3 * 7) + 108 + 55 + 108 + (7 + 5) + 2 == 311
-    assert config.worst_case_lock_hold_s() == 311
-    assert config.worst_case_sleep_call_s() == 30 + 311 + 2 == 343
+    assert config.worst_case_plan_lock_s() == (5 + 3 * 7) + (108 + 2 * 7) + 55 + 108 + (7 + 5) + 2 == 325
+    assert config.worst_case_lock_hold_s() == 325
+    assert config.worst_case_sleep_call_s() == 30 + 325 + 2 == 357
     assert config.worst_case_sleep_call_s() < config.api_call_timeout_s
-    assert config.shutdown_timeout_s() == 311 + 2
+    assert config.shutdown_timeout_s() == 325 + 2
 
     slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 200}})
     errors = Registry(ClusterTopology(nodes=()), [], service_manager=slow).validate()
-    assert any("worst-case service-manager call is 703s" in e for e in errors)
+    assert any("worst-case service-manager call is 717s" in e for e in errors)
 
     from tre_common.registry import sleep_call_timeout_errors
 

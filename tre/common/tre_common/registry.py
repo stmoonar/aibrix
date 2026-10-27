@@ -248,7 +248,7 @@ SLEEP_PATHS = (
     "safescale_commit",  # SafeScale commit of a hidden probe pod
     "urgent",  # controller *_immediate donor paths (fast loop)
     "scale_down",  # ordinary scale-down (manual / console, TRE without SafeScale)
-    "apa",  # APA scale-down through the v1-compatible /scale_service
+    "apa",  # APA scale-down (Go APA: sleep item of POST /v2/plans since 2026-10-27)
     "defrag",  # buddy defragmentation migration
     "repair",  # fleet repair quarantine / resident pool rebuild
     "startup",  # startup admission / startup convergence
@@ -269,7 +269,8 @@ DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
     # No deadline pressure: wait for in-flight requests up to the hard cap. The same
     # budget applies to TRE and APA scale-downs (both arms drain identically).
     "scale_down": None,
-    # APA through /scale_service (was "scale_down" before 2026-09-29): with "apa" in
+    # APA scale-downs (was "scale_down" before 2026-09-29; through /scale_service until
+    # 2026-10-27, now a POST /v2/plans sleep item with this path): with "apa" in
     # no_drain_paths (default) the budget is unused; without it, the old hard-cap drain.
     "apa": None,
     "defrag": 30.0,
@@ -300,11 +301,16 @@ K8S_CONNECT_TIMEOUT_S = 2.0
 #: 8. Wake: the Pod LIST, the wake gate's resident LIST, the commit annotation
 #: (2) = 4. Plan selection (2026-10-27): the Pod LIST, the routable view, the residents'
 #: LIST = 3 (an upper bound: the executor reads them from one LIST). Observed
-#: refresh at the end of a plan: one Pod LIST = 1.
+#: refresh at the end of a plan: one Pod LIST = 1. Wave-1 record (2026-10-28):
+#: the awake annotation (read + patch) of the wave-1 wakes runs after the join
+#: with the plan's sleeps, so it adds to the longer of the two = 2. A plan's
+#: sleeps run their floor guard on the selection's Pod LIST (0 extra calls);
+#: any other sleep's guard lists once for all its models.
 K8S_CALLS_SLEEP = 8
 K8S_CALLS_WAKE = 4
 K8S_CALLS_PLAN_SELECT = 3
 K8S_CALLS_REFRESH = 1
+K8S_CALLS_WAVE1_RECORD = 2
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
@@ -1190,15 +1196,18 @@ class ServiceManagerConfig:
         items - every phase runs its items in parallel and makes batched
         Kubernetes calls (design 20261027-sm-plans.md section 6): selection
         (one probe round + :data:`K8S_CALLS_PLAN_SELECT` calls) + wave 1 (the
-        longer of one sleep call and one wake wave) + wave 2 (one wake wave) +
-        ONE deferred settlement (one compensating sleep) + the observed refresh
-        (:data:`K8S_CALLS_REFRESH` calls + one probe round) + ``io_margin_s``.
-        Defaults: 26 + 108 + 55 + 108 + 12 + 2 = 311 s."""
+        longer of one sleep call and one wake wave, then the wave-1 wakes'
+        awake annotation after the join, :data:`K8S_CALLS_WAVE1_RECORD` calls)
+        + wave 2 (one wake wave) + ONE deferred settlement (one compensating
+        sleep) + the observed refresh (:data:`K8S_CALLS_REFRESH` calls + one
+        probe round) + ``io_margin_s``. Defaults:
+        26 + (108 + 14) + 55 + 108 + 12 + 2 = 325 s."""
         sleep = self.sleep
         wake_core = self.worst_case_wake_core_s()
         return (
             sleep.probe_timeout_s + K8S_CALLS_PLAN_SELECT * self.k8s_call_s()
             + max(self.worst_case_sleep_lock_s(), wake_core)
+            + K8S_CALLS_WAVE1_RECORD * self.k8s_call_s()
             + wake_core
             + self.worst_case_sleep_lock_s()
             + K8S_CALLS_REFRESH * self.k8s_call_s() + sleep.probe_timeout_s
@@ -1217,7 +1226,7 @@ class ServiceManagerConfig:
         """Upper bound of one sleeping / waking / plan SM call as its client
         sees it: the wait for the writer lock (``writer_lock_wait_s``, then 409
         writer_busy) + the longest lock hold + ``io_margin_s``. Defaults:
-        30 + 311 + 2 = 343 s."""
+        30 + 325 + 2 = 357 s."""
         return self.writer_lock_wait_s + self.worst_case_lock_hold_s() + self.sleep.io_margin_s
 
     def shutdown_timeout_s(self) -> float:

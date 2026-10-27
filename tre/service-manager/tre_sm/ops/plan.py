@@ -238,8 +238,13 @@ def select_plan(
         for member in choice.members:
             asleep_view[member.serve_id] = replace(member, awake=False, hidden=False)
     s_ids = {member.binding_id for choice in selection.sleeps for member in choice.members}
-    # R: the books plus every wake picked so far; P: R with S asleep.
+    # R: the books plus every wave-1 wake picked so far; P: the books with S
+    # asleep plus every pick. A wave-2 pick is not written into R (its GPUs still
+    # carry the S members it waits for: two awake on one GPU would make every later
+    # account check on R fail); its GPUs are ``reserved`` instead, so no later
+    # wave-1 pick takes them (R1: the free half of a TP=2 receiver too).
     real = dict(books)
+    reserved: set[tuple[str, int]] = set()
     planning = {
         serve_id: replace(binding, awake=False, hidden=False) if binding.binding_id in s_ids else binding
         for serve_id, binding in books.items()
@@ -260,14 +265,24 @@ def select_plan(
 
         def take(binding: Binding, wake_pick_: WakePick) -> None:
             choice.picks.append(wake_pick_)
-            real[binding.serve_id] = replace(binding, awake=True, hidden=False)
+            if wake_pick_.wave == 1:
+                real[binding.serve_id] = replace(binding, awake=True, hidden=False)
+            else:
+                reserved.update((binding.slot.node, int(gpu)) for gpu in binding.slot.gpu_ids)
             planning[binding.serve_id] = replace(binding, awake=True, hidden=False)
 
         def classify(binding: Binding):
             """(wave, depends_on) or (None, the refusal)."""
             blocked = wake_blocker(binding, list(real.values()), frozenset())
             if blocked is None:
-                return 1, ()
+                taken = sorted(int(g) for g in binding.slot.gpu_ids if (binding.slot.node, int(g)) in reserved)
+                if not taken:
+                    return 1, ()
+                blocked = Refusal(
+                    reason="slot_occupied",
+                    detail=f"{binding.serve_id}: gpu(s) {taken} are taken by a wave-2 wake of this plan",
+                    binding_id=binding.binding_id, node=binding.slot.node, gpu_ids=tuple(binding.slot.gpu_ids),
+                )
             if wake_blocker(binding, list(planning.values()), frozenset(s_ids)) is not None:
                 return None, blocked
             deps = _sleepers_on(binding, books, s_ids)
@@ -280,7 +295,11 @@ def select_plan(
 
         if item.pods is not None:
             for name in item.pods:
-                binding = planning[name]
+                binding = planning.get(name)
+                if binding is None:
+                    choice.refusals.append(_unknown_pod(name, "wake"))
+                    choice.unfilled += 1
+                    continue
                 if binding.awake:
                     choice.already_awake.append(binding)
                     continue
@@ -425,7 +444,10 @@ def _select_sleep(
     if item.pods is not None:
         members = []
         for name in item.pods:
-            binding = books[name]
+            binding = books.get(name)
+            if binding is None:
+                choice.refusal = _unknown_pod(name, "sleep")
+                return choice
             if not binding.awake:
                 choice.already_asleep.append(binding)
                 continue
@@ -501,6 +523,11 @@ def _sleepers_on(binding: Binding, books: dict[str, Binding], s_ids: set[str]) -
         ),
         key=lambda b: natural_key(b.serve_id),
     )
+
+
+def _unknown_pod(name: str, what: str) -> Refusal:
+    """A named pod the books do not know (replaced since the caller's view)."""
+    return Refusal(reason="pod_not_found", detail=f"pod {name} is not a known binding ({what})")
 
 
 def _cap_refusal(binding: Binding | None, cap, *, model: str | None = None) -> Refusal:

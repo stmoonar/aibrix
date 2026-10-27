@@ -23,9 +23,11 @@ spec:
       # SIGTERM stops new sleeps; a sleep waiting for its gateway ack rolls back,
       # anything past /sleep or /wake_up finishes. The SM waits
       # ServiceManagerConfig.shutdown_timeout_s() for the operation holding the
-      # writer lock (the longest hold, a plan, + io_margin_s = 311 + 2 = 313 s
-      # with the registry defaults, 2026-10-27); the grace period must exceed
-      # it. Guard test: deploy/tests/test_kustomize_overlays.py.
+      # writer lock (the longest hold, a plan, + io_margin_s = 325 + 2 = 327 s
+      # with the registry defaults, 2026-10-28) - an in-process plan finishes
+      # its waves and settlement within it, the wake executor stays up until
+      # then; the grace period must exceed it. Guard test:
+      # deploy/tests/test_kustomize_overlays.py.
       terminationGracePeriodSeconds: 330
       nodeSelector:
         kubernetes.io/hostname: nscc-ds-4a100-node10

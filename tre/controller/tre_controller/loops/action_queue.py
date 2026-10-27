@@ -460,7 +460,12 @@ class ActionQueue:
         rescue path, which skips the inflight check) starts the next batch; the
         batches serialize through their shared models. A batch takes the queue
         position of its first member; a member never jumps over another accepted
-        action of one of its models. No timer: nothing waits for more actions."""
+        action of one of its models. No timer: nothing waits for more actions.
+
+        Only members whose resources are FREE at submit time are fused (review
+        2026-10-28): a rescue member whose model a running commit / plan (or an
+        earlier queued action) still holds would make the whole batch wait for
+        it; it stays its own queued action, as before fusion."""
         if sum(1 for queued in accepted if _fusable(queued)) < 2:
             return
         mine = {id(queued) for queued in accepted}
@@ -470,12 +475,15 @@ class ActionQueue:
         tail = list(self._pending)[start:]
         if any(id(queued) not in mine for queued in tail):
             return  # not this submit's contiguous tail (never expected): leave it unfused
+        held: set[str] = set()
+        for queued in [*self._running.values(), *list(self._pending)[:start]]:
+            held |= set(queued.resources)
         out: list = []
         batch: list[QueuedAction] | None = None
         used: set[str] = set()
         for queued in tail:
             models = set(queued.models)
-            if not _fusable(queued):
+            if not _fusable(queued) or _conflicts(queued.resources, held):
                 out.append(queued)
                 used |= models  # a later member may not jump over it on a shared model
                 continue
@@ -1686,14 +1694,9 @@ class ActionQueue:
     def _met_locally(self, member) -> DispatchResult:
         """No-op fix (design §5.5): a target already met makes no SM call and changes
         nothing - ``woke_none`` (a growth) / ``taken: 0`` (a shrink): no stamp, no last
-        action, no rescue gain beyond what the call would have reported."""
+        action, no rescue gain beyond what the call would have reported. A relay never
+        gets here: its ``at_least`` is ``awake + pairs`` with ``pairs >= 1`` and no cap."""
         model = _member_model(member)
-        if isinstance(member, TransferIntent):
-            return DispatchResult(
-                model=model, action_kind="transfer", ok=False, error="noop: receiver target already met",
-                retriable=False, taken=0, done=0, woke_none=True,
-                transfer={"outcome": "noop", "done": 0, "taken": 0, "pairs": []},
-            )
         if _action_direction(member) == "down":
             return DispatchResult(model=model, action_kind="scale", ok=True, taken=0)
         return DispatchResult(model=model, action_kind="scale", ok=True, woke_none=True)

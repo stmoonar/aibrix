@@ -401,10 +401,11 @@ service_manager:
   # sleep_call_timeout_s + max(physical_confirm_timeout_s + probe_timeout_s,
   # 4 x probe_timeout_s) + 8 Kubernetes calls x 7 + io_margin_s = 108 s - and
   # one wake wave - probe_timeout_s + wake.call_timeout_s + 2 x probe_timeout_s
-  # + 4 Kubernetes calls x 7 + io_margin_s = 55 s; wave 2: one wake wave 55 s;
+  # + 4 Kubernetes calls x 7 + io_margin_s = 55 s - then the wave-1 awake
+  # annotation, 2 Kubernetes calls x 7 = 14 s; wave 2: one wake wave 55 s;
   # ONE deferred compensating sleep 108 s; the observed refresh: 1 Kubernetes
-  # call x 7 + probe_timeout_s = 12 s; io_margin_s 2 s = 311 s) + io_margin_s
-  # = 30 + 311 + 2 = 343 s with these values (every timeout at its bound);
+  # call x 7 + probe_timeout_s = 12 s; io_margin_s 2 s = 325 s) + io_margin_s
+  # = 30 + 325 + 2 = 357 s with these values (every timeout at its bound);
   # validated at SM and controller start. The controller uses it unless
   # TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
   api_call_timeout_s: 360
