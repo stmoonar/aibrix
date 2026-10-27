@@ -4,12 +4,13 @@
 * planner: an immediate donor -> receiver relay is a TransferIntent (a count, no pod /
   GPU); free capacity is used first; ``pairable_count`` bounds the intent; a donor
   gives at most its SM ``floor_headroom``; the IDLE proactive shrink is a model-level
-  ``/target`` call;
-* ActionQueue: one ``POST /v2/transfers`` per intent (the SM completes or fails it
-  under its global writer lock before answering), accounted by done / taken /
-  unfilled (also when partial); refusals, floor clamps and ``taken: 0`` are events
-  only; ``writer_busy`` / ``routable_unknown`` count as not executed; a 404 degrades
-  to "not executed";
+  shrink (a plan sleep item ``at_most``);
+* ActionQueue: an intent is one plan wake item with ``donors`` (design 20261027-sm-plans;
+  ``POST /v2/transfers`` before) - the SM completes or fails it under its writer lock
+  before answering -, accounted by done / taken / unfilled (also when partial);
+  refusals, floor clamps and ``taken: 0`` are events only; ``writer_busy`` /
+  ``routable_unknown`` / a 404 count as not executed. The queue tests drive the old
+  per-endpoint fakes through tests/plan_shim.py;
 * SM view: ``routable`` / ``floor_headroom`` straight from ``/v2/state`` with a
   fallback (and an event) when the SM does not report them.
 """

@@ -83,7 +83,8 @@ class ScriptedSM:
 
 def transfer_body(count, *, done=None, taken=None, unfilled=0, clamped=False, statuses=None,
                   refusals=(), skipped=None, transfer_id="tr-1"):
-    """A ``POST /v2/transfers`` response body: ``count`` pairs 7b-i -> 8b-i on n/i."""
+    """A legacy ``POST /v2/transfers`` response body (answered by the fake's ``transfer``,
+    translated to a plan wake item by tests/plan_shim.py): ``count`` pairs 7b-i -> 8b-i on n/i."""
     statuses = list(statuses) if statuses is not None else ["done"] * count
     pairs = []
     for index, status in enumerate(statuses):

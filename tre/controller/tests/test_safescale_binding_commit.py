@@ -74,7 +74,8 @@ class InProcessServiceManager:
         return {"ok": True}
 
     async def transfer(self, donor_model, receiver_model, count, *, sleep_path="urgent"):
-        """Fake ``POST /v2/transfers`` (2026-10-02) on the in-process service, whose
+        """Fake relay (the old ``POST /v2/transfers``; a plan wake item with ``donors`` via
+        tests/plan_shim.py) on the in-process service, whose
         service-manager has no transfer primitive: the SM's pair rule (a sleeping, not
         hidden receiver binding all of whose GPUs awake, not hidden donor bindings hold),
         then a binding-level donor sleep and receiver wake per pair; the response has

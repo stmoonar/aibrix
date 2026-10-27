@@ -367,13 +367,12 @@ class ActionQueue:
             "observe_commit_stopped_total": 0,
             "observe_transfer_completed_total": 0,
             "floor_violation_total": 0,
-            # Relays (a wake item with donors, 2026-10-27; POST /v2/transfers before) and floor clamps.
+            # Relays (a plan wake item with donors) and floor clamps.
             "transfer_total": 0,
             "transfer_pairs_done_total": 0,
             "transfer_partial_total": 0,
             "transfer_failed_total": 0,
             "transfer_clamped_by_floor_total": 0,
-            "transfer_unsupported_total": 0,
             "scale_clamped_by_floor_total": 0,
             # 2026-10-06: a SafeScale receiver target the SM filled in part.
             "receiver_short_total": 0,
@@ -658,15 +657,6 @@ class ActionQueue:
     def drain_events(self) -> list[str]:
         events, self._events = self._events, []
         return events
-
-    def _note_wake_refused(self, action, result: DispatchResult) -> None:
-        """A located wake refusal (structured 409): an observation event only - the next
-        tick re-plans from a new view (the per-GPU / per-node cooldown was removed on
-        2026-10-02)."""
-        conflict = result.wake_conflict
-        if conflict is None or _action_direction(action) != "up":
-            return
-        self._wake_refused_event(result.model, conflict)
 
     def _wake_refused_event(self, model: str, conflict: dict) -> None:
         if not conflict.get("node"):
@@ -1511,7 +1501,7 @@ class ActionQueue:
         """Re-plannable power actions = ONE ``POST /v2/plans`` (design 20261027-sm-plans
         §5.2), each action exactly one item. Each member keeps its own result and
         bookkeeping (rescue credit, F4 / scale memory, relay hold, events): a relay
-        answers a donor-side and a receiver-side result, as ``/v2/transfers`` did."""
+        answers a donor-side and a receiver-side result."""
         run = await self._run_plan(members, observe_check=True)
         if run.observe_skipped:
             return [result for member in members for result in _member_observe_skipped(member)]
@@ -1930,7 +1920,6 @@ class ActionQueue:
                 error=f"dispatch_exception: {type(exc).__name__}: {exc}",
             )
         self._note_floor_violation(result)
-        self._note_wake_refused(action, result)
         self._stamp_changes(action, model, result)
         if self._prof is not None:
             self._prof.record(
@@ -1947,7 +1936,7 @@ class ActionQueue:
         """O1 / view-pending stamps, after the SM answered: a failed or partial call may
         still have changed the routable set, so it is stamped too - except a call that
         certainly changed nothing (2026-10-02): a model-level shrink with ``taken: 0``,
-        a relay side without any pair, a refused / unsupported relay, a partial /
+        a relay side without any pair, a refused relay, a partial /
         unfilled growth that woke nothing (review P2-2)."""
         now = int(self._now_ms())
 
@@ -2166,7 +2155,7 @@ def _transfer_changed(result: DispatchResult) -> tuple[bool, bool]:
     summary = result.transfer
     if not summary or summary.get("outcome") == "unknown":
         return True, True
-    if summary.get("outcome") in ("unsupported", "refused", "noop"):
+    if summary.get("outcome") in ("refused", "noop"):
         return False, False
     pairs = summary.get("pairs") or ()
     donor = bool(summary.get("taken")) or bool(pairs)
