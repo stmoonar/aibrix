@@ -31,6 +31,13 @@ and `APA_SCALE_SLEEP_MODE != 0`, scaling is applied through service-manager inst
   that changed nothing (409 `partial`) is a warning, as v1's 200 `actual 0`; `writer_busy`
   and failed items are errors. Client timeout: `SERVICE_MANAGE_TIMEOUT_S` (default 360 s,
   the SM's `api_call_timeout_s`).
+- every service-manager call has its OWN deadline (that timeout), not the reconcile context's
+  10 s (`DefaultReconcileTimeoutDuration`): a plan may wait for the SM writer lock and then hold
+  it (`serviceManageContext`). A canceled reconcile context (manager shutdown) still ends the
+  call. The PodAutoscaler controller keeps ONE reconcile worker (`MaxConcurrentReconciles` not
+  raised, so APA behaves as upstream): a slow SM call delays the reconciles of the other
+  PodAutoscalers until it returns. With absolute targets no plans stack up meanwhile: the next
+  reconcile re-reads the awake count and sends the target it wants then.
 
 In every one of those calls the model name is **`pa.Spec.ScaleTargetRef.Name`**. That is why
 each CR sets `scaleTargetRef.name` to the exact registry model name (`dsqwen-7b`,

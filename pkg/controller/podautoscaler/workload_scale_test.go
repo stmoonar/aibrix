@@ -334,6 +334,71 @@ func TestAPASleepModeSetDesiredReplicasPostsAnAbsolutePlan(t *testing.T) {
 	}
 }
 
+// TestAPASleepModeServiceManageCallOutlivesTheReconcileDeadline: Reconcile bounds its context at
+// DefaultReconcileTimeoutDuration (10 s), below a plan's worst case; the SM calls use their own
+// deadline (the client timeout), so an SM slower than the reconcile context still completes. A
+// canceled parent (manager shutdown) still ends the call.
+func TestAPASleepModeServiceManageCallOutlivesTheReconcileDeadline(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models_replicas":
+			_, _ = w.Write([]byte(`{"test-llm":1}`))
+		case "/v2/plans":
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write([]byte(`{"plan_id":"pl-0","status":"done","sleeps":[],` +
+				`"wakes":[{"model":"test-llm","status":"done","awake_before":1,"awake_after":2}]}`))
+		}
+	}))
+	defer server.Close()
+	pa := &autoscalingv1alpha1.PodAutoscaler{
+		ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
+			ScalingStrategy: autoscalingv1alpha1.APA,
+			ScaleTargetRef:  corev1.ObjectReference{Kind: "Deployment", Name: "test-llm"},
+		},
+	}
+	client := server.Client()
+	client.Timeout = 30 * time.Second
+	ws := &workloadScale{serviceManageURL: server.URL, serviceManageHTTPClient: client, sleepModeEnabled: true}
+
+	// The reconcile context expires while the SM is still executing the plan.
+	reconcileCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	go func() {
+		<-reconcileCtx.Done()
+		close(release) // the SM answers only after the reconcile deadline
+	}()
+	assert.NoError(t, ws.SetDesiredReplicas(reconcileCtx, pa, 2))
+
+	// Shutdown: a canceled parent ends the call.
+	shutdownCtx, stop := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	blocked := make(chan struct{})
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models_replicas" {
+			_, _ = w.Write([]byte(`{"test-llm":1}`))
+			return
+		}
+		_, _ = io.ReadAll(r.Body) // the server notices a closed connection only once the body is read
+		close(blocked)
+		<-r.Context().Done()
+	})
+	go func() { stopped <- ws.SetDesiredReplicas(shutdownCtx, pa, 2) }()
+	<-blocked
+	stop()
+	select {
+	case err := <-stopped:
+		assert.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a canceled parent context did not end the service-manager call")
+	}
+}
+
 func TestAPASleepModeConfigServiceManageTimeout(t *testing.T) {
 	t.Setenv("APA_SCALE_SLEEP_MODE", "1")
 	t.Setenv("SERVICE_MANAGE_URL", "http://sm.test:8000")

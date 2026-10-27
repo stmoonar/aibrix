@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -361,6 +362,35 @@ func (s *workloadScale) serviceManageClient() *http.Client {
 	return &http.Client{Timeout: defaultServiceManageTimeout}
 }
 
+// serviceManageContext is the context of one service-manager call. The reconcile context carries
+// DefaultReconcileTimeoutDuration (10 s, podautoscaler_controller.go Reconcile), far below a plan's
+// worst case (writer lock wait + one hold, service_manager.api_call_timeout_s): a call bound to it
+// would be cut off mid-plan while the SM completes the plan anyway. So the call gets its OWN
+// deadline - the client timeout (SERVICE_MANAGE_TIMEOUT_S) - and keeps the parent's values; it still
+// ends at once when the parent is CANCELED (the manager shutting down), but not when the parent
+// only reached its reconcile deadline.
+//
+// Consequence (kept on purpose, APA baseline behaviour): the PodAutoscaler controller runs ONE
+// reconcile worker (MaxConcurrentReconciles is not raised), so a slow SM call delays the reconciles
+// of the other PodAutoscalers until it returns. With absolute targets nothing stacks up meanwhile:
+// the next reconcile re-reads the awake count and sends the target it wants then.
+func (s *workloadScale) serviceManageContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.serviceManageClient().Timeout
+	if timeout <= 0 {
+		timeout = defaultServiceManageTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	stop := context.AfterFunc(parent, func() {
+		if errors.Is(parent.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 func (s *workloadScale) serviceManageEndpoint(path string, values url.Values) (string, error) {
 	if strings.TrimSpace(s.serviceManageURL) == "" {
 		return "", fmt.Errorf("%s is required for APA sleep mode", serviceManageURLEnv)
@@ -377,6 +407,8 @@ func (s *workloadScale) getWakeReplicasFromServiceManage(ctx context.Context, mo
 	if err != nil {
 		return 0, err
 	}
+	ctx, cancel := s.serviceManageContext(ctx)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to build service_manage /models_replicas request: %w", err)
@@ -487,6 +519,8 @@ func (s *workloadScale) postServicePlan(ctx context.Context, modelName string, c
 	if err != nil {
 		return fmt.Errorf("failed to encode service_manage plan: %w", err)
 	}
+	ctx, cancel := s.serviceManageContext(ctx)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("failed to build service_manage /v2/plans request: %w", err)
