@@ -4,8 +4,8 @@
 # Arms: the TSS base (the recalibrated registry as is) and one parameter changed at a time, every model by the same
 # factor, nothing refitted (v1 rule): theta_m, lambda_wait, w_p x0.8 / x1.2; tau x0.8 / x1.2 = tau_crit and tau_high
 # scaled together, tau_low (1.0) unchanged (v1 TAU rule; refused unless 0 < tau_crit < tau_low < tau_high);
-# WP-ABS1 = w_p 1.0 on every model (v1 D60: prefill and decode tokens weigh the same; check that w_d is still 1.0 in
-# the recalibrated registry). The factors apply to the canonical live values at the start of each arm.
+# WP-ABS1 = w_p 1.0 on every model (v1 D60: prefill and decode tokens weigh the same; w_d is set to 1.0 too, so
+# the arm keeps v1's meaning whatever the recalibrated w_d is). The factors apply to the canonical live values at the start of each arm.
 # SafeScale scope receiverless_shrink on every arm (user 10-28, §8.1).
 #
 # How a perturbed arm runs (tre/eval/runner/arm_registry.py): right before the arm the runner writes the values
@@ -47,6 +47,10 @@ eta: {overhead_s: 400, report_s: 150}
 
 registry_expect:
   registry_id: null                 # FILL after prerequisite 1 (arm_registry.py id); null = the run refuses to start
+  present:
+    # recalibration stamps (feat/tss-counter-20261028, field names to VERIFY after merging tss-counter):
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
 
 env:
   CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
@@ -115,7 +119,7 @@ arm_defs:
     base: tre
     label: WP-ABS1
     controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
-    registry_params: {"*.trs.w_p": 1.0}   # w_p = w_d (= 1.0): prefill and decode tokens weigh the same
+    registry_params: {"*.trs.w_p": 1.0, "*.trs.w_d": 1.0}   # w_p = w_d = 1 (v1 D60): prefill and decode tokens weigh the same
 
 preserve:                           # unused (TRE arms only); kept so the file validates like the other campaigns
   trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
