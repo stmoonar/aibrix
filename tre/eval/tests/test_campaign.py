@@ -553,11 +553,42 @@ def test_ablation_arm_passes_its_controller_switch_and_other_arms_pass_none(tmp_
     ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "receiverless"}}, "must be one of"),
     ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "off", "TRE_ABLATION_DISABLE_SAFESCALE": False}},
      "contradicts"),
+    ({"base": "tre", "controller_env": {"TRE_SIGNAL_SOURCE": "tss"}}, "must be one of"),
+    ({"base": "tre", "controller_env": {"TRE_DISABLE_ETA_GATE": "off"}}, "true or false"),
 ])
 def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, bad, match):
     c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {"x": bad}}))
     with pytest.raises(C.CampaignError, match=match):
         C.build_plan(c)
+
+
+def test_controller_env_keys_are_one_list_in_campaign_and_both_shell_scripts():
+    """run_arm_pilot.sh sets / checks and reset_canonical.sh restores exactly campaign.CONTROLLER_ENV_KEYS, with
+    the same defaults (TRE_SIGNAL_SOURCE back to zm = unset, TRE_DISABLE_ETA_GATE back to false); the runner
+    accepts every signal source the controller knows."""
+    import re
+    for f in ("run_arm_pilot.sh", "reset_canonical.sh"):
+        txt = (RUNNER / f).read_text()
+        keys = re.search(r'(?m)^CTL_ENV_KEYS="([^"]+)"', txt).group(1).split()
+        assert tuple(keys) == C.CONTROLLER_ENV_KEYS, f
+        assert "TRE_SIGNAL_SOURCE) echo zm ;;" in txt and "TRE_SAFESCALE_SCOPE) echo all ;;" in txt, f
+    sh = re.search(r"TRE_SIGNAL_SOURCE\) case \"\$2\" in ([a-z0-9_|]+)\)", (RUNNER / "run_arm_pilot.sh").read_text())
+    assert set(sh.group(1).split("|")) == set(C.SIGNAL_SOURCES)
+    try:
+        from tre_controller.config import SIGNAL_SOURCES as CTL
+    except Exception:  # noqa: BLE001  controller deps not importable here
+        pytest.skip("tre_controller not importable")
+    assert set(CTL) <= set(C.SIGNAL_SOURCES)
+
+
+def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):
+    extra = {"arm_defs": {"sig-queue": {"base": "tre", "controller_env": {
+        "TRE_SIGNAL_SOURCE": "queue_len", "TRE_DISABLE_ETA_GATE": True, "TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}}}
+    deps = EnvDeps()
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sig-queue",), "extra": extra})
+    assert camp.run() == 0
+    assert deps.envs == {"Alternating_s1/sig-queue": "TRE_DISABLE_ETA_GATE=true TRE_SAFESCALE_SCOPE=receiverless_shrink "
+                                                     "TRE_SIGNAL_SOURCE=queue_len"}
 
 
 def test_ablation_safescale_campaign_plan(tmp_path):

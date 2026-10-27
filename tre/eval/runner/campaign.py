@@ -64,11 +64,17 @@ TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 # controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
-CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE")
+CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE",
+                       "TRE_SIGNAL_SOURCE", "TRE_DISABLE_ETA_GATE")
 # 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
-CONTROLLER_ENV_SCOPE_KEYS = ("TRE_SAFESCALE_SCOPE",)
+# 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source);
+# TRE_DISABLE_ETA_GATE is a switch (default false; logged as disable_eta_gate).
 SAFESCALE_SCOPES = ("all", "receiverless_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
+# tre_controller.config.SIGNAL_SOURCES, plus ttft_mean / kv_usage (the v1 signals, added to the controller by the
+# signal-source change; an image without them refuses to start -> the startup-line check fails the arm)
+SIGNAL_SOURCES = ("zm", "queue_len", "ttft_mean", "kv_usage", "latency_p95", "decode_tps", "prefill_tps", "kv_cache")
+CONTROLLER_ENV_CHOICES = {"TRE_SAFESCALE_SCOPE": SAFESCALE_SCOPES, "TRE_SIGNAL_SOURCE": SIGNAL_SOURCES}
 # collectors of docs/eval-metrics-spec §7 that every arm directory should hold (missing -> suspect)
 COLLECTOR_FILES = ("layout.jsonl", "pod_metrics_1s.jsonl", "pod_gauges.jsonl", "gpu_map.jsonl", "gpu_truth.jsonl",
                    "resource_usage.jsonl", "apa_status.jsonl", "signal_log.jsonl", "clock_offsets.json",
@@ -263,9 +269,9 @@ def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
     out = {}
     for k, v in raw.items():
         v = str(v).strip().lower()
-        if k in CONTROLLER_ENV_SCOPE_KEYS:
-            if v not in SAFESCALE_SCOPES:
-                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be one of {SAFESCALE_SCOPES}")
+        if k in CONTROLLER_ENV_CHOICES:
+            if v not in CONTROLLER_ENV_CHOICES[k]:
+                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be one of {CONTROLLER_ENV_CHOICES[k]}")
         elif v not in ("true", "false"):
             raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be true or false")
         out[k] = v
