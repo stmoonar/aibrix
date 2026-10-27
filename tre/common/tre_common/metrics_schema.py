@@ -100,6 +100,10 @@ class PodWindowMetrics:
     #: start_hidden_probe). Excluded from equality like the fields above.
     ttft_avg_ms: float | None = field(default=None, compare=False)
     ttft_count: float | None = field(default=None, compare=False)
+    #: False when some histogram doc of the read lacks the TTFT series, so ``ttft_count``
+    #: (a delta of what the docs carry) is not a trustworthy first-token count. Read only
+    #: by the alt ``ttft_mean`` signal; SafeScale and TSS ignore it.
+    ttft_count_complete: bool = field(default=True, compare=False)
     tpot_avg_ms: float | None = field(default=None, compare=False)
     tpot_count: float | None = field(default=None, compare=False)
     #: The window's e2e-latency histogram delta, UNGATED: cumulative buckets

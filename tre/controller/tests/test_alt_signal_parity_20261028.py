@@ -26,7 +26,7 @@ P = 2_000
 T0 = 900_000
 END = 1_000_000
 WINDOW = 20_000
-WAKE = 951_000  # pod b sleeps until here (zero gauges, flat counters), then serves
+WAKE = 951_000  # pod b sleeps until here (zero gauges, flat TTFT counters; its token counters still rise), then serves
 NO_TTFT = 976_000  # pod a's doc here lacks the TTFT histogram (L3)
 
 
@@ -131,8 +131,28 @@ def test_a_missing_ttft_histogram_is_unknown_not_no_first_token():
     store = _online_store()
     w = store.read_model_window(MODEL, NO_TTFT - 10_000, NO_TTFT + 10_000, use_cache=False, start_exclusive=True)
     [pod_a] = [pod for pod in w.per_pod.values() if pod.pod == "a"]
-    assert pod_a.ttft_count is None
+    assert pod_a.ttft_count_complete is False
     window = restrict_to_serving(w, sleeping_pods=[], routable_pods=2)
     spec = load_registry(str(REGISTRY_PATH)).model(MODEL)
     sig = get_signal(window, spec, "ttft_mean", trs_z_m=None, routable_pod_ids=frozenset({"a", "b"}))
     assert sig.raw_value is None and sig.unavailable_reason == "ttft_mean_missing"
+
+
+def test_missing_ttft_histogram_leaves_safescale_ttft_count_as_before():
+    """The shared ``ttft_count`` stays the plain delta of the docs (SafeScale evidence reads
+    it on every arm); only the alt ttft_mean sees the series as incomplete."""
+    from tre_controller.planning.safescale_evidence import MetricsEvidenceReader
+
+    store = _online_store()
+    start, end = NO_TTFT - 10_000, NO_TTFT + 10_000
+    w = store.read_model_window(MODEL, start, end, use_cache=False, start_exclusive=True)
+    [pod_a] = [pod for pod in w.per_pod.values() if pod.pod == "a"]
+    assert pod_a.ttft_count_complete is False
+    assert pod_a.ttft_count is not None and pod_a.ttft_count > 0.0  # not unknown, as before
+    ev_store = MetricsStore(store.redis_client, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P,
+                            schema="v2", histogram_lookback_ms=0)  # as the controller builds it
+    reader = MetricsEvidenceReader(ev_store, redis_client=store.redis_client)
+    evidence = reader.read(MODEL, start_ms=start, end_ms=end, exclude_pods=())
+    w0 = ev_store.read_model_window(MODEL, start - 1, end, use_cache=False, start_exclusive=True)
+    assert evidence.ttft_count > 0.0
+    assert evidence.ttft_count == pytest.approx(sum(p.ttft_count or 0.0 for p in w0.per_pod.values()))

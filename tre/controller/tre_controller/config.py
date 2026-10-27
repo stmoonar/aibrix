@@ -577,10 +577,10 @@ def _validate_signal_thresholds(registry_path: str, signal_source: str, *, windo
     """A fitted alternative signal runs only on its own fitted theta and band margins.
 
     Every model needs ``alt_thresholds.<signal>`` with a positive theta, the expected
-    direction and both ``delta_crit`` / ``delta_high``: a missing margin would otherwise
-    fall back to the plan defaults 0.2 / 0.25 (``AltThreshold.bands``) and the arm would
-    run on bands nobody fitted. And the ``basis`` stamp must name the signal definition
-    this controller computes and its metrics window (``alt_basis_errors``).
+    direction and both ``delta_crit`` / ``delta_high`` (no default bands: a missing
+    margin is refused, the arm never runs on bands nobody fitted). And the 3-field
+    ``basis`` stamp ``{definition, window_ms, ema_tau_ms}`` must name the signal definition
+    this controller computes, its metrics window and its EMA tau (``alt_basis_errors``).
     """
     expected_direction = EXPECTED_SIGNAL_DIRECTIONS.get(signal_source)
     if expected_direction is None:

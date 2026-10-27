@@ -1230,6 +1230,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"skipping {len(skipped_cells)} cell(s) by id: {', '.join(sorted(set(skipped_cells)))}")
     low_n = 0
     alt_written = False
+    alt_failed = 0
     for raw_path in cell_files:
         cell_id = raw_path.stem
         try:
@@ -1263,14 +1264,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for row in cell_rows:
                 for key in ("role", "split", "primitive", "stage"):
                     row[key] = entry.get(key)
-        alt_source = alt_columns_for_raw(raw_path)
-        if alt_source is not None:
+        try:
+            alt_source = alt_columns_for_raw(raw_path)
+            alt_rows = (
+                [alt_source(int(row["window_start_ms"]), int(row["window_end_ms"])) for row in cell_rows]
+                if alt_source is not None else None
+            )
+        except Exception as exc:  # noqa: BLE001 - a bad capture must not abort the TSS rewindow
+            alt_failed += 1
+            alt_rows = None
+            print(f"warning: alt columns of {raw_path} unavailable ({exc!r}); its alt columns stay empty")
+        if alt_rows is not None:
             # The v1 ablation signals' inputs (ttft_mean / kv_usage) from the cell's 1 Hz
             # capture, as the standard dataset adds them (scripts.alt_signal_columns), so the
             # campaign's alt fit of every signal reads this CSV (review 2026-10-28).
             alt_written = True
-            for row in cell_rows:
-                row.update(alt_source(int(row["window_start_ms"]), int(row["window_end_ms"])))
+            for row, alt_row in zip(cell_rows, alt_rows):
+                row.update(alt_row)
         low_n += sum(
             1 for row in cell_rows
             if (row.get(slo_labels.COMPLETED_REQUESTS_COLUMN) or 0) < primary.min_completed_requests
@@ -1287,6 +1297,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         print(f"cell {cell_id}: {len(cell_rows)} windows")
 
+    if alt_failed:
+        print(f"warning: {alt_failed} cell(s) had unreadable alt-signal captures (alt columns empty for them)")
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     extra_columns = list(LEDGER_COLUMNS) if ledger else []

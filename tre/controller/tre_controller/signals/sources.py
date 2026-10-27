@@ -183,7 +183,7 @@ def model_mean_ttft_ms(pods: list[PodWindowMetrics]) -> float | None | object:
     count = 0.0
     for pod in pods:
         n = pod.ttft_count
-        if n is None or not math.isfinite(float(n)) or float(n) < 0.0:
+        if not pod.ttft_count_complete or n is None or not math.isfinite(float(n)) or float(n) < 0.0:
             return _MISSING
         if float(n) == 0.0:
             continue
