@@ -84,6 +84,12 @@ class TrsParams:
     epsat: float
     hsat: int
     ema_tau_ms: float | None = None
+    #: What theta was fitted on (2026-10-28, ``tre_common.tss.theta_basis_errors``): the
+    #: numerator source (``step_counters`` / ``completion_histograms``) and the metrics
+    #: window (ms). None = not stamped (a registry from before 2026-10-28). The
+    #: controller refuses to start unless both equal what it computes.
+    numerator: str | None = None
+    theta_window_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2014,6 +2020,8 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             epsat=float(trs["epsat"]),
             hsat=int(trs["hsat"]),
             ema_tau_ms=(float(trs["ema_tau_ms"]) if trs.get("ema_tau_ms") is not None else None),
+            numerator=(str(trs["numerator"]) if trs.get("numerator") is not None else None),
+            theta_window_ms=(float(trs["theta_window_ms"]) if trs.get("theta_window_ms") is not None else None),
         ),
         vllm_extra_args=tuple(str(arg) for arg in raw.get("vllm_extra_args", [])),
         vllm_features=tuple(str(feature) for feature in raw.get("vllm_features") or ()),

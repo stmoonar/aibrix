@@ -379,7 +379,9 @@ def _store_with_ticks(end: int) -> MetricsStore:
     redis.sets["tre:v2:pods:m"] = {"default/p"}
     for k, tick in enumerate(range(end - 40_000, end + 1, P)):
         redis.add("tre:v2:inst:default/p", tick, {"pod_name": "p", "model_metrics": {"m/num_requests_running": 3.0}})
-        redis.add("tre:v2:hist:default/p", tick, {"pod_name": "p", "model_histogram_metrics": {
+        redis.add("tre:v2:hist:default/p", tick, {"pod_name": "p", "model_counter_metrics": {
+            "m/generation_tokens_total": 100.0 * k, "m/prompt_tokens_total": 10.0 * k,
+        }, "model_histogram_metrics": {
             "m/request_generation_tokens": {"sum": 100.0 * k, "count": k, "buckets": {}},
             "m/request_prompt_tokens": {"sum": 10.0 * k, "count": k, "buckets": {}},
         }})

@@ -23,7 +23,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.metrics_refresh_interval_s == 5.0
     assert config.rescue_interval_s == 5.0
     assert config.fairness_interval_s == 10.0
-    assert config.metrics_window_ms == 30_000
+    assert config.metrics_window_ms == 20_000  # 2026-10-28: 20 s with the step-counter numerator
     assert config.metrics_window_mode == "sliding"
     # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 2 s); the read
     # offset defaults to min(2 s, evidence / 2).

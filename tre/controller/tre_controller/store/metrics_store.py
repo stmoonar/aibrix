@@ -22,11 +22,21 @@ LOG = logging.getLogger("tre_controller.store.metrics_store")
 # tre_common.vllm_metrics.GATEWAY_DOC_KEYS, so the vLLM 0.30 identifiers
 # (inter_token_latency_seconds, kv_cache_usage_perc) are accepted as well, newest first.
 HISTOGRAM_METRICS = {
-    "prompt_tokens": "request_prompt_tokens",
-    "generation_tokens": "request_generation_tokens",
+    # Completed requests: the count is the window's request evidence, the sum the
+    # numerator of its mean prompt length (SafeScale). Not the TSS numerator.
+    "completed_prompt_tokens": "request_prompt_tokens",
     "ttft": "time_to_first_token_seconds",
     "tpot": "time_per_output_token_seconds",
     "e2e": "e2e_request_latency_seconds",
+}
+
+# The TSS numerator (2026-10-28, design docs/design/20261028-tss-step-counters.md):
+# vLLM's per-step token counters, on the histogram docs under ``model_counter_metrics``
+# (same boundary and scraped_ms as the histograms). Tokens the engine processed, read
+# as (newest - baseline) / their scraped_ms span x window; a missing counter is unknown.
+COUNTER_METRICS = {
+    "prompt_tokens": "prompt_tokens_total",
+    "generation_tokens": "generation_tokens_total",
 }
 
 INSTANT_METRICS = {
@@ -269,9 +279,11 @@ class MetricsStore:
           come from this one pod set; the O1 suffixes use the same set.
         * Queue gauges: the mean over all the pod's instant docs in the window (a
           repeated ``scraped_ms`` is a zero-order hold of the last observation).
-        * Tokens: (end - baseline counter sum) / (their ``scraped_ms`` span) x window;
-          the baseline is the newest histogram doc at or before the window start, else
-          the first one inside it.
+        * Tokens: vLLM's step counters ``prompt_tokens_total`` / ``generation_tokens_total``,
+          (end - baseline) / (their ``scraped_ms`` span) x window; the baseline is the
+          newest histogram doc at or before the window start, else the first one inside
+          it. A pod whose baseline or end doc lacks a counter has unknown tokens: left
+          out of queue and tokens, flagged (never read as zero tokens).
         * Flags (``sample_incomplete_pods``; a donor-gate flag only): coverage =
           distinct ``scraped_ms`` in the window / (window / instant period) below
           ``min_sample_ratio``; a token span outside [0.67, 1.5] x window; a missing or
@@ -597,8 +609,8 @@ class MetricsStore:
             return None
         pod_name = _pod_name(hist_docs, inst_docs, pod_key)
 
-        prompt_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms)
-        generation_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["generation_tokens"], hist_docs, window_start_ms)
+        prompt_tokens = self._counter_delta(model, COUNTER_METRICS["prompt_tokens"], hist_docs, window_start_ms)
+        generation_tokens = self._counter_delta(model, COUNTER_METRICS["generation_tokens"], hist_docs, window_start_ms)
         ttft_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
         tpot_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
         e2e_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
@@ -630,19 +642,15 @@ class MetricsStore:
             tpot_p95_ms=_seconds_to_ms(tpot_p95_s),
             e2e_p95_ms=_seconds_to_ms(e2e_p95_s),
             request_count=self._hist_count_delta(
-                model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms
+                model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms
             ),
             request_count_observed=self._hist_count_delta(
-                model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms
+                model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms
             ),
-            token_counter_reset=(
-                self._hist_counter_reset(
-                    model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs
-                )
-                or self._hist_counter_reset(
-                    model, HISTOGRAM_METRICS["generation_tokens"], hist_docs
-                )
+            completed_prompt_tokens=self._hist_sum_delta(
+                model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms
             ),
+            token_counter_reset=_counter_reset_index(model, hist_docs) > 0,
             instant_ticks_ms=_doc_ticks(inst_docs) if instant_ticks is None else instant_ticks,
             gpu_cache_usage=self._instant_avg_optional(model, INSTANT_METRICS["gpu_cache"], inst_docs),
             ttft_avg_ms=_seconds_to_ms(ttft_avg_s),
@@ -707,13 +715,21 @@ class MetricsStore:
         delta = _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0)
         return delta if delta >= 0.0 else None
 
-    def _hist_counter_reset(
-        self, model: str, metric: str, docs: list[dict[str, Any]]
-    ) -> bool:
-        first, last = _first_last_metric(model, metric, docs)
-        if first is None or last is None:
-            return False
-        return _number(last.get("sum"), 0.0) < _number(first.get("sum"), 0.0)
+    def _counter_delta(
+        self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
+    ) -> float | None:
+        """Increase of a token counter from the baseline doc (the first histogram doc)
+        to the newest one - the same two docs whose ``scraped_ms`` span scales it. None
+        (unknown, never 0) without a histogram doc in the window, when either of the two
+        docs lacks the counter, or when the counter went down (a reset the caller did
+        not cut at)."""
+        hist = [doc for doc in docs if isinstance(doc.get("model_histogram_metrics"), dict)]
+        if not hist or _number(hist[-1].get("timestamp"), 0.0) < window_start_ms:
+            return None
+        first, last = _counter_value(model, metric, hist[0]), _counter_value(model, metric, hist[-1])
+        if first is None or last is None or last < first:
+            return None
+        return last - first
 
     def _hist_count_delta(
         self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
@@ -826,6 +842,11 @@ class MetricsStore:
         metrics = self._aggregate_pod(model, pod_key, hist_docs, inst_docs, read_start_ms)
         if metrics is None:
             return None, False
+        if self._read_instant and (metrics.prompt_tokens is None or metrics.generation_tokens is None):
+            # 2026-10-28: a token counter missing at the baseline or the end doc (an old
+            # gateway, a non-finite value) - unknown tokens: out of queue AND tokens,
+            # flagged, like a pod without a usable delta.
+            return None, True
         if not self._read_instant:
             return replace(metrics, observed=_pod_observed(hist_docs, inst_docs, read_start_ms)), False
         if reset:
@@ -1037,24 +1058,43 @@ def _pod_observed(hist_docs: list[dict[str, Any]], inst_docs: list[dict[str, Any
 
 
 #: The token counters whose decrease marks an engine restart (counter reset).
-_TOKEN_COUNTERS = (HISTOGRAM_METRICS["prompt_tokens"], HISTOGRAM_METRICS["generation_tokens"])
+_TOKEN_COUNTERS = (COUNTER_METRICS["prompt_tokens"], COUNTER_METRICS["generation_tokens"])
 
 
-def _after_counter_reset(model: str, hist_docs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
-    """``hist_docs`` from the first doc after the last token-counter reset (a ``sum``
-    lower than the previous doc's: the engine restarted), and whether there was one.
-    That doc is the new baseline of every delta."""
+def _counter_value(model: str, metric: str, doc: dict[str, Any]) -> float | None:
+    """A token counter of a histogram doc (``model_counter_metrics``), None when absent
+    or not a finite number."""
+    counters = doc.get("model_counter_metrics")
+    if not isinstance(counters, dict):
+        return None
+    raw = doc_lookup(counters, model, metric)
+    if isinstance(raw, bool) or raw is None:
+        return None
+    value = _number(raw, float("nan"))
+    return value if value == value and value not in (float("inf"), float("-inf")) else None
+
+
+def _counter_reset_index(model: str, hist_docs: list[dict[str, Any]]) -> int:
+    """Index of the first doc after the last token-counter reset (a counter lower than
+    in the previous doc carrying it: the engine restarted; vLLM keeps its counters
+    across sleep / wake), 0 when there is none."""
     cut = 0
     for metric in _TOKEN_COUNTERS:
         previous: float | None = None
         for index, doc in enumerate(hist_docs):
-            entry = _metric_entry(model, metric, doc)
-            if entry is None:
+            value = _counter_value(model, metric, doc)
+            if value is None:
                 continue
-            value = _number(entry.get("sum"), 0.0)
             if previous is not None and value < previous:
                 cut = max(cut, index)
             previous = value
+    return cut
+
+
+def _after_counter_reset(model: str, hist_docs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """``hist_docs`` from the first doc after the last token-counter reset, and whether
+    there was one. That doc is the new baseline of every delta."""
+    cut = _counter_reset_index(model, hist_docs)
     return (hist_docs[cut:], True) if cut else (hist_docs, False)
 
 

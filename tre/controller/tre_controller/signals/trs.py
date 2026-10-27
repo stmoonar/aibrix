@@ -115,7 +115,8 @@ class TRSInput:
     """Inputs of one window's TSS (the unified definition, ``tre_common.tss``).
 
     ``prompt_tokens_total`` / ``generation_tokens_total`` are window totals and the TSS
-    numerator is that total (tokens per window, window = TRE_METRICS_WINDOW_MS).
+    numerator is that total (tokens per window, the window's own length; 2026-10-28: from
+    vLLM's step counters, ``tre_common.tss``).
     ``window_ms`` is the window duration; it only drives the EMA idle-gap reset (``None``
     disables it). ``avg_swapping`` and ``w_d`` are carried for schema compatibility and are
     ignored by the formula (a non-zero swapping / a w_d != 1 is logged once).

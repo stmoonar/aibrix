@@ -186,7 +186,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     # P0-4A: per-model params load from a mounted ConfigMap so params_set.py can edit +
     # restart-to-apply. W stays frozen as an explicit env value (not in the CM).
     assert _env(controller)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
-    assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "30000"  # W freeze artifact (explicit env lock)
+    assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "20000"  # W (2026-10-28: 20 s, step counters)
     assert controller["spec"]["strategy"] == {"type": "Recreate"}  # no dual-controller actuation
     mounts = controller["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
     assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in mounts

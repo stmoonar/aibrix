@@ -294,7 +294,10 @@ class Sim:
                 f"{pod.model}/gpu_cache_usage_perc": kv,
             }}, ts)
             if ts % self.period == 0:
-                self.redis.zadd(f"tre:v2:hist:default/{pod.name}", {**base, "model_histogram_metrics": {
+                self.redis.zadd(f"tre:v2:hist:default/{pod.name}", {**base, "model_counter_metrics": {
+                    f"{pod.model}/prompt_tokens_total": pod.count * PROMPT_TOKENS,
+                    f"{pod.model}/generation_tokens_total": pod.gen,
+                }, "model_histogram_metrics": {
                     f"{pod.model}/request_prompt_tokens": _hist(pod.count, pod.count * PROMPT_TOKENS, (1e9,)),
                     f"{pod.model}/request_generation_tokens": _hist(pod.count, pod.gen, (1e9,)),
                     f"{pod.model}/time_to_first_token_seconds": _hist(pod.count, pod.ttft_sum, TTFT_BOUNDS, pod.ttft),

@@ -344,6 +344,7 @@ def test_bad_or_missing_tp_size_raises_instead_of_falling_back():
 def _e2e_doc(pod, count, buckets):
     return {
         "pod_name": pod,
+        "model_counter_metrics": {"dsqwen-7b/prompt_tokens_total": count, "dsqwen-7b/generation_tokens_total": 0.0},
         "model_histogram_metrics": {
             "dsqwen-7b/request_prompt_tokens": {"sum": count, "count": count, "buckets": {"1": count}},
             "dsqwen-7b/e2e_request_latency_seconds": {"sum": float(count), "count": count, "buckets": buckets},

@@ -97,5 +97,5 @@ def test_smooth_series_seeds_passes_undefined_through_and_decays() -> None:
 
 
 def test_theta_rate_equivalent_divides_by_the_window_seconds() -> None:
-    assert tss.convert_window_total_theta(1718.2369972339602) == 1718.2369972339602 / 30.0
+    assert tss.convert_window_total_theta(1718.2369972339602, 30_000) == 1718.2369972339602 / 30.0
     assert tss.convert_window_total_theta(739.0, 20_000) == 739.0 / 20.0

@@ -68,6 +68,11 @@ def _entry(sum_, count_, buckets):
 def _hist_doc(prompt_sum, prompt_count, gen_sum, gen_count, ttft, tpot, e2e) -> dict:
     return {
         "pod_name": "pod-a",
+        # 2026-10-28: the online numerator is the step counters. Here they advance at
+        # completion (as the client records do), so the offline completion window and the
+        # online counter window see the same tokens: the parity checked is the shared
+        # formula (windowing, queue, p95), not the numerator source (tests of l3_numerator).
+        "model_counter_metrics": {f"{MODEL}/prompt_tokens_total": prompt_sum, f"{MODEL}/generation_tokens_total": gen_sum},
         "model_histogram_metrics": {
             f"{MODEL}/request_prompt_tokens": _entry(prompt_sum, prompt_count, {"1": prompt_count}),
             f"{MODEL}/request_generation_tokens": _entry(gen_sum, gen_count, {"1": gen_count}),

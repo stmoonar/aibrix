@@ -358,7 +358,10 @@ class ControllerConfig:
             ),
         )
 
-        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
+        # 2026-10-28 (user decision): 20 s (was 30 s). The registry's thetas are window
+        # token totals fitted on one window: their trs.theta_window_ms must equal this
+        # (checked at start, tre_common.tss.theta_basis_errors).
+        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 20_000)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
         # Round 5: the former N2 warning (a commit-gate tail of hq x W could read metrics

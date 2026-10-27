@@ -57,7 +57,9 @@ def _pod_docs(redis: _Redis, pod: str, *, busy: bool) -> None:
             "m/num_requests_waiting": 1.0 if busy else 0.0,
         }})
         gen = 50.0 * k if busy else 777.0  # a sleeping pod's counters are flat (stale total)
-        redis.add(f"tre:v2:hist:default/{pod}", tick, {"pod_name": pod, "model_histogram_metrics": {
+        redis.add(f"tre:v2:hist:default/{pod}", tick, {"pod_name": pod, "model_counter_metrics": {
+            "m/generation_tokens_total": gen, "m/prompt_tokens_total": gen / 5,
+        }, "model_histogram_metrics": {
             "m/request_generation_tokens": {"sum": gen, "count": k if busy else 9, "buckets": {}},
             "m/request_prompt_tokens": {"sum": gen / 5, "count": k if busy else 9, "buckets": {}},
         }})

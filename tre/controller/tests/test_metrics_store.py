@@ -68,6 +68,8 @@ def set_legacy_doc(redis, key, ts_ms, doc):
 def hist_doc(pod, prompt_sum, prompt_count, ttft_sum, ttft_count, ttft_buckets):
     return {
         "pod_name": pod,
+        # 2026-10-28: the TSS numerator is the step counters (here equal to the sums).
+        "model_counter_metrics": {"dsqwen-7b/prompt_tokens_total": prompt_sum, "dsqwen-7b/generation_tokens_total": 0.0},
         "model_histogram_metrics": {
             "dsqwen-7b/request_prompt_tokens": {"sum": prompt_sum, "count": prompt_count, "buckets": {"1": prompt_count}},
             "dsqwen-7b/time_to_first_token_seconds": {

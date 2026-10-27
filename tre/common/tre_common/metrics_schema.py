@@ -62,6 +62,12 @@ class Observed:
 @dataclass(frozen=True)
 class PodWindowMetrics:
     pod: str
+    #: The TSS numerator's token totals over the window (2026-10-28, design
+    #: docs/design/20261028-tss-step-counters.md): vLLM's per-step counters
+    #: ``prompt_tokens_total`` / ``generation_tokens_total`` - their delta between the
+    #: baseline and the newest histogram doc, divided by the two docs' ``scraped_ms``
+    #: span and multiplied by the window length. Tokens the engine PROCESSED in the
+    #: window, not the tokens of the requests that completed in it. None = unknown.
     prompt_tokens: float | None
     generation_tokens: float | None
     avg_waiting: float
@@ -137,6 +143,11 @@ class PodWindowMetrics:
     #: Round 4: the pod's observation of the window (:class:`Observed`); None = not
     #: read on the observation clock (v1 schema, offline / synthetic windows).
     observed: Observed | None = field(default=None, compare=False)
+    #: 2026-10-28: prompt tokens of the requests that COMPLETED in the window (the
+    #: ``request_prompt_tokens`` histogram sum delta, not scaled), the numerator of the
+    #: window's mean prompt length with ``request_count_observed`` (SafeScale's
+    #: length-dependent TTFT threshold). Not a TSS input. None = no histogram.
+    completed_prompt_tokens: float | None = field(default=None, compare=False)
 
 
 #: How a model-level p95 is formed from the pods' merged histograms:
@@ -170,6 +181,8 @@ class ModelWindowMetrics:
     request_count_observed: float | None = field(default=None, compare=False)
     #: Union of the per-pod ``instant_ticks_ms`` (see :class:`PodWindowMetrics`).
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
+    #: Sum of the pods' ``completed_prompt_tokens`` (see :class:`PodWindowMetrics`).
+    completed_prompt_tokens: float | None = field(default=None, compare=False)
     #: Round 4: the model's observation of the window (:class:`Observed`, merged over
     #: the pods in ``per_pod``; the store's flags included). None = not read on the
     #: observation clock - use :func:`observed_of`.
@@ -228,6 +241,18 @@ class MetricsSnapshot:
     #: freshness rule: a window ending at ``E`` is complete once this is >= ``E``.
     #: None = not read (no cadence check, v1 schema, offline).
     gateway_last_hist_ms: int | None = field(default=None, compare=False)
+
+
+def mean_completed_prompt_tokens(metrics: Any) -> float | None:
+    """Mean prompt length of the requests completed in a window: ``completed_prompt_tokens``
+    / the observed completed-request count. None when either is unknown or no request
+    completed. (``prompt_tokens`` is the step-counter total since 2026-10-28: tokens
+    processed, not tokens of completed requests - never a mean-length numerator.)"""
+    tokens = getattr(metrics, "completed_prompt_tokens", None)
+    count = observed_requests(metrics)
+    if tokens is None or not count or float(count) <= 0:
+        return None
+    return float(tokens) / float(count)
 
 
 def observed_requests(metrics: Any) -> float | None:

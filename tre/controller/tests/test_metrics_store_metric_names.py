@@ -35,6 +35,7 @@ def _hist(count: float, sum_: float, bounds: tuple[str, ...], filled_from: int) 
 def _hist_doc(tpot_key: str, n: float) -> dict:
     return {
         "pod_name": "pod-a",
+        "model_counter_metrics": {f"{MODEL}/prompt_tokens_total": 100 * n, f"{MODEL}/generation_tokens_total": 100 * n},
         "model_histogram_metrics": {
             f"{MODEL}/request_prompt_tokens": _hist(n, 100 * n, ("100", "+Inf"), 0),
             f"{MODEL}/request_generation_tokens": _hist(n, 100 * n, ("100", "+Inf"), 0),

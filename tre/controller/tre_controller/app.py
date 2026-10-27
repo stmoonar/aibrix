@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.gateway_inflight import instance_max_age_ms
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
+from tre_common.tss import theta_basis_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
@@ -305,6 +306,14 @@ def create_controller_dependencies(
     sm_transport: AsyncTransport | None = None,
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
+    # 2026-10-28: thetas are window token totals of one numerator source - refuse to run
+    # on thetas fitted for another window or numerator (an old registry with a new image).
+    basis_errors = theta_basis_errors(registry.models(), window_ms=float(cfg.metrics_window_ms))
+    if basis_errors:
+        raise ValueError(
+            "controller configuration: registry thetas were not fitted on this controller's TSS "
+            "(publish the recalibrated trs with the image): " + "; ".join(basis_errors)
+        )
     injected_redis_client = redis_client is not None
     redis_timeout_s = float(getattr(cfg, "redis_socket_timeout_s", 0.0) or 0.0)
     redis_client = (

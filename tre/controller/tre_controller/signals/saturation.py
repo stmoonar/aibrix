@@ -1,17 +1,20 @@
 """Onset saturation rescue (2026-10-02, design docs/design/20261002-saturation-onset-rescue.md).
 
-The TSS numerator counts tokens when a request COMPLETES. At a load onset nothing has
-completed yet: the window numerator is zero (Z undefined, the model takes part in no
-decision), and once the first requests complete the O1 evidence gate still holds the
-model for about 20 s. A model that is visibly full meanwhile - requests
-waiting in vLLM, or the KV cache nearly full - is not scaled for 40-50 s.
+Written when the TSS numerator counted tokens when a request COMPLETED: at a load onset
+nothing had completed, the window numerator was zero (Z undefined, the model took part in
+no decision), and once the first requests completed the O1 evidence gate still held the
+model for about 20 s. A model visibly full meanwhile - requests waiting in vLLM, or the
+KV cache nearly full - was not scaled for 40-50 s. Since 2026-10-28 the numerator is
+vLLM's step counters (design docs/design/20261028-tss-step-counters.md): it is non-zero
+as soon as the engine decodes, so ``numerator_zero`` now means "no token processed in the
+window"; the O1-hold path is unchanged.
 
 This module decides, per model and per metrics window, whether such a model is a
 CRITICAL receiver anyway:
 
 * **eligible** only while the TSS cannot decide:
 
-  - ``numerator_zero``: nothing completed in the window (tokens present);
+  - ``numerator_zero``: no token processed in the window (tokens known);
   - ``o1_hold``: the receiver gate is not warm (O1 evidence gate, or the ADR-0013 onset
     guard with O1 off) AND the breakpoint is the traffic onset or the routable change of
     this tracker's own last step: once a window of the current traffic period was warm,

@@ -81,6 +81,20 @@ def test_apply_valid_edit_roundtrips_through_loader() -> None:
     assert m["weights_path"] == "/w/m1"
 
 
+def test_theta_basis_stamps_publish_with_theta_and_reject_unknown_values() -> None:
+    # 2026-10-28: a recalibration publishes theta and what it was fitted on in one edit.
+    new_yaml = apply_and_validate(
+        _REGISTRY,
+        {"m1": {"trs": {"theta_m": 500.0, "numerator": "step_counters", "theta_window_ms": 20000}}},
+    )
+    trs = yaml.safe_load(new_yaml)["models"][0]["trs"]
+    assert (trs["theta_m"], trs["numerator"], trs["theta_window_ms"]) == (500.0, "step_counters", 20000)
+    with pytest.raises(ParamValidationError):
+        apply_and_validate(_REGISTRY, {"m1": {"trs": {"numerator": "tokens"}}})
+    with pytest.raises(ParamValidationError):
+        apply_and_validate(_REGISTRY, {"m1": {"trs": {"theta_window_ms": 20.5}}})
+
+
 def test_alt_threshold_rejects_wrong_direction() -> None:
     with pytest.raises(ParamValidationError) as exc_info:
         apply_and_validate(

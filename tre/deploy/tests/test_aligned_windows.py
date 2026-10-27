@@ -92,7 +92,12 @@ def _online_store(records: list[dict], sidecar: list[dict]) -> MetricsStore:
             f"{MODEL}/num_requests_waiting": s["waiting"],
             f"{MODEL}/num_requests_swapped": 0.0,
         }})
-        redis.add(f"tre:v2:hist:{POD}", tick, {"pod_name": "pod-a", "model_histogram_metrics": {
+        # 2026-10-28: counters advancing at completion (= the offline completion window;
+        # the numerator source itself is tested in test_l3_numerator).
+        redis.add(f"tre:v2:hist:{POD}", tick, {"pod_name": "pod-a", "model_counter_metrics": {
+            f"{MODEL}/prompt_tokens_total": float(sum(r["input_tokens"] for r in done)),
+            f"{MODEL}/generation_tokens_total": float(sum(r["output_tokens"] for r in done)),
+        }, "model_histogram_metrics": {
             f"{MODEL}/request_prompt_tokens": {"sum": float(sum(r["input_tokens"] for r in done)), "count": len(done), "buckets": {}},
             f"{MODEL}/request_generation_tokens": {"sum": float(sum(r["output_tokens"] for r in done)), "count": len(done), "buckets": {}},
         }})

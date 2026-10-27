@@ -66,7 +66,9 @@ def _write_pod(redis, model, pod, *, running, waiting=0.0, gen_per_s=100.0, miss
         base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod, "scraped_ms": seen}
         if ts % evidence == 0 and ts not in hist_missing:
             n = (seen - ORIGIN) / 1000 + 1.0 if reset_at is None or ts < reset_at else (seen - reset_at) / 1000
-            redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_histogram_metrics": {
+            redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_counter_metrics": {
+                f"{model}/prompt_tokens_total": 50.0 * n, f"{model}/generation_tokens_total": gen_per_s * n,
+            }, "model_histogram_metrics": {
                 f"{model}/request_prompt_tokens": {"sum": 50.0 * n, "count": n, "buckets": {"+Inf": n}},
                 f"{model}/request_generation_tokens": {"sum": gen_per_s * n, "count": n, "buckets": {"+Inf": n}},
             }}, ts)

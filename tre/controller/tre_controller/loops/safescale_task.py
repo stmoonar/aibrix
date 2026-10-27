@@ -7,7 +7,13 @@ import time
 from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Collection, Mapping, Protocol
 
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_of, observed_requests
+from tre_common.metrics_schema import (
+    MetricsSnapshot,
+    ModelWindowMetrics,
+    mean_completed_prompt_tokens,
+    observed_of,
+    observed_requests,
+)
 from tre_common.registry import Registry
 from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
@@ -830,11 +836,9 @@ def _pooled_p95(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...], hist:
 
 
 def _mean_prompt_tokens(metrics: ModelWindowMetrics) -> float | None:
-    tokens = getattr(metrics, "prompt_tokens", None)
-    count = getattr(metrics, "request_count", None)
-    if tokens is None or not count or float(count) <= 0:
-        return None
-    return float(tokens) / float(count)
+    """Mean prompt length of the requests completed in the window (the histogram
+    sum / count; 2026-10-28: never the TSS step-counter total)."""
+    return mean_completed_prompt_tokens(metrics)
 
 
 def _probe_request_id(safescale: SafeScaleObserver, model: str) -> str | None:

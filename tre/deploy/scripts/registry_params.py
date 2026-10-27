@@ -20,6 +20,7 @@ from typing import Any, Callable
 import yaml
 
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
+from tre_common.tss import NUMERATOR_COMPLETION_HISTOGRAMS, NUMERATOR_STEP_COUNTERS
 
 # field -> (min, max, kind, min_exclusive, max_exclusive)
 _TRS_BOUNDS: dict[str, tuple] = {
@@ -35,6 +36,10 @@ _TRS_BOUNDS: dict[str, tuple] = {
     "ema_alpha": (0, 1, "float", True, True),
     "epsat": (0, 0.5, "float", True, True),
     "hsat": (1, 20, "int", False, False),
+    # 2026-10-28: what theta was fitted on (tre_common.tss.theta_basis_errors). Published
+    # with theta in the same --apply; the controller refuses to start on a mismatch.
+    "theta_window_ms": (1000, 120000, "int", False, False),
+    "numerator": ((NUMERATOR_STEP_COUNTERS, NUMERATOR_COMPLETION_HISTOGRAMS), None, "enum", False, False),
 }
 _ALT_THRESHOLD_BOUNDS = (0, 1_000_000_000, "float", True, False)
 _ALT_DELTA_BOUNDS = {
@@ -122,6 +127,8 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
 
 def _field_view(value: Any, spec: tuple) -> dict[str, Any]:
     lo, hi, kind, lo_ex, hi_ex = spec
+    if kind == "enum":
+        return {"value": value, "type": "enum", "choices": list(lo)}
     return {"value": value, "min": lo, "max": hi, "type": kind, "min_exclusive": lo_ex, "max_exclusive": hi_ex}
 
 
@@ -239,6 +246,11 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
 
 def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
     lo, hi, kind, lo_ex, hi_ex = spec
+    if kind == "enum":
+        if raw in lo:
+            return raw
+        errors.append({"model": model, "field": key, "error": "not_a_choice", "choices": list(lo)})
+        return None
     if isinstance(raw, bool):  # YAML true/false would coerce to 1/0
         errors.append({"model": model, "field": key, "error": f"not_a_{kind}"})
         return None
