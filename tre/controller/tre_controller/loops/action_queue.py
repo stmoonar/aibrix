@@ -398,6 +398,8 @@ class ActionQueue:
 
         accepted = 0
         held = 0
+        #: This submit's accepted items (fused into plans below).
+        accepted_items: list[QueuedAction] = []
         dropped: list[tuple[str, str]] = []
         replaced: list[tuple[str, SourceLoop]] = []
         observe = self._is_observe()
@@ -428,6 +430,7 @@ class ActionQueue:
                 continue
 
             self._pending.append(queued)
+            accepted_items.append(queued)
             self._inflight.update(queued.models)
             accepted += 1
             self._register_rescue(queued.action, rescue_started)
@@ -440,12 +443,57 @@ class ActionQueue:
                 record.done_ms = int(self._now_ms())  # covered by restored pods only
             self._persist_scale_memory(model)
 
+        self._fuse_into_plans(accepted_items)
         return SubmitResult(
             accepted=accepted,
             held=held,
             dropped=tuple(dropped),
             replaced=tuple(replaced),
         )
+
+    def _fuse_into_plans(self, accepted: list[QueuedAction]) -> None:
+        """One decision -> one plan (design 20261027-sm-plans §5.2, narrowed by the
+        architect): the accepted re-plannable power actions of ONE submit
+        (``ScaleAction``, ``TransferIntent``) become ONE :class:`PlanBatch`, in submit
+        order, each action exactly one plan item. Only DIFFERENT models are fused: an
+        action touching a model an earlier member already uses (the same receiver
+        twice, a shared donor, a shrink and a grow of one model - possible through the
+        rescue path, which skips the inflight check) starts the next batch; the
+        batches serialize through their shared models. A batch takes the queue
+        position of its first member; a member never jumps over another accepted
+        action of one of its models. No timer: nothing waits for more actions."""
+        if sum(1 for queued in accepted if _fusable(queued)) < 2:
+            return
+        mine = {id(queued) for queued in accepted}
+        start = len(self._pending)
+        while start > 0 and id(self._pending[start - 1]) in mine:
+            start -= 1
+        tail = list(self._pending)[start:]
+        if any(id(queued) not in mine for queued in tail):
+            return  # not this submit's contiguous tail (never expected): leave it unfused
+        out: list = []
+        batch: list[QueuedAction] | None = None
+        used: set[str] = set()
+        for queued in tail:
+            models = set(queued.models)
+            if not _fusable(queued):
+                out.append(queued)
+                used |= models  # a later member may not jump over it on a shared model
+                continue
+            if batch is not None and not (models & used):
+                batch.append(queued)
+                used |= models
+                continue
+            batch = [queued]
+            out.append(batch)
+            used = set(models)
+        fused: deque[QueuedAction] = deque(list(self._pending)[:start])
+        for entry in out:
+            if isinstance(entry, list) and len(entry) > 1:
+                fused.append(self._queued(PlanBatch(tuple(item.action for item in entry))))
+            else:
+                fused.append(entry[0] if isinstance(entry, list) else entry)
+        self._pending = fused
 
     def pending_actions(self) -> tuple[QueuedAction, ...]:
         return tuple(self._pending)
@@ -2012,6 +2060,18 @@ class ActionQueue:
         removed: list[tuple[str, SourceLoop]] = []
         retained: deque[QueuedAction] = deque()
         for item in self._pending:
+            if isinstance(item.action, PlanBatch):
+                # A fused plan: only its fairness members of ``model`` go.
+                kept = tuple(
+                    member for member in item.action.members
+                    if not (member.source_loop == "fairness" and model in _queued_models(member))
+                )
+                removed.extend((model, "fairness") for _ in range(len(item.action.members) - len(kept)))
+                if len(kept) == len(item.action.members):
+                    retained.append(item)
+                elif kept:
+                    retained.append(self._queued(kept[0] if len(kept) == 1 else PlanBatch(kept)))
+                continue
             if model in item.models and item.source_loop == "fairness":
                 removed.append((model, item.source_loop))
                 continue
@@ -2253,6 +2313,15 @@ def _queued_models(action) -> tuple[str, ...]:
     if isinstance(action, TransferIntent):
         return tuple(dict.fromkeys((action.donor_model, action.receiver_model)))
     return (action.model,)
+
+
+def _fusable(queued: QueuedAction) -> bool:
+    """A re-plannable power action that may share one plan with the other actions of
+    its submit (a SafeScale one-shot action keeps its own plan and retries)."""
+    action = queued.action
+    if queued.source_loop in ONE_SHOT_LOOPS:
+        return False
+    return isinstance(action, TransferIntent) or (isinstance(action, ScaleAction) and action.delta != 0)
 
 
 def _replannable_power(queued: QueuedAction) -> bool:

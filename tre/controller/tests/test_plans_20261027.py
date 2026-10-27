@@ -5,7 +5,14 @@ from __future__ import annotations
 import asyncio
 
 from tre_controller.loops.action_queue import ActionQueue
-from tre_controller.planning.planner import ReceiverTarget, SafeScaleCommitAction, ScaleAction
+from tre_controller.planning.planner import (
+    HideAction,
+    ReceiverTarget,
+    RescuePlan,
+    SafeScaleCommitAction,
+    ScaleAction,
+    TransferIntent,
+)
 
 from plan_shim import PlanSM, done_plan
 
@@ -139,3 +146,93 @@ def test_a_whole_plan_refusal_keeps_every_commit_member_pending():
     assert first["wakes"] == [{"model": "8b", "reason": "safescale_receiver", "at_least": 2}]
     assert seen_at_retry == [{}]  # the refused plan stamped nothing
     assert all(result.ok for result in results) and results[0].attempts == 2
+
+
+# ------------------------------------------------------------------ (12) one submit -> one plan
+def test_one_submit_of_different_models_is_one_plan_with_one_item_per_action():
+    """§5.2 as narrowed: [+k on R1, D->R2, shrink D2] of one submit = ONE POST with three
+    items; each member keeps its own accounting (rescue credit, relay, F4 memory)."""
+    rescue = RescuePlan(target=3, desired=3, base=1, covered=1)
+    sm = PlanSM({"R1": 1, "R2": 1, "D": 4, "D2": 3})
+    queue = ActionQueue(sm, now_ms=lambda: 5_000)
+    submitted = queue.submit((
+        ScaleAction("R1", 2, "critical_sleeping_capacity", "rescue", rescue=rescue),
+        TransferIntent("D", "R2", 1, "critical_donor_immediate", "rescue"),
+        ScaleAction("D2", -1, "idle_proactive_immediate", "rescue", sleep_path="urgent"),
+    ))
+    assert submitted.accepted == 3 and len(queue.pending_actions()) == 1
+    results = asyncio.run(queue.drain_once())
+
+    assert sm.plans == [{
+        "sleeps": [{"model": "D2", "reason": "idle_proactive_immediate", "sleep_path": "urgent", "at_most": 2}],
+        "wakes": [
+            {"model": "R1", "reason": "critical_sleeping_capacity", "at_least": 3},
+            {"model": "R2", "reason": "critical_donor_immediate", "at_least": 2,
+             "donors": [{"model": "D", "max": 1, "sleep_path": "urgent"}]},
+        ],
+    }]
+    assert sm.state_reads == 1
+    assert [(r.model, r.action_kind, r.ok) for r in results] == [
+        ("R1", "scale", True), ("D", "transfer", True), ("R2", "transfer", True), ("D2", "scale", True),
+    ]
+    record = queue.rescue_targets()["R1"]
+    assert (record.gained, record.outstanding, record.done_ms) == (2, 0, 5_000)
+    assert {m: d for m, (_, d) in queue.last_actions().items()} == {"R1": "up", "R2": "up", "D": "down", "D2": "down"}
+    assert any(event.startswith("transfer_done:D->R2:count=1:done=1:taken=1") for event in queue.drain_events())
+    assert queue.relay_holds() == {} and queue.inflight_models() == set()
+
+
+def test_a_second_action_on_a_used_model_starts_the_next_plan():
+    """Same-model actions are never merged into one item: the rescue path may submit
+    a +k and a relay for one receiver; the relay starts the next plan, which runs
+    after the first (they share the receiver), and both parts count for the target."""
+    rescue = RescuePlan(target=4, desired=4, base=1, covered=1)
+    sm = PlanSM({"R1": 1, "R2": 1, "D": 4, "D3": 4})
+    queue = ActionQueue(sm, now_ms=lambda: 6_000)
+    submitted = queue.submit((
+        ScaleAction("R1", 1, "critical_sleeping_capacity", "rescue", rescue=rescue),
+        ScaleAction("R2", 1, "critical_sleeping_capacity", "rescue"),
+        TransferIntent("D3", "R1", 1, "critical_donor_immediate", "rescue", rescue=rescue),
+    ))
+    assert submitted.accepted == 3 and len(queue.pending_actions()) == 2
+    asyncio.run(queue.drain_once())
+
+    first, second = sm.plans
+    assert [item["model"] for item in first["wakes"]] == ["R1", "R2"] and first["sleeps"] == []
+    assert second == {"sleeps": [], "wakes": [{"model": "R1", "reason": "critical_donor_immediate", "at_least": 2,
+                                               "donors": [{"model": "D3", "max": 1, "sleep_path": "urgent"}]}]}
+    record = queue.rescue_targets()["R1"]
+    assert (record.gained, record.outstanding) == (2, 0)
+
+
+def test_a_member_never_jumps_over_another_action_of_its_model():
+    """A hide of B between a scale-up of A and a (rescue) scale-up of B: the B scale-up is
+    not fused forward into A's plan (it would run before the hide); it starts the next
+    plan, which a later scale-up of C joins."""
+    sm = PlanSM({"A": 1, "B": 2, "C": 1})
+    queue = ActionQueue(sm)
+    queue.submit((
+        ScaleAction("A", 1, "critical_sleeping_capacity", "rescue"),
+        HideAction("B", ("b-1",), "probe_started", "rescue"),
+        ScaleAction("B", 1, "critical_sleeping_capacity", "rescue"),
+        ScaleAction("C", 1, "critical_sleeping_capacity", "rescue"),
+    ))
+    pending = queue.pending_actions()
+    assert [type(item.action).__name__ for item in pending] == ["ScaleAction", "HideAction", "PlanBatch"]
+    assert [member.model for member in pending[2].action.members] == ["B", "C"]
+    asyncio.run(queue.drain_once())
+    assert [[item["model"] for item in plan["wakes"]] for plan in sm.plans] == [["A"], ["B", "C"]]
+    assert sm.routable == [("B", ("b-1",))]
+
+
+def test_a_rescue_replaces_only_the_fairness_member_of_a_pending_plan():
+    queue = ActionQueue(PlanSM({"m": 2, "n": 1}))
+    queue.submit((
+        ScaleAction("m", -1, "high_release_immediate", "fairness", sleep_path="urgent"),
+        ScaleAction("n", 1, "low_sleeping_capacity", "fairness"),
+    ))
+    [batch] = queue.pending_actions()
+    assert [member.model for member in batch.action.members] == ["m", "n"]
+    rescue = queue.submit((ScaleAction("m", 1, "critical_sleeping_capacity", "rescue"),))
+    assert rescue.accepted == 1 and rescue.replaced == (("m", "fairness"),)
+    assert [(item.action.model, item.action.delta) for item in queue.pending_actions()] == [("n", 1), ("m", 1)]

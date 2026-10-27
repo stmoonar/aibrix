@@ -100,7 +100,10 @@ def test_drain_once_runs_models_concurrently_and_waits_for_all() -> None:
     async def scenario():
         client = GatedClient({"a"})
         queue = ActionQueue(client)
-        queue.submit((ScaleAction("a", 1, "critical", "rescue"), ScaleAction("b", 1, "critical", "rescue")))
+        # Two submits (two decisions): one submit of both would be ONE plan (design
+        # 20261027-sm-plans §5.2), executed by the SM under one writer-lock hold.
+        queue.submit((ScaleAction("a", 1, "critical", "rescue"),))
+        queue.submit((ScaleAction("b", 1, "critical", "rescue"),))
         drain = asyncio.ensure_future(queue.drain_once())
         for _ in range(50):
             await asyncio.sleep(0.001)
