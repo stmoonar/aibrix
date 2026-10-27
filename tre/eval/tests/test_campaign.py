@@ -477,6 +477,10 @@ def test_assess_arm_baseline_refusals_and_route_timeout_cuts(tmp_path):
     (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") * 2)
     v = C.assess_arm(d, 0, 100, thr, baseline=True)
     assert v["verdict"] == "valid" and v["metrics"]["bl_sm_refusals"] == {"slot_occupied": 2}
+    # a plan's partial wake item (200, unfilled, located by slot_occupied) is one too
+    (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(200, "slot_occupied").replace(
+        "'reason'", "'unfilled': 1, 'reason'"))
+    assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "valid"
     # any failure the log does not explain stays suspect (fail closed): other reason, other code, no log
     (d / "baseline-scaler.log").write_text(refused(409, "slot_occupied") + refused(503, "slot_occupied"))
     assert C.assess_arm(d, 0, 100, thr, baseline=True)["verdict"] == "suspect"

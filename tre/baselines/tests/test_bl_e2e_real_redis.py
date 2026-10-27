@@ -5,8 +5,8 @@ container; every test id contains ``real-redis``); skipped in a plain ``make che
 
 Fakes (nothing else is faked, the shell code is the production one):
 
-* a stub service manager over HTTP (``bl_fakes.StubSM``): records ``PUT /v2/models/{m}/target``
-  and serves ``GET /v2/state`` consistent with the targets it applied;
+* a stub service manager over HTTP (``bl_fakes.StubSM``): records ``POST /v2/plans`` and
+  serves ``GET /v2/state`` consistent with the plan items it applied;
 * one fake vLLM ``/metrics`` HTTP server per pod, rendered from the real 0.30 fixture, its
   gauges and cumulative counters advancing with the simulated load;
 * a request-event generator XADDing ``tre:v2:bl:req:<model>`` entries in exactly the Go
@@ -141,11 +141,22 @@ class World:
                 ],
             }
 
-    def apply_target(self, model: str, body: dict) -> None:
+    def apply_item(self, item: dict) -> dict:
+        """One plan item (wake ``at_least`` grow-only, sleep ``at_most``) -> its result."""
         with self.lock:
-            target = min(int(body["wake_replicas"]), self.max_pods)
-            self.awake[model] = max(self.awake[model], target) if body.get("at_least") else target
+            model, before = item["model"], self.awake[item["model"]]
+            if "at_least" in item:
+                after = max(before, min(int(item["at_least"]), self.max_pods))
+            else:
+                after = min(before, int(item["at_most"]))
+            self.awake[model] = after
             self.version += 1
+            out = {"model": model, "status": "done" if after != before else "noop"}
+            if "at_least" in item:
+                out.update(awake_before=before, awake_after=after, unfilled=0, refusals=[])
+            else:
+                out.update(taken=before - after, clamped_by_floor=False)
+            return out
 
     def running_waiting(self, model: str, i: int) -> tuple[float, float]:
         with self.lock:
@@ -330,13 +341,13 @@ class EventGen(threading.Thread):
 
 class Harness:
     def __init__(self, tmp_path, redis_url: str, redis, policy: str, params: dict, *, dry_run: bool,
-                 hook: Optional[Callable[[int, str, dict], Optional[tuple]]] = None, sm_delay_s: float = 0.0,
+                 hook: Optional[Callable[[int, dict], Optional[tuple]]] = None, sm_delay_s: float = 0.0,
                  num_gpu_blocks: Optional[int] = None) -> None:
         self.redis = redis
         self.redis_url = redis_url
         self.policy_name = policy
         self.world = World([A, B], MAX_R, (num_gpu_blocks or 20381) * 16)
-        self.puts: list[tuple[str, dict, int]] = []  # (model, body, http status)
+        self.puts: list[tuple[str, dict, int]] = []  # (model, plan item, http status of its plan)
         self._hook = hook
         self._put_seq = 0
         self.sm = StubSM(responder=self._responder, delay_s=sm_delay_s, state=self.world.state_doc())
@@ -347,7 +358,7 @@ class Harness:
             lock_ttl_s=5.0, max_tick_failures=3,
         )
         client = SMClient(self.sm.url, timeout_s=10.0)
-        self.dispatcher = Dispatcher(client.put_target, abort_sleep_path=self.config.abort_sleep_path)
+        self.dispatcher = Dispatcher(client.post_plan, abort_sleep_path=self.config.abort_sleep_path)
         self.source = LiveSource(self.config, redis, client.get_state, self._list_pods)
         self.shell = BaselineShell(
             self.config, self.source, build_policy(policy, self.config), self.dispatcher, redis,
@@ -359,16 +370,19 @@ class Harness:
         self.marks: dict[str, int] = {}
 
     # stub SM: apply like the real one, then refresh the state it serves
-    def _responder(self, model: str, body: dict):
+    def _responder(self, body: dict):
         self._put_seq += 1
-        override = self._hook(self._put_seq, model, body) if self._hook else None
+        items = list(body.get("sleeps") or ()) + list(body.get("wakes") or ())
+        override = self._hook(self._put_seq, body) if self._hook else None
         if override is not None:
-            self.puts.append((model, body, override[0]))
+            self.puts.extend((item["model"], item, override[0]) for item in items)
             return override
-        self.world.apply_target(model, body)
+        sleeps = [self.world.apply_item(item) for item in body.get("sleeps") or ()]
+        wakes = [self.world.apply_item(item) for item in body.get("wakes") or ()]
         self.sm.state = self.world.state_doc()
-        self.puts.append((model, body, 200))
-        return 200, json.dumps({"model": model}).encode(), "application/json"
+        self.puts.extend((item["model"], item, 200) for item in items)
+        doc = {"plan_id": body.get("plan_id"), "status": "done", "sleeps": sleeps, "wakes": wakes}
+        return 200, json.dumps(doc).encode(), "application/json"
 
     def _list_pods(self) -> list[PodEndpoint]:
         return [PodEndpoint(name=p, model=m, ip="127.0.0.1", port=self.farm.port(p), ready=True)
@@ -523,20 +537,18 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     assert max(ln["awake"] for ln in mine) >= 2
     assert not any(ln["action"] == "up" for ln in other)          # the quiet model is left alone
     assert all(ln["owner"] and not ln["dry_run"] for ln in lines)
-    # every dispatched action reached the stub SM with the contract's body. Scale-up is stepped
-    # (one PUT per +1), so one "up" decision may produce several PUTs: at least one PUT per
-    # decision, and every at_least PUT raises the target by exactly 1.
+    # every dispatched action reached the stub SM as one plan item with the contract's body:
+    # one item per decision (no steps; a queued decision a later tick replaced is never sent),
+    # at most one plan per tick
     dispatched = [ln for ln in lines if ln["action"] in ("up", "down")]
-    assert len(h.puts) >= len(dispatched)
-    prev = {A: MIN_R, B: MIN_R}
-    for model, body, _ in h.puts:
-        if body.get("at_least"):
-            assert body["wake_replicas"] == prev[model] + 1, (model, body, prev)
-        prev[model] = body["wake_replicas"]
-    for model, body, status in h.puts:
-        assert 1 <= body["wake_replicas"] <= MAX_R and status == 200
-        assert body.get("at_least") is True or body == {"wake_replicas": body["wake_replicas"], "sleep_path": "urgent"}
-    assert any(b.get("at_least") for _, b, _ in h.puts) and any(not b.get("at_least") for _, b, _ in h.puts)
+    assert 0 < len(h.puts) <= len(dispatched)
+    assert len(h.sm.requests) <= len({ln["tick"] for ln in dispatched})
+    for model, item, status in h.puts:
+        assert status == 200
+        assert item in ({"model": model, "at_least": item.get("at_least")},
+                        {"model": model, "at_most": item.get("at_most"), "sleep_path": "urgent"}), item
+        assert 1 <= item.get("at_least", item.get("at_most")) <= MAX_R
+    assert any("at_least" in i for _, i, _ in h.puts) and any("at_most" in i for _, i, _ in h.puts)
     # the decision is mirrored to Redis (TTL) and the stream saw all three kinds
     assert redis.ttl(f"tre:v2:bl:decision:{A}") > 0
     # every decision line is also in the stream (evidence that survives the pod)
@@ -573,7 +585,7 @@ def test_dry_run_sends_nothing(tmp_path, redis_url, redis, policy) -> None:
 
 
 def test_sm_refusals_do_not_stop_the_loop(tmp_path, redis_url, redis) -> None:
-    def hook(seq: int, model: str, body: dict):
+    def hook(seq: int, body: dict):
         if seq == 1:  # structured (T1-style) refusal
             payload = {"detail": {"error": "gpu_busy", "reason": "no_free_gpu", "node": "node-a",
                                   "gpu_ids": [0], "retry_after_s": 2}}

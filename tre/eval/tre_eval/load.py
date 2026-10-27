@@ -99,7 +99,7 @@ class Arm:
     pod_nodes: dict[str, str] = field(default_factory=dict)               # components.json pods: pod -> node
     component_meta: dict = field(default_factory=dict)                    # components.json image ids, node moves
     clock_meta: dict = field(default_factory=dict)                        # clock_offsets.json drift / rtt
-    sm_access: list[dict] = field(default_factory=list)                   # sm.ts.log uvicorn access lines
+    sm_access: list[dict] = field(default_factory=list)                   # sm.ts.log uvicorn access lines + plan_item_refused (409)
     gw_requests: dict[str, dict] = field(default_factory=dict)            # gateway per-request events by req_id
 
     # ---- helpers
@@ -478,6 +478,16 @@ def _parse_sm(arm: Arm, path: str, kubelet_ts: bool = False) -> None:
             if not isinstance(rec, dict):
                 continue
             kind = rec.get("event") or (body[:i].strip() or None)
+            if kind == "plan_item_refused" and rec.get("model"):
+                # POST /v2/plans (SM 2026-10-27): a refused item may come in a 200 and the URL has no
+                # model, so the per-model SM 409 record of a plan is this event (model from the event),
+                # kept with the access lines the refusal pairing reads. Older runs: access lines only.
+                arm.sm_access.append({"ts": _utc_epoch(mt.group(1), mt.group(2)) - off, "method": "POST",
+                                      "path": "/v2/plans", "status": 409, "model": rec["model"],
+                                      "template": "/v2/plans plan_item_refused", "plan_id": rec.get("plan_id"),
+                                      "item_kind": rec.get("kind"), "reason": rec.get("reason"),
+                                      "error": rec.get("error")})
+                continue
             if kind not in ("wake_start", "wake_done", "wake_failed", "sleep"):
                 continue
             bid = rec.get("binding_id")
@@ -486,6 +496,7 @@ def _parse_sm(arm: Arm, path: str, kubelet_ts: bool = False) -> None:
                                   "logger": mt.group(3), "binding_id": bid, "model": model,
                                   "serve_id": rec.get("serve_id"), "rec": rec})
     arm.sm_events.sort(key=lambda e: e["ts"])
+    arm.sm_access.sort(key=lambda e: e["ts"])
 
 
 # ---------------------------------------------------------------- newer collectors

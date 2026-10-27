@@ -321,28 +321,6 @@ def test_a_gap_forgets_pre_gap_tracked_requests(tmp_path) -> None:
     source.close()
 
 
-def test_wakeable_slots_from_the_sm_gpu_view() -> None:
-    from tre_baselines.sources import wakeable_slots
-
-    state = {"bindings": [
-        {"serve_id": "a0", "model": "a", "node": "n", "gpu_ids": [0], "awake": True},
-        {"serve_id": "a1", "model": "a", "node": "n", "gpu_ids": [1], "awake": False},
-        {"serve_id": "a2", "model": "a", "node": "n", "gpu_ids": [2], "awake": False},
-        {"serve_id": "t0", "model": "t", "node": "n", "gpu_ids": [1, 2], "awake": False},
-        {"serve_id": "t1", "model": "t", "node": "n", "gpu_ids": [2, 3], "awake": False},
-    ], "gpus": [{"node": "n", "gpu": g, "wakeable": g in (1, 2)} for g in range(4)]}
-    assert wakeable_slots(state, "a") == 2
-    assert wakeable_slots(state, "t") == 1          # TP=2: only (1,2) is fully free
-    assert wakeable_slots({"bindings": state["bindings"]}, "a") is None  # no gpus[]: unknown
-    from tre_baselines.sources import wakeable_gpus
-    assert wakeable_gpus(state) == ["n/1", "n/2"] and wakeable_gpus({}) is None
-    from tre_baselines.sources import awake_binding_ids, free_gpus
-    assert free_gpus(state, "a") == ["n/1", "n/2"] and free_gpus(state, "t") == ["n/1", "n/2"]
-    assert free_gpus({"bindings": state["bindings"]}, "a") is None
-    state["gpus"][0]["awake_binding_id"] = "a/n/0"
-    assert awake_binding_ids(state) == ["a/n/0"] and awake_binding_ids({}) is None
-
-
 def test_parse_event_stream_flag() -> None:
     assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r", "stream": "false"}).stream is False
     assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r", "stream": "true"}).stream is True

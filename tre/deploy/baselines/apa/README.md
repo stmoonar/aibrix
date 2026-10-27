@@ -15,16 +15,22 @@ exact same pods and the comparison is apples-to-apples.
 
 ## How the seam works (evidence)
 
-The aibrix podautoscaler controller is patched (`TRE-PATCH(P2-APA-001)`,
+The aibrix podautoscaler controller is patched (`TRE-PATCH(P2-APA-001/002)`,
 `pkg/controller/podautoscaler/workload_scale.go`) so that when `spec.scalingStrategy == APA`
 and `APA_SCALE_SLEEP_MODE != 0`, scaling is applied through service-manager instead of k8s
 `spec.replicas`:
 
-- `shouldUseAPASleepMode` — `workload_scale.go:334` (`sleepModeEnabled && ScalingStrategy == APA`).
-- current replicas read from service-manager `POST /models_replicas?models=<name>` —
-  `workload_scale.go:179,357`.
-- desired replicas applied via service-manager `POST /scale_service?model_name=<name>&scale_type=up|down&scale_value=<delta>` —
-  `workload_scale.go:243,409`.
+- `shouldUseAPASleepMode` (`sleepModeEnabled && ScalingStrategy == APA`).
+- current replicas read from service-manager `POST /models_replicas?models=<name>`
+  (`getWakeReplicasFromServiceManage`).
+- desired replicas applied as an ABSOLUTE target via service-manager `POST /v2/plans`
+  (`setWakeReplicasViaServiceManage`, 2026-10-27): desired > current -> one wake item
+  `at_least=desired`; desired < current -> one sleep item `at_most=desired` on sleep path
+  `apa`. The SM resolves it under its writer lock, so two reconciles can no longer stack
+  deltas computed from one count (the old v1 `/scale_service` delta race). A refused wake
+  that changed nothing (409 `partial`) is a warning, as v1's 200 `actual 0`; `writer_busy`
+  and failed items are errors. Client timeout: `SERVICE_MANAGE_TIMEOUT_S` (default 360 s,
+  the SM's `api_call_timeout_s`).
 
 In every one of those calls the model name is **`pa.Spec.ScaleTargetRef.Name`**. That is why
 each CR sets `scaleTargetRef.name` to the exact registry model name (`dsqwen-7b`,
@@ -32,13 +38,13 @@ each CR sets `scaleTargetRef.name` to the exact registry model name (`dsqwen-7b`
 `deploy/registry.yaml` `min_replicas`; maxReplicas mirrors the registry scaling cap
 `max_awake_replicas` (4 for every model, same cap as TRE; v1/paper alignment A1), not the
 GPU layout size `max_replicas` (7b/8b 8 bindings, 14b 4). Service-manager enforces the same
-cap on `/scale_service`, so every model is `1..4` (14b raised from 0 to 1 on 2026-09-24, as in v1).
+cap on every wake, so every model is `1..4` (14b raised from 0 to 1 on 2026-09-24, as in v1).
 
 ### Why the anchor Deployment exists
 
 Even in sleep mode the reconcile still resolves the scale target to read the pod label
 selector for metric scraping (`getScaleResource` → `GetPodSelectorFromScale`,
-`workload_scale.go:497`). tre-v2 model pods are per-GPU Deployments
+`workload_scale.go`). tre-v2 model pods are per-GPU Deployments
 (`dsqwen-7b-<node>-gpu-N`) with no aggregate Deployment, so each anchor is a **0-replica**
 Deployment named after the model whose `spec.selector` is `model.aibrix.ai/name: <model>`.
 That selector matches all awake pods of the model, so APA averages `kv_cache_usage_perc`
