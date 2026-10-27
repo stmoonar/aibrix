@@ -10,7 +10,12 @@ first failure) - and translating the answers into plan item results (design
 20261027-sm-plans §3).
 
 Conservative SM model: when a named sleep of the plan failed, the plan's wakes are refused
-``donor_sleep_failed`` without a call (the old commit never sent its receivers then). An
+``donor_sleep_failed`` without a call (the old commit never sent its receivers then). That is
+the real SM's answer only for receivers on the failed donor's GPUs: the legacy fakes have no GPU
+map. The real SM wakes a receiver on a free GPU (wave 1) even when the donor sleep fails; that
+case is tested with plan-native fakes (``test_plans_20261027.py``
+``test_a_receiver_on_a_free_gpu_may_wake_when_the_donor_sleep_fails``) and end to end in
+``service-manager/tests/test_plan_execute_20261027.py``. Do not use the shim to assert it. An
 unstructured failure of the FIRST call (timeout, transport, writer_busy, routable_unknown,
 400 / 404 / 503, a raised exception) is the answer of the whole plan; later in the plan it
 fails only its item. New behaviour of the plan path is tested with plan-native fakes."""

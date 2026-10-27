@@ -55,7 +55,7 @@ from tre_sm.ops.plan import (
     refusal_reason,
     select_plan,
 )
-from tre_sm.ops.transfer import TransferRefusal, busy_binding_ids
+from tre_sm.ops.transfer import SKIP_FLOOR, TransferRefusal, busy_binding_ids
 from tre_sm.ops.sleep_primitive import (
     PHASE_SLEPT,
     STATUS_SLEPT,
@@ -4942,6 +4942,8 @@ class ServiceManagerV2:
                     for donor in choice.donor_sleeps
                 ],
                 "unfilled": unfilled, "skipped": dict(choice.skipped),
+                # The donors' replica floor held part of a relay back (as /transfers did).
+                "clamped_by_floor": bool(choice.unfilled > 0 and choice.skipped.get(SKIP_FLOOR)),
                 "_refusals": refusals, "_tickets": [
                     run.tickets[p.binding.binding_id] for p in choice.picks if p.binding.binding_id in run.tickets
                 ],
@@ -4974,9 +4976,11 @@ class ServiceManagerV2:
                 error = item.get("_error")
                 if kind == "wake":
                     public["refusals"] = [self._plan_error_body(exc) for exc in item["_refusals"]]
-                if error is not None and item["status"] in ("refused", "failed", "partial"):
+                problem = item["status"] in ("refused", "failed", "partial")
+                if error is not None and problem:
                     public["error"] = self._plan_error_body(error)
-                    public["retriable"] = _retriable(error)
+                # Always sent (design section 3): the controller never guesses.
+                public["retriable"] = problem and _retriable(error)
                 if item["status"] in ("refused", "failed"):
                     _log_event(
                         "plan_item_refused", level=logging.WARNING, plan_id=run.plan.plan_id,
@@ -6920,11 +6924,21 @@ def _plan_item_brief(item) -> dict:
     return brief
 
 
+#: Item error codes a re-send of the same item cannot fix: the planner re-plans
+#: from a new view instead (design section 3; the old controller treated a
+#: ``floor_violation`` and a ``wake_failed`` 409 as non-retriable).
+_NOT_RETRIABLE_CODES = frozenset({"floor_violation", "wake_failed", "no_binding", "max_awake_replicas", "pod_not_found"})
+
+
 def _retriable(exc: BaseException | None) -> bool:
-    """The per-item mirror of the old per-endpoint answer: a structured 409
-    (wake refusal / failure, floor, sleep failure, lease conflict) is
-    retriable, a 400-type error is not."""
-    return isinstance(exc, (WakeConflict, FloorViolation, SleepFailed, GpuLeaseConflict))
+    """``retriable`` of a refused / failed / partial item: a transient structured
+    conflict (a GPU busy or loading, a lease conflict, a sleep that failed or a
+    donor sleep that failed - ``donor_sleep_failed``) is retriable; the codes of
+    :data:`_NOT_RETRIABLE_CODES`, a 400-type error and an item without an error
+    (nothing left to select, e.g. a donor floor) are not."""
+    if not isinstance(exc, (WakeConflict, FloorViolation, SleepFailed, GpuLeaseConflict)):
+        return False
+    return _error_code(exc) not in _NOT_RETRIABLE_CODES
 
 
 

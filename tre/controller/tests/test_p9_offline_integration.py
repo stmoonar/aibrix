@@ -9,19 +9,11 @@ from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.offline_integration import run_offline_integration_step
 from tre_controller.planning.planner import ClusterView, DefragAction, ScaleAction
-from tre_controller.sm_client import ServiceManagerClient
+from tre_controller.sm_client import ServiceManagerClient, ServiceManagerError
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import K8sPodSnapshot
-from tre_sm.api import v2 as sm_v2
 from tre_sm.api.v2 import ServiceManagerV2, create_app
 from tre_sm.state.store import StateStore
-
-#: The controller dispatches every power change as POST /v2/plans (design
-#: 20261027-sm-plans); these chains need a service-manager that serves it (SM step 2).
-needs_sm_plans = pytest.mark.skipif(
-    not hasattr(sm_v2, "PlanRequest"), reason="service-manager without POST /v2/plans (design 20261027 step 2)"
-)
-
 
 class FakeRedis:
     def __init__(self) -> None:
@@ -71,7 +63,13 @@ class AppTransport:
         path = "/" + url.split("/", 3)[3]
         self.calls.append((method, path, json))
         response = self.client.request(method, path, json=json)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # As the urllib transport: the SM's JSON error body travels with the error.
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            raise ServiceManagerError(f"HTTP {response.status_code}", status=response.status_code, body=body)
         return response.json()
 
 
@@ -237,7 +235,6 @@ def _critical_tp2_snapshot() -> MetricsSnapshot:
     )
 
 
-@needs_sm_plans
 @pytest.mark.asyncio
 async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chain() -> None:
     registry = _registry()
@@ -276,9 +273,11 @@ async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chai
     assert b"critical_idle_capacity" in decision_hash[b"actions"]
 
 
-@needs_sm_plans
 @pytest.mark.asyncio
-async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_tp2() -> None:
+async def test_p9_offline_integration_defrags_fragmented_capacity_then_never_cold_creates_tp2() -> None:
+    """The planner defrags for a tp2 replica; tp2 has no binding, and a plan never
+    creates one (design 20261027-sm-plans §4.3): the growth is refused
+    ``no_binding`` (bindings are the layout: registry max_replicas)."""
     base = _registry()
     # Automatic defrag is opt-in (registry placement.defrag.enabled, default false).
     registry = Registry(base.topology(), base.models(), placement=PlacementConfig(defrag_enabled=True))
@@ -308,10 +307,9 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
     assert [action.reason for action in result.decision.actions] == ["critical_tp_defrag", "critical_tp_defrag"]
     assert [(item.action_kind, item.model, item.ok) for item in result.dispatches] == [
         ("defrag", "__cluster__", True),
-        ("scale", "tp2", True),
+        ("scale", "tp2", False),
     ]
-    # NOTE design §4.3: the plan executor never cold-creates a binding (Q3); whether the
-    # tp2 growth below still creates one depends on the SM step 3 wrappers.
+    assert "no_binding" in result.dispatches[1].error
     assert transport.calls == [
         ("POST", "/v2/defrag", {"tp_size": 2}),
         ("GET", "/v2/state", None),
@@ -321,7 +319,6 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
     assert sm_store.load().bindings == [
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
         Binding("serve-b-new", "m1", Slot("node-a", (1,)), awake=True),
-        Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),
     ]
     # Make-before-break defrag (replica floor, 2026-09-29): the new m1 replica is up
     # before serve-b is hidden, slept and deleted.
@@ -334,14 +331,9 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
         ("annotate", "serve-b", "sleeping"),
         ("delete_deployment", "serve-b", (2,)),
         ("wait_deleted", "serve-b"),
-        ("create_deployment", "tp2", (2, 3)),
-        ("wait_ready", "tp2-deployment"),
-        ("annotate", "tp2-pod", "awake"),
     ]
     assert vllm_ops.calls == [
         ("wait_until_ready", "10.0.0.3", 8000),
         ("wake_up", "10.0.0.3", 8000),
         ("sleep", "10.0.0.2", 8000),
-        ("wait_until_ready", "10.0.0.4", 8000),
-        ("wake_up", "10.0.0.4", 8000),
     ]

@@ -165,21 +165,24 @@ def test_repro_a_fully_empty_gpu_is_not_receiver_idle_capacity_while_it_has_bloc
     assert len(_relay_moved(bindings, awake, "dsqwen-7b", "dsllama-8b")) == 1
 
 
-def test_empty_gpu_is_used_by_create_when_receiver_has_no_sleeping_binding() -> None:
+def test_an_empty_gpu_is_used_by_the_receivers_binding_there() -> None:
+    # 2026-10-27 (design 20261027-sm-plans §4.3): the SM never cold-creates; the
+    # receiver's binding sleeps on the empty GPU (bindings are the layout).
     bindings = [Binding("8b-0", "dsllama-8b", Slot("node9", (0,)), awake=True)]
     bindings += [
         Binding(f"7b-{index}", "dsqwen-7b", Slot(node, (gpu,)), awake=True)
         for index, (node, gpu) in enumerate(SLOTS)
         if 0 < index < 7
-    ]  # node10/3 completely empty
+    ]  # node10/3: no awake binding
+    bindings.append(Binding("8b-7", "dsllama-8b", Slot("node10", (3,)), awake=False))
 
     result, calls, awake, _ = _run(
         _registry(*REG_7B_8B), bindings, {"dsllama-8b": (CRITICAL, 1.0), "dsqwen-7b": (HIGH, 6.0)}
     )
 
-    assert _scale(result) == [("dsllama-8b", 1, "critical_idle_capacity", ())]
-    assert calls == [("scale_model", "dsllama-8b", 1)]
-    assert sum(1 for pod in awake if pod.startswith("dsllama")) == 1  # SM created one
+    assert _scale(result) == [("dsllama-8b", 1, "critical_sleeping_capacity", ("8b-7",))]
+    assert calls == [("set_binding_power", "8b-7", True)]
+    assert "8b-7" in awake
 
 
 def test_repro_b_donor_without_slot_match_is_skipped_not_drained() -> None:
@@ -230,15 +233,16 @@ def test_tp2_receiver_uses_a_complete_free_slot_pair() -> None:
         Binding(f"7b-{i}", "dsqwen-7b", Slot(n, (g,)), awake=True)
         for i, (n, g) in enumerate(SLOTS)
         if n == "node9" and g >= 2 or n == "node10" and g < 2
-    ]  # node10 (2,3) free
+    ]  # node10 (2,3) free; 14b-1 sleeps there (the SM never cold-creates)
+    bindings.append(Binding("14b-1", "dsqwen-14b", Slot("node10", (2, 3)), awake=False))
 
     result, calls, awake, _ = _run(
         _registry(*REG_TP2), bindings, {"dsqwen-14b": (LOW, 1.0), "dsqwen-7b": (HEALTHY, 4.0)}, loop="fairness"
     )
 
-    assert _scale(result) == [("dsqwen-14b", 1, "low_fairness_idle_capacity", ())]
-    assert calls == [("scale_model", "dsqwen-14b", 1)]
-    assert sum(1 for pod in awake if "14b" in pod) == 2
+    assert _scale(result) == [("dsqwen-14b", 1, "low_fairness_sleeping_capacity", ("14b-1",))]
+    assert calls == [("set_binding_power", "14b-1", True)]
+    assert {"14b-0", "14b-1"} <= awake
 
 
 def test_tp2_critical_receiver_with_blocked_sleeping_binding_does_not_request_empty_slot() -> None:

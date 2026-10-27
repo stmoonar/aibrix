@@ -155,9 +155,10 @@ def item_code(item: Mapping[str, Any]) -> str | None:
 
 
 def item_retriable(item: Mapping[str, Any]) -> bool:
-    """The item's ``retriable`` (design §3: mirrors the old per-endpoint classification);
-    without it: a refusal is retriable unless it is a floor violation, a failure is not
-    (the wake failed on that GPU and was settled; the planner re-plans)."""
+    """The item's ``retriable`` (design §3: the SM always sends it and mirrors the old
+    per-endpoint classification). Fallback for an answer without it: a refusal is
+    retriable unless it is a floor violation, a failure is not (the wake failed on that
+    GPU and was settled; the planner re-plans)."""
     value = item.get("retriable")
     if isinstance(value, bool):
         return value

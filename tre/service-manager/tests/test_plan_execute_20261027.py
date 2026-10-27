@@ -83,8 +83,9 @@ def test_an_unanswered_donor_sleep_keeps_its_gpu_and_blocks_only_its_dependent()
     assert body["sleeps"][0]["status"] == "failed" and body["sleeps"][0]["retriable"] is True
     assert body["sleeps"][0]["outcomes"][0]["status"] == "unconfirmed"
     x_item, r_item = body["wakes"]
-    assert x_item["status"] == "done"
+    assert x_item["status"] == "done" and x_item["retriable"] is False
     assert r_item["status"] == "refused" and r_item["error"]["reason"] == "donor_sleep_failed"
+    assert r_item["retriable"] is True
     assert _wake_calls(world, "r-0") == []  # never prepared
     assert world.lease("d-0") == "awake" and world.state("d-0") == "hidden"
     assert world.lease("r-0") is None and world.awake("x-1")
@@ -139,6 +140,7 @@ def test_floor_refuses_named_sleeps_with_nothing_hidden_and_clamps_at_most():
     assert refused.status_code == 409 and refused.json()["error"] == "partial"
     [item] = refused.json()["sleeps"]
     assert item["status"] == "refused" and item["error"]["error"] == "floor_violation"
+    assert item["retriable"] is False  # as the old /power 409: the controller re-plans
     assert not [p for p in world.runtime.patches if p[1] == "hidden"]
 
     clamped = post(world, {"sleeps": [{"model": "d", "at_most": 0, "sleep_path": "scale_down"}]})
