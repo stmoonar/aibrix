@@ -485,8 +485,9 @@ def _history(redis: DocRedis, *, skip: tuple[int, ...] = ()) -> None:
 
 
 def _reader(redis: DocRedis) -> MetricsEvidenceReader:
+    # as the controller builds it (app.py): latency histograms only, no instant docs
     store = MetricsStore(redis, _slo_registry(), instant_sample_interval_ms=10_000, min_latency_samples=10,
-                         histogram_lookback_ms=0)
+                         histogram_lookback_ms=0, read_instant=False)
     return MetricsEvidenceReader(store, redis_client=redis, sleeping_pods=lambda model: {"m-2"})
 
 

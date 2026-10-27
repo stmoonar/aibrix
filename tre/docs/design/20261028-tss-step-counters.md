@@ -28,6 +28,16 @@ Per pod and window `(start, end]` (`MetricsStore`):
 - A counter missing at the baseline or the newest doc: the pod's tokens are unknown. The pod
   is left out of queue AND tokens and flagged; a model with no pod left has unknown tokens
   (no signal), never zero.
+- Review 10-28 (L2): a pod with histogram docs but no instant doc has an unknown queue (not
+  0, which would raise Z). Same rule: left out of queue AND tokens, flagged.
+- Review 10-28 (L3): a pod whose baseline lies inside the window (no doc at or before the
+  window start: woken mid-window, a counter reset in the window, a single doc) and whose
+  token span is below 0.67 x window (or not positive) is unknown, not scaled up (scaling
+  could multiply its tokens up to x10). Same rule: left out of queue AND tokens, flagged;
+  no pod left = the model's tokens are unknown. A short span WITH a baseline (a scrape
+  that froze late in the window) stays in the window and is flagged, as before.
+- `TRE_METRICS_SCHEMA=v1` (no counters, no span scaling) is refused at controller start
+  (review L4).
 - Requests stay a completion measure: `request_count(_observed)` = the
   `request_prompt_tokens` count delta (O1 `min_evidence_requests`, SafeScale). The mean
   prompt length (SafeScale's length-dependent TTFT threshold) = `completed_prompt_tokens`
@@ -99,14 +109,26 @@ live theta x rho (rho = counter / completion steady ratio .995 / .994 / 1.013), 
     (`dline_refit.ONSET_TAU_S`), which is skipped now. Not changed.
 - O1 `scaling.min_evidence_ms` = 20000: a suffix is strictly shorter than the 20 s window,
   so it never reaches 20 s. The model then waits for the first whole window after the
-  breakpoint, about the same 20-22 s as today. The suffix branch is effectively dead.
-  **Not changed; user decision** (keep, or lower to e.g. 10 s).
-- `scaling.min_evidence_requests` = 3 was added for the completion numerator. Kept;
-  **user decision** whether to drop it.
+  breakpoint, about the same 20-22 s as today. **The O1 suffix branch is dead under the
+  current window** (window <= min_evidence_ms). The controller therefore does not build
+  the breakpoint suffix while window <= min_evidence_ms (`app.py`, review L1); the hold
+  reason is then `no_suffix` instead of `evidence_span` (both H3-exempt, same hold). The
+  SafeScale tail suffix is still built. Not removed; candidate for the controller
+  simplification (or lower min_evidence_ms to e.g. 10 s: user decision).
+- `scaling.min_evidence_requests` = 3 was added for the completion numerator. It is only
+  checked inside the O1 suffix branch, so it is **dead under the current window** too.
+  Not removed; candidate for the controller simplification.
 - Relative rules adapt by themselves: token span [0.67, 1.5] x window, coverage
   `sample_min_ratio`, SafeScale tail suffix, H3, hold fallback 50 s.
 - Calibration: dataset `--window-ms`, dline_refit `windowing`, accept check C independence
-  = window / step (2 at 20/10).
+  = window / step (2 at 20/10). Defaults (review L5): `calibration_dataset.DEFAULT_WINDOW_MS`
+  and `dline_refit.WINDOW_MS` are 20 s; a stage output / freeze without a windowing record
+  predates it and reads as 30 s (`dline_refit.LEGACY_WINDOWING`).
+- Online / offline parity (review M2): `test_online_and_offline_numerators_agree_on_clean_windows`
+  feeds one counter series to `MetricsStore` and to `l3_numerator.CounterTokenSource`. The
+  dataset manifest counts, per void reason, the windows the offline rules void but the
+  online controller would have used (`numerator.windows_void_online_used`, per cell and
+  total): the selection bias of the void rules. The void rules are unchanged.
 
 ## Registry values on this branch
 
@@ -162,7 +184,11 @@ freeze.)
 ### Atomic release (after the freeze; user approval, two batches apart)
 
 1. Back up to `backups/<name>/` with `rollback.sh`, and notify parallel sessions.
-2. `set_run_mode.sh observe observe`.
+   `rollback.sh` restores the ConfigMap AND the controller image together (with the
+   gateway-plugins / SM images). The old controller does not check the stamps: a
+   counter / 20 s theta with the old image (or the reverse) runs with every Z off.
+2. `set_run_mode.sh observe observe`. The cluster stays `observe observe` until the new
+   controller is up (step 7), also during a rollback.
 3. Build `gateway-plugins`, `service-manager` and `controller` from the merged sha (tag
    `<date>-<sha>`). The overlay tags and `test_kustomize_overlays.py` change together.
    `controller.yaml` carries `TRE_METRICS_WINDOW_MS=20000`.
@@ -171,7 +197,12 @@ freeze.)
 5. `params_set.py --set <m>.trs.{theta_m,lambda_wait,w_p,tau_crit,tau_high}=... --set
    <m>.trs.numerator=step_counters --set <m>.trs.theta_window_ms=20000 --apply
    --backup-dir ...`. Use one `--apply` for all models and do not restart the old
-   controller after it.
+   controller after it. `params_set.py` refuses `--restart` with a `numerator` /
+   `theta_window_ms` edit unless `--allow-basis-change` (review M1).
+   If the release also changes structural keys, `merge_live_registry.py` keeps the live
+   theta with its stamps; a live theta without stamps (fitted before 10-28) gets
+   `completion_histograms` / 30000, never the release file's stamps (review H1). The new
+   controller then refuses to start until step 5 is published.
 6. SM (Recreate), then controller (new image + overlay env). The new controller refuses
    to start if a stamp is missing. That is the check that steps 5-6 happened together.
 7. `set_run_mode.sh observe active` (canonical), then a few-minute smoke: no
@@ -180,7 +211,7 @@ freeze.)
 ## Not done / follow-ups
 
 - Live registry ConfigMap, images, cluster: untouched.
-- `min_evidence_ms` / `min_evidence_requests`: see above (user decision).
-- `numerator_zero` saturation branch and the O1 suffix branch are now mostly dead code.
-  They are candidates for the controller simplification.
+- `min_evidence_ms` / `min_evidence_requests` and the O1 suffix branch: dead under the
+  current 20 s window (see above). Candidates for the controller simplification.
+- `numerator_zero` saturation branch: now mostly dead code; also a candidate.
 - Alt-threshold refit for decode_tps / prefill_tps if an ablation arm uses them.
