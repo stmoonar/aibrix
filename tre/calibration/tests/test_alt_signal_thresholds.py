@@ -409,7 +409,10 @@ def test_v1_signals_go_through_the_same_fit_in_their_own_direction(signal: str, 
     # The fit stamps what theta was fitted on (the controller checks it at start).
     from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
 
-    assert threshold["basis"] == {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": 1000}
+    from tre_common.tss import DEFAULT_EMA_TAU_MS
+
+    assert threshold["basis"] == {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": 1000,
+                                  "ema_tau_ms": float(DEFAULT_EMA_TAU_MS)}
     # The boundary at 300 on the fixture axis: 300 ms, or headroom 1 - 0.3.
     boundary = BOUNDARY if signal == "ttft_mean" else 1.0 - BOUNDARY / 1000.0
     assert threshold["theta"] == pytest.approx(boundary, rel=0.03)

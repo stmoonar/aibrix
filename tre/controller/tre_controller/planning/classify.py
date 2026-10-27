@@ -135,9 +135,6 @@ def classify_model(
     )
 
 
-_warned_default_bands: set[tuple[str, str]] = set()
-
-
 def model_control_configs_from_registry(
     registry: Any, signal_source: str = "zm"
 ) -> dict[str, dict[str, Any]]:
@@ -149,23 +146,23 @@ def model_control_configs_from_registry(
 
     For an alternative signal (the ablation arms) the bands are that signal's own fitted
     ``alt_thresholds.<signal>.delta_crit`` / ``delta_high`` (plan §6.9 item 3) - running
-    queue length on the TSS bands would compare the signals under TSS's margins. A
-    missing margin falls back to the plan default 0.2 / 0.25 with a warning (once per
-    model and signal). Models missing from the registry simply get no entry, and
-    ``classify_all_models`` then applies its ``delta_crit`` / ``delta_high`` defaults.
+    queue length on the TSS bands would compare the signals under TSS's margins. The
+    controller refuses to start an alt arm without them (``config._validate_signal_thresholds``),
+    so a missing margin here is an error, never a default band (the plan defaults 0.2 /
+    0.25 fallback was removed, review 2026-10-28). An unfitted source (``latency_p95``,
+    no ``alt_thresholds`` entry) keeps the TSS bands. Models missing from the registry
+    simply get no entry, and ``classify_all_models`` then applies its defaults.
     """
     configs: dict[str, dict[str, Any]] = {}
     for spec in registry.models():
         if signal_source != "zm" and signal_source in getattr(spec, "alt_thresholds", {}):
-            delta_crit, delta_high, defaulted = spec.alt_thresholds[signal_source].bands()
-            if defaulted and (spec.name, signal_source) not in _warned_default_bands:
-                _warned_default_bands.add((spec.name, signal_source))
-                LOG.warning(
-                    "model %s: alt_thresholds.%s has no fitted delta_crit/delta_high; using "
-                    "the plan defaults %.2f/%.2f",
-                    spec.name, signal_source, delta_crit, delta_high,
+            threshold = spec.alt_thresholds[signal_source]
+            if threshold.delta_crit is None or threshold.delta_high is None:
+                raise ValueError(
+                    f"model {spec.name}: alt_thresholds.{signal_source} has no fitted delta_crit/delta_high "
+                    f"(no default bands)"
                 )
-            configs[spec.name] = {"delta_crit": delta_crit, "delta_high": delta_high}
+            configs[spec.name] = {"delta_crit": float(threshold.delta_crit), "delta_high": float(threshold.delta_high)}
             continue
         trs = spec.trs
         tau_low = float(trs.tau_low)

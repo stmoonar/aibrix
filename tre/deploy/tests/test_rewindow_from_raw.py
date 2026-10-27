@@ -652,3 +652,25 @@ def test_named_queue_estimators_raw_mean_and_the_2026_10_05_live_sum() -> None:
     gappy = [s for s in full if s["ts_ms"] != 30_000]     # one live-grid sample missing
     assert rows("live_grid_sum_over_expected", gappy)[0]["avg_waiting"] == pytest.approx(3.0 / 6)
     assert rows("live_grid_mean", gappy)[0]["avg_waiting"] == pytest.approx(3.0 / 5)
+
+
+def test_alt_columns_come_from_the_cells_capture_of_the_campaign_layout(tmp_path):
+    """The campaign's fitting CSVs carry the v1 ablation signals' inputs (ttft_mean /
+    kv_usage) when the cell has a 1 Hz capture (``<model>/cells/<stem>/vllm_metrics_1hz``
+    next to ``<model>/raw/<stem>/``), so their alt fit runs in the campaign; a cell
+    without one gets no source (empty columns, never zero)."""
+    from scripts import alt_signal_columns
+    from scripts.rewindow_from_raw import alt_columns_for_raw
+
+    raw = tmp_path / "m" / "raw" / "stem1" / "i0_o0_c95.jsonl"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("", encoding="utf-8")
+    assert alt_columns_for_raw(raw) is None
+    (tmp_path / "m" / "cells" / "stem1" / "vllm_metrics_1hz").mkdir(parents=True)
+    source = alt_columns_for_raw(raw)
+    assert isinstance(source, alt_signal_columns.AltSignalColumns)
+    assert source(0, 20_000) == {column: None for column in alt_signal_columns.COLUMNS}
+    flat = tmp_path / "flat" / "i0_o0_c95.jsonl"
+    flat.parent.mkdir()
+    flat.write_text("", encoding="utf-8")
+    assert alt_columns_for_raw(flat) is None

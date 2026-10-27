@@ -14,18 +14,25 @@ theta / delta on the values the controller will compute:
   ``vllm:time_to_first_token_seconds`` ``_sum`` and ``_count`` deltas between them; the
   model value = sum of the sums / sum of the counts (v1 D38: pooled by first-token count),
   in ms. Count 0 = no first token in the window: the mean is empty (no value), the count 0;
-* ``kv_cache_usage_sum`` / ``kv_cache_pods``: per awake pod, the mean of its
+* ``kv_cache_usage_sum`` / ``kv_cache_pods``: per serving pod, the mean of ALL its
   ``vllm:kv_cache_usage_perc`` samples in ``(start, end]`` (``gpu_cache_usage_perc`` on
-  engines before 0.11); the sum over the awake pods and their number. A pod is asleep in
-  a sample whose ``vllm:engine_sleep_state{sleep_state="awake"}`` is 0 (online the
-  controller drops sleeping pods from the window); a pod asleep in every sample of the
-  window does not count.
+  engines before 0.11); the sum over the serving pods and their number. A pod serves when
+  it is awake in its last sample of the window (``vllm:engine_sleep_state{sleep_state=
+  "awake"}`` not 0): online the controller keeps the pods the fleet state reports awake
+  at the tick and averages every instant doc of the window. Review L4 (2026-10-28):
+  samples of a pod woken mid-window taken before the wake (fill ~0) are therefore
+  averaged in, as online - the gateway docs carry no sleep state, so the controller
+  cannot drop them, and the offline rule follows the online one exactly (it used to drop
+  them: online / offline differed in every window holding a wake). O1 holds such
+  windows on every arm (a routable-count change), so a decision rarely reads one.
 
 Void (all four columns empty: unknown, never zero) when the cell has no capture or a
 pod expected by ``cell_meta.json`` has no file, and per pod: no boundary sample / a zero
 span (``no_sample``), an interior spacing > 10 s (``gap``, the TSS counter rule of
-:mod:`scripts.l3_numerator`), a TTFT count that decreases (``reset``), a sample without
-the TTFT histogram (``missing_series``), no awake KV sample in the window (``no_kv``).
+:mod:`scripts.l3_numerator`), a TTFT count that decreases (``reset``). Per column (as the
+controller reads each signal from its own series): a sample without the TTFT histogram
+(``missing_series``) empties the two TTFT columns, no KV sample of a serving pod in the
+window (``no_kv``) the two KV columns.
 The counts per status go into the dataset manifest.
 """
 from __future__ import annotations
@@ -137,15 +144,17 @@ class PodAltSamples:
         return STATUS_OK, max(0.0, span[-1][1] - span[0][1]), span[-1][2] - span[0][2]
 
     def window_kv(self, start_ms: int, end_ms: int) -> tuple[str, Optional[float], bool]:
-        """``(status, mean KV fill of the awake samples, awake)`` over ``(start_ms, end_ms]``;
-        ``awake`` False = asleep in every sample (status ok, no value)."""
+        """``(status, mean KV fill of the window's samples, serving)`` over ``(start_ms,
+        end_ms]``; ``serving`` False = asleep in the last sample of the window (status ok,
+        no value: online the fleet state drops the pod). The mean is over every sample of
+        the window that carries the gauge, pre-wake ones included (online rule, module
+        docstring)."""
         inside = [s for s in self.samples if start_ms < s[0] <= end_ms]
         if not inside:
             return l3.STATUS_NO_SAMPLE, None, False
-        awake = [s for s in inside if not s[4]]
-        if not awake:
+        if inside[-1][4]:
             return STATUS_OK, None, False
-        values = [s[3] for s in awake if s[3] is not None]
+        values = [s[3] for s in inside if s[3] is not None]
         if not values:
             return STATUS_NO_KV, None, True
         return STATUS_OK, sum(values) / len(values), True
@@ -153,8 +162,9 @@ class PodAltSamples:
 
 class AltSignalColumns:
     """Columns of one cell's windows: ``self(start_ms, end_ms)`` -> the :data:`COLUMNS`
-    (None = empty). Counts every window asked for by status (``counts``: a void window
-    under the first void status of its pods in :data:`VOID_STATUSES` order)."""
+    (None = empty). Counts every window asked for by status (``counts``: a window with a
+    void column under the first void status of its pods in :data:`VOID_STATUSES` order;
+    ``missing_series`` voids only the TTFT columns, ``no_kv`` only the KV columns)."""
 
     def __init__(self, pods: Sequence[PodAltSamples], *, missing_pods: Sequence[str] = (),
                  max_gap_ms: int = l3.DEFAULT_MAX_GAP_MS) -> None:
@@ -170,33 +180,42 @@ class AltSignalColumns:
     def __call__(self, start_ms: int, end_ms: int) -> dict[str, Any]:
         if not self.pods or self.missing_pods:
             return self._void(l3.STATUS_NO_METRICS)
-        statuses: list[str] = []
+        ttft_statuses: list[str] = []
+        kv_statuses: list[str] = []
         ttft_sum = ttft_count = kv_sum = 0.0
         kv_pods = 0
         for pod in self.pods:
             status, s, n = pod.window_ttft(int(start_ms), int(end_ms), max_gap_ms=self.max_gap_ms)
-            statuses.append(status)
+            ttft_statuses.append(status)
             if status == STATUS_OK:
                 ttft_sum += s
                 ttft_count += n
             status, kv, awake = pod.window_kv(int(start_ms), int(end_ms))
-            statuses.append(status)
+            kv_statuses.append(status)
             if status == STATUS_OK and awake:
                 kv_sum += kv
                 kv_pods += 1
+        # Review L4 (2026-10-28), per column as online: a missing TTFT histogram makes only
+        # ttft_mean unknown, a missing KV gauge only kv_usage (the controller reads each
+        # signal from its own series); a pod without samples, a gap or a reset voids both.
+        statuses = ttft_statuses + kv_statuses
         void = [s for s in VOID_STATUSES if s in statuses]
-        if void:
+        both = [s for s in void if s not in (l3.STATUS_MISSING_SERIES, STATUS_NO_KV)]
+        if both or (l3.STATUS_MISSING_SERIES in void and (STATUS_NO_KV in void or kv_pods == 0)):
             return self._void(void[0])
-        if kv_pods == 0:
-            # Every pod asleep: no serving replica, nothing to read (online: no routable pod).
-            return self._void(STATUS_NO_KV)
-        self.counts[STATUS_OK] += 1
-        return {
-            "ttft_server_mean_ms": ttft_sum / ttft_count * 1000.0 if ttft_count > 0 else None,
-            "ttft_server_count": ttft_count,
-            "kv_cache_usage_sum": kv_sum,
-            "kv_cache_pods": kv_pods,
-        }
+        ttft = {"ttft_server_mean_ms": ttft_sum / ttft_count * 1000.0 if ttft_count > 0 else None,
+                "ttft_server_count": ttft_count}
+        kv_cols = {"kv_cache_usage_sum": kv_sum, "kv_cache_pods": kv_pods}
+        if l3.STATUS_MISSING_SERIES in void:
+            ttft = {"ttft_server_mean_ms": None, "ttft_server_count": None}
+        if STATUS_NO_KV in void or kv_pods == 0:
+            # No KV sample of a serving pod, or every pod asleep (no serving replica: online
+            # no routable pod, every signal unknown - the TTFT columns too).
+            if kv_pods == 0 and STATUS_NO_KV not in void:
+                return self._void(STATUS_NO_KV)
+            kv_cols = {"kv_cache_usage_sum": None, "kv_cache_pods": None}
+        self.counts[void[0] if void else STATUS_OK] += 1
+        return {**ttft, **kv_cols}
 
     def summary(self) -> dict:
         return {"pods": [p.pod for p in self.pods], "missing_pods": self.missing_pods,

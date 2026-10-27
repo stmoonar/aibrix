@@ -46,7 +46,7 @@ KV_HEADROOM_FLOOR = 1e-3
 
 #: What each fitted alternative signal's value IS (the formulas in this module). A theta
 #: is only valid for the definition and the metrics window it was fitted on, so the fit
-#: stamps ``alt_thresholds.<signal>.basis = {definition, window_ms}`` and the controller
+#: stamps ``alt_thresholds.<signal>.basis = {definition, window_ms, ema_tau_ms}`` and the controller
 #: refuses to start an alt arm on a missing or different stamp (:func:`alt_basis_errors`,
 #: the alternative-signal twin of ``tre_common.tss.theta_basis_errors``). Change an id
 #: whenever its value changes (floor, pooling, counter source, ...).
@@ -146,11 +146,28 @@ def normalize_signal_value(
     return min(Z_MAX, normalized)
 
 
+def alt_ema_tau_ms(ema_tau_ms: object) -> float:
+    """The tau (ms) an alternative signal is smoothed with, from the registry's
+    ``trs.ema_tau_ms`` (the TSS tau): unset (None) = :data:`tre_common.tss.DEFAULT_EMA_TAU_MS`;
+    ``<= 0`` = 0.0, i.e. no smoothing (alpha = 1, the raw value). The fit uses the same
+    rule (``theta_verdict.build_signal_spec``: tau <= 0 = no EMA) and stamps the result as
+    ``basis.ema_tau_ms``."""
+    from tre_common.tss import DEFAULT_EMA_TAU_MS
+
+    if ema_tau_ms is None:
+        return float(DEFAULT_EMA_TAU_MS)
+    tau = _finite(ema_tau_ms)
+    return tau if tau is not None and tau > 0.0 else 0.0
+
+
 def alt_basis_errors(models, signal: str, *, window_ms: float) -> list[str]:
     """Why the registry's ``alt_thresholds.<signal>`` do not fit this controller, one
     line per model (empty: they fit). Each model's threshold must carry
-    ``basis.definition == ALT_SIGNAL_DEFINITIONS[signal]`` and ``basis.window_ms ==
-    window_ms`` (TRE_METRICS_WINDOW_MS). A missing stamp is a mismatch."""
+    ``basis.definition == ALT_SIGNAL_DEFINITIONS[signal]``, ``basis.window_ms ==
+    window_ms`` (TRE_METRICS_WINDOW_MS) and ``basis.ema_tau_ms ==`` the tau the controller
+    smooths the signal with (:func:`alt_ema_tau_ms` of the model's ``trs.ema_tau_ms``):
+    theta and its bands were fitted on the smoothed value, so another tau is another
+    signal. A missing stamp is a mismatch."""
     want = ALT_SIGNAL_DEFINITIONS.get(signal)
     errors: list[str] = []
     for spec in models:
@@ -158,10 +175,16 @@ def alt_basis_errors(models, signal: str, *, window_ms: float) -> list[str]:
         threshold = (getattr(spec, "alt_thresholds", None) or {}).get(signal)
         definition = getattr(threshold, "basis_definition", None)
         window = getattr(threshold, "basis_window_ms", None)
-        if want is None or definition != want or window is None or float(window) != float(window_ms):
+        tau = getattr(threshold, "basis_ema_tau_ms", None)
+        want_tau = alt_ema_tau_ms(getattr(getattr(spec, "trs", None), "ema_tau_ms", None))
+        if (
+            want is None or definition != want or window is None or float(window) != float(window_ms)
+            or tau is None or float(tau) != want_tau
+        ):
             errors.append(
-                f"{name}: alt_thresholds.{signal}.basis definition={definition!r} window_ms={window!r}, "
-                f"controller computes definition={want!r} on TRE_METRICS_WINDOW_MS={int(window_ms)}"
+                f"{name}: alt_thresholds.{signal}.basis definition={definition!r} window_ms={window!r} "
+                f"ema_tau_ms={tau!r}, controller computes definition={want!r} on "
+                f"TRE_METRICS_WINDOW_MS={int(window_ms)} with ema_tau_ms={want_tau!r} (trs.ema_tau_ms)"
             )
     return errors
 
@@ -176,6 +199,7 @@ __all__ = (
     "TTFT_FLOOR_MS",
     "Z_MAX",
     "alt_basis_errors",
+    "alt_ema_tau_ms",
     "kv_headroom",
     "normalize_signal_value",
     "queue_len_per_replica",

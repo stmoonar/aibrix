@@ -234,7 +234,9 @@ def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
     [verdict] = plan["verdict"]
     assert "scripts.theta_verdict" in verdict["command"] and "verdict" in verdict["command"]
     assert verdict["command"].count("--family") == 2
-    assert sorted(e["signal"] for e in plan["alt"]) == ["decode_tps", "prefill_tps", "queue_len"]
+    # every alternative signal of the fit, the v1 ttft_mean / kv_usage included
+    from tre_calibration.alt_signals import ALT_SIGNALS as FIT_SIGNALS
+    assert sorted(e["signal"] for e in plan["alt"]) == sorted(FIT_SIGNALS)
     for entry in plan["alt"]:
         assert "--registry" not in entry["command"]
         assert "--ttft-p95-ms" in entry["command"] and "--tpot-p95-ms" in entry["command"]
@@ -829,7 +831,7 @@ def test_the_fit_plan_keeps_the_held_out_shape_out_of_training() -> None:
         assert not any(str(validation["output"]) in entry["command"] for entry in plan[step])
     # one hold-out per verdict: TSS, the two ablation arms and every alt signal
     assert sorted(h["arm"] for h in plan["holdout"]) == sorted(
-        ["tss", "tss_lw0", "tss_wp1", "queue_len", "decode_tps", "prefill_tps"]
+        ["tss", "tss_lw0", "tss_wp1", "queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefill_tps"]
     )
     for holdout in plan["holdout"]:
         assert str(validation["output"]) in holdout["command"]

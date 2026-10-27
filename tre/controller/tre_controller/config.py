@@ -367,6 +367,16 @@ class ControllerConfig:
         # (checked at start, tre_common.tss.theta_basis_errors).
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 20_000)
         _validate_signal_thresholds(registry_path, signal_source, window_ms=metrics_window_ms)
+        disable_eta_gate = _get_bool(values, "TRE_DISABLE_ETA_GATE", False)
+        if signal_source != "zm" and not disable_eta_gate:
+            # Signal ablation (plan docs/v2-ablation-sensitivity-gap-20261028.md section 8, v1
+            # D31): only the signal changes on an alt arm; the eta gate and the waste ranking
+            # are TSS machinery (token efficiency) and are off there. An alt arm with the gate
+            # on would compare signal + gate, so it is refused, not silently corrected.
+            raise ValueError(
+                f"TRE_SIGNAL_SOURCE={signal_source} requires TRE_DISABLE_ETA_GATE=true "
+                f"(got TRE_DISABLE_ETA_GATE=false): the eta gate is off on every alt-signal arm"
+            )
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
         # Round 5: the former N2 warning (a commit-gate tail of hq x W could read metrics
@@ -420,7 +430,7 @@ class ControllerConfig:
             ablation_disable_slow_loop=_get_bool(values, "TRE_ABLATION_DISABLE_SLOW_LOOP", False),
             ablation_disable_safescale=_safescale_scope(values) == SAFESCALE_SCOPE_OFF,
             safescale_scope=_safescale_scope(values),
-            disable_eta_gate=_get_bool(values, "TRE_DISABLE_ETA_GATE", False),
+            disable_eta_gate=disable_eta_gate,
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),
             orphan_grace_s=_get_positive_float(values, "TRE_ORPHAN_GRACE_S", 600.0),
             safescale_suppress_hot_proactive=_get_bool(

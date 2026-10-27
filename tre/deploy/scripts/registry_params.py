@@ -52,6 +52,8 @@ _ALT_DELTA_BOUNDS = {
 #: alt_thresholds.<signal>.basis.<field> (tre_common.alt_signals.alt_basis_errors): what
 #: theta was fitted on; published with theta, checked by the controller at start.
 _ALT_BASIS_WINDOW_BOUNDS = (1000, 120000, "int", False, False)
+#: basis.ema_tau_ms: the EMA tau the alt fit smoothed the value with (0 = raw; review L5).
+_ALT_BASIS_TAU_BOUNDS = (0.0, 600000.0, "float", False, False)
 
 _SLO_BOUNDS: dict[str, tuple] = {
     "ttft_p95_ms": (50, 5000, "float", False, False),
@@ -119,6 +121,9 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
             }
             editable[f"alt_thresholds.{signal}.basis.window_ms"] = _field_view(
                 basis.get("window_ms"), _ALT_BASIS_WINDOW_BOUNDS
+            )
+            editable[f"alt_thresholds.{signal}.basis.ema_tau_ms"] = _field_view(
+                basis.get("ema_tau_ms"), _ALT_BASIS_TAU_BOUNDS
             )
         for field, spec in _SLO_BOUNDS.items():
             editable[f"slo.{field}"] = _field_view(slo.get(field), spec)
@@ -266,7 +271,7 @@ def _apply_alt_basis(threshold: dict, raw: Any, signal: str, model: str, errors:
     if not isinstance(raw, dict):
         errors.append({"model": model, "field": key, "error": "not_an_object"})
         return
-    for field in sorted(set(raw) - {"definition", "window_ms"}):
+    for field in sorted(set(raw) - {"definition", "window_ms", "ema_tau_ms"}):
         errors.append({"model": model, "field": f"{key}.{field}", "error": "unknown_field"})
     basis = threshold.setdefault("basis", {})
     if "definition" in raw:
@@ -280,6 +285,10 @@ def _apply_alt_basis(threshold: dict, raw: Any, signal: str, model: str, errors:
         value = _coerce(raw["window_ms"], _ALT_BASIS_WINDOW_BOUNDS, model, f"{key}.window_ms", errors)
         if value is not None:
             basis["window_ms"] = value
+    if "ema_tau_ms" in raw:
+        value = _coerce(raw["ema_tau_ms"], _ALT_BASIS_TAU_BOUNDS, model, f"{key}.ema_tau_ms", errors)
+        if value is not None:
+            basis["ema_tau_ms"] = value
 
 
 def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
@@ -354,7 +363,7 @@ def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
     """``["<model>.<path>=<value>", ...]`` -> the ``edits`` mapping of apply_and_validate.
 
     <path> is ``trs.<f>``, ``slo.<f>``, ``alt_thresholds.<signal>.<f>``,
-    ``alt_thresholds.<signal>.basis.{definition,window_ms}`` or a top-level
+    ``alt_thresholds.<signal>.basis.{definition,window_ms,ema_tau_ms}`` or a top-level
     replica bound. The model is matched by the longest registry name that prefixes the
     key (names may contain dots). VALUE is parsed as YAML. Raises ParamValidationError
     for a malformed item, an unknown model or a path outside the editable shapes (locked

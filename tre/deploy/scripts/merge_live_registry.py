@@ -45,6 +45,44 @@ THETA_BASIS_STAMPS = ("numerator", "theta_window_ms")
 LEGACY_THETA_BASIS = {"numerator": NUMERATOR_COMPLETION_HISTOGRAMS, "theta_window_ms": 30000}
 
 
+#: One alternative-signal threshold is ONE fit (review M1, 2026-10-28): theta, its bands
+#: and the basis stamp (definition, window, EMA tau) belong together. A key-by-key merge
+#: combined a stale live theta (07-10 fit, no bands, no stamp) with the release file's bands
+#: and basis, and that mix passed the controller's start check.
+ALT_THRESHOLD_GROUP = ("theta", "direction", "delta_crit", "delta_high", "basis")
+
+
+def _merge_alt_threshold(name: str, signal: str, live: dict, model: dict, report: list[str]) -> None:
+    """``alt_thresholds.<signal>``: the whole live fit (when live has a theta) or the whole
+    release fit, never a mix. A live theta without a basis stays without one, so an alt arm
+    on it refuses to start until a stamped fit is published."""
+    target = model.setdefault("alt_thresholds", {}).setdefault(signal, {})
+    if "theta" not in live:
+        if any(key in live for key in ALT_THRESHOLD_GROUP):
+            report.append(
+                f"WARN {name}: alt_thresholds.{signal} live entry has no theta "
+                f"({sorted(k for k in live if k in ALT_THRESHOLD_GROUP)}): the release fit is used whole"
+            )
+        return
+    release_fit = {key: target[key] for key in ALT_THRESHOLD_GROUP if key in target}
+    live_fit = {key: copy.deepcopy(live[key]) for key in ALT_THRESHOLD_GROUP if key in live}
+    for key in ALT_THRESHOLD_GROUP:
+        target.pop(key, None)
+    target.update(live_fit)
+    for key, value in live.items():  # any non-fit key: live wins, as for every tunable
+        if key not in ALT_THRESHOLD_GROUP:
+            target[key] = copy.deepcopy(value)
+    if live_fit != release_fit:
+        report.append(
+            f"{name}: alt_thresholds.{signal} live fit {live_fit!r} kept whole (release {release_fit!r})"
+        )
+    if "basis" not in live_fit:
+        report.append(
+            f"WARN {name}: alt_thresholds.{signal} live theta has no basis stamp: kept without one "
+            f"(an alt arm on {signal} refuses to start until a stamped fit is published)"
+        )
+
+
 def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     merged = copy.deepcopy(release)
     report: list[str] = []
@@ -74,13 +112,7 @@ def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any]
                         )
                     target[key] = value
         for signal, fields in (src.get("alt_thresholds") or {}).items():
-            target = model.setdefault("alt_thresholds", {}).setdefault(signal, {})
-            for key, value in (fields or {}).items():
-                if target.get(key) != value:
-                    report.append(
-                        f"{name}: alt_thresholds.{signal}.{key} live {value!r} kept (release {target.get(key)!r})"
-                    )
-                target[key] = value
+            _merge_alt_threshold(name, signal, fields or {}, model, report)
         for key in TUNABLE_KEYS:
             if key in src:
                 if model.get(key) != src[key]:

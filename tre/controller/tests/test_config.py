@@ -140,7 +140,8 @@ def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
     registry = yaml.safe_load(repo.read_text(encoding="utf-8"))
     entry = {"theta": 2.0, "direction": EXPECTED_SIGNAL_DIRECTIONS[source],
              "delta_crit": 0.1, "delta_high": 0.3,
-             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000}, **fields}
+             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000,
+                       "ema_tau_ms": 10_000.0}, **fields}
     for model in registry["models"]:
         model.setdefault("alt_thresholds", {})[source] = {k: v for k, v in entry.items() if v is not None}
     path = tmp_path / "registry.yaml"
@@ -150,14 +151,29 @@ def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
 
 @pytest.mark.parametrize("source", ["zm", "latency_p95"])
 def test_config_accepts_unfitted_signal_sources(source: str) -> None:
-    assert ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source}).signal_source == source
+    env = {"TRE_SIGNAL_SOURCE": source}
+    if source != "zm":
+        env["TRE_DISABLE_ETA_GATE"] = "true"
+    assert ControllerConfig.from_env(env).signal_source == source
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
 def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
     path = _registry_with_alt(tmp_path, source)
-    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
-    assert cfg.signal_source == source
+    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
+                                     "TRE_DISABLE_ETA_GATE": "true"})
+    assert cfg.signal_source == source and cfg.disable_eta_gate is True
+
+
+@pytest.mark.parametrize("source", [*FITTED_ALT_SOURCES, "latency_p95"])
+def test_alt_source_refuses_to_start_with_the_eta_gate_on(tmp_path, source: str) -> None:
+    """Plan section 8: only the signal changes on an alt arm - the eta gate is off there."""
+    path = _registry_with_alt(tmp_path, source) if source in FITTED_ALT_SOURCES else None
+    env = {"TRE_SIGNAL_SOURCE": source, **({"TRE_REGISTRY_PATH": str(path)} if path else {})}
+    with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires TRE_DISABLE_ETA_GATE=true"):
+        ControllerConfig.from_env(env)
+    with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE"):
+        ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "false"})
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
@@ -172,21 +188,27 @@ def test_alt_source_refuses_to_start_without_fitted_bands(tmp_path, source: str,
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
 @pytest.mark.parametrize("basis", [
     None,                                              # not stamped
-    {"definition": "queue_len:old", "window_ms": 20_000},  # another definition
+    {"definition": "queue_len:old", "window_ms": 20_000, "ema_tau_ms": 10_000.0},  # another definition
     "window",                                          # fitted on another window
+    "tau",                                             # smoothed with another tau
+    "no_tau",                                          # stamped before the tau (review L5)
 ])
 def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, source: str, basis) -> None:
     from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
 
     if basis == "window":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000, "ema_tau_ms": 10_000.0}
+    elif basis == "tau":
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000, "ema_tau_ms": 0.0}
+    elif basis == "no_tau":
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000}
     path = _registry_with_alt(tmp_path, source, basis=basis)
     with pytest.raises(ValueError, match="basis does not match.*dsqwen-7b"):
         ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
     # the same stamp is accepted when the controller window matches it
     if basis is not None and basis["window_ms"] == 30_000:
         cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
-                                         "TRE_METRICS_WINDOW_MS": "30000"})
+                                         "TRE_METRICS_WINDOW_MS": "30000", "TRE_DISABLE_ETA_GATE": "true"})
         assert cfg.signal_source == source
 
 

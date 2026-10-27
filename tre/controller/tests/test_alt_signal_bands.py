@@ -1,22 +1,14 @@
 """Each alternative signal is classified on its own fitted bands (plan 6.9 item 3).
 
 classify.py used to apply the TSS tau_crit/tau_high to every signal source. The registry
-now carries delta_crit/delta_high per alt_thresholds entry; a missing pair falls back to
-the plan defaults 0.2/0.25 with a warning, so an old registry keeps working.
+now carries delta_crit/delta_high per alt_thresholds entry; a missing pair is an error
+(the controller refuses such an alt arm at start), never a default band.
 """
 from __future__ import annotations
 
-import logging
-
 import pytest
 
-from tre_common.registry import (
-    ALT_DEFAULT_DELTA_CRIT,
-    ALT_DEFAULT_DELTA_HIGH,
-    AltThreshold,
-    _parse_registry,
-)
-from tre_controller.planning import classify
+from tre_common.registry import _parse_registry
 from tre_controller.planning.classify import (
     ModelState,
     classify_all_models,
@@ -55,23 +47,17 @@ def test_an_alt_signal_uses_its_own_fitted_bands_not_the_tss_ones() -> None:
     assert on_tss.state == ModelState.CRITICAL
 
 
-def test_missing_bands_fall_back_to_plan_defaults_with_a_warning(caplog) -> None:
-    classify._warned_default_bands.clear()
+def test_missing_bands_are_an_error_not_a_default_band() -> None:
     reg = _registry({"decode_tps": {"theta": 900.0, "direction": "lower_is_healthier"}})
     assert reg.validate() == []
-    with caplog.at_level(logging.WARNING):
-        cfg = model_control_configs_from_registry(reg, "decode_tps")["m"]
+    with pytest.raises(ValueError, match="no fitted delta_crit/delta_high"):
         model_control_configs_from_registry(reg, "decode_tps")
-    assert cfg == {"delta_crit": ALT_DEFAULT_DELTA_CRIT, "delta_high": ALT_DEFAULT_DELTA_HIGH}
-    assert (ALT_DEFAULT_DELTA_CRIT, ALT_DEFAULT_DELTA_HIGH) == (0.2, 0.25)
-    warnings = [r for r in caplog.records if "decode_tps" in r.getMessage()]
-    assert len(warnings) == 1  # once per model and signal
+    # an unfitted source (no alt_thresholds entry) keeps the TSS bands
+    assert model_control_configs_from_registry(reg, "latency_p95") == model_control_configs_from_registry(reg)
 
 
-def test_band_validation_and_the_bands_helper() -> None:
+def test_band_validation() -> None:
     bad = _registry({"queue_len": {"theta": 20.0, "direction": "lower_is_healthier",
                                    "delta_crit": 1.2, "delta_high": -0.1}})
     errors = bad.validate()
     assert any("delta_crit" in e for e in errors) and any("delta_high" in e for e in errors)
-    assert AltThreshold(1.0, "lower_is_healthier", 0.3, None).bands() == (0.3, 0.25, True)
-    assert AltThreshold(1.0, "lower_is_healthier", 0.3, 0.4).bands() == (0.3, 0.4, False)

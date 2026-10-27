@@ -19,6 +19,7 @@ from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import (
     _cluster_view_counts,
+    _routable_pod_ids,
     breakpoint_observation,
     compute_model_signal,
     serving_window,
@@ -176,6 +177,12 @@ def run_safescale_observation_tick(
                 else None
             ),
             tail_start_ms=_tail_start_ms(safescale, probe.model),
+            # Review L2: the alt signals sum the routable pods (the probe's hidden pods out).
+            routable_pod_ids=(
+                (_routable_pod_ids(cluster_view) or {}).get(probe.model, frozenset())
+                if probe.model in _cluster_view_counts(cluster_view)
+                else None
+            ),
         )
         poll = (direct_polls or {}).get(probe.model)
         # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
@@ -689,6 +696,7 @@ def _observation_from_metrics(
     gateway: GatewayCounters | None = None,
     routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
     tail_start_ms: int | None = None,
+    routable_pod_ids: frozenset[str] | None = None,
 ) -> ProbeObservation:
     if signal_state is not None and getattr(signal_state, "breakpoint", None) is not None:
         # O1: the planner tick's computation (same effective window, same EMA). The hide
@@ -702,6 +710,7 @@ def _observation_from_metrics(
             signal_source=signal_source,
             signal_state=signal_state,
             routable_observation=routable_observation,
+            routable_pod_ids=routable_pod_ids,
         )
         result, signal = computed.result, computed.signal
     else:
@@ -716,7 +725,10 @@ def _observation_from_metrics(
             theta_m=spec.trs.theta_m,
             window_end_ms=metrics.window_end_ms,
         )
-        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        signal = get_signal(
+            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+            routable_pod_ids=routable_pod_ids,
+        )
     return ProbeObservation(
         ts_ms=ts_ms,
         ttft_p95_ms=metrics.ttft_p95_ms,
@@ -739,7 +751,7 @@ def _observation_from_metrics(
         pooled_ttft_p95_ms=_pooled_p95(metrics, hidden_pods, "ttft_hist", "ttft_hist_count"),
         pooled_tpot_p95_ms=_pooled_p95(metrics, hidden_pods, "tpot_hist", "tpot_hist_count"),
         observed_ms=observed_of(metrics).t_last_ms,
-        **_tail_terms(metrics, spec, signal_source, hidden_pods, tail_start_ms),
+        **_tail_terms(metrics, spec, signal_source, hidden_pods, tail_start_ms, routable_pod_ids),
     )
 
 
@@ -752,7 +764,8 @@ def _tail_start_ms(safescale: object, model: str) -> int | None:
 
 
 def _tail_terms(
-    metrics: ModelWindowMetrics, spec, signal_source: str, hidden_pods: tuple[str, ...], tail_start_ms: int | None
+    metrics: ModelWindowMetrics, spec, signal_source: str, hidden_pods: tuple[str, ...], tail_start_ms: int | None,
+    routable_pod_ids: frozenset[str] | None = None,
 ) -> dict:
     """Round 5 (H1): the commit gate's tail of this snapshot - the post-hide part of
     the window, from the first gateway boundary at or after the probe's post-hide start
@@ -802,7 +815,9 @@ def _tail_terms(
         window_ms=whole,
     )
     result = TRSComputer(ema_tau_ms=0.0).compute(inp, theta_m=spec.trs.theta_m)
-    signal = get_signal(window, spec, signal_source, trs_z_m=result.Z_m, signal_state=None)
+    signal = get_signal(
+        window, spec, signal_source, trs_z_m=result.Z_m, signal_state=None, routable_pod_ids=routable_pod_ids
+    )
     return {
         **terms,
         "tail_z_m": signal.z_m,
