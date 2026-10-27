@@ -1539,10 +1539,11 @@ def fit_plan(
     return plan
 
 
-#: The plan 6.9 alternative signals this campaign step fits (a subset of
-#: tre_calibration.alt_signals.ALT_SIGNALS; the v1 signals ttft_mean / kv_usage need the
-#: standard dataset columns of scripts.alt_signal_columns and are fitted from there).
-ALT_SIGNALS = ("queue_len", "decode_tps", "prefill_tps")
+#: The alternative signals this campaign step fits: every one of
+#: tre_calibration.alt_signals.ALT_SIGNALS. The v1 signals ttft_mean / kv_usage read the
+#: standard dataset columns of scripts.alt_signal_columns (written by calibration_dataset),
+#: so their fit is part of the campaign, not a manual step (review 2026-10-28).
+ALT_SIGNALS = ("queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefill_tps")
 
 
 def _without_idle_fit(label_args: Sequence[str]) -> list[str]:

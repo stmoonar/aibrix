@@ -1078,6 +1078,21 @@ def discover_cell_files(
     return kept, skipped
 
 
+def alt_columns_for_raw(raw_path: Path):
+    """The ``scripts.alt_signal_columns`` source of one cell file in the campaign layout
+    (``<model_dir>/raw/<stem>/<cell>.jsonl`` next to ``<model_dir>/cells/<stem>/``), or
+    None when the cell has no 1 Hz capture (a run before the capture layout)."""
+    from scripts import alt_signal_columns, calibration_capture
+
+    raw_path = Path(raw_path)
+    stem, model_dir = raw_path.parent.name, raw_path.parent.parent.parent
+    if raw_path.parent.parent.name != "raw":
+        return None
+    if not (model_dir / calibration_capture.CELLS_DIRNAME / stem / calibration_capture.VLLM_METRICS_DIRNAME).is_dir():
+        return None
+    return alt_signal_columns.columns_for_cell(model_dir, stem)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
@@ -1214,6 +1229,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if skipped_cells:
         print(f"skipping {len(skipped_cells)} cell(s) by id: {', '.join(sorted(set(skipped_cells)))}")
     low_n = 0
+    alt_written = False
     for raw_path in cell_files:
         cell_id = raw_path.stem
         try:
@@ -1247,6 +1263,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for row in cell_rows:
                 for key in ("role", "split", "primitive", "stage"):
                     row[key] = entry.get(key)
+        alt_source = alt_columns_for_raw(raw_path)
+        if alt_source is not None:
+            # The v1 ablation signals' inputs (ttft_mean / kv_usage) from the cell's 1 Hz
+            # capture, as the standard dataset adds them (scripts.alt_signal_columns), so the
+            # campaign's alt fit of every signal reads this CSV (review 2026-10-28).
+            alt_written = True
+            for row in cell_rows:
+                row.update(alt_source(int(row["window_start_ms"]), int(row["window_end_ms"])))
         low_n += sum(
             1 for row in cell_rows
             if (row.get(slo_labels.COMPLETED_REQUESTS_COLUMN) or 0) < primary.min_completed_requests
@@ -1265,7 +1289,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    r3_grid.write_csv(rows, out, extra_columns=LEDGER_COLUMNS if ledger else ())
+    extra_columns = list(LEDGER_COLUMNS) if ledger else []
+    if alt_written:
+        from scripts import alt_signal_columns
+
+        extra_columns += list(alt_signal_columns.COLUMNS)
+        for row in rows:  # a cell without a capture: empty columns (no value, never zero)
+            for column in alt_signal_columns.COLUMNS:
+                row.setdefault(column, None)
+    r3_grid.write_csv(rows, out, extra_columns=extra_columns)
     print(f"wrote {len(rows)} rows to {out} (window={args.window_ms}ms step={step_ms}ms "
           f"align={args.window_align})")
     print(f"{low_n} window(s) with completed_requests < {primary.min_completed_requests} "

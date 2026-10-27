@@ -37,39 +37,23 @@ EXPECTED_SIGNAL_DIRECTIONS = {
 }
 
 
-#: Band margins an alternative signal falls back to when its registry entry carries none:
-#: the plan defaults, the same numbers classify_all_models uses for an unfitted TSS.
-ALT_DEFAULT_DELTA_CRIT = 0.2
-ALT_DEFAULT_DELTA_HIGH = 0.25
-
-
 @dataclass(frozen=True)
 class AltThreshold:
     theta: float
     direction: str
     #: Per-signal band margins around tau_low = 1 (plan §6.9 item 3): the classifier runs
     #: an alternative signal on its OWN fitted bands, not on the TSS tau_crit/tau_high.
-    #: ``None`` = not fitted; :meth:`bands` then falls back to the plan defaults.
+    #: ``None`` = not fitted: an alt arm on this signal refuses to start (no default bands).
     delta_crit: float | None = None
     delta_high: float | None = None
     #: What theta was fitted on (2026-10-28, ``tre_common.alt_signals.alt_basis_errors``):
     #: registry ``basis: {definition, window_ms, ema_tau_ms}``. None = not stamped; the controller
-    #: refuses to start an alt arm unless both equal what it computes.
+    #: refuses to start an alt arm unless all three equal what it computes.
     basis_definition: str | None = None
     basis_window_ms: float | None = None
     #: The EMA tau (ms; 0 = no smoothing) the fit smoothed the value with (review L5,
     #: 2026-10-28): must equal the tau the controller uses (``alt_ema_tau_ms``).
     basis_ema_tau_ms: float | None = None
-
-    def bands(self) -> tuple[float, float, bool]:
-        """(delta_crit, delta_high, defaulted) - ``defaulted`` is True when either margin
-        is missing and the plan default was used."""
-        defaulted = self.delta_crit is None or self.delta_high is None
-        return (
-            float(self.delta_crit) if self.delta_crit is not None else ALT_DEFAULT_DELTA_CRIT,
-            float(self.delta_high) if self.delta_high is not None else ALT_DEFAULT_DELTA_HIGH,
-            defaulted,
-        )
 
 
 @dataclass(frozen=True)
