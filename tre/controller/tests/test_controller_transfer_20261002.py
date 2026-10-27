@@ -20,7 +20,6 @@ import json
 from dataclasses import replace
 
 from tre_common.metrics_schema import MetricsSnapshot
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.loops.decision_snapshot import build_decision_snapshot
 from tre_controller.loops.replay import TickReplayStep, run_tick_replay
@@ -45,6 +44,7 @@ from test_o1_breakpoint_window_20261001 import _registry as _o1_registry
 from test_o1_breakpoint_window_20261001 import _snap, _window
 from test_planner_slot_occupancy import TOPOLOGY, _cls
 from test_safescale_binding_commit import FakeRedis, InProcessServiceManager
+from plan_shim import LegacyFakeQueue as ActionQueue, PlanShim  # pre-plan fakes behind POST /v2/plans
 
 R, D = "dsllama-8b", "dsqwen-7b"
 GPUS = [(node, gpu) for node in ("node9", "node10") for gpu in range(4)]
@@ -186,7 +186,11 @@ def test_partial_transfer_is_accounted_by_done_and_taken_not_count():
     assert queue.routable_changes() == {"7b": (5_000, -1), "8b": (5_000, 1)}
     events = queue.drain_events()
     assert "transfer_done:7b->8b:count=2:done=1:taken=2:unfilled=0:id=tr-1" in events
-    assert "transfer_pair:7b->8b:7b-1->8b-1@n/1:receiver_wake_failed" in events
+    # A plan wake item reports the receivers it woke (the failed one is in ``unfilled`` /
+    # ``refusals``): only the done pair is an event.
+    assert [event for event in events if event.startswith("transfer_pair:")] == [
+        "transfer_pair:7b->8b:7b-0->8b-0@n/0:done"
+    ]
     assert queue.stats()["transfer_partial_total"] == 1
 
 
@@ -240,21 +244,19 @@ def test_a_relay_is_finished_when_its_call_returns():
     assert queue.view_changes().keys() == {"7b", "8b"}
 
 
-def test_transfer_404_degrades_to_not_executed_with_an_error_event(caplog):
+def test_plans_404_is_not_executed_for_both_sides_of_a_relay():
     class Transport:
         async def request(self, method, url, *, json=None, timeout_s):
+            if method == "GET":
+                return {"models": {"8b": {"awake": 1, "bound": 4}}}
             raise ServiceManagerError("HTTP 404: Not Found", status=404, body={"detail": "Not Found"})
 
     queue = ActionQueue(ServiceManagerClient("http://sm", transport=Transport()))
     queue.submit((_intent(1),))
-    with caplog.at_level("ERROR", logger="tre_controller.loops.action_queue"):
-        donor, receiver = asyncio.run(queue.drain_once())
-    assert (donor.ok, receiver.ok) == (False, False)
-    assert receiver.error.startswith("transfer_unsupported")
+    donor, receiver = asyncio.run(queue.drain_once())
+    assert (donor.ok, receiver.ok) == (False, False) and donor.not_executed and receiver.not_executed
     assert queue.view_changes() == {} and queue.last_actions() == {} and queue.inflight_models() == set()
-    assert queue.drain_events() == ["transfer_unsupported:7b->8b"]
-    assert queue.stats()["transfer_unsupported_total"] == 1
-    assert any("transfer_endpoint_missing" in record.getMessage() for record in caplog.records)
+    assert queue.drain_events() == ["transfer_failed:7b->8b:refused:HTTP 404: Not Found"]
 
 
 def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
@@ -274,6 +276,7 @@ def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
         "scale:8b": [writer_busy],
         "scale:7b": [routable_unknown],
     })
+    sm.awake_counts = {"7b": 4}
     queue = ActionQueue(sm)
     queue.submit((_intent(1),))
     queue.submit((ScaleAction("9b", 1, "critical_idle_capacity", "rescue"),))
@@ -295,6 +298,7 @@ def test_target_scale_down_is_accounted_by_taken():
                                          "floor": {"clamped": clamped}}}
 
     sm = ScriptedSM(results={"scale:7b": [shrink(1, True), shrink(0, True)]})
+    sm.awake_counts = {"7b": 4}
     queue = ActionQueue(sm, now_ms=lambda: 7_000)
     down = ScaleAction("7b", -2, "idle_proactive_immediate", "rescue", sleep_path="urgent")
     queue.submit((down,))
@@ -303,7 +307,9 @@ def test_target_scale_down_is_accounted_by_taken():
     assert queue.last_actions() == {"7b": (7_000, "down")} and queue.view_changes() == {"7b": (7_000, "down")}
     assert queue.drain_events() == ["scale_clamped_by_floor:7b:taken=1:asked=2"]
 
-    fresh = ActionQueue(ScriptedSM(results={"scale:7b": [shrink(0, True)]}), now_ms=lambda: 8_000)
+    other = ScriptedSM(results={"scale:7b": [shrink(0, True)]})
+    other.awake_counts = {"7b": 4}
+    fresh = ActionQueue(other, now_ms=lambda: 8_000)
     fresh.submit((down,))
     [second] = asyncio.run(fresh.drain_once())
     assert (second.ok, second.taken) == (True, 0)
@@ -320,36 +326,6 @@ def test_observe_mode_skips_an_intent_before_its_single_call():
 
 
 # ===================================================================== sm_client / SM view
-
-
-class _Transport:
-    def __init__(self, answers):
-        self.answers = answers
-        self.calls = []
-
-    async def request(self, method, url, *, json=None, timeout_s):
-        self.calls.append((method, url.replace("http://sm", ""), json))
-        answer = self.answers[(method, url.replace("http://sm", ""))]
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
-
-def test_sm_client_transfer():
-    body = transfer_body(1)
-    transport = _Transport({("POST", "/v2/transfers"): body})
-    client = ServiceManagerClient("http://sm", transport=transport)
-    assert asyncio.run(client.transfer("7b", "8b", 1)) == {"ok": True, "response": body}
-    assert transport.calls == [("POST", "/v2/transfers",
-                                {"donor_model": "7b", "receiver_model": "8b", "count": 1, "sleep_path": "urgent"})]
-
-    partial = dict(transfer_body(1, statuses=["donor_sleep_failed"], done=0, taken=0), error="partial")
-    transport.answers[("POST", "/v2/transfers")] = ServiceManagerError("HTTP 409", status=409, body=partial)
-    result = asyncio.run(client.transfer("7b", "8b", 1))
-    assert (result["ok"], result["partial"], result["retriable"]) == (False, True, False)
-    assert result["response"]["pairs"][0]["status"] == "donor_sleep_failed"
-    transport.answers[("POST", "/v2/transfers")] = ServiceManagerError("HTTP 404", status=404, body={"detail": "x"})
-    assert asyncio.run(client.transfer("7b", "8b", 1))["unsupported"] is True
 
 
 def _state(routable_flags, *, models=None, error=None):
@@ -419,7 +395,7 @@ def test_offline_replay_plans_an_intent_and_the_fake_sm_names_the_pods():
     assert (payload["donor"], payload["receiver"], payload["count"]) == (D, R, intent.count)
     assert "pods" not in payload
 
-    queue = ActionQueue(InProcessServiceManager(service))
+    queue = ActionQueue(PlanShim(InProcessServiceManager(service), state=service.get_state))
     queue.submit((intent,))
     results = asyncio.run(queue.drain_once())
     assert all(result.ok for result in results)

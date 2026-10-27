@@ -23,31 +23,20 @@ class FakeTransport:
 
 
 @pytest.mark.asyncio
-async def test_sm_client_scale_model_converts_delta_to_v2_target() -> None:
-    transport = FakeTransport(
-        responses=[
-            {"models": {"m": {"awake": 2, "bound": 4}}, "bindings": []},
-            {"model": "m", "wake_replicas": 3, "version": 2, "actions": [{"action": "wake", "serve_id": "s3"}]},
-        ]
-    )
-    client = ServiceManagerClient("http://sm.local/", transport=transport, timeout_s=1.5)
+async def test_sm_client_post_plan_sends_one_request_on_the_slow_timeout() -> None:
+    # Design 20261027-sm-plans §5.1: one POST /v2/plans, no GET precheck, long timeout
+    # (a plan runs its sleeps and wakes inside the SM handler); get_state / set_routable
+    # stay on the fast timeout.
+    body = {"plan_id": "pl-1", "status": "done", "sleeps": [], "wakes": [{"index": 0, "model": "m", "status": "done"}]}
+    transport = FakeTransport(responses=[body])
+    client = ServiceManagerClient("http://sm.local/", transport=transport, timeout_s=5.0, slow_timeout_s=300.0)
+    request = {"sleeps": [], "wakes": [{"model": "m", "at_least": 3, "reason": "r"}]}
 
-    result = await client.scale_model("m", 1)
+    result = await client.post_plan(request)
 
-    assert result == {"ok": True, "response": {"model": "m", "wake_replicas": 3, "version": 2, "actions": [{"action": "wake", "serve_id": "s3"}]}}
-    assert transport.calls == [
-        ("GET", "http://sm.local/v2/state", None),
-        ("PUT", "http://sm.local/v2/models/m/target", {"wake_replicas": 3}),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_sm_client_scale_and_defrag_use_slow_timeout_b1() -> None:
-    # B1: wake/create (target) and defrag run for minutes in the SM -> long timeout;
-    # get_state / set_routable stay on the fast timeout.
-    t = FakeTransport(responses=[{"models": {"m": {"awake": 1, "bound": 4}}, "bindings": []}, {"actions": []}])
-    await ServiceManagerClient("http://sm.local/", transport=t, timeout_s=5.0, slow_timeout_s=300.0).scale_model("m", 1)
-    assert t.timeouts == [5.0, 300.0]  # GET state fast, PUT target slow
+    assert result == {"ok": True, "status": 200, "response": body}
+    assert transport.calls == [("POST", "http://sm.local/v2/plans", request)]
+    assert transport.timeouts == [300.0]
 
     t2 = FakeTransport(responses=[{"ok": True}])
     await ServiceManagerClient("http://sm.local/", transport=t2, timeout_s=5.0, slow_timeout_s=300.0).defrag(())
@@ -59,19 +48,17 @@ async def test_sm_client_scale_and_defrag_use_slow_timeout_b1() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sm_client_scale_model_keeps_one_awake_bound_replica_on_downscale() -> None:
-    transport = FakeTransport(
-        responses=[
-            {"models": {"m": {"awake": 1, "bound": 4}}, "bindings": []},
-            {"model": "m", "wake_replicas": 1, "version": 2, "actions": []},
-        ]
-    )
+async def test_sm_client_post_plan_409_partial_carries_the_item_results() -> None:
+    body = {"error": "partial", "plan_id": "pl-2", "status": "partial", "sleeps": [],
+            "wakes": [{"index": 0, "model": "m", "status": "refused", "error": "gpu_busy"}]}
+    transport = FakeTransport(responses=[ServiceManagerError("HTTP 409: partial", status=409, body=body)])
     client = ServiceManagerClient("http://sm.local", transport=transport)
 
-    result = await client.scale_model("m", -3)
+    result = await client.post_plan({"sleeps": [], "wakes": [{"model": "m", "at_least": 2}]})
 
-    assert result["ok"] is True
-    assert transport.calls[-1] == ("PUT", "http://sm.local/v2/models/m/target", {"wake_replicas": 1})
+    assert result["ok"] is False and result["partial"] is True
+    assert result["response"] == body
+    assert not result.get("not_executed")
 
 
 @pytest.mark.asyncio
@@ -159,22 +146,10 @@ async def test_sm_client_defrag_keeps_unsupported_fallback_for_old_service_manag
 
 
 @pytest.mark.asyncio
-async def test_sm_client_set_binding_power_puts_binding_power_endpoint() -> None:
-    transport = FakeTransport(responses=[{"serve_id": "p1", "awake": False, "actions": [{"action": "sleep", "serve_id": "p1"}]}])
-    client = ServiceManagerClient("http://sm.local/", transport=transport, timeout_s=5.0, slow_timeout_s=300.0)
-
-    result = await client.set_binding_power("p1", awake=False)
-
-    assert result["ok"] is True
-    assert transport.calls == [("PUT", "http://sm.local/v2/bindings/p1/power", {"awake": False})]
-    assert transport.timeouts == [300.0]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "retriable"),
     [
-        (ServiceManagerError("HTTP 409: busy", status=409), True),
+        (ServiceManagerError("HTTP 409: busy", status=409, body={"error": "writer_busy"}), True),
         (ServiceManagerError("HTTP 503: shutting down", status=503), True),
         (TimeoutError("timed out"), True),
         (ConnectionRefusedError("refused"), True),
@@ -186,7 +161,8 @@ async def test_sm_client_classifies_retriable_failures_review2_p2_5(error, retri
     transport = FakeTransport(responses=[error])
     client = ServiceManagerClient("http://sm.local", transport=transport)
 
-    result = await client.set_binding_power("p1", awake=False)
+    result = await client.post_plan({"sleeps": [{"model": "m", "pods": ["p1"], "sleep_path": "urgent"}], "wakes": []})
 
     assert result["ok"] is False
     assert result["retriable"] is retriable
+    assert "partial" not in result

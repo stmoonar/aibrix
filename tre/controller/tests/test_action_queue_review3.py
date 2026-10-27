@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 
 from tre_controller.loops.action_queue import (
-    ActionQueue,
     RetryPolicy,
     revalidate_commit_from_signals,
 )
@@ -27,6 +26,7 @@ from tre_controller.planning.safescale import SafeScaleCommand
 from tre_controller.sm_client import ServiceManagerClient
 from tre_common.registry import ClusterTopology, NodeSpec
 from tre_sm.allocator.slots import Binding, Slot
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 class ScriptedSM:
@@ -38,6 +38,9 @@ class ScriptedSM:
         self.results = {key: list(value) for key, value in (results or {}).items()}
         self.gates = {key: asyncio.Event() for key in gated}
         self.raises = dict(raises or {})
+        #: Awake counts of the plan's GET /v2/state (PlanShim; other models: 8): the
+        #: receivers of ``_commit`` start below their targets.
+        self.awake_counts = {"8b": 1, "14b": 1}
 
     async def _call(self, key, event):
         self.events.append(("start",) + event)
@@ -60,8 +63,6 @@ class ScriptedSM:
     async def scale_model_to(self, model, target):
         return await self._call(f"target:{model}", (model, "target", target))
 
-    async def model_awake(self, model):
-        return {"ok": True, "awake": 1}
 
     async def scale_model(self, model, delta, **_kwargs):
         return await self._call(f"scale:{model}", (model, "scale", delta))
@@ -128,28 +129,29 @@ def _calls(sm):
 
 
 class StatefulTransport:
-    """An SM behind HTTP: GET /v2/state counts; PUT target applies (grow-only
-    with at_least) - the first PUT succeeds on the SM but times out on the client."""
+    """An SM behind HTTP: GET /v2/state counts; POST /v2/plans applies the wake item
+    (grow-only ``at_least``) - the first POST succeeds on the SM but times out on the
+    client."""
 
     def __init__(self, awake: int) -> None:
         self.awake = awake
-        self.puts: list[dict] = []
+        self.posts: list[dict] = []
         self.timeouts_left = 1
 
     async def request(self, method, url, *, json=None, timeout_s):
         if method == "GET" and url.endswith("/v2/state"):
             return {"models": {"8b": {"awake": self.awake, "bound": 4}}}
-        if method == "PUT" and url.endswith("/v2/models/8b/target"):
-            self.puts.append(dict(json))
-            target = int(json["wake_replicas"])
-            if json.get("at_least"):
-                self.awake = max(self.awake, target)
-            else:
-                self.awake = target
+        if method == "POST" and url.endswith("/v2/plans"):
+            self.posts.append(json)
+            [item] = json["wakes"]
+            before = self.awake
+            self.awake = max(self.awake, int(item["at_least"]))
             if self.timeouts_left:
                 self.timeouts_left -= 1
                 raise TimeoutError("read timed out")
-            return {"ok": True}
+            woke = [{"serve_id": f"8b-{i}"} for i in range(before, self.awake)]
+            return {"plan_id": "pl", "status": "done", "sleeps": [],
+                    "wakes": [{"index": 0, "model": "8b", "status": "done" if woke else "noop", "woke": woke}]}
         raise AssertionError((method, url))
 
 
@@ -170,8 +172,9 @@ def test_retried_upscale_after_sm_side_success_and_client_timeout_is_applied_onc
         assert queue.submit((commit,)).accepted == 1
         results = await queue.drain_once()
         assert transport.awake == 3  # NOT 4: the retry did not add the delta again
-        # the retry saw the target reached (pre-check): no second PUT at all
-        assert transport.puts == [{"wake_replicas": 3, "at_least": True}]
+        # the retry's GET saw the target reached: dropped locally, no second POST
+        assert [plan["wakes"] for plan in transport.posts] == [[{"model": "8b", "reason": "safescale_receiver",
+                                                                 "at_least": 3}]]
         [result] = results
         assert result.ok and result.model == "8b" and result.attempts == 2
         assert slept == [2.0]
@@ -228,10 +231,7 @@ def test_commit_targets_are_resolved_at_first_dispatch_and_capped() -> None:
     async def scenario():
         sm = ScriptedSM()
 
-        async def awake(model):
-            return {"ok": True, "awake": 2}  # hidden counts, as on the SM
-
-        sm.model_awake = awake
+        sm.awake_counts["8b"] = 2  # hidden counts, as on the SM
         queue = ActionQueue(sm, sleep=lambda _s: asyncio.sleep(0))
         queue.submit((commit,))
         await queue.drain_once()
@@ -564,19 +564,24 @@ def test_transfer_exception_is_a_failed_result_for_both_models() -> None:
     asyncio.run(scenario())
 
 
-def test_sm_client_reports_malformed_state_counts_as_a_failed_result() -> None:
+def test_malformed_state_counts_fail_the_plan_member_without_a_post() -> None:
     class BadState:
+        def __init__(self):
+            self.calls = []
+
         async def request(self, method, url, *, json=None, timeout_s):
+            self.calls.append(method)
             return {"models": {"m": {"awake": "two", "bound": 4}}}
 
     async def scenario():
-        client = ServiceManagerClient("http://sm", transport=BadState())
-        result = await client.scale_model("m", 1)
-        assert result["ok"] is False and result["retriable"] is False
-        assert "malformed /v2/state counts" in result["error"]
-        result = await client.scale_model_to("m", 3)
-        assert result["ok"] is False
-        assert (await client.model_awake("m"))["ok"] is False
+        transport = BadState()
+        queue = ActionQueue(ServiceManagerClient("http://sm", transport=transport))
+        queue.submit((ScaleAction("m", 1, "critical", "rescue"),))
+        [result] = await queue.drain_once()
+        assert result.ok is False and result.retriable is False and result.not_executed
+        assert "malformed /v2/state" in result.error
+        assert transport.calls == ["GET"]
+        assert queue.view_changes() == {} and queue.last_actions() == {}
 
     asyncio.run(scenario())
 

@@ -11,6 +11,7 @@ import asyncio
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.action_queue import ActionQueue
+from plan_shim import PlanShim  # the in-process service has no plan executor here
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.loops.fairness_task import run_fairness_tick
 from tre_controller.loops.rescue_task import run_rescue_tick
@@ -68,7 +69,7 @@ def _run(registry: Registry, bindings: list[Binding], load: dict[str, tuple[floa
         models={model: _window(model, per_q=per_q, running=running) for model, (per_q, running) in load.items()},
     )
     sm = InProcessServiceManager(service)
-    queue = ActionQueue(sm)
+    queue = ActionQueue(PlanShim(sm, state=service.get_state))
     tick = run_rescue_tick if loop == "rescue" else run_fairness_tick
     # No safescale controller here, so the receiver-less HIGH proactive probe (default on
     # since A2) would dispatch as an immediate sleep; these cases exercise slot planning.

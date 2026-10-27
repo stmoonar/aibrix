@@ -12,8 +12,15 @@ from tre_controller.planning.planner import ClusterView, DefragAction, ScaleActi
 from tre_controller.sm_client import ServiceManagerClient
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import K8sPodSnapshot
+from tre_sm.api import v2 as sm_v2
 from tre_sm.api.v2 import ServiceManagerV2, create_app
 from tre_sm.state.store import StateStore
+
+#: The controller dispatches every power change as POST /v2/plans (design
+#: 20261027-sm-plans); these chains need a service-manager that serves it (SM step 2).
+needs_sm_plans = pytest.mark.skipif(
+    not hasattr(sm_v2, "PlanRequest"), reason="service-manager without POST /v2/plans (design 20261027 step 2)"
+)
 
 
 class FakeRedis:
@@ -230,6 +237,7 @@ def _critical_tp2_snapshot() -> MetricsSnapshot:
     )
 
 
+@needs_sm_plans
 @pytest.mark.asyncio
 async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chain() -> None:
     registry = _registry()
@@ -259,7 +267,8 @@ async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chai
     assert [(item.action_kind, item.model, item.ok) for item in result.dispatches] == [("scale", "m1", True)]
     assert transport.calls == [
         ("GET", "/v2/state", None),
-        ("PUT", "/v2/models/m1/target", {"wake_replicas": 2}),
+        ("POST", "/v2/plans", {"sleeps": [], "wakes": [{"model": "m1", "reason": "critical_idle_capacity",
+                                                         "at_least": 2}]}),
     ]
     assert sm_store.load().bindings[1].awake is True
     decision_hash = redis.hgetall(DECISION_LATEST_KEY)
@@ -267,6 +276,7 @@ async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chai
     assert b"critical_idle_capacity" in decision_hash[b"actions"]
 
 
+@needs_sm_plans
 @pytest.mark.asyncio
 async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_tp2() -> None:
     base = _registry()
@@ -300,10 +310,13 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
         ("defrag", "__cluster__", True),
         ("scale", "tp2", True),
     ]
+    # NOTE design §4.3: the plan executor never cold-creates a binding (Q3); whether the
+    # tp2 growth below still creates one depends on the SM step 3 wrappers.
     assert transport.calls == [
         ("POST", "/v2/defrag", {"tp_size": 2}),
         ("GET", "/v2/state", None),
-        ("PUT", "/v2/models/tp2/target", {"wake_replicas": 1}),
+        ("POST", "/v2/plans", {"sleeps": [], "wakes": [{"model": "tp2", "reason": "critical_tp_defrag",
+                                                         "at_least": 1}]}),
     ]
     assert sm_store.load().bindings == [
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),

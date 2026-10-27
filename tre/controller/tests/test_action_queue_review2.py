@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 
 from tre_controller.loops.action_queue import (
-    ActionQueue,
     RetryPolicy,
     revalidate_from_cluster_view,
 )
@@ -18,6 +17,7 @@ from tre_controller.planning.planner import (
     UnhideAction,
 )
 from tre_sm.allocator.slots import Binding, Slot
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 class GatedPowerClient:

@@ -12,6 +12,7 @@ import pytest
 
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.action_queue import ActionQueue
+from plan_shim import PlanShim  # the in-process service has no plan executor here
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import (
     ClusterView,
@@ -206,7 +207,7 @@ def test_e1_plan_executes_through_serial_queue_without_wake_conflict() -> None:
     store = StateStore(FakeRedis())
     store.save(list(_e1_bindings()), expected_version=0)
     service = ServiceManagerV2(_registry(), store)
-    queue = ActionQueue(InProcessServiceManager(service))
+    queue = ActionQueue(PlanShim(InProcessServiceManager(service), state=service.get_state))
 
     plan = _plan(_e1_bindings(), ModelState.IDLE)
     queue.submit(plan.actions)

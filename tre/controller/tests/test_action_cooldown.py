@@ -5,7 +5,6 @@ import asyncio
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_controller.config import ControllerConfig
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.rescue_task import rescue_task, run_rescue_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
@@ -15,6 +14,7 @@ from tre_common.registry import Registry, ScalingRegistryConfig
 from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 from test_loop_ticks import _registry as _base_registry
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 def _registry(**scaling) -> Registry:

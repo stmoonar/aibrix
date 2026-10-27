@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.planning.planner import HideAction, ScaleAction
@@ -31,6 +30,7 @@ from test_loop_ticks import (
     _registry_with_models,
 )
 from test_safescale_commit import FakeRedis, _machine, _metrics, _probe_records, _registry, _start_and_prime
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 MAX_AGE_MS = 120_000
 DECIDED_MS = 1_000  # the observation tick that decides the commit runs at ts 1000

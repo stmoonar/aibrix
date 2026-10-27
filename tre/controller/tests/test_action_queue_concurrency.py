@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.planner import ScaleAction
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 class GatedClient:

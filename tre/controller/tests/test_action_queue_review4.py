@@ -10,7 +10,6 @@ import asyncio
 from types import SimpleNamespace
 
 from tre_controller.loops.action_queue import (
-    ActionQueue,
     DispatchResult,
     _dispatch_result,
     revalidate_commit_from_signals,
@@ -39,6 +38,7 @@ from test_safescale_commit import (
     _registry,
     _start_and_prime,
 )
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 def _view(*bindings):
@@ -57,15 +57,12 @@ UNCONFIRMED_409 = {
 def test_a_receiver_target_is_resolved_once_from_the_sm_then_frozen():
     async def scenario():
         sm = ScriptedSM(results={"target:8b": [{"ok": False, "error": "HTTP 409", "retriable": True}]})
-        awake = {"n": 2}
-
-        async def model_awake(model):
-            return {"ok": True, "awake": awake["n"]}
-
-        sm.model_awake = model_awake
+        sm.awake_counts = {"8b": 2}
 
         async def grow(_seconds):
-            awake["n"] = 5  # the SM state changes meanwhile: the retry keeps its target
+            # The SM state changes meanwhile: the retry keeps its target (a target met
+            # meanwhile is dropped locally instead, test_plans_20261027).
+            sm.awake_counts["8b"] = 1
 
         queue = ActionQueue(sm, sleep=grow)
         commit = SafeScaleCommitAction(
@@ -252,8 +249,7 @@ class RecordingSM:
         self.calls.append((model, "target", target))
         return {"ok": True}
 
-    async def model_awake(self, model):
-        return {"ok": True, "awake": 0}
+    default_awake = 0  # the plan's GET /v2/state (PlanShim)
 
 
 def test_a_committing_probe_survives_a_controller_restart_and_is_finished():

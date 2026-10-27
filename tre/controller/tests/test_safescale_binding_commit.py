@@ -9,6 +9,7 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_controller.app import _active_probe_models
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue
+from plan_shim import PlanShim  # the in-process service has no plan executor here
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_from_state
 from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.rescue_task import rescue_task
@@ -190,7 +191,7 @@ def test_probe_hides_serving_pod_and_commit_sleeps_exactly_that_pod() -> None:
     )
     service = ServiceManagerV2(registry, store)
     sm = InProcessServiceManager(service)
-    queue = ActionQueue(sm)
+    queue = ActionQueue(PlanShim(sm, state=service.get_state))
     machine = SafeScaleStateMachine(
         config=SafeScaleConfig(
             ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5
