@@ -860,17 +860,23 @@ class ServiceManagerV2:
             request=request,
             wait_s=self._sm_config.writer_lock_wait_s if wait_s is None else wait_s,
         ) as operation:
-            with self._holds:
-                self._holds_active += 1
-            try:
+            with self._hold_counted():
                 # ``executing`` carries the lock wait (requested_at, lock_wait_ms)
                 # the coordinator measured, for the queueing after deployment.
                 operation.advance("executing")
                 yield operation
-            finally:
-                with self._holds:
-                    self._holds_active -= 1
-                    self._holds.notify_all()
+
+    @contextmanager
+    def _hold_counted(self):
+        """Count one writer-lock hold of this process for the shutdown wait."""
+        with self._holds:
+            self._holds_active += 1
+        try:
+            yield
+        finally:
+            with self._holds:
+                self._holds_active -= 1
+                self._holds.notify_all()
 
     @contextmanager
     def _desired_guard(self, binding_ids=None, *, reason: str):
@@ -1631,6 +1637,10 @@ class ServiceManagerV2:
         back at its next poll. Safe to call from a signal handler."""
         if self._sleep_primitive is not None:
             self._sleep_primitive.begin_shutdown()
+        coordinator = self._operation_coordinator
+        if coordinator is not None and hasattr(coordinator, "begin_shutdown"):
+            # Writers still queued for the lock fail fast (503); the holder finishes.
+            coordinator.begin_shutdown(ServiceShuttingDown("service-manager is shutting down; retry"))
         supervisor = self._supervisor
         stop_flag = getattr(supervisor, "request_stop", None)
         if callable(stop_flag):
@@ -2332,7 +2342,7 @@ class ServiceManagerV2:
         # another short writer phase happened to hold it.
         with self._operation_coordinator.operation(
             "startup_admit", request=request, wait_s=self._sm_config.writer_lock_wait_s
-        ) as operation:
+        ) as operation, self._hold_counted():
             operation.advance("validating_startup", details={"binding_id": pod.binding_id})
             # Checked again under the writer lock (review 2 P3): no sleep can start
             # and no transient lease can appear between the check and the admission.
@@ -5069,8 +5079,6 @@ class ServiceManagerV2:
             # Nothing of the call was sent (its floor guard, a shutdown, ...).
             detail = (f"sleep of {failed[0].serve_id} not sent: the {choice.item.sleep_path} sleep call "
                       f"failed ({type(error).__name__}: {error})")
-            if not isinstance(error, SleepFailed):
-                return error
         else:
             detail = f"sleep of {failed[0].serve_id} did not complete"
         failure = type(error)(detail, outcomes=outcomes) if isinstance(error, SleepFailed) else SleepFailed(
@@ -5928,7 +5936,11 @@ class ServiceManagerV2:
                 view = (live, self._transient_lease_ids())
             except Exception as exc:  # noqa: BLE001 - per model below (exempt paths skip)
                 view_error = exc
-        books = self._store.load().bindings
+        books = None
+        try:
+            books = self._store.load().bindings
+        except Exception as exc:  # noqa: BLE001 - per model below (exempt paths skip)
+            view_error = view_error or exc
         for model, binding_ids in sorted(by_model.items()):
             try:
                 if view_error is not None:

@@ -200,6 +200,19 @@ def test_fenced_operation_atomically_writes_state_and_records_success():
     assert _SAVE_SCRIPT in redis.eval_calls
 
 
+def test_a_queued_writer_raises_the_shutdown_error_instead_of_taking_the_lock():
+    redis = ScriptRedis()
+    holder = OperationCoordinator(redis, owner="pod-a")
+    waiter = OperationCoordinator(redis, owner="pod-b", poll_interval_s=0.01)
+    boom = RuntimeError("shutting down")
+    with holder.operation("reconcile"):
+        waiter.begin_shutdown(boom)
+        with pytest.raises(RuntimeError) as caught:
+            waiter.acquire("late", wait_s=5)
+        assert caught.value is boom
+    assert redis.values.get(rediskeys.SM_WRITER_LOCK_KEY) is None
+
+
 def test_second_writer_is_rejected_while_lease_is_held():
     redis = ScriptRedis()
     first = OperationCoordinator(redis, owner="pod-a")

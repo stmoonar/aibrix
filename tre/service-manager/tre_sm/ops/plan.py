@@ -285,7 +285,7 @@ def select_plan(
             choice.skipped[SKIP_UNCOVERED] = choice.skipped.get(SKIP_UNCOVERED, 0) + 1
             return None, blocked
         # A GPU of the binding not held by S is free on P (the blocker
-        # passed): taken now in R, leased at the wave-2 prepare.
+        # passed): reserved now (not written into R), leased at the wave-2 prepare.
         return 2, tuple(dep.binding_id for dep in deps)
 
     def step(fill: _Fill, keep_reserve: bool) -> bool:

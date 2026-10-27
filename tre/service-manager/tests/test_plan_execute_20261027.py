@@ -22,6 +22,7 @@ from tre_common.registry import (
     K8S_CALLS_WAVE1_RECORD,
 )
 from tre_sm.ops.plan import SleepItem, WakeItem
+from tre_sm.ops.sleep_primitive import ServiceShuttingDown
 
 from test_k8s_call_budget_20261006 import _count_sequential_k8s_calls
 from test_wholelock_20261002 import DEFAULT_PODS, Unanswered, World, _run
@@ -190,6 +191,26 @@ def test_one_plan_is_one_writer_lock_acquisition():
     assert world.coordinator.kinds == ["plan"]
     [(_kind, handle)] = world.coordinator.handles
     assert handle.notes["plan"]["status"] == "done" and "phases_ms" in handle.notes
+
+
+def test_a_redis_load_error_on_the_floor_check_is_409_routable_unknown():
+    world = World(pods=MIXED)
+    service = world.service
+    guard, load = service._sleep_floor_guard, service._store.load
+
+    def failing_guard(targets, path):  # Redis breaks between the plan's read and the hide
+        service._store.load = lambda *a, **k: (_ for _ in ()).throw(ConnectionError("redis"))
+        try:
+            return guard(targets, path)
+        finally:
+            service._store.load = load
+
+    service._sleep_primitive._floor_guard = failing_guard
+    response = post(world, MIXED_PLAN)
+
+    [sleep] = response.json()["sleeps"]  # a plan reports the 409 per item
+    assert sleep["status"] in ("refused", "failed") and sleep["error"]["reason"] == "routable_unknown"
+    assert not [p for p in world.runtime.patches if p[1] == "hidden"] and world.awake("d-0")
 
 
 def test_an_unreadable_routable_view_is_409_before_any_hide_or_wake():
@@ -484,6 +505,29 @@ def test_shutdown_waits_for_a_plan_and_its_wakes_stay_parallel():
     assert len(threads) == 2 and all(name.startswith("wake") for name in threads)
     assert order == ["plan", "shutdown"] and "error" not in stopped
     assert world.awake("r-0") and world.awake("r-1") and world.journals() == ({}, {})
+
+
+def test_a_writer_queued_for_the_lock_fails_fast_once_shutdown_begins():
+    """Review 2026-10-28: a plan queued behind the holder started after it and pushed
+    the shutdown past the termination grace. Now it gets the shutting-down error
+    without taking the lock; the holder finishes."""
+    world = World(pods=MIXED)
+    entered, release = world.hold_inside("sleep", world.ip_of["d-0"])
+    holder, held = _run(lambda: world.service.execute_plan(
+        sleeps=[SleepItem(model="d", sleep_path="urgent", at_most=0)], wakes=[],
+    ))
+    assert entered.wait(5)
+    queued, box = _run(lambda: world.service.execute_plan(sleeps=[], wakes=[WakeItem(model="x", at_least=1)]))
+    threading.Event().wait(0.3)  # the second plan is waiting for the lock
+    assert queued.is_alive()
+    world.service.begin_shutdown()
+    queued.join(5)
+    release.set()
+    holder.join(5)
+
+    assert isinstance(box.get("error"), ServiceShuttingDown), box
+    assert "error" not in held, held
+    assert not world.awake("x-1")
 
 
 def test_a_wave_2_pick_does_not_block_a_later_wave_1_pick():

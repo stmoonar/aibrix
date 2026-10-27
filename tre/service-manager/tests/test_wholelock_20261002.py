@@ -64,14 +64,25 @@ class BlockingCoordinator:
         self.handles: list[tuple[str, FakeHandle]] = []
         self.waiting = threading.Event()
         self.active = None
+        self.shutdown_error = None
+
+    def begin_shutdown(self, error):
+        """As the real coordinator: a caller not holding the lock raises ``error``."""
+        self.shutdown_error = error
 
     @contextmanager
     def operation(self, kind, *, request=None, wait_s=0.0):
         requested = time.monotonic()
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
         if not self._lock.acquire(blocking=False):
             self.waiting.set()
-            if not self._lock.acquire(timeout=max(0.01, float(wait_s))):
-                raise OperationBusy(f"held by {self.active}")
+            deadline = requested + max(0.01, float(wait_s))
+            while not self._lock.acquire(timeout=0.02):
+                if self.shutdown_error is not None:
+                    raise self.shutdown_error
+                if time.monotonic() >= deadline:
+                    raise OperationBusy(f"held by {self.active}")
         self.kinds.append(kind)
         handle = FakeHandle(f"{kind}-{len(self.kinds)}")
         handle.lock_wait_ms = int(round((time.monotonic() - requested) * 1000))  # as the real coordinator
