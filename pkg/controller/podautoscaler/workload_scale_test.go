@@ -399,6 +399,53 @@ func TestAPASleepModeServiceManageCallOutlivesTheReconcileDeadline(t *testing.T)
 	}
 }
 
+// The reconcile deadline fires first, then the outer (manager) context is canceled: the call ends.
+func TestAPASleepModeServiceManageCallEndsOnShutdownAfterReconcileDeadline(t *testing.T) {
+	blocked := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models_replicas" {
+			_, _ = w.Write([]byte(`{"test-llm":1}`))
+			return
+		}
+		_, _ = io.ReadAll(r.Body)
+		close(blocked)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	pa := &autoscalingv1alpha1.PodAutoscaler{
+		ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
+			ScalingStrategy: autoscalingv1alpha1.APA,
+			ScaleTargetRef:  corev1.ObjectReference{Kind: "Deployment", Name: "test-llm"},
+		},
+	}
+	client := server.Client()
+	client.Timeout = 60 * time.Second
+	ws := &workloadScale{serviceManageURL: server.URL, serviceManageHTTPClient: client, sleepModeEnabled: true}
+
+	outer, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	ctx := context.WithValue(outer, outerContextKey{}, outer)
+	ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond) // what Reconcile does
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- ws.SetDesiredReplicas(ctx, pa, 2) }()
+	<-blocked
+	<-ctx.Done() // the reconcile deadline fired; the call must still be running
+	select {
+	case err := <-done:
+		t.Fatalf("call ended on the reconcile deadline: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	shutdown()
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("manager shutdown after the reconcile deadline did not end the service-manager call")
+	}
+}
+
 func TestAPASleepModeConfigServiceManageTimeout(t *testing.T) {
 	t.Setenv("APA_SCALE_SLEEP_MODE", "1")
 	t.Setenv("SERVICE_MANAGE_URL", "http://sm.test:8000")

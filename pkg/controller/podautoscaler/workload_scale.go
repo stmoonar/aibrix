@@ -362,6 +362,9 @@ func (s *workloadScale) serviceManageClient() *http.Client {
 	return &http.Client{Timeout: defaultServiceManageTimeout}
 }
 
+// outerContextKey stores the Reconcile context from before its deadline was added.
+type outerContextKey struct{}
+
 // serviceManageContext is the context of one service-manager call. The reconcile context carries
 // DefaultReconcileTimeoutDuration (10 s, podautoscaler_controller.go Reconcile), far below a plan's
 // worst case (writer lock wait + one hold, service_manager.api_call_timeout_s): a call bound to it
@@ -380,8 +383,14 @@ func (s *workloadScale) serviceManageContext(parent context.Context) (context.Co
 		timeout = defaultServiceManageTimeout
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
-	stop := context.AfterFunc(parent, func() {
-		if errors.Is(parent.Err(), context.Canceled) {
+	// Cancellation follows the context from BEFORE Reconcile added its deadline, so a shutdown after
+	// the reconcile deadline already fired still ends the call.
+	outer := parent
+	if o, ok := parent.Value(outerContextKey{}).(context.Context); ok {
+		outer = o
+	}
+	stop := context.AfterFunc(outer, func() {
+		if errors.Is(outer.Err(), context.Canceled) {
 			cancel()
 		}
 	})
