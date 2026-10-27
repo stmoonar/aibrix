@@ -12,7 +12,7 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 TRE_ROOT = DEPLOY_ROOT.parent
 BL_DIR = DEPLOY_ROOT / "baselines" / "tre"
 POLICIES = ("chiron", "tokenscale", "preserve")
-BASELINE_SCALER_TAG = "20261028-5755f6cf"  # built from that commit (clean non-worktree clone, context tre/)
+BASELINE_SCALER_TAG = "20261028-e891d29b"  # built from that commit (clean non-worktree clone, context tre/)
 IP_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 
