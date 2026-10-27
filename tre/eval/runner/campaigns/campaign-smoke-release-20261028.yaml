@@ -30,7 +30,7 @@ gap_s: 0
 eta: {overhead_s: 320, report_s: 60}
 
 registry_expect:
-  registry_id: null                 # FILL after the release params_set publication (arm_registry.py id); null = refuses
+  registry_id: af9aef4701804743                 # live registry after the release params_set publication (10-28 03:18, freeze 01a7308a)
   present:
     - "*.trs.numerator"
     - "*.trs.theta_window_ms"

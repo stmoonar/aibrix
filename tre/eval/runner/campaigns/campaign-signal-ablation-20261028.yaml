@@ -42,7 +42,7 @@ gap_s: 0
 eta: {overhead_s: 280, report_s: 150}
 
 registry_expect:
-  registry_id: null                 # FILL after prerequisites 1-2 (arm_registry.py id); null = the run refuses to start
+  registry_id: af9aef4701804743                 # live registry after the release params_set publication (10-28 03:18, freeze 01a7308a)
   present:
     # recalibration stamps (feat/tss-counter-20261028; names verified on release/20261028: tre_common.tss.theta_basis_errors):
     - "*.trs.numerator"
