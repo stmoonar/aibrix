@@ -1123,7 +1123,8 @@ def fit_plan(
     4. ``ablation`` - the same verdict for the two TSS ablation arms of plan §6.9,
        TSS(lambda=0) and TSS(w_p=1), with the primary label (``--label-lambda-wait``), so
        the paper can show that the weighting, not the signal, does the work;
-    5. ``alt`` - ``fit_alt_thresholds`` for queue_len / decode_tps / prefill_tps on the
+    5. ``alt`` - ``fit_alt_thresholds`` for all five ALT_SIGNALS (queue_len, ttft_mean,
+       kv_usage, decode_tps, prefill_tps) on the
        same fitting and family CSVs and the same label; it runs the very same
        ``theta_verdict.verdict_report`` per model and writes one verdict JSON per
        model and signal;
@@ -1139,7 +1140,6 @@ def fit_plan(
     from tre_common.slo_labels import (
         label_arms, label_cli_args, label_def_from_args, label_mode_cli_args,
     )
-    from tre_common.tss import DEFAULT_EMA_TAU_MS
 
     from scripts import alpha_fit
 
@@ -1176,7 +1176,7 @@ def fit_plan(
         "order": ["rewindow", "alpha", "dline", "theta", "verdict", "ablation", "alt", "holdout"],
         "label_def": None,  # filled per model below
         "label_def_by_model": {},
-        "ema_tau_ms": DEFAULT_EMA_TAU_MS,
+        "ema_tau_ms": None,  # set from the registry below
         "rewindow": [],
         "alpha": [],
         "alpha_rule": {
@@ -1266,6 +1266,11 @@ def fit_plan(
         "holdout": holdout_sel,
     }
     registry = _load_registry(getattr(args, "registry", None))
+    # The tau every fit step runs at is the one the controller will use: the registry's
+    # ``trs.ema_tau_ms`` (a stamped alt basis must equal it). No default: a fit at another
+    # tau would make the controller refuse to start.
+    ema_tau_ms = registry_ema_tau_ms(registry, models)
+    plan["ema_tau_ms"] = ema_tau_ms
     # Plan ��6.9g pitfall 2 / D8: by default every fitting window ends on the gateway's
     # 10 s grid with a 10 s step, the window the phase-aligned controller reads.
     # --fit-window-align none (+ --fit-step-ms 5000) reproduces the legacy windowing.
@@ -1426,7 +1431,7 @@ def fit_plan(
                         "--recompute-tss",
                         "--w-p", str(w_p),
                         "--lambda-wait", str(lambda_wait),
-                        "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                        "--ema-tau-ms", str(ema_tau_ms),
                     ],
                 }
                 if family:
@@ -1449,7 +1454,7 @@ def fit_plan(
                 *[a for family, _scope, path in scopes if family for a in ("--family", f"{family}={path}")],
                 "--w-p", str(w_p),
                 "--lambda-wait", str(PRIMARY_LAMBDA_WAIT),
-                "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                "--ema-tau-ms", str(ema_tau_ms),
                 *slo,
                 "--output", str(verdict_json),
             ],
@@ -1475,7 +1480,7 @@ def fit_plan(
                     "--w-p", str(arm_w_p),
                     "--lambda-wait", str(arm_lambda),
                     "--label-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
-                    "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                    "--ema-tau-ms", str(ema_tau_ms),
                     *slo,
                     "--output", str(arm_json),
                 ],
@@ -1530,7 +1535,7 @@ def fit_plan(
                 *_without_idle_fit(slo),
                 "--signal", signal,
                 "--label-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
-                "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                "--ema-tau-ms", str(ema_tau_ms),
                 "--verdict-dir", str(fit_dir),
                 "--output", str(fit_dir / f"alt_{signal}.yaml"),
                 "--curve-dir", str(fit_dir / "alt_curves"),
@@ -1567,6 +1572,18 @@ def ablation_arms(w_p: float) -> list[tuple[str, float, float]]:
         ("tss_lw0", float(w_p), 0.0),
         ("tss_wp1", 1.0, PRIMARY_LAMBDA_WAIT),
     ]
+
+
+def registry_ema_tau_ms(registry, models: Sequence[str]) -> float:
+    """The one ``trs.ema_tau_ms`` of ``models`` in ``registry``; raises when a model has none
+    or the models differ (the fit has a single tau and the stamped basis must equal it)."""
+    taus = {m: registry.model(m).trs.ema_tau_ms for m in models}
+    missing = sorted(m for m, tau in taus.items() if tau is None)
+    if missing:
+        raise SystemExit(f"registry trs.ema_tau_ms is not set for {missing}: the fit needs the controller's tau")
+    if len(set(taus.values())) != 1:
+        raise SystemExit(f"registry trs.ema_tau_ms differs between models ({taus}): one fit, one tau")
+    return float(next(iter(taus.values())))
 
 
 def _load_registry(path: Optional[str]):

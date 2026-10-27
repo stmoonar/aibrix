@@ -659,7 +659,8 @@ class MetricsStore:
             instant_ticks_ms=_doc_ticks(inst_docs) if instant_ticks is None else instant_ticks,
             gpu_cache_usage=self._instant_avg_optional(model, INSTANT_METRICS["gpu_cache"], inst_docs),
             ttft_avg_ms=_seconds_to_ms(ttft_avg_s),
-            ttft_count=self._hist_count_known(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
+            ttft_count=self._hist_count_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
+            ttft_count_complete=self._hist_series_complete(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
             tpot_avg_ms=_seconds_to_ms(tpot_avg_s),
             tpot_count=self._hist_count_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms),
             e2e_hist=e2e_hist,
@@ -749,20 +750,17 @@ class MetricsStore:
             _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0),
         )
 
-    def _hist_count_known(
+    def _hist_series_complete(
         self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
-    ) -> float | None:
-        """Count delta of ``metric`` when every histogram doc of the read (the baseline and
-        the window's docs) carries it; None (unknown, never 0) otherwise. Review L3
-        (2026-10-28): the ttft_mean signal's first-token count - an absent TTFT histogram
-        read 0 ("no first token") and the pod was skipped silently; the offline columns
-        void such a window (``alt_signal_columns`` ``missing_series``)."""
+    ) -> bool:
+        """True when every histogram doc of the read (the baseline and the window's docs)
+        carries ``metric``. Review L3 (2026-10-28): the alt ttft_mean signal must not read an
+        absent TTFT histogram as "no first token"; the offline columns void such a window
+        (``alt_signal_columns`` ``missing_series``). Only the alt signal reads this."""
         hist = [doc for doc in docs if isinstance(doc.get("model_histogram_metrics"), dict)]
         if not _has_window_hist_doc(hist, window_start_ms):
-            return None
-        if any(_metric_entry(model, metric, doc) is None for doc in hist):
-            return None
-        return self._hist_count_delta(model, metric, hist, window_start_ms)
+            return False
+        return all(_metric_entry(model, metric, doc) is not None for doc in hist)
 
     def _hist_avg_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
         if not _has_window_metric(model, metric, docs, window_start_ms):
