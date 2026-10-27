@@ -9,20 +9,23 @@ Columns (v1 basis first, v2 basis next to it):
   replicas            mean awake replicas summed over the models over the load window (v1 "GPU")
   GPUs                mean awake GPUs (14b TP2 counts 2; the v2 cost basis)
   E2E / TTFT (s), TPOT (ms)   p50 / p90 / p95 / p99 over the successful scored requests (first trim_s
-                      seconds dropped, as the report)
+                      seconds dropped, as the report). TPOT = v2 definition (e2e - ttft) / (output_tokens - 1);
+                      "TPOT v1" = the client's own TPOT field (score_requests tpot_v1, p50 / p95 / p99)
   reissues            sidecar continuations (tre_reissue events) in the load window (v1 "重发")
   timeouts            requests cut by the 150 s route timeout (e2e >= 149 s) and their share of the scored
-                      requests (v1 ">115 s" was the v1 route cut)
+                      requests (v1 counted "> 115 s", its own route cut: not the same threshold)
   V_req %             the v2 primary metric
   scale up / down     increases / decreases of a model's awake replicas in the layout samples (v1 definition)
   probes              SafeScale probes started / committed / rolled back (safescale_summary.json)
-  actions             controller actions by reason (TRE arms): urgent = critical_*, HIGH shrink =
+  verdict             the campaign's validity verdict; a "suspect" arm is marked in the tables
+  actions             controller actions by reason (TRE arms): urgent = critical_* scale-ups only (receiver side,
+                      as v1's rescue gain; donor-side critical_* actions count as other), HIGH shrink =
                       high_proactive*, fairness = low_fairness*, LOW rescue = low_rescue*, IDLE shrink = idle*
 Per model: mean awake replicas; E2E p50 / p95 / p99 (s); TTFT p95 (s).
 
 CLI: ``python3 tre/eval/v1_summary.py <results_root | arm_dir>... --out DIR [--trim-s 30]``
 (a results root: every ``<trace>/<arm>/`` with a CAMPAIGN_DONE.json). Writes v1_summary.md,
-v1_summary.json and v1_summary.csv.
+v1_summary.json ({"notes", "rows"}) and v1_summary.csv.
 """
 from __future__ import annotations
 
@@ -40,6 +43,13 @@ from . import metrics as M
 ACTION_CLASSES = (("urgent", ("critical_",)), ("high_shrink", ("high_proactive",)), ("fairness", ("low_fairness",)),
                   ("low_rescue", ("low_rescue",)), ("idle_shrink", ("idle",)))
 PCTS = (50, 90, 95, 99)
+V1_PCTS = (50, 95, 99)       # score_requests' tpot_v1 percentiles
+NOTES = ("Latency cells: p50 / p90 / p95 / p99 of the successful scored requests (first trim_s seconds dropped). "
+         "TPOT = v2 definition (e2e - ttft) / (output_tokens - 1); TPOT v1 = the client's TPOT field (p50 / p95 / p99). "
+         "replicas = mean awake replicas summed over the models (v1 \"GPU\"); GPUs = mean awake GPUs (TP2 = 2). "
+         "timeouts = cut by the 150 s route timeout (e2e >= 149 s), share of scored requests; v1 counted > 115 s "
+         "(its route cut), not the same threshold. urgent = critical_* scale-ups only (v1 rescue gain). "
+         "[suspect] = campaign verdict suspect. Definitions: tre_eval/v1_summary.py.")
 
 
 def action_class(reason: str | None) -> str:
@@ -48,6 +58,14 @@ def action_class(reason: str | None) -> str:
         if r.startswith(prefixes):
             return name
     return "other"
+
+
+def _verdict(arm_dir: str) -> str | None:
+    for f in ("CAMPAIGN_DONE.json", "campaign_manifest.json"):
+        v = ((L._read_json(os.path.join(arm_dir, f)) or {}).get("validity") or {}).get("verdict")
+        if v:
+            return v
+    return None
 
 
 def _setting(arm_dir: str) -> str:
@@ -72,7 +90,7 @@ def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
     a = summ.get(M.ALL) or {}
     load_s = (gpu.get(M.ALL) or {}).get("load_s")
     row: dict[str, Any] = {"trace": arm.trace_name, "arm": arm.name, "label": arm.label, "setting": _setting(arm.dir),
-                           "dir": arm.dir, "n": a.get("n"), "fail": a.get("fail"), "V_req_pct": a.get("V_req_pct")}
+                           "dir": arm.dir, "verdict": _verdict(arm.dir), "n": a.get("n"), "fail": a.get("fail"), "V_req_pct": a.get("V_req_pct")}
     rep_s = sum((gpu.get(m) or {}).get("replica_s") or 0.0 for m in arm.models)
     row["replicas"] = round(rep_s / load_s, 2) if load_s else None
     row["gpus"] = round((gpu.get(M.ALL) or {}).get("mean_gpus"), 2) if (gpu.get(M.ALL) or {}).get("mean_gpus") is not None else None
@@ -80,6 +98,9 @@ def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
         for p in PCTS:
             v = a.get(f"{m}_p{p}_ms")
             row[f"{m}_p{p}"] = None if v is None else round(v * scale, 3 if scale != 1.0 else 1)
+    for p in V1_PCTS:
+        v = a.get(f"tpot_v1_p{p}_ms")
+        row[f"tpot_v1_p{p}"] = None if v is None else round(v, 1)
     row["reissues"] = inter.get("sidecar_reissue_events")
     row["continued_requests"] = inter.get("client_continued_requests")
     row["timeouts"] = a.get("censored_ge_149s")
@@ -103,7 +124,10 @@ def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
                 continue
             for x in t["actions"]:
                 if isinstance(x, dict) and x.get("reason") != "probe_started":   # probes are counted above
-                    acts[action_class(x.get("reason"))] += 1
+                    cls = action_class(x.get("reason"))
+                    if cls == "urgent" and not (x.get("receiver") or (x.get("delta") or 0) > 0):
+                        cls = "other"     # donor side of a CRITICAL action: v1 counted the gain only
+                    acts[cls] += 1
                     by_reason[str(x.get("reason"))] += 1
     row.update({f"act_{name}": acts.get(name, 0) for name, _ in ACTION_CLASSES})
     row["act_other"] = acts.get("other", 0)
@@ -146,25 +170,24 @@ def _quad(r: dict, m: str) -> str:
 
 
 def _name(r: dict) -> str:
-    return r["label"] + (f" ({r['setting']})" if r.get("setting") else "")
+    return (r["label"] + (f" ({r['setting']})" if r.get("setting") else "")
+            + (" [suspect]" if r.get("verdict") == "suspect" else ""))
 
 
 def markdown(rows: list[dict]) -> str:
     traces: dict[str, list] = {}
     for r in rows:
         traces.setdefault(r["trace"], []).append(r)
-    out = ["# Cross-arm summary (v1 table format)", "",
-           "Latency cells: p50 / p90 / p95 / p99 of the successful scored requests. replicas = mean awake replicas "
-           "summed over the models (v1 \"GPU\"); GPUs = mean awake GPUs (TP2 = 2). timeouts = cut by the 150 s route "
-           "timeout (share of scored requests). See tre_eval/v1_summary.py for every definition.", ""]
+    out = ["# Cross-arm summary (v1 table format)", "", NOTES, ""]
     for t, rs in traces.items():
         models = sorted({m for r in rs for m in r["models"]})
         out += [f"## {t}", "",
-                "| arm | replicas | GPUs | E2E (s) | TTFT (s) | TPOT (ms) | reissues | timeouts | V_req % |",
-                "|---|---|---|---|---|---|---|---|---|"]
+                "| arm | replicas | GPUs | E2E (s) | TTFT (s) | TPOT (ms) | TPOT v1 (ms) | reissues | timeouts | V_req % |",
+                "|---|---|---|---|---|---|---|---|---|---|"]
         for r in rs:
+            v1 = " / ".join(_f(r.get(f"tpot_v1_p{p}")) for p in V1_PCTS)
             out.append(f"| {_name(r)} | {_f(r['replicas'])} | {_f(r['gpus'])} | {_quad(r, 'e2e')} | {_quad(r, 'ttft')} | "
-                       f"{_quad(r, 'tpot')} | {_f(r['reissues'])} | {_f(r['timeouts'])} ({_f(r['timeout_pct'])} %) | "
+                       f"{_quad(r, 'tpot')} | {v1} | {_f(r['reissues'])} | {_f(r['timeouts'])} ({_f(r['timeout_pct'])} %) | "
                        f"{_f(r['V_req_pct'])} |")
         out += ["", "Controller actions:", "",
                 "| arm | scale up / down | probes started / committed / rolled back | HIGH shrink | urgent (CRITICAL) "
@@ -187,8 +210,9 @@ def markdown(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
-CSV_FIELDS = ["trace", "arm", "label", "setting", "n", "fail", "V_req_pct", "replicas", "gpus",
-              *[f"{m}_p{p}" for m in ("e2e", "ttft", "tpot") for p in PCTS], "reissues", "continued_requests",
+CSV_FIELDS = ["trace", "arm", "label", "setting", "verdict", "n", "fail", "V_req_pct", "replicas", "gpus",
+              *[f"{m}_p{p}" for m in ("e2e", "ttft", "tpot") for p in PCTS],
+              *[f"tpot_v1_p{p}" for p in V1_PCTS], "reissues", "continued_requests",
               "timeouts", "timeout_pct", "scale_up", "scale_down", "probes", "probe_commits", "probe_rollbacks",
               *[f"act_{n}" for n, _ in ACTION_CLASSES], "act_other", "dir"]
 
@@ -199,7 +223,7 @@ def write(rows: list[dict], out: str) -> dict[str, str]:
     with open(paths["md"], "w") as fh:
         fh.write(markdown(rows) + "\n")
     with open(paths["json"], "w") as fh:
-        json.dump(rows, fh, indent=1, default=str)
+        json.dump({"notes": NOTES, "rows": rows}, fh, indent=1, default=str)
     with open(paths["csv"], "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
         w.writeheader()

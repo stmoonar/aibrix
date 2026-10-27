@@ -25,7 +25,8 @@ def make_tre_arm(root, name="sens-theta-m20"):
             for i in range(95)]
     rows.append(req(95, model="m-b", t=60.0, e2e=150.0, ttft=0.2))       # cut by the route timeout
     write_arm(d, layout, rows)
-    acts = [(31, [{"model": "m-a", "delta": 1, "reason": "critical_sleeping_capacity"}]),
+    acts = [(31, [{"model": "m-a", "delta": 1, "reason": "critical_sleeping_capacity"},
+                  {"model": "m-b", "delta": -1, "reason": "critical_donor_immediate"}]),     # donor side: not urgent
             (50, [{"receiver": "m-b", "donor": "m-a", "reason": "low_fairness_idle_capacity"},
                   {"model": "m-b", "reason": "probe_started", "kind": "hide"}]),
             (60, [{"model": "m-a", "delta": -1, "reason": "high_proactive_safescale"}]),
@@ -39,7 +40,7 @@ def make_tre_arm(root, name="sens-theta-m20"):
         json.dump({"registry_rules": ["*.trs.theta_m x0.8"],
                    "controller_env": {"TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}, fh)
     with open(os.path.join(d, "CAMPAIGN_DONE.json"), "w") as fh:
-        fh.write("{}")
+        json.dump({"validity": {"verdict": "suspect" if name == "tre" else "valid"}}, fh)
     return d
 
 
@@ -57,7 +58,9 @@ def test_v1_row_reuses_tre_eval_metrics_and_classifies_actions(tmp_path):
     assert r["replicas"] == pytest.approx((100 + 30 + 100 + 50) / 100, abs=0.02)
     assert r["gpus"] == pytest.approx((100 + 30 + 100 + 2 * 50) / 100, abs=0.02)
     assert (r["probes"], r["probe_commits"], r["probe_rollbacks"]) == (3, 2, 1)
-    assert (r["act_urgent"], r["act_fairness"], r["act_high_shrink"], r["act_other"]) == (1, 1, 1, 0)
+    assert (r["act_urgent"], r["act_fairness"], r["act_high_shrink"], r["act_other"]) == (1, 1, 1, 1)
+    assert r["tpot_v1_p95"] == (None if a["tpot_v1_p95_ms"] is None else pytest.approx(a["tpot_v1_p95_ms"], abs=0.1))
+    assert r["verdict"] == "valid"
     assert r["setting"] == "*.trs.theta_m x0.8"
 
 
@@ -71,4 +74,7 @@ def test_v1_summary_files_from_a_results_root(tmp_path):
     assert "## Simul_spike_s1" in md and "| sens-theta-m20 (*.trs.theta_m x0.8) |" in md
     assert md.count("| E2E (s) |") == 1 and "scale up / down" in md and "m-a | m-b" in md
     assert open(paths["csv"]).readline().startswith("trace,arm,label,setting")
-    assert len(json.load(open(paths["json"]))) == 2
+    doc = json.load(open(paths["json"]))
+    assert len(doc["rows"]) == 2 and "115 s" in doc["notes"] and "(e2e - ttft)" in doc["notes"]
+    assert "| TRE [suspect] |" in md or "(*.trs.theta_m x0.8) [suspect] |" in md
+    assert "150 s route timeout" in md and "TPOT v1 (ms)" in md
