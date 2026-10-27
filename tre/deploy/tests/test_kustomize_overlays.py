@@ -82,8 +82,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     controller = _load_yaml(overlay / "controller.yaml")
     sm = _load_yaml(overlay / "service-manager.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20261026-11cb2166"
-    assert _image(sm) == "tre-v2-service-manager:20261026-ffc240d1"
+    assert _image(controller) == "tre-v2-controller:20261028-5755f6cf"
+    assert _image(sm) == "tre-v2-service-manager:20261028-5755f6cf"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     # Review P1-2: single writer across rollouts, and a grace period derived from
     # the registry sleep policy (a sleep past /sleep finishes; drains roll back).
@@ -105,7 +105,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         if d and d["kind"] == "Deployment"
     )
     # Rebuilt by deploy/scripts/build_gateway_plugins_nozmq.sh (TRE-PATCH P2-GW-004/005).
-    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20261026-ffc240d1-nozmq2"
+    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20261028-5755f6cf-nozmq2"
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"

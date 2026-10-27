@@ -22,7 +22,7 @@ spec:
       serviceAccountName: tre-v2-baseline-scaler
       containers:
         - name: baseline-scaler
-          image: tre-v2-baseline-scaler:20261026-aa011067
+          image: tre-v2-baseline-scaler:20261028-5755f6cf
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
