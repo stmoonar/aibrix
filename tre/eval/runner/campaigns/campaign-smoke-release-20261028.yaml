@@ -1,0 +1,115 @@
+# Release 20261028 smoke (tre/docs/release/20261028-release.md step 7), after the deploy and the alt-signal fit are
+# published. One 300 s slice of Simul_spike (base 0.5; P1 surge 90-240 s up and down: exactly 8 GPUs, the 14b
+# aligned-pair race), 5 arms, one attempt each:
+#   tre-ss-receiverless  TRE as in campaign-v2-20261028 (TSS step counters, 20 s window)
+#   apa                  APA (controller-manager posts absolute targets to POST /v2/plans)
+#   tokenscale           baseline-scaler, one POST /v2/plans per tick
+#   sig-queue            alt signal queue_len (controller refuses unless the fitted alt thresholds + basis are live)
+#   sens-theta-m20       theta_m x0.8 on every model: exercises params_set apply / restore and the
+#                        tre.dev/arm-registry-restore annotation (check it is cleared and the registry id is back)
+# registry_expect needs the published registry id (same value as campaign-v2-20261028). The smoke may run from the
+# release branch before main is updated (AGENTS.md rule 6 exception for smoke; the dry-run warns).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-release-20261028.yaml --dry-run --probe
+#   (marker: validation <start> <end> round=smoke-release-20261028)
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-smoke-release-20261028.yaml > /data/nfs_shared_data/xxy/smoke-release-20261028.out 2>&1 &
+#   python3 tre/eval/runner/first_run_check.py /data/nfs_shared_data/xxy/smoke-release-20261028/Simul_spike_slice0-300_s1/<arm>
+# NOTE: results_root, the trace / config roots and the other absolute paths below are site-specific.
+name: smoke-release-20261028
+round: smoke-release-20261028       # exclusive-window marker: "validation <start> <end> round=smoke-release-20261028"
+results_root: /data/nfs_shared_data/xxy/smoke-release-20261028
+trace_root: ${CAMPAIGN_TRACE_ROOT}
+loadgen_config_root: ${CAMPAIGN_CONFIG_ROOT}
+seed: 1
+arms: [tre-ss-receiverless, apa, tokenscale, sig-queue, sens-theta-m20]
+order: williams
+max_attempts: 1                     # a smoke failure is looked at, not retried
+gap_s: 0
+# per arm: slice (300 s) + ~280 s runner overhead (+ ~120 s for the two params_set restarts of the perturbed arm)
+eta: {overhead_s: 320, report_s: 60}
+
+registry_expect:
+  registry_id: null                 # FILL after the release params_set publication (arm_registry.py id); null = refuses
+  present:
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+    - "*.alt_thresholds.queue_len.theta"
+    - "*.alt_thresholds.queue_len.delta_crit"
+    - "*.alt_thresholds.queue_len.delta_high"
+    - "*.alt_thresholds.queue_len.basis.definition"
+    - "*.alt_thresholds.queue_len.basis.window_ms"
+
+env:
+  CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
+  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2}"
+  CAMPAIGN_TIGHT_POOL: "${CAMPAIGN_TIGHT_POOL:-Tight_pool}"
+  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-${TRE_REPO}/eval/configs/t7-decision-points.yaml}"
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, baselines and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"               # the event stream stays on between arms (every arm wants it): no gateway rollouts
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  # post-run check (first_run_check.py, run_check.json): expected periods and limits
+  RUN_CHECK_CONTROLLER_TICK_S: "5"  # controller fast loop (TRE_RESCUE_INTERVAL_SECONDS)
+  RUN_CHECK_BASELINE_TICK_S: "5"    # baseline scaler tick (TRE_BL_TICK_S, 5 s from feat/bl-v1-port-20261026)
+  RUN_CHECK_COVERAGE_MIN: "0.9"     # ticks during the load >= 0.9 x load / tick
+  RUN_CHECK_FROZEN_MAX: "0.05"      # PreServe frozen-tick share, when the policy reports it
+
+arm_defs:
+  tre-ss-receiverless:
+    base: tre
+    label: TRE-SS-receiverless
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  sig-queue:
+    base: tre
+    label: QUEUE
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: queue_len, TRE_DISABLE_ETA_GATE: true}
+  sens-theta-m20:
+    base: tre
+    label: THETA-x0.8
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.theta_m": x0.8}
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces   # hostPath of the scaler's trace volume (overlay tre-cluster-75-76)
+  trace_pod_root: /etc/tre-baselines-traces                    # the same directory inside the scaler pod
+  match_parts: 3                    # mlstm needs >= 3 (<trace>/seed<k>/<file>: trace name + history)
+  history_root: /data/nfs_shared_data/xxy/bl-history-20261026   # Real_* only (not in the smoke)
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${CAMPAIGN_DECISION_POINTS}   # Tight_pool only (applies_to): no-op on these two traces
+  ref: tre-ss-receiverless
+  reps: 200
+  timeout_s: 600
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Simul_spike
+    slice: {start_s: 0, duration_s: 300}
