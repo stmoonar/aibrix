@@ -776,7 +776,7 @@ def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
         assert len(probs) == 1 and "registry_id is not filled in" in probs[0], probs   # every present path parses
         assert {"*.trs.numerator", "*.trs.theta_window_ms"} <= set(c["registry_expect"]["present"])
     assert {f"*.alt_thresholds.{s}.basis.{f}" for s in ("queue_len", "ttft_mean", "kv_usage")
-            for f in ("definition", "window_ms")} <= set(a["registry_expect"]["present"])
+            for f in ("definition", "window_ms", "ema_tau_ms")} <= set(a["registry_expect"]["present"])
 
 
 @pytest.mark.parametrize("kw, why", [

@@ -56,9 +56,9 @@ ANNOTATION = "tre.dev/arm-registry-restore"
 TRANSFORMS = ("tau_band",)
 _PATH = re.compile(r"(?P<model>\*|[A-Za-z0-9][A-Za-z0-9_.-]*?)\.(?P<path>(trs|slo)\.\w+|alt_thresholds\.\w+\.\w+|"
                    r"min_replicas|max_awake_replicas)")
-# registry_expect.present may also name the alt basis stamps (alt_thresholds.<signal>.basis.{definition,window_ms},
-# tre_common.alt_signals.alt_basis_errors); an arm cannot edit them (registry_params keeps _PATH).
-_PRESENT_PATH = re.compile(_PATH.pattern[:-1] + r"|alt_thresholds\.\w+\.basis\.(definition|window_ms))")
+# registry_expect.present may also name the alt basis stamps (alt_thresholds.<signal>.basis.{definition,window_ms,
+# ema_tau_ms}, tre_common.alt_signals.alt_basis_errors); an arm cannot edit them (registry_params keeps _PATH).
+_PRESENT_PATH = re.compile(_PATH.pattern[:-1] + r"|alt_thresholds\.\w+\.basis\.(definition|window_ms|ema_tau_ms))")
 _FACTOR = re.compile(r"x(?P<f>[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)")
 _ROUND = 6
 

@@ -6,8 +6,10 @@
 #   * SafeScale scope receiverless_shrink on every arm (user 10-28, §8.1).
 #   * eta gate (and waste ordering) off only on the alternative-signal arms (v1 D31, §8.3).
 #   * Tight_pool replaces v1's Alternating (§8.5). Disclose: Tight_pool is an integer overload, unlike Alternating.
-#   * Disclose: the O1 breakpoint hold and the onset saturation rescue act only on zm (eligibility_reason returns
-#     None for other signals), so the alternative-signal arms run without them (§3, §8.4).
+#   * Disclose: the O1 breakpoint-aware window and hold apply on every arm (alt signals included; the alt EMA
+#     restarts at the breakpoint like the TSS). Only the onset saturation rescue is zm-only (eligibility_reason returns
+#     None for other signals), so the alternative-signal arms run without it (§3, §8.4).
+#   * The controller refuses an alt-signal arm unless TRE_DISABLE_ETA_GATE=true (feat/alt-signals-20261028 1f05e51c).
 #
 # PREREQUISITES - the campaign refuses to start until all hold:
 #   1. The RECALIBRATED registry is live: TSS numerator = vLLM per-step token counter, signal window 20 s, EMA kept
@@ -55,13 +57,16 @@ registry_expect:
     - "*.alt_thresholds.kv_usage.delta_crit"
     - "*.alt_thresholds.kv_usage.delta_high"
     # alt basis stamps (feat/alt-signals-20261028: tre_common.alt_signals.alt_basis_errors; the controller refuses a
-    # mismatching definition / window_ms at start, this check fails the campaign before any arm):
+    # mismatching definition / window_ms / ema_tau_ms at start, this check fails the campaign before any arm):
     - "*.alt_thresholds.queue_len.basis.definition"
     - "*.alt_thresholds.queue_len.basis.window_ms"
+    - "*.alt_thresholds.queue_len.basis.ema_tau_ms"
     - "*.alt_thresholds.ttft_mean.basis.definition"
     - "*.alt_thresholds.ttft_mean.basis.window_ms"
+    - "*.alt_thresholds.ttft_mean.basis.ema_tau_ms"
     - "*.alt_thresholds.kv_usage.basis.definition"
     - "*.alt_thresholds.kv_usage.basis.window_ms"
+    - "*.alt_thresholds.kv_usage.basis.ema_tau_ms"
 
 env:
   CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
