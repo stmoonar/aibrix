@@ -1181,6 +1181,7 @@ def compute_model_signal(
     signal_state: SignalState | None,
     routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
     observe_onset: bool = True,
+    routable_pod_ids: frozenset[str] | None = None,
 ) -> ModelSignal:
     """TSS / Z of ``metrics`` (a serving window) with the O1 breakpoint window.
 
@@ -1218,7 +1219,10 @@ def compute_model_signal(
             theta_m=spec.trs.theta_m,
             window_end_ms=metrics.window_end_ms,
         )
-        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        signal = get_signal(
+            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+            routable_pod_ids=routable_pod_ids,
+        )
         return ModelSignal(result=result, signal=signal, metrics=metrics, warm=legacy_warm)
 
     if routable_observation is not None:
@@ -1240,7 +1244,10 @@ def compute_model_signal(
             theta_m=spec.trs.theta_m,
             window_end_ms=metrics.window_end_ms,
         )
-        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        signal = get_signal(
+            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+            routable_pod_ids=routable_pod_ids,
+        )
         return ModelSignal(result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window)
     if not window.warm and held > 0:
         # Review P2-2: the routable count keeps changing (crash loop, probes): after
@@ -1251,7 +1258,10 @@ def compute_model_signal(
             theta_m=spec.trs.theta_m,
             window_end_ms=metrics.window_end_ms,
         )
-        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        signal = get_signal(
+            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+            routable_pod_ids=routable_pod_ids,
+        )
         return ModelSignal(
             result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window, hold_fallback=held
         )
@@ -1263,7 +1273,10 @@ def compute_model_signal(
             window_end_ms=metrics.window_end_ms,
             advance_ema=False,
         )
-        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=None)
+        signal = get_signal(
+            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=None,
+            routable_pod_ids=routable_pod_ids,
+        )
         return ModelSignal(result=result, signal=signal, metrics=metrics, warm=False, window=window)
     suffix = window.metrics
     inp = TRSInput.from_metrics(suffix, spec.trs)
@@ -1276,7 +1289,13 @@ def compute_model_signal(
         window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
     )
     result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=suffix.window_end_ms)
-    signal = get_signal(suffix, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+    # Review M2 (2026-10-28): the alt EMA's idle-gap rule keeps the configured metrics
+    # window too (the suffix span reset it to the raw suffix value on every tick).
+    signal = get_signal(
+        suffix, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+        routable_pod_ids=routable_pod_ids,
+        ema_window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+    )
     return ModelSignal(result=result, signal=signal, metrics=suffix, warm=guard_warm, window=window)
 
 
@@ -1342,6 +1361,12 @@ def _model_contexts(
                 routable_observation=(
                     breakpoint_observation(cluster_view, queue, model_name, metrics.window_end_ms)
                     if counts is not None
+                    else None
+                ),
+                # Review L2: the alt signals sum the routable pods only (hidden probes out).
+                routable_pod_ids=(
+                    (routable_by_model or {}).get(model_name, frozenset())
+                    if counts is not None and routable_by_model is not None
                     else None
                 ),
             )

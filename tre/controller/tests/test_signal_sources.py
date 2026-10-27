@@ -61,6 +61,14 @@ def _metrics(**overrides) -> ModelWindowMetrics:
         "per_pod": {},
     }
     values.update(overrides)
+    if "per_pod" not in overrides:
+        # One pod carrying the window's queue: queue_len reads the routable pods' data
+        # (review L1/L2), a window without its pod is unknown.
+        values["per_pod"] = {"p0": PodWindowMetrics(
+            pod="p0", prompt_tokens=values["prompt_tokens"], generation_tokens=values["generation_tokens"],
+            avg_waiting=values["avg_waiting"], avg_running=values["avg_running"], avg_swapping=0.0,
+            kv_cache_hit_rate=0.0, ttft_p95_ms=None, tpot_p95_ms=None, e2e_p95_ms=None,
+        )}
     return ModelWindowMetrics(**values)
 
 
@@ -259,7 +267,7 @@ def test_ttft_mean_pools_pod_means_by_first_token_count() -> None:
     assert sig.z_m == pytest.approx(200.0 / 175.0)
 
 
-@pytest.mark.parametrize("source", ["ttft_mean", "kv_usage"])
+@pytest.mark.parametrize("source", ["queue_len", "ttft_mean", "kv_usage"])
 @pytest.mark.parametrize(
     "case",
     ["pod_left_out", "no_routable", "no_pods", "kv_gauge_missing", "ttft_hist_missing"],
@@ -277,7 +285,8 @@ def test_unknown_pod_data_is_never_healthy(source: str, case: str) -> None:
         "ttft_hist_missing": _pods_window([good, _pod("b", kv=0.1, ttft_n=None)], routable=2),
     }
     sig = get_signal(windows[case], _spec(), source, trs_z_m=9.0)
-    if (source, case) in {("ttft_mean", "kv_gauge_missing"), ("kv_usage", "ttft_hist_missing")}:
+    if (source, case) in {("ttft_mean", "kv_gauge_missing"), ("kv_usage", "ttft_hist_missing"),
+                          ("queue_len", "kv_gauge_missing"), ("queue_len", "ttft_hist_missing")}:
         assert sig.z_m is not None  # the other signal's input is not needed
         return
     assert sig.z_m is None
@@ -320,6 +329,41 @@ def test_ttft_mean_idle_window_clears_the_held_value() -> None:
     assert idle.z_m is None
 
 
-def test_kv_cache_hit_rate_source_is_removed() -> None:
-    with pytest.raises(ValueError, match="unsupported signal source"):
-        get_signal(_metrics(), _spec(), "kv_cache", trs_z_m=9.0)
+def test_the_alt_signals_sum_the_routable_pods_only() -> None:
+    """Review L2: matched by identity against the fleet view's routable pods - a hidden
+    SafeScale probe pod (still in the window while it drains) is left out of the sums, and
+    it cannot stand in for a routable pod without data."""
+    routable = _pod("a", kv=0.2, ttft_ms=100.0, ttft_n=10.0)
+    hidden = _pod("probe", kv=0.9, ttft_ms=900.0, ttft_n=10.0)
+    hidden = PodWindowMetrics(**{**hidden.__dict__, "avg_running": 7.0})
+    window = _pods_window([routable, hidden], routable=1)
+    q = get_signal(window, _spec(), "queue_len", trs_z_m=9.0, routable_pod_ids=frozenset({"a"}))
+    kv = get_signal(window, _spec(), "kv_usage", trs_z_m=9.0, routable_pod_ids=frozenset({"a"}))
+    ttft = get_signal(window, _spec(), "ttft_mean", trs_z_m=9.0, routable_pod_ids=frozenset({"a"}))
+    assert (q.raw_value, kv.raw_value, ttft.raw_value) == (1.0, pytest.approx(0.8), pytest.approx(100.0))
+    # routable b has no data, the hidden pod is there: still unknown (a count check passed it)
+    gap = _pods_window([routable, hidden], routable=2, scrape_stale_pods=("b",))
+    for source in ("queue_len", "ttft_mean", "kv_usage"):
+        assert get_signal(gap, _spec(), source, trs_z_m=9.0, routable_pod_ids=frozenset({"a", "b"})).z_m is None
+    # ids that disagree with the routable count: fail closed
+    assert get_signal(window, _spec(), "queue_len", trs_z_m=9.0, routable_pod_ids=frozenset()).z_m is None
+
+
+def test_the_alt_ema_gap_is_the_metrics_window_not_a_suffix_span() -> None:
+    """Review M2: an O1 suffix (here 5 s) decides with the EMA's idle-gap length = the
+    configured metrics window, as TSS; its own span reset the EMA to the raw suffix value
+    on every tick (dt 10 s > 5 s)."""
+    from tre_controller.signals.trs import SignalState
+
+    spec = _spec_with_tau(10_000.0)
+    out = {}
+    for gap in (None, 20_000.0):
+        state = SignalState()
+        values = []
+        for end, running in ((60_000, 2.0), (70_000, 8.0)):
+            window = _metrics(window_start_ms=end - 5_000, window_end_ms=end, avg_running=running)
+            values.append(get_signal(window, spec, "queue_len", trs_z_m=9.0, signal_state=state,
+                                     ema_window_ms=gap).raw_value)
+        out[gap] = values
+    assert out[None] == [2.0, 8.0]  # reset: the suffix span is shorter than the tick gap
+    assert out[20_000.0][0] == 2.0 and 2.0 < out[20_000.0][1] < 8.0

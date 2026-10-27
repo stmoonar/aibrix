@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from tre_common.alt_signals import queue_len_per_replica
-from tre_common.metrics_schema import ModelWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import AltThreshold, ModelSpec, SloSpec, TrsParams
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 from tre_controller.signals.sources import get_signal
@@ -54,7 +54,15 @@ def _metrics(*, pods: int, running: float, waiting: float, end_ms: int = 30_000,
         prompt_tokens=prompt, generation_tokens=gen, avg_waiting=waiting,
         avg_running=running, avg_swapping=swapping, kv_cache_hit_rate=0.0,
         ttft_p95_ms=100.0, tpot_p95_ms=20.0, e2e_p95_ms=1000.0,
-        routable_pods=pods, assigned_replicas=pods, per_pod={},
+        routable_pods=pods, assigned_replicas=pods,
+        # The pods' share of the window's queue: queue_len reads the routable pods' data
+        # (review L1/L2, 2026-10-28).
+        per_pod={f"p{i}": PodWindowMetrics(
+            pod=f"p{i}", prompt_tokens=prompt / max(pods, 1), generation_tokens=gen / max(pods, 1),
+            avg_waiting=waiting / max(pods, 1), avg_running=running / max(pods, 1),
+            avg_swapping=swapping / max(pods, 1), kv_cache_hit_rate=0.0,
+            ttft_p95_ms=None, tpot_p95_ms=None, e2e_p95_ms=None,
+        ) for i in range(pods)},
     )
 
 

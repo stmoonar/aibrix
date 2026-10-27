@@ -43,7 +43,6 @@ def test_no_first_token_is_an_empty_mean_not_zero() -> None:
 
 @pytest.mark.parametrize("case, status", [
     ("reset", l3.STATUS_RESET),
-    ("kv_missing", alt.STATUS_NO_KV),
     ("past_capture", l3.STATUS_NO_SAMPLE),
     ("missing_pod_file", l3.STATUS_NO_METRICS),
 ])
@@ -52,8 +51,6 @@ def test_unknown_inputs_void_every_column(case: str, status: str) -> None:
     pods, missing, window = [good], [], (40_000, 60_000)
     if case == "reset":
         pods.append(_pod("b", ttft_ms=100.0, rps=1.0, kv=0.3, reset_at=50_500))
-    elif case == "kv_missing":
-        pods.append(_pod("b", ttft_ms=100.0, rps=1.0, kv=None))
     elif case == "past_capture":
         window = (130_000, 150_000)
     else:
@@ -61,6 +58,34 @@ def test_unknown_inputs_void_every_column(case: str, status: str) -> None:
     src = alt.AltSignalColumns(pods, missing_pods=missing)
     assert src(*window) == {column: None for column in alt.COLUMNS}
     assert src.counts == {status: 1}
+
+
+def test_a_missing_series_voids_only_its_own_columns() -> None:
+    """Review L4: as online, a missing KV gauge makes only kv_usage unknown and a missing
+    TTFT histogram only ttft_mean (each signal reads its own series)."""
+    good = _pod("a", ttft_ms=100.0, rps=1.0, kv=0.3)
+    src = alt.AltSignalColumns([good, _pod("b", ttft_ms=100.0, rps=1.0, kv=None)])
+    row = src(40_000, 60_000)
+    assert row["kv_cache_usage_sum"] is None and row["kv_cache_pods"] is None
+    assert row["ttft_server_mean_ms"] == pytest.approx(100.0)
+    no_hist = alt.PodAltSamples("c", [(t, None, None, 0.5, False) for t, *_ in good.samples])
+    src = alt.AltSignalColumns([good, no_hist])
+    row = src(40_000, 60_000)
+    assert row["ttft_server_mean_ms"] is None and row["ttft_server_count"] is None
+    assert row["kv_cache_usage_sum"] == pytest.approx(0.8) and row["kv_cache_pods"] == 2
+    assert src.counts == {l3.STATUS_MISSING_SERIES: 1}
+
+
+def test_a_pod_woken_mid_window_averages_all_its_samples_as_online() -> None:
+    """Review L4: the gateway docs carry no sleep state, so the controller averages every
+    instant doc of a pod the fleet state reports awake at the tick; offline does the same
+    (serving = awake in the last sample of the window), pre-wake samples included."""
+    rows = [(t, 0.0, 0.0, 0.0 if t < 50_000 else 0.6, t < 50_000) for t in range(1, 120_000, 1000)]
+    row = alt.AltSignalColumns([alt.PodAltSamples("b", rows)])(40_000, 60_000)
+    assert row["kv_cache_pods"] == 1
+    assert row["kv_cache_usage_sum"] == pytest.approx(0.6 * 10 / 20)  # 10 of 20 samples awake
+    asleep_at_end = alt.AltSignalColumns([alt.PodAltSamples("b", rows)])(20_000, 40_000)
+    assert asleep_at_end == {column: None for column in alt.COLUMNS}
 
 
 def test_columns_are_read_by_the_shared_signal_functions() -> None:

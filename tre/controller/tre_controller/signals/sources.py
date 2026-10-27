@@ -3,9 +3,9 @@
 Sources (``TRE_SIGNAL_SOURCE``): ``zm`` (TSS), the v1 ablation signals ``queue_len`` /
 ``ttft_mean`` / ``kv_usage`` (definitions in :mod:`tre_common.alt_signals`), the plan
 section 6.9 rates ``decode_tps`` / ``prefill_tps``, and ``latency_p95`` (worst p95/SLO
-ratio; not fitted, not v1's latency signal - not used by the ablation). ``ttft_mean`` and
-``kv_usage`` are built from the per-pod window data and are unknown unless every routable
-replica reported (:func:`_serving_pods`).
+ratio; not fitted, not v1's latency signal - not used by the ablation). ``queue_len``,
+``ttft_mean`` and ``kv_usage`` are built from the per-pod window data of the routable pods
+and are unknown unless every routable replica reported (:func:`_serving_pods`).
 
 Every alternative signal goes through :func:`_thresholded_signal`: its raw value comes
 from :mod:`tre_common.alt_signals` (the same function the offline fit uses), is smoothed
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Collection
 
 from tre_common.alt_signals import (
     EPS,
@@ -60,32 +60,56 @@ def get_signal(
     *,
     trs_z_m: float | None,
     signal_state: "SignalState | None" = None,
+    routable_pod_ids: Collection[str] | None = None,
+    ema_window_ms: float | None = None,
 ) -> SignalValue:
     """``source``'s value and ``z`` for this window.
 
     ``signal_state`` carries the per-(model, signal) EMA across ticks; without it the
     alternative signals are scored raw (a fresh EMA seeds at the raw value), exactly as
     a fresh ``TRSComputer`` does for TSS.
+
+    ``routable_pod_ids``: the fleet state's routable pods of the model (review L2,
+    2026-10-28); queue_len / ttft_mean / kv_usage sum only those pods (a hidden SafeScale
+    probe pod is left out) and are unknown unless each of them has data. None = no fleet
+    view: every pod of the window, checked by count.
+
+    ``ema_window_ms``: the EMA's idle-gap length, the configured metrics window (review
+    M2). An O1 suffix passes the whole window here, as the TSS EMA does; the suffix's own
+    span would reset the EMA to the raw suffix value on every tick after a breakpoint.
+    None = the window's own span.
     """
     if source == "zm":
         return SignalValue(source=source, raw_value=trs_z_m, z_m=trs_z_m)
     if source == "latency_p95":
         return _latency_signal(metrics, spec)
+    gap_ms = float(ema_window_ms) if ema_window_ms is not None else float(metrics.window_end_ms - metrics.window_start_ms)
     if source == "queue_len":
-        raw = queue_len_per_replica(metrics.avg_running, metrics.avg_waiting, metrics.routable_pods)
-        return _thresholded_signal(metrics, spec, source, raw, "queue_len_missing", "queue_threshold_missing", signal_state)
+        # Review L1 (2026-10-28): the per-pod rules leave a pod with an unknown queue or a
+        # short token span out of ``per_pod``; dividing the remaining pods' sum by every
+        # routable replica read q too low (z too high). Same completeness rule as
+        # ttft_mean / kv_usage: fewer usable pods than routable replicas = unknown.
+        pods = _serving_pods(metrics, routable_pod_ids)
+        raw = None if pods is None else queue_len_per_replica(
+            sum(float(pod.avg_running) for pod in pods),
+            sum(float(pod.avg_waiting) for pod in pods),
+            metrics.routable_pods,
+        )
+        return _thresholded_signal(
+            metrics, spec, source, raw, "queue_len_missing", "queue_threshold_missing", signal_state, gap_ms
+        )
     if source == "decode_tps":
         return _thresholded_signal(
             metrics, spec, source, per_replica_token_rate(metrics, metrics.generation_tokens),
-            f"{source}_counter_missing", f"{source}_threshold_missing", signal_state,
+            f"{source}_counter_missing", f"{source}_threshold_missing", signal_state, gap_ms,
         )
     if source == "prefill_tps":
         return _thresholded_signal(
             metrics, spec, source, per_replica_token_rate(metrics, metrics.prompt_tokens),
-            f"{source}_counter_missing", f"{source}_threshold_missing", signal_state,
+            f"{source}_counter_missing", f"{source}_threshold_missing", signal_state, gap_ms,
         )
     if source == "ttft_mean":
-        pods = _serving_pods(metrics)
+        pods = _serving_pods(metrics, routable_pod_ids)
         if pods is None:
             return SignalValue(source, raw_value=None, z_m=None, unavailable_reason="ttft_mean_missing")
         mean_ms = model_mean_ttft_ms(pods)
@@ -95,13 +119,17 @@ def get_signal(
         if raw is None:
             # Fresh pods, no first token in the window: hold the last EMA (v1), bounded
             # by the EMA's own gap / idle rules (SignalState.held_signal).
-            return _held_signal(metrics, spec, source, "ttft_mean_no_sample", signal_state)
-        return _thresholded_signal(metrics, spec, source, raw, "ttft_mean_missing", "ttft_mean_threshold_missing", signal_state)
+            return _held_signal(metrics, spec, source, "ttft_mean_no_sample", signal_state, gap_ms)
+        return _thresholded_signal(
+            metrics, spec, source, raw, "ttft_mean_missing", "ttft_mean_threshold_missing", signal_state, gap_ms
+        )
     if source == "kv_usage":
-        pods = _serving_pods(metrics)
+        pods = _serving_pods(metrics, routable_pod_ids)
         usage_sum = None if pods is None else model_kv_usage_sum(pods)
         raw = kv_headroom(usage_sum, metrics.routable_pods)
-        return _thresholded_signal(metrics, spec, source, raw, "kv_usage_missing", "kv_usage_threshold_missing", signal_state)
+        return _thresholded_signal(
+            metrics, spec, source, raw, "kv_usage_missing", "kv_usage_threshold_missing", signal_state, gap_ms
+        )
     raise ValueError(f"unsupported signal source: {source}")
 
 
@@ -109,22 +137,42 @@ def get_signal(
 _MISSING = object()
 
 
-def _serving_pods(metrics: ModelWindowMetrics) -> list[PodWindowMetrics] | None:
-    """The pods of a serving window whose data the model-level ttft_mean / kv_usage are
-    built from, or None when the window cannot speak for every routable replica (fail
-    closed: unknown, never healthy or idle).
+def _serving_pods(
+    metrics: ModelWindowMetrics, routable_pod_ids: Collection[str] | None = None
+) -> list[PodWindowMetrics] | None:
+    """The routable pods of a serving window whose data the model-level queue_len /
+    ttft_mean / kv_usage are built from, or None when the window cannot speak for every
+    routable replica (fail closed: unknown, never healthy or idle).
 
     ``metrics`` is the serving window (``restrict_to_serving``: sleeping pods dropped,
     ``routable_pods`` = the fleet state's serving count). The store leaves a pod without
-    a sample in the window out of ``per_pod`` (``scrape_stale_pods``), so fewer pods than
-    routable replicas means a serving replica is unknown. Hidden-but-awake pods (a
-    SafeScale probe) stay in the window, as in the queue sum.
+    usable data out of ``per_pod`` (scrape-stale, unknown queue, a short token span), so a
+    routable pod missing from ``per_pod`` makes the window unknown.
+
+    Review L2 (2026-10-28): with the fleet view's ``routable_pod_ids`` the pods are matched
+    by identity, not by count: only routable pods are summed, so a hidden-but-awake pod
+    (a SafeScale probe, still in the window while it drains) is left out, and it can no
+    longer stand in for a missing routable pod. The ids must be ``routable_pods`` many.
+    Without ids (no fleet view): every pod of the window, checked by count.
     """
     routable = int(metrics.routable_pods or 0)
-    pods = list((metrics.per_pod or {}).values())
-    if routable < 1 or len(pods) < routable:
+    per_pod = metrics.per_pod or {}
+    if routable < 1:
         return None
-    return pods
+    if routable_pod_ids is None:
+        pods = list(per_pod.values())
+        return pods if len(pods) >= routable else None
+    ids = frozenset(routable_pod_ids)
+    if len(ids) != routable:
+        return None
+    pods: list[PodWindowMetrics] = []
+    matched: set[str] = set()
+    for key, pod in per_pod.items():
+        name = pod.pod if pod.pod in ids else key if key in ids else None
+        if name is not None and name not in matched:
+            matched.add(name)
+            pods.append(pod)
+    return pods if matched == ids else None
 
 
 def model_mean_ttft_ms(pods: list[PodWindowMetrics]) -> float | None | object:
@@ -205,15 +253,17 @@ def _thresholded_signal(
     missing_reason: str,
     threshold_missing_reason: str,
     signal_state: "SignalState | None",
+    ema_window_ms: float,
 ) -> SignalValue:
-    """The one place every alternative signal is smoothed and normalised."""
+    """The one place every alternative signal is smoothed and normalised. ``ema_window_ms``
+    is the EMA's idle-gap length (the configured metrics window, :func:`get_signal`)."""
     if raw_value is None:
         return SignalValue(source, raw_value=None, z_m=None, unavailable_reason=missing_reason)
     tau_ms = alt_signal_tau_ms(spec)
     if signal_state is not None and tau_ms is not None:
         raw_value = signal_state.smooth_signal(
             spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
-            window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+            window_ms=float(ema_window_ms),
             idle=window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
         )
     z_m = normalize_signal(raw_value, spec.alt_thresholds.get(source))
@@ -233,6 +283,7 @@ def _held_signal(
     source: str,
     no_sample_reason: str,
     signal_state: "SignalState | None",
+    ema_window_ms: float,
 ) -> SignalValue:
     """A window without a sample of ``source``: the last smoothed value, normalised, or
     unavailable when there is none (no state, no smoothing, or the EMA was cleared)."""
@@ -241,7 +292,7 @@ def _held_signal(
     if signal_state is not None and tau_ms is not None:
         held = signal_state.held_signal(
             spec.name, source, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
-            window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+            window_ms=float(ema_window_ms),
             idle=window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
         )
     if held is None:
