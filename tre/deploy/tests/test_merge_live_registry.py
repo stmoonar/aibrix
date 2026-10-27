@@ -78,3 +78,39 @@ def test_live_theta_without_basis_stamps_keeps_its_true_basis():
     # a stamped live theta keeps its own stamps
     stamped, _ = mlr.merge(release, release)
     assert stamped["models"] == release["models"]
+
+
+def test_an_alt_threshold_is_merged_as_one_fit_never_key_by_key():
+    # M1 (10-28): a stale live theta (no bands, no basis) mixed with the release bands and
+    # basis passed the controller's start check. The fit is one group: whole live or whole
+    # release; a live theta without a basis keeps no basis, so an alt arm refuses to start.
+    from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS, alt_basis_errors
+    from tre_common.registry import _parse_registry
+
+    release = _release()
+    fit = {"theta": 216.2, "direction": "lower_is_healthier", "delta_crit": 0.81, "delta_high": 0.98,
+           "basis": {"definition": ALT_SIGNAL_DEFINITIONS["ttft_mean"], "window_ms": 20000, "ema_tau_ms": 10000.0}}
+    for model in release["models"]:
+        model.setdefault("alt_thresholds", {})["ttft_mean"] = copy.deepcopy(fit)
+    live = copy.deepcopy(release)
+    stale = {"theta": 999.0, "direction": "lower_is_healthier"}  # a 07-10 fit: no bands, no basis
+    for model in live["models"]:
+        model["alt_thresholds"]["ttft_mean"] = copy.deepcopy(stale)
+    merged, report = mlr.merge(live, release)
+    for model in merged["models"]:
+        assert model["alt_thresholds"]["ttft_mean"] == stale
+    models = _parse_registry(merged).models()
+    assert len(alt_basis_errors(models, "ttft_mean", window_ms=20000)) == len(models)
+    assert any(line.startswith("WARN") and "no basis stamp" in line for line in report)
+    # a live entry without theta: the release fit whole
+    for model in live["models"]:
+        model["alt_thresholds"]["ttft_mean"] = {"delta_crit": 0.5}
+    merged, report = mlr.merge(live, release)
+    assert all(m["alt_thresholds"]["ttft_mean"] == fit for m in merged["models"])
+    assert any("has no theta" in line for line in report)
+    # a stamped live fit is kept whole (its own bands and basis)
+    newer = {**fit, "theta": 230.0, "delta_crit": 0.7, "basis": {**fit["basis"], "ema_tau_ms": 0.0}}
+    for model in live["models"]:
+        model["alt_thresholds"]["ttft_mean"] = copy.deepcopy(newer)
+    merged, _ = mlr.merge(live, release)
+    assert all(m["alt_thresholds"]["ttft_mean"] == newer for m in merged["models"])

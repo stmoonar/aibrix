@@ -23,7 +23,7 @@ docs/design/20261028-tss-step-counters.md).
 Editable (deploy/scripts/registry_params.py): <model>.trs.<f> (not ema_tau_ms),
 <model>.slo.{ttft_p95_ms,tpot_p95_ms,e2e_p95_ms,ttft_idle_c_ms,ttft_idle_b_ms_per_token},
 <model>.alt_thresholds.<signal>.{theta,direction,delta_crit,delta_high,basis.definition,
-basis.window_ms} (an alt arm starts only on a matching basis stamp),
+basis.window_ms,basis.ema_tau_ms} (an alt arm starts only on a matching basis stamp),
 <model>.{min_replicas,max_awake_replicas}. Several --set go out in ONE ConfigMap write, so a
 recalibration (theta, lambda, tau, w_p and c/b) is published atomically. max_replicas (the
 GPU layout) is structural. VALUE is parsed as YAML. The edit

@@ -195,10 +195,12 @@ def test_alt_threshold_basis_stamp_is_settable_and_checked() -> None:
         "m1.alt_thresholds.ttft_mean.delta_crit=0.89", "m1.alt_thresholds.ttft_mean.delta_high=7.5",
         f"m1.alt_thresholds.ttft_mean.basis.definition={definition}",
         "m1.alt_thresholds.ttft_mean.basis.window_ms=20000",
+        "m1.alt_thresholds.ttft_mean.basis.ema_tau_ms=10000",
     ], ["m1"])
     new_yaml = apply_and_validate(_REGISTRY, edits)
     spec = _parse_registry(yaml.safe_load(new_yaml)).model("m1").alt_thresholds["ttft_mean"]
-    assert (spec.basis_definition, spec.basis_window_ms, spec.delta_high) == (definition, 20000.0, 7.5)
+    assert (spec.basis_definition, spec.basis_window_ms, spec.basis_ema_tau_ms, spec.delta_high) == (
+        definition, 20000.0, 10000.0, 7.5)
     with pytest.raises(ParamValidationError) as exc_info:
         apply_and_validate(_REGISTRY, {"m1": {"alt_thresholds": {"ttft_mean": {
             "theta": 1.0, "direction": "lower_is_healthier", "basis": {"definition": "ttft_mean:old"}}}}})

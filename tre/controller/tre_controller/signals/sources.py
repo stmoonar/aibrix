@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from tre_common.alt_signals import (
     EPS,
     Z_MAX,
+    alt_ema_tau_ms,
     kv_headroom,
     normalize_signal_value,
     queue_len_per_replica,
@@ -31,7 +32,7 @@ from tre_common.alt_signals import (
 )
 from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import AltThreshold, ModelSpec
-from tre_common.tss import DEFAULT_EMA_TAU_MS, window_is_idle
+from tre_common.tss import window_is_idle
 
 if TYPE_CHECKING:  # pragma: no cover
     from tre_controller.signals.trs import SignalState
@@ -187,18 +188,12 @@ def per_replica_token_rate(
 
 
 def alt_signal_tau_ms(spec: ModelSpec) -> float | None:
-    """The time constant an alternative signal is smoothed with: the registry's TSS tau.
-
-    ``ema_tau_ms`` unset (None) keeps :data:`DEFAULT_EMA_TAU_MS`. ``ema_tau_ms <= 0`` is
-    tau = 0, i.e. alpha = 1: no smoothing, the raw value is used - as offline
-    (``theta_verdict.build_signal_spec`` maps tau <= 0 to no EMA). It used to be read as
-    "unset" and fall back to the 20 s default, so a registry publishing tau = 0 smoothed
-    the ablation signals online with a tau the fit never saw.
-    """
-    tau = spec.trs.ema_tau_ms
-    if tau is None:
-        return DEFAULT_EMA_TAU_MS
-    tau = float(tau)
+    """The time constant an alternative signal is smoothed with: the registry's TSS tau
+    (:func:`tre_common.alt_signals.alt_ema_tau_ms`, the rule the fit stamps as
+    ``basis.ema_tau_ms``). ``ema_tau_ms`` unset keeps the default; ``<= 0`` is tau = 0,
+    i.e. alpha = 1: no smoothing (None here), as offline (``theta_verdict.build_signal_spec``
+    maps tau <= 0 to no EMA)."""
+    tau = alt_ema_tau_ms(spec.trs.ema_tau_ms)
     return tau if tau > 0 else None
 
 

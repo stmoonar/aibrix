@@ -162,7 +162,9 @@ def fit_model(
                 "delta_high": float(published["delta_high"]),
                 # What theta was fitted on (tre_common.alt_signals.alt_basis_errors): the
                 # controller starts an alt arm only on this stamp.
-                "basis": {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": int(csv_window_ms(input_path))},
+                # ema_tau_ms: the tau the value was smoothed with (0 = raw), review L5.
+                "basis": {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": int(csv_window_ms(input_path)),
+                          "ema_tau_ms": float(ema_tau_ms) if ema_tau_ms is not None and ema_tau_ms > 0 else 0.0},
             }
         },
         # A band on its grid's top edge has its optimum outside the searched range.

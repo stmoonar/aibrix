@@ -53,10 +53,13 @@ class AltThreshold:
     delta_crit: float | None = None
     delta_high: float | None = None
     #: What theta was fitted on (2026-10-28, ``tre_common.alt_signals.alt_basis_errors``):
-    #: registry ``basis: {definition, window_ms}``. None = not stamped; the controller
+    #: registry ``basis: {definition, window_ms, ema_tau_ms}``. None = not stamped; the controller
     #: refuses to start an alt arm unless both equal what it computes.
     basis_definition: str | None = None
     basis_window_ms: float | None = None
+    #: The EMA tau (ms; 0 = no smoothing) the fit smoothed the value with (review L5,
+    #: 2026-10-28): must equal the tau the controller uses (``alt_ema_tau_ms``).
+    basis_ema_tau_ms: float | None = None
 
     def bands(self) -> tuple[float, float, bool]:
         """(delta_crit, delta_high, defaulted) - ``defaulted`` is True when either margin
@@ -1364,6 +1367,10 @@ class Registry:
                     math.isfinite(threshold.basis_window_ms) and threshold.basis_window_ms > 0.0
                 ):
                     errors.append(f"model {model.name}: alt_thresholds.{signal}.basis.window_ms must be positive")
+                if threshold.basis_ema_tau_ms is not None and not (
+                    math.isfinite(threshold.basis_ema_tau_ms) and threshold.basis_ema_tau_ms >= 0.0
+                ):
+                    errors.append(f"model {model.name}: alt_thresholds.{signal}.basis.ema_tau_ms must be >= 0")
 
         seen_nodes: set[str] = set()
         for node in self._topology.nodes:
@@ -2054,6 +2061,10 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
                 basis_window_ms=(
                     float((values.get("basis") or {}).get("window_ms"))
                     if (values.get("basis") or {}).get("window_ms") is not None else None
+                ),
+                basis_ema_tau_ms=(
+                    float((values.get("basis") or {}).get("ema_tau_ms"))
+                    if (values.get("basis") or {}).get("ema_tau_ms") is not None else None
                 ),
             )
             for signal, values in (raw.get("alt_thresholds") or {}).items()
