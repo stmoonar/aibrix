@@ -38,13 +38,17 @@ def _warn_removed_env(values: Mapping[str, str]) -> None:
                 "tre:v2:controller:mode only; remove it from the Deployment", name, values.get(name)
             )
 
+#: ``TRE_SIGNAL_SOURCE`` values (``tre_controller.signals.sources``). Every source in
+#: ``EXPECTED_SIGNAL_DIRECTIONS`` is a fitted alternative signal: the controller refuses
+#: to start on it unless every model carries its fitted theta AND band margins.
 SIGNAL_SOURCES = {
     "zm",
     "latency_p95",
     "queue_len",
+    "ttft_mean",
+    "kv_usage",
     "decode_tps",
     "prefill_tps",
-    "kv_cache",
 }
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
 WINDOW_MODES = {"tumbling", "sliding"}
@@ -559,11 +563,19 @@ def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
 
 
 def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
+    """A fitted alternative signal runs only on its own fitted theta and band margins.
+
+    Every model needs ``alt_thresholds.<signal>`` with a positive theta, the expected
+    direction and both ``delta_crit`` / ``delta_high``: a missing margin would otherwise
+    fall back to the plan defaults 0.2 / 0.25 (``AltThreshold.bands``) and the arm would
+    run on bands nobody fitted.
+    """
     expected_direction = EXPECTED_SIGNAL_DIRECTIONS.get(signal_source)
     if expected_direction is None:
         return
     registry = load_registry(registry_path)
     missing = []
+    missing_bands = []
     invalid_direction = []
     for model in registry.models():
         threshold = model.alt_thresholds.get(signal_source)
@@ -571,10 +583,18 @@ def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
             missing.append(model.name)
         elif threshold.direction != expected_direction:
             invalid_direction.append(model.name)
+        elif threshold.delta_crit is None or threshold.delta_high is None:
+            missing_bands.append(model.name)
     if missing:
         raise ValueError(
             f"TRE_SIGNAL_SOURCE={signal_source} requires fitted alt_thresholds for every model; "
             f"missing={sorted(missing)}"
+        )
+    if missing_bands:
+        raise ValueError(
+            f"TRE_SIGNAL_SOURCE={signal_source} requires fitted alt_thresholds.{signal_source}"
+            f".delta_crit and .delta_high for every model (no default bands); "
+            f"missing={sorted(missing_bands)}"
         )
     if invalid_direction:
         raise ValueError(

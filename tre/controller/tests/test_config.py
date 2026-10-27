@@ -127,12 +127,51 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.disable_eta_gate is True
 
 
-@pytest.mark.parametrize(
-    "source",
-    ["zm", "latency_p95", "queue_len", "decode_tps", "prefill_tps", "kv_cache"],
-)
-def test_config_accepts_plan_signal_sources(source: str) -> None:
+FITTED_ALT_SOURCES = ["queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefill_tps"]
+
+
+def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
+    """The repo registry with ``alt_thresholds.<source>`` = ``fields`` on every model
+    (a field set to None is left out)."""
+    from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS
+
+    repo = Path(__file__).parents[2] / "deploy" / "registry.yaml"
+    registry = yaml.safe_load(repo.read_text(encoding="utf-8"))
+    entry = {"theta": 2.0, "direction": EXPECTED_SIGNAL_DIRECTIONS[source],
+             "delta_crit": 0.1, "delta_high": 0.3, **fields}
+    for model in registry["models"]:
+        model.setdefault("alt_thresholds", {})[source] = {k: v for k, v in entry.items() if v is not None}
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("source", ["zm", "latency_p95"])
+def test_config_accepts_unfitted_signal_sources(source: str) -> None:
     assert ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source}).signal_source == source
+
+
+@pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
+def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
+    path = _registry_with_alt(tmp_path, source)
+    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
+    assert cfg.signal_source == source
+
+
+@pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
+@pytest.mark.parametrize("missing", ["delta_crit", "delta_high"])
+def test_alt_source_refuses_to_start_without_fitted_bands(tmp_path, source: str, missing: str) -> None:
+    """No silent default bands (0.2 / 0.25): an alt arm runs on its own fitted margins."""
+    path = _registry_with_alt(tmp_path, source, **{missing: None})
+    with pytest.raises(ValueError, match="delta_crit and .delta_high.*missing=.*dsqwen-7b"):
+        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
+
+
+@pytest.mark.parametrize("source", ["ttft_mean", "kv_usage"])
+def test_v1_alt_source_refuses_to_start_on_the_repo_registry(source: str) -> None:
+    """The repo registry carries no fitted theta for the v1 signals."""
+    with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires fitted"):
+        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source})
 
 
 def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:
@@ -226,9 +265,12 @@ def test_config_reads_and_validates_signal_idle_rps_epsilon() -> None:
         ControllerConfig.from_env({"TRE_SIGNAL_IDLE_RPS_EPS": "-0.1"})
 
 
-def test_config_rejects_invalid_signal_source() -> None:
-    with pytest.raises(ValueError, match="TRE_SIGNAL_SOURCE"):
-        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": "legacy"})
+@pytest.mark.parametrize("source", ["legacy", "kv_cache"])
+def test_config_rejects_invalid_signal_source(source: str) -> None:
+    # kv_cache (prefix-cache hit rate / 0.5, always 0 with prefix caching off) was removed
+    # 2026-10-28; the KV signal is kv_usage.
+    with pytest.raises(ValueError, match="TRE_SIGNAL_SOURCE must be one of"):
+        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source})
 
 
 def test_config_rejects_invalid_bool() -> None:
