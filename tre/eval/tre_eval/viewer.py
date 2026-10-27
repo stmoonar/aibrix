@@ -480,7 +480,9 @@ def build_events(ev_rows: list[dict], raw: str | None, clock: _Clock, warn=lambd
         elif src == "tre_counterfactual":
             ev.append({"t": _rt(t), "kind": "counterfactual", "model": model, "src": "tre (observe)",
                        "reason": det.get("reason"), "value": _f(r.get("value")), "detail": det})
-        elif src == "sm_api" and str(r.get("value")) == "409":
+        elif src == "sm_api" and str(r.get("value")) == "409" and not (b == "/v2/plans" and model is None):
+            # A plan's own 409 access line has no model; its refused items come as per-model
+            # plan_item_refused records (load._parse_sm), which pair instead.
             sm409.append({"t": t, "model": model, "path": b, "kind": kind})
     got = _refusals(raw, clock, sm409, warn)
     ref, sure = got if got is not None else ([], False)

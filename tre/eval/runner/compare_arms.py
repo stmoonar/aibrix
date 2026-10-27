@@ -89,6 +89,8 @@ def arm_row(d):
             if '" 409' in line or " 409 " in line:
                 if "/target" in line:
                     sm409["target"] += 1
+                elif "/v2/plans" in line:
+                    sm409["plans"] += 1
                 elif "/scale_service" in line:
                     sm409["scale_service"] += 1
                 else:
