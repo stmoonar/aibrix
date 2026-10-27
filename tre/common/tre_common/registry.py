@@ -299,9 +299,14 @@ K8S_CONNECT_TIMEOUT_S = 2.0
 #: LIST overrunning the ack wait, the confirmation or rollback annotation (2) =
 #: 8. Wake: the Pod LIST, the wake gate's resident LIST, the commit annotation
 #: (2) = 4. Transfer selection: the floor's and the residents' Pod LIST = 2.
+#: Plan selection (2026-10-27): the Pod LIST, the routable view, the residents'
+#: LIST = 3 (an upper bound: the executor reads them from one LIST). Observed
+#: refresh at the end of a plan: one Pod LIST = 1.
 K8S_CALLS_SLEEP = 8
 K8S_CALLS_WAKE = 4
 K8S_CALLS_TRANSFER_SELECT = 2
+K8S_CALLS_PLAN_SELECT = 3
+K8S_CALLS_REFRESH = 1
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
@@ -1182,22 +1187,58 @@ class ServiceManagerConfig:
             + self.worst_case_wake_lock_s()
         )
 
+    def worst_case_wake_core_s(self) -> float:
+        """One wave of wakes without its settlement: resident probes + /wake_up +
+        the convergence and settlement probes + :data:`K8S_CALLS_WAKE` Kubernetes
+        calls + ``io_margin_s``. Defaults: 5 + 10 + 2 x 5 + 4 x 7 + 2 = 55 s."""
+        sleep = self.sleep
+        return (
+            sleep.probe_timeout_s
+            + self.wake_call_timeout_s
+            + 2 * sleep.probe_timeout_s
+            + K8S_CALLS_WAKE * self.k8s_call_s()
+            + sleep.io_margin_s
+        )
+
+    def worst_case_plan_lock_s(self) -> float:
+        """Longest writer-lock hold of one plan (``POST /v2/plans``, and the
+        ``/target``, ``/power`` and v1 wrappers that run one), any number of
+        items - every phase runs its items in parallel and makes batched
+        Kubernetes calls (design 20261027-sm-plans.md section 6): selection
+        (one probe round + :data:`K8S_CALLS_PLAN_SELECT` calls) + wave 1 (the
+        longer of one sleep call and one wake wave) + wave 2 (one wake wave) +
+        ONE deferred settlement (one compensating sleep) + the observed refresh
+        (:data:`K8S_CALLS_REFRESH` calls + one probe round) + ``io_margin_s``.
+        Defaults: 26 + 108 + 55 + 108 + 12 + 2 = 311 s."""
+        sleep = self.sleep
+        wake_core = self.worst_case_wake_core_s()
+        return (
+            sleep.probe_timeout_s + K8S_CALLS_PLAN_SELECT * self.k8s_call_s()
+            + max(self.worst_case_sleep_lock_s(), wake_core)
+            + wake_core
+            + self.worst_case_sleep_lock_s()
+            + K8S_CALLS_REFRESH * self.k8s_call_s() + sleep.probe_timeout_s
+            + sleep.io_margin_s
+        )
+
     def worst_case_lock_hold_s(self) -> float:
-        """Longest writer-lock hold of any one API-timed service-manager call (a
-        transfer; a sleep or a wake alone holds it for less). Cold starts,
-        defrag and fleet repair hold it longer by design (a pod start) and are
-        not part of the controller's planning loop."""
+        """Longest writer-lock hold of any one API-timed service-manager call: a
+        plan (every power-changing endpoint runs one since 2026-10-27; a lone
+        sleep, wake or transfer holds it for less). Cold starts, defrag and
+        fleet repair hold it longer by design (a pod start) and are not part of
+        the controller's planning loop."""
         return max(
             self.worst_case_sleep_lock_s(),
             self.worst_case_wake_lock_s(),
             self.worst_case_transfer_lock_s(),
+            self.worst_case_plan_lock_s(),
         )
 
     def worst_case_sleep_call_s(self) -> float:
-        """Upper bound of one sleeping / waking / transfer SM call as its client
+        """Upper bound of one sleeping / waking / plan SM call as its client
         sees it: the wait for the writer lock (``writer_lock_wait_s``, then 409
         writer_busy) + the longest lock hold + ``io_margin_s``. Defaults:
-        30 + 290 + 2 = 322 s."""
+        30 + 311 + 2 = 343 s."""
         return self.writer_lock_wait_s + self.worst_case_lock_hold_s() + self.sleep.io_margin_s
 
     def shutdown_timeout_s(self) -> float:

@@ -1147,6 +1147,8 @@ class SleepPrimitive:
             "non_continuable_at_sleep": pod.last_load.get("non_continuable") or 0,
             "waited_s": round(pod.waited_s, 3),
         }
+        if batch.journal_extra.get("plan_id"):
+            outcome["plan_id"] = batch.journal_extra["plan_id"]  # additive (POST /v2/plans)
         outcome.update(extra)
         self._recent.append(outcome)
         return outcome

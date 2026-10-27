@@ -394,16 +394,19 @@ service_manager:
   # (sleep 8, wake 4, transfer selection 2; per-target calls run in parallel).
   k8s_request_timeout_s: 5
   # Timeout clients (the controller) use for slow SM calls. Must exceed the
-  # worst-case call = writer_lock_wait_s + the longest writer-lock hold (a
-  # transfer, any number of pairs: its donors' sleep - ack_timeout_s +
-  # probe_timeout_s + sleep_call_timeout_s + max(physical_confirm_timeout_s +
-  # probe_timeout_s, 4 x probe_timeout_s) + 8 Kubernetes calls x 7 + io_margin_s
-  # = 108 s - plus its receivers' wake - probe_timeout_s + wake.call_timeout_s +
-  # 2 x probe_timeout_s + ONE compensating sleep (108 s) + 4 Kubernetes calls x 7
-  # + io_margin_s = 163 s - plus one selection probe round and 2 Kubernetes
-  # calls) + io_margin_s = 30 + 290 + 2 = 322 s with these values (every
-  # timeout at its bound); validated at SM and controller start. The controller
-  # uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
+  # worst-case call = writer_lock_wait_s + the longest writer-lock hold (a plan:
+  # POST /v2/plans and the /target, /power, v1 wrappers, any number of items -
+  # selection: one probe round + 3 Kubernetes calls x 7 = 26 s; wave 1: the
+  # longer of one sleep call - ack_timeout_s + probe_timeout_s +
+  # sleep_call_timeout_s + max(physical_confirm_timeout_s + probe_timeout_s,
+  # 4 x probe_timeout_s) + 8 Kubernetes calls x 7 + io_margin_s = 108 s - and
+  # one wake wave - probe_timeout_s + wake.call_timeout_s + 2 x probe_timeout_s
+  # + 4 Kubernetes calls x 7 + io_margin_s = 55 s; wave 2: one wake wave 55 s;
+  # ONE deferred compensating sleep 108 s; the observed refresh: 1 Kubernetes
+  # call x 7 + probe_timeout_s = 12 s; io_margin_s 2 s = 311 s) + io_margin_s
+  # = 30 + 311 + 2 = 343 s with these values (every timeout at its bound);
+  # validated at SM and controller start. The controller uses it unless
+  # TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
   api_call_timeout_s: 360
   # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
   # ERROR, WARNING, INFO or DEBUG; the TRE_SM_LOG_LEVEL env var overrides it.

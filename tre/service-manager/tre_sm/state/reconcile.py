@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Protocol
@@ -368,15 +369,20 @@ def observe_bindings(
     no observation. Pods whose annotations cannot be parsed are skipped (the
     full reconcile reports them)."""
     wanted = set(binding_ids)
-    observations: list[BindingObservation] = []
+    pods = []
     for pod in k8s_client.list_pods():
         try:
             binding_id = pod.to_binding().binding_id
         except ValueError:
             continue
         if binding_id in wanted:
-            observations.append(observe_pod(pod, prober))
-    return observations
+            pods.append(pod)
+    if len(pods) <= 1 or prober is None:
+        return [observe_pod(pod, prober) for pod in pods]
+    # One LIST and ONE parallel probe round (2026-10-27): the refresh after a
+    # plan touches many bindings, its hold must not grow with their number.
+    with ThreadPoolExecutor(max_workers=len(pods)) as pool:
+        return list(pool.map(lambda pod: observe_pod(pod, prober), pods))
 
 
 def _enforce_routable_labels(

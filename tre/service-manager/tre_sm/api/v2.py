@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tre_common.registry import (
     SLEEP_PATHS,
@@ -47,6 +47,14 @@ from tre_sm.allocator.slots import (
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.ops.k8s_ops import StartupPodRecord, UnreadablePodBinding
+from tre_sm.ops.plan import (
+    Donor as PlanDonorSpec,
+    Refusal as PlanRefusal,
+    SleepItem as PlanSleep,
+    WakeItem as PlanWake,
+    refusal_reason,
+    select_plan,
+)
 from tre_sm.ops.transfer import (
     SKIP_FLOOR,
     TRANSFER_DONE,
@@ -54,6 +62,7 @@ from tre_sm.ops.transfer import (
     TRANSFER_PENDING,
     TRANSFER_RECEIVER_FAILED,
     TransferPair,
+    TransferRefusal,
     TransferSelection,
     busy_binding_ids,
     select_transfer_pairs,
@@ -285,9 +294,11 @@ class ServiceManagerV2:
         #: Redis of the acceptance-test fault hooks; read only while registry
         #: service_manager.test_hooks is true (off by default: never read).
         self._fault_redis = fault_redis
-        #: /wake_up of the bindings of ONE request run concurrently on it.
+        #: /wake_up of the bindings of ONE request run concurrently on it. A wave
+        #: of a plan wakes at most one binding per GPU: at least one worker per
+        #: GPU, so a wave never queues (2026-10-27).
         self._wake_executor = ThreadPoolExecutor(
-            max_workers=WAKE_WORKERS, thread_name_prefix="wake"
+            max_workers=max(WAKE_WORKERS, _topology_gpu_count(registry)), thread_name_prefix="wake"
         )
         #: P2-8 / P1-3: starting lease binding id -> (monotonic time this SM first
         #: saw it, restart count of its Pod then).
@@ -3266,8 +3277,15 @@ class ServiceManagerV2:
         observation code) and replace only their observed records, so the
         audit does not report the pre-operation power (desired_power_mismatch,
         gpu_lease_*) until the next full reconcile. Best effort: a failure is
-        logged and left to the next reconcile; it never fails the operation."""
+        logged and left to the next reconcile; it never fails the operation.
+        ONE Pod LIST and one parallel probe round for every binding of the call;
+        inside :meth:`_deferred_refresh` (a plan) the ids are collected and
+        refreshed once at its end (2026-10-27: one refresh per hold)."""
         ids = {binding_id for binding_id in binding_ids if binding_id}
+        deferred = _REFRESH_DEFERRED.get()
+        if deferred is not None:
+            deferred |= ids
+            return
         if not ids or self._fleet_store is None or self._k8s_client is None:
             return
         try:
@@ -3278,6 +3296,21 @@ class ServiceManagerV2:
                 "refreshing the observed state of %s failed; the next reconcile does it",
                 sorted(ids), exc_info=True,
             )
+
+    @contextmanager
+    def _deferred_refresh(self):
+        """Every :meth:`_refresh_observed` inside the block is collected and done
+        ONCE when the block ends (also on an exception)."""
+        if _REFRESH_DEFERRED.get() is not None:
+            yield
+            return
+        ids: set[str] = set()
+        token = _REFRESH_DEFERRED.set(ids)
+        try:
+            yield
+        finally:
+            _REFRESH_DEFERRED.reset(token)
+            self._refresh_observed(ids)
 
     def _pod_prober(self):
         if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
@@ -3520,6 +3553,7 @@ class ServiceManagerV2:
             node=binding.slot.node, gpu_ids=list(binding.slot.gpu_ids),
             truth_source=ticket.truth_source, placement=placement,
             operation_id=None if operation is None else operation.operation_id,
+            **_plan_tags(placement),
         )
         return ticket
 
@@ -4031,7 +4065,15 @@ class ServiceManagerV2:
         most ONE compensating sleep, so the hold does not grow with the number of
         tickets) and (``restore_desired``) its desired power restored from before
         the wake. One ticket's error never stops the others (P1-1): it stays
-        journaled for the recovery."""
+        journaled for the recovery. Two steps (2026-10-27): :meth:`_record_wakes`
+        and :meth:`_finish_wakes`; a plan records each wave and finishes every
+        ticket of both waves together (ONE settlement per hold)."""
+        self._record_wakes(tickets, update_store=update_store)
+        self._finish_wakes(tickets, restore_desired=restore_desired)
+
+    def _record_wakes(self, tickets: list["_WakeTicket"], *, update_store: bool) -> None:
+        """First commit step: the awake annotation, lease and (``update_store``)
+        store of every woken ticket; one that cannot be recorded becomes failed."""
         started = time.monotonic()
         # The awake annotations of every woken ticket in parallel (a k8s read +
         # patch each): the hold does not grow with the number of tickets.
@@ -4042,6 +4084,13 @@ class ServiceManagerV2:
             except Exception as exc:  # noqa: BLE001 - left journaled for the recovery
                 LOG.exception("committing the wake of %s failed", ticket.binding.binding_id)
                 ticket.commit_error = exc
+            ticket.phases_ms["commit"] = _elapsed_ms(started)
+
+    def _finish_wakes(self, tickets: list["_WakeTicket"], *, restore_desired: bool) -> None:
+        """Second commit step: every failed ticket settled together (one probe
+        round, at most ONE compensating sleep), then each journal entry ended,
+        and the observed state of all of them refreshed once."""
+        started = time.monotonic()
         failed = [
             ticket for ticket in tickets
             if ticket.commit_error is None and not ticket.woke and not ticket.left_to_recovery
@@ -4062,12 +4111,13 @@ class ServiceManagerV2:
                 ticket.commit_error = exc
             finally:
                 # Woken, or a failed wake in whatever state it left: an earlier
-                # gpu-truth sample no longer describes these GPUs (S1), and
-                # observed follows (B2).
+                # gpu-truth sample no longer describes these GPUs (S1).
                 self._note_binding_power_change(binding)
-                self._refresh_observed([binding.binding_id])
-                ticket.phases_ms["commit"] = _elapsed_ms(started)
+                # ``commit`` = record + settle (the phase keys stay as they were).
+                ticket.phases_ms["commit"] = ticket.phases_ms.get("commit", 0) + _elapsed_ms(started)
                 self._log_wake_outcome(ticket)
+        # Observed follows (B2): one refresh for every ticket.
+        self._refresh_observed([ticket.binding.binding_id for ticket in tickets])
 
     def _annotate_woken(self, ticket: "_WakeTicket") -> BaseException | None:
         """The awake annotation of a woken ticket; returns the error (never raises)."""
@@ -4269,6 +4319,7 @@ class ServiceManagerV2:
                 node=binding.slot.node, gpu_ids=list(binding.slot.gpu_ids),
                 phases_ms=dict(ticket.phases_ms), parallel_inflight=ticket.parallel_inflight,
                 truth_source=ticket.truth_source, placement=ticket.placement,
+                **_plan_tags(ticket.placement),
             )
             return
         self._wake_journal.incr("wake_failed_total")
@@ -4280,6 +4331,7 @@ class ServiceManagerV2:
             error_code=_error_code(ticket.exception), error=str(ticket.exception),
             physically_awake=None if ticket.physical is None else not ticket.physical,
             compensating_sleep=ticket.compensating_sleep, phases_ms=dict(ticket.phases_ms),
+            **_plan_tags(ticket.placement),
         )
 
     def _note_wake_details(self, tickets: list["_WakeTicket"], *, error: BaseException | None = None) -> None:
@@ -4585,6 +4637,735 @@ class ServiceManagerV2:
     # sleep and wake journals - after a crash those settle each binding from its
     # physical state (a donor may have slept for nothing: the controller re-plans
     # on its next tick).
+
+    # ------------------------------------------------------------------ plans
+    # POST /v2/plans (2026-10-27, design docs/design/20261027-sm-plans.md): one
+    # decision of a caller - sleep items and wake items - in ONE writer-lock hold:
+    #   select: pure (tre_sm.ops.plan) on books read once - one Pod LIST, at most
+    #     one resident probe round, the routable views of the sleep models (an
+    #     unreadable one: 409 routable_unknown before anything is hidden);
+    #   wave 1: every plan sleep (the sleep primitive, one call per sleep path, in
+    #     parallel) alongside the wakes on free GPUs; the books of both (store,
+    #     leases, desired) are written on the request thread after the join;
+    #   wave 2: the wakes on GPUs the plan's sleeps free, each once every sleep it
+    #     depends on is confirmed asleep (a failed / unconfirmed / rolled-back
+    #     sleep: its dependents are never prepared, ``donor_sleep_failed``);
+    #   settle: every failed wake of both waves together (one /is_sleeping round,
+    #     at most ONE compensating sleep); refresh: one observed refresh.
+    # No new intermediate state: a crash is settled per binding by the sleep and
+    # wake journals (entries tagged ``plan_id``), as for any sleep or wake.
+
+    def execute_plan(
+        self,
+        *,
+        sleeps: list[PlanSleep] | tuple[PlanSleep, ...] = (),
+        wakes: list[PlanWake] | tuple[PlanWake, ...] = (),
+        plan_id: str | None = None,
+    ) -> dict:
+        """``POST /v2/plans``: validate (ValueError / KeyError -> 400, nothing
+        done), then :meth:`_execute_plan_locked` in one ``_writer("plan")``.
+        Returns the plan response; raises :class:`PlanFailed` (409 ``partial``,
+        the full response in the body) when nothing changed and an item was
+        refused or failed."""
+        plan = self._validated_plan(sleeps, wakes, plan_id)
+        request = {
+            "plan_id": plan.plan_id,
+            "sleeps": [_plan_item_brief(item) for item in plan.sleeps],
+            "wakes": [_plan_item_brief(item) for item in plan.wakes],
+        }
+        with self._writer("plan", request=request) as operation:
+            run = self._execute_plan_locked(plan)
+            response = self._plan_response(run)
+            self._note_plan(run, response, operation)
+            if response["status"] == "failed":
+                first = next(
+                    (item.get("error") for item in response["sleeps"] + response["wakes"] if item.get("error")),
+                    None,
+                ) or {}
+                raise PlanFailed(
+                    f"plan {plan.plan_id}: nothing changed "
+                    f"(sleeps {[(i['model'], i['status']) for i in response['sleeps']]}, "
+                    f"wakes {[(i['model'], i['status']) for i in response['wakes']]})",
+                    response=response, first=first,
+                )
+            return response
+
+    def _validated_plan(self, sleeps, wakes, plan_id: str | None) -> "_Plan":
+        """The request rules (design section 3): at least one item, known models,
+        each model in at most ONE item (a relay donor counts as its model's sleep
+        side), external sleep paths, exactly one of pods / at_most (sleep) and
+        at_least / pods (wake)."""
+        sleeps, wakes = list(sleeps or ()), list(wakes or ())
+        if not sleeps and not wakes:
+            raise ValueError("a plan needs at least one sleep or wake item")
+        seen: set[str] = set()
+
+        def claim(model: str, what: str) -> None:
+            self._registry.model(model)  # KeyError: unknown model (400)
+            if model in seen:
+                raise ValueError(f"model {model} appears in more than one plan item ({what})")
+            seen.add(model)
+
+        for item in sleeps:
+            claim(item.model, "sleep")
+            _sleep_path(item.sleep_path)
+            if (item.pods is None) == (item.at_most is None):
+                raise ValueError(f"sleep item of {item.model}: exactly one of pods / at_most")
+            if item.pods is not None and not item.pods:
+                raise ValueError(f"sleep item of {item.model}: pods must not be empty")
+            if item.at_most is not None and item.at_most < 0:
+                raise ValueError(f"sleep item of {item.model}: at_most must be non-negative")
+        for item in wakes:
+            claim(item.model, "wake")
+            if (item.pods is None) == (item.at_least is None):
+                raise ValueError(f"wake item of {item.model}: exactly one of at_least / pods")
+            if item.pods is not None and not item.pods:
+                raise ValueError(f"wake item of {item.model}: pods must not be empty")
+            if item.at_least is not None and item.at_least < 0:
+                raise ValueError(f"wake item of {item.model}: at_least must be non-negative")
+            for donor in item.donors:
+                claim(donor.model, f"donor of {item.model}")
+                _sleep_path(donor.sleep_path)
+                if donor.sleep_path == "safescale_commit":
+                    raise ValueError("sleep_path safescale_commit is not a relay path (donors are not hidden)")
+                if donor.max < 1:
+                    raise ValueError(f"donor {donor.model} of {item.model}: max must be at least 1")
+        return _Plan(plan_id=str(plan_id or f"pl-{uuid4().hex[:12]}"), sleeps=sleeps, wakes=wakes)
+
+    def _execute_plan_locked(self, plan: "_Plan") -> "_PlanRun":
+        """The executor (writer lock held; see the section comment). Raises
+        before any change for a bad pod name (ValueError) or an unreadable
+        routable view (409 ``routable_unknown``); otherwise every item's outcome
+        is in the returned run."""
+        started = time.monotonic()
+        run = _PlanRun(plan=plan)
+        _log_event(
+            "plan_start", plan_id=plan.plan_id,
+            sleeps=[_plan_item_brief(item) for item in plan.sleeps],
+            wakes=[_plan_item_brief(item) for item in plan.wakes],
+        )
+        refresh = None
+        with self._deferred_refresh():
+            self._plan_select(run)
+            run.phases_ms["select"] = _elapsed_ms(started)
+            if self._sleep_primitive is not None and self._physical_wake_capable():
+                self._plan_actuate(run)
+            else:
+                self._plan_actuate_books(run)
+            refresh = time.monotonic()
+        run.phases_ms["refresh"] = _elapsed_ms(refresh)
+        run.phases_ms["total"] = _elapsed_ms(started)
+        run.version = self._store.load().version
+        if run.fatal is not None:
+            raise run.fatal
+        return run
+
+    def _plan_select(self, run: "_PlanRun") -> None:
+        plan = run.plan
+        snapshot = self._store.load()
+        bindings = snapshot.bindings
+        by_name = {binding.serve_id: binding for binding in bindings}
+        by_id = {binding.binding_id: binding for binding in bindings}
+        for item in [*plan.sleeps, *plan.wakes]:
+            for name in item.pods or ():
+                binding = by_name.get(name)
+                if binding is None:
+                    raise ValueError(f"unknown binding: {name}")
+                if binding.model != item.model:
+                    raise ValueError(f"pod {name} is a replica of {binding.model}, not {item.model}")
+        physical = self._sleep_primitive is not None and self._physical_wake_capable()
+        leases = self._active_leases()
+        wake_entries = self._wake_journal.entries()
+        sleep_models = sorted({item.model for item in plan.sleeps} | {
+            donor.model for item in plan.wakes for donor in item.donors
+        })
+        wake_models = {item.model for item in plan.wakes}
+        # ONE Pod LIST for everything this hold needs: pod IPs, the routable
+        # views, the resident probe round.
+        snapshots = None
+        lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
+        if self._runtime_ops is not None and callable(lister):
+            try:
+                snapshots = list(lister())
+            except Exception as exc:
+                if sleep_models:
+                    raise WakeConflict(
+                        f"plan {plan.plan_id}: the Pods cannot be listed ({type(exc).__name__}: {exc}); "
+                        "nothing changed",
+                        reason="routable_unknown",
+                    ) from exc
+                raise
+        floors: dict[str, tuple[int, set[str]]] = {}
+        if self._floor_enforced() and sleep_models:
+            try:
+                transient = self._transient_lease_ids()
+                for model in sleep_models:
+                    floors[model] = (
+                        self._model_floor(model),
+                        self._routable_binding_ids(model, bindings, live=snapshots, transient=transient),
+                    )
+            except Exception as exc:  # noqa: BLE001 - structured refusal, before any hide
+                raise WakeConflict(
+                    f"plan {plan.plan_id}: the routable view cannot be read ({type(exc).__name__}: {exc}); "
+                    "nothing changed",
+                    reason="routable_unknown",
+                ) from exc
+        pods = {snap.name: snap for snap in snapshots or ()}
+        run.pods = pods
+        sleepable = {name for name, snap in pods.items() if snap.pod_ip} if physical else None
+        topology = self._registry.topology()
+        caps = {item.model: scale_max_replicas(self._registry.model(item.model)) for item in plan.wakes}
+        busy = busy_binding_ids(
+            wake_journal=wake_entries,
+            sleep_journal=self._sleep_primitive.journal.entries() if self._sleep_primitive is not None else {},
+            transient_lease_ids=[
+                lease.binding_id for lease in leases
+                if str(getattr(lease, "phase", "")) in TRANSIENT_LEASE_PHASES
+            ],
+        )
+        # At most ONE resident probe round, over every GPU a wake candidate or a
+        # possible plan sleep holds (on first use: nothing changes before).
+        gpus = {
+            (binding.slot.node, int(gpu))
+            for binding in bindings
+            if (binding.model in wake_models and not binding.awake)
+            or (binding.model in sleep_models and binding.awake)
+            for gpu in binding.slot.gpu_ids
+        }
+        probe_cache: list = []
+
+        def probed():
+            if not probe_cache:
+                try:
+                    probe_cache.append(self._probe_pods_on_gpus(gpus, snapshots=snapshots))
+                except Exception as exc:  # noqa: BLE001 - every resident unknown (fail closed)
+                    probe_cache.append(exc)
+            return probe_cache[0]
+
+        def residents_of(binding: Binding):
+            return self._residents_from(binding, gpus, probed())
+
+        def veto(binding: Binding, wave: int, sleeping_ids: frozenset[str]):
+            node, gpu_ids = binding.slot.node, tuple(binding.slot.gpu_ids)
+            if binding.binding_id in wake_entries:
+                return WakeConflict(
+                    f"{binding.serve_id}: a wake of {binding.binding_id} is already in progress",
+                    reason="wake_in_progress", node=node, gpus=gpu_ids,
+                    binding_id=binding.binding_id, blocking_binding_id=binding.binding_id,
+                )
+            if self._fault_active("refuse_wake", binding):
+                return WakeConflict(
+                    f"{binding.serve_id}: wake refused by the test hook "
+                    f"{rediskeys.SM_FAULT_KEY_PREFIX}refuse_wake (service_manager.test_hooks)",
+                    reason="fault_injected", node=node, gpus=gpu_ids, binding_id=binding.binding_id,
+                )
+            if not physical:
+                run.gates[binding.binding_id] = {"truth_source": "none", "truth_age_s": None}
+                return None
+            snap = pods.get(binding.serve_id)
+            if snap is None or not snap.pod_ip:
+                return ValueError(f"pod {binding.serve_id} not found (or no pod IP) for wake")
+            if wave == 1:
+                try:
+                    run.gates[binding.binding_id] = self._ensure_wake_headroom(binding, residents_of=residents_of) or {}
+                except WakeConflict as exc:
+                    return exc
+                return None
+            for sleeper_id in sorted(sleeping_ids):
+                sleeper = by_id.get(sleeper_id)
+                if sleeper is None or not _slots_overlap(sleeper.slot, binding.slot):
+                    continue
+                if not getattr(pods.get(sleeper.serve_id), "pod_ip", None):
+                    return WakeConflict(
+                        f"{binding.binding_id}: plan sleep {sleeper.serve_id} has no pod IP",
+                        reason="resident_unknown", node=node, gpus=gpu_ids,
+                        binding_id=binding.binding_id, blocking_binding_id=sleeper_id,
+                    )
+            conflict = self._plan_resident_veto(binding, sleeping_ids, probed())
+            if conflict is None:
+                # The wake gate is answered in this hold: the probe found every
+                # third resident asleep, the sleep primitive confirms every plan
+                # sleep on these GPUs before the wake is prepared (gpu-truth is
+                # untrusted after those power changes anyway).
+                run.gates[binding.binding_id] = {"truth_source": "plan_probe", "truth_age_s": None}
+            return conflict
+
+        def blocker(binding: Binding, planning: list[Binding], ignored: frozenset[str]):
+            try:
+                return self._wake_blocker(
+                    binding, planning, [lease for lease in leases if lease.binding_id not in ignored], wake_entries
+                )
+            except WakeConflict as exc:
+                return exc
+
+        def shrink_order(serving, books, released):
+            return release_order(
+                serving, bindings=books, topology=topology, already_released=released, policy=self._placement
+            )
+
+        run.selection = select_plan(
+            bindings,
+            sleeps=plan.sleeps,
+            wakes=plan.wakes,
+            topology=topology,
+            policy=self._placement,
+            floors=floors,
+            caps=caps,
+            busy=busy,
+            wake_journaled=set(wake_entries),
+            sleepable=sleepable,
+            wake_blocker=blocker,
+            wake_pick=lambda feasible, planning: _wake_pick(feasible, planning, topology, self._placement),
+            shrink_order=shrink_order,
+            veto=veto,
+        )
+        for choice in run.selection.sleeps:
+            check = choice.floor_check
+            if check is not None and choice.refusal is not None and refusal_reason(choice.refusal) == "floor_violation":
+                self._floor_recorder.record("rejected", check, path=choice.item.sleep_path)
+            elif check is not None and choice.clamped:
+                self._floor_recorder.record(
+                    "clamped", check, path=choice.item.sleep_path,
+                    requested_sleep=sorted({b.binding_id for b in choice.members + choice.kept_awake}),
+                    kept_awake=sorted(b.serve_id for b in choice.kept_awake),
+                )
+        for choice in run.selection.wakes:
+            for binding_id, refusal in choice.substituted:
+                _log_event(
+                    "placement_substituted", level=logging.WARNING, plan_id=plan.plan_id,
+                    model=choice.item.model, refused_binding_id=binding_id,
+                    error_code=refusal_reason(refusal), detail=str(refusal),
+                )
+
+    def _plan_resident_veto(self, binding: Binding, sleeping_ids, residents) -> "WakeConflict | None":
+        """Why a wave-2 wake must not be taken (None = take it): a resident of its
+        GPUs other than the plan's sleeps that is not confirmed asleep. The plan
+        sleeps are still awake, so gpu-truth shows the GPU in use: only the
+        probe round can tell whether a third resident sleeps. ``residents``: the
+        round (:meth:`_probe_pods_on_gpus`) or the exception that made it
+        unreadable."""
+        node = binding.slot.node
+        gpus = tuple(binding.slot.gpu_ids)
+        if isinstance(residents, BaseException):
+            return WakeConflict(
+                f"{binding.binding_id}: residents cannot be listed ({type(residents).__name__}: {residents})",
+                reason="resident_unknown", node=node, gpus=gpus, binding_id=binding.binding_id,
+            )
+        others = [
+            (other.binding_id, sleeping) for other, sleeping, _ip in residents
+            if other.serve_id != binding.serve_id and other.binding_id not in sleeping_ids
+            and _slots_overlap(other.slot, binding.slot)
+        ]
+        awake = sorted(binding_id for binding_id, sleeping in others if sleeping is False)
+        unknown = sorted(binding_id for binding_id, sleeping in others if sleeping is None)
+        if awake:
+            return WakeConflict(
+                f"{binding.binding_id}: resident(s) {awake} on {node}/{','.join(str(g) for g in gpus)} "
+                "are awake (besides the plan's sleeps)",
+                reason="resident_awake", node=node, gpus=gpus, binding_id=binding.binding_id,
+                blocking_binding_id=awake[0],
+            )
+        if unknown:
+            return WakeConflict(
+                f"{binding.binding_id}: cannot verify resident(s) {unknown} asleep",
+                reason="resident_unknown", node=node, gpus=gpus, binding_id=binding.binding_id,
+                blocking_binding_id=unknown[0],
+            )
+        return None
+
+    def _plan_actuate(self, run: "_PlanRun") -> None:
+        """The two waves and the settlement (see the section comment)."""
+        selection = run.selection
+        primitive = self._sleep_primitive
+        operation = current_operation()
+        before = self._desired_records()
+        picks = [(choice, pick) for choice in selection.wakes for pick in choice.picks]
+        self._plan_record_noops(run)
+        groups: dict[str, list[SleepTarget]] = {}
+        for binding, path in selection.sleep_set():
+            snap = run.pods[binding.serve_id]
+            groups.setdefault(path, []).append(SleepTarget(binding, str(snap.pod_ip), getattr(snap, "pod_uid", None)))
+        group_items = list(groups.items())
+        journal_extra = {**DESIRED_ON_SLEEP, "plan_id": run.plan.plan_id}
+
+        phase = time.monotonic()
+        wave1 = self._prepare_plan_wakes(run, [(c, p) for c, p in picks if p.wave == 1], before)
+
+        def sleep_group(group):
+            path, targets = group
+            try:
+                return primitive.sleep(targets, path=path, journal_extra=journal_extra, keep_journal=True), None
+            except SleepFailed as exc:
+                return list(exc.outcomes or []), exc
+            except Exception as exc:  # noqa: BLE001 - nothing of this group was sent
+                return [], exc
+
+        def sleep_phase():
+            return _parallel(sleep_group, group_items)
+
+        def wake_phase():
+            try:
+                self._run_wakes(wave1)
+            except Exception as exc:  # noqa: BLE001 - recorded per ticket
+                for ticket in wave1:
+                    if not ticket.woke and ticket.exception is None:
+                        ticket.exception = exc
+            return None
+
+        if operation is not None and (group_items or wave1):
+            operation.advance("plan_wave1", details={
+                "sleeps": [t.binding.serve_id for _p, ts in group_items for t in ts],
+                "wakes": [t.binding.serve_id for t in wave1],
+            })
+        # Thread A sleeps (hide, ack, /sleep, confirm - no store / lease / desired
+        # write), thread B wakes on free GPUs: different GPUs (selection).
+        phases = [fn for fn, todo in ((sleep_phase, group_items), (wake_phase, wave1)) if todo]
+        results = _parallel(lambda fn: fn(), phases)
+        sleep_results = results.get(id(sleep_phase)) or {}
+        for group in group_items:
+            _path, targets = group
+            outcomes, error = sleep_results.get(id(group), ([], None))
+            recorded = True
+            try:
+                self._record_sleep_outcomes(targets, outcomes, update_store=True, desired_sleeping=True)
+                primitive.end_journal(outcomes)
+            except Exception as exc:  # noqa: BLE001 - journals kept; raised after the settlement
+                LOG.exception("recording the plan sleeps %s failed", [t.binding.serve_id for t in targets])
+                run.fatal = run.fatal or exc
+                error = error or exc
+                recorded = False
+            by_id = {item.get("binding_id"): item for item in outcomes}
+            for target in targets:
+                binding_id = target.binding.binding_id
+                outcome = by_id.get(binding_id)
+                if outcome is not None:
+                    run.sleep_outcomes[binding_id] = outcome
+                if recorded and outcome is not None and outcome.get("status") == STATUS_SLEPT:
+                    run.slept.add(binding_id)
+                elif error is not None:
+                    run.sleep_errors[binding_id] = error
+        self._record_wakes(wave1, update_store=True)
+        run.phases_ms["wave1"] = _elapsed_ms(phase)
+
+        phase = time.monotonic()
+        ready = []
+        for choice, pick in picks:
+            if pick.wave != 2:
+                continue
+            missing = [dep for dep in pick.depends_on if dep not in run.slept]
+            if missing:
+                binding = pick.binding
+                run.pick_errors[binding.binding_id] = WakeConflict(
+                    f"{binding.serve_id}: the plan sleep of {missing} on its GPUs did not complete",
+                    reason="donor_sleep_failed", node=binding.slot.node, gpus=binding.slot.gpu_ids,
+                    binding_id=binding.binding_id, blocking_binding_id=missing[0],
+                )
+                continue
+            ready.append((choice, pick))
+        wave2 = self._prepare_plan_wakes(run, ready, before)
+        if wave2:
+            if operation is not None:
+                operation.advance("plan_wave2", details={"wakes": [t.binding.serve_id for t in wave2]})
+            self._run_wakes(wave2)
+            self._record_wakes(wave2, update_store=True)
+        run.phases_ms["wave2"] = _elapsed_ms(phase)
+
+        phase = time.monotonic()
+        tickets = wave1 + wave2
+        self._finish_wakes(tickets, restore_desired=True)
+        self._note_wake_details(tickets)
+        run.phases_ms["settle"] = _elapsed_ms(phase)
+
+    def _prepare_plan_wakes(self, run: "_PlanRun", picks, before: dict) -> list["_WakeTicket"]:
+        """The prepare of a wave's picks (account and gate already decided in this
+        hold by the selection), then their desired power awake. A pick the
+        prepare refuses is reported, never raised: the other items go on."""
+        tickets: list[_WakeTicket] = []
+        for choice, pick in picks:
+            binding = pick.binding
+            placement = {
+                "source": pick.source,
+                "plan_id": run.plan.plan_id,
+                "item": choice.index,
+                "wave": pick.wave,
+                "chosen_binding_id": binding.binding_id,
+                "hint_binding_id": binding.binding_id if pick.hinted else None,
+                "donor_binding_ids": list(pick.donor_ids or pick.depends_on),
+            }
+            gate = run.gates.get(binding.binding_id) or {"truth_source": "plan_probe", "truth_age_s": None}
+            try:
+                ticket = self._prepare_wake(
+                    binding, None, check_account=False, previous_desired=before.get(binding.binding_id),
+                    placement=placement, gate=gate, pods=run.pods,
+                )
+            except (WakeConflict, GpuLeaseConflict, ValueError) as exc:
+                run.pick_errors[binding.binding_id] = exc
+                continue
+            ticket.hinted = pick.hinted
+            run.tickets[binding.binding_id] = ticket
+            tickets.append(ticket)
+        if tickets:
+            try:
+                self._update_desired(
+                    {ticket.binding.binding_id: {"power": "awake"} for ticket in tickets},
+                    updated_by="service-manager-plan",
+                    reason="plan",
+                )
+            except Exception as exc:  # noqa: BLE001 - nothing woke: reported per pick
+                LOG.exception("writing the desired power of the plan wakes failed")
+                self._abort_prepared_wakes(tickets)
+                for ticket in tickets:
+                    run.tickets.pop(ticket.binding.binding_id, None)
+                    run.pick_errors[ticket.binding.binding_id] = exc
+                return []
+        return tickets
+
+    def _plan_record_noops(self, run: "_PlanRun") -> None:
+        """Named pods already in the asked state: their desired power follows the
+        request (as ``/power`` always did)."""
+        updates: dict[str, dict] = {}
+        for choice in run.selection.sleeps:
+            for binding in choice.already_asleep:
+                updates[binding.binding_id] = {"power": "sleeping", "hidden": False}
+        for choice in run.selection.wakes:
+            for binding in choice.already_awake:
+                updates[binding.binding_id] = {"power": "awake"}
+        if updates and self._fleet_store is not None:
+            known = {item.binding_id for item in self._fleet_store.load_desired().bindings}
+            self._update_desired(
+                {binding_id: fields for binding_id, fields in updates.items() if binding_id in known},
+                updated_by="service-manager-api",
+                reason="plan",
+            )
+
+    def _plan_actuate_books(self, run: "_PlanRun") -> None:
+        """Without the runtime and vLLM ops (embedded / unit-test wiring): the
+        same selection, its outcome written to the store and the desired state
+        only (every plan sleep counts as slept, every pick as woken)."""
+        selection = run.selection
+        self._plan_record_noops(run)
+        sleeping = {binding.binding_id for binding, _path in selection.sleep_set()}
+        waking = {pick.binding.binding_id for choice in selection.wakes for pick in choice.picks}
+        if not sleeping and not waking:
+            return
+        snapshot = self._store.load()
+        updated = []
+        for binding in snapshot.bindings:
+            if binding.binding_id in sleeping:
+                binding = replace(binding, awake=False, hidden=False)
+            elif binding.binding_id in waking:
+                binding = replace(binding, awake=True, hidden=False)
+            updated.append(binding)
+        self._store.save(updated, expected_version=snapshot.version)
+        for model in sorted({b.model for b in snapshot.bindings if b.binding_id in sleeping | waking}):
+            self._set_model_desired_target(
+                model=model,
+                target_bindings=[b for b in updated if b.model == model and b.awake],
+                reason="model_target_request",
+            )
+        run.slept |= sleeping
+        run.books_woken |= waking
+
+    def _plan_results(self, run: "_PlanRun") -> tuple[list[dict], list[dict]]:
+        """Per item results with the internal fields the wrappers map back from
+        (``_error``: the exception, ``_tickets``, ``_check``), see :meth:`_plan_response`."""
+        selection = run.selection
+        final = self._store.load().bindings
+        sleeps: list[dict] = []
+        for choice in selection.sleeps:
+            item = choice.item
+            entry: dict = {
+                "index": choice.index, "model": item.model, "reason": item.reason,
+                "sleep_path": item.sleep_path, "taken": 0, "clamped_by_floor": choice.clamped,
+                "outcomes": [], "_check": choice.floor_check,
+                "_members": list(choice.members),
+            }
+            if choice.floor_check is not None and (choice.clamped or choice.refusal is not None):
+                entry["floor"] = {
+                    "clamped": choice.clamped,
+                    "kept_awake": sorted(b.serve_id for b in choice.kept_awake),
+                    **choice.floor_check.as_dict(),
+                }
+            if choice.refusal is not None:
+                entry.update(status="refused", _error=self._refusal_exception(choice.refusal, choice), not_executed=True)
+                sleeps.append(entry)
+                continue
+            entry["outcomes"] = [
+                run.sleep_outcomes[b.binding_id] for b in choice.members if b.binding_id in run.sleep_outcomes
+            ]
+            entry["taken"] = sum(1 for b in choice.members if b.binding_id in run.slept)
+            failed = [b for b in choice.members if b.binding_id not in run.slept]
+            if failed:
+                error = run.sleep_errors.get(failed[0].binding_id) or SleepFailed(
+                    f"sleep of {failed[0].serve_id} did not complete", outcomes=entry["outcomes"]
+                )
+                entry.update(status="failed", _error=error, not_executed=entry["taken"] == 0)
+            elif choice.clamped:
+                entry["status"] = "clamped"
+            elif not choice.members:
+                entry["status"] = "noop"
+            else:
+                entry["status"] = "done"
+            sleeps.append(entry)
+        wakes: list[dict] = []
+        for choice in selection.wakes:
+            item = choice.item
+            woke, errors, compensating = [], [], []
+            for pick in choice.picks:
+                binding = pick.binding
+                ticket = run.tickets.get(binding.binding_id)
+                if (ticket is not None and ticket.woke) or binding.binding_id in run.books_woken:
+                    woke.append({
+                        "serve_id": binding.serve_id, "binding_id": binding.binding_id,
+                        "node": binding.slot.node, "gpu_ids": list(binding.slot.gpu_ids),
+                        "wave": pick.wave, "source": pick.source, "hinted": pick.hinted,
+                        "donor_binding_ids": list(pick.donor_ids or pick.depends_on),
+                    })
+                    continue
+                error = run.pick_errors.get(binding.binding_id) or (ticket.exception if ticket else None)
+                errors.append(error or WakeFailed(
+                    f"wake of {binding.serve_id} failed", node=binding.slot.node,
+                    gpus=binding.slot.gpu_ids, binding_id=binding.binding_id,
+                ))
+                if ticket is not None and ticket.compensating_sleep:
+                    compensating.append({"serve_id": binding.serve_id, **ticket.compensating_sleep})
+            refusals = errors + [self._refusal_exception(refusal) for refusal in choice.refusals]
+            unfilled = choice.unfilled + len(choice.picks) - len(woke)
+            failed_wake = next((e for e in errors if isinstance(e, WakeFailed)), None)
+            if not choice.picks and choice.unfilled == 0 and not choice.refusals:
+                status = "noop"
+            elif woke:
+                status = "done" if unfilled == 0 else "partial"
+            else:
+                status = "failed" if failed_wake is not None else "refused"
+            entry = {
+                "index": choice.index, "model": item.model, "reason": item.reason, "status": status,
+                "awake_before": choice.awake_before,
+                "awake_after": sum(1 for b in final if b.model == item.model and b.awake),
+                "woke": woke,
+                "donors_slept": [
+                    {
+                        "model": donor.model, "binding_id": donor.binding.binding_id,
+                        "serve_id": donor.binding.serve_id, "sleep_path": donor.sleep_path,
+                        "status": (run.sleep_outcomes.get(donor.binding.binding_id) or {}).get("status")
+                        or ("slept" if donor.binding.binding_id in run.slept else "failed"),
+                    }
+                    for donor in choice.donor_sleeps
+                ],
+                "unfilled": unfilled, "skipped": dict(choice.skipped),
+                "_refusals": refusals, "_tickets": [
+                    run.tickets[p.binding.binding_id] for p in choice.picks if p.binding.binding_id in run.tickets
+                ],
+                "_error": failed_wake or (refusals[0] if refusals and not woke else None),
+            }
+            if compensating:
+                entry["compensating_sleep"] = compensating
+            if status in ("refused", "failed"):
+                entry["not_executed"] = status == "refused"
+            wakes.append(entry)
+        return sleeps, wakes
+
+    def _plan_response(self, run: "_PlanRun") -> dict:
+        """The ``POST /v2/plans`` response (design section 3) and the
+        ``plan_item_refused`` / ``plan_done`` events."""
+        sleeps, wakes = self._plan_results(run)
+        run.results = (sleeps, wakes)
+        changed = bool(run.slept) or any(item["woke"] for item in wakes)
+        problems = [item for item in sleeps + wakes if item["status"] in ("refused", "failed")]
+        if not changed:
+            status = "failed" if problems else "noop"
+        elif problems or any(item["status"] == "partial" for item in wakes):
+            status = "partial"
+        else:
+            status = "done"
+        out_sleeps, out_wakes = [], []
+        for kind, items, out in (("sleep", sleeps, out_sleeps), ("wake", wakes, out_wakes)):
+            for item in items:
+                public = {key: value for key, value in item.items() if not key.startswith("_")}
+                error = item.get("_error")
+                if kind == "wake":
+                    public["refusals"] = [self._plan_error_body(exc) for exc in item["_refusals"]]
+                if error is not None and item["status"] in ("refused", "failed", "partial"):
+                    public["error"] = self._plan_error_body(error)
+                    public["retriable"] = _retriable(error)
+                if item["status"] in ("refused", "failed"):
+                    _log_event(
+                        "plan_item_refused", level=logging.WARNING, plan_id=run.plan.plan_id,
+                        model=item["model"], kind=kind, reason=getattr(error, "reason", None) or _error_code(error),
+                        error=_error_code(error),
+                    )
+                out.append(public)
+        response = {
+            "plan_id": run.plan.plan_id,
+            "version": run.version,
+            "status": status,
+            "sleeps": out_sleeps,
+            "wakes": out_wakes,
+            "phases_ms": dict(run.phases_ms),
+        }
+        _log_event(
+            "plan_done", level=logging.INFO if status in ("done", "noop") else logging.WARNING,
+            plan_id=run.plan.plan_id, status=status, phases_ms=dict(run.phases_ms),
+            sleeps=[(item["model"], item["status"], item["taken"]) for item in out_sleeps],
+            wakes=[(item["model"], item["status"], len(item["woke"])) for item in out_wakes],
+        )
+        return response
+
+    def _refusal_exception(self, refusal, choice=None) -> BaseException:
+        """Any refusal the selection reports, as the exception a single-item
+        endpoint raises (structured 409 body)."""
+        if isinstance(refusal, BaseException):
+            return refusal
+        if isinstance(refusal, TransferRefusal):
+            if isinstance(refusal.error, BaseException):
+                return refusal.error
+            return WakeConflict(
+                refusal.detail, reason=refusal.reason, node=refusal.node, gpus=refusal.gpu_ids,
+                binding_id=refusal.receiver_binding_id, blocking_binding_id=refusal.blocking_binding_id,
+            )
+        if isinstance(refusal, PlanRefusal):
+            if refusal.reason == "floor_violation" and choice is not None and choice.floor_check is not None:
+                return FloorViolation(choice.floor_check, path=choice.item.sleep_path)
+            return WakeConflict(
+                refusal.detail, reason=refusal.reason, node=refusal.node, gpus=refusal.gpu_ids,
+                binding_id=refusal.binding_id, blocking_binding_id=refusal.blocking_binding_id,
+            )
+        return WakeConflict(str(refusal), reason=str(refusal))
+
+    def _plan_error_body(self, exc: BaseException) -> dict:
+        if isinstance(exc, WakeConflict):
+            return exc.body(retry_after_s=self.wake_retry_after_s(exc.scope))
+        if isinstance(exc, FloorViolation):
+            return exc.body()
+        body = {"detail": str(exc), "error": _error_code(exc)}
+        if isinstance(exc, SleepFailed) and exc.outcomes:
+            body["outcomes"] = exc.outcomes
+        return body
+
+    def _note_plan(self, run: "_PlanRun", response: dict, operation) -> None:
+        """The plan on its operation record (``GET /v2/operations``):
+        ``details.plan`` with the items' statuses and ``details.phases_ms``."""
+        note = getattr(operation, "note", None)
+        if not callable(note):
+            return
+        try:
+            note(
+                plan={
+                    "plan_id": response["plan_id"],
+                    "status": response["status"],
+                    "sleeps": [
+                        {"model": i["model"], "status": i["status"], "taken": i["taken"]} for i in response["sleeps"]
+                    ],
+                    "wakes": [
+                        {"model": i["model"], "status": i["status"], "woke": [w["serve_id"] for w in i["woke"]],
+                         "unfilled": i["unfilled"]}
+                        for i in response["wakes"]
+                    ],
+                },
+                phases_ms=dict(response["phases_ms"]),
+            )
+        except Exception:  # noqa: BLE001 - observability only
+            LOG.warning("recording the plan in the operation record failed", exc_info=True)
 
     def transfer(
         self,
@@ -5412,9 +6193,12 @@ class ServiceManagerV2:
 
         return residents_of
 
-    def _probe_pods_on_gpus(self, gpus: set[tuple[str, int]]) -> list[tuple[Binding, bool | None, str | None]]:
+    def _probe_pods_on_gpus(
+        self, gpus: set[tuple[str, int]], *, snapshots=None
+    ) -> list[tuple[Binding, bool | None, str | None]]:
         """(binding, /is_sleeping, pod IP) of every Pod on any of ``gpus``
-        (``(node, gpu)``): ONE Pod LIST and ONE parallel probe round. A Pod
+        (``(node, gpu)``): ONE Pod LIST (or the caller's ``snapshots`` of every
+        Pod, read in the same hold) and ONE parallel probe round. A Pod
         without an IP or not Ready is unknown (None). Raises when the Pods
         cannot be listed, and :class:`UnreadablePodBinding` when a Pod on one of
         the nodes has no readable binding (it may sit on these GPUs: fail
@@ -5424,7 +6208,7 @@ class ServiceManagerV2:
             raise ValueError("no runtime to probe residents")
         nodes = {node for node, _gpu in gpus}
         found: list[tuple[Binding, object]] = []
-        for snapshot in lister():
+        for snapshot in (lister() if snapshots is None else snapshots):
             try:
                 other = _binding_from_snapshot(snapshot)
             except (KeyError, ValueError) as exc:
@@ -5558,6 +6342,7 @@ class ServiceManagerV2:
                 "worst_case_sleep_lock_s": self._sm_config.worst_case_sleep_lock_s(),
                 "worst_case_wake_lock_s": self._sm_config.worst_case_wake_lock_s(),
                 "worst_case_transfer_lock_s": self._sm_config.worst_case_transfer_lock_s(),
+                "worst_case_plan_lock_s": self._sm_config.worst_case_plan_lock_s(),
                 "worst_case_call_s": self._sm_config.worst_case_sleep_call_s(),
             },
             "shutting_down": primitive.shutting_down,
@@ -6533,6 +7318,14 @@ def restart_placeholder_candidates(
     return out
 
 
+def _topology_gpu_count(registry) -> int:
+    """GPUs of the registry topology (0 for a registry stub without one)."""
+    try:
+        return sum(int(node.gpus) for node in registry.topology().nodes)
+    except Exception:  # noqa: BLE001 - embedded / unit-test registry stubs
+        return 0
+
+
 def _elapsed_ms(started: float) -> int:
     return int(round((time.monotonic() - started) * 1000))
 
@@ -6555,6 +7348,13 @@ def _unanswered(result) -> bool:
 def _log_event(event: str, *, level: int = logging.INFO, **fields) -> None:
     """One structured (JSON) log line ``{"event": ..., ...}``."""
     LOG.log(level, json.dumps({"event": event, **fields}, sort_keys=True, default=str))
+
+
+def _plan_tags(placement: dict | None) -> dict:
+    """Additive ``plan_id`` / ``item`` fields of a wake event of a plan's wake."""
+    if not placement or not placement.get("plan_id"):
+        return {}
+    return {"plan_id": placement["plan_id"], "item": placement.get("item")}
 
 
 def _wake_action(ticket: "_WakeTicket") -> dict:
@@ -6681,6 +7481,11 @@ class WakeConflict(ValueError):
         "gpu_truth_unavailable": "truth_unavailable",
         "partial": "partial",
         "routable_unknown": "routable_unknown",
+        # Plan refusals (2026-10-27).
+        "donor_sleep_failed": "donor_sleep_failed",
+        "no_binding": "no_binding",
+        "max_awake_replicas": "max_awake_replicas",
+        "pod_not_found": "pod_not_found",
     }
 
     def __init__(
@@ -6770,6 +7575,12 @@ class TransferFailed(WakeConflict):
         return {**self.response, **super().body(retry_after_s=retry_after_s)}
 
 
+class PlanFailed(TransferFailed):
+    """A plan that changed nothing while an item was refused or failed (HTTP
+    409 ``error: partial``, the structured WakeConflict body of the first item
+    error plus the whole plan response)."""
+
+
 class TargetPartial(TransferFailed):
     """An exact model target that woke some but not all of its wakes (HTTP 409
     ``error: partial``, 2026-10-06): the structured WakeConflict body plus the
@@ -6833,6 +7644,63 @@ class _WakeTicket:
     uncertain: bool = False
     #: Settling the lease of a failed wake raised: journal entry kept.
     lease_unsettled: bool = False
+
+
+@dataclass
+class _Plan:
+    """One validated plan (``POST /v2/plans`` or a one-item wrapper plan)."""
+
+    plan_id: str
+    sleeps: list[PlanSleep]
+    wakes: list[PlanWake]
+
+
+@dataclass
+class _PlanRun:
+    """One plan execution: the selection and what happened to each binding."""
+
+    plan: _Plan
+    selection: object = None
+    pods: dict = field(default_factory=dict)
+    #: Wake gate answers of the selection, by binding id.
+    gates: dict = field(default_factory=dict)
+    #: Sleep primitive outcome / error of every plan sleep, by binding id.
+    sleep_outcomes: dict = field(default_factory=dict)
+    sleep_errors: dict = field(default_factory=dict)
+    #: Plan sleeps recorded asleep (books written).
+    slept: set = field(default_factory=set)
+    #: Wake tickets of the picks, by binding id; picks never prepared -> error.
+    tickets: dict = field(default_factory=dict)
+    pick_errors: dict = field(default_factory=dict)
+    #: Books-only execution: picks recorded awake.
+    books_woken: set = field(default_factory=set)
+    phases_ms: dict = field(default_factory=dict)
+    version: int | None = None
+    #: A books write failed mid-plan (journals kept): raised after the settlement.
+    fatal: BaseException | None = None
+    #: (sleep results, wake results) of :meth:`ServiceManagerV2._plan_results`.
+    results: tuple | None = None
+
+
+def _plan_item_brief(item) -> dict:
+    """A plan item for the operation record's request and the plan_start event."""
+    brief = {"model": item.model}
+    for key in ("pods", "at_most", "at_least", "sleep_path", "reason"):
+        value = getattr(item, key, None)
+        if value not in (None, ""):
+            brief[key] = list(value) if isinstance(value, tuple) else value
+    if getattr(item, "hints", ()):
+        brief["hints"] = list(item.hints)
+    if getattr(item, "donors", ()):
+        brief["donors"] = [{"model": d.model, "max": d.max, "sleep_path": d.sleep_path} for d in item.donors]
+    return brief
+
+
+def _retriable(exc: BaseException | None) -> bool:
+    """The per-item mirror of the old per-endpoint answer: a structured 409
+    (wake refusal / failure, floor, sleep failure, lease conflict) is
+    retriable, a 400-type error is not."""
+    return isinstance(exc, (WakeConflict, FloorViolation, SleepFailed, GpuLeaseConflict))
 
 
 @dataclass
@@ -6931,6 +7799,65 @@ class TransferRequest(BaseModel):
     count: int = 1
     #: Sleep path of the donors (external paths only; safescale_commit -> 400).
     sleep_path: str = "urgent"
+
+
+class PlanDonor(BaseModel):
+    """Relay allowance of a wake item (as ``TransferIntent.count``)."""
+
+    model: str
+    max: int = Field(ge=1)
+    sleep_path: str = "urgent"
+
+
+class PlanSleepItem(BaseModel):
+    model: str
+    #: Exact serve ids (SafeScale probe pods, ShrinkForSlot); one of pods / at_most.
+    pods: list[str] | None = None
+    #: Model-level shrink (clamped at the replica floor).
+    at_most: int | None = Field(None, ge=0)
+    sleep_path: str
+    #: Caller label, echoed in the results.
+    reason: str = ""
+
+
+class PlanWakeItem(BaseModel):
+    model: str
+    #: Absolute grow-only target; one of at_least / pods.
+    at_least: int | None = Field(None, ge=0)
+    pods: list[str] | None = None
+    hints: list[str] = []
+    avoid_gpus: list[str] = []
+    donors: list[PlanDonor] = []
+    reason: str = ""
+
+
+class PlanRequest(BaseModel):
+    #: Echoed; the service-manager makes ``pl-<12 hex>`` when absent.
+    plan_id: str | None = None
+    sleeps: list[PlanSleepItem] = []
+    wakes: list[PlanWakeItem] = []
+
+    def to_items(self) -> tuple[list[PlanSleep], list[PlanWake]]:
+        return (
+            [
+                PlanSleep(
+                    model=item.model, sleep_path=item.sleep_path,
+                    pods=None if item.pods is None else tuple(item.pods),
+                    at_most=item.at_most, reason=item.reason,
+                )
+                for item in self.sleeps
+            ],
+            [
+                PlanWake(
+                    model=item.model, at_least=item.at_least,
+                    pods=None if item.pods is None else tuple(item.pods),
+                    hints=tuple(item.hints), avoid_gpus=tuple(item.avoid_gpus),
+                    donors=tuple(PlanDonorSpec(d.model, d.max, d.sleep_path) for d in item.donors),
+                    reason=item.reason,
+                )
+                for item in self.wakes
+            ],
+        )
 
 
 class BindingPowerRequest(BaseModel):
@@ -7205,6 +8132,20 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/v2/plans")
+    def post_plan(request: PlanRequest) -> dict:
+        # 200: something changed, or every item was a no-op / floor clamp
+        # (``status`` done | partial | noop); 409 ``partial``: nothing changed
+        # and an item was refused or failed (full response in the body); 409
+        # ``writer_busy`` / ``routable_unknown`` before anything; 400: bad request.
+        try:
+            sleeps, wakes = request.to_items()
+            return service.execute_plan(sleeps=sleeps, wakes=wakes, plan_id=request.plan_id)
+        except WakeConflict:
+            raise  # structured 409 (wake_conflict_handler)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/v2/transfers")
     def post_transfer(request: TransferRequest) -> dict:
         # 200: at least one pair done (``pairs[].status``), or the donor's floor
@@ -7328,6 +8269,11 @@ _FLOOR_EXTRA_ROUTABLE: contextvars.ContextVar[frozenset] = contextvars.ContextVa
 #: sleep's floor check (why no make-up happened). Never mutated in place.
 _FLOOR_EVENT_NOTES: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "tre_sm_floor_event_notes", default={}
+)
+#: Binding ids whose observed refresh is deferred to the end of the hold
+#: (ServiceManagerV2._deferred_refresh); None = refresh at once.
+_REFRESH_DEFERRED: contextvars.ContextVar[set | None] = contextvars.ContextVar(
+    "tre_sm_refresh_deferred", default=None
 )
 #: Desired-state reason prefix / writer of a startup's floor make-up wake; the reason
 #: is ``replica_floor_makeup:<suspended binding id>:<startup Pod UID>``.
