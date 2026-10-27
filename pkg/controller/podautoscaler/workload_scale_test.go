@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -330,6 +331,27 @@ func TestAPASleepModeSetDesiredReplicasPostsAnAbsolutePlan(t *testing.T) {
 			assert.NoError(t, fakeClient.Get(context.TODO(), client.ObjectKey{Namespace: "default", Name: "test-llm"}, updated))
 			assert.Equal(t, int32(1), *updated.Spec.Replicas)
 		})
+	}
+}
+
+func TestAPASleepModeConfigServiceManageTimeout(t *testing.T) {
+	t.Setenv("APA_SCALE_SLEEP_MODE", "1")
+	t.Setenv("SERVICE_MANAGE_URL", "http://sm.test:8000")
+
+	t.Setenv("SERVICE_MANAGE_TIMEOUT_S", "")
+	config, err := newServiceManageConfigFromEnv()
+	assert.NoError(t, err)
+	assert.Equal(t, 360*time.Second, config.timeout) // the SM's api_call_timeout_s
+
+	t.Setenv("SERVICE_MANAGE_TIMEOUT_S", "400.5")
+	config, err = newServiceManageConfigFromEnv()
+	assert.NoError(t, err)
+	assert.Equal(t, 400500*time.Millisecond, config.timeout)
+
+	for _, bad := range []string{"0", "-1", "soon"} {
+		t.Setenv("SERVICE_MANAGE_TIMEOUT_S", bad)
+		_, err = newServiceManageConfigFromEnv()
+		assert.ErrorContains(t, err, "SERVICE_MANAGE_TIMEOUT_S")
 	}
 }
 

@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,7 +51,11 @@ const (
 	AutoscalingStormServiceModeAnnotationKey = "autoscaling.aibrix.ai/storm-service-mode"
 	serviceManageURLEnv                      = "SERVICE_MANAGE_URL"
 	apaScaleSleepModeEnv                     = "APA_SCALE_SLEEP_MODE"
-	defaultServiceManageTimeout              = 10 * time.Second
+	// serviceManageTimeoutEnv: client timeout (seconds) of every service-manager call. A plan
+	// may wait for the writer lock (service_manager.writer_lock_wait_s) and then hold it, so the
+	// default matches the SM's service_manager.api_call_timeout_s.
+	serviceManageTimeoutEnv     = "SERVICE_MANAGE_TIMEOUT_S"
+	defaultServiceManageTimeout = 360 * time.Second
 	// apaSleepPath is the service-manager sleep path of an APA scale-down: the one its v1
 	// /scale_service used (no drain, like every sleep of the service-manager).
 	apaSleepPath = "apa"
@@ -88,6 +93,7 @@ type workloadScale struct {
 type serviceManageConfig struct {
 	url              string
 	sleepModeEnabled bool
+	timeout          time.Duration
 }
 
 // NewWorkloadScale creates a stateless WorkloadScale implementation
@@ -115,7 +121,7 @@ func NewWorkloadScaleFromEnv(
 		client:                  client,
 		restMapper:              restMapper,
 		serviceManageURL:        config.url,
-		serviceManageHTTPClient: &http.Client{Timeout: defaultServiceManageTimeout},
+		serviceManageHTTPClient: &http.Client{Timeout: config.timeout},
 		sleepModeEnabled:        config.sleepModeEnabled,
 	}, nil
 }
@@ -126,9 +132,18 @@ func newServiceManageConfigFromEnv() (serviceManageConfig, error) {
 	if sleepModeEnabled && serviceManageURL == "" {
 		return serviceManageConfig{}, fmt.Errorf("%s must be set when %s is enabled", serviceManageURLEnv, apaScaleSleepModeEnv)
 	}
+	timeout := defaultServiceManageTimeout
+	if raw := strings.TrimSpace(os.Getenv(serviceManageTimeoutEnv)); raw != "" {
+		seconds, err := strconv.ParseFloat(raw, 64)
+		if err != nil || seconds <= 0 {
+			return serviceManageConfig{}, fmt.Errorf("%s must be a positive number of seconds, got %q", serviceManageTimeoutEnv, raw)
+		}
+		timeout = time.Duration(seconds * float64(time.Second))
+	}
 	return serviceManageConfig{
 		url:              serviceManageURL,
 		sleepModeEnabled: sleepModeEnabled,
+		timeout:          timeout,
 	}, nil
 }
 
