@@ -1,0 +1,128 @@
+# Signal ablation (v1 10-23 shape, docs/v2-ablation-sensitivity-gap-20261028.md §1.1, §3, §8). NOT RUN YET.
+# 3 traces (720 s set) x 4 arms x seed 1 = 12 runs, ~19 min each (~3.8 h + reports).
+# Arms: TRE with the TSS signal (zm, re-run: no reuse of older TRE runs, §2) and TRE with the TSS replaced by one
+# v1 signal - queue_len (running + waiting per routable pod, floor 1 request / pod), ttft_mean (mean TTFT, v1 D38),
+# kv_usage (KV-cache occupancy, not the prefix hit rate). Everything else unchanged.
+#   * SafeScale scope receiverless_shrink on every arm (user 10-28, §8.1).
+#   * eta gate (and waste ordering) off only on the alternative-signal arms (v1 D31, §8.3).
+#   * Tight_pool replaces v1's Alternating (§8.5). Disclose: Tight_pool is an integer overload, unlike Alternating.
+#   * Disclose: the O1 breakpoint hold and the onset saturation rescue act only on zm (eligibility_reason returns
+#     None for other signals), so the alternative-signal arms run without them (§3, §8.4).
+#
+# PREREQUISITES - the campaign refuses to start until all hold:
+#   1. The RECALIBRATED registry is live: TSS numerator = vLLM per-step token counter, signal window 20 s, EMA kept
+#      (feat/tss-counter-20261028); theta / lambda / tau / w_p and c/b published atomically with params_set.py.
+#   2. REFITTED alt_thresholds (theta, delta_crit, delta_high) for queue_len, ttft_mean and kv_usage, fitted on the
+#      same new calibration data (calibration fit_alt_thresholds.py) and published in the same params_set write.
+#      The registry's old alt values (07-10, old engine, no delta) must not be used.
+#   3. Controller image with the ttft_mean / kv_usage signal sources (queue floor 1 / pod, delta fail-closed) on the
+#      cluster; images, this runner and the client at shas in main and pushed (AGENTS.md rule 6).
+#   4. registry_expect.registry_id below = `python3 tre/eval/runner/arm_registry.py id` on the live ConfigMap after
+#      steps 1-2 (the id is a content hash of the parsed registry; a params_set re-render keeps it). Unfilled -> the
+#      run refuses; a different live registry -> hard pre-check failure. `present` checks the refitted values exist.
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-signal-ablation-20261028.yaml --dry-run --probe
+#   (marker: validation <start> <end> round=campaign-signal-ablation-20261028)
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-signal-ablation-20261028.yaml > /data/nfs_shared_data/xxy/campaign-signal-ablation-20261028.out 2>&1 &
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/<arm>      # after run 1, then every 50 min
+#   python3 tre/eval/v1_summary.py <results_root> --out <results_root>/v1_summary    # v1-format tables
+# NOTE: results_root and the absolute paths below are site-specific.
+name: campaign-signal-ablation-20261028
+round: campaign-signal-ablation-20261028
+results_root: /data/nfs_shared_data/xxy/campaign-signal-ablation-20261028
+trace_root: ${CAMPAIGN_TRACE_ROOT}
+loadgen_config_root: ${CAMPAIGN_CONFIG_ROOT}
+seed: 1
+arms: [sig-tss, sig-queue, sig-ttft, sig-kv]
+order: williams                     # 4 arms: every arm in every position over 4 traces; 3 traces -> rows 0..2 (recorded)
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 280, report_s: 150}
+
+registry_expect:
+  registry_id: null                 # FILL after prerequisites 1-2 (arm_registry.py id); null = the run refuses to start
+  present:
+    - "*.alt_thresholds.queue_len.theta"
+    - "*.alt_thresholds.queue_len.delta_crit"
+    - "*.alt_thresholds.queue_len.delta_high"
+    - "*.alt_thresholds.ttft_mean.theta"
+    - "*.alt_thresholds.ttft_mean.delta_crit"
+    - "*.alt_thresholds.ttft_mean.delta_high"
+    - "*.alt_thresholds.kv_usage.theta"
+    - "*.alt_thresholds.kv_usage.delta_crit"
+    - "*.alt_thresholds.kv_usage.delta_high"
+
+env:
+  CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
+  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2}"
+  CAMPAIGN_TIGHT_POOL: "${CAMPAIGN_TIGHT_POOL:-Tight_pool}"
+  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-${TRE_REPO}/eval/configs/t7-decision-points.yaml}"
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, params_set, runner and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  sig-tss:
+    base: tre
+    label: TSS
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: zm, TRE_DISABLE_ETA_GATE: false}
+  sig-queue:
+    base: tre
+    label: QUEUE
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: queue_len, TRE_DISABLE_ETA_GATE: true}
+  sig-ttft:
+    base: tre
+    label: LATENCY-ttft-mean
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: ttft_mean, TRE_DISABLE_ETA_GATE: true}
+  sig-kv:
+    base: tre
+    label: KV-usage
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: kv_usage, TRE_DISABLE_ETA_GATE: true}
+
+preserve:                           # unused (TRE arms only); kept so the file validates like the other campaigns
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${CAMPAIGN_DECISION_POINTS}
+  ref: sig-tss
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: ${CAMPAIGN_TIGHT_POOL}
+  - trace: Simul_spike
+  - trace: Real_conv

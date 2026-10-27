@@ -730,3 +730,34 @@ def test_trace_set_is_one_setting_switchable_from_the_environment(tmp_path):
     assert C.expand("${X:-${Y}/z}", {"Y": "y"}) == "y/z"
     with pytest.raises(C.CampaignError):
         C.expand("${X}", {})
+
+
+def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
+    """The shipped 10-28 specs: (A) Tight_pool / Simul_spike / Real_conv x {TSS, queue, ttft_mean, kv_usage}, SafeScale
+    receiverless_shrink everywhere, the eta gate off exactly on the alternative-signal arms; (B) Simul_spike /
+    Real_conv x {base, theta / lambda / w_p / tau x0.8 x1.2, WP-ABS1}, one parameter per arm. Both refuse to start
+    until registry_expect.registry_id (the recalibrated registry) is filled in, and the A spec requires the refitted
+    alt thresholds of its three signals."""
+    env = {"TRE_REPO": str(tmp_path)}
+    a = C.load_campaign(RUNNER / "campaigns" / "campaign-signal-ablation-20261028.yaml", environ=env)
+    plan = C.build_plan(a)
+    assert [e.trace for e in C.resolve_traces(a)] == ["Tight_pool", "Simul_spike", "Real_conv"] and len(plan) == 12
+    envs = {i.arm: C.arm_def(a, i.arm).controller_env for i in plan}
+    assert all(e["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for e in envs.values())
+    assert {k: (e["TRE_SIGNAL_SOURCE"], e["TRE_DISABLE_ETA_GATE"]) for k, e in envs.items()} == {
+        "sig-tss": ("zm", "false"), "sig-queue": ("queue_len", "true"), "sig-ttft": ("ttft_mean", "true"),
+        "sig-kv": ("kv_usage", "true")}
+    assert len({i.arm for i in plan if i.position == 1}) == 3 and a["report"]["ref"] == "sig-tss"
+    assert {p.split(".")[2] for p in a["registry_expect"]["present"]} == {"queue_len", "ttft_mean", "kv_usage"}
+    b = C.load_campaign(RUNNER / "campaigns" / "campaign-sensitivity-20261028.yaml", environ=env)
+    plan = C.build_plan(b)
+    assert [e.trace for e in C.resolve_traces(b)] == ["Simul_spike", "Real_conv"] and len(plan) == 20
+    rules = {i.arm: C.AR.describe(C.arm_def(b, i.arm).registry_rules) for i in plan}
+    assert rules["sens-base"] == [] and rules["sens-wp-abs1"] == ["*.trs.w_p =1"]
+    assert rules["sens-tau-m20"] == ["tau_band x0.8 (tau_crit, tau_high; tau_low unchanged)"]
+    assert {r[0] for k, r in rules.items() if k not in ("sens-base", "sens-wp-abs1", "sens-tau-m20", "sens-tau-p20")} == {
+        f"*.trs.{p} x{f}" for p in ("theta_m", "lambda_wait", "w_p") for f in ("0.8", "1.2")}
+    assert all(len(r) <= 1 for r in rules.values())             # one parameter per arm
+    assert all(C.arm_def(b, i.arm).controller_env["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for i in plan)
+    for c in (a, b):
+        assert any("registry_id is not filled in" in p for p in C.AR.expect_spec_problems(c["registry_expect"]))
