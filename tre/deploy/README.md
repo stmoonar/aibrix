@@ -59,9 +59,9 @@ by the controller and the service-manager).
 - The service-manager refuses to start when `service_manager:` / `gateway:` is
   invalid. One check is the worst-case duration of one SM call as its client
   sees it (whole-lock, `ServiceManagerConfig.worst_case_sleep_call_s`):
-  `writer_lock_wait_s` + the longest writer-lock hold (a transfer: its donors'
-  sleep 108 s + its receivers' wake with one compensating sleep 163 s + the
-  selection 19 s) + `sleep.io_margin_s` = 30 + 290 + 2 = 322 s with the shipped
+  `writer_lock_wait_s` + the longest writer-lock hold (a plan: selection 26 s +
+  wave 1 108 s + wave 2 55 s + one compensating sleep 108 s + the observed
+  refresh 12 s + 2 s) + `sleep.io_margin_s` = 30 + 311 + 2 = 343 s with the shipped
   values; it must be below `service_manager.api_call_timeout_s` (360 s). The
   formula is in `tre_common/registry.py`, the numbers in
   `docs/design/20261002-sm-wholelock.md` section 5.

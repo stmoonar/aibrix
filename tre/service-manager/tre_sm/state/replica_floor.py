@@ -17,7 +17,7 @@ the exempt / make-up paths below.
 What happens when an operation would go below the floor depends on its path:
 
 * a model-level shrink - ``PUT /v2/models/{m}/target`` on ANY path (2026-10-02;
-  before only ``apa``) and ``POST /v2/transfers`` (the donor model) - is clamped so
+  before only ``apa``) and a ``POST /v2/plans`` ``at_most`` sleep item - is clamped so
   that the floor holds: HTTP 200 with ``taken`` and ``clamped_by_floor``, never 409;
 * a named binding or pod - ``PUT /v2/bindings/{b}/power`` (``urgent``,
   ``scale_down``, ``safescale_commit``, ``default``), the SafeScale hide

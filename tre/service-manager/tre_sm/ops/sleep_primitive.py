@@ -1,6 +1,6 @@
 """The one way the service-manager puts a vLLM pod to sleep (plan 2026-09-27 D1-D4).
 
-Every sleep - SafeScale commit, controller scale-downs and transfers, APA
+Every sleep - SafeScale commit, controller plans and scale-downs, APA
 scale-downs, defrag, fleet repair, startup admission, a failed wake's
 compensating sleep - runs the same ordered protocol, and callers cannot skip a
 step. Since 2026-10-02 (design ``docs/design/20261002-sm-wholelock.md``) the

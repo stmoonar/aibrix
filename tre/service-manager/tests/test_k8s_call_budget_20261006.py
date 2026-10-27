@@ -1,11 +1,11 @@
 """The writer-lock hold must not grow with the number of targets (review
-2026-10-06 P2-1): the Kubernetes calls a sleep, a wake or a transfer makes one
+2026-10-06 P2-1): the Kubernetes calls a sleep or a wake makes one
 after the other stay within the K8S_CALLS_* the worst-case formulas count,
 whatever the number of bindings (per-target calls run in parallel)."""
 
 import threading
 
-from tre_common.registry import K8S_CALLS_SLEEP, K8S_CALLS_TRANSFER_SELECT, K8S_CALLS_WAKE
+from tre_common.registry import K8S_CALLS_SLEEP, K8S_CALLS_WAKE
 
 from test_wholelock_20261002 import World
 
@@ -47,10 +47,3 @@ def test_a_model_growth_of_two_replicas_stays_within_one_wakes_k8s_budget():
     assert world.awake("r-2") and world.awake("r-3")
     assert counted[0] <= K8S_CALLS_WAKE
 
-
-def test_a_two_pair_transfer_stays_within_the_transfer_k8s_budget():
-    world = World()
-    counted = _count_sequential_k8s_calls(world)
-    body = world.service.transfer(donor_model="d", receiver_model="r", count=2)
-    assert body["done"] == 2
-    assert counted[0] <= K8S_CALLS_TRANSFER_SELECT + K8S_CALLS_SLEEP + K8S_CALLS_WAKE

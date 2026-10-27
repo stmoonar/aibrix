@@ -380,7 +380,7 @@ reissue:
 service_manager:
   # Whole-lock (2026-10-02, design docs/design/20261002-sm-wholelock.md): every
   # write holds the SM writer lock from start to end - a sleep from its hide to
-  # its bookkeeping, a wake from its checks to its commit, a transfer for both.
+  # its bookkeeping, a wake from its checks to its commit, a plan for all of its items.
   # A request waits up to writer_lock_wait_s for the lock (first-come
   # first-served), then gets 409 writer_busy. 30 s queue behind several ordinary
   # 2-5 s operations; behind a worst-case hold (a hung engine) a caller gets 409
@@ -391,7 +391,7 @@ service_manager:
   # Read timeout (s) of every Kubernetes API call of the SM (connect timeout 2 s,
   # no retry: one call takes at most 2 + this). Most calls run under the writer
   # lock; the worst case below counts the calls a phase makes one after the other
-  # (sleep 8, wake 4, transfer selection 2; per-target calls run in parallel).
+  # (sleep 8, wake 4, plan selection 3, refresh 1; per-target calls run in parallel).
   k8s_request_timeout_s: 5
   # Timeout clients (the controller) use for slow SM calls. Must exceed the
   # worst-case call = writer_lock_wait_s + the longest writer-lock hold (a plan:
@@ -414,7 +414,7 @@ service_manager:
   # Replica floor (2026-09-29): no hide or sleep may leave a model with fewer
   # ROUTABLE replicas (awake, not hidden, Ready, not starting) than its
   # models[].min_replicas - both arms (TRE and APA) use it. A model-level shrink
-  # (/target on any path, /scale_service, a transfer's donor model): clamped (200,
+  # (/target on any path, /scale_service, a plan's at_most sleep): clamped (200,
   # taken + clamped_by_floor). A named binding (/power), the SafeScale hide and
   # defrag: refused (409 floor_violation; the controller re-plans next tick).
   # Routable view unreadable: 409 routable_unknown before anything is hidden.

@@ -298,13 +298,11 @@ K8S_CONNECT_TIMEOUT_S = 2.0
 #: when a model-level shrink is clamped first), the hide (2), one plugin-pod
 #: LIST overrunning the ack wait, the confirmation or rollback annotation (2) =
 #: 8. Wake: the Pod LIST, the wake gate's resident LIST, the commit annotation
-#: (2) = 4. Transfer selection: the floor's and the residents' Pod LIST = 2.
-#: Plan selection (2026-10-27): the Pod LIST, the routable view, the residents'
+#: (2) = 4. Plan selection (2026-10-27): the Pod LIST, the routable view, the residents'
 #: LIST = 3 (an upper bound: the executor reads them from one LIST). Observed
 #: refresh at the end of a plan: one Pod LIST = 1.
 K8S_CALLS_SLEEP = 8
 K8S_CALLS_WAKE = 4
-K8S_CALLS_TRANSFER_SELECT = 2
 K8S_CALLS_PLAN_SELECT = 3
 K8S_CALLS_REFRESH = 1
 
@@ -1068,8 +1066,8 @@ class ServiceManagerConfig:
     #: (single attempt; measured 1.5-3 s). A call without an answer leaves the
     #: wake journaled (the engine may still wake) for the journal recovery.
     wake_call_timeout_s: float = 10.0
-    #: Timeout clients (the controller) use for slow SM calls (scale / binding
-    #: power / transfer / defrag). Must exceed :meth:`worst_case_sleep_call_s`
+    #: Timeout clients (the controller) use for slow SM calls (plans, scale /
+    #: binding power, defrag). Must exceed :meth:`worst_case_sleep_call_s`
     #: (lock wait + worst-case lock hold); the controller uses it unless
     #: TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
     api_call_timeout_s: float = 360.0
@@ -1173,20 +1171,6 @@ class ServiceManagerConfig:
             + sleep.io_margin_s
         )
 
-    def worst_case_transfer_lock_s(self) -> float:
-        """Longest writer-lock hold of one ``POST /v2/transfers``, any number of
-        pairs: the selection's resident probe (one parallel round for every
-        candidate) and its Kubernetes calls (:data:`K8S_CALLS_TRANSFER_SELECT`)
-        + the donors' sleep (one call) + the receivers' wake (one call).
-        Defaults: 5 + 2 x 7 + 108 + 163 = 290 s (every failure path and every
-        Kubernetes call at its bound)."""
-        return (
-            self.sleep.probe_timeout_s
-            + K8S_CALLS_TRANSFER_SELECT * self.k8s_call_s()
-            + self.worst_case_sleep_lock_s()
-            + self.worst_case_wake_lock_s()
-        )
-
     def worst_case_wake_core_s(self) -> float:
         """One wave of wakes without its settlement: resident probes + /wake_up +
         the convergence and settlement probes + :data:`K8S_CALLS_WAKE` Kubernetes
@@ -1224,15 +1208,10 @@ class ServiceManagerConfig:
     def worst_case_lock_hold_s(self) -> float:
         """Longest writer-lock hold of any one API-timed service-manager call: a
         plan (every power-changing endpoint runs one since 2026-10-27; a lone
-        sleep, wake or transfer holds it for less). Cold starts, defrag and
-        fleet repair hold it longer by design (a pod start) and are not part of
-        the controller's planning loop."""
-        return max(
-            self.worst_case_sleep_lock_s(),
-            self.worst_case_wake_lock_s(),
-            self.worst_case_transfer_lock_s(),
-            self.worst_case_plan_lock_s(),
-        )
+        sleep or wake holds it for less). Cold starts, defrag and fleet repair
+        hold it longer by design (a pod start) and are not part of the
+        controller's planning loop."""
+        return self.worst_case_plan_lock_s()
 
     def worst_case_sleep_call_s(self) -> float:
         """Upper bound of one sleeping / waking / plan SM call as its client
@@ -1977,9 +1956,9 @@ def sleep_call_timeout_errors(
         return []
     return [
         f"worst-case service-manager call is {worst:g}s (writer_lock_wait_s + the longest "
-        "writer-lock hold, a transfer: its donors' sleep - sleep.ack_timeout_s + "
-        "sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s + probes - and its "
-        "receivers' wake - wake.call_timeout_s + probes + a compensating sleep - + "
+        "writer-lock hold, a plan: its sleeps - sleep.ack_timeout_s + "
+        "sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s + probes -, two "
+        "waves of wakes - wake.call_timeout_s + probes - and one compensating sleep - + "
         "sleep.io_margin_s), not below "
         f"{name} = {call_timeout_s:g}s: the caller would time out mid-operation"
     ]

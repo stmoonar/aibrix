@@ -139,7 +139,6 @@ def test_worst_case_lock_holds_and_the_call_bound_fit_the_api_call_timeout():
     # 2 x 5 + ONE compensating sleep 108 (whatever the number of failed wakes) +
     # 4 Kubernetes calls x 7 + io 2.
     assert config.worst_case_wake_lock_s() == 5 + 10 + 2 * 5 + 108 + 4 * 7 + 2 == 163
-    assert config.worst_case_transfer_lock_s() == 5 + 2 * 7 + 108 + 163 == 290
     # A plan (2026-10-27): selection 5 + 3 x 7, wave 1 max(108, wake wave 55),
     # wave 2 55, ONE deferred compensating sleep 108, refresh 7 + 5, io 2.
     assert config.worst_case_wake_core_s() == 5 + 10 + 2 * 5 + 4 * 7 + 2 == 55
