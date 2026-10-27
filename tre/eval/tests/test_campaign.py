@@ -595,22 +595,29 @@ class RegDeps(FakeDeps):
     """FakeDeps + the registry hooks of a sensitivity arm; ``reg_fail`` = keys whose first apply fails,
     ``abort`` = keys whose run raises (Ctrl-C / crash inside the arm)."""
 
-    def __init__(self, reg_fail=(), abort=(), **kw):
+    def __init__(self, reg_fail=(), abort=(), held=True, theta=616.8, reg_exc=None, **kw):
         super().__init__(**kw)
-        self.reg_fail, self.abort = set(reg_fail), set(abort)
+        self.reg_fail, self.abort, self.held, self.theta, self.reg_exc = set(reg_fail), set(abort), held, theta, reg_exc
 
     def registry_apply(self, item, attempt):
         self.calls.append(("reg_apply", item.key, attempt))
         if item.key in self.reg_fail:
             self.reg_fail.discard(item.key)
-            raise C.AR.RegistryError("params_set --apply --restart rc=1: REJECTED")
+            raise self.reg_exc or C.AR.RegistryError("params_set --apply --restart rc=1: REJECTED")
         return {"set": {"m7.trs.theta_m": 616.8}, "restore": {"m7.trs.theta_m": 771.0}, "applied": True}
 
-    def registry_restore(self, item):
+    def registry_restore(self, item, attempt):
         self.calls.append(("reg_restore", item.key))
-        return {"restored": {"m7.trs.theta_m": 771.0}}
+        return {"restored": {"m7.trs.theta_m": 771.0}, "held": self.held}
 
     def run_arm(self, item, env, attempt):
+        rc = self._run(item, env, attempt)
+        d = Path(item.arm_dir)
+        if d.is_dir():
+            (d / "signal_log.jsonl").write_text(json.dumps({"model": "m7", "theta_m": str(self.theta)}) + "\n")
+        return rc
+
+    def _run(self, item, env, attempt):
         if item.key in self.abort:
             self.calls.append(("run", item.key, attempt, None, None))
             raise KeyboardInterrupt
@@ -748,16 +755,40 @@ def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
         "sig-tss": ("zm", "false"), "sig-queue": ("queue_len", "true"), "sig-ttft": ("ttft_mean", "true"),
         "sig-kv": ("kv_usage", "true")}
     assert len({i.arm for i in plan if i.position == 1}) == 3 and a["report"]["ref"] == "sig-tss"
-    assert {p.split(".")[2] for p in a["registry_expect"]["present"]} == {"queue_len", "ttft_mean", "kv_usage"}
+    assert {p.split(".")[2] for p in a["registry_expect"]["present"] if ".alt_thresholds." in p} == {
+        "queue_len", "ttft_mean", "kv_usage"}
     b = C.load_campaign(RUNNER / "campaigns" / "campaign-sensitivity-20261028.yaml", environ=env)
     plan = C.build_plan(b)
     assert [e.trace for e in C.resolve_traces(b)] == ["Simul_spike", "Real_conv"] and len(plan) == 20
     rules = {i.arm: C.AR.describe(C.arm_def(b, i.arm).registry_rules) for i in plan}
-    assert rules["sens-base"] == [] and rules["sens-wp-abs1"] == ["*.trs.w_p =1"]
+    assert rules["sens-base"] == [] and rules["sens-wp-abs1"] == ["*.trs.w_p =1", "*.trs.w_d =1"]
     assert rules["sens-tau-m20"] == ["tau_band x0.8 (tau_crit, tau_high; tau_low unchanged)"]
     assert {r[0] for k, r in rules.items() if k not in ("sens-base", "sens-wp-abs1", "sens-tau-m20", "sens-tau-p20")} == {
         f"*.trs.{p} x{f}" for p in ("theta_m", "lambda_wait", "w_p") for f in ("0.8", "1.2")}
-    assert all(len(r) <= 1 for r in rules.values())             # one parameter per arm
+    assert all(len(r) <= 1 for k, r in rules.items() if k != "sens-wp-abs1")   # one parameter per arm
     assert all(C.arm_def(b, i.arm).controller_env["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for i in plan)
     for c in (a, b):
         assert any("registry_id is not filled in" in p for p in C.AR.expect_spec_problems(c["registry_expect"]))
+        assert {"*.trs.numerator", "*.trs.theta_window_ms"} <= set(c["registry_expect"]["present"])
+
+
+@pytest.mark.parametrize("kw, why", [
+    ({"held": False}, "not confirmed held"),
+    ({"theta": 771.0}, "signal_log theta_m [771.0] != applied 616.8"),
+])
+def test_perturbed_arm_invalid_when_the_perturbation_did_not_hold_or_the_controller_used_another_theta(tmp_path, kw, why):
+    k = "Alternating_s1/sens-theta-m20"
+    deps = RegDeps(**kw)
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20",), "extra": SENS})
+    camp.run()
+    assert deps.runs() == [k, k]                                 # invalid -> one retry -> failed marker
+    fm = json.loads(C.failed_marker_path(camp.plan[0]).read_text())
+    assert any(why in x for x in fm["validity"]["invalid"])
+
+
+def test_unexpected_error_in_registry_apply_fails_the_item_not_the_campaign(tmp_path):
+    k = "Alternating_s1/sens-theta-m20"
+    deps = RegDeps(reg_fail={k}, reg_exc=TimeoutError("kubectl timed out"))
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20", "tre"), "extra": SENS})
+    assert camp.run() == 0
+    assert deps.seq(k)[:3] == ["reg_apply", "reg_restore", "reset!"] and "Alternating_s1/tre" in deps.runs()

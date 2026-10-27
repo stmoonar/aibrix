@@ -1437,6 +1437,10 @@ def registry_dir(c: dict) -> Path:
     return Path(c["results_root"]) / "_registry"
 
 
+def registry_label(c: dict, item: PlanItem, attempt: int) -> str:
+    return f"{c['name']}/{item.key}/a{attempt}"
+
+
 class Deps:
     """What the loop does to the world (replaced by fakes in the tests)."""
 
@@ -1464,7 +1468,7 @@ class Deps:
         then the pre-checks again WITHOUT a reset (a reset would restore the registry) and without the
         registry checks. Raises arm_registry.RegistryError (the caller restores and counts the attempt)."""
         rules = arm_def(self.c, item.arm).registry_rules
-        rec = AR.apply(AR.Cluster(), rules, label=f"{self.c['name']}/{item.key}/a{attempt}",
+        rec = AR.apply(AR.Cluster(), rules, label=registry_label(self.c, item, attempt),
                        backup_dir=str(registry_dir(self.c) / "backups"), log=self.rec.line)
         write_json_atomic(registry_dir(self.c) / f"{item.out_name}.{item.arm}.a{attempt}.json", rec)
 
@@ -1479,9 +1483,11 @@ class Deps:
                                    + "; ".join(f"{r['name']}: {r['detail']}" for r in res if not r["ok"]))
         return rec
 
-    def registry_restore(self, item: PlanItem) -> Optional[dict]:
+    def registry_restore(self, item: PlanItem, attempt: int) -> Optional[dict]:
+        """Only this attempt's record (label) is restored; another runner's perturbation is left alone."""
         return AR.restore(AR.Cluster(), backup_dir=str(registry_dir(self.c) / "backups"),
-                          reason=f"campaign {self.c['name']} after {item.key}", log=self.rec.line)
+                          reason=f"campaign {self.c['name']} after {item.key}", log=self.rec.line,
+                          expect_label=registry_label(self.c, item, attempt))
 
     def run_arm(self, item: PlanItem, env: dict, attempt: int) -> int:
         out = Path(self.c["results_root"]) / "logs" / f"{item.out_name}.{item.arm}.a{attempt}.out"
@@ -1629,22 +1635,30 @@ class Campaign:
                           f"attempt={att} expected_end={cur['expected_end']}")
             rules = arm_def(self.c, item.arm).registry_rules
             reg, reg_err = None, None
+            restored = None
             try:
                 if rules:   # sensitivity arm: live registry perturbed for this arm only
-                    reg = self.deps.registry_apply(item, att)
+                    try:
+                        reg = self.deps.registry_apply(item, att)
+                    except AR.RegistryError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001  timeouts, OS / parse errors: this item fails, the campaign goes on
+                        raise AR.RegistryError(f"{type(exc).__name__}: {exc}") from exc
                 rc = self.deps.run_arm(item, self.arm_env(item, e, prep), att)
             except AR.RegistryError as exc:
                 rc, reg_err = None, str(exc)
                 self.rec.line(f"[{item.n}/{len(self.plan)}] {key}: registry params failed: {exc}")
             finally:        # success, failure, exception, abort: the registry goes back before anything else
                 if rules:
-                    self._restore_registry(item)
+                    restored = self._restore_registry(item, att)
             t1 = self.clock()
             if reg_err is not None:
                 verdict = {"verdict": "invalid", "invalid": [f"registry params: {reg_err}"], "suspect": [], "info": [],
                            "metrics": {"rc": None}}
             else:
                 verdict = assess_arm(item.arm_dir, rc, e.requests, self.c["validity"], item.base_arm in BASELINE_ARMS)
+                if reg and reg.get("applied"):
+                    self._registry_verdict(item, reg, restored, verdict)
             self.last_validity = {"key": key, "attempt": att, **verdict}
             extra = {"preserve": prep.get("record")} if prep.get("record") else {}
             if rules:
@@ -1672,12 +1686,28 @@ class Campaign:
                 return "failed"
             # else loop: full reset + retry (the STOP file is honoured before it)
 
-    def _restore_registry(self, item: PlanItem) -> None:
+    def _restore_registry(self, item: PlanItem, attempt: int) -> Optional[dict]:
         try:
-            self.deps.registry_restore(item)
+            return self.deps.registry_restore(item, attempt)
         except Exception as exc:  # noqa: BLE001  the next pre-check sees the annotation and resets (restores)
             self.rec.line(f"ERROR registry restore after {item.key} failed: {type(exc).__name__}: {exc} "
                           "(the next pre-check resets; reset_canonical.sh restores it)")
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _registry_verdict(self, item: PlanItem, reg: dict, restored: Optional[dict], verdict: dict) -> None:
+        """A perturbed arm is valid only if the perturbation held for the whole arm (the live values were
+        still the applied ones at the restore) and the controller used the applied theta (signal_log)."""
+        why = []
+        if not isinstance(restored, dict) or restored.get("held") is not True:
+            det = (restored or {}).get("error") or (restored or {}).get("skipped") or (restored or {}).get("classes")
+            why.append(f"registry perturbation not confirmed held during the arm: {det}")
+        bad, unver = AR.signal_log_theta_check(item.arm_dir, reg.get("set") or {})
+        why += bad
+        verdict["suspect"] += unver
+        verdict["metrics"]["registry_held"] = (restored or {}).get("held")
+        if why:
+            verdict["invalid"] += why
+        verdict["verdict"] = "invalid" if verdict["invalid"] else ("suspect" if verdict["suspect"] else "valid")
 
     def _mark_failed(self, item: PlanItem, attempts: int, why: str) -> None:
         write_json_atomic(failed_marker_path(item), {"campaign": self.c["name"], "out_name": item.out_name, "arm": item.arm,

@@ -211,10 +211,21 @@ def values_at(registry_yaml: str, keys: list[str]) -> dict[str, Any]:
     return out
 
 
+def _norm(v: Any) -> Any:
+    """Every non-bool number as float (params_set's coercion writes a float field as float: lambda_wait: 3 ->
+    3.0) and no empty mappings (params_set's edit adds empty trs / slo / alt_thresholds sections to a model
+    that has none): neither changes the id."""
+    if isinstance(v, dict):
+        return {k: _norm(x) for k, x in v.items() if x != {}}
+    if isinstance(v, list):
+        return [_norm(x) for x in v]
+    return float(v) if _num(v) else v
+
+
 def registry_id(registry_yaml: str) -> str:
-    """Content id of a registry: sha256 of its parsed content (key order, comments and float spelling
-    do not count; a params_set re-render keeps it), first 16 hex."""
-    data = _yaml().safe_load(registry_yaml) or {}
+    """Content id of a registry: sha256 of its parsed content (key order, comments, float spelling and
+    int-vs-float do not count; a params_set re-render keeps it), first 16 hex."""
+    data = _norm(_yaml().safe_load(registry_yaml) or {})
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()[:16]
 
 
@@ -271,13 +282,20 @@ class Cluster:
 
     def _kubectl(self, args: list[str], stdin: Optional[str] = None) -> str:
         cmd = [self.e.get("KUBECTL", "kubectl"), "-n", self.e.get("TRE_NS", "tre-v2"), *args]
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120)
+        try:
+            r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:   # TimeoutExpired, kubectl missing
+            raise RegistryError(f"{' '.join(cmd[:6])}: {type(exc).__name__}: {exc}") from exc
         if r.returncode != 0:
             raise RegistryError(f"{' '.join(cmd[:6])}: {r.stderr.strip()[:300]}")
         return r.stdout
 
     def read_cm(self) -> dict:
-        return json.loads(self._kubectl(["get", "configmap", self.e.get("REGISTRY_CM", "tre-v2-registry"), "-o", "json"]))
+        out = self._kubectl(["get", "configmap", self.e.get("REGISTRY_CM", "tre-v2-registry"), "-o", "json"])
+        try:
+            return json.loads(out)
+        except ValueError as exc:
+            raise RegistryError(f"registry ConfigMap: not JSON: {exc}") from exc
 
     def annotate(self, value: Optional[str], resource_version: Optional[str] = None) -> None:
         name = self.e.get("REGISTRY_CM", "tre-v2-registry")
@@ -291,8 +309,11 @@ class Cluster:
 
     def params_set(self, args: list[str]) -> tuple[int, str]:
         tre = Path(self.e.get("TRE_DIR") or HERE.parents[1])
-        r = subprocess.run([sys.executable, str(tre / "deploy/scripts/release/params_set.py"), *args],
-                           capture_output=True, text=True, timeout=1800, env=self.e)
+        try:
+            r = subprocess.run([sys.executable, str(tre / "deploy/scripts/release/params_set.py"), *args],
+                               capture_output=True, text=True, timeout=1800, env=self.e)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RegistryError(f"params_set {' '.join(args[:3])}: {type(exc).__name__}: {exc}") from exc
         return r.returncode, (r.stdout + r.stderr)
 
 
@@ -373,19 +394,34 @@ def apply(cl: Cluster, rules: list[Rule], *, label: str, backup_dir: str,
     return rec
 
 
-def restore(cl: Cluster, *, backup_dir: str, reason: str = "arm-registry restore",
+def restore(cl: Cluster, *, backup_dir: str, reason: str = "arm-registry restore", expect_label: Optional[str] = None,
             log: Callable[[str], None] = lambda s: None) -> Optional[dict]:
     """Put the values recorded in the annotation back (params_set --apply --restart, or only --restart
     when the values are back but a restart is pending), verify, remove the annotation. Idempotent;
-    None when nothing was in effect."""
+    None when nothing was in effect.
+
+    Each recorded key is classified on the live registry: ``set`` (still the arm's value), ``want``
+    (already the original) or ``other`` (a third value: someone else changed it). ``other`` keys are
+    never overwritten: the ``set`` keys are written back, the annotation stays and RegistryError
+    names the keys (a human decides; the pre-check blocks meanwhile). ``held`` = every key was still
+    the arm's value, i.e. the perturbation held for the whole arm. With ``expect_label`` a record of
+    another label (another runner's or attempt's perturbation) is left alone: {"skipped": ...}."""
     cm = cl.read_cm()
     rec = _annotation(cm)
     if rec is None:
         return None
+    if expect_label is not None and rec.get("label") != expect_label:
+        log(f"registry restore: the record in effect is {rec.get('label')!r}, not {expect_label!r}; left alone")
+        return {"skipped": f"record of {rec.get('label')!r} in effect", "label": rec.get("label")}
     want = rec["restore"]
+    applied = rec.get("set") or {}
     text = _data(cm)
     got = values_at(text, list(want))
-    back = {k: v for k, v in want.items() if not same(got[k], v)}
+    cls = {k: ("set" if k in applied and same(got[k], applied[k]) else "want" if same(got[k], v) else "other")
+           for k, v in want.items()}
+    other = {k: got[k] for k, c in cls.items() if c == "other"}
+    held = all(c == "set" for c in cls.values())
+    back = {k: v for k, v in want.items() if cls[k] == "set"}
     out = ""
     if back:
         args = [x for k, v in back.items() for x in ("--set", set_arg(k, v))]
@@ -396,14 +432,48 @@ def restore(cl: Cluster, *, backup_dir: str, reason: str = "arm-registry restore
         rc, out = cl.params_set(["--restart", "--reason", f"{reason} {rec.get('label')}"[:200]])
         if rc != 0:
             raise RegistryError(f"restore: params_set --restart rc={rc}: {_tail(out, 4)}")
+    if other:
+        raise RegistryError(f"restore of {rec.get('label')}: changed by someone else during the arm, NOT overwritten: "
+                            + "; ".join(f"{k} = {v!r} (arm set {applied.get(k)!r}, original {want[k]!r})"
+                                        for k, v in sorted(other.items()))
+                            + f". Decide, then `kubectl annotate configmap <registry> {ANNOTATION}-`")
     live = registry_id(verify(cl, want))
     cl.annotate(None)
-    res = {"label": rec.get("label"), "restored": want, "written": back, "canonical_id": rec.get("canonical_id"),
-           "live_id": live, "canonical_id_match": live == rec.get("canonical_id"), "params_set_output": _tail(out)}
+    res = {"label": rec.get("label"), "restored": want, "written": back, "classes": cls, "held": held,
+           "canonical_id": rec.get("canonical_id"), "live_id": live,
+           "canonical_id_match": live == rec.get("canonical_id"), "params_set_output": _tail(out)}
     log(f"registry restored after {rec.get('label')}: {len(back)} value(s) written"
         + ("" if res["canonical_id_match"] else f"; WARN live id {live} != canonical {rec.get('canonical_id')} "
            "(another change to the registry meanwhile?)"))
     return res
+
+
+def signal_log_theta_check(arm_dir: str | Path, sets: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """The theta the controller actually used (signal_log.jsonl theta_m per model) vs the applied
+    ``<model>.trs.theta_m`` values (v1 check_run.py did this with the startup log). Returns
+    (mismatches, unverified)."""
+    want = {k[: -len(".trs.theta_m")]: v for k, v in sets.items() if k.endswith(".trs.theta_m")}
+    if not want:
+        return [], []
+    seen: dict[str, set] = {m: set() for m in want}
+    try:
+        with open(Path(arm_dir) / "signal_log.jsonl") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                    if r.get("model") in seen and r.get("theta_m") not in (None, "", "nan"):
+                        seen[r["model"]].add(round(float(r["theta_m"]), 6))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        return [], [f"no signal_log.jsonl: theta of {sorted(want)} not verified"]
+    bad, unver = [], []
+    for m, v in want.items():
+        if not seen[m]:
+            unver.append(f"{m}: no theta_m in signal_log.jsonl")
+        elif any(not same(x, v) for x in seen[m]):
+            bad.append(f"{m}: signal_log theta_m {sorted(seen[m])} != applied {v}")
+    return bad, unver
 
 
 # ------------------------------------------------------------------ CLI

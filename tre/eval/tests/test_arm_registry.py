@@ -18,9 +18,14 @@ from pathlib import Path
 import pytest
 
 yaml = pytest.importorskip("yaml")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runner"))
+_TRE = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_TRE / "eval" / "runner"))
+for _p in (_TRE / "common", _TRE / "deploy"):
+    if str(_p) not in sys.path:
+        sys.path.append(str(_p))
 
 import arm_registry as AR  # noqa: E402
+from scripts import registry_params as rp  # noqa: E402  the real params_set edit (coercion, bounds, render)
 
 REGISTRY = """\
 # comment lines are dropped by a params_set re-render; the registry id does not change
@@ -43,7 +48,9 @@ def _hash(text: str) -> str:
 
 class FakeCluster:
     """The registry ConfigMap (data + annotations + resourceVersion) and the two Deployments' applied hash.
-    params_set: --set k=v (YAML value) / --apply / --restart / --status, like the real script;
+    params_set: --set k=v / --apply / --restart / --status; the edit itself is the real params_set one
+    (registry_params.parse_sets + apply_and_validate: coercion, bounds, re-render; the controller's full
+    registry parser is skipped, the fixture is not a complete registry);
     ``fail`` = a predicate on the args that makes that call return rc 1 before it changes anything."""
 
     def __init__(self, text: str = REGISTRY, fail=None):
@@ -79,17 +86,8 @@ class FakeCluster:
         if sets:
             assert "--apply" in args and "--backup-dir" in args
             self.annotated_before_write.append(AR.ANNOTATION in self.annotations)
-            data = yaml.safe_load(self.text)
-            models = {m["name"]: m for m in data["models"]}
-            for s in sets:
-                k, _, v = s.partition("=")
-                name, path = AR.split_key(k, list(models))
-                cur = models[name]
-                *head, last = path.split(".")
-                for p in head:
-                    cur = cur.setdefault(p, {})
-                cur[last] = yaml.safe_load(v)
-            self.text = yaml.safe_dump(data, sort_keys=False)
+            names = [m["name"] for m in rp.load_models(self.text)]
+            self.text = rp.apply_and_validate(self.text, rp.parse_sets(sets, names), loader=lambda path: None)
             self.rv += 1
         if "--restart" in args:
             self.applied = {k: _hash(self.text) for k in self.applied}
@@ -213,3 +211,66 @@ def test_registry_id_ignores_comments_and_rendering_and_expectations():
 def test_set_arg_keeps_small_floats_floats_for_params_set():
     k, _, v = AR.set_arg("m.trs.w_p", 1e-05).partition("=")
     assert yaml.safe_load(v) == 1e-05 and isinstance(yaml.safe_load(v), float)
+
+
+def test_int_valued_float_field_keeps_the_registry_id_after_restore():
+    """params_set coerces float fields to float (lambda_wait: 3 -> 3.0): the id must not change, or every arm
+    after the first perturbed one would fail the registry_expect pre-check."""
+    text = REGISTRY.replace("lambda_wait: 2.375", "lambda_wait: 3")
+    cl = FakeCluster(text)
+    AR.apply(cl, rules({"*.trs.lambda_wait": "x1.2"}), label="x", backup_dir="/b")
+    AR.restore(cl, backup_dir="/b")
+    assert "lambda_wait: 3.0" in cl.text and AR.registry_id(cl.text) == AR.registry_id(text)
+
+
+def test_restore_never_overwrites_a_third_value_and_reports_held():
+    cl = FakeCluster()
+    AR.apply(cl, rules({"*.trs.theta_m": "x0.8", "*.trs.w_p": 1.0}), label="x", backup_dir="/b")
+    # someone else sets 7b's w_p during the arm
+    names = [m["name"] for m in rp.load_models(cl.text)]
+    cl.text = rp.apply_and_validate(cl.text, rp.parse_sets(["dsqwen-7b.trs.w_p=0.5"], names), loader=lambda p: None)
+    with pytest.raises(AR.RegistryError, match="NOT overwritten: dsqwen-7b.trs.w_p = 0.5"):
+        AR.restore(cl, backup_dir="/b")
+    assert cl.value("dsqwen-7b.trs.w_p") == 0.5 and AR.ANNOTATION in cl.annotations     # kept for a human
+    assert cl.value("dsqwen-7b.trs.theta_m") == pytest.approx(771.0746050443564)        # the arm's own keys went back
+    # a perturbation that held to the end: held True; one undone during the arm: held False
+    cl = FakeCluster()
+    AR.apply(cl, rules({"*.trs.w_p": 1.0}), label="a", backup_dir="/b")
+    assert AR.restore(cl, backup_dir="/b")["held"] is True
+    AR.apply(cl, rules({"*.trs.w_p": 1.0}), label="b", backup_dir="/b")
+    rec = cl.annotations[AR.ANNOTATION]
+    AR.restore(cl, backup_dir="/b")
+    cl.annotations[AR.ANNOTATION] = rec                                                  # values back early
+    assert AR.restore(cl, backup_dir="/b")["held"] is False and canonical(cl)
+
+
+def test_restore_leaves_another_runners_record_alone():
+    cl = FakeCluster()
+    AR.apply(cl, rules({"*.trs.w_p": 1.0}), label="other-campaign/a1", backup_dir="/b")
+    n = len(cl.calls)
+    assert "skipped" in AR.restore(cl, backup_dir="/b", expect_label="mine/a1")
+    assert len(cl.calls) == n and AR.ANNOTATION in cl.annotations
+
+
+def test_signal_log_theta_check(tmp_path):
+    import json
+    rows = [{"model": "dsqwen-7b", "theta_m": "616.859684"}, {"model": "dsqwen-14b", "theta_m": "642.6"},
+            {"model": "dsqwen-7b", "theta_m": "nan"}]
+    (tmp_path / "signal_log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    sets = {"dsqwen-7b.trs.theta_m": 616.859684, "dsqwen-14b.trs.theta_m": 514.083954, "dsllama-8b.trs.theta_m": 1.0}
+    bad, unver = AR.signal_log_theta_check(tmp_path, sets)
+    assert bad == ["dsqwen-14b: signal_log theta_m [642.6] != applied 514.083954"]
+    assert unver == ["dsllama-8b: no theta_m in signal_log.jsonl"]
+    assert AR.signal_log_theta_check(tmp_path / "none", sets)[1][0].startswith("no signal_log")
+
+
+def test_cluster_wraps_timeouts_as_registry_errors(monkeypatch):
+    import subprocess
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired("kubectl", 120)
+    monkeypatch.setattr(AR.subprocess, "run", boom)
+    with pytest.raises(AR.RegistryError, match="TimeoutExpired"):
+        AR.Cluster({}).read_cm()
+    with pytest.raises(AR.RegistryError, match="TimeoutExpired"):
+        AR.Cluster({}).params_set(["--status"])
