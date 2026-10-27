@@ -17,6 +17,7 @@ limitations under the License.
 package podautoscaler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -50,6 +51,9 @@ const (
 	serviceManageURLEnv                      = "SERVICE_MANAGE_URL"
 	apaScaleSleepModeEnv                     = "APA_SCALE_SLEEP_MODE"
 	defaultServiceManageTimeout              = 10 * time.Second
+	// apaSleepPath is the service-manager sleep path of an APA scale-down: the one its v1
+	// /scale_service used (no drain, like every sleep of the service-manager).
+	apaSleepPath = "apa"
 )
 
 // WorkloadScale provides scaling operations for different workload types.
@@ -238,7 +242,7 @@ func (s *workloadScale) getCurrentReplicasForRole(ctx context.Context, pa *autos
 }
 
 func (s *workloadScale) SetDesiredReplicas(ctx context.Context, pa *autoscalingv1alpha1.PodAutoscaler, replicas int32) error {
-	// TRE-PATCH(P2-APA-001): APA sleep mode applies wake/sleep deltas through service-manager.
+	// TRE-PATCH(P2-APA-002): APA sleep mode applies an absolute wake/sleep target through service-manager.
 	if s.shouldUseAPASleepMode(pa) {
 		return s.setWakeReplicasViaServiceManage(ctx, pa.Spec.ScaleTargetRef.Name, replicas)
 	}
@@ -387,63 +391,142 @@ func (s *workloadScale) getWakeReplicasFromServiceManage(ctx context.Context, mo
 	return replicas, nil
 }
 
+// TRE-PATCH(P2-APA-002): an ABSOLUTE target through POST /v2/plans instead of a v1 /scale_service
+// delta. The service-manager resolves "at least / at most desiredReplicas" under its writer lock, so
+// two reconciles that computed different deltas from one awake count can no longer stack (the
+// lost-update race of the whole-lock design, tre/docs/design/20261002-sm-wholelock.md section 7).
+// One model per call (APA scales per PodAutoscaler): desired > current -> one wake item
+// at_least=desired; desired < current -> one sleep item at_most=desired on the "apa" sleep path.
 func (s *workloadScale) setWakeReplicasViaServiceManage(ctx context.Context, modelName string, desiredReplicas int32) error {
 	currentReplicas, err := s.getWakeReplicasFromServiceManage(ctx, modelName)
 	if err != nil {
 		return err
 	}
-	delta := desiredReplicas - currentReplicas
-	if delta == 0 {
+	if desiredReplicas == currentReplicas {
 		return nil
 	}
-	scaleType := "up"
-	scaleValue := delta
-	if delta < 0 {
-		scaleType = "down"
-		scaleValue = -delta
+	plan := servicePlanRequest{Sleeps: []servicePlanSleepItem{}, Wakes: []servicePlanWakeItem{}}
+	if desiredReplicas > currentReplicas {
+		plan.Wakes = append(plan.Wakes, servicePlanWakeItem{Model: modelName, AtLeast: desiredReplicas, Reason: "apa"})
+	} else {
+		plan.Sleeps = append(plan.Sleeps, servicePlanSleepItem{
+			Model: modelName, AtMost: desiredReplicas, SleepPath: apaSleepPath, Reason: "apa",
+		})
 	}
-	return s.scaleViaServiceManage(ctx, modelName, scaleType, scaleValue)
+	return s.postServicePlan(ctx, modelName, currentReplicas, desiredReplicas, plan)
 }
 
-func (s *workloadScale) scaleViaServiceManage(ctx context.Context, modelName, scaleType string, scaleValue int32) error {
-	reqURL, err := s.serviceManageEndpoint("/scale_service", url.Values{
-		"model_name":  []string{modelName},
-		"scale_type":  []string{scaleType},
-		"scale_value": []string{fmt.Sprintf("%d", scaleValue)},
-	})
+// servicePlanRequest is the body of the service-manager's POST /v2/plans (one item per model).
+type servicePlanRequest struct {
+	Sleeps []servicePlanSleepItem `json:"sleeps"`
+	Wakes  []servicePlanWakeItem  `json:"wakes"`
+}
+
+type servicePlanSleepItem struct {
+	Model     string `json:"model"`
+	AtMost    int32  `json:"at_most"`
+	SleepPath string `json:"sleep_path"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type servicePlanWakeItem struct {
+	Model   string `json:"model"`
+	AtLeast int32  `json:"at_least"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// servicePlanItemResult is one item of the plan response (only the fields APA logs or decides on).
+type servicePlanItemResult struct {
+	Model          string                  `json:"model"`
+	Status         string                  `json:"status"`
+	AwakeBefore    *int32                  `json:"awake_before,omitempty"`
+	AwakeAfter     *int32                  `json:"awake_after,omitempty"`
+	Taken          int32                   `json:"taken"`
+	Unfilled       int32                   `json:"unfilled"`
+	ClampedByFloor bool                    `json:"clamped_by_floor"`
+	Error          *servicePlanErrorDetail `json:"error,omitempty"`
+}
+
+type servicePlanErrorDetail struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail"`
+}
+
+// servicePlanResponse is the plan response (200), or the 409 body: "partial" carries the whole
+// response; "writer_busy" / "routable_unknown" carry no items (nothing was done).
+type servicePlanResponse struct {
+	PlanID string                  `json:"plan_id"`
+	Status string                  `json:"status"`
+	Error  string                  `json:"error"`
+	Sleeps []servicePlanItemResult `json:"sleeps"`
+	Wakes  []servicePlanItemResult `json:"wakes"`
+}
+
+func (s *workloadScale) postServicePlan(ctx context.Context, modelName string, current, desired int32, plan servicePlanRequest) error {
+	reqURL, err := s.serviceManageEndpoint("/v2/plans", nil)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
+	payload, err := json.Marshal(plan)
 	if err != nil {
-		return fmt.Errorf("failed to build service_manage /scale_service request: %w", err)
+		return fmt.Errorf("failed to encode service_manage plan: %w", err)
 	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("failed to build service_manage /v2/plans request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.serviceManageClient().Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to call service_manage /scale_service: %w", err)
+		return fmt.Errorf("failed to call service_manage /v2/plans: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read service_manage scale response: %w", err)
+		return fmt.Errorf("failed to read service_manage plan response: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("service_manage /scale_service returned status %d: %s", resp.StatusCode, string(body))
+	var planResp servicePlanResponse
+	parseErr := json.Unmarshal(body, &planResp)
+	var item *servicePlanItemResult
+	if parseErr == nil {
+		for _, items := range [][]servicePlanItemResult{planResp.Wakes, planResp.Sleeps} {
+			for i := range items {
+				if items[i].Model == modelName {
+					item = &items[i]
+				}
+			}
+		}
 	}
-
-	var scaleResp struct {
-		Actual    int32 `json:"actual"`
-		Requested int32 `json:"requested"`
+	switch {
+	case resp.StatusCode == http.StatusOK && parseErr == nil && item != nil:
+		// done / noop / clamped (floor) / partial (some wakes placed): what happened stays; the
+		// next reconcile re-reads the awake count.
+		if item.Status != "done" && item.Status != "noop" {
+			klog.Warningf("service_manage plan %s for %s: %d -> %d is %s (unfilled %d, clamped_by_floor %t)",
+				planResp.PlanID, modelName, current, desired, item.Status, item.Unfilled, item.ClampedByFloor)
+		}
+		klog.InfoS("service_manage plan completed", "model", modelName, "plan", planResp.PlanID,
+			"current", current, "desired", desired, "status", item.Status, "taken", item.Taken, "unfilled", item.Unfilled)
+		return nil
+	case resp.StatusCode == http.StatusConflict && parseErr == nil && planResp.Error == "partial" &&
+		item != nil && item.Status == "refused":
+		// Nothing changed: the wake could not be placed (or a sleep was refused). The v1
+		// /scale_service answered this case 200 with actual 0; keep that: warn, no error, so the
+		// controller does not requeue with backoff against a state that has not changed.
+		reason := ""
+		if item.Error != nil {
+			reason = item.Error.Reason
+		}
+		klog.Warningf("service_manage plan %s for %s: %d -> %d refused (%s), nothing changed",
+			planResp.PlanID, modelName, current, desired, reason)
+		return nil
+	default:
+		// writer_busy, routable_unknown, a failed wake / sleep, a bad request, or an answer this
+		// client cannot read: an error, as for any service-manager error before.
+		return fmt.Errorf("service_manage /v2/plans returned status %d: %s", resp.StatusCode, string(body))
 	}
-	if err := json.Unmarshal(body, &scaleResp); err != nil {
-		return fmt.Errorf("failed to parse service_manage scale response: %w", err)
-	}
-	if scaleResp.Actual < scaleResp.Requested {
-		klog.Warningf("service_manage scale_%s for %s: requested %d but only %d succeeded", scaleType, modelName, scaleResp.Requested, scaleResp.Actual)
-	}
-	klog.InfoS("service_manage scale completed", "model", modelName, "scaleType", scaleType, "requested", scaleResp.Requested, "actual", scaleResp.Actual)
-	return nil
 }
 
 func (s *workloadScale) getPodSelectorForRole(ctx context.Context, pa *autoscalingv1alpha1.PodAutoscaler) (labels.Selector, error) {
