@@ -3,17 +3,22 @@
 # every arm, and with --force before a retry and when a pre-check needs it):
 #   run mode observe/active; decision source NONE (0 APA CRs, baseline scaler at 0 replicas, no
 #   baseline owner lock); no hidden binding; awake set == $BASELINE (runner.env); engines idle;
-#   (2026-10-08) controller ablation switches false (unset counts as false).
+#   (2026-10-08) controller ablation switches false (unset counts as false); (2026-10-28) TRE_SIGNAL_SOURCE
+#   unset (= zm), TRE_DISABLE_ETA_GATE false; (2026-10-28) no sensitivity-arm registry perturbation in effect
+#   (arm_registry.py: annotation tre.dev/arm-registry-restore on the registry ConfigMap; restored through
+#   params_set.py --apply --restart, SM then controller, backups in $ARM_REGISTRY_BACKUP_DIR, which campaign.py
+#   sets to <results_root>/_registry/backups; else $TRE_BACKUP_ROOT/arm-registry).
 # Usage: reset_canonical.sh [--check | --force]
 #   --check  report only: exit 0 when canonical, 1 when not (read-only)
 #   (none)   reset only when not canonical
 #   --force  always run the full sequence
 # Exit 0 = canonical afterwards, 3 = could not reach it (see the output).
 # CHANGES CLUSTER STATE (except --check): run mode, APA CRs, baseline scaler, SM awake set,
-# controller ablation switches (set env + rollout).
+# controller ablation switches (set env + rollout), live registry (restore of an arm's registry params).
 set -euo pipefail
 # shellcheck source=lib_env.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_env.sh"
+RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$RUNNER_DIR/lib_env.sh"
 need_env TRE_DIR BASELINE TRE_NS SM_SVC SM_PORT APA_NS BL_NS BL_DEPLOY MODEL_NS MODEL_SELECTOR ENGINE_PORT \
   REDIS_SVC REDIS_PORT GW_NS GW_SELECTOR CONTROLLER_DEPLOY
 MODE="${1:-auto}"
@@ -36,13 +41,15 @@ mode_set() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; lo
 n_apa() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true; }
 bl_replicas() { kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0; }
 bl_owner() { kubectl -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
-CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE"   # = run_arm_pilot.sh notes 14 / 15
-ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; *) echo false ;; esac; }
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE"   # = run_arm_pilot.sh note 14
+ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
 # settings off their default (unset = default): "K=v" lines
 ctl_not_false() { local k v d; for k in $CTL_ENV_KEYS; do d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-$d}" = "$d" ] || echo "$k=$v"; done; }
 # their reset arguments: a switch -> K=false, the scope -> K- (unset)
 ctl_reset_args() { local kv k; for kv in $(ctl_not_false); do k=${kv%%=*}; if [ "$(ctl_default "$k")" = false ]; then echo "$k=false"; else echo "$k-"; fi; done; }
+AREG() { TRE_DIR="$TRE" TRE_NS="$TRE_NS" CONTROLLER_DEPLOY="$CONTROLLER_DEPLOY" SM_DEPLOY="${SM_DEPLOY:-tre-v2-service-manager}" \
+           python3 "$RUNNER_DIR/arm_registry.py" "$@"; }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \
                --namespace "$BL_NS" --deployment "$BL_DEPLOY" --redis-url "$REDIS_URL" --gw-namespace "$GW_NS" --gw-selector "$GW_SELECTOR"; }
 
@@ -55,6 +62,7 @@ problems() {   # prints one line per deviation from the canonical state
   r=$(bl_replicas); [ "${r:-0}" = 0 ] || echo "baseline scaler replicas: $r"
   o=$(bl_owner); [ -z "$o" ] || echo "baseline owner lock: $o"
   c=$(ctl_not_false | tr '\n' ' '); [ -z "$c" ] || echo "controller ablation switches not false / scope not default: $c"
+  g=$(AREG check 2>&1) || echo "registry: $(echo "$g" | tail -1)"
 }
 
 P=$(problems)
@@ -71,6 +79,17 @@ if [ -n "$CF" ]; then
     log "controller switches -> $CF"
   else
     log "ERROR controller switch reset failed ($CF)"
+  fi
+fi
+# a sensitivity arm's registry params back to the recorded values (params_set restart-to-apply: SM, then controller)
+if ! AREG check >/dev/null 2>&1; then
+  RB="${ARM_REGISTRY_BACKUP_DIR:-${TRE_BACKUP_ROOT:+$TRE_BACKUP_ROOT/arm-registry}}"
+  if [ -z "$RB" ]; then
+    log "ERROR registry perturbation in effect but neither ARM_REGISTRY_BACKUP_DIR nor TRE_BACKUP_ROOT is set (backup dir)"
+  elif AREG restore --backup-dir "$RB" --reason "reset_canonical.sh"; then
+    log "registry restored (backups in $RB)"
+  else
+    log "ERROR registry restore failed (arm_registry.py restore --backup-dir DIR by hand)"
   fi
 fi
 # baseline shell: disable through the arm tool (releases the owner lock), then make sure it is at 0

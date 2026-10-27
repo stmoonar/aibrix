@@ -56,6 +56,8 @@
 #  14. (2026-10-08) controller ablation switches (TRE_ABLATION_DISABLE_SAFESCALE / _SLOW_LOOP):
 #      ARM_CONTROLLER_ENV="K=true|false ..." (campaign arm_defs.<id>.controller_env, tre arms only;
 #      2026-10-26: also TRE_SAFESCALE_SCOPE=<scope>, default all = unset, restored to unset;
+#      2026-10-28: also TRE_SIGNAL_SOURCE=<signal> (default zm = unset, restored to unset) and the switch
+#      TRE_DISABLE_ETA_GATE; the startup line logs them as signal_source / disable_eta_gate;
 #      unset = every switch false = production). Before the controller restart of EVERY arm (all arm
 #      types): (a) hygiene gate - no unresolved SafeScale probe record in Redis (status other than
 #      "resolved", or unparsable; resolved records stay an hour until gc_resolved_probes), polled up
@@ -119,11 +121,14 @@ PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for o
 # ---- controller ablation switches (2026-10-08, note 14)
 # (2026-10-26) TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025): which placements SafeScale covers;
 # default "all" = unset (production), e.g. receiverless_shrink. Restored to unset like the switches.
-CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE"
-ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; *) echo false ;; esac; }
+# (2026-10-28) signal ablation: TRE_SIGNAL_SOURCE (default zm = TSS = unset, restored to unset; the values of
+# campaign.py SIGNAL_SOURCES) and the switch TRE_DISABLE_ETA_GATE (default false).
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE"
+ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_valid() {   # ctl_valid KEY VALUE
   case "$1" in
     TRE_SAFESCALE_SCOPE) case "$2" in all|receiverless_shrink|off) ;; *) return 1 ;; esac ;;
+    TRE_SIGNAL_SOURCE) case "$2" in zm|queue_len|ttft_mean|kv_usage|latency_p95|decode_tps|prefill_tps|kv_cache) ;; *) return 1 ;; esac ;;
     *) [ "$2" = true ] || [ "$2" = false ] ;;
   esac
 }
@@ -161,7 +166,7 @@ if [ "$SEND_IN_TOKENS" = 1 ]; then
 fi
 for kv in $ARM_CONTROLLER_ENV; do
   case " $CTL_ENV_KEYS " in *" ${kv%%=*} "*) ;; *) echo "ARM_CONTROLLER_ENV: unknown switch '${kv%%=*}' (allowed: $CTL_ENV_KEYS)" >&2; exit 2;; esac
-  ctl_valid "${kv%%=*}" "${kv#*=}" || { echo "ARM_CONTROLLER_ENV: '$kv': bad value (switches true|false, TRE_SAFESCALE_SCOPE all|receiverless_shrink|off)" >&2; exit 2; }
+  ctl_valid "${kv%%=*}" "${kv#*=}" || { echo "ARM_CONTROLLER_ENV: '$kv': bad value (switches true|false, TRE_SAFESCALE_SCOPE all|receiverless_shrink|off, TRE_SIGNAL_SOURCE one of ctl_valid)" >&2; exit 2; }
   [ "$ARM" = tre ] || { echo "ARM_CONTROLLER_ENV is for tre arms only (arm=$ARM)" >&2; exit 2; }
 done
 # the switch is the alias of scope "off": both given must agree, else the controller refuses to start
@@ -309,9 +314,9 @@ record_ablation_switches() {   # prints match | mismatch | missing; writes ablat
     line=$(kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" 2>/dev/null | grep -m1 'ablation_switches' || true)
     [ -n "$line" ] && break; sleep 2
   done
-  python3 - "$D/ablation_switches.json" "$line" "$(ctl_want TRE_ABLATION_DISABLE_SAFESCALE)" "$(ctl_want TRE_ABLATION_DISABLE_SLOW_LOOP)" "$(ctl_env_now)" "$(ctl_want TRE_SAFESCALE_SCOPE)" <<'PY'
+  python3 - "$D/ablation_switches.json" "$line" "$(ctl_want TRE_ABLATION_DISABLE_SAFESCALE)" "$(ctl_want TRE_ABLATION_DISABLE_SLOW_LOOP)" "$(ctl_env_now)" "$(ctl_want TRE_SAFESCALE_SCOPE)" "$(ctl_want TRE_SIGNAL_SOURCE)" "$(ctl_want TRE_DISABLE_ETA_GATE)" <<'PY'
 import json, sys
-out, line, want_ss, want_sl, env_now, want_scope = sys.argv[1:7]
+out, line, want_ss, want_sl, env_now, want_scope, want_sig, want_eta = sys.argv[1:9]
 def event_of(obj):
     if isinstance(obj, dict) and obj.get("event") == "ablation_switches":
         return obj
@@ -339,9 +344,17 @@ ok = rec is not None and all(rec.get(k) == v for k, v in want.items())
 scope_logged = None if rec is None else rec.get("safescale_scope")
 ok = ok and (scope_logged == eff_scope if scope_logged is not None else eff_scope in ("all", "off") and want_scope == "all")
 want["safescale_scope"] = eff_scope
+# signal ablation (2026-10-28): a line without signal_source / disable_eta_gate (controller image before them)
+# matches only the defaults zm / false
+for key, wv, default in (("signal_source", want_sig, "zm"), ("disable_eta_gate", want_eta == "true", False)):
+    want[key] = wv
+    got = None if rec is None else rec.get(key)
+    ok = ok and (got == wv if got is not None else wv == default)
 effective = None if rec is None else {"disable_safescale": rec.get("disable_safescale"),
                                       "disable_slow_loop": rec.get("disable_slow_loop"),
-                                      "safescale_scope": scope_logged if scope_logged is not None else "all (not logged)"}
+                                      "safescale_scope": scope_logged if scope_logged is not None else "all (not logged)",
+                                      "signal_source": rec.get("signal_source", "zm (not logged)"),
+                                      "disable_eta_gate": rec.get("disable_eta_gate", "false (not logged)")}
 json.dump({"logged": rec, "wanted": want, "effective": effective, "match": ok, "deployment_env": env_now.strip(),
            "raw": line[:500] or None}, open(out, "w"), indent=1)
 print("match" if ok else ("missing" if rec is None else "mismatch"))
@@ -377,7 +390,7 @@ on_exit() {   # safety net: never leave a baseline shell actuating or the stream
   fi
   if [ "$CTL_ENV_TOUCHED" = 1 ]; then
     log "TRAP rc=$rc: run mode -> $(mode observe observe || echo FAILED) before the switches"
-    log "TRAP rc=$rc: controller ablation switches back to false (scope unset)"; ctl_env_set false || log "TRAP ERROR: controller env restore failed (set them to false / unset TRE_SAFESCALE_SCOPE by hand)"
+    log "TRAP rc=$rc: controller ablation switches back to false (scope / signal source unset)"; ctl_env_set false || log "TRAP ERROR: controller env restore failed (set them to false / unset TRE_SAFESCALE_SCOPE and TRE_SIGNAL_SOURCE by hand)"
   fi
   [ "$rc" = 0 ] || log "TRAP: runner exited rc=$rc mid-arm; cluster NOT reset (see RUN.md 'stop')"
 }

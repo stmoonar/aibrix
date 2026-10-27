@@ -47,6 +47,9 @@ from typing import Any, Callable, Iterable, Optional
 
 HERE = Path(__file__).resolve().parent
 TRE_REPO_DEFAULT = HERE.parents[1]          # .../tre
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import arm_registry as AR  # noqa: E402  per-arm registry params (sensitivity arms)
 BASE_ARMS = ("tre", "apa", "chiron", "tokenscale", "preserve")
 BASELINE_ARMS = ("chiron", "tokenscale", "preserve")
 DEFAULT_LABELS = {"tre": "TRE", "apa": "APA-kvcache", "chiron": "Chiron-global",
@@ -64,11 +67,17 @@ TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 # controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
-CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE")
+CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE",
+                       "TRE_SIGNAL_SOURCE", "TRE_DISABLE_ETA_GATE")
 # 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
-CONTROLLER_ENV_SCOPE_KEYS = ("TRE_SAFESCALE_SCOPE",)
+# 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source);
+# TRE_DISABLE_ETA_GATE is a switch (default false; logged as disable_eta_gate).
 SAFESCALE_SCOPES = ("all", "receiverless_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
+# tre_controller.config.SIGNAL_SOURCES, plus ttft_mean / kv_usage (the v1 signals, added to the controller by the
+# signal-source change; an image without them refuses to start -> the startup-line check fails the arm)
+SIGNAL_SOURCES = ("zm", "queue_len", "ttft_mean", "kv_usage", "latency_p95", "decode_tps", "prefill_tps", "kv_cache")
+CONTROLLER_ENV_CHOICES = {"TRE_SAFESCALE_SCOPE": SAFESCALE_SCOPES, "TRE_SIGNAL_SOURCE": SIGNAL_SOURCES}
 # collectors of docs/eval-metrics-spec §7 that every arm directory should hold (missing -> suspect)
 COLLECTOR_FILES = ("layout.jsonl", "pod_metrics_1s.jsonl", "pod_gauges.jsonl", "gpu_map.jsonl", "gpu_truth.jsonl",
                    "resource_usage.jsonl", "apa_status.jsonl", "signal_log.jsonl", "clock_offsets.json",
@@ -248,6 +257,7 @@ class ArmDef:
     policy: dict = field(default_factory=dict)
     oracle_shift: Optional[dict] = None
     controller_env: dict = field(default_factory=dict)
+    registry_rules: list = field(default_factory=list)   # arm_registry.Rule (registry_params / registry_transforms)
 
 
 def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
@@ -263,9 +273,9 @@ def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
     out = {}
     for k, v in raw.items():
         v = str(v).strip().lower()
-        if k in CONTROLLER_ENV_SCOPE_KEYS:
-            if v not in SAFESCALE_SCOPES:
-                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be one of {SAFESCALE_SCOPES}")
+        if k in CONTROLLER_ENV_CHOICES:
+            if v not in CONTROLLER_ENV_CHOICES[k]:
+                raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be one of {CONTROLLER_ENV_CHOICES[k]}")
         elif v not in ("true", "false"):
             raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k} must be true or false")
         out[k] = v
@@ -299,8 +309,14 @@ def arm_def(c: dict, arm_id: str) -> ArmDef:
     if shift is not None:
         if float(shift.get("period_s", 0)) <= 0 or not (0 < float(shift.get("frac", 0.25)) <= 0.5):
             raise CampaignError(f"arm_defs.{arm_id}.oracle_shift needs period_s > 0 and 0 < frac <= 0.5")
+    try:
+        rules = AR.parse_spec(f"arm_defs.{arm_id}", d.get("registry_params"), d.get("registry_transforms"))
+    except AR.RegistryError as exc:
+        raise CampaignError(str(exc)) from exc
+    if rules and base != "tre":
+        raise CampaignError(f"arm_defs.{arm_id}: registry_params / registry_transforms are only supported for base tre")
     return ArmDef(arm_id, base, str(d.get("label") or DEFAULT_LABELS[base]), pol, shift,
-                  _controller_env(arm_id, base, d.get("controller_env")))
+                  _controller_env(arm_id, base, d.get("controller_env")), rules)
 
 
 # ------------------------------------------------------------------ arm order
@@ -949,6 +965,7 @@ def arm_manifest(c: dict, item: PlanItem, e: TraceEntry, attempt: int, t0: float
             comp["baseline_scaler"].get("node"))) if isinstance(comp.get("baseline_scaler"), dict) else None,
         "env": {k: c["env"][k] for k in sorted(c["env"])},
         "controller_env": arm_def(c, item.arm).controller_env or None,
+        "registry_rules": AR.describe(arm_def(c, item.arm).registry_rules) or None,
         "ablation_switches": read_json(d / "ablation_switches.json"),
         "validity": verdict, **extra,
     }
@@ -1012,10 +1029,12 @@ class Cluster:
         return clock_probe.probe(t, shlex.split(self.e.get("CLOCK_SSH_OPTS", "-o BatchMode=yes -o ConnectTimeout=5")))["offset_s"]
 
     # each check -> {"name", "ok", "detail", "kind": reset | wait | hard}
-    def checks(self, c: dict, need_baseline: bool) -> list[dict]:
+    def checks(self, c: dict, need_baseline: bool, skip: tuple = ()) -> list[dict]:
         out = []
 
         def add(name, kind, fn):
+            if name in skip:
+                return
             try:
                 ok, detail = fn()
             except Exception as exc:  # noqa: BLE001
@@ -1121,6 +1140,29 @@ class Cluster:
                     bad.append(node)
             return not bad, "; ".join(det)
         add("disk", "hard", disk)
+
+        # 2026-10-28: a sensitivity arm's registry perturbation still in effect (annotation on the registry
+        # ConfigMap) -> full reset (reset_canonical.sh restores it); the canonical registry must be the one the
+        # campaign expects (registry_expect: recalibrated registry id, required values)
+        reg_cl = AR.Cluster(self.e)
+        state: dict = {}
+
+        def registry():
+            cm = reg_cl.read_cm()
+            state["cm"] = cm
+            rec = AR._annotation(cm)
+            return rec is None, ("canonical (no arm perturbation)" if rec is None else
+                                 f"perturbation of {rec.get('label')} in effect since {rec.get('at')}")
+        add("registry", "reset", registry)
+
+        def registry_expect():
+            cm = state.get("cm") or reg_cl.read_cm()
+            if AR._annotation(cm) is not None:
+                return True, "skipped while a perturbation is in effect (the reset restores it first)"
+            probs = AR.expect_problems(c.get("registry_expect"), AR._data(cm))
+            return not probs, "; ".join(probs) or f"registry id {AR.registry_id(AR._data(cm))} as expected"
+        if c.get("registry_expect"):
+            add("registry_expect", "hard", registry_expect)
         return out
 
 
@@ -1204,8 +1246,11 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
             arm_def(c, a)
         except CampaignError as exc:
             problems.append(str(exc))
+    problems.extend(AR.expect_spec_problems(c.get("registry_expect")))
+    if any(arm_def_safe(c, i.arm) for i in plan) and not c.get("registry_expect"):
+        warnings.append("arms with registry params but no registry_expect: the factors apply to whatever registry is live")
     for f in ("run_arm_pilot.sh", "reset_canonical.sh", "lib_env.sh", "sampler.py", "clock_probe.py", "components.py",
-              "collect_redis.py", "first_run_check.py"):
+              "collect_redis.py", "first_run_check.py", "arm_registry.py"):
         if not (HERE / f).is_file():
             problems.append(f"runner file missing: {HERE / f}")
     problems.extend(paths_outside_repo(env))
@@ -1266,6 +1311,14 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
             if w:
                 warnings.append(w)
     return problems, warnings
+
+
+def arm_def_safe(c: dict, arm: str) -> list:
+    """The arm's registry rules, [] when the arm definition is invalid (reported elsewhere)."""
+    try:
+        return arm_def(c, arm).registry_rules
+    except CampaignError:
+        return []
 
 
 def provenance_warning(label: str, path: Path) -> Optional[str]:
@@ -1387,6 +1440,15 @@ def report_cmds(c: dict, item: PlanItem, trace_arm_dirs: list[str]) -> list[tupl
 
 
 # ------------------------------------------------------------------ the campaign loop
+def registry_dir(c: dict) -> Path:
+    """Per-arm registry records + params_set backups of the live ConfigMap (sensitivity arms)."""
+    return Path(c["results_root"]) / "_registry"
+
+
+def registry_label(c: dict, item: PlanItem, attempt: int) -> str:
+    return f"{c['name']}/{item.key}/a{attempt}"
+
+
 class Deps:
     """What the loop does to the world (replaced by fakes in the tests)."""
 
@@ -1404,9 +1466,36 @@ class Deps:
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a") as f:
             f.write(f"=== {now_iso()} {' '.join(args)}\n"); f.flush()
-            rc = subprocess.call(args, stdout=f, stderr=subprocess.STDOUT)
+            rc = subprocess.call(args, stdout=f, stderr=subprocess.STDOUT,
+                                 env={**os.environ, "ARM_REGISTRY_BACKUP_DIR": str(registry_dir(self.c) / "backups")})
         self.rec.line(f"reset{' --force' if force else ''} rc={rc} (logs/reset.log)")
         return rc
+
+    def registry_apply(self, item: PlanItem, attempt: int) -> dict:
+        """Sensitivity arm: its registry params on the live registry (params_set restart-to-apply, verified),
+        then the pre-checks again WITHOUT a reset (a reset would restore the registry) and without the
+        registry checks. Raises arm_registry.RegistryError (the caller restores and counts the attempt)."""
+        rules = arm_def(self.c, item.arm).registry_rules
+        rec = AR.apply(AR.Cluster(), rules, label=registry_label(self.c, item, attempt),
+                       backup_dir=str(registry_dir(self.c) / "backups"), log=self.rec.line)
+        write_json_atomic(registry_dir(self.c) / f"{item.out_name}.{item.arm}.a{attempt}.json", rec)
+
+        def no_reset(force: bool) -> int:
+            self.rec.line("precheck after the registry params: no reset while they are applied")
+            return 1
+        ok, res = precheck_until_ready(
+            lambda: self.cluster.checks(self.c, item.base_arm in BASELINE_ARMS, skip=("registry", "registry_expect")),
+            no_reset, self.c, self.rec.line)
+        if not ok:
+            raise AR.RegistryError("pre-checks after the registry params failed: "
+                                   + "; ".join(f"{r['name']}: {r['detail']}" for r in res if not r["ok"]))
+        return rec
+
+    def registry_restore(self, item: PlanItem, attempt: int) -> Optional[dict]:
+        """Only this attempt's record (label) is restored; another runner's perturbation is left alone."""
+        return AR.restore(AR.Cluster(), backup_dir=str(registry_dir(self.c) / "backups"),
+                          reason=f"campaign {self.c['name']} after {item.key}", log=self.rec.line,
+                          expect_label=registry_label(self.c, item, attempt))
 
     def run_arm(self, item: PlanItem, env: dict, attempt: int) -> int:
         out = Path(self.c["results_root"]) / "logs" / f"{item.out_name}.{item.arm}.a{attempt}.out"
@@ -1552,11 +1641,36 @@ class Campaign:
             self.publish("running", cur, item, t0)
             self.rec.line(f"[{item.n}/{len(self.plan)}] START {key} pos={item.position}/{item.k} order={','.join(item.order)} "
                           f"attempt={att} expected_end={cur['expected_end']}")
-            rc = self.deps.run_arm(item, self.arm_env(item, e, prep), att)
+            rules = arm_def(self.c, item.arm).registry_rules
+            reg, reg_err = None, None
+            restored = None
+            try:
+                if rules:   # sensitivity arm: live registry perturbed for this arm only
+                    try:
+                        reg = self.deps.registry_apply(item, att)
+                    except AR.RegistryError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001  timeouts, OS / parse errors: this item fails, the campaign goes on
+                        raise AR.RegistryError(f"{type(exc).__name__}: {exc}") from exc
+                rc = self.deps.run_arm(item, self.arm_env(item, e, prep), att)
+            except AR.RegistryError as exc:
+                rc, reg_err = None, str(exc)
+                self.rec.line(f"[{item.n}/{len(self.plan)}] {key}: registry params failed: {exc}")
+            finally:        # success, failure, exception, abort: the registry goes back before anything else
+                if rules:
+                    restored = self._restore_registry(item, att)
             t1 = self.clock()
-            verdict = assess_arm(item.arm_dir, rc, e.requests, self.c["validity"], item.base_arm in BASELINE_ARMS)
+            if reg_err is not None:
+                verdict = {"verdict": "invalid", "invalid": [f"registry params: {reg_err}"], "suspect": [], "info": [],
+                           "metrics": {"rc": None}}
+            else:
+                verdict = assess_arm(item.arm_dir, rc, e.requests, self.c["validity"], item.base_arm in BASELINE_ARMS)
+                if reg and reg.get("applied"):
+                    self._registry_verdict(item, reg, restored, verdict)
             self.last_validity = {"key": key, "attempt": att, **verdict}
             extra = {"preserve": prep.get("record")} if prep.get("record") else {}
+            if rules:
+                extra["registry_params"] = reg
             man = arm_manifest(self.c, item, e, att, t0, t1, rc, verdict, extra)
             if Path(item.arm_dir).is_dir():
                 write_json_atomic(Path(item.arm_dir) / "campaign_manifest.json", man)
@@ -1580,6 +1694,29 @@ class Campaign:
                 return "failed"
             # else loop: full reset + retry (the STOP file is honoured before it)
 
+    def _restore_registry(self, item: PlanItem, attempt: int) -> Optional[dict]:
+        try:
+            return self.deps.registry_restore(item, attempt)
+        except Exception as exc:  # noqa: BLE001  the next pre-check sees the annotation and resets (restores)
+            self.rec.line(f"ERROR registry restore after {item.key} failed: {type(exc).__name__}: {exc} "
+                          "(the next pre-check resets; reset_canonical.sh restores it)")
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _registry_verdict(self, item: PlanItem, reg: dict, restored: Optional[dict], verdict: dict) -> None:
+        """A perturbed arm is valid only if the perturbation held for the whole arm (the live values were
+        still the applied ones at the restore) and the controller used the applied theta (signal_log)."""
+        why = []
+        if not isinstance(restored, dict) or restored.get("held") is not True:
+            det = (restored or {}).get("error") or (restored or {}).get("skipped") or (restored or {}).get("classes")
+            why.append(f"registry perturbation not confirmed held during the arm: {det}")
+        bad, unver = AR.signal_log_theta_check(item.arm_dir, reg.get("set") or {})
+        why += bad
+        verdict["suspect"] += unver
+        verdict["metrics"]["registry_held"] = (restored or {}).get("held")
+        if why:
+            verdict["invalid"] += why
+        verdict["verdict"] = "invalid" if verdict["invalid"] else ("suspect" if verdict["suspect"] else "valid")
+
     def _mark_failed(self, item: PlanItem, attempts: int, why: str) -> None:
         write_json_atomic(failed_marker_path(item), {"campaign": self.c["name"], "out_name": item.out_name, "arm": item.arm,
                                                      "attempts": attempts, "reason": why, "at": now_iso(),
@@ -1599,6 +1736,10 @@ class Campaign:
         if (self.root / "STOP").exists():
             self.rec.line(f"campaign {self.c['name']}: {self.root / 'STOP'} is present; remove it to start")
             return 0
+        bad = AR.expect_spec_problems(self.c.get("registry_expect"))
+        if bad:
+            self.rec.line(f"campaign {self.c['name']} refused: " + "; ".join(bad))
+            return 2
         self.rec.line(f"campaign {self.c['name']} start: {len(self.plan)} arms, file {self.c['campaign_file']} "
                       f"(sha256 {str(self.c['campaign_sha256'])[:12]}), pid {os.getpid()}")
         final = "done"
@@ -1683,6 +1824,25 @@ def dry_run(c: dict, probe: bool = False, out=sys.stdout) -> int:
     else:
         w(f"  {marker or '(MARKER unset)'}: absent. Create it before the run (one line, then notify the parallel sessions):\n"
           f"    validation {now_iso()} {now_iso(time.time() + total + float(c['marker']['margin_s']))} round={c['round']} owner=<session>\n")
+    reg_arms = {a: arm_def_safe(c, a) for a in sorted({i.arm for i in plan})}
+    reg_arms = {a: r for a, r in reg_arms.items() if r}
+    if reg_arms:
+        w("\nregistry params per arm (live registry via params_set, restored after the arm):\n")
+        live = None
+        if probe:
+            try:
+                live = AR._data(AR.Cluster().read_cm())
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"registry preview: {exc}")
+        for a, rules in reg_arms.items():
+            w(f"  {a}: {'; '.join(AR.describe(rules))}\n")
+            if live is not None:
+                try:
+                    sets, olds = AR.resolve(rules, live)
+                    for k, v in sets.items():
+                        w(f"      {k}: {olds[k]} -> {v}\n")
+                except AR.RegistryError as exc:
+                    problems.append(f"arm {a}: registry params do not apply to the live registry: {exc}")
     if c["env"]:
         w("\ncampaign env (wins over the caller and runner.env):\n")
         for k in sorted(c["env"]):

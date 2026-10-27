@@ -557,11 +557,127 @@ def test_ablation_arm_passes_its_controller_switch_and_other_arms_pass_none(tmp_
     ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "receiverless"}}, "must be one of"),
     ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "off", "TRE_ABLATION_DISABLE_SAFESCALE": False}},
      "contradicts"),
+    ({"base": "tre", "controller_env": {"TRE_SIGNAL_SOURCE": "tss"}}, "must be one of"),
+    ({"base": "tre", "controller_env": {"TRE_DISABLE_ETA_GATE": "off"}}, "true or false"),
 ])
 def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, bad, match):
     c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {"x": bad}}))
     with pytest.raises(C.CampaignError, match=match):
         C.build_plan(c)
+
+
+def test_controller_env_keys_are_one_list_in_campaign_and_both_shell_scripts():
+    """run_arm_pilot.sh sets / checks and reset_canonical.sh restores exactly campaign.CONTROLLER_ENV_KEYS, with
+    the same defaults (TRE_SIGNAL_SOURCE back to zm = unset, TRE_DISABLE_ETA_GATE back to false); the runner
+    accepts every signal source the controller knows."""
+    import re
+    for f in ("run_arm_pilot.sh", "reset_canonical.sh"):
+        txt = (RUNNER / f).read_text()
+        keys = re.search(r'(?m)^CTL_ENV_KEYS="([^"]+)"', txt).group(1).split()
+        assert tuple(keys) == C.CONTROLLER_ENV_KEYS, f
+        assert "TRE_SIGNAL_SOURCE) echo zm ;;" in txt and "TRE_SAFESCALE_SCOPE) echo all ;;" in txt, f
+    sh = re.search(r"TRE_SIGNAL_SOURCE\) case \"\$2\" in ([a-z0-9_|]+)\)", (RUNNER / "run_arm_pilot.sh").read_text())
+    assert set(sh.group(1).split("|")) == set(C.SIGNAL_SOURCES)
+    try:
+        from tre_controller.config import SIGNAL_SOURCES as CTL
+    except Exception:  # noqa: BLE001  controller deps not importable here
+        pytest.skip("tre_controller not importable")
+    assert set(CTL) <= set(C.SIGNAL_SOURCES)
+
+
+def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):
+    extra = {"arm_defs": {"sig-queue": {"base": "tre", "controller_env": {
+        "TRE_SIGNAL_SOURCE": "queue_len", "TRE_DISABLE_ETA_GATE": True, "TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}}}
+    deps = EnvDeps()
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sig-queue",), "extra": extra})
+    assert camp.run() == 0
+    assert deps.envs == {"Alternating_s1/sig-queue": "TRE_DISABLE_ETA_GATE=true TRE_SAFESCALE_SCOPE=receiverless_shrink "
+                                                     "TRE_SIGNAL_SOURCE=queue_len"}
+
+
+class RegDeps(FakeDeps):
+    """FakeDeps + the registry hooks of a sensitivity arm; ``reg_fail`` = keys whose first apply fails,
+    ``abort`` = keys whose run raises (Ctrl-C / crash inside the arm)."""
+
+    def __init__(self, reg_fail=(), abort=(), held=True, theta=616.8, reg_exc=None, **kw):
+        super().__init__(**kw)
+        self.reg_fail, self.abort, self.held, self.theta, self.reg_exc = set(reg_fail), set(abort), held, theta, reg_exc
+
+    def registry_apply(self, item, attempt):
+        self.calls.append(("reg_apply", item.key, attempt))
+        if item.key in self.reg_fail:
+            self.reg_fail.discard(item.key)
+            raise self.reg_exc or C.AR.RegistryError("params_set --apply --restart rc=1: REJECTED")
+        return {"set": {"m7.trs.theta_m": 616.8}, "restore": {"m7.trs.theta_m": 771.0}, "applied": True}
+
+    def registry_restore(self, item, attempt):
+        self.calls.append(("reg_restore", item.key))
+        return {"restored": {"m7.trs.theta_m": 771.0}, "held": self.held}
+
+    def run_arm(self, item, env, attempt):
+        rc = self._run(item, env, attempt)
+        d = Path(item.arm_dir)
+        if d.is_dir():
+            (d / "signal_log.jsonl").write_text(json.dumps({"model": "m7", "theta_m": str(self.theta)}) + "\n")
+        return rc
+
+    def _run(self, item, env, attempt):
+        if item.key in self.abort:
+            self.calls.append(("run", item.key, attempt, None, None))
+            raise KeyboardInterrupt
+        return super().run_arm(item, env, attempt)
+
+    def seq(self, key):
+        return [c[0] if c[0] != "reset" else f"reset{'!' if c[1] else ''}" for c in self.calls
+                if (len(c) > 1 and c[1] == key) or c[0] == "reset"]
+
+
+SENS = {"arm_defs": {"sens-theta-m20": {"base": "tre", "registry_params": {"*.trs.theta_m": "x0.8"},
+                                        "controller_env": {"TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}}}
+
+
+def test_sensitivity_arm_registry_restored_after_success_failure_and_abort(tmp_path):
+    """The registry params are applied right before the arm and restored right after it - before the
+    post-arm reset - whether the arm succeeded, the apply failed (attempt invalid, retried after a full
+    reset) or the arm was aborted; an arm without registry params never touches the registry."""
+    k = "Alternating_s1/sens-theta-m20"
+    deps = RegDeps(reg_fail={k})
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20", "tre"), "extra": SENS})
+    assert camp.run() == 0
+    assert deps.seq(k)[:7] == ["reg_apply", "reg_restore", "reset!", "reg_apply", "run", "reg_restore", "reset"]
+    assert not [c for c in deps.calls if c[0].startswith("reg") and c[1].endswith("/tre")]
+    item = next(i for i in camp.plan if i.arm == "sens-theta-m20")
+    man = json.loads((Path(item.arm_dir) / "campaign_manifest.json").read_text())
+    assert man["registry_params"]["set"] == {"m7.trs.theta_m": 616.8} and man["registry_rules"] == ["*.trs.theta_m x0.8"]
+    assert man["attempt"] == 2
+    # a failed run (rc) and an abort: restored all the same
+    for script, abort in (({k: ["rc", "rc"]}, set()), ({}, {k})):
+        t = tmp_path / ("rc" if script else "abort")
+        t.mkdir()
+        deps = RegDeps(script=script, abort=abort)
+        camp = campaign(t, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20",), "extra": SENS})
+        if abort:
+            with pytest.raises(KeyboardInterrupt):
+                camp.run()
+            assert deps.seq(k) == ["reg_apply", "run", "reg_restore"]
+        else:
+            camp.run()
+            s = deps.seq(k)
+            assert s.count("reg_apply") == s.count("reg_restore") == 2
+            assert all(s[i + 1] == "reg_restore" for i, x in enumerate(s) if x == "run")
+
+
+def test_registry_params_refused_outside_tre_and_unfilled_registry_expect_refuses_the_run(tmp_path):
+    c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {
+        "x": {"base": "apa", "registry_params": {"*.trs.w_p": 1.0}}}}))
+    with pytest.raises(C.CampaignError, match="only supported for base tre"):
+        C.build_plan(c)
+    t = tmp_path / "exp"
+    t.mkdir()
+    deps = RegDeps()
+    camp = campaign(t, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20",),
+                                  "extra": {**SENS, "registry_expect": {"registry_id": None}}})
+    assert camp.run() == 2 and deps.runs() == []
 
 
 def test_ablation_safescale_campaign_plan(tmp_path):
@@ -625,3 +741,58 @@ def test_trace_set_is_one_setting_switchable_from_the_environment(tmp_path):
     assert C.expand("${X:-${Y}/z}", {"Y": "y"}) == "y/z"
     with pytest.raises(C.CampaignError):
         C.expand("${X}", {})
+
+
+def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
+    """The shipped 10-28 specs: (A) Tight_pool / Simul_spike / Real_conv x {TSS, queue, ttft_mean, kv_usage}, SafeScale
+    receiverless_shrink everywhere, the eta gate off exactly on the alternative-signal arms; (B) Simul_spike /
+    Real_conv x {base, theta / lambda / w_p / tau x0.8 x1.2, WP-ABS1}, one parameter per arm. Both refuse to start
+    until registry_expect.registry_id (the recalibrated registry) is filled in, and the A spec requires the refitted
+    alt thresholds of its three signals."""
+    env = {"TRE_REPO": str(tmp_path)}
+    a = C.load_campaign(RUNNER / "campaigns" / "campaign-signal-ablation-20261028.yaml", environ=env)
+    plan = C.build_plan(a)
+    assert [e.trace for e in C.resolve_traces(a)] == ["Tight_pool", "Simul_spike", "Real_conv"] and len(plan) == 12
+    envs = {i.arm: C.arm_def(a, i.arm).controller_env for i in plan}
+    assert all(e["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for e in envs.values())
+    assert {k: (e["TRE_SIGNAL_SOURCE"], e["TRE_DISABLE_ETA_GATE"]) for k, e in envs.items()} == {
+        "sig-tss": ("zm", "false"), "sig-queue": ("queue_len", "true"), "sig-ttft": ("ttft_mean", "true"),
+        "sig-kv": ("kv_usage", "true")}
+    assert len({i.arm for i in plan if i.position == 1}) == 3 and a["report"]["ref"] == "sig-tss"
+    assert {p.split(".")[2] for p in a["registry_expect"]["present"] if ".alt_thresholds." in p} == {
+        "queue_len", "ttft_mean", "kv_usage"}
+    b = C.load_campaign(RUNNER / "campaigns" / "campaign-sensitivity-20261028.yaml", environ=env)
+    plan = C.build_plan(b)
+    assert [e.trace for e in C.resolve_traces(b)] == ["Simul_spike", "Real_conv"] and len(plan) == 20
+    rules = {i.arm: C.AR.describe(C.arm_def(b, i.arm).registry_rules) for i in plan}
+    assert rules["sens-base"] == [] and rules["sens-wp-abs1"] == ["*.trs.w_p =1", "*.trs.w_d =1"]
+    assert rules["sens-tau-m20"] == ["tau_band x0.8 (tau_crit, tau_high; tau_low unchanged)"]
+    assert {r[0] for k, r in rules.items() if k not in ("sens-base", "sens-wp-abs1", "sens-tau-m20", "sens-tau-p20")} == {
+        f"*.trs.{p} x{f}" for p in ("theta_m", "lambda_wait", "w_p") for f in ("0.8", "1.2")}
+    assert all(len(r) <= 1 for k, r in rules.items() if k != "sens-wp-abs1")   # one parameter per arm
+    assert all(C.arm_def(b, i.arm).controller_env["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for i in plan)
+    for c in (a, b):
+        assert any("registry_id is not filled in" in p for p in C.AR.expect_spec_problems(c["registry_expect"]))
+        assert {"*.trs.numerator", "*.trs.theta_window_ms"} <= set(c["registry_expect"]["present"])
+
+
+@pytest.mark.parametrize("kw, why", [
+    ({"held": False}, "not confirmed held"),
+    ({"theta": 771.0}, "signal_log theta_m [771.0] != applied 616.8"),
+])
+def test_perturbed_arm_invalid_when_the_perturbation_did_not_hold_or_the_controller_used_another_theta(tmp_path, kw, why):
+    k = "Alternating_s1/sens-theta-m20"
+    deps = RegDeps(**kw)
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20",), "extra": SENS})
+    camp.run()
+    assert deps.runs() == [k, k]                                 # invalid -> one retry -> failed marker
+    fm = json.loads(C.failed_marker_path(camp.plan[0]).read_text())
+    assert any(why in x for x in fm["validity"]["invalid"])
+
+
+def test_unexpected_error_in_registry_apply_fails_the_item_not_the_campaign(tmp_path):
+    k = "Alternating_s1/sens-theta-m20"
+    deps = RegDeps(reg_fail={k}, reg_exc=TimeoutError("kubectl timed out"))
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20", "tre"), "extra": SENS})
+    assert camp.run() == 0
+    assert deps.seq(k)[:3] == ["reg_apply", "reg_restore", "reset!"] and "Alternating_s1/tre" in deps.runs()

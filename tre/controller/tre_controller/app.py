@@ -484,6 +484,9 @@ def create_controller_dependencies(
         # TRE_SAFESCALE_SCOPE (2026-10-26): all | receiverless_shrink | off.
         "safescale_scope": str(getattr(cfg, "safescale_scope", "all")),
         "disable_slow_loop": bool(getattr(cfg, "ablation_disable_slow_loop", False)),
+        # Signal ablation (2026-10-28): TRE_SIGNAL_SOURCE (zm = TSS) and TRE_DISABLE_ETA_GATE.
+        "signal_source": str(getattr(cfg, "signal_source", "zm")),
+        "disable_eta_gate": bool(getattr(cfg, "disable_eta_gate", False)),
     }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)

@@ -1,0 +1,160 @@
+# Parameter sensitivity, v1 10-25 shape (docs/v2-ablation-sensitivity-gap-20261028.md §1.2, §3, §8). NOT RUN YET.
+# 2 traces (Simul_spike, Real_conv; 720 s set, fixed replay) x 10 arms x seed 1 = 20 runs, ~22 min each (one extra
+# SM + controller restart per perturbed arm; ~7.3 h + reports). No noise-floor repeats (user 10-28, §8.6).
+# Arms: the TSS base (the recalibrated registry as is) and one parameter changed at a time, every model by the same
+# factor, nothing refitted (v1 rule): theta_m, lambda_wait, w_p x0.8 / x1.2; tau x0.8 / x1.2 = tau_crit and tau_high
+# scaled together, tau_low (1.0) unchanged (v1 TAU rule; refused unless 0 < tau_crit < tau_low < tau_high);
+# WP-ABS1 = w_p 1.0 on every model (v1 D60: prefill and decode tokens weigh the same; w_d is set to 1.0 too, so
+# the arm keeps v1's meaning whatever the recalibrated w_d is). The factors apply to the canonical live values at the start of each arm.
+# SafeScale scope receiverless_shrink on every arm (user 10-28, §8.1).
+#
+# How a perturbed arm runs (tre/eval/runner/arm_registry.py): right before the arm the runner writes the values
+# through deploy/scripts/release/params_set.py --apply --restart --backup-dir <results_root>/_registry/backups
+# (SM, then controller; §8.8), checks the live ConfigMap and params_set --status, runs the pre-checks again, and
+# after the arm writes the original values back the same way. The original values are kept in the annotation
+# tre.dev/arm-registry-restore of the registry ConfigMap, so reset_canonical.sh (every reset, every pre-check after
+# a crash) restores them too. Applied values: campaign_manifest.json "registry_params" and <results_root>/_registry/.
+#
+# PREREQUISITES - the campaign refuses to start until all hold:
+#   1. The RECALIBRATED registry is live: TSS numerator = vLLM per-step token counter, signal window 20 s, EMA kept
+#      (feat/tss-counter-20261028); theta / lambda / tau / w_p and c/b published atomically with params_set.py.
+#      The perturbations are relative to THAT calibration (not comparable in absolute terms with v1, §2).
+#   2. Images, this runner and the client at shas in main and pushed (AGENTS.md rule 6).
+#   3. registry_expect.registry_id below = `python3 tre/eval/runner/arm_registry.py id` on the live ConfigMap after
+#      step 1. Unfilled -> the run refuses; a different live registry -> hard pre-check failure.
+#   `--dry-run --probe` prints every arm's concrete values against the live registry (and refuses a tau band that
+#   would cross tau_low).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-sensitivity-20261028.yaml --dry-run --probe
+#   (marker: validation <start> <end> round=campaign-sensitivity-20261028)
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-sensitivity-20261028.yaml > /data/nfs_shared_data/xxy/campaign-sensitivity-20261028.out 2>&1 &
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/<arm>      # after run 1, then every 50 min
+#   python3 tre/eval/v1_summary.py <results_root> --out <results_root>/v1_summary    # v1-format tables
+# NOTE: results_root and the absolute paths below are site-specific.
+name: campaign-sensitivity-20261028
+round: campaign-sensitivity-20261028
+results_root: /data/nfs_shared_data/xxy/campaign-sensitivity-20261028
+trace_root: ${CAMPAIGN_TRACE_ROOT}
+loadgen_config_root: ${CAMPAIGN_CONFIG_ROOT}
+seed: 1
+arms: [sens-base, sens-theta-m20, sens-theta-p20, sens-lambda-m20, sens-lambda-p20, sens-wp-m20, sens-wp-p20, sens-tau-m20, sens-tau-p20, sens-wp-abs1]
+order: williams
+max_attempts: 2
+gap_s: 0
+# trace (720 s) + ~280 s runner overhead + ~120 s for the two params_set restarts (SM Recreate + controller) of a
+# perturbed arm; report ~150 s
+eta: {overhead_s: 400, report_s: 150}
+
+registry_expect:
+  registry_id: null                 # FILL after prerequisite 1 (arm_registry.py id); null = the run refuses to start
+  present:
+    # recalibration stamps (feat/tss-counter-20261028, field names to VERIFY after merging tss-counter):
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+
+env:
+  CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
+  CAMPAIGN_CONFIG_ROOT: "${CAMPAIGN_CONFIG_ROOT:-${TRE_REPO}/loadgen_v1/configs/traces_v2}"
+  CAMPAIGN_TIGHT_POOL: "${CAMPAIGN_TIGHT_POOL:-Tight_pool}"
+  CAMPAIGN_DECISION_POINTS: "${CAMPAIGN_DECISION_POINTS:-${TRE_REPO}/eval/configs/t7-decision-points.yaml}"
+  RELEASE_TRE: ${TRE_REPO}          # one tree: scripts, params_set, runner and client all come from the tree the runner runs from
+  TRE_DIR: ${RELEASE_TRE}
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  sens-base:
+    base: tre
+    label: TSS-base
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  sens-theta-m20:
+    base: tre
+    label: THETA-x0.8
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.theta_m": x0.8}
+  sens-theta-p20:
+    base: tre
+    label: THETA-x1.2
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.theta_m": x1.2}
+  sens-lambda-m20:
+    base: tre
+    label: LAMBDA-x0.8
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.lambda_wait": x0.8}
+  sens-lambda-p20:
+    base: tre
+    label: LAMBDA-x1.2
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.lambda_wait": x1.2}
+  sens-wp-m20:
+    base: tre
+    label: WP-x0.8
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.w_p": x0.8}
+  sens-wp-p20:
+    base: tre
+    label: WP-x1.2
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.w_p": x1.2}
+  sens-tau-m20:
+    base: tre
+    label: TAU-x0.8
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_transforms: {tau_band: 0.8}   # tau_crit, tau_high x 0.8; tau_low unchanged
+  sens-tau-p20:
+    base: tre
+    label: TAU-x1.2
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_transforms: {tau_band: 1.2}   # tau_crit, tau_high x 1.2; tau_low unchanged
+  sens-wp-abs1:
+    base: tre
+    label: WP-ABS1
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+    registry_params: {"*.trs.w_p": 1.0, "*.trs.w_d": 1.0}   # w_p = w_d = 1 (v1 D60): prefill and decode tokens weigh the same
+
+preserve:                           # unused (TRE arms only); kept so the file validates like the other campaigns
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  decision_points: ${CAMPAIGN_DECISION_POINTS}
+  ref: sens-base
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Simul_spike
+  - trace: Real_conv
