@@ -591,6 +591,84 @@ def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):
                                                      "TRE_SIGNAL_SOURCE=queue_len"}
 
 
+class RegDeps(FakeDeps):
+    """FakeDeps + the registry hooks of a sensitivity arm; ``reg_fail`` = keys whose first apply fails,
+    ``abort`` = keys whose run raises (Ctrl-C / crash inside the arm)."""
+
+    def __init__(self, reg_fail=(), abort=(), **kw):
+        super().__init__(**kw)
+        self.reg_fail, self.abort = set(reg_fail), set(abort)
+
+    def registry_apply(self, item, attempt):
+        self.calls.append(("reg_apply", item.key, attempt))
+        if item.key in self.reg_fail:
+            self.reg_fail.discard(item.key)
+            raise C.AR.RegistryError("params_set --apply --restart rc=1: REJECTED")
+        return {"set": {"m7.trs.theta_m": 616.8}, "restore": {"m7.trs.theta_m": 771.0}, "applied": True}
+
+    def registry_restore(self, item):
+        self.calls.append(("reg_restore", item.key))
+        return {"restored": {"m7.trs.theta_m": 771.0}}
+
+    def run_arm(self, item, env, attempt):
+        if item.key in self.abort:
+            self.calls.append(("run", item.key, attempt, None, None))
+            raise KeyboardInterrupt
+        return super().run_arm(item, env, attempt)
+
+    def seq(self, key):
+        return [c[0] if c[0] != "reset" else f"reset{'!' if c[1] else ''}" for c in self.calls
+                if (len(c) > 1 and c[1] == key) or c[0] == "reset"]
+
+
+SENS = {"arm_defs": {"sens-theta-m20": {"base": "tre", "registry_params": {"*.trs.theta_m": "x0.8"},
+                                        "controller_env": {"TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}}}
+
+
+def test_sensitivity_arm_registry_restored_after_success_failure_and_abort(tmp_path):
+    """The registry params are applied right before the arm and restored right after it - before the
+    post-arm reset - whether the arm succeeded, the apply failed (attempt invalid, retried after a full
+    reset) or the arm was aborted; an arm without registry params never touches the registry."""
+    k = "Alternating_s1/sens-theta-m20"
+    deps = RegDeps(reg_fail={k})
+    camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20", "tre"), "extra": SENS})
+    assert camp.run() == 0
+    assert deps.seq(k)[:7] == ["reg_apply", "reg_restore", "reset!", "reg_apply", "run", "reg_restore", "reset"]
+    assert not [c for c in deps.calls if c[0].startswith("reg") and c[1].endswith("/tre")]
+    item = next(i for i in camp.plan if i.arm == "sens-theta-m20")
+    man = json.loads((Path(item.arm_dir) / "campaign_manifest.json").read_text())
+    assert man["registry_params"]["set"] == {"m7.trs.theta_m": 616.8} and man["registry_rules"] == ["*.trs.theta_m x0.8"]
+    assert man["attempt"] == 2
+    # a failed run (rc) and an abort: restored all the same
+    for script, abort in (({k: ["rc", "rc"]}, set()), ({}, {k})):
+        t = tmp_path / ("rc" if script else "abort")
+        t.mkdir()
+        deps = RegDeps(script=script, abort=abort)
+        camp = campaign(t, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20",), "extra": SENS})
+        if abort:
+            with pytest.raises(KeyboardInterrupt):
+                camp.run()
+            assert deps.seq(k) == ["reg_apply", "run", "reg_restore"]
+        else:
+            camp.run()
+            s = deps.seq(k)
+            assert s.count("reg_apply") == s.count("reg_restore") == 2
+            assert all(s[i + 1] == "reg_restore" for i, x in enumerate(s) if x == "run")
+
+
+def test_registry_params_refused_outside_tre_and_unfilled_registry_expect_refuses_the_run(tmp_path):
+    c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {
+        "x": {"base": "apa", "registry_params": {"*.trs.w_p": 1.0}}}}))
+    with pytest.raises(C.CampaignError, match="only supported for base tre"):
+        C.build_plan(c)
+    t = tmp_path / "exp"
+    t.mkdir()
+    deps = RegDeps()
+    camp = campaign(t, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20",),
+                                  "extra": {**SENS, "registry_expect": {"registry_id": None}}})
+    assert camp.run() == 2 and deps.runs() == []
+
+
 def test_ablation_safescale_campaign_plan(tmp_path):
     """The shipped campaign: Alternating seed2 then seed1, both arms set the switch explicitly,
     seed2 starts with the ablation arm, seed1 with tre (williams over two arms)."""
