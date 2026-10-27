@@ -29,6 +29,7 @@ from tre_common import rediskeys
 from tre_common.gpu_placement import (
     PlacementPolicy,
     choose_placement,
+    free_blocks,
     placement_policy_from_registry,
 )
 from tre_sm.allocator.slots import (
@@ -4588,6 +4589,9 @@ class ServiceManagerV2:
             wake_pick=lambda feasible, planning: _wake_pick(feasible, planning, topology, self._placement),
             shrink_order=shrink_order,
             veto=veto,
+            reserve_violation=lambda binding, planning: _reserve_violation(
+                binding, planning, topology, self._placement
+            ),
         )
         for choice in run.selection.sleeps:
             check = choice.floor_check
@@ -7430,6 +7434,32 @@ def _wake_pick(feasible, planned, topology, policy: PlacementPolicy | None = Non
         if choice is not None:
             return scorable[choice.index]
     return min(feasible, key=lambda item: _natural_key(item.serve_id))
+
+
+def _reserve_violation(binding: Binding, planned, topology, policy: PlacementPolicy | None) -> bool:
+    """Waking ``binding`` on ``planned`` breaks a TP pair the reserve keeps
+    (registry ``placement.reserve_tp_pairs``): the reserve shortfall
+    ``max(0, reserve - free max-order blocks)`` - the ``violation`` term of the
+    placement score - grows. A plan's relay item uses its donors before such a
+    free pick (2026-10-27). A pick that breaks no pair (none is free, or it
+    fills the half-used one) is not one."""
+    if policy is None or not policy.max_order:
+        return False
+    planned = list(planned)
+    reserve = policy.for_awake(awake_model_counts(planned)).effective_reserve()
+    if reserve <= 0:
+        return False
+    nodes = node_gpu_counts(topology)
+    occupied = set(awake_gpus(planned))
+    try:
+        before = len(free_blocks(nodes, occupied, 1 << int(policy.max_order)))
+        after = len(free_blocks(
+            nodes, occupied | {(binding.slot.node, int(gpu)) for gpu in binding.slot.gpu_ids},
+            1 << int(policy.max_order),
+        ))
+    except ValueError:
+        return False
+    return max(0, reserve - after) > max(0, reserve - before)
 
 
 #: Replica floor (2026-09-29): (model, binding id) pairs a floor check counts as

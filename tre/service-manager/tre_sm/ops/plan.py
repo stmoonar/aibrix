@@ -17,19 +17,27 @@ Rules:
    (``wake_in_progress``); the item's pods are checked against the model's
    replica floor ONCE and a violation refuses the whole item (named pods are
    never clamped). ``at_most``: hidden replicas first, then the shrink order,
-   clamped at the floor (``clamped_by_floor``);
+   clamped at the floor (``clamped_by_floor``). Sleep items are cumulative:
+   the shrink order of an item sees the earlier items' members asleep, so its
+   merge gain completes the pairs they started (as serial ``/target`` calls);
 2. the planning view P = the books with S counted asleep (and S's GPU leases
    ignored by the wake blocker); R = the books with S still awake;
-3. wake items in request order, ``need = at_least - awake`` (<= 0: a no-op,
-   donors untouched), at most the model's cap. Candidates are sleeping
-   bindings whose wake the account allows on R (free GPUs: **wave 1**) or only
-   on P with EVERY GPU held by S members (**wave 2**, ``depends_on`` = those
-   members; a TP=2 binding over one free GPU and one plan sleep is skipped).
-   The caller's hints first, else the placement pick on P; ``veto`` is asked
-   for the pick about to be taken (wave 1: the wake gate; wave 2: the third
-   resident), a vetoed pick is replaced by the next best one. Still short and
-   ``donors`` given: :func:`select_transfer_pairs` per donor on P (free GPUs
-   are used before any donor); its donors join S, its receivers wave 2.
+3. wake items widest model first (stable by tp size, results keep the
+   request ``index``), ``need = at_least - awake`` (<= 0: a no-op, donors
+   untouched), at most the model's cap. Candidates are sleeping bindings whose
+   wake the account allows on R (free GPUs: **wave 1**) or only on P with at
+   least one GPU held by S members (**wave 2**, ``depends_on`` = those
+   members; a TP=2 binding over one free GPU and one plan sleep is wave 2 too:
+   the free GPU is marked used at once, so no later item takes it, and its
+   lease is taken when wave 2 is prepared - the whole plan holds the writer
+   lock, no other writer runs between the waves). The caller's hints first,
+   else the placement pick on P; ``veto`` is asked for the pick about to be
+   taken (wave 1: the wake gate; wave 2: the third resident on every GPU), a
+   vetoed pick is replaced by the next best one. Still short and ``donors``
+   given: :func:`select_transfer_pairs` per donor on P; its donors join S, its
+   receivers wave 2. Free GPUs are used before any donor, except a free pick
+   that would break a reserved TP pair (``reserve_violation``): such picks are
+   deferred until the donors are used, then taken if still short.
    Named wakes: each feasible as above, else refused;
 4. every pick updates R and P (GPU use and cap across items).
 """
@@ -173,6 +181,7 @@ WakeBlocker = Callable[[Binding, list[Binding], frozenset[str]], object | None]
 Veto = Callable[[Binding, int, frozenset[str]], object | None]
 WakePickFn = Callable[[list[Binding], list[Binding]], Binding]
 ShrinkOrder = Callable[[list[Binding], list[Binding], list[Binding]], list[Binding]]
+ReserveViolation = Callable[[Binding, list[Binding]], bool]
 
 
 def select_plan(
@@ -191,6 +200,7 @@ def select_plan(
     wake_pick: WakePickFn | None = None,
     shrink_order: ShrinkOrder | None = None,
     veto: Veto | None = None,
+    reserve_violation: ReserveViolation | None = None,
 ) -> PlanSelection:
     """Select the sleep set and the wake picks of one plan (see the module doc).
 
@@ -206,7 +216,9 @@ def select_plan(
     the placement pick. ``shrink_order(serving, bindings, already_released)``:
     the release order of an ``at_most`` shrink. ``veto(binding, wave,
     sleeping_ids)``: why the pick about to be taken must not be (None = take it);
-    ``sleeping_ids`` = the S members it may share GPUs with."""
+    ``sleeping_ids`` = the S members it may share GPUs with.
+    ``reserve_violation(binding, planning)``: waking ``binding`` on ``planning``
+    breaks a reserved TP pair (placement score violation > 0; None = never)."""
     floors = dict(floors or {})
     caps = dict(caps or {})
     busy_ids = frozenset(str(item) for item in busy)
@@ -216,10 +228,15 @@ def select_plan(
     books = {binding.serve_id: binding for binding in bindings}
     selection = PlanSelection()
 
+    # The view the shrink order sees: earlier sleep items' members asleep.
+    asleep_view = dict(books)
     for index, item in enumerate(sleeps):
-        selection.sleeps.append(
-            _select_sleep(index, item, books, floors.get(item.model), journaled, can_sleep, shrink_order)
+        choice = _select_sleep(
+            index, item, books, asleep_view, floors.get(item.model), journaled, can_sleep, shrink_order
         )
+        selection.sleeps.append(choice)
+        for member in choice.members:
+            asleep_view[member.serve_id] = replace(member, awake=False, hidden=False)
     s_ids = {member.binding_id for choice in selection.sleeps for member in choice.members}
     # R: the books plus every wake picked so far; P: R with S asleep.
     real = dict(books)
@@ -227,7 +244,14 @@ def select_plan(
         serve_id: replace(binding, awake=False, hidden=False) if binding.binding_id in s_ids else binding
         for serve_id, binding in books.items()
     }
-    for index, item in enumerate(wakes):
+    widths: dict[str, int] = {}
+    for binding in books.values():
+        widths[binding.model] = max(widths.get(binding.model, 1), len(binding.slot.gpu_ids))
+    # Widest model first: a TP=2 item takes a free pair before a TP=1 item can
+    # split it (stable: request order among equal widths).
+    order = sorted(range(len(wakes)), key=lambda i: -widths.get(wakes[i].model, 1))
+    for index in order:
+        item = wakes[index]
         choice = WakeChoice(index=index, item=item)
         selection.wakes.append(choice)
         awake = [b for b in planning.values() if b.model == item.model and b.awake]
@@ -247,10 +271,11 @@ def select_plan(
             if wake_blocker(binding, list(planning.values()), frozenset(s_ids)) is not None:
                 return None, blocked
             deps = _sleepers_on(binding, books, s_ids)
-            covered = {gpu for dep in deps for gpu in dep.slot.gpu_ids} & set(binding.slot.gpu_ids)
-            if not deps or covered != set(binding.slot.gpu_ids):
+            if not deps:
                 choice.skipped[SKIP_UNCOVERED] = choice.skipped.get(SKIP_UNCOVERED, 0) + 1
                 return None, blocked
+            # A GPU of the binding not held by S is free on P (the blocker
+            # passed): taken now in R, leased at the wave-2 prepare.
             return 2, tuple(dep.binding_id for dep in deps)
 
         if item.pods is not None:
@@ -285,39 +310,54 @@ def select_plan(
         tried: set[str] = set()
         avoided: set[str] = set()
         blockers: dict[str, object] = {}
-        while need > 0 and budget > 0:
-            feasible: dict[str, tuple[int, tuple[str, ...]]] = {}
-            blockers = {}
-            for binding in sorted(planning.values(), key=lambda b: natural_key(b.serve_id)):
-                if binding.model != item.model or binding.awake or binding.serve_id in tried:
-                    continue
-                if any(f"{binding.slot.node}/{gpu}" in avoid for gpu in binding.slot.gpu_ids):
-                    avoided.add(binding.binding_id)
-                    continue
-                wave, extra = classify(binding)
-                if wave is None:
-                    blockers[binding.serve_id] = extra
-                else:
+
+        def fill(keep_reserve: bool) -> bool:
+            """Wake candidates until the need is met; ``keep_reserve``: leave out
+            free (wave-1, unhinted) picks that break a reserved TP pair. True =
+            such a pick was left out."""
+            nonlocal need, budget, blockers
+            deferred = False
+            while need > 0 and budget > 0:
+                feasible: dict[str, tuple[int, tuple[str, ...]]] = {}
+                blockers = {}
+                for binding in sorted(planning.values(), key=lambda b: natural_key(b.serve_id)):
+                    if binding.model != item.model or binding.awake or binding.serve_id in tried:
+                        continue
+                    if any(f"{binding.slot.node}/{gpu}" in avoid for gpu in binding.slot.gpu_ids):
+                        avoided.add(binding.binding_id)
+                        continue
+                    wave, extra = classify(binding)
+                    if wave is None:
+                        blockers[binding.serve_id] = extra
+                        continue
+                    if (
+                        keep_reserve and wave == 1 and binding.serve_id not in hints
+                        and reserve_violation(binding, list(planning.values()))
+                    ):
+                        deferred = True
+                        continue
                     feasible[binding.serve_id] = (wave, extra)
-            if not feasible:
-                break
-            candidates = [planning[serve_id] for serve_id in feasible]
-            preferred = [binding for binding in candidates if binding.serve_id in hints]
-            binding = pick(preferred or candidates, list(planning.values()))
-            tried.add(binding.serve_id)
-            wave, deps = feasible[binding.serve_id]
-            refused = veto(binding, wave, frozenset(deps)) if veto is not None else None
-            if refused is not None:
-                choice.refusals.append(refused)
-                choice.substituted.append((binding.binding_id, refused))
-                continue
-            hinted = binding.serve_id in hints
-            source = SOURCE_HINT if hinted else (SOURCE_FREE if wave == 1 else SOURCE_PLAN_SLEEP)
-            take(binding, WakePick(binding, wave, deps, source, hinted))
-            need -= 1
-            budget -= 1
-        if avoided:
-            choice.skipped[SKIP_AVOIDED] = len(avoided)
+                if not feasible:
+                    break
+                candidates = [planning[serve_id] for serve_id in feasible]
+                preferred = [binding for binding in candidates if binding.serve_id in hints]
+                binding = pick(preferred or candidates, list(planning.values()))
+                tried.add(binding.serve_id)
+                wave, deps = feasible[binding.serve_id]
+                refused = veto(binding, wave, frozenset(deps)) if veto is not None else None
+                if refused is not None:
+                    choice.refusals.append(refused)
+                    choice.substituted.append((binding.binding_id, refused))
+                    continue
+                hinted = binding.serve_id in hints
+                source = SOURCE_HINT if hinted else (SOURCE_FREE if wave == 1 else SOURCE_PLAN_SLEEP)
+                take(binding, WakePick(binding, wave, deps, source, hinted))
+                need -= 1
+                budget -= 1
+            return deferred
+
+        # A relay keeps the TP pair reserve: its donors before a pair-breaking free pick.
+        deferred = fill(keep_reserve=bool(item.donors) and reserve_violation is not None)
         for donor in item.donors:
             if need <= 0 or budget <= 0:
                 break
@@ -351,6 +391,10 @@ def select_plan(
                 take(pair.receiver, WakePick(pair.receiver, 2, pair.donor_ids, SOURCE_DONOR, donor_ids=pair.donor_ids))
                 need -= 1
                 budget -= 1
+        if deferred:
+            fill(keep_reserve=False)
+        if avoided:
+            choice.skipped[SKIP_AVOIDED] = len(avoided)
         if need > 0:
             choice.unfilled = need
             if budget <= 0:
@@ -361,6 +405,7 @@ def select_plan(
                 choice.refusals.append(
                     Refusal(reason="no_binding", detail=f"no sleeping binding of {item.model} left to wake")
                 )
+    selection.wakes.sort(key=lambda choice: choice.index)
     return selection
 
 
@@ -368,6 +413,7 @@ def _select_sleep(
     index: int,
     item: SleepItem,
     books: dict[str, Binding],
+    asleep_view: dict[str, Binding],
     floor_entry,
     journaled: frozenset[str],
     can_sleep: frozenset[str] | None,
@@ -419,7 +465,7 @@ def _select_sleep(
     hidden = [b for b in awake if b.hidden]
     serving = [b for b in awake if not b.hidden]
     if shrink_order is not None:
-        serving = shrink_order(serving, list(books.values()), hidden[:shrink])
+        serving = shrink_order(serving, list(asleep_view.values()), hidden[:shrink])
     candidates = [b for b in hidden + serving if can_sleep is None or b.serve_id in can_sleep]
     members = candidates[:shrink]
     if floor is not None and members:

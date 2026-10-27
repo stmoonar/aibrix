@@ -17,7 +17,7 @@ import pytest
 from tre_common.registry import K8S_CALLS_PLAN_SELECT, K8S_CALLS_REFRESH, K8S_CALLS_SLEEP, K8S_CALLS_WAKE
 
 from test_k8s_call_budget_20261006 import _count_sequential_k8s_calls
-from test_wholelock_20261002 import Unanswered, World, _run
+from test_wholelock_20261002 import DEFAULT_PODS, Unanswered, World, _run
 
 #: d-0 holds GPU 0 (r-0 sleeps under it); GPU 1 is free (x-1 sleeps there).
 MIXED = (
@@ -152,7 +152,9 @@ def test_floor_refuses_named_sleeps_with_nothing_hidden_and_clamps_at_most():
 
 
 def test_a_relay_takes_donors_only_for_what_free_gpus_cannot_fill():
-    world = World()  # r-2 sits on the free GPU 2; r-0 / r-1 under d-0 / d-1
+    # r-2 sits on the free GPU 2 (x-3 awake on GPU 3: no free pair to keep);
+    # r-0 / r-1 under d-0 / d-1.
+    world = World(pods=DEFAULT_PODS + (("x-3", "x", (3,), "awake"),))
 
     body = post(world, {"wakes": [{"model": "r", "at_least": 2, "donors": [{"model": "d", "max": 2}]}]}).json()
 
@@ -161,6 +163,17 @@ def test_a_relay_takes_donors_only_for_what_free_gpus_cannot_fill():
     assert sorted((w["source"], w["wave"]) for w in item["woke"]) == [("donor", 2), ("free", 1)]
     assert len(item["donors_slept"]) == 1 and item["donors_slept"][0]["status"] == "slept"
     assert [world.awake("d-0"), world.awake("d-1")].count(True) == 1
+    assert world.violations == [] and world.journals() == ({}, {})
+
+
+def test_a_relay_keeps_the_last_free_tp_pair():
+    world = World()  # GPUs 2-3 are the only free pair (registry reserve_tp_pairs)
+
+    body = post(world, {"wakes": [{"model": "r", "at_least": 2, "donors": [{"model": "d", "max": 2}]}]}).json()
+
+    [item] = body["wakes"]
+    assert sorted(w["serve_id"] for w in item["woke"]) == ["r-0", "r-1"]
+    assert {w["source"] for w in item["woke"]} == {"donor"} and not world.awake("r-2")
     assert world.violations == [] and world.journals() == ({}, {})
 
 
