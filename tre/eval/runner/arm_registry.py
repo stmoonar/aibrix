@@ -56,6 +56,9 @@ ANNOTATION = "tre.dev/arm-registry-restore"
 TRANSFORMS = ("tau_band",)
 _PATH = re.compile(r"(?P<model>\*|[A-Za-z0-9][A-Za-z0-9_.-]*?)\.(?P<path>(trs|slo)\.\w+|alt_thresholds\.\w+\.\w+|"
                    r"min_replicas|max_awake_replicas)")
+# registry_expect.present may also name the alt basis stamps (alt_thresholds.<signal>.basis.{definition,window_ms},
+# tre_common.alt_signals.alt_basis_errors); an arm cannot edit them (registry_params keeps _PATH).
+_PRESENT_PATH = re.compile(_PATH.pattern[:-1] + r"|alt_thresholds\.\w+\.basis\.(definition|window_ms))")
 _FACTOR = re.compile(r"x(?P<f>[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)")
 _ROUND = 6
 
@@ -249,7 +252,7 @@ def expect_spec_problems(expect: Any) -> list[str]:
     elif not re.fullmatch(r"[0-9a-f]{16}", str(rid)):
         out.append(f"registry_expect.registry_id {rid!r} is not 16 hex digits (arm_registry.py id)")
     pres = expect.get("present") or []
-    if not isinstance(pres, list) or any(not _PATH.fullmatch(str(p)) for p in pres):
+    if not isinstance(pres, list) or any(not _PRESENT_PATH.fullmatch(str(p)) for p in pres):
         out.append("registry_expect.present must be a list of <model|*>.<params_set path>")
     return out
 
@@ -266,7 +269,7 @@ def expect_problems(expect: Optional[dict], registry_yaml: str) -> list[str]:
     data = _yaml().safe_load(registry_yaml) or {}
     models = _models(data)
     for p in expect.get("present") or []:
-        m = _PATH.fullmatch(str(p))
+        m = _PRESENT_PATH.fullmatch(str(p))
         if not m:
             continue
         for name in (sorted(models) if m.group("model") == "*" else [m.group("model")]):

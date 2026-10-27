@@ -582,7 +582,7 @@ def test_controller_env_keys_are_one_list_in_campaign_and_both_shell_scripts():
         from tre_controller.config import SIGNAL_SOURCES as CTL
     except Exception:  # noqa: BLE001  controller deps not importable here
         pytest.skip("tre_controller not importable")
-    assert set(CTL) <= set(C.SIGNAL_SOURCES)
+    assert set(CTL) == set(C.SIGNAL_SOURCES)
 
 
 def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):
@@ -772,8 +772,11 @@ def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
     assert all(len(r) <= 1 for k, r in rules.items() if k != "sens-wp-abs1")   # one parameter per arm
     assert all(C.arm_def(b, i.arm).controller_env["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for i in plan)
     for c in (a, b):
-        assert any("registry_id is not filled in" in p for p in C.AR.expect_spec_problems(c["registry_expect"]))
+        probs = C.AR.expect_spec_problems(c["registry_expect"])
+        assert len(probs) == 1 and "registry_id is not filled in" in probs[0], probs   # every present path parses
         assert {"*.trs.numerator", "*.trs.theta_window_ms"} <= set(c["registry_expect"]["present"])
+    assert {f"*.alt_thresholds.{s}.basis.{f}" for s in ("queue_len", "ttft_mean", "kv_usage")
+            for f in ("definition", "window_ms")} <= set(a["registry_expect"]["present"])
 
 
 @pytest.mark.parametrize("kw, why", [

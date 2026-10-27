@@ -48,7 +48,7 @@ eta: {overhead_s: 400, report_s: 150}
 registry_expect:
   registry_id: null                 # FILL after prerequisite 1 (arm_registry.py id); null = the run refuses to start
   present:
-    # recalibration stamps (feat/tss-counter-20261028, field names to VERIFY after merging tss-counter):
+    # recalibration stamps (feat/tss-counter-20261028; names verified on release/20261028: tre_common.tss.theta_basis_errors):
     - "*.trs.numerator"
     - "*.trs.theta_window_ms"
 

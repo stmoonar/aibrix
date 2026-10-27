@@ -128,7 +128,7 @@ ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE)
 ctl_valid() {   # ctl_valid KEY VALUE
   case "$1" in
     TRE_SAFESCALE_SCOPE) case "$2" in all|receiverless_shrink|off) ;; *) return 1 ;; esac ;;
-    TRE_SIGNAL_SOURCE) case "$2" in zm|queue_len|ttft_mean|kv_usage|latency_p95|decode_tps|prefill_tps|kv_cache) ;; *) return 1 ;; esac ;;
+    TRE_SIGNAL_SOURCE) case "$2" in zm|queue_len|ttft_mean|kv_usage|latency_p95|decode_tps|prefill_tps) ;; *) return 1 ;; esac ;;
     *) [ "$2" = true ] || [ "$2" = false ] ;;
   esac
 }

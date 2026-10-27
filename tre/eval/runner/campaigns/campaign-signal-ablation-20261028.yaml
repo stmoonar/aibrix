@@ -42,7 +42,7 @@ eta: {overhead_s: 280, report_s: 150}
 registry_expect:
   registry_id: null                 # FILL after prerequisites 1-2 (arm_registry.py id); null = the run refuses to start
   present:
-    # recalibration stamps (feat/tss-counter-20261028, field names to VERIFY after merging tss-counter):
+    # recalibration stamps (feat/tss-counter-20261028; names verified on release/20261028: tre_common.tss.theta_basis_errors):
     - "*.trs.numerator"
     - "*.trs.theta_window_ms"
     - "*.alt_thresholds.queue_len.theta"
@@ -54,6 +54,14 @@ registry_expect:
     - "*.alt_thresholds.kv_usage.theta"
     - "*.alt_thresholds.kv_usage.delta_crit"
     - "*.alt_thresholds.kv_usage.delta_high"
+    # alt basis stamps (feat/alt-signals-20261028: tre_common.alt_signals.alt_basis_errors; the controller refuses a
+    # mismatching definition / window_ms at start, this check fails the campaign before any arm):
+    - "*.alt_thresholds.queue_len.basis.definition"
+    - "*.alt_thresholds.queue_len.basis.window_ms"
+    - "*.alt_thresholds.ttft_mean.basis.definition"
+    - "*.alt_thresholds.ttft_mean.basis.window_ms"
+    - "*.alt_thresholds.kv_usage.basis.definition"
+    - "*.alt_thresholds.kv_usage.basis.window_ms"
 
 env:
   CAMPAIGN_TRACE_ROOT: "${CAMPAIGN_TRACE_ROOT:-/data/nfs_shared_data/xxy/traces-v2-720-20261026}"
