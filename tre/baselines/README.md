@@ -11,7 +11,9 @@ loop, `TRE_BL_TICK_S`) it builds a snapshot (service
 manager `/v2/state`, each awake pod's `/metrics`, the gateway request-event stream
 `tre:v2:bl:req:<model>`, the replay marker `tre:v2:bl:replay_t0`), asks the selected
 policy for a desired replica count per model, clamps it to the registry bounds and sends
-`PUT /v2/models/{m}/target` to the service manager. All timestamps are Redis server time.
+the tick's decisions to the service manager as ONE plan (`POST /v2/plans`: one sleep item
+`at_most` per scale-down, one wake item `at_least` per scale-up, one writer-lock hold), the
+actuation the TRE controller gets. All timestamps are Redis server time.
 
 Rules every arm shares (2026-10-05 decision, `docs/baselines-methodology-20261005.md` of the
 local workspace):
@@ -30,9 +32,11 @@ local workspace):
   `service_manager.sleep.no_drain_paths`): hide, gateway ack, `/sleep mode=abort`,
   sidecar continuation. The shell never drains and never sends `drain_budget_s`;
   aborts/continuations are a reported cost of each arm.
-- **Donor before dependent.** No scale-up is sent while a scale-down call is in flight
-  (action `wait_donor`); the SM answers a scale-down after the sleep is committed and the
-  GPU released.
+- **Donor before dependent, inside the plan.** The SM starts a wake that needs a GPU a
+  sleep of the same plan releases only once that sleep is confirmed; a wake on a free GPU
+  starts at once. One plan at a time: a model whose item is in the plan in flight logs
+  `inflight_skip`; the other models' latest decisions go in the next plan, sent as soon as
+  the one in flight returns (line field `queued`; latest wins, no batching timer).
 - **Execution right is re-checked right before every SM call** (owner lock still ours,
   controller still `observe`); otherwise the call is dropped (`sm_result.error =
   "dropped"`).
@@ -81,12 +85,11 @@ wakeable GPU set of `/v2/state` changed (`retry_evidence` on the line). Only a c
 SM's `retry_after_s` (none: next tick). A failed scale-down or an unanswered call backs off
 (`max(retry_after_s, tick)`, doubling, capped at `TRE_BL_BACKOFF_MAX_S` = 10 s; action
 `backoff`; a refused scale-down is retried at once when the SM state changes). A scale-up
-is sent one replica at a time
-(`awake+1`, `awake+2`, ... each grow-only) and stops at the first 409, because the SM
-refuses a whole multi-replica target when one wake is blocked; granted-then-refused is
-`sm_result.partial_fill` (metric `tre_bl_partial_fills_total`) and is asked again next
-tick. An SM that fills partially itself (200 `unfilled`, or a 409 listing wakes done) is
-counted the same way. Remaining
+is one grow-only wake item for the whole target; the SM fills it best effort. Some woken,
+the rest unplaced is `sm_result.partial_fill` (`reached` = the item's `awake_after`; metric
+`tre_bl_partial_fills_total`) and is asked again next tick. The SM call timeout defaults
+to the registry's `service_manager.api_call_timeout_s` (`TRE_BL_SM_TIMEOUT_S` overrides;
+refused when not above the SM's worst-case plan call). Remaining
 timers and what they guard: the owner-lock TTL (mutual exclusion after a crash), the SM
 call timeout, the SM's `retry_after_s` for refusals whose cause `/v2/state` does not show
 and the backoff cap (liveness), `/livez` stall (k8s probe); the policy windows (TokenScale `window_s`, PreServe

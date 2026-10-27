@@ -1,9 +1,11 @@
-"""Pair selection of the transfer primitive ``POST /v2/transfers`` (2026-10-02).
+"""Donor / receiver pair selection of a relay (2026-10-02; since 2026-10-27 the
+``donors`` of a plan's wake item, :mod:`tre_sm.ops.plan` - ``POST /v2/transfers``
+is gone).
 
-A transfer hands GPUs from a donor model to a receiver model: an awake donor
+A relay hands GPUs from a donor model to a receiver model: an awake donor
 binding is put to sleep and the receiver binding that sleeps on the SAME GPUs is
 woken right after, all in ONE writer-lock hold (design
-``docs/design/20261002-sm-wholelock.md``). This module is the selection step
+``docs/design/20261027-sm-plans.md``). This module is the selection step
 only: a pure function over an in-memory view of the fleet. Everything that
 needs I/O (the account's wake blocker, the fault hook, the resident probe) is
 injected as a callable, so the rules can be tested without a service.
@@ -48,15 +50,6 @@ from tre_sm.allocator.slots import (
     node_gpu_counts,
     slot_block,
 )
-
-#: Status of one pair (``pairs[].status`` of the response).
-TRANSFER_PENDING = "pending"  # selected, not finished yet (never in a response)
-TRANSFER_DONE = "done"
-TRANSFER_DONOR_SLEEP_FAILED = "donor_sleep_failed"
-TRANSFER_RECEIVER_WAKE_FAILED = "receiver_wake_failed"
-#: Short aliases.
-TRANSFER_DONOR_FAILED = TRANSFER_DONOR_SLEEP_FAILED
-TRANSFER_RECEIVER_FAILED = TRANSFER_RECEIVER_WAKE_FAILED
 
 #: Why a receiver binding was not a candidate (``TransferSelection.skipped``).
 SKIP_NO_DONOR = "no_awake_occupant"

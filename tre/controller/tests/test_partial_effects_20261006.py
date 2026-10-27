@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.planner import ScaleAction
 from tre_controller.sm_client import ServiceManagerError
 
 from test_action_queue_review3 import ScriptedSM, _calls
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 FLOOR_REFUSAL = ServiceManagerError(
     "HTTP 409", status=409, body={"error": "floor_violation", "floor": {"model": "7b", "floor": 1}}

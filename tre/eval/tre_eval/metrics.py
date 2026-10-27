@@ -20,7 +20,13 @@ E2E_CENSOR_MS = 149000.0  # streams cut by the 150 s route timeout are recorded 
 ALL = "ALL"
 
 
+#: Baseline decision-log actions that are a decision to scale -> direction (the scaler logs a
+#: decision waiting behind the plan in flight as ``queued_up`` / ``queued_down`` since 2026-10-28).
+BL_DECISION_DIRECTION = {"up": "up", "down": "down", "queued_up": "up", "queued_down": "down"}
+
+
 # ---------------------------------------------------------------- percentiles (score_pilot's)
+
 def pct(xs: Iterable[float | None], p: float) -> float | None:
     """Linear-interpolated percentile, None ignored, rounded to 3 decimals (score_pilot.pct)."""
     v = sorted(x for x in xs if x is not None)
@@ -264,8 +270,12 @@ def decisions(arm: Arm) -> list[dict]:
                 out.append({"ts": ts, "model": m, "dir": 1 if delta > 0 else -1, "source": "tre", "detail": det})
     elif src == "baseline":
         for r in arm.bl_decisions:
-            if r.get("action") in ("up", "down"):
-                out.append({"ts": r["ts_ms"] / 1000.0, "model": r.get("model"), "dir": 1 if r["action"] == "up" else -1,
+            # A policy decision to scale: ``up`` / ``down`` (sent at its tick), or ``queued_up`` /
+            # ``queued_down`` (scaler 2026-10-28: waiting behind the plan in flight; older runs
+            # logged those as up / down with ``queued``).
+            direction = BL_DECISION_DIRECTION.get(r.get("action"))
+            if direction is not None:
+                out.append({"ts": r["ts_ms"] / 1000.0, "model": r.get("model"), "dir": 1 if direction == "up" else -1,
                             "source": "baseline", "detail": {"reason": r.get("reason"), "raw_desired": r.get("raw_desired"),
                                                              "clamped": r.get("clamped"), "awake": r.get("awake")}})
     else:

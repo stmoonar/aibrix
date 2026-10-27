@@ -12,13 +12,13 @@ import asyncio
 
 import pytest
 
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import ClusterView, ScaleAction, build_plan
 from tre_controller.sm_client import ServiceManagerError, _request_json, sm_actor
 from tre_sm.allocator.slots import Binding, Slot
 
 from test_planner_slot_occupancy import TOPOLOGY, _cfg, _cls
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 STRUCTURED = {
@@ -281,10 +281,11 @@ def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
     ``picked``, an "up" last action) and never re-sends the relative call."""
     from tre_controller.sm_client import ServiceManagerClient
 
-    body = dict(STRUCTURED, error="partial", reason="partial", unfilled=1,
-                actions=[{"action": "wake", "serve_id": "8b-2"}],
-                picked=[{"serve_id": "8b-2", "node": "node9", "gpu_ids": [2], "hinted": False}],
-                refusals=[STRUCTURED])
+    # A plan item filled in part: the plan changed something, so HTTP 200.
+    body = {"plan_id": "pl-1", "status": "done", "sleeps": [], "wakes": [{
+        "index": 0, "model": "dsllama-8b", "status": "partial", "unfilled": 1,
+        "woke": [{"serve_id": "8b-2", "node": "node9", "gpu_ids": [2], "wave": 1, "source": "free"}],
+        "refusals": [STRUCTURED]}]}
 
     class Transport:
         calls = 0
@@ -293,7 +294,7 @@ def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
             if method == "GET":
                 return {"models": {"dsllama-8b": {"awake": 1, "bound": 4}}}
             Transport.calls += 1
-            raise ServiceManagerError("HTTP 409", status=409, body=body)
+            return body
 
     queue = ActionQueue(ServiceManagerClient("http://sm", transport=Transport()), now_ms=lambda: 5)
     queue.submit([ScaleAction("dsllama-8b", 2, "critical_sleeping_capacity", "rescue")])
@@ -319,8 +320,10 @@ def test_a_partial_growth_that_woke_nothing_is_no_routable_change():
     (result,) = asyncio.run(queue.drain_once())
     assert result.ok is False and queue.routable_changes() == {} and queue.view_changes() == {}
 
-    body = dict(STRUCTURED, error="partial", reason="partial", unfilled=2, actions=[], picked=[],
-                refusals=[STRUCTURED])
+    # Nothing changed and the item was refused: 409 ``partial`` with the item results.
+    body = {"error": "partial", "plan_id": "pl-2", "status": "partial", "sleeps": [], "wakes": [{
+        "index": 0, "model": "dsllama-8b", "status": "refused", "unfilled": 2, "woke": [],
+        "refusals": [STRUCTURED]}]}
 
     class Transport:
         async def request(self, method, url, *, json=None, timeout_s):

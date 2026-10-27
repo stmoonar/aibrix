@@ -293,6 +293,8 @@ class _Stop(Exception):
 
 
 def test_cold_start_callers_pass_the_created_model(monkeypatch):
+    # The defrag destination start is the only cold start left (a /target
+    # growth never creates since 2026-10-27).
     from types import SimpleNamespace
 
     from tre_sm.allocator.slots import Binding, Migration
@@ -305,10 +307,6 @@ def test_cold_start_callers_pass_the_created_model(monkeypatch):
         raise _Stop()
 
     monkeypatch.setattr(service, "_ensure_create_headroom", spy)
-    with pytest.raises(_Stop):
-        service._create_and_wake_runtime_binding("m1", Slot("node-a", (1,)))
-    assert seen[-1] == (Slot("node-a", (1,)), "m1")
-
     monkeypatch.setattr(service, "_apply_runtime_power_action", lambda *a, **k: None)
     monkeypatch.setattr(service, "_refresh_observed", lambda *a, **k: None)
     service._runtime_ops = SimpleNamespace(

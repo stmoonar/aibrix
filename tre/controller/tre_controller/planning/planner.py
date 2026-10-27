@@ -250,12 +250,9 @@ def relay_hold_reason(summary: Mapping[str, Any]) -> tuple[str, bool]:
     """(reason, fleet) of a relay answered with nothing done, from its transfer
     summary (review 2026-10-06 P2-1). ``fleet``: the answer follows from the fleet
     view the relay was planned from (``floor_violation``, ``clamped_by_floor``, a
-    pair tried and failed, unfilled for ``occupant_*`` / ``receiver_cap`` only, an SM
-    without the endpoint), so only a new SM state version or floor view releases its
+    pair tried and failed, unfilled for ``occupant_*`` / ``receiver_cap`` only), so only a new SM state version or floor view releases its
     hold. Anything else is transient: any newer view releases it."""
     outcome = summary.get("outcome")
-    if outcome == "unsupported":
-        return "unsupported", True
     if outcome == "refused":
         code = summary.get("code")
         return str(code or "refused"), code in FLEET_RELAY_REFUSALS
@@ -301,11 +298,11 @@ class TransferIntent:
     """An immediate donor -> receiver relay expressed as a COUNT (2026-10-02, design
     20261002-controller-transfer). The controller decides the quantity - how many
     replicas, from which model, to which model, in which order; the service-manager
-    (``POST /v2/transfers``) decides the placement - which donor pods, which receiver
+    (a ``POST /v2/plans`` wake item with ``donors``) decides the placement - which donor pods, which receiver
     bindings, which GPUs - and keeps the replica floor and "one awake model per GPU"
     under its writer lock. No pod or GPU is named here.
 
-    ``count`` = donor replicas to hand over (the SM's ``count``); ``pairs`` = receiver
+    ``count`` = donor replicas to hand over (the plan donor's ``max``); ``pairs`` = receiver
     replicas the planner expects from them (equal unless a TP receiver needs several
     single-GPU donors). The SM may complete fewer: the ActionQueue accounts by the
     response's ``done`` / ``taken`` / ``unfilled``, never by ``count``."""
@@ -1622,7 +1619,7 @@ class _SlotOccupancy:
 
     Since 2026-10-02 it only COUNTS relay capacity (:meth:`pairable_count`): which donor
     pods and receiver bindings a relay uses is the service-manager's choice
-    (``POST /v2/transfers``); nothing it counts here is sent to the SM.
+    (a plan wake item with ``donors``); nothing it counts here is sent to the SM.
     """
 
     def __init__(self, cluster_view: ClusterView) -> None:

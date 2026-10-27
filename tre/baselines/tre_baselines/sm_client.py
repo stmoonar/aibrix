@@ -1,43 +1,47 @@
-"""Service-manager client and the per-model asynchronous dispatcher.
+"""Service-manager client and the asynchronous plan dispatcher.
 
-Contract (service manager on main, ``tre_sm/api/v2.py``):
+Contract (service manager, ``tre_sm/api/v2.py``, design ``docs/design/20261027-sm-plans.md``):
 
-* ``PUT /v2/models/{m}/target`` body ``{wake_replicas, at_least}`` (scale-up) or
-  ``{wake_replicas, sleep_path}`` (scale-down). ``at_least`` = grow-only (no-op when the
-  model already has that many awake), so a re-sent scale-up never shrinks a model. A
-  scale-down is an absolute ``wake_replicas`` on the **abort sleep path**: no drain. The SM
-  hides the pod, waits for the gateway ack and sleeps it with ``mode=abort``; requests in
-  flight are cut off and continued by the reissue sidecar (the transparent sleep every arm
-  shares). ``sleep_path`` names a path in the registry's
-  ``service_manager.sleep.no_drain_paths`` (default ``urgent``; the SM on main drains on
-  the other paths, the whole-lock SM never drains); ``drain_budget_s`` is never sent. The
-  handler returns once the sleep is committed (GPU released) or the wake done.
+* ``POST /v2/plans`` body ``{plan_id, sleeps: [...], wakes: [...]}``, ONE writer-lock hold for
+  the whole plan, at most one item per model. A scale-up is a wake item ``{model, at_least}``
+  (grow-only: a no-op when the model already has that many awake, so a re-sent scale-up
+  never shrinks a model; the SM fills it best effort - free GPUs first, then GPUs the plan's
+  own sleeps release, in the same hold). A scale-down is a sleep item ``{model, at_most,
+  sleep_path}`` on the **abort sleep path**: no drain. The SM hides the pod, waits for the
+  gateway ack and sleeps it with ``mode=abort``; requests in flight are cut off and continued
+  by the reissue sidecar (the transparent sleep every arm shares). ``sleep_path`` names a
+  path in the registry's ``service_manager.sleep.no_drain_paths`` (default ``urgent``). The
+  SM clamps an ``at_most`` at the replica floor (``clamped_by_floor``). The handler returns
+  once every sleep is committed (GPU released) and every wake done.
+* Response: ``{plan_id, version, status, sleeps: [item], wakes: [item], phases_ms}``; an item
+  has ``model``, ``status`` (``done | noop | clamped | partial | refused | failed``) and, on
+  a wake item, ``awake_before`` / ``awake_after`` / ``woke`` / ``unfilled`` / ``refusals``,
+  on a sleep item ``taken`` / ``clamped_by_floor``; a refused or failed item carries the
+  structured 409 body of the old single-model endpoint under ``error``. HTTP 200 when
+  anything changed or every item was a no-op / clamp; 409 ``error: partial`` (the full
+  response in the body) when nothing changed and an item was refused or failed; 409
+  ``writer_busy`` / ``routable_unknown`` and 400 before anything was done (no items).
 * ``GET /v2/state`` -> ``{"version", "models": {m: {"awake", "bound"}}, "bindings":
   [{"serve_id" (= pod name), "model", "node", "gpu_ids", "awake", "hidden"}], ...}``.
-* Refusals are HTTP 409 (writer lock busy ``writer_busy``, wake conflict, cap,
-  ``routable_unknown``). Wake conflicts and ``writer_busy`` carry a structured body
-  (``detail, error, reason, node, gpu_ids, scope, binding_id, blocking_binding_id,
-  retry_after_s``); others only ``{"detail": "<text>"}``. :func:`parse_sm_error` reads
-  whichever keys are present, nested under ``detail`` or not, and falls back to the raw
-  text. The whole-lock SM answers some outcomes with 200, not 409: a shrink clamped at the
-  replica floor (``taken``, ``clamped_by_floor``) and a grow-only scale-up that could not
-  place every wake (``unfilled``, ``refusals``); :meth:`SMResult.as_dict` logs those keys.
+* :func:`parse_sm_error` reads a structured 409 body (``detail, error, reason, node, gpu_ids,
+  scope, binding_id, blocking_binding_id, retry_after_s``), nested under ``detail`` or not,
+  and falls back to the raw text. :func:`plan_item_results` turns one plan answer into one
+  :class:`SMResult` per model: an item refused / failed reads like the old endpoint's 409
+  (``code`` 409, located by its ``error``), a partial wake like the old 200 with
+  ``unfilled`` (located by its first refusal), a whole-plan answer without items (409
+  ``writer_busy``, 400, transport error, timeout) is every model's answer.
 
-The dispatcher gives every model one worker thread and at most one SM call in flight;
-the tick never waits for the SM. A scale-up from ``awake`` to ``target`` goes out one
-replica at a time (``awake+1``, ``awake+2``, ... each a grow-only call) and stops at the
-first refusal: the SM refuses a whole target when any wake it needs is blocked
-(``tre_sm/api/v2.py`` ``_plan_target``), so one call for several replicas would leave a GPU
-that is free right now unused while another is still held. The answer reports how far it
-got (``Completed.reached``; ``partial_fill`` = some granted, then refused). This is a
-substrate adaptation for the baseline arms (temporary, until the SM fills partially
-itself). It already accepts an SM that does: a 200 with ``unfilled`` > 0 counts
-``step - unfilled`` as reached and becomes a refusal located by its first ``refusals``
-entry; a 409 (e.g. ``reason="partial"``) that lists ``wake`` actions counts those wakes as
-done. Right before each call the worker asks the dispatcher's
-``guard`` (set by the shell: still the owner-lock holder, controller still in observe);
-when the answer is a reason, the call is dropped (``SMResult.error = "dropped"``,
-``reason`` = why) and never reaches the SM.
+The dispatcher sends ONE plan per tick covering every model's decision, so a baseline gets
+the actuation of the TRE controller (one decision, one plan, one lock hold): the comparison
+is about policy, not actuation. One plan at a time: a model whose item is in the plan in
+flight gets ``inflight_skip`` (its next decision sees the answer, as with one call per model
+before); every other model's decision waits for the next plan, and only the latest tick's
+decisions are kept (latest wins - an older decision of the same model, or of a model that no
+longer wants to scale, is never sent). The next plan goes out as soon as the one in flight
+returns; no batching timer. The tick never waits for the SM. Right before each POST the
+worker asks the dispatcher's ``guard`` (set by the shell: still the owner-lock holder,
+controller still in observe); when the answer is a reason, the plan is dropped
+(``SMResult.error = "dropped"``, ``reason`` = why) and never reaches the SM.
 
 After a scale-up refusal (an SM answer) :class:`RefusalGate` holds the next scale-up of
 that model until the SM state shows a change (no timer when ``/v2/state`` can show the
@@ -52,6 +56,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
@@ -89,10 +94,13 @@ class SMResult:
             "elapsed_s": round(self.elapsed_s, 3),
         }
         if isinstance(self.raw, dict):
-            for key in ("binding_id", "blocking_binding_id", "actions", "at_least", "awake",
-                        "taken", "clamped_by_floor", "unfilled", "refusals"):
+            for key in ("binding_id", "blocking_binding_id", "plan_id", "plan_status", "http_status", "status",
+                        "awake_before", "awake_after", "taken", "clamped_by_floor", "unfilled", "refusals"):
                 if key in self.raw:
                     out[key] = self.raw[key]
+            woke = self.raw.get("woke")
+            if isinstance(woke, list):
+                out["woke"] = [w.get("serve_id") if isinstance(w, dict) else w for w in woke]
         if self.blocking_binding_id is not None:
             out.setdefault("blocking_binding_id", self.blocking_binding_id)
         return out
@@ -155,34 +163,83 @@ def parse_sm_error(code: Optional[int], body: bytes | str | None, elapsed_s: flo
     )
 
 
-def _wakes_done(raw: Any) -> int:
-    """``wake`` actions an SM answer reports as done (0 when it lists none)."""
-    actions = raw.get("actions") if isinstance(raw, dict) else None
-    if not isinstance(actions, list):
-        return 0
-    return sum(1 for a in actions if isinstance(a, dict) and a.get("action") == "wake")
-
-
-def unfilled_refusal(result: SMResult) -> SMResult:
-    """A 200 grow-only answer with ``unfilled`` > 0 (the SM placed only some wakes) as a
-    refusal, located by its first ``refusals`` entry; ``raw`` keeps the whole answer."""
-    refusals = result.raw.get("refusals") if isinstance(result.raw, dict) else None
-    first = refusals[0] if isinstance(refusals, list) and refusals and isinstance(refusals[0], dict) else {}
-    located = parse_sm_error(result.code, json.dumps(first), result.elapsed_s) if first else None
+def located_refusal(result: SMResult, where: Any) -> SMResult:
+    """``result`` as a refusal located by the structured body ``where`` (a plan item's
+    ``error`` or its first ``refusals`` entry); ``raw`` / ``code`` / ``elapsed_s`` kept."""
+    located = parse_sm_error(result.code, json.dumps(where), result.elapsed_s) if isinstance(where, dict) else None
     return SMResult(
-        ok=False, code=result.code, error=(located.error if located else "unfilled"),
-        reason=located.reason if located else "unfilled", node=located.node if located else None,
+        ok=False, code=result.code, error=(located.error if located else result.error or "unfilled"),
+        reason=located.reason if located else result.reason or "unfilled", node=located.node if located else None,
         gpu_ids=located.gpu_ids if located else None, scope=located.scope if located else None,
         retry_after_s=located.retry_after_s if located else None,
-        detail=located.detail if located else None, raw=result.raw, elapsed_s=result.elapsed_s,
+        detail=located.detail if located else result.detail, raw=result.raw, elapsed_s=result.elapsed_s,
         blocking_binding_id=located.blocking_binding_id if located else None,
     )
+
+
+#: Item statuses that are a success for the caller (``clamped``: a shrink the SM stopped at
+#: the replica floor, as the old ``/target`` 200 with ``clamped_by_floor``).
+ITEM_OK = frozenset({"done", "noop", "clamped"})
+
+
+def _plan_items(raw: Any) -> dict[str, dict]:
+    """``model -> item`` of a plan answer (both lists; empty when it has none)."""
+    out: dict[str, dict] = {}
+    if isinstance(raw, dict):
+        for kind in ("sleeps", "wakes"):
+            for item in raw.get(kind) or ():
+                if isinstance(item, dict) and item.get("model") is not None:
+                    out[str(item["model"])] = item
+    return out
+
+
+def _item_result(plan: SMResult, item: dict) -> SMResult:
+    """One plan item as the answer of the old single-model call."""
+    raw = dict(item)
+    whole = plan.raw if isinstance(plan.raw, dict) else {}
+    raw.update(plan_id=whole.get("plan_id"), plan_status=whole.get("status"), http_status=plan.code)
+    error = item.get("error") if isinstance(item.get("error"), dict) else None
+    if error is not None and error.get("binding_id") is not None:
+        raw.setdefault("binding_id", error["binding_id"])
+    status = item.get("status")
+    base = SMResult(ok=True, code=200, raw=raw, elapsed_s=plan.elapsed_s)
+    if status in ITEM_OK:
+        return base
+    if status == "partial":
+        # Some wakes done, the rest unplaced: like the old 200 with ``unfilled``.
+        refusals = item.get("refusals")
+        first = refusals[0] if isinstance(refusals, list) and refusals and isinstance(refusals[0], dict) else None
+        return located_refusal(SMResult(ok=False, code=200, error="unfilled", reason="unfilled", raw=raw,
+                                        elapsed_s=plan.elapsed_s), error or first)
+    # refused / failed (or a status this client does not know): the old endpoint's 409.
+    return located_refusal(SMResult(ok=False, code=409, error=str(status or "unknown_status"),
+                                    reason=str(status or "unknown_status"), raw=raw, elapsed_s=plan.elapsed_s),
+                           error)
+
+
+def plan_item_results(plan: SMResult, models: list[str] | tuple[str, ...]) -> dict[str, SMResult]:
+    """One :class:`SMResult` per model of a plan answer. An answer that lists items (200, or
+    409 ``partial``) gives each model its item; one without items (409 ``writer_busy`` /
+    ``routable_unknown``, 400, 5xx, transport error, timeout, dropped) is every model's."""
+    items = _plan_items(plan.raw)
+    out: dict[str, SMResult] = {}
+    for model in models:
+        item = items.get(model)
+        if item is not None:
+            out[model] = _item_result(plan, item)
+        elif items or plan.ok:
+            out[model] = SMResult(ok=False, code=plan.code, error="missing_item",
+                                  detail=f"the plan answer has no item for {model}", raw=plan.raw,
+                                  elapsed_s=plan.elapsed_s)
+        else:
+            out[model] = plan
+    return out
 
 
 class SMClient:
     """Blocking HTTP client (stdlib). Every call is made from a worker thread."""
 
-    def __init__(self, base_url: str, *, timeout_s: float = 300.0, state_timeout_s: float = 5.0,
+    def __init__(self, base_url: str, *, timeout_s: float = 360.0, state_timeout_s: float = 5.0,
                  actor: str = ACTOR) -> None:
         self._base = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
@@ -205,11 +262,13 @@ class SMClient:
             raise ValueError("malformed /v2/state: no models object")
         return state
 
-    def put_target(self, model: str, body: Mapping[str, Any], timeout_s: Optional[float] = None) -> SMResult:
+    def post_plan(self, body: Mapping[str, Any], timeout_s: Optional[float] = None) -> SMResult:
+        """``POST /v2/plans``; never raises. 200 -> ``ok`` with the plan response in ``raw``;
+        an HTTP error -> :func:`parse_sm_error` (a 409 ``partial`` keeps its items in ``raw``)."""
         started = time.monotonic()
         timeout = self.timeout_s if timeout_s is None else float(timeout_s)
         try:
-            with self._open("PUT", f"/v2/models/{model}/target", dict(body), timeout) as resp:
+            with self._open("POST", "/v2/plans", dict(body), timeout) as resp:
                 raw = resp.read()
                 code = resp.status
         except HTTPError as exc:
@@ -230,19 +289,20 @@ class SMClient:
         return SMResult(ok=True, code=code, raw=parsed, elapsed_s=elapsed)
 
 
-#: Default sleep path of a scale-down: a no-drain (abort) path on the SM on main
-#: (``DEFAULT_NO_DRAIN_PATHS``) and the whole-lock SM's default. The whole-lock SM clamps a
-#: shrink at the replica floor (200, ``clamped_by_floor`` in the logged result).
+#: Default sleep path of a scale-down: a no-drain (abort) path (``DEFAULT_NO_DRAIN_PATHS``).
+#: The SM clamps a shrink at the replica floor (item ``clamped``, ``clamped_by_floor``).
 DEFAULT_ABORT_SLEEP_PATH = "urgent"
 
 
-def target_body(direction: str, target: int, *, abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH) -> dict:
-    """Request body of one scale action (``up`` = grow-only, ``down`` = absolute, abort
-    sleep: hide -> gateway ack -> ``/sleep mode=abort``, no drain)."""
+def plan_item(model: str, direction: str, target: int, *,
+              abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH) -> dict:
+    """The plan item of one scale action: ``up`` = wake item, grow-only ``at_least``;
+    ``down`` = sleep item ``at_most`` on the abort path (hide -> gateway ack -> ``/sleep
+    mode=abort``, no drain)."""
     if direction == "up":
-        return {"wake_replicas": int(target), "at_least": True}
+        return {"model": model, "at_least": int(target)}
     if direction == "down":
-        return {"wake_replicas": int(target), "sleep_path": abort_sleep_path}
+        return {"model": model, "at_most": int(target), "sleep_path": abort_sleep_path}
     raise ValueError(f"unknown direction {direction!r}")
 
 
@@ -409,174 +469,206 @@ class Completed:
     model: str
     direction: str
     target: int
+    #: The plan item of this decision.
     body: Mapping[str, Any]
-    #: The answer to the last call made (a refusal when the steps stopped early).
+    #: This model's answer: its plan item, or the whole-plan answer (no items).
     result: SMResult
     submitted_seq: int
-    #: Awake count the scale-up started from (None: one call for ``target``).
+    #: The awake count it started from - the item's ``awake_before`` (the SM's count
+    #: under the lock), else the count the decision saw (scale-up; None for a
+    #: scale-down without an item).
     start: Optional[int] = None
-    #: Highest target the SM granted (None: no call granted).
+    #: The awake count after the plan (the item's ``awake_after``; sleep items carry it
+    #: too since 2026-10-28); None when the plan gave no item (dropped, whole-plan
+    #: refusal, transport error).
     reached: Optional[int] = None
-    #: SM calls made for this job (a dropped step is not a call).
-    steps: int = 1
+    plan_id: Optional[str] = None
+    #: Items in the plan this decision went out with.
+    plan_size: int = 1
+    #: The decision waited behind the plan in flight (``queued`` at its tick).
+    queued: bool = False
 
     @property
     def progressed(self) -> bool:
-        """At least one replica was added (the SM state changed because of us)."""
-        return self.reached is not None and (self.start is None or self.reached > self.start)
+        """At least one replica was added (scale-up) or put to sleep (scale-down): the
+        SM state changed because of us."""
+        if self.reached is None or self.start is None:
+            return False
+        return self.reached > self.start if self.direction == "up" else self.reached < self.start
 
     @property
     def partial_fill(self) -> bool:
-        """A stepped scale-up that got some replicas, then was refused or dropped."""
-        return (not self.result.ok) and self.start is not None and self.progressed
+        """A scale-up that got some replicas, then the SM could place no more."""
+        return (not self.result.ok) and self.direction == "up" and self.progressed
 
     def as_dict(self) -> dict[str, Any]:
-        out = {"direction": self.direction, "target": self.target, **self.result.as_dict()}
-        if self.start is not None:
-            out.update(start=self.start, reached=self.reached, steps=self.steps,
-                       partial_fill=self.partial_fill)
+        out = {"direction": self.direction, "target": self.target, **self.result.as_dict(),
+               "plan_id": self.plan_id, "plan_size": self.plan_size}
+        if self.queued:
+            out["queued"] = True
+        out.update(start=self.start, reached=self.reached)
+        if self.direction == "up":
+            out["partial_fill"] = self.partial_fill
         return out
 
 
-@dataclass
-class _Worker:
-    thread: threading.Thread
-    jobs: "queue.Queue[Optional[tuple[int, str, int, Optional[int]]]]"
+@dataclass(frozen=True)
+class _Job:
+    seq: int
+    model: str
+    direction: str
+    target: int
+    #: Awake count the decision saw (scale-up), for ``Completed.start``.
+    start: Optional[int]
+    #: Waited behind the plan in flight (answered ``queued``).
+    queued: bool = False
 
 
 class Dispatcher:
-    """One worker thread per model; at most one SM call in flight per model.
+    """One plan in flight at a time, latest-wins coalescing (see the module docstring).
 
-    :meth:`submit` returns False (the caller logs ``inflight_skip``) when the model
-    already has a call queued or running; it never blocks. Finished calls are collected
-    with :meth:`drain_results`.
+    :meth:`dispatch` takes one tick's decisions and never blocks. Finished decisions are
+    collected with :meth:`drain_results` (one :class:`Completed` per model of a plan).
     """
 
-    def __init__(self, put_target: Callable[[str, Mapping[str, Any]], SMResult], *,
+    def __init__(self, post_plan: Callable[[Mapping[str, Any]], SMResult], *,
                  abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH,
                  guard: Optional[Callable[[], Optional[str]]] = None) -> None:
-        self._put = put_target
-        #: Called right before every SM call: None = go, a string = drop the call (why).
+        self._post = post_plan
+        #: Called right before every POST: None = go, a string = drop the plan (why).
         self.guard = guard
         self._abort_sleep_path = abort_sleep_path
-        self._lock = threading.Lock()
-        self._inflight: dict[str, tuple[str, int]] = {}
-        self._workers: dict[str, _Worker] = {}
+        self._cond = threading.Condition()
+        #: The plan in flight (model -> job), empty when none.
+        self._sending: dict[str, _Job] = {}
+        #: The latest tick's decisions waiting for the next plan.
+        self._pending: dict[str, _Job] = {}
         self._results: "queue.Queue[Completed]" = queue.Queue()
         self._seq = 0
-        #: Submission log (seq, model, direction, target), for tests and debugging.
+        #: Decisions handed over (seq, model, direction, target), for tests and debugging; a
+        #: queued decision a later tick replaced is listed but never sent.
         self.submitted: list[tuple[int, str, str, int]] = []
+        self._thread: Optional[threading.Thread] = None
         self._closed = False
 
     def inflight(self, model: str) -> bool:
-        with self._lock:
-            return model in self._inflight
+        """The model has a decision in the plan in flight or waiting for the next plan."""
+        with self._cond:
+            return model in self._sending or model in self._pending
 
     def inflight_count(self) -> int:
-        with self._lock:
-            return len(self._inflight)
+        """Models with a decision not answered yet (in flight or waiting)."""
+        with self._cond:
+            return len(set(self._sending) | set(self._pending))
 
-    def inflight_downs(self) -> list[str]:
-        """Models whose scale-down call is queued or running (not yet answered)."""
-        with self._lock:
-            return sorted(m for m, (direction, _t) in self._inflight.items() if direction == "down")
+    def dispatch(self, decisions: Mapping[str, tuple[str, int, Optional[int]]]) -> dict[str, str]:
+        """Hand over one tick's decisions ``{model: (direction, target, start)}``.
 
-    def submit(self, model: str, direction: str, target: int, start: Optional[int] = None) -> bool:
-        """Queue one scale action. ``start`` (scale-up only) = the awake count the decision
-        saw: the worker then asks for ``start+1``, ``start+2``, ... ``target`` one call at a
-        time and stops at the first refusal. Without it, one call for ``target``."""
-        target_body(direction, target, abort_sleep_path=self._abort_sleep_path)  # validates
-        if direction != "up" or start is None or int(start) >= int(target):
-            start = None
-        with self._lock:
+        Per model: ``sent`` (no plan in flight: it goes out now, with the tick's other
+        decisions, in one plan), ``queued`` (a plan is in flight: it goes in the next one,
+        unless a later tick replaces it) or ``inflight`` (its item is in the plan in flight:
+        not taken; the next decision sees the answer). The tick's decisions replace every
+        decision still waiting (latest wins): a model waiting from an older tick and absent
+        here - its desired count is back at awake, or a gate holds it now - is not sent."""
+        for model, (direction, target, _start) in decisions.items():
+            plan_item(model, direction, target, abort_sleep_path=self._abort_sleep_path)  # validates
+        out: dict[str, str] = {}
+        with self._cond:
             if self._closed:
                 raise RuntimeError("dispatcher is closed")
-            if model in self._inflight:
-                return False
-            self._inflight[model] = (direction, int(target))
-            self._seq += 1
-            seq = self._seq
-            self.submitted.append((seq, model, direction, int(target)))
-            worker = self._workers.get(model)
-            if worker is None:
-                jobs: "queue.Queue[Optional[tuple[int, str, int, dict]]]" = queue.Queue()
-                thread = threading.Thread(
-                    target=self._run, args=(model, jobs), name=f"bl-sm-{model}", daemon=True
-                )
-                worker = _Worker(thread=thread, jobs=jobs)
-                self._workers[model] = worker
-                thread.start()
-        worker.jobs.put((seq, direction, int(target), None if start is None else int(start)))
-        return True
+            busy = bool(self._sending)
+            pending: dict[str, _Job] = {}
+            for model in sorted(decisions):
+                direction, target, start = decisions[model]
+                if model in self._sending:
+                    out[model] = "inflight"
+                    continue
+                self._seq += 1
+                pending[model] = _Job(self._seq, model, direction, int(target),
+                                      None if start is None else int(start), queued=busy)
+                self.submitted.append((self._seq, model, direction, int(target)))
+                out[model] = "queued" if busy else "sent"
+            self._pending = pending
+            if pending:
+                if self._thread is None:
+                    self._thread = threading.Thread(target=self._run, name="bl-sm-plans", daemon=True)
+                    self._thread.start()
+                self._cond.notify_all()
+        return out
 
-    def _check_guard(self, model: str, direction: str, target: int) -> Optional[str]:
+    def _check_guard(self, plan_id: str) -> Optional[str]:
         try:
             why = self.guard() if self.guard is not None else None
         except Exception as exc:  # cannot tell whether we may act: do not act
             why = f"guard_failed: {exc!r}"[:200]
         if why:
-            LOG.warning("SM call %s %s->%s dropped: %s", model, direction, target, why)
+            LOG.warning("SM plan %s dropped: %s", plan_id, why)
         return why or None
 
-    def _call(self, model: str, body: dict) -> SMResult:
+    def _call(self, body: dict) -> SMResult:
         try:
-            return self._put(model, body)
-        except Exception as exc:  # the client should not raise; never lose the flag
-            LOG.exception("SM call for %s raised", model)
+            return self._post(body)
+        except Exception as exc:  # the client should not raise; never lose the plan's answers
+            LOG.exception("SM plan %s raised", body.get("plan_id"))
             return SMResult(ok=False, error="exception", detail=repr(exc)[:2000])
 
-    def _run(self, model: str, jobs: "queue.Queue[Optional[tuple[int, str, int, Optional[int]]]]") -> None:
+    def _run(self) -> None:
         while True:
-            job = jobs.get()
-            if job is None:
-                return
-            seq, direction, target, start = job
+            with self._cond:
+                while not self._pending and not self._closed:
+                    self._cond.wait()
+                if self._closed:
+                    return
+                jobs, self._pending = self._pending, {}
+                self._sending = jobs
             try:
-                done = self._execute(model, seq, direction, target, start)
-            except Exception as exc:  # never lose the in-flight flag
-                LOG.exception("SM job for %s failed", model)
-                body = target_body(direction, target, abort_sleep_path=self._abort_sleep_path)
-                done = Completed(model, direction, target, body,
-                                 SMResult(ok=False, error="exception", detail=repr(exc)[:2000]), seq,
-                                 start=start)
-            self._results.put(done)
-            with self._lock:
-                self._inflight.pop(model, None)
+                done = self._execute(jobs)
+            except Exception as exc:  # never lose the answers
+                LOG.exception("SM plan failed")
+                done = [Completed(job.model, job.direction, job.target,
+                                  plan_item(job.model, job.direction, job.target,
+                                            abort_sleep_path=self._abort_sleep_path),
+                                  SMResult(ok=False, error="exception", detail=repr(exc)[:2000]), job.seq,
+                                  start=job.start, plan_size=len(jobs), queued=job.queued)
+                        for job in jobs.values()]
+            # The answers and the end of the send in ONE critical section: a tick never
+            # sees the models free again before their results are collectable (L1).
+            with self._cond:
+                for item in done:
+                    self._results.put(item)
+                self._sending = {}
+                self._cond.notify_all()
 
-    def _execute(self, model: str, seq: int, direction: str, target: int, start: Optional[int]) -> Completed:
-        steps = [target] if start is None else list(range(start + 1, target + 1))
-        reached: Optional[int] = None
-        calls = 0
-        body = target_body(direction, steps[0], abort_sleep_path=self._abort_sleep_path)
-        result = SMResult(ok=False, error=DROPPED, reason="no_step")
-        for step in steps:
-            # Owner lock and controller mode are checked again before every call.
-            why = self._check_guard(model, direction, step)
-            if why:
-                result = SMResult(ok=False, error=DROPPED, reason=str(why))
-                break
-            body = target_body(direction, step, abort_sleep_path=self._abort_sleep_path)
-            result = self._call(model, body)
-            calls += 1
-            base = reached if reached is not None else start
-            if result.ok and direction == "up":
-                unfilled = result.raw.get("unfilled") if isinstance(result.raw, dict) else None
-                if isinstance(unfilled, int) and unfilled > 0:
-                    # The SM filled partially itself: what it woke stays woken.
-                    got = step - unfilled
-                    if base is None or got > base:
-                        reached = got
-                    result = unfilled_refusal(result)
-            elif not result.ok and base is not None and _wakes_done(result.raw):
-                reached = base + _wakes_done(result.raw)  # e.g. 409 reason="partial" with wakes done
-            if not result.ok:
-                if reached is not None:
-                    LOG.info("SM partial fill %s: %s of %s->%s, then %s", model, reached, start, target,
-                             result.as_dict())
-                break
-            reached = step
-        return Completed(model, direction, target, body, result, seq, start=start,
-                         reached=reached, steps=calls)
+    def _execute(self, jobs: Mapping[str, _Job]) -> list[Completed]:
+        plan_id = f"bl-{uuid.uuid4().hex[:12]}"
+        models = sorted(jobs)
+        items = {m: plan_item(m, jobs[m].direction, jobs[m].target, abort_sleep_path=self._abort_sleep_path)
+                 for m in models}
+        body = {
+            "plan_id": plan_id,
+            "sleeps": [items[m] for m in models if jobs[m].direction == "down"],
+            "wakes": [items[m] for m in models if jobs[m].direction == "up"],
+        }
+        # Owner lock and controller mode are checked again right before the POST.
+        why = self._check_guard(plan_id)
+        whole = SMResult(ok=False, error=DROPPED, reason=str(why)) if why else self._call(body)
+        answers = plan_item_results(whole, models)
+        out: list[Completed] = []
+        for model in models:
+            job, result = jobs[model], answers[model]
+            # Wake and sleep items both carry awake_before / awake_after.
+            raw = result.raw if isinstance(result.raw, dict) else {}
+            before, after = raw.get("awake_before"), raw.get("awake_after")
+            start = before if isinstance(before, int) else job.start
+            reached = after if isinstance(after, int) else None
+            done = Completed(model, job.direction, job.target, items[model], result, job.seq,
+                             start=start, reached=reached, plan_id=plan_id, plan_size=len(models),
+                             queued=job.queued)
+            if done.partial_fill:
+                LOG.info("SM partial fill %s: %s of %s->%s, then %s", model, reached, start, job.target,
+                         result.as_dict())
+            out.append(done)
+        return out
 
     def drain_results(self) -> list[Completed]:
         out: list[Completed] = []
@@ -587,12 +679,11 @@ class Dispatcher:
                 return out
 
     def close(self, join_s: float = 0.0) -> None:
-        with self._lock:
+        """Stop the worker after the plan in flight; decisions still waiting are not sent."""
+        with self._cond:
             self._closed = True
-            workers = list(self._workers.values())
-        for worker in workers:
-            worker.jobs.put(None)
-        if join_s > 0:
-            deadline = time.monotonic() + join_s
-            for worker in workers:
-                worker.thread.join(max(0.0, deadline - time.monotonic()))
+            self._pending = {}
+            thread = self._thread
+            self._cond.notify_all()
+        if join_s > 0 and thread is not None:
+            thread.join(join_s)

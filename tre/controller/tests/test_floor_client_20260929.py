@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.planner import HideAction
 from tre_controller.sm_client import ServiceManagerClient, ServiceManagerError
 
 from test_action_queue_review3 import ScriptedSM, _calls, _commit
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 FLOOR_BODY = {
     "detail": "replica floor: safescale_hide would leave m with 0 routable replica(s) < min_replicas 1",
@@ -51,7 +51,8 @@ def test_client_calls_report_the_floor_violation_as_permanent():
     client = ServiceManagerClient("http://sm", transport=transport)
 
     routable = asyncio.run(client.set_routable("m", ("m-0",)))
-    power = asyncio.run(client.set_binding_power("m-0", awake=False, sleep_path="urgent"))
+    power = asyncio.run(client.post_plan({"sleeps": [{"model": "m", "pods": ["m-0"], "sleep_path": "urgent"}],
+                                          "wakes": []}))
 
     for result in (routable, power):
         assert result["ok"] is False and result["retriable"] is False

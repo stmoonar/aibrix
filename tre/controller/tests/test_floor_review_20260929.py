@@ -29,7 +29,6 @@ import yaml
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.loops.safescale_task import _observation_from_metrics, run_safescale_observation_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
@@ -51,6 +50,7 @@ from test_safescale import FakeProbeStore
 from test_safescale_task import FakeQueue as ObservationQueue
 from test_safescale_task import _metrics as _observation_snapshot
 from test_safescale_task import _registry as _donor_registry
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 TRE_DIR = Path(__file__).resolve().parents[2]
 

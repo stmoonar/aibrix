@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+import pytest
+
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import K8sPodSnapshot
@@ -454,160 +456,22 @@ def test_v2_put_binding_power_wake_respects_max_awake_replicas():
     ]
 
 
-def test_v2_put_target_allocates_new_binding_when_free_slot_exists():
+
+def test_v2_put_target_growth_past_the_bindings_never_creates():
+    """2026-10-27: no cold create - a growth past the existing bindings is
+    refused ``no_binding`` (nothing feasible: 409; nothing changed)."""
+    from tre_sm.api.v2 import WakeConflict
+
     store = StateStore(FakeRedis())
-    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)], expected_version=0)
+    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
+    store.save(original, expected_version=0)
     service = ServiceManagerV2(registry_with_tp2(), store)
 
-    result = service.put_model_target("tp2", wake_replicas=1)
-
-    assert result == {
-        "model": "tp2",
-        "wake_replicas": 1,
-        "version": 2,
-        "actions": [{"action": "create", "serve_id": "tp2-1", "node": "node-a", "gpu_ids": [2, 3]}],
-    }
-    assert store.load().bindings == [
-        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
-        Binding("tp2-1", "tp2", Slot("node-a", (2, 3)), awake=True),
-    ]
-
-
-def test_v2_put_target_rejects_state_only_create_when_runtime_ops_are_enabled():
-    from tre_sm.allocator.topology import K8sPodSnapshot
-
-    store = StateStore(FakeRedis())
-    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
-    store.save(original, expected_version=0)
-    service = ServiceManagerV2(
-        registry(),
-        store,
-        runtime_ops=FakeRuntimeOps(
-            [
-                K8sPodSnapshot(
-                    name="serve-a",
-                    model="m1",
-                    node="node-a",
-                    env={"CUDA_VISIBLE_DEVICES": "0"},
-                    pod_ip="10.0.0.1",
-                )
-            ]
-        ),
-        vllm_ops=FakeVllmOps(),
-    )
-
-    try:
-        service.put_model_target("m1", wake_replicas=2)
-    except ValueError as exc:
-        assert "runtime create is not implemented" in str(exc)
-    else:
-        raise AssertionError("expected runtime create to fail")
-    assert store.load().bindings == original
-
-
-def test_v2_put_target_creates_deployment_when_runtime_deployment_ops_are_available():
-    from tre_sm.allocator.topology import K8sPodSnapshot
-
-    class RuntimeWithDeployments(FakeRuntimeOps):
-        def __init__(self):
-            super().__init__([])
-            self.ready = K8sPodSnapshot(
-                name="tp2-pod",
-                model="tp2",
-                node="node-a",
-                env={"CUDA_VISIBLE_DEVICES": "0,1"},
-                pod_ip="10.0.0.9",
-            )
-
-        def delete_model_deployment(self, binding):
-            raise AssertionError("target growth should not delete deployments")
-
-        def wait_pod_deleted(self, serve_id):
-            raise AssertionError("target growth should not wait for deletion")
-
-        def create_model_deployment(self, model, slot):
-            self.annotations.append(("create", model, tuple(slot.gpu_ids)))
-            return "tp2-deployment"
-
-        def wait_pod_ready(self, serve_id):
-            self.annotations.append(("ready", serve_id))
-            return self.ready
-
-    store = StateStore(FakeRedis())
-    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)], expected_version=0)
-    runtime_ops = RuntimeWithDeployments()
-    vllm_ops = FakeVllmOps()
-    service = ServiceManagerV2(registry_with_tp2(), store, runtime_ops=runtime_ops, vllm_ops=vllm_ops)
-
-    result = service.put_model_target("tp2", wake_replicas=1)
-
-    assert result["actions"] == [{"action": "create", "serve_id": "tp2-pod", "node": "node-a", "gpu_ids": [2, 3]}]
-    assert runtime_ops.annotations == [
-        ("create", "tp2", (2, 3)),
-        ("ready", "tp2-deployment"),
-        ("tp2-pod", "awake"),
-    ]
-    assert runtime_ops.routes == ["tp2", "tp2"]
-    assert vllm_ops.calls == [
-        ("wait_until_ready", "10.0.0.9", 8000),
-        ("wake_up", "10.0.0.9", 8000),
-    ]
-    assert store.load().bindings == [
-        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
-        Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),
-    ]
-
-
-def test_v2_put_target_rejects_runtime_create_when_gpu_truth_exceeds_headroom_limit():
-    from tre_sm.allocator.topology import K8sPodSnapshot
-
-    class RuntimeWithDeployments(FakeRuntimeOps):
-        def __init__(self):
-            super().__init__(
-                [
-                    K8sPodSnapshot(
-                        name="serve-a",
-                        model="m1",
-                        node="node-a",
-                        env={"CUDA_VISIBLE_DEVICES": "0"},
-                        pod_ip="10.0.0.1",
-                    )
-                ]
-            )
-
-        def delete_model_deployment(self, binding):
-            raise AssertionError("target growth should not delete deployments")
-
-        def wait_pod_deleted(self, serve_id):
-            raise AssertionError("target growth should not wait for deletion")
-
-        def create_model_deployment(self, model, slot):
-            raise AssertionError("headroom check must run before create")
-
-        def wait_pod_ready(self, serve_id):
-            raise AssertionError("headroom check must run before wait")
-
-    store = StateStore(FakeRedis())
-    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
-    store.save(original, expected_version=0)
-    service = ServiceManagerV2(
-        registry_with_tp2(),
-        store,
-        runtime_ops=RuntimeWithDeployments(),
-        vllm_ops=FakeVllmOps(),
-        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 4070, ("node-a", "GPU-3"): 2248}),
-        create_max_used_mib=2500,
-    )
-
-    try:
+    with pytest.raises(WakeConflict) as info:
         service.put_model_target("tp2", wake_replicas=1)
-    except ValueError as exc:
-        assert "insufficient startup headroom" in str(exc)
-        assert "node-a/GPU-2 used_mib=4070" in str(exc)
-    else:
-        raise AssertionError("expected target growth to fail before create")
-    assert store.load().bindings == original
 
+    assert info.value.reason == "no_binding"
+    assert store.load().bindings == original
 
 def test_v2_fastapi_routes_delegate_to_service_layer():
     store = StateStore(FakeRedis())
@@ -1226,103 +1090,6 @@ def test_v2_put_target_treats_matching_state_conflict_after_runtime_action_as_su
     }
     assert vllm_ops.calls == [("sleep", "10.0.0.1", 8000)]
     assert runtime_ops.annotations == [("serve-a", "hidden"), ("serve-a", "sleeping")]
-
-
-class _HeadroomProbeRuntime(FakeRuntimeOps):
-    """Runtime whose create marks that the headroom gate let us through."""
-
-    def __init__(self):
-        from tre_sm.allocator.topology import K8sPodSnapshot
-
-        super().__init__(
-            [
-                K8sPodSnapshot(
-                    name="serve-a",
-                    model="m1",
-                    node="node-a",
-                    env={"CUDA_VISIBLE_DEVICES": "0"},
-                    pod_ip="10.0.0.1",
-                )
-            ]
-        )
-
-    def delete_model_deployment(self, binding):
-        raise AssertionError("target growth should not delete deployments")
-
-    def wait_pod_deleted(self, serve_id):
-        raise AssertionError("target growth should not wait for deletion")
-
-    def create_model_deployment(self, model, slot):
-        raise ValueError("headroom-gate-passed")
-
-    def wait_pod_ready(self, serve_id):
-        raise AssertionError("headroom check must run before wait")
-
-
-def test_v2_put_target_refuses_runtime_create_when_gpu_truth_is_unavailable():
-    store = StateStore(FakeRedis())
-    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
-    store.save(original, expected_version=0)
-    service = ServiceManagerV2(
-        registry_with_tp2(),
-        store,
-        runtime_ops=_HeadroomProbeRuntime(),
-        vllm_ops=FakeVllmOps(),
-        gpu_truth=FakeGpuTruth({}, unavailable_nodes={"node-a"}),
-        create_max_used_mib=2500,
-    )
-
-    try:
-        service.put_model_target("tp2", wake_replicas=1)
-    except ValueError as exc:
-        assert "gpu truth unavailable" in str(exc)
-        assert "node-a" in str(exc)
-    else:
-        raise AssertionError("expected cold start to be refused without gpu truth")
-    assert store.load().bindings == original
-
-
-def test_v2_put_target_refuses_runtime_create_when_the_slot_gpu_has_no_truth_entry():
-    store = StateStore(FakeRedis())
-    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
-    store.save(original, expected_version=0)
-    service = ServiceManagerV2(
-        registry_with_tp2(),
-        store,
-        runtime_ops=_HeadroomProbeRuntime(),
-        vllm_ops=FakeVllmOps(),
-        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 100}),
-        create_max_used_mib=2500,
-    )
-
-    try:
-        service.put_model_target("tp2", wake_replicas=1)
-    except ValueError as exc:
-        assert "gpu truth unavailable" in str(exc)
-        assert "GPU-3" in str(exc)
-    else:
-        raise AssertionError("expected cold start to be refused for the untracked gpu")
-
-
-def test_v2_put_target_allows_runtime_create_without_truth_when_not_required():
-    store = StateStore(FakeRedis())
-    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)], expected_version=0)
-    service = ServiceManagerV2(
-        registry_with_tp2(),
-        store,
-        runtime_ops=_HeadroomProbeRuntime(),
-        vllm_ops=FakeVllmOps(),
-        gpu_truth=FakeGpuTruth({}, unavailable_nodes={"node-a"}),
-        create_max_used_mib=2500,
-        require_gpu_truth=False,
-    )
-
-    try:
-        service.put_model_target("tp2", wake_replicas=1)
-    except ValueError as exc:
-        assert "headroom-gate-passed" in str(exc)
-    else:
-        raise AssertionError("expected the create path to be reached")
 
 
 def test_v2_put_target_shrink_sleeps_hidden_binding_first():

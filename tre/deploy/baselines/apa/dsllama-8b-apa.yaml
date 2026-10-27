@@ -1,7 +1,8 @@
 # APA (KVCache) baseline autoscaler for dsllama-8b (experiment 3 control arm).
 # scaleTargetRef.Name MUST equal the registry model name: the patched aibrix podautoscaler
 # controller passes it verbatim as the model to service-manager /models_replicas and
-# /scale_service (TRE-PATCH P2-APA-001, pkg/controller/podautoscaler/workload_scale.go:179,243,357,409).
+# POST /v2/plans (absolute target: wake at_least / sleep at_most on the "apa" path;
+# TRE-PATCH P2-APA-001/002, pkg/controller/podautoscaler/workload_scale.go).
 # See dsllama-8b-apa-anchor.yaml for the scale-anchor Deployment. Toggle via
 # deploy/scripts/toggle_tre_apa.sh (never alongside TRE).
 apiVersion: autoscaling.aibrix.ai/v1alpha1

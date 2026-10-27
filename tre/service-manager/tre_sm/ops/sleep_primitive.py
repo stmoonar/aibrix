@@ -1,6 +1,6 @@
 """The one way the service-manager puts a vLLM pod to sleep (plan 2026-09-27 D1-D4).
 
-Every sleep - SafeScale commit, controller scale-downs and transfers, APA
+Every sleep - SafeScale commit, controller plans and scale-downs, APA
 scale-downs, defrag, fleet repair, startup admission, a failed wake's
 compensating sleep - runs the same ordered protocol, and callers cannot skip a
 step. Since 2026-10-02 (design ``docs/design/20261002-sm-wholelock.md``) the
@@ -1147,6 +1147,8 @@ class SleepPrimitive:
             "non_continuable_at_sleep": pod.last_load.get("non_continuable") or 0,
             "waited_s": round(pod.waited_s, 3),
         }
+        if batch.journal_extra.get("plan_id"):
+            outcome["plan_id"] = batch.journal_extra["plan_id"]  # additive (POST /v2/plans)
         outcome.update(extra)
         self._recent.append(outcome)
         return outcome

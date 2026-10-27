@@ -3,8 +3,7 @@ every write holds the writer lock from start to end; requests queue on it.
 
 One test per risk: concurrent requests serialize and keep one awake engine per
 GPU, a hung /sleep or /wake_up leaves the books fenced and releases the lock for
-the recovery, a replayed relative target is harmless (converted at arrival), the transfer
-primitive (POST /v2/transfers) and its failure / crash paths, /v2/state's
+the recovery, a replayed relative target is harmless (converted at arrival), /v2/state's
 routable view, the floor and routable_unknown answers, supervisor isolation.
 
 Concurrency is made deterministic with events (a request is held inside its
@@ -16,12 +15,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, ServiceManagerConfig, SloSpec
-from tre_sm.api.v2 import ServiceManagerV2, TransferFailed, create_app
+from tre_sm.api.v2 import ServiceManagerV2, create_app
 from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
@@ -64,15 +64,28 @@ class BlockingCoordinator:
         self.handles: list[tuple[str, FakeHandle]] = []
         self.waiting = threading.Event()
         self.active = None
+        self.shutdown_error = None
+
+    def begin_shutdown(self, error):
+        """As the real coordinator: a caller not holding the lock raises ``error``."""
+        self.shutdown_error = error
 
     @contextmanager
     def operation(self, kind, *, request=None, wait_s=0.0):
+        requested = time.monotonic()
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
         if not self._lock.acquire(blocking=False):
             self.waiting.set()
-            if not self._lock.acquire(timeout=max(0.01, float(wait_s))):
-                raise OperationBusy(f"held by {self.active}")
+            deadline = requested + max(0.01, float(wait_s))
+            while not self._lock.acquire(timeout=0.02):
+                if self.shutdown_error is not None:
+                    raise self.shutdown_error
+                if time.monotonic() >= deadline:
+                    raise OperationBusy(f"held by {self.active}")
         self.kinds.append(kind)
         handle = FakeHandle(f"{kind}-{len(self.kinds)}")
+        handle.lock_wait_ms = int(round((time.monotonic() - requested) * 1000))  # as the real coordinator
         self.handles.append((kind, handle))
         self.active = {"operation_id": handle.operation_id, "kind": kind, "status": "running"}
         token = _CURRENT_OPERATION.set(handle)
@@ -98,7 +111,7 @@ class BlockingCoordinator:
         return []
 
 
-def _registry(*, d_min=0):
+def _registry(*, d_min=0, extra_models=()):
     topology = ClusterTopology(
         nodes=(NodeSpec("node-a", 4, ((0, 1), (2, 3)), ("GPU-0", "GPU-1", "GPU-2", "GPU-3")),)
     )
@@ -107,6 +120,7 @@ def _registry(*, d_min=0):
         ModelSpec("r", "/r", 1, 0, 4, "image", SLO, trs()),
         ModelSpec("x", "/x", 1, 0, 4, "image", SLO, trs()),
         ModelSpec("t", "/t", 2, 0, 2, "image", SLO, trs()),
+        *(ModelSpec(name, f"/{name}", 1, 0, 4, "image", SLO, trs()) for name in extra_models),
     ]
     return Registry(topology, models, service_manager=ServiceManagerConfig(sleep=policy()))
 
@@ -125,9 +139,9 @@ DEFAULT_PODS = (
 
 
 class World:
-    def __init__(self, pods=DEFAULT_PODS, *, d_min=0):
+    def __init__(self, pods=DEFAULT_PODS, *, d_min=0, extra_models=()):
         self.redis = FakeRedis()
-        self.registry = _registry(d_min=d_min)
+        self.registry = _registry(d_min=d_min, extra_models=extra_models)
         self.ip_of, self.gpus_of_ip, snapshots = {}, {}, []
         for index, (name, model, gpus, state) in enumerate(pods, start=1):
             ip = f"10.0.0.{index}"
@@ -364,134 +378,6 @@ def test_a_wake_without_an_answer_keeps_its_fence_releases_the_lock_and_is_recov
     assert result["resolved"] == [{"binding_id": "r/node-a/2", "result": "completed"}]
     assert world.stored_awake("r-2") and world.state("r-2") == "awake"
     assert world.journals() == ({}, {})
-
-
-# ------------------------------------------------------------ transfers
-def test_transfer_sleeps_the_donor_and_wakes_the_receiver_in_one_lock_hold():
-    world = World()
-
-    response = world.client.post("/v2/transfers", json={"donor_model": "d", "receiver_model": "r", "count": 1})
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    [pair] = body["pairs"]
-    assert pair["status"] == "done"
-    assert body["done"] == body["taken"] == 1
-    assert body["unfilled"] == 0 and body["clamped_by_floor"] is False
-    assert set(body["phases_ms"]) == {"select", "donor_sleep", "receiver_wake", "total"}
-    assert not world.awake(pair["donor"]) and world.awake(pair["receiver"])
-    assert world.lease(pair["donor"]) is None and world.lease(pair["receiver"]) == "awake"
-    assert world.coordinator.kinds == ["transfer"]
-    [(_kind, handle)] = world.coordinator.handles
-    assert handle.notes["transfer"]["pairs"][0]["status"] == "done"  # GET /v2/operations
-    assert "phases_ms" in handle.notes
-    assert world.violations == [] and world.journals() == ({}, {})
-
-
-def test_transfer_tp2_receiver_is_not_woken_when_one_donor_fails_to_sleep():
-    world = World(pods=(("d-0", "d", (0,), "awake"), ("d-1", "d", (1,), "awake"), ("t-01", "t", (0, 1), "sleeping")))
-    world.vllm.fail_sleep_for.add(world.ip_of["d-1"])
-
-    response = world.client.post("/v2/transfers", json={"donor_model": "d", "receiver_model": "t", "count": 2})
-
-    assert response.status_code == 409 and response.json()["error"] == "partial"
-    assert response.json()["pairs"][0]["status"] == "donor_sleep_failed"
-    assert not any(call == ("wake_up", world.ip_of["t-01"]) for call in world.vllm.calls)
-    assert world.awake("d-1") and world.state("d-1") == "awake"  # rolled back, routable
-    assert world.lease("t-01") is None
-    assert world.violations == []
-
-
-def test_transfer_receiver_wake_failure_sleeps_it_back_and_keeps_the_donor_asleep():
-    world = World(pods=(("d-0", "d", (0,), "awake"), ("r-0", "r", (0,), "sleeping")))
-    real_wake = world.vllm.wake_up
-
-    def late(pod_ip, *, port=None):
-        real_wake(pod_ip, port=port)  # it woke ...
-        return Result(False, "engine error")  # ... and reported a failure
-
-    world.vllm.wake_up = late
-
-    with pytest.raises(TransferFailed) as info:
-        world.service.transfer(donor_model="d", receiver_model="r")
-
-    [pair] = info.value.response["pairs"]
-    assert pair["status"] == "receiver_wake_failed"
-    assert pair["compensating_sleep"]["done"] is True
-    assert not world.awake("r-0") and world.lease("r-0") is None
-    assert not world.awake("d-0") and not world.stored_awake("d-0")  # the donor is not rolled back
-
-
-def test_transfer_receiver_pod_list_failure_after_the_donor_slept_still_answers():
-    """Review 2026-10-06 P3-3: the receivers' Pod LIST fails after the donor
-    slept. The caller still gets the transfer answer (409 partial with pairs and
-    taken), the receiver is untouched and the donor stays asleep."""
-    world = World(pods=(("d-0", "d", (0,), "awake"), ("r-0", "r", (0,), "sleeping")))
-    real_list = world.runtime.list_pod_snapshots
-
-    def flaky(*, model=None):
-        if model == "r" and world.vllm.sleeping.get(world.ip_of["d-0"]):
-            raise RuntimeError("api server timeout")
-        return real_list(model=model)
-
-    world.runtime.list_pod_snapshots = flaky
-
-    response = world.client.post("/v2/transfers", json={"donor_model": "d", "receiver_model": "r"})
-
-    assert response.status_code == 409
-    body = response.json()
-    assert body["error"] == "partial" and body["taken"] == 1 and body["done"] == 0
-    [pair] = body["pairs"]
-    assert pair["status"] == "receiver_wake_failed"
-    assert "api server timeout" in pair["error"]["detail"]
-    assert not any(call == ("wake_up", world.ip_of["r-0"]) for call in world.vllm.calls)
-    assert not world.awake("r-0") and world.lease("r-0") is None
-    assert not world.awake("d-0") and not world.stored_awake("d-0") and world.lease("d-0") is None
-    assert world.violations == [] and world.journals() == ({}, {})
-
-
-def test_transfer_crash_after_the_donor_slept_is_settled_by_the_journals():
-    world = World(pods=(("d-0", "d", (0,), "awake"), ("r-0", "r", (0,), "sleeping")))
-
-    class Crash(BaseException):
-        pass
-
-    def crash(*_args, **_kwargs):
-        raise Crash()  # the SM dies right after the donor's physical confirmation
-
-    world.service._record_sleep_outcomes = crash
-    with pytest.raises(Crash):
-        world.service.transfer(donor_model="d", receiver_model="r")
-    assert not world.awake("d-0") and world.lease("d-0") == "awake"  # books not written yet
-
-    world.service = world.make_service()  # a new SM process (the dead one's lock lease expired)
-    world.service.recover_sleep_journal()
-    world.service.recover_wake_journal()
-
-    assert not world.stored_awake("d-0") and world.lease("d-0") is None
-    assert next(d.power for d in world.fleet.load_desired().bindings if d.binding_id == "d/node-a/0") == "sleeping"
-    assert not world.awake("r-0") and world.lease("r-0") is None  # untouched, no orphan lease
-    assert world.leases.load() == []
-    assert world.journals() == ({}, {})
-
-
-def test_transfer_held_back_by_the_donor_floor_is_200_clamped():
-    world = World(d_min=2)
-
-    response = world.client.post("/v2/transfers", json={"donor_model": "d", "receiver_model": "r", "count": 1})
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["clamped_by_floor"] is True and body["taken"] == 0 and body["unfilled"] == 1
-    assert world.awake("d-0") and world.awake("d-1")
-
-
-def test_transfer_on_the_safescale_commit_path_is_a_400():
-    world = World()
-    response = world.client.post(
-        "/v2/transfers", json={"donor_model": "d", "receiver_model": "r", "sleep_path": "safescale_commit"}
-    )
-    assert response.status_code == 400
 
 
 # ------------------------------------------------------------ routable view / floor

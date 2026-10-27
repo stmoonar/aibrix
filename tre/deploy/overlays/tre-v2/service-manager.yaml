@@ -20,13 +20,15 @@ spec:
         app.kubernetes.io/name: tre-v2-service-manager
     spec:
       serviceAccountName: tre-v2-service-manager
-      # SIGTERM stops new sleeps and rolls back every drain that has not reached
-      # /sleep (also the drain of a repair / defrag sleep); a commit already past
-      # /sleep finishes. The SM waits ServiceManagerConfig.shutdown_timeout_s()
-      # for that (commit-lock wait + parallel commit + one poll round, 150.5 s
-      # with the registry defaults); the grace period must exceed it. Guard test:
+      # SIGTERM stops new sleeps; a sleep waiting for its gateway ack rolls back,
+      # anything past /sleep or /wake_up finishes. The SM waits
+      # ServiceManagerConfig.shutdown_timeout_s() for the operation holding the
+      # writer lock (the longest hold, a plan, + io_margin_s = 325 + 2 = 327 s
+      # with the registry defaults, 2026-10-28) - an in-process plan finishes
+      # its waves and settlement within it, the wake executor stays up until
+      # then; the grace period must exceed it. Guard test:
       # deploy/tests/test_kustomize_overlays.py.
-      terminationGracePeriodSeconds: 300
+      terminationGracePeriodSeconds: 330
       nodeSelector:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:

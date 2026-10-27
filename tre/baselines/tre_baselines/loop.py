@@ -22,15 +22,18 @@
   themselves; this one covers any policy that does not. A policy that gates its evidence
   itself, by design differently, opts out with ``evidence_backstop = False`` (PreServe:
   Tier-1 is never held, Tier-2 holds in both directions, v1 D56 / D64).
-* The dispatcher is asynchronous: a model whose previous SM call is still running gets
-  ``inflight_skip`` (not queued); the tick never waits for the SM.
-* Donor before dependent (no arbiter): scale-downs are submitted first. A scale-up that
-  needs a donor - ``/v2/state`` ``gpus[]`` shows fewer GPU sets the model can wake on
-  than replicas it adds (``ModelSnapshot.wakeable_slots``; unknown counts as none) - is
-  not sent while any scale-down call is in flight (action ``wait_donor``): the SM answers
-  a scale-down only after the sleep is committed and the GPU released, so it goes out on
-  the first tick after that answer (state, not a timer; thread scheduling and model names
-  no longer decide who gets a shared GPU). A scale-up with free GPUs goes out at once.
+* The dispatcher is asynchronous and sends ONE plan (``POST /v2/plans``) per tick covering
+  every model's decision: scale-downs as sleep items, scale-ups as wake items, in one SM
+  writer-lock hold. The SM orders them (donor before dependent): a wake that needs a GPU a
+  sleep of the same plan releases starts once that sleep is confirmed; a wake on a free GPU
+  starts at once. One plan at a time: a model whose item is in the plan in flight gets
+  ``inflight_skip`` (not queued); the other models' decisions go in the next plan, sent as
+  soon as the one in flight returns (action ``queued_up`` / ``queued_down``, line field
+  ``queued``), and only the latest tick's decisions are kept (latest wins). The tick never
+  waits for the SM. A queued decision is not an ``up`` / ``down`` action: the actions
+  counter (``tre_bl_actions_total``) and the direction reversals count a queued decision
+  as ``up`` / ``down`` only once it was actually sent (its result, ``sm_result.queued`` with
+  the ``plan_id``, is collected); one replaced by a later tick is never counted (2026-10-28).
 * SM refusals are logged (``sm_result`` on the model's next decision line).
 * A refused scale-up (an SM answer) is not a model-wide pause: the SM's ``retry_after_s``
   means "avoid THOSE GPUs", and the shell cannot steer the SM to other GPUs, so it waits
@@ -50,14 +53,11 @@
   capped at ``TRE_BL_BACKOFF_MAX_S``, default 10 s; action ``backoff``); a refused
   scale-down is retried at once when the SM state changes.
 * A success or the desired count back at awake clears both.
-* Scale-ups are stepped (:class:`~tre_baselines.sm_client.Dispatcher`): ``awake+1``,
-  ``awake+2``, ... until the target or the first refusal, because the SM refuses a whole
-  multi-replica target when one wake is blocked. Some replicas granted, then refused =
-  ``partial_fill`` (``sm_result.partial_fill``, ``reached``; metric
-  ``tre_bl_partial_fills_total``). Our own wakes changed the state, so the next tick asks
-  again from the new awake count; a refusal of that call waits for evidence. An SM that
-  fills partially itself (200 ``unfilled``, or a 409 that lists wakes done) is handled the
-  same way: the wakes it reports are counted as done.
+* A scale-up is one grow-only wake item ``at_least = target``; the SM fills it best effort.
+  Some replicas woken, the rest unplaced = ``partial_fill`` (``sm_result.partial_fill``,
+  ``reached`` = the item's ``awake_after``; metric ``tre_bl_partial_fills_total``). Our own
+  wakes changed the state, so the next tick asks again from the new awake count; a refusal
+  of that call waits for evidence.
 * One JSONL line per model per tick (``policy`` = the ``TRE_BL_POLICY`` key, ``arm`` = the
   adapted arm's name, e.g. ``PreServe-oracle``) to
   ``$TRE_BL_LOG_DIR/decisions-<policy>-<YYYYMMDD>.jsonl``
@@ -107,8 +107,7 @@ from tre_baselines.snapshot import ClusterSnapshot, evidence_gaps
 LOG = logging.getLogger(__name__)
 
 REVERSAL_WINDOW_MS = 60_000
-ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run", "backoff", "wait_refusal", "guard_controller_active",
-           "wait_donor")
+ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run", "backoff", "wait_refusal", "guard_controller_active")
 #: Controller modes under which a baseline may actuate (missing key = observe).
 _CONTROLLER_OK = (None, "", "observe")
 
@@ -194,7 +193,7 @@ class ShellStats:
     backoff_skips: int = 0
     #: Ticks a refused scale-up waited for evidence of a state change.
     refusal_waits: int = 0
-    #: Stepped scale-ups that got some replicas, then a refusal (per model).
+    #: Scale-ups that got some replicas, the rest unplaced (per model).
     partial_fills: dict[str, int] = field(default_factory=dict)
     #: arr events per model whose request does not stream (expected 0: PreServe's map
     #: needs ft, which a non-streaming request only gets at the end).
@@ -278,18 +277,28 @@ class BaselineShell:
 
     # -- one tick ---------------------------------------------------------------------
 
-    def _collect_results(self) -> dict[str, Completed]:
+    def _collect_results(self, now_ms: int) -> dict[str, Completed]:
         latest: dict[str, Completed] = {}
         for done in self.dispatcher.drain_results():
             dropped = done.result.error == DROPPED
             with self._stats_lock:
                 if dropped:
                     self.stats.sm_dropped += 1
-                elif not done.result.ok:
-                    self.stats.sm_failures += 1
+                else:
+                    self.stats.sm_calls += 1  # a plan item the SM was asked for
+                    if not done.result.ok:
+                        self.stats.sm_failures += 1
+                    if done.queued:
+                        # A queued decision counts as an up / down action once sent.
+                        key = (done.model, done.direction)
+                        self.stats.actions[key] = self.stats.actions.get(key, 0) + 1
+            if done.queued and not dropped:
+                self._note_dispatch(done.model, done.direction, now_ms)
             if not done.result.ok and not dropped:
+                # ``plan_id`` pairs the line with the SM's plan_item_refused event, and the lines
+                # of a whole-plan refusal (writer_busy: one per model) with its one 409 line.
                 LOG.warning("SM refused %s %s->%s: %s", done.model, done.direction, done.target,
-                            done.result.as_dict())
+                            {**done.result.as_dict(), "plan_id": done.plan_id})
             latest[done.model] = done
         return latest
 
@@ -323,7 +332,7 @@ class BaselineShell:
         effective_dry = bool(self.config.dry_run or not owner or guard)
         snap = self.source.gather(self._tick)
         # After the gather: a tick whose gather raises leaves the results for the next one.
-        results = self._collect_results()
+        results = self._collect_results(snap.now_ms)
         view = self._state_view(snap.extra or {})
         version = view.key
         if version is not None and version != self._sm_version:
@@ -337,7 +346,7 @@ class BaselineShell:
                 with self._stats_lock:
                     self.stats.partial_fills[model] = self.stats.partial_fills.get(model, 0) + 1
             submitted_view = self._submit_view.pop(model, None)
-            if done.result.ok or (done.result.error == DROPPED and done.progressed):
+            if done.result.ok:
                 self.backoff.reset(model)
                 self._refused.discard(model)
                 self.refusals.clear(model)
@@ -385,13 +394,15 @@ class BaselineShell:
         order = {"down": 0, "up": 1, "none": 2}
         planned.sort(key=lambda p: (order[p["direction"]], p["model"]))
 
-        lines: list[dict] = []
+        # Gates first (per model), then ONE hand-over of the tick's would-be calls: the
+        # dispatcher sends them as one plan (or queues them behind the plan in flight).
+        gated: list[tuple[dict, Optional[str], Optional[float], Optional[str]]] = []
+        calls: dict[str, tuple[str, int, Optional[int]]] = {}
         for item in planned:
             model, direction = item["model"], item["direction"]
             ms = snap.models[model]
             wait_s = None
             evidence = None
-            donors: list[str] = []
             if direction == "none":
                 action = "none"
                 self.backoff.reset(model)  # the desired count is back at awake
@@ -401,21 +412,34 @@ class BaselineShell:
                 action = "guard_controller_active"
             elif effective_dry:
                 action = "dry_run"
-            elif (direction == "up" and self._needs_donor(snap.models[model], item["clamped"])
-                  and (donors := self.dispatcher.inflight_downs())):
-                action = "wait_donor"  # the GPU it needs is released when that call returns
             elif (wait_s := self.backoff.remaining_s(model, snap.now_ms)) is not None:
                 action = "backoff"
             elif direction == "up" and (evidence := self.refusals.evidence(model, view, snap.now_ms)) is None:
                 action = "wait_refusal"  # nothing changed since the refusal: no call
-            elif self.dispatcher.submit(model, direction, item["clamped"],
-                                        start=ms.awake if direction == "up" else None):
-                action = direction
-                if direction == "up":
-                    self._submit_view[model] = view
-                self._note_dispatch(model, direction, snap.now_ms)
             else:
-                action = "inflight_skip"
+                action = None  # a call, if the dispatcher takes it
+                calls[model] = (direction, item["clamped"], ms.awake if direction == "up" else None)
+            gated.append((item, action, wait_s, evidence))
+        # Always handed over (also empty): the tick's decisions replace any still waiting.
+        taken = self.dispatcher.dispatch(calls)
+
+        lines: list[dict] = []
+        for item, action, wait_s, evidence in gated:
+            model, direction = item["model"], item["direction"]
+            queued = False
+            if action is None:
+                answer = taken.get(model)
+                if answer in ("sent", "queued"):
+                    queued = answer == "queued"
+                    # Queued: not sent yet (and maybe replaced by a later tick) - no up /
+                    # down action, no reversal; counted when its result comes back.
+                    action = f"queued_{direction}" if queued else direction
+                    if direction == "up":
+                        self._submit_view[model] = view
+                    if not queued:
+                        self._note_dispatch(model, direction, snap.now_ms)
+                else:
+                    action = "inflight_skip"
             line = {
                 "ts_ms": snap.now_ms,
                 "tick": snap.tick,
@@ -429,15 +453,15 @@ class BaselineShell:
             }
             if mode is not None or guard:
                 line["controller_mode"] = mode
-            if donors:
-                line["wait_donor"] = donors
+            if queued:
+                line["queued"] = True
             if wait_s is not None:
                 line["backoff_s"] = round(wait_s, 3)
                 line["backoff_delay_s"] = self.backoff.delay_s(model)
             refusal = self.refusals.get(model) if direction == "up" else None
             if refusal is not None:
                 line["refusal"] = refusal.as_dict(snap.now_ms)
-                if action == "up":
+                if action in ("up", "queued_up"):
                     line["retry_evidence"] = evidence
             done = results.get(model)
             if done is not None:
@@ -486,15 +510,8 @@ class BaselineShell:
                 m: frozenset(v) for m, v in free.items() if v is not None},
         )
 
-    @staticmethod
-    def _needs_donor(ms: Any, target: int) -> bool:
-        """The scale-up cannot be served from GPUs the model can wake on now."""
-        free = getattr(ms, "wakeable_slots", None)
-        return free is None or free < int(target) - int(ms.awake)
-
     def _note_dispatch(self, model: str, direction: str, now_ms: int) -> None:
         with self._stats_lock:
-            self.stats.sm_calls += 1
             prev = self._last_dispatch.get(model)
             if prev is not None and prev[0] != direction and now_ms - prev[1] <= REVERSAL_WINDOW_MS:
                 self.stats.reversals[model] = self.stats.reversals.get(model, 0) + 1

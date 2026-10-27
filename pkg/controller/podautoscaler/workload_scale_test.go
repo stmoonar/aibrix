@@ -18,9 +18,12 @@ package podautoscaler
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -230,63 +233,238 @@ func TestAPASleepModeGetsCurrentReplicasFromServiceManage(t *testing.T) {
 	assert.Equal(t, int32(3), currentReplicas)
 }
 
-func TestAPASleepModeSetDesiredReplicasUsesServiceManageDelta(t *testing.T) {
-	var scaleCalled bool
+// TestAPASleepModeSetDesiredReplicasPostsAnAbsolutePlan: APA sends an ABSOLUTE target through
+// POST /v2/plans (wake at_least / sleep at_most on the "apa" path), never a delta; nothing when the
+// target is already met; a refused wake (nothing changed) is a warning like v1's 200 actual 0;
+// writer_busy and a failed item are errors. The Deployment's spec.replicas is never touched.
+func TestAPASleepModeSetDesiredReplicasPostsAnAbsolutePlan(t *testing.T) {
+	refusedWake := `{"plan_id":"pl-1","status":"failed","error":"partial","reason":"partial","sleeps":[],` +
+		`"wakes":[{"model":"test-llm","status":"refused","unfilled":3,"error":{"error":"gpu_busy","reason":"slot_occupied"}}]}`
+	failedWake := `{"plan_id":"pl-2","status":"failed","error":"partial","reason":"partial","sleeps":[],` +
+		`"wakes":[{"model":"test-llm","status":"failed","unfilled":3,"error":{"error":"wake_failed"}}]}`
+	cases := []struct {
+		name     string
+		current  int32
+		desired  int32
+		status   int
+		response string
+		wantPlan string // "" = no POST /v2/plans
+		wantErr  bool
+	}{
+		{name: "scale up: wake at_least desired", current: 2, desired: 5, status: http.StatusOK,
+			response: `{"plan_id":"pl-0","status":"done","sleeps":[],"wakes":[{"model":"test-llm","status":"done","awake_before":2,"awake_after":5}]}`,
+			wantPlan: `{"sleeps":[],"wakes":[{"model":"test-llm","at_least":5,"reason":"apa"}]}`},
+		{name: "scale down to zero: sleep at_most on the apa path", current: 3, desired: 0, status: http.StatusOK,
+			response: `{"plan_id":"pl-0","status":"done","sleeps":[{"model":"test-llm","status":"clamped","taken":2,"clamped_by_floor":true}],"wakes":[]}`,
+			wantPlan: `{"sleeps":[{"model":"test-llm","at_most":0,"sleep_path":"apa","reason":"apa"}],"wakes":[]}`},
+		{name: "target already met: no plan", current: 2, desired: 2},
+		{name: "refused wake, nothing changed: warning", current: 2, desired: 5, status: http.StatusConflict,
+			response: refusedWake, wantPlan: `{"sleeps":[],"wakes":[{"model":"test-llm","at_least":5,"reason":"apa"}]}`},
+		{name: "failed wake: error", current: 2, desired: 5, status: http.StatusConflict,
+			response: failedWake, wantPlan: `{"sleeps":[],"wakes":[{"model":"test-llm","at_least":5,"reason":"apa"}]}`,
+			wantErr: true},
+		{name: "writer busy: error", current: 3, desired: 1, status: http.StatusConflict,
+			response: `{"detail":"writer lock busy","error":"writer_busy","retry_after_s":1.0}`,
+			wantPlan: `{"sleeps":[{"model":"test-llm","at_most":1,"sleep_path":"apa","reason":"apa"}],"wakes":[]}`,
+			wantErr:  true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var plans []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodPost, r.Method)
+				switch r.URL.Path {
+				case "/models_replicas":
+					assert.Equal(t, "test-llm", r.URL.Query().Get("models"))
+					_, _ = fmt.Fprintf(w, `{"test-llm":%d}`, tc.current)
+				case "/v2/plans":
+					assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+					body, _ := io.ReadAll(r.Body)
+					plans = append(plans, string(body))
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.response))
+				default:
+					t.Fatalf("unexpected service_manage path: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			pa := &autoscalingv1alpha1.PodAutoscaler{
+				ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+				Spec: autoscalingv1alpha1.PodAutoscalerSpec{
+					ScalingStrategy: autoscalingv1alpha1.APA,
+					ScaleTargetRef: corev1.ObjectReference{
+						Kind:       "Deployment",
+						Name:       "test-llm",
+						APIVersion: "apps/v1",
+					},
+				},
+			}
+			deployment := &appsv1.Deployment{
+				ObjectMeta: v1.ObjectMeta{Name: "test-llm", Namespace: "default"},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To[int32](1)},
+			}
+			scheme := runtime.NewScheme()
+			_ = autoscalingv1alpha1.AddToScheme(scheme)
+			_ = appsv1.AddToScheme(scheme)
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pa, deployment).Build()
+			workloadScale := &workloadScale{
+				client:                  fakeClient,
+				serviceManageURL:        server.URL,
+				serviceManageHTTPClient: server.Client(),
+				sleepModeEnabled:        true,
+			}
+
+			err := workloadScale.SetDesiredReplicas(context.TODO(), pa, tc.desired)
+
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			if tc.wantPlan == "" {
+				assert.Empty(t, plans)
+			} else if assert.Len(t, plans, 1) {
+				assert.JSONEq(t, tc.wantPlan, plans[0])
+			}
+			updated := &appsv1.Deployment{}
+			assert.NoError(t, fakeClient.Get(context.TODO(), client.ObjectKey{Namespace: "default", Name: "test-llm"}, updated))
+			assert.Equal(t, int32(1), *updated.Spec.Replicas)
+		})
+	}
+}
+
+// TestAPASleepModeServiceManageCallOutlivesTheReconcileDeadline: Reconcile bounds its context at
+// DefaultReconcileTimeoutDuration (10 s), below a plan's worst case; the SM calls use their own
+// deadline (the client timeout), so an SM slower than the reconcile context still completes. A
+// canceled parent (manager shutdown) still ends the call.
+func TestAPASleepModeServiceManageCallOutlivesTheReconcileDeadline(t *testing.T) {
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method)
 		switch r.URL.Path {
 		case "/models_replicas":
-			assert.Equal(t, "test-llm", r.URL.Query().Get("models"))
-			_, _ = w.Write([]byte(`{"test-llm":2}`))
-		case "/scale_service":
-			scaleCalled = true
-			query := r.URL.Query()
-			assert.Equal(t, "test-llm", query.Get("model_name"))
-			assert.Equal(t, "up", query.Get("scale_type"))
-			assert.Equal(t, "3", query.Get("scale_value"))
-			_, _ = w.Write([]byte(`{"requested":3,"actual":3}`))
-		default:
-			t.Fatalf("unexpected service_manage path: %s", r.URL.Path)
+			_, _ = w.Write([]byte(`{"test-llm":1}`))
+		case "/v2/plans":
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write([]byte(`{"plan_id":"pl-0","status":"done","sleeps":[],` +
+				`"wakes":[{"model":"test-llm","status":"done","awake_before":1,"awake_after":2}]}`))
 		}
 	}))
 	defer server.Close()
-
 	pa := &autoscalingv1alpha1.PodAutoscaler{
 		ObjectMeta: v1.ObjectMeta{Namespace: "default"},
 		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
 			ScalingStrategy: autoscalingv1alpha1.APA,
-			ScaleTargetRef: corev1.ObjectReference{
-				Kind:       "Deployment",
-				Name:       "test-llm",
-				APIVersion: "apps/v1",
-			},
+			ScaleTargetRef:  corev1.ObjectReference{Kind: "Deployment", Name: "test-llm"},
 		},
 	}
-	deployment := &appsv1.Deployment{
-		ObjectMeta: v1.ObjectMeta{
-			Name:      "test-llm",
-			Namespace: "default",
+	client := server.Client()
+	client.Timeout = 30 * time.Second
+	ws := &workloadScale{serviceManageURL: server.URL, serviceManageHTTPClient: client, sleepModeEnabled: true}
+
+	// The reconcile context expires while the SM is still executing the plan.
+	reconcileCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	go func() {
+		<-reconcileCtx.Done()
+		close(release) // the SM answers only after the reconcile deadline
+	}()
+	assert.NoError(t, ws.SetDesiredReplicas(reconcileCtx, pa, 2))
+
+	// Shutdown: a canceled parent ends the call.
+	shutdownCtx, stop := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	blocked := make(chan struct{})
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models_replicas" {
+			_, _ = w.Write([]byte(`{"test-llm":1}`))
+			return
+		}
+		_, _ = io.ReadAll(r.Body) // the server notices a closed connection only once the body is read
+		close(blocked)
+		<-r.Context().Done()
+	})
+	go func() { stopped <- ws.SetDesiredReplicas(shutdownCtx, pa, 2) }()
+	<-blocked
+	stop()
+	select {
+	case err := <-stopped:
+		assert.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a canceled parent context did not end the service-manager call")
+	}
+}
+
+// The reconcile deadline fires first, then the outer (manager) context is canceled: the call ends.
+func TestAPASleepModeServiceManageCallEndsOnShutdownAfterReconcileDeadline(t *testing.T) {
+	blocked := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models_replicas" {
+			_, _ = w.Write([]byte(`{"test-llm":1}`))
+			return
+		}
+		_, _ = io.ReadAll(r.Body)
+		close(blocked)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	pa := &autoscalingv1alpha1.PodAutoscaler{
+		ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
+			ScalingStrategy: autoscalingv1alpha1.APA,
+			ScaleTargetRef:  corev1.ObjectReference{Kind: "Deployment", Name: "test-llm"},
 		},
-		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1)},
 	}
-	scheme := runtime.NewScheme()
-	_ = autoscalingv1alpha1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pa, deployment).Build()
-	workloadScale := &workloadScale{
-		client:                  fakeClient,
-		serviceManageURL:        server.URL,
-		serviceManageHTTPClient: server.Client(),
-		sleepModeEnabled:        true,
+	client := server.Client()
+	client.Timeout = 60 * time.Second
+	ws := &workloadScale{serviceManageURL: server.URL, serviceManageHTTPClient: client, sleepModeEnabled: true}
+
+	outer, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	ctx := context.WithValue(outer, outerContextKey{}, outer)
+	ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond) // what Reconcile does
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- ws.SetDesiredReplicas(ctx, pa, 2) }()
+	<-blocked
+	<-ctx.Done() // the reconcile deadline fired; the call must still be running
+	select {
+	case err := <-done:
+		t.Fatalf("call ended on the reconcile deadline: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
+	shutdown()
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("manager shutdown after the reconcile deadline did not end the service-manager call")
+	}
+}
 
-	err := workloadScale.SetDesiredReplicas(context.TODO(), pa, 5)
+func TestAPASleepModeConfigServiceManageTimeout(t *testing.T) {
+	t.Setenv("APA_SCALE_SLEEP_MODE", "1")
+	t.Setenv("SERVICE_MANAGE_URL", "http://sm.test:8000")
 
+	t.Setenv("SERVICE_MANAGE_TIMEOUT_S", "")
+	config, err := newServiceManageConfigFromEnv()
 	assert.NoError(t, err)
-	assert.True(t, scaleCalled)
-	updated := &appsv1.Deployment{}
-	assert.NoError(t, fakeClient.Get(context.TODO(), client.ObjectKey{Namespace: "default", Name: "test-llm"}, updated))
-	assert.Equal(t, int32(1), *updated.Spec.Replicas)
+	assert.Equal(t, 360*time.Second, config.timeout) // the SM's api_call_timeout_s
+
+	t.Setenv("SERVICE_MANAGE_TIMEOUT_S", "400.5")
+	config, err = newServiceManageConfigFromEnv()
+	assert.NoError(t, err)
+	assert.Equal(t, 400500*time.Millisecond, config.timeout)
+
+	for _, bad := range []string{"0", "-1", "soon"} {
+		t.Setenv("SERVICE_MANAGE_TIMEOUT_S", bad)
+		_, err = newServiceManageConfigFromEnv()
+		assert.ErrorContains(t, err, "SERVICE_MANAGE_TIMEOUT_S")
+	}
 }
 
 func TestAPASleepModeConfigRequiresServiceManageURL(t *testing.T) {

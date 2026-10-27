@@ -197,6 +197,43 @@ def test_scaler_refusals_trust_an_inferred_clock_shift_only_with_a_clear_margin(
     assert sorted(e["t"] for e in ev if e["src"] == "sm_api") == [20, 40]  # the SM 409 lines are the markers
 
 
+def test_plan_item_refused_is_the_per_model_sm_409_record(arm_dir, tmp_path):
+    """POST /v2/plans: a refused item can come in a 200 and the URL has no model. load.py turns the
+    SM's plan_item_refused event into the per-model 409 record; the plan's own 409 access line (no
+    model) is not one; the baseline 'SM refused' line pairs with the event."""
+    import time
+    from tre_eval import load as L
+    from tre_eval import timeseries as T
+    from test_eval_metrics import _utc, add_new_collectors
+    add_new_collectors(arm_dir)  # SM on n2, 10 s ahead of the reference clock
+    rec = {"event": "plan_item_refused", "plan_id": "bl-1", "model": "m-b", "kind": "wake",
+           "reason": "slot_occupied", "error": "gpu_busy"}
+    with open(os.path.join(arm_dir, "sm.log"), "a") as fh:
+        fh.write(f"{_utc(T0 + 70)} WARNING tre_sm.api.v2: {json.dumps(rec)}\n")
+    with open(os.path.join(arm_dir, "sm.ts.log"), "a") as fh:
+        fh.write('1970-01-12T13:47:50.200000000Z INFO:     10.0.0.1:5 - "POST /v2/plans HTTP/1.1" 409 Conflict\n')
+    arm = L.load_arm(arm_dir)
+    plans = [e for e in arm.sm_access if e["path"] == "/v2/plans"]
+    assert [(e["model"], e["status"]) for e in plans] == [("m-b", 409), (None, 409)]
+    assert plans[0]["ts"] == pytest.approx(T0 + 60.0) and plans[0]["plan_id"] == "bl-1"
+    rows = [{"t": str(e["t"]), "source": e["source"], "kind": e["kind"], "model": e["model"] or "",
+             "target": e["target"] or "", "value": str(e["value"])} for e in T.events(arm) if e["source"] == "sm_api"]
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    e = T0 + 60.5  # scaler on n1 (no offset): its line 0.5 s after the SM answered
+    (raw / "baseline-scaler.log").write_text(
+        time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(e)) + f",{int(round(e % 1 * 1000)):03d} WARNING x.loop "
+        "SM refused m-b up->2: {'code': 409, 'reason': 'slot_occupied', 'elapsed_s': 0.1}\n")
+    clock = V._Clock({"load_start_epoch": arm.t_load, "clock_offsets_s": {"n1": 0.0, "n2": 10.0},
+                      "component_nodes": {"baseline-scaler": "n1"}})
+    warns = []
+    ev = V.build_events(rows, str(raw), clock, warns.append)
+    ref = [x for x in ev if x["kind"] == "refusal"]
+    assert [(x["src"], x["model"]) for x in ref] == [("baseline", "m-b")]
+    assert ref[0]["t"] == pytest.approx(T0 + 60.0 - arm.t_load, abs=1e-3)  # drawn at the SM's time
+    assert not any("without a matching" in w for w in warns)
+
+
 def test_apa_window_value_follows_the_log_else_the_trailing_mean_and_recorded_thresholds(tmp_path):
     import time
     with open(tmp_path / "apa_crs_before.yaml", "w") as fh:  # recorded CR: not the defaults
@@ -232,3 +269,26 @@ def test_apa_window_value_follows_the_log_else_the_trailing_mean_and_recorded_th
     for i in range(60):  # trailing 10 s mean of the routable cross-pod series
         xs = [x for x in kv[max(0, i - 9):i + 1] if x is not None]
         assert series[i] == (pytest.approx(sum(xs) / len(xs), rel=1e-3) if xs else None)
+
+
+def test_a_whole_plan_refusal_pairs_its_scaler_lines_by_plan_id(tmp_path):
+    """Review 2026-10-28 (M3): a whole-plan refusal (409 writer_busy) is one SM access line without
+    a model and one scaler line per model of the plan, all with the plan's plan_id: the lines pair
+    as a group with that access line (no 'without a matching' warning). A line without plan_id
+    (older scaler) never pairs this way."""
+    import time
+    clock = V._Clock({"load_start_epoch": T0, "clock_offsets_s": {"n1": 0.0},
+                      "component_nodes": {"baseline-scaler": "n1"}})
+    e = T0 + 30.5  # the scaler stamps its lines 0.5 s after the SM answered
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(e)) + f",{int(round(e % 1 * 1000)):03d} WARNING x.loop "
+    (tmp_path / "baseline-scaler.log").write_text("".join(
+        stamp + f"SM refused {m} up->2: {{'code': 409, 'error': 'writer_busy', 'elapsed_s': 0.1, "
+                f"'plan_id': 'bl-7'}}\n" for m in ("m-a", "m-b")))
+    rows = [{"t": "30.0", "source": "sm_api", "kind": "POST /v2/plans", "model": "", "target": "/v2/plans",
+             "value": "409"}]
+    warns = []
+    ev = V.build_events(rows, str(tmp_path), clock, warns.append)
+    ref = [x for x in ev if x["kind"] == "refusal"]
+    assert sorted((x["src"], x["model"]) for x in ref) == [("baseline", "m-a"), ("baseline", "m-b")]
+    assert all(x["t"] == pytest.approx(30.0, abs=1e-3) for x in ref)  # drawn at the SM's time
+    assert not any("without a matching" in w for w in warns)

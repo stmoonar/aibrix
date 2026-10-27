@@ -18,6 +18,10 @@ MODELS = tuple(m for m in os.environ.get("MODELS", "dsqwen-7b,dsllama-8b,dsqwen-
 TP = {k: int(v) for k, v in (p.split("=", 1) for p in os.environ.get("TP_SIZES", "dsqwen-14b=2").split(",") if "=" in p)}
 
 
+#: Baseline decision actions that scale -> direction (``queued_*``: scaler 2026-10-28).
+_BL_DIRECTION = {"up": "up", "down": "down", "queued_up": "up", "queued_down": "down"}
+
+
 def load(p):
     try:
         with open(p) as fh:
@@ -89,6 +93,8 @@ def arm_row(d):
             if '" 409' in line or " 409 " in line:
                 if "/target" in line:
                     sm409["target"] += 1
+                elif "/v2/plans" in line:
+                    sm409["plans"] += 1
                 elif "/scale_service" in line:
                     sm409["scale_service"] += 1
                 else:
@@ -108,24 +114,27 @@ def arm_row(d):
         bl["reversals_60s"] = {k[1]: v for k, v in mt.items() if k[0] == "tre_bl_direction_reversals_60s_total"}
         bl["policy_events"] = {f"{k[1]}:{k[2]}": v for k, v in mt.items()
                                if k[0] == "tre_bl_policy_events_total" and v}
-        # flips: dispatched direction changes per model
+        # flips: direction changes of the scale decisions per model (queued_up / queued_down =
+        # a decision waiting behind the plan in flight, scaler 2026-10-28; older runs: up / down)
         flips = Counter()
         last = {}
         for l in lines:
-            if l["action"] in ("up", "down"):
-                if last.get(l["model"]) and last[l["model"]] != l["action"]:
+            direction = _BL_DIRECTION.get(l["action"])
+            if direction is not None:
+                if last.get(l["model"]) and last[l["model"]] != direction:
                     flips[l["model"]] += 1
-                last[l["model"]] = l["action"]
+                last[l["model"]] = direction
         bl["flips"] = dict(flips)
         pol = lines[0].get("policy")
         if pol == "preserve":
             split = Counter()
             below = 0
             for l in lines:
-                if l["action"] in ("up", "down"):
+                direction = _BL_DIRECTION.get(l["action"])
+                if direction is not None:
                     rsn = l.get("reason", "")
                     tier = "tier1" if rsn.startswith("tier1") else "tier2" if rsn.startswith("tier2") else rsn
-                    split[f"{tier}:{l['action']}"] += 1
+                    split[f"{tier}:{direction}"] += 1
                     n = (l.get("inputs") or {}).get("tier1_n")
                     if n is not None and l["clamped"] < n:
                         below += 1

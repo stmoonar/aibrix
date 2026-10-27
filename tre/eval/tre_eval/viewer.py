@@ -369,7 +369,31 @@ def _match(sm409: list[dict], items: list[tuple[float, str, float]]) -> list[int
     return out
 
 
-def _refusals(raw: str | None, clock: _Clock, sm409: list[dict], warn) -> tuple[list[dict], bool] | None:
+def _plan_groups(lines: list, taken: list[int | None], plan409: list[dict], off: float) -> dict[int, float]:
+    """Whole-plan refusals (``POST /v2/plans`` 409 without items, e.g. ``writer_busy``): the scaler logs one
+    line per model of the plan, all with the same ``plan_id``, the SM one access line without a model.
+    The not yet paired lines of one ``plan_id`` pair as a group with the closest unused plan 409 line
+    (same window as :func:`_match`). Returns line index -> SM time. Lines without ``plan_id`` (older
+    scalers) never pair here."""
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, ((_t, _mt, d, _log, _el), j) in enumerate(zip(lines, taken)):
+        if j is None and d.get("plan_id"):
+            groups[str(d["plan_id"])].append(i)
+    used: set[int] = set()
+    out: dict[int, float] = {}
+    for members in sorted(groups.values(), key=lambda m: lines[m[0]][0]):
+        t = min(lines[i][0] for i in members) - off
+        el = max(lines[i][4] for i in members)
+        k = min((k for k, e in enumerate(plan409) if k not in used and PAIR_LO <= t - e["t"] <= PAIR_HI + el),
+                key=lambda k: abs(t - plan409[k]["t"]), default=None)
+        if k is not None:
+            used.add(k)
+            out.update({i: plan409[k]["t"] for i in members})
+    return out
+
+
+def _refusals(raw: str | None, clock: _Clock, sm409: list[dict], warn,
+              plan409: list[dict] | None = None) -> tuple[list[dict], bool] | None:
     """baseline-scaler.log 'SM refused' lines (None when there is no log), each paired with its SM 409
     access line (events.csv, SM clock corrected by load.py) and drawn at that SM time: the same reference
     clock as the decision markers. The log is stamped by the scaler host's clock, which load.py never reads:
@@ -417,17 +441,19 @@ def _refusals(raw: str | None, clock: _Clock, sm409: list[dict], warn) -> tuple[
                  f"{len(lines)} refusal(s) are listed in the event table as 'time uncertain' and not drawn; the SM 409 "
                  "access lines are drawn instead")
     pairs = pair(best) if sure else [None] * len(lines)
+    whole = _plan_groups(lines, pairs, plan409 or [], best) if sure else {}
     out = []
-    for (t, mt, d, log, _), j in zip(lines, pairs):
-        if j is not None:
+    for i, ((t, mt, d, log, _), j) in enumerate(zip(lines, pairs)):
+        sm_t = sm409[j]["t"] if j is not None else whole.get(i)
+        if sm_t is not None:
             d = {**d, "scaler_log_t": _rt(t - best)}
-        out.append({"t": sm409[j]["t"] if j is not None else t - best, "model": mt.group(3),
-                    "binding": d.get("binding_id"), "matched": j is not None, "uncertain": not sure,
+        out.append({"t": sm_t if sm_t is not None else t - best, "model": mt.group(3),
+                    "binding": d.get("binding_id"), "matched": sm_t is not None, "uncertain": not sure,
                     "reason": d.get("reason") or d.get("error"), "dir": mt.group(4), "to": int(mt.group(5)),
                     "detail": d, "log": log})
     if sure:
         n_sm = len(sm409) - sum(j is not None for j in pairs)
-        n_sc = sum(j is None for j in pairs)
+        n_sc = sum(j is None and i not in whole for i, j in enumerate(pairs))
         if n_sm:
             warn(f"{n_sm} SM 409 response(s) without a matching baseline-scaler 'SM refused' line (not drawn)")
         if n_sc:
@@ -440,6 +466,7 @@ def build_events(ev_rows: list[dict], raw: str | None, clock: _Clock, warn=lambd
     ev: list[dict] = []
     open_wake: dict[str, dict] = {}
     sm409 = []
+    plan409 = []  # a plan's own 409 access lines (no model): whole-plan refusals, paired by plan_id
     for r in ev_rows:
         t, src, kind, model = _f(r.get("t")), r.get("source"), r.get("kind", ""), r.get("model") or None
         if t is None:
@@ -480,9 +507,14 @@ def build_events(ev_rows: list[dict], raw: str | None, clock: _Clock, warn=lambd
         elif src == "tre_counterfactual":
             ev.append({"t": _rt(t), "kind": "counterfactual", "model": model, "src": "tre (observe)",
                        "reason": det.get("reason"), "value": _f(r.get("value")), "detail": det})
+        elif src == "sm_api" and str(r.get("value")) == "409" and b == "/v2/plans" and model is None:
+            # A plan's own 409 access line has no model: its refused items come as per-model
+            # plan_item_refused records (load._parse_sm), which pair instead; a whole-plan refusal
+            # (writer_busy) pairs with the scaler lines of its plan_id.
+            plan409.append({"t": t, "model": None, "path": b, "kind": kind})
         elif src == "sm_api" and str(r.get("value")) == "409":
             sm409.append({"t": t, "model": model, "path": b, "kind": kind})
-    got = _refusals(raw, clock, sm409, warn)
+    got = _refusals(raw, clock, sm409, warn, plan409)
     ref, sure = got if got is not None else ([], False)
     if not sure:  # no scaler log, or its clock is uncertain: the SM 409 lines (reference clock) are the markers
         for e in sm409:

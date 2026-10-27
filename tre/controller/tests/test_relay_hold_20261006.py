@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import ClusterView, PlanConfig, TransferIntent, build_plan
@@ -15,6 +14,7 @@ from tre_controller.sm_client import ModelFloor, ServiceManagerError
 from test_action_queue_review3 import ScriptedSM, transfer_body
 from test_controller_transfer_20261002 import D, R, _e1
 from test_planner_slot_occupancy import TOPOLOGY, _cls
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 FLOORS = {D: ModelFloor(routable=8, floor=1, floor_headroom=7), R: ModelFloor(routable=1, floor=1, floor_headroom=0)}
 

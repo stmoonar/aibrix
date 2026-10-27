@@ -139,7 +139,9 @@ SM_RESTART_SEEN_KEY = "tre:v2:sm:restart_seen"
 #: STRING (any value, with a TTL) per GPU: test hooks of the service-manager, read
 #: only while registry service_manager.test_hooks is true. ``refuse_wake`` refuses
 #: a wake on the GPU (409 gpu_busy); ``fail_wake`` makes the wake fail after
-#: /wake_up (the engine is awake: exercises the compensating sleep).
+#: /wake_up (the engine is awake: exercises the compensating sleep);
+#: ``refuse_sleep`` fails a plan sleep on the GPU before anything is hidden (its
+#: dependents are refused ``donor_sleep_failed``).
 SM_FAULT_KEY_PREFIX = "tre:v2:sm:fault:"
 #: LIST of recent gateway-ack latencies (ms), newest first, capped.
 SM_SLEEP_ACK_LATENCY_KEY = "tre:v2:sm:sleep_ack_latency_ms"

@@ -790,7 +790,15 @@ def _classify_bl_sm_failures(log: Path, total: int) -> tuple[dict, int]:
                     r = ast.literal_eval(mt.group(1))
                 except (ValueError, SyntaxError):
                     continue
-                if isinstance(r, dict) and r.get("code") == 409 and r.get("reason") in _PLACEMENT_REFUSALS:
+                # A plan's partial wake item (200 with ``unfilled``, located by its first refusal) is
+                # the same placement refusal for the replicas the SM could not place. Known limit: the
+                # item is explained by its FIRST refusal only - when several replicas stayed unplaced
+                # for different reasons (one slot_occupied, one resident_unknown), the others are not
+                # looked at, so such an item counts as a placement refusal although a later reason
+                # might signal a fault (the SM's plan_item_refused event / the item's refusals list
+                # every reason).
+                placed_part = r.get("code") == 200 and bool(r.get("unfilled")) if isinstance(r, dict) else False
+                if isinstance(r, dict) and (r.get("code") == 409 or placed_part) and r.get("reason") in _PLACEMENT_REFUSALS:
                     refusals[r["reason"]] = refusals.get(r["reason"], 0) + 1
     except OSError:
         pass

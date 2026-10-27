@@ -21,7 +21,6 @@ from tre_common.registry import (
     load_registry,
     parse_scaling_config,
 )
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import (
@@ -36,6 +35,7 @@ from tre_controller.planning.planner import (
 from tre_sm.allocator.slots import Binding, Slot
 
 from test_loop_ticks import _registry as _base_registry
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 TAU = TauThresholds.from_control()  # tau_crit 0.8, tau_low 1.0, tau_high 1.25
 

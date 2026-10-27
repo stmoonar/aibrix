@@ -1,5 +1,6 @@
 """Test doubles for the baseline shell: in-memory Redis, a stub SM HTTP server, a fake
-cluster that applies target calls, and a scripted policy. No network beyond 127.0.0.1."""
+cluster that applies plans (``POST /v2/plans``), and a scripted policy. No network beyond
+127.0.0.1."""
 from __future__ import annotations
 
 import json
@@ -105,39 +106,115 @@ class FakeRedis:
         return out
 
 
+def error_body(result: SMResult) -> dict:
+    """The structured 409 body an SM item ``error`` carries, from an :class:`SMResult`."""
+    body = {"detail": result.detail, "error": result.error, "reason": result.reason, "node": result.node,
+            "gpu_ids": list(result.gpu_ids) if result.gpu_ids is not None else None, "scope": result.scope,
+            "retry_after_s": result.retry_after_s, "blocking_binding_id": result.blocking_binding_id}
+    return {k: v for k, v in body.items() if v is not None}
+
+
+#: The refusal of a wake the fake cluster cannot place (``FakeCluster.place_limit``).
+SLOT_OCCUPIED = SMResult(ok=False, code=409, error="gpu_busy", reason="slot_occupied", node="n", gpu_ids=(0,),
+                         scope="gpu", retry_after_s=30.0, blocking_binding_id="x/n/0")
+
+
 @dataclass
 class FakeCluster:
-    """Awake counts per model; ``put_target`` applies a target body like the SM does."""
+    """Awake counts per model; ``post_plan`` applies a plan like the SM does (one item per
+    model: wake ``at_least`` grow-only, sleep ``at_most``) and answers with its items."""
 
     awake: dict[str, int]
+    #: (model, item) per plan item, in the order the plans ran.
     calls: list[tuple[str, dict]] = field(default_factory=list)
+    #: Every plan body received.
+    plans: list[dict] = field(default_factory=list)
     delay_s: float = 0.0
     refuse: set = field(default_factory=set)
+    #: ``hook(model, item)`` -> an SMResult refusal for that item (its fields become the
+    #: item's ``error``), or None to apply it.
+    hook: Optional[Callable[[str, dict], Optional[SMResult]]] = None
+    #: Per model, the most replicas the fake can place; a wake past it is ``unfilled``
+    #: (``partial`` when some woke, else ``refused``), located by ``SLOT_OCCUPIED``.
+    place_limit: dict = field(default_factory=dict)
+    #: Set to hold every plan until it is set again (a plan in flight).
+    gate: Optional[threading.Event] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
-    #: ``/v2/state`` version: bumped by every applied target.
+    #: ``/v2/state`` version: bumped by every change.
     version: int = 1
-    #: (model, "start" | "end") in the order the calls ran.
+    #: ("plan", "start" | "end") in the order the plans ran.
     trace: list = field(default_factory=list)
+    in_flight: int = 0
+    max_in_flight: int = 0
 
-    def put_target(self, model: str, body: Mapping[str, Any]) -> SMResult:
+    def post_plan(self, body: Mapping[str, Any]) -> SMResult:
         with self.lock:
-            self.calls.append((model, dict(body)))
-            self.trace.append((model, "start"))
+            self.plans.append(json.loads(json.dumps(body)))
+            self.trace.append(("plan", "start"))
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        if self.gate is not None:
+            self.gate.wait(5.0)
         if self.delay_s:
             time.sleep(self.delay_s)
-        if model in self.refuse:
-            with self.lock:
-                self.trace.append((model, "end"))
-            return SMResult(ok=False, code=409, error="http_error", detail="refused")
+        out: dict[str, list] = {"sleeps": [], "wakes": []}
+        changed = problems = False
+        for kind in ("sleeps", "wakes"):
+            for index, item in enumerate(body.get(kind) or ()):
+                model = item["model"]
+                refusal = self.hook(model, item) if self.hook else None
+                if refusal is None and model in self.refuse:
+                    refusal = SMResult(ok=False, code=409, error="http_error", detail="refused")
+                with self.lock:
+                    self.calls.append((model, dict(item)))
+                    before = self.awake[model]
+                    entry: dict[str, Any] = {"index": index, "model": model}
+                    if refusal is not None:
+                        after = before
+                        entry.update(status="refused", error=error_body(refusal))
+                    elif kind == "wakes":
+                        want = int(item["at_least"])
+                        after = max(before, min(want, int(self.place_limit.get(model, want))))
+                        unfilled = max(0, want - after)
+                        entry.update(status="noop" if want <= before else
+                                     "done" if not unfilled else "partial" if after > before else "refused",
+                                     unfilled=unfilled, refusals=[error_body(SLOT_OCCUPIED)] if unfilled else [])
+                        if unfilled and after == before:
+                            # As the SM: ``error`` = the first refusal of an item that woke
+                            # nothing (or a failed wake); a partial item has none - its
+                            # cause is its first refusal.
+                            entry["error"] = error_body(SLOT_OCCUPIED)
+                    else:
+                        after = min(before, int(item["at_most"]))
+                        entry.update(status="done" if after < before else "noop", taken=before - after,
+                                     clamped_by_floor=False)
+                    if after != before:
+                        self.awake[model] = after
+                        self.version += 1
+                        changed = True
+                    entry.update(awake_before=before, awake_after=after)  # both kinds (SM 2026-10-28)
+                    if kind == "wakes":
+                        entry["woke"] = [{"serve_id": f"{model}-{i}"} for i in range(before, after)]
+                    problems = problems or entry["status"] in ("refused", "failed")
+                out[kind].append(entry)
         with self.lock:
-            target = int(body["wake_replicas"])
-            if body.get("at_least"):
-                self.awake[model] = max(self.awake[model], target)
-            else:
-                self.awake[model] = target
-            self.version += 1
-            self.trace.append((model, "end"))
-        return SMResult(ok=True, code=200, raw={"model": model})
+            self.trace.append(("plan", "end"))
+            self.in_flight -= 1
+        status = ("failed" if problems else "noop") if not changed else ("partial" if problems else "done")
+        response = {"plan_id": body.get("plan_id"), "version": self.version, "status": status, **out}
+        if status == "failed":  # 409 partial: nothing changed, an item refused (full body)
+            return SMResult(ok=False, code=409, error="partial", reason="partial",
+                            raw={**response, "error": "partial", "reason": "partial"})
+        return SMResult(ok=True, code=200, raw=response)
+
+
+def plan_done(body: Mapping[str, Any]) -> dict:
+    """A 200 plan answer with every item ``done`` (the stub SM's default)."""
+    return {"plan_id": body.get("plan_id"), "status": "done",
+            "sleeps": [{"index": i, "model": it["model"], "status": "done", "taken": 1}
+                       for i, it in enumerate(body.get("sleeps") or ())],
+            "wakes": [{"index": i, "model": it["model"], "status": "done", "unfilled": 0, "refusals": []}
+                      for i, it in enumerate(body.get("wakes") or ())]}
 
 
 def limits(name: str, lo: int = 1, hi: int = 4, tp: int = 1) -> ModelLimits:
@@ -205,15 +282,16 @@ class ScriptedPolicy:
 
 
 class StubSM:
-    """Stub SM HTTP server on 127.0.0.1: records PUT bodies; the reply per call comes from
-    ``responder(model, body) -> (status, body_bytes, content_type)``; optional delay."""
+    """Stub SM HTTP server on 127.0.0.1: records ``POST /v2/plans`` bodies; the reply per call
+    comes from ``responder(body) -> (status, body_bytes, content_type)`` (default: every item
+    done); optional delay."""
 
     def __init__(self, responder=None, delay_s: float = 0.0,
                  state: Optional[dict] = None) -> None:
         self.requests: list[tuple[str, str, dict, dict]] = []
-        #: time.monotonic() at which each PUT arrived (same order as ``requests``).
+        #: time.monotonic() at which each POST arrived (same order as ``requests``).
         self.arrivals: list[float] = []
-        self.responder = responder or (lambda model, body: (200, json.dumps({"model": model}).encode(), "application/json"))
+        self.responder = responder or (lambda body: (200, json.dumps(plan_done(body)).encode(), "application/json"))
         self.delay_s = delay_s
         self.state = state or {"version": 1, "models": {}, "bindings": []}
         stub = self
@@ -225,15 +303,17 @@ class StubSM:
                 else:
                     self._send(404, b"{}", "application/json")
 
-            def do_PUT(self):  # noqa: N802
+            def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("content-length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
-                model = self.path.split("/")[3] if self.path.startswith("/v2/models/") else ""
                 stub.arrivals.append(time.monotonic())
-                stub.requests.append(("PUT", self.path, body, {k.lower(): v for k, v in self.headers.items()}))
+                stub.requests.append(("POST", self.path, body, {k.lower(): v for k, v in self.headers.items()}))
+                if self.path != "/v2/plans":
+                    self._send(404, b"{}", "application/json")
+                    return
                 if stub.delay_s:
                     time.sleep(stub.delay_s)
-                status, payload, ctype = stub.responder(model, body)
+                status, payload, ctype = stub.responder(body)
                 try:
                     self._send(status, payload, ctype)
                 except (BrokenPipeError, ConnectionResetError):

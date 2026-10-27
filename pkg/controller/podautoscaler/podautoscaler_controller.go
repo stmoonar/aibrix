@@ -278,6 +278,9 @@ type PodAutoscalerReconciler struct {
 //+kubebuilder:rbac:groups=orchestration.aibrix.ai,resources=stormservices,verbs=get;list;watch;patch
 
 func (r *PodAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// Keep the pre-timeout context: service-manager calls outlive the 10 s reconcile deadline but must
+	// still end when the manager shuts down (see serviceManageContext).
+	ctx = context.WithValue(ctx, outerContextKey{}, ctx)
 	ctx, cancel := context.WithTimeout(ctx, DefaultReconcileTimeoutDuration)
 	defer cancel()
 

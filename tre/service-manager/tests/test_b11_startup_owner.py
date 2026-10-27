@@ -27,7 +27,7 @@ from tre_sm.state.supervisor import FleetSupervisor
 
 from sm_test_fakes import fence
 from test_review2_sleep import _desired
-from test_review4_sm import _deployment_name, _gate_world
+from test_review4_sm import _cold_start, _deployment_name, _gate_world
 from sm_test_fakes import pod
 
 
@@ -69,7 +69,7 @@ def _fail_cold_start(world):
         success=False, message="readiness timeout"
     )
     with pytest.raises(ValueError, match="readiness timeout"):
-        world.service.put_model_target("m1", wake_replicas=2)
+        _cold_start(world)
     created = world.runtime.created
     assert created and world.runtime.deleted == created  # rolled back
     # the first Pod is gone (deleted during its vLLM load)
@@ -171,10 +171,10 @@ def test_b11_a_legitimate_pod_is_still_admitted_with_its_starting_lease():
 def test_b11_a_cold_start_still_admits_its_own_pod_with_the_owner_check():
     world = _registry_slot_world()
 
-    world.service.put_model_target("m1", wake_replicas=2)
+    _cold_start(world)
 
     new_pod = world.runtime.pending[world.runtime.created[0]][0]
-    assert world.runtime.admitted[new_pod]["operation_id"] == "put_model_target-1"
+    assert world.runtime.admitted[new_pod]["operation_id"] == "defrag-1"
     assert new_pod in world.runtime.owner_checks
     assert world.leases.held["m1/node-a/1"][1] == "awake"
 

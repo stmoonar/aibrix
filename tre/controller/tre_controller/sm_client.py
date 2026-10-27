@@ -28,8 +28,8 @@ WAKE_ERROR_CODES = frozenset({
 #: 409 ``error`` codes the service-manager answers BEFORE it changes anything
 #: (2026-10-02): the routable view unreadable (fail closed), the replica floor, the
 #: writer lock busy, and the located wake refusals of the prepare step. ``wake_failed``
-#: (the wake itself failed and was settled) and ``partial`` (a transfer: see its
-#: pairs) are not in it.
+#: (the wake itself failed and was settled) and ``partial`` (a plan: see its
+#: items) are not in it.
 NOT_EXECUTED_CODES = frozenset({
     "routable_unknown", "floor_violation", "writer_busy",
     "gpu_busy", "resident_loading", "lease_conflict", "resident_awake", "truth_unavailable", "wake_conflict",
@@ -196,166 +196,32 @@ class ServiceManagerClient:
         except ServiceManagerError as exc:
             return exc.result()
 
-    async def scale_model(
-        self,
-        model: str,
-        delta: int,
-        *,
-        sleep_path: str | None = None,
-        drain_budget_s: float | None = None,
-    ) -> dict:
-        """RELATIVE scale (current awake + ``delta``, read at dispatch). Not
-        idempotent: callers never retry it (review 3 P2-1) - a retried upscale
-        uses :meth:`scale_model_to` with an absolute target."""
+    async def post_plan(self, request: dict) -> dict:
+        """``POST /v2/plans`` (design 20261027-sm-plans §3): sleep items and wake items
+        of one decision under ONE writer-lock hold of the service-manager. Never re-sent
+        by the client (a SafeScale commit re-sends an idempotent plan itself: named pods,
+        absolute targets).
+
+        Returns ``{"ok": True, "status": 200, "response": body}`` on 200 (which may still
+        hold refused / partial items - account per item). A 409 ``partial`` (nothing
+        changed, at least one item refused or failed) returns ``ok: False`` with that body
+        as ``response`` and ``partial: True``. Any other failure is
+        :meth:`ServiceManagerError.result` (whole-plan refusals ``writer_busy`` /
+        ``routable_unknown`` / 400 carry ``not_executed``; a timeout or a transport error
+        leaves the outcome unknown)."""
         try:
-            counts = await self._model_counts(model)
-            current = counts["awake"]
-            serving_floor = 1 if counts["bound"] > 0 and current > 0 and int(delta) < 0 else 0
-            target = max(serving_floor, current + int(delta))
-            payload: dict = {"wake_replicas": target}
-            payload.update(_sleep_fields(sleep_path, drain_budget_s))
-            response = await self._request(
-                "PUT", f"/v2/models/{model}/target", json=payload, timeout_s=self._slow_timeout_s
-            )
-            return {"ok": True, "response": response}
+            response = await self._request("POST", "/v2/plans", json=request, timeout_s=self._slow_timeout_s)
+            return {"ok": True, "status": 200, "response": response}
         except ServiceManagerError as exc:
             result = exc.result()
             body = exc.body or {}
-            if exc.status == 409 and body.get("error") == "partial" and isinstance(body.get("actions"), list):
-                # An exact growth the SM filled in part (2026-10-06): the body is the
-                # target response (``actions``, ``picked``, ``unfilled``, ``refusals``).
+            if exc.status == 409 and body.get("error") == "partial" and (
+                isinstance(body.get("sleeps"), list) or isinstance(body.get("wakes"), list)
+            ):
                 result["partial"] = True
+                result["not_executed"] = False
                 result["response"] = body
             return result
-
-    async def scale_model_to(self, model: str, target: int) -> dict:
-        """Grow ``model`` to at least ``target`` awake replicas (absolute and
-        grow-only, review 3 P2-1): re-sending it after a success that timed out
-        on the client is a no-op, and it never shrinks a model that meanwhile grew
-        past the target. The SM applies ``at_least`` under its writer lock; the
-        pre-check also keeps a service-manager without ``at_least`` from shrinking."""
-        try:
-            target = int(target)
-            counts = await self._model_counts(model)
-            if counts["awake"] >= target:
-                return {"ok": True, "response": {"model": model, "wake_replicas": target, "actions": [], "noop": True}}
-            response = await self._request(
-                "PUT",
-                f"/v2/models/{model}/target",
-                json={"wake_replicas": target, "at_least": True},
-                timeout_s=self._slow_timeout_s,
-            )
-            return {"ok": True, "response": response}
-        except ServiceManagerError as exc:
-            return exc.result()
-
-    async def scale_model_hinted(self, model: str, delta: int, *, hints: tuple[str, ...]) -> dict:
-        """Grow ``model`` by ``delta`` awake replicas, waking the sleeping bindings
-        ``hints`` names when the service-manager can (S5): it picks the GPUs itself
-        (registry placement policy) and substitutes a hint it cannot wake; the
-        response's ``picked`` says where the replicas went. Relative (awake read at
-        dispatch) and grow-only (``at_least``); never retried."""
-        try:
-            counts = await self._model_counts(model)
-            target = counts["awake"] + int(delta)
-            response = await self._request(
-                "PUT",
-                f"/v2/models/{model}/target",
-                json={"wake_replicas": target, "at_least": True, "hints": list(hints)},
-                timeout_s=self._slow_timeout_s,
-            )
-            return {"ok": True, "response": response}
-        except ServiceManagerError as exc:
-            return exc.result()
-
-    async def transfer(
-        self,
-        donor_model: str,
-        receiver_model: str,
-        count: int,
-        *,
-        sleep_path: str = "urgent",
-    ) -> dict:
-        """``POST /v2/transfers`` (2026-10-02, design 20261002-controller-transfer): the
-        service-manager hands ``count`` donor replicas' GPUs to the receiver model -
-        it picks the pairs (same GPUs, TP coverage), sleeps the donors and wakes the
-        receivers in one request under its global writer lock: when the call returns,
-        the relay has completed or failed (no follow-up tracking). Never retried (not
-        idempotent; the planner re-plans). A writer-lock wait that timed out is a 409
-        ``writer_busy`` (``not_executed``).
-
-        Returns ``{"ok": True, "response": body}`` on 200 (which may still be a
-        PARTIAL transfer - account by ``done`` / ``taken`` / ``unfilled``, never by
-        ``count``). A 409 that carries the transfer response (``error: partial``, no
-        pair completed) returns ``ok: False`` with that body as ``response`` and
-        ``partial: True``. A 404 (service-manager without the endpoint) returns
-        ``ok: False`` with ``unsupported: True``."""
-        try:
-            response = await self._request(
-                "POST",
-                "/v2/transfers",
-                json={
-                    "donor_model": donor_model,
-                    "receiver_model": receiver_model,
-                    "count": int(count),
-                    "sleep_path": sleep_path,
-                },
-                timeout_s=self._slow_timeout_s,
-            )
-            return {"ok": True, "response": response}
-        except ServiceManagerError as exc:
-            result = exc.result()
-            # A transfer is never re-sent as is (the planner re-plans from a new view).
-            result["retriable"] = False
-            body = exc.body or {}
-            if exc.status == 404:
-                result["unsupported"] = True
-            elif exc.status == 409 and isinstance(body.get("pairs"), list):
-                result["partial"] = True
-                result["response"] = body
-            return result
-
-    async def model_awake(self, model: str) -> dict:
-        """{"ok": True, "awake": n} from the SM state, or a failed result."""
-        try:
-            counts = await self._model_counts(model)
-            return {"ok": True, "awake": counts["awake"]}
-        except ServiceManagerError as exc:
-            return exc.result()
-
-    async def _model_counts(self, model: str) -> dict[str, int]:
-        """Awake / bound counts of ``model`` from GET /v2/state. A malformed
-        answer is a (permanent) ServiceManagerError, never a raw exception."""
-        state = await self.get_state()
-        models = state.get("models", {})
-        counts = models.get(model, {}) if isinstance(models, dict) else None
-        if not isinstance(counts, dict):
-            raise ServiceManagerError(f"malformed /v2/state for {model}: models entry is not an object")
-        try:
-            return {"awake": int(counts.get("awake", 0)), "bound": int(counts.get("bound", 0))}
-        except (TypeError, ValueError) as exc:
-            raise ServiceManagerError(f"malformed /v2/state counts for {model}: {counts!r}") from exc
-
-    async def set_binding_power(
-        self,
-        serve_id: str,
-        *,
-        awake: bool,
-        sleep_path: str | None = None,
-        drain_budget_s: float | None = None,
-    ) -> dict:
-        # Binding-level power (PUT /v2/bindings/{serve_id}/power): used to sleep exactly
-        # one chosen binding (safescale commit of the hidden pod, slot-targeted donor).
-        try:
-            response = await self._request(
-                "PUT",
-                f"/v2/bindings/{serve_id}/power",
-                json={"awake": bool(awake), **_sleep_fields(sleep_path, drain_budget_s)},
-                timeout_s=self._slow_timeout_s,
-            )
-            return {"ok": True, "response": response}
-        except ServiceManagerError as exc:
-            return exc.result()
 
     async def set_routable(self, model: str, hidden_pods: tuple[str, ...]) -> dict:
         try:
@@ -476,15 +342,6 @@ def _opt_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _sleep_fields(sleep_path: str | None, drain_budget_s: float | None) -> dict:
-    fields: dict = {}
-    if sleep_path is not None:
-        fields["sleep_path"] = sleep_path
-    if drain_budget_s is not None:
-        fields["drain_budget_s"] = float(drain_budget_s)
-    return fields
 
 
 def _request_json(method: str, url: str, payload: dict | None, timeout_s: float) -> dict[str, Any]:
