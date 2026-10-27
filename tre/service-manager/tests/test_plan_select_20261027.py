@@ -164,3 +164,13 @@ def test_the_widest_wake_item_goes_first_and_results_keep_the_request_order():
     assert [c.index for c in selection.wakes] == [0, 1]
     assert [(p.binding.serve_id, p.source) for p in selection.wakes[0].picks] == [("r-0", SOURCE_DONOR)]
     assert [(p.binding.serve_id, p.source) for p in selection.wakes[1].picks] == [("t-23", SOURCE_FREE)]
+
+
+def test_tp1_items_of_one_plan_share_contested_free_gpus_round_robin():
+    """H2 (2026-10-28): two TP=1 items each wanting +2 with 2 free GPUs get one each,
+    whatever their order in the request (was: the first item took both)."""
+    fleet = [b("a-0", "a", (0,)), b("a-1", "a", (1,)), b("z-0", "z", (0,)), b("z-1", "z", (1,))]
+    for order in (("a", "z"), ("z", "a")):
+        selection = select(fleet, wakes=[WakeItem(model, at_least=2) for model in order])
+        assert [len(choice.picks) for choice in selection.wakes] == [1, 1], order
+        assert [choice.unfilled for choice in selection.wakes] == [1, 1], order
