@@ -30,7 +30,7 @@ from tre_sm.state.supervisor import FleetSupervisor
 from sm_test_fakes import FakeRedis, FakeSafety, LegacyRedis, fence, pod, registry
 from test_operations import ScriptRedis, _registry as _ops_registry
 from test_review2_sleep import _desired, _startup_world
-from test_review4_sm import _cold_start_world, _gate_world
+from test_review4_sm import _cold_start, _cold_start_world, _gate_world
 from test_supervisor import FakeService
 
 
@@ -269,30 +269,38 @@ def test_an_unrequested_startup_in_active_still_sleeps_the_resident():
     assert result["suspended_binding_ids"] == ["tp2/node-a/0,1"]
 
 
-def test_a_cold_start_requested_through_the_api_is_admitted_in_observe():
-    # The APA arm scales through the SM API: its cold start owns the Pod
-    # (phase starting_binding), so the admission is pre-authorized in observe.
+def test_a_cold_start_of_the_sm_is_admitted_in_observe():
+    # A cold start of the SM itself (a defrag destination) owns the Pod (phase
+    # starting_binding), so the admission is pre-authorized in observe.
     world = _cold_start_world()
     world.service._safety_gate.actuation = "observe"
 
-    world.service.put_model_target("m1", wake_replicas=2)
+    _cold_start(world)
 
     created = world.runtime.created
     assert len(created) == 1
-    assert world.runtime.admitted[world.runtime.pending[created[0]][0]]["operation_id"] == "put_model_target-1"
+    assert world.runtime.admitted[world.runtime.pending[created[0]][0]]["operation_id"] == "defrag-1"
     assert world.service._safety_gate.suppressed == []
 
 
 # ------------------------------------------------------------ SM HTTP API
 def _http_service():
     redis = ScriptRedis()
+    store = StateStore(redis, require_fence=True)
+    coordinator = OperationCoordinator(redis, owner="sm-pod")
+    with coordinator.operation("bootstrap"):  # one sleeping binding to wake
+        store.save([Binding("pod-a", "m1", Slot("node-a", (0,)), awake=False)], expected_version=0)
     service = ServiceManagerV2(
         _ops_registry(),
-        StateStore(redis, require_fence=True),
-        operation_coordinator=OperationCoordinator(redis, owner="sm-pod"),
+        store,
+        operation_coordinator=coordinator,
         safety_gate=FakeSafety("observe"),
     )
     return TestClient(create_app(service))
+
+
+def _target_operations(client):
+    return [op for op in client.get("/v2/operations").json()["operations"] if op["kind"] != "bootstrap"]
 
 
 def test_sm_http_writes_work_in_observe_and_record_the_actor():
@@ -303,7 +311,7 @@ def test_sm_http_writes_work_in_observe_and_record_the_actor():
     )
 
     assert response.status_code == 200
-    [operation] = client.get("/v2/operations").json()["operations"]
+    [operation] = _target_operations(client)
     assert operation["kind"] == "put_model_target" and operation["status"] == "succeeded"
     assert operation["request"]["actor"] == "aibrix-apa"
     supervisor = client.get("/v2/supervisor").json()
@@ -313,5 +321,5 @@ def test_sm_http_writes_work_in_observe_and_record_the_actor():
 def test_the_actor_falls_back_to_user_agent_and_remote_address():
     client = _http_service()
     client.put("/v2/models/m1/target", json={"wake_replicas": 1}, headers={"User-Agent": "Go-http-client/1.1"})
-    [operation] = client.get("/v2/operations").json()["operations"]
+    [operation] = _target_operations(client)
     assert operation["request"]["actor"].startswith("ua=Go-http-client/1.1;addr=")

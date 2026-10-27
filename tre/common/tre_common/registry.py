@@ -1112,7 +1112,7 @@ class ServiceManagerConfig:
     #: running but not Ready past this long is alerted, the lease kept.
     startup_placeholder_max_s: float = 900.0
     #: ``service_manager.test_hooks``: honour the fault-injection keys
-    #: ``tre:v2:sm:fault:<refuse_wake|fail_wake>:<node>/<gpu>`` (acceptance tests
+    #: ``tre:v2:sm:fault:<refuse_wake|fail_wake|refuse_sleep>:<node>/<gpu>`` (acceptance tests
     #: only). Off by default: the keys are then never read.
     test_hooks: bool = False
     #: ``service_manager.k8s_request_timeout_s``: read timeout of every Kubernetes

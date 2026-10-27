@@ -232,6 +232,22 @@ def _cold_start_world(**kwargs):
     )
 
 
+def _cold_start(world, kind="defrag"):
+    """A cold start of m1 on GPU 1 in one writer-lock hold, as its callers do it
+    (desired intent under a guard, the starting lease, the gated start): the
+    defrag destination start is the only cold start left - a /target growth
+    never creates since 2026-10-27."""
+    service = world.service
+    planned = Binding("startup", "m1", Slot("node-a", (1,)), awake=False)
+    with service._writer(kind), service._desired_guard(reason="cold_start"):
+        awake = [b for b in service._store.load().bindings if b.model == "m1" and b.awake]
+        service._set_model_desired_target(
+            model="m1", target_bindings=awake + [replace(planned, serve_id="m1-1", awake=True)], reason="cold_start"
+        )
+        service._gpu_leases.acquire(planned, phase="starting")
+        return service._start_gated_binding(planned)
+
+
 def _defrag_world(**kwargs):
     return _gate_world(
         [pod("pod-a", "m1", (0,), ip="10.0.0.1"), pod("pod-b", "m1", (2,), ip="10.0.0.2")],
@@ -244,18 +260,16 @@ def _defrag_world(**kwargs):
 def test_a_cold_start_holding_the_writer_lock_admits_its_own_gated_pod():
     world = _cold_start_world()
 
-    result = world.service.put_model_target("m1", wake_replicas=2)
+    started = _cold_start(world)
 
     created = world.runtime.created
     assert len(created) == 1
     new_pod = world.runtime.pending[created[0]][0]
-    assert world.runtime.admitted[new_pod]["operation_id"] == "put_model_target-1"
+    assert world.runtime.admitted[new_pod]["operation_id"] == "defrag-1"
     assert 200 in world.runtime.gate_answers
-    assert world.coordinator.kinds == ["put_model_target"]  # the gate never took the lock
-    assert [a["action"] for a in result["actions"]] == ["create"]
-    new_id = next(b for b in world.store.load().bindings if b.serve_id == new_pod).binding_id
-    assert world.desired()[new_id][0] == "awake"
-    assert world.leases.held[new_id][1] == "awake"
+    assert world.coordinator.kinds == ["defrag"]  # the gate never took the lock
+    assert started.serve_id == new_pod and started.awake
+    assert world.leases.held[started.binding_id][1] == "awake"
     assert world.runtime.cleared == [new_pod]  # the creator converged its own Pod
     # the operation left phase starting_binding again (and noted the UID)
     phases = [(phase, details.get("pod_uid")) for _kind, phase, details in world.coordinator.phases]
@@ -287,7 +301,7 @@ def test_without_pre_authorization_the_gate_and_the_creator_deadlock(monkeypatch
     monkeypatch.setattr(world.service, "_starting_binding", _no_phase)
 
     with pytest.raises(TimeoutError, match="init gate refused"):
-        world.service.put_model_target("m1", wake_replicas=2)
+        _cold_start(world)
 
     assert "startup_admit" in world.coordinator.busy
     # the failed start cleaned up after itself: no Deployment left to 400-loop
@@ -370,7 +384,7 @@ def test_a_failed_cold_start_deletes_its_deployment_and_keeps_the_lease_until_th
     }
 
     with pytest.raises(ValueError, match="engine crashed"):
-        world.service.put_model_target("m1", wake_replicas=2)
+        _cold_start(world)
 
     assert world.runtime.created and world.runtime.deleted == world.runtime.created
     assert world.desired().get("m1/node-a/1", (None, None, "absent"))[2] == "absent"
@@ -390,7 +404,7 @@ def test_the_supervisor_reaps_a_deployment_whose_cleanup_failed():
     world.vllm.wait_until_ready = lambda pod_ip, *, port=None: SimpleNamespace(success=False, message="engine crashed")
     world.runtime.fail_delete = 1
     with pytest.raises(ValueError):
-        world.service.put_model_target("m1", wake_replicas=2)
+        _cold_start(world)
     assert "m1-node-a-gpu-1" in [d.name for d in world.runtime.deployments]
     # its Pod never got Running in this scenario: drop the snapshot the fake made
     world.runtime.snapshots = {k: v for k, v in world.runtime.snapshots.items() if k == "pod-a"}

@@ -256,3 +256,33 @@ def test_a_plan_stays_within_its_k8s_budget_and_refreshes_observed_once():
     assert body["status"] == "done" and len(body["wakes"][0]["woke"]) == 2
     assert counted[0] <= K8S_CALLS_PLAN_SELECT + K8S_CALLS_SLEEP + K8S_CALLS_WAKE + K8S_CALLS_REFRESH
     assert lists == [1]  # ONE observed refresh for the four bindings
+
+
+def test_target_and_power_are_one_item_plans_in_one_lock_acquisition_each():
+    world = World(pods=(("r-2", "r", (2,), "sleeping"), ("r-3", "r", (3,), "sleeping"), ("d-0", "d", (0,), "awake")))
+
+    grown = world.client.put("/v2/models/r/target", json={"wake_replicas": 2})
+    slept = world.client.put("/v2/bindings/d-0/power", json={"awake": False})
+
+    assert grown.status_code == 200 and sorted(a["serve_id"] for a in grown.json()["actions"]) == ["r-2", "r-3"]
+    assert slept.status_code == 200 and slept.json()["actions"] == [{"action": "sleep", "serve_id": "d-0"}]
+    assert world.coordinator.kinds == ["put_model_target", "put_binding_power"]
+    assert world.violations == [] and world.journals() == ({}, {})
+
+
+def test_the_refuse_sleep_hook_fails_a_plan_sleep_before_its_hide():
+    from dataclasses import replace
+
+    from tre_common import rediskeys
+
+    world = World(pods=MIXED)
+    world.service._sm_config = replace(world.service._sm_config, test_hooks=True)
+    world.service._fault_redis = world.redis
+    world.redis.set(rediskeys.sm_fault_key("refuse_sleep", "node-a", 0), "1")
+
+    body = post(world, MIXED_PLAN).json()
+
+    assert body["sleeps"][0]["status"] == "failed"
+    assert body["wakes"][1]["error"]["reason"] == "donor_sleep_failed"
+    assert world.awake("d-0") and world.state("d-0") == "awake" and world.awake("x-1")
+    assert not [p for p in world.runtime.patches if p[1] == "hidden"]

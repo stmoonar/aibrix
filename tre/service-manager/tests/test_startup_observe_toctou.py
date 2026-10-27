@@ -13,7 +13,7 @@ import pytest
 from tre_sm.api.v2 import RetryLater
 
 from test_review2_sleep import _startup_world
-from test_review4_sm import _cold_start_world
+from test_review4_sm import _cold_start, _cold_start_world
 
 
 def _flip_to_observe_after_the_precheck(world):
@@ -66,6 +66,6 @@ def test_an_owned_admission_is_unchanged_in_observe():
     # never reaches the unrequested-sleep checks.
     world = _cold_start_world()
     world.service._safety_gate.actuation = "observe"
-    world.service.put_model_target("m1", wake_replicas=2)
+    _cold_start(world)
     assert len(world.runtime.created) == 1
     assert world.service._safety_gate.suppressed == []

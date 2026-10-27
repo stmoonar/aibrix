@@ -261,18 +261,17 @@ def test_production_store_refuses_non_atomic_client():
 def test_http_mutation_uses_fence_and_exposes_operation_journal():
     redis = ScriptRedis()
     coordinator = OperationCoordinator(redis, owner="sm-pod")
-    service = ServiceManagerV2(
-        _registry(),
-        StateStore(redis, require_fence=True),
-        operation_coordinator=coordinator,
-    )
+    store = StateStore(redis, require_fence=True)
+    with coordinator.operation("bootstrap"):  # one sleeping binding to wake
+        store.save([Binding("pod-a", "m1", Slot("node-a", (0,)), awake=False)], expected_version=0)
+    service = ServiceManagerV2(_registry(), store, operation_coordinator=coordinator)
     client = TestClient(create_app(service))
 
     response = client.put("/v2/models/m1/target", json={"wake_replicas": 1})
-    operations = client.get("/v2/operations").json()["operations"]
+    operations = [op for op in client.get("/v2/operations").json()["operations"] if op["kind"] != "bootstrap"]
 
     assert response.status_code == 200
-    assert response.json()["version"] == 1
+    assert response.json()["version"] == 2
     assert len(operations) == 1
     assert operations[0]["kind"] == "put_model_target"
     assert operations[0]["status"] == "succeeded"

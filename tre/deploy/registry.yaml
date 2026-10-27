@@ -450,8 +450,9 @@ service_manager:
   #   max_records: 20000
   # Acceptance-test fault hooks: while true, the keys
   # tre:v2:sm:fault:refuse_wake:<node>/<gpu> (409 gpu_busy) and
-  # tre:v2:sm:fault:fail_wake:<node>/<gpu> (the wake fails after /wake_up) are
-  # honoured. Default false: the keys are never read.
+  # tre:v2:sm:fault:fail_wake:<node>/<gpu> (the wake fails after /wake_up) and
+  # tre:v2:sm:fault:refuse_sleep:<node>/<gpu> (a plan sleep fails before its hide)
+  # are honoured. Default false: the keys are never read.
   # test_hooks: false
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
