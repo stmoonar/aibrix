@@ -497,3 +497,21 @@ def test_a_wave_2_pick_does_not_block_a_later_wave_1_pick():
     assert body["status"] == "done", body
     assert world.awake("r-0") and world.awake("x-1") and not world.awake("d-0")
     assert world.violations == [] and world.journals() == ({}, {})
+
+
+def test_a_partial_wake_item_is_logged_as_a_refused_rest(caplog):
+    """Review 2026-10-28 (M3): a wake filled in part answers 200; its unplaced rest is a
+    plan_item_refused event (kind ``partial``, ``unfilled``) so the run analysis pairs it."""
+    import json as _json
+    import logging
+
+    world = World()  # x-0 sits under the awake d-0, x-2 on the free GPU 2
+
+    with caplog.at_level(logging.WARNING, logger="tre_sm.api.v2"):
+        body = post(world, {"wakes": [{"model": "x", "at_least": 2}]}).json()
+
+    [item] = body["wakes"]
+    assert item["status"] == "partial" and item["unfilled"] == 1
+    events = [_json.loads(r.getMessage()) for r in caplog.records if "plan_item_refused" in r.getMessage()]
+    assert [(e["model"], e["kind"], e["unfilled"]) for e in events] == [("x", "partial", 1)]
+    assert events[0]["plan_id"] == body["plan_id"] and events[0]["error"] == "gpu_busy"

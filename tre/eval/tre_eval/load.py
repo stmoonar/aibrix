@@ -486,7 +486,7 @@ def _parse_sm(arm: Arm, path: str, kubelet_ts: bool = False) -> None:
                                       "path": "/v2/plans", "status": 409, "model": rec["model"],
                                       "template": "/v2/plans plan_item_refused", "plan_id": rec.get("plan_id"),
                                       "item_kind": rec.get("kind"), "reason": rec.get("reason"),
-                                      "error": rec.get("error")})
+                                      "error": rec.get("error"), "unfilled": rec.get("unfilled")})
                 continue
             if kind not in ("wake_start", "wake_done", "wake_failed", "sleep"):
                 continue

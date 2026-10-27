@@ -5110,6 +5110,16 @@ class ServiceManagerV2:
                         model=item["model"], kind=kind, reason=getattr(error, "reason", None) or _error_code(error),
                         error=_error_code(error),
                     )
+                elif kind == "wake" and item["status"] == "partial" and item["unfilled"] > 0:
+                    # A wake filled in part answers 200; its unplaced rest is this model's
+                    # refusal record for the run analysis (eval pairs it with the caller's
+                    # line), cause = the first refusal (2026-10-28).
+                    first = item["_refusals"][0] if item["_refusals"] else None
+                    _log_event(
+                        "plan_item_refused", level=logging.WARNING, plan_id=run.plan.plan_id,
+                        model=item["model"], kind="partial", unfilled=item["unfilled"],
+                        reason=getattr(first, "reason", None) or _error_code(first), error=_error_code(first),
+                    )
                 out.append(public)
         response = {
             "plan_id": run.plan.plan_id,

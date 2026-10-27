@@ -269,3 +269,26 @@ def test_apa_window_value_follows_the_log_else_the_trailing_mean_and_recorded_th
     for i in range(60):  # trailing 10 s mean of the routable cross-pod series
         xs = [x for x in kv[max(0, i - 9):i + 1] if x is not None]
         assert series[i] == (pytest.approx(sum(xs) / len(xs), rel=1e-3) if xs else None)
+
+
+def test_a_whole_plan_refusal_pairs_its_scaler_lines_by_plan_id(tmp_path):
+    """Review 2026-10-28 (M3): a whole-plan refusal (409 writer_busy) is one SM access line without
+    a model and one scaler line per model of the plan, all with the plan's plan_id: the lines pair
+    as a group with that access line (no 'without a matching' warning). A line without plan_id
+    (older scaler) never pairs this way."""
+    import time
+    clock = V._Clock({"load_start_epoch": T0, "clock_offsets_s": {"n1": 0.0},
+                      "component_nodes": {"baseline-scaler": "n1"}})
+    e = T0 + 30.5  # the scaler stamps its lines 0.5 s after the SM answered
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(e)) + f",{int(round(e % 1 * 1000)):03d} WARNING x.loop "
+    (tmp_path / "baseline-scaler.log").write_text("".join(
+        stamp + f"SM refused {m} up->2: {{'code': 409, 'error': 'writer_busy', 'elapsed_s': 0.1, "
+                f"'plan_id': 'bl-7'}}\n" for m in ("m-a", "m-b")))
+    rows = [{"t": "30.0", "source": "sm_api", "kind": "POST /v2/plans", "model": "", "target": "/v2/plans",
+             "value": "409"}]
+    warns = []
+    ev = V.build_events(rows, str(tmp_path), clock, warns.append)
+    ref = [x for x in ev if x["kind"] == "refusal"]
+    assert sorted((x["src"], x["model"]) for x in ref) == [("baseline", "m-a"), ("baseline", "m-b")]
+    assert all(x["t"] == pytest.approx(30.0, abs=1e-3) for x in ref)  # drawn at the SM's time
+    assert not any("without a matching" in w for w in warns)
