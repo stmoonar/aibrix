@@ -297,7 +297,12 @@ def _write_window_csv(path: Path) -> Path:
     return path
 
 
-@pytest.mark.parametrize("signal", alt_signal_names())
+#: The signals the one-CSV fixture below carries (queue column and token counters);
+#: ttft_mean / kv_usage read dataset columns of their own (tests further down).
+_FIXTURE_SIGNALS = ("queue_len", "decode_tps", "prefill_tps")
+
+
+@pytest.mark.parametrize("signal", _FIXTURE_SIGNALS)
 def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
     signal: str, tmp_path: Path
 ) -> None:
@@ -334,7 +339,7 @@ def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
     assert curve and "balanced_accuracy" in curve[0]
 
 
-@pytest.mark.parametrize("signal", alt_signal_names())
+@pytest.mark.parametrize("signal", _FIXTURE_SIGNALS)
 def test_every_alternative_signal_moves_when_the_criterion_is_switched(
     signal: str, tmp_path: Path
 ) -> None:
@@ -363,7 +368,57 @@ def test_the_driver_and_the_registry_agree_on_every_signals_orientation() -> Non
     assert set(alt_signal_names()) == set(EXPECTED_SIGNAL_DIRECTIONS)
     for signal in alt_signal_names():
         assert alt_signal_direction(signal) == EXPECTED_SIGNAL_DIRECTIONS[signal]
-        assert ALT_SIGNALS[signal][1] == "lower_is_healthier"
+        assert ALT_SIGNALS[signal][1] == EXPECTED_SIGNAL_DIRECTIONS[signal]
+    assert alt_signal_direction("kv_usage") == "higher_is_healthier"  # headroom
+
+
+def _write_v1_signal_csv(path: Path) -> Path:
+    """The fixture on the v1 dataset columns: mean TTFT = the fixture value (ms) and KV
+    fill = value / 1000 on one pod (headroom 1 - value / 1000; healthy side high)."""
+    fields = ["scenario_id", "scenario_family", "window_start_ms", "window_end_ms",
+              "ttft_server_mean_ms", "kv_cache_usage_sum", "kv_cache_pods",
+              "prompt_tokens_total", "generation_tokens_total", "p95_ttft_client_ms", "p95_tpot_client_ms", "p95_e2e_client_ms"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        for index, (signal, slo_met) in enumerate(_signal_values()):
+            writer.writerow({
+                "scenario_id": f"cell-{index}", "scenario_family": "steady" if index % 2 == 0 else "burst",
+                "window_start_ms": 0, "window_end_ms": 1000,
+                "ttft_server_mean_ms": signal, "kv_cache_usage_sum": signal / 1000.0, "kv_cache_pods": 1,
+                "prompt_tokens_total": 100, "generation_tokens_total": 100,
+                "p95_ttft_client_ms": 400.0 if slo_met else 600.0,
+                "p95_tpot_client_ms": 50.0, "p95_e2e_client_ms": 1000.0,
+            })
+    return path
+
+
+@pytest.mark.parametrize("signal", ["ttft_mean", "kv_usage"])
+def test_v1_signals_go_through_the_same_fit_in_their_own_direction(signal: str, tmp_path: Path) -> None:
+    driver = _load_driver()
+    payload, _curve = driver.fit_model(
+        _MODEL, _write_v1_signal_csv(tmp_path / "windows.csv"),
+        label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
+        signal=signal, trim_ramp_windows=0,
+    )
+    threshold = payload["alt_thresholds"][signal]
+    assert threshold["direction"] == EXPECTED_SIGNAL_DIRECTIONS[signal]
+    assert set(threshold) == {"theta", "direction", "delta_crit", "delta_high"}
+    assert payload["ranking"]["inert"] is False
+    assert payload["fit"]["balanced_accuracy"] == pytest.approx(0.90)
+    # The boundary at 300 on the fixture axis: 300 ms, or headroom 1 - 0.3.
+    boundary = BOUNDARY if signal == "ttft_mean" else 1.0 - BOUNDARY / 1000.0
+    assert threshold["theta"] == pytest.approx(boundary, rel=0.03)
+
+
+def test_v1_signal_columns_empty_means_no_value_not_zero() -> None:
+    from tre_calibration.alt_signals import alt_signal_transform
+
+    ttft, kv = alt_signal_transform("ttft_mean"), alt_signal_transform("kv_usage")
+    empty = {"ttft_server_mean_ms": "", "kv_cache_usage_sum": "", "kv_cache_pods": ""}
+    assert ttft(empty) is None and kv(empty) is None
+    assert kv({"kv_cache_usage_sum": "0.5", "kv_cache_pods": "0"}) is None  # no awake pod
+    assert ttft({"ttft_server_mean_ms": "0"}) is None  # no first token
 
 
 def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tmp_path: Path) -> None:
