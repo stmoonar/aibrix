@@ -1,6 +1,7 @@
 """Review 2: donor->receiver relays, one-shot retries, resource serialization.
 
-2026-10-02: a relay is one TransferIntent (``POST /v2/transfers``); the former
+2026-10-02: a relay is one TransferIntent (since 2026-10-27 one plan wake item with
+``donors``, before ``POST /v2/transfers``); the former
 TransferAction / fuse_transfers pair and the GPU resource keys were removed."""
 
 from __future__ import annotations
@@ -8,7 +9,6 @@ from __future__ import annotations
 import asyncio
 
 from tre_controller.loops.action_queue import (
-    ActionQueue,
     RetryPolicy,
     revalidate_from_cluster_view,
 )
@@ -18,6 +18,7 @@ from tre_controller.planning.planner import (
     UnhideAction,
 )
 from tre_sm.allocator.slots import Binding, Slot
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 class GatedPowerClient:

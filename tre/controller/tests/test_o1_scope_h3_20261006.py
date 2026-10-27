@@ -34,6 +34,7 @@ from test_o1_breakpoint_window_20261001 import (
     _view,
     _window,
 )
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 RISE = {"breakpoint_ms": 1_000, "base_ms": 0, "base_q": 80.0, "base_waiting": 20.0, "base_pods": 1,
         "sample_ms": 10_000, "q": 120.0, "waiting": 30.0, "pods": 2}
@@ -224,8 +225,6 @@ def test_low_wake_holds_the_exempt_free_gpu_step_until_o1_settles():
     receiver is still CRITICAL, the next step is planned."""
     import asyncio
 
-    from tre_controller.loops.action_queue import ActionQueue
-
     class _Client:
         async def set_binding_power(self, serve_id, *, awake):
             return {"ok": True}
@@ -278,8 +277,6 @@ def test_released_upscale_record_leaves_a_later_unrelated_breakpoint_exempt():
     whole window follows the LOW wake, a breakpoint of another cause (here a replica lost
     outside the controller) is its own stale window and buys its own exempt wake."""
     import asyncio
-
-    from tre_controller.loops.action_queue import ActionQueue
 
     class _Client:
         async def set_binding_power(self, serve_id, *, awake):

@@ -8,6 +8,8 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Iterable, Mapping, Protocol
 
+from tre_controller.loops import plan_items
+from tre_controller.loops.plan_items import SleepPathRefused
 from tre_controller.sm_client import sm_actor
 from tre_controller.planning.planner import (
     Action,
@@ -68,19 +70,13 @@ CommitRevalidate = Callable[[SafeScaleCommitAction], CommitVerdict]
 
 
 class ServiceManagerClient(Protocol):
-    async def scale_model(self, model: str, delta: int) -> dict: ...
+    async def get_state_result(self) -> dict: ...
 
-    async def scale_model_to(self, model: str, target: int) -> dict: ...
-
-    async def model_awake(self, model: str) -> dict: ...
+    async def post_plan(self, request: dict) -> dict: ...
 
     async def set_routable(self, model: str, hidden_pods: tuple[str, ...]) -> dict: ...
 
-    async def set_binding_power(self, serve_id: str, *, awake: bool) -> dict: ...
-
     async def defrag(self, migrations: tuple) -> dict: ...
-
-    async def transfer(self, donor_model: str, receiver_model: str, count: int, *, sleep_path: str) -> dict: ...
 
 
 @dataclass(frozen=True)
@@ -220,12 +216,13 @@ class ActionQueue:
 
     Actions run concurrently unless they share a resource (a model, a pod; a
     defrag conflicts with everything): those run one at a time in submit order
-    (review P1-3 / review 2 P1-1). A donor -> receiver relay (TransferIntent,
-    2026-10-02) is ONE service-manager call (``POST /v2/transfers``) holding both
-    models; the SM picks the pods / GPUs, sleeps the donors and wakes the
-    receivers under its global writer lock, so when the call returns the relay
-    has completed or failed. A SafeScale commit is an ordered unit for its hidden
-    donor pods and its follow-up receivers (review 3 P2-2). One-shot actions (SafeScale commit /
+    (review P1-3 / review 2 P1-1). Every power change is ONE ``POST /v2/plans``
+    (design 20261027-sm-plans): sleep and wake items executed by the SM under ONE
+    writer-lock hold, each action exactly one item. A donor -> receiver relay
+    (TransferIntent) is a wake item of the receiver with ``donors=[donor]``, holding
+    both models; the SM picks the pods / GPUs, so when the call returns the relay has
+    completed or failed. A SafeScale commit is one plan per attempt: the sleep of its
+    hidden donor pods plus its receivers' absolute targets (review 3 P2-2). One-shot actions (SafeScale commit /
     rollback) that fail retriably are retried with bounded backoff and
     re-validated before every retry; a retry only ever re-sends idempotent
     requests (named bindings, absolute targets - review 3 P2-1). A rescue action
@@ -235,9 +232,8 @@ class ActionQueue:
     Observe mode (user decision 2026-09-28, record only): re-plannable actions
     are dropped; a SafeScale one-shot action runs only as the unhide of its
     probe pods; the mode is re-read (uncached) right before every
-    capacity-changing step, so a commit already running stops there. A relay is
-    checked right before its one ``POST /v2/transfers``; once sent, the SM
-    completes it (design 20261002-controller-transfer).
+    capacity-changing step (a plan's POST, a commit attempt, a hide). Once a plan
+    is posted, the SM completes it (also a commit's receivers).
 
     Refusals, ``clamped_by_floor`` and ``taken: 0`` are observation events only
     (``wake_refused``, ``transfer_clamped_by_floor``, ``scale_clamped_by_floor``):
@@ -290,7 +286,7 @@ class ActionQueue:
         # their observe-safe form (the unhide of the probe pods, see _execute).
         self._is_observe = is_observe or (lambda: False)
         #: Uncached mode read, right before every capacity-changing step (a hide,
-        #: a transfer's donor / receiver, a commit's donor / each receiver).
+        #: a plan's POST, a commit attempt).
         self._is_observe_fresh = is_observe_fresh or self._is_observe
         self._prof = prof
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
@@ -371,13 +367,12 @@ class ActionQueue:
             "observe_commit_stopped_total": 0,
             "observe_transfer_completed_total": 0,
             "floor_violation_total": 0,
-            # 2026-10-02 relays (POST /v2/transfers) and floor clamps.
+            # Relays (a plan wake item with donors) and floor clamps.
             "transfer_total": 0,
             "transfer_pairs_done_total": 0,
             "transfer_partial_total": 0,
             "transfer_failed_total": 0,
             "transfer_clamped_by_floor_total": 0,
-            "transfer_unsupported_total": 0,
             "scale_clamped_by_floor_total": 0,
             # 2026-10-06: a SafeScale receiver target the SM filled in part.
             "receiver_short_total": 0,
@@ -402,6 +397,8 @@ class ActionQueue:
 
         accepted = 0
         held = 0
+        #: This submit's accepted items (fused into plans below).
+        accepted_items: list[QueuedAction] = []
         dropped: list[tuple[str, str]] = []
         replaced: list[tuple[str, SourceLoop]] = []
         observe = self._is_observe()
@@ -432,6 +429,7 @@ class ActionQueue:
                 continue
 
             self._pending.append(queued)
+            accepted_items.append(queued)
             self._inflight.update(queued.models)
             accepted += 1
             self._register_rescue(queued.action, rescue_started)
@@ -444,12 +442,57 @@ class ActionQueue:
                 record.done_ms = int(self._now_ms())  # covered by restored pods only
             self._persist_scale_memory(model)
 
+        self._fuse_into_plans(accepted_items)
         return SubmitResult(
             accepted=accepted,
             held=held,
             dropped=tuple(dropped),
             replaced=tuple(replaced),
         )
+
+    def _fuse_into_plans(self, accepted: list[QueuedAction]) -> None:
+        """One decision -> one plan (design 20261027-sm-plans §5.2, narrowed by the
+        architect): the accepted re-plannable power actions of ONE submit
+        (``ScaleAction``, ``TransferIntent``) become ONE :class:`PlanBatch`, in submit
+        order, each action exactly one plan item. Only DIFFERENT models are fused: an
+        action touching a model an earlier member already uses (the same receiver
+        twice, a shared donor, a shrink and a grow of one model - possible through the
+        rescue path, which skips the inflight check) starts the next batch; the
+        batches serialize through their shared models. A batch takes the queue
+        position of its first member; a member never jumps over another accepted
+        action of one of its models. No timer: nothing waits for more actions."""
+        if sum(1 for queued in accepted if _fusable(queued)) < 2:
+            return
+        mine = {id(queued) for queued in accepted}
+        start = len(self._pending)
+        while start > 0 and id(self._pending[start - 1]) in mine:
+            start -= 1
+        tail = list(self._pending)[start:]
+        if any(id(queued) not in mine for queued in tail):
+            return  # not this submit's contiguous tail (never expected): leave it unfused
+        out: list = []
+        batch: list[QueuedAction] | None = None
+        used: set[str] = set()
+        for queued in tail:
+            models = set(queued.models)
+            if not _fusable(queued):
+                out.append(queued)
+                used |= models  # a later member may not jump over it on a shared model
+                continue
+            if batch is not None and not (models & used):
+                batch.append(queued)
+                used |= models
+                continue
+            batch = [queued]
+            out.append(batch)
+            used = set(models)
+        fused: deque[QueuedAction] = deque(list(self._pending)[:start])
+        for entry in out:
+            if isinstance(entry, list) and len(entry) > 1:
+                fused.append(self._queued(PlanBatch(tuple(item.action for item in entry))))
+            else:
+                fused.append(entry[0] if isinstance(entry, list) else entry)
+        self._pending = fused
 
     def pending_actions(self) -> tuple[QueuedAction, ...]:
         return tuple(self._pending)
@@ -587,7 +630,11 @@ class ActionQueue:
 
     def _finish_rescue(self, action) -> None:
         """C1: one rescue scale-up ended (done, failed, dropped): the target is done
-        once all of its parts ended."""
+        once all of its parts ended (a fused plan: each member)."""
+        if isinstance(action, PlanBatch):
+            for member in action.members:
+                self._finish_rescue(member)
+            return
         record = self._rescue_parts.pop(id(action), None)
         if record is None or record.outstanding <= 0:
             return
@@ -610,15 +657,6 @@ class ActionQueue:
     def drain_events(self) -> list[str]:
         events, self._events = self._events, []
         return events
-
-    def _note_wake_refused(self, action, result: DispatchResult) -> None:
-        """A located wake refusal (structured 409): an observation event only - the next
-        tick re-plans from a new view (the per-GPU / per-node cooldown was removed on
-        2026-10-02)."""
-        conflict = result.wake_conflict
-        if conflict is None or _action_direction(action) != "up":
-            return
-        self._wake_refused_event(result.model, conflict)
 
     def _wake_refused_event(self, model: str, conflict: dict) -> None:
         if not conflict.get("node"):
@@ -786,10 +824,17 @@ class ActionQueue:
             current = self._running.get(task, queued)
             LOG.exception("action dispatch for %s failed", current.model)
             error = f"dispatch_exception: {type(exc).__name__}: {exc}"
-            results.extend(
-                DispatchResult(model=model, action_kind=_action_kind(current.action), ok=False, error=error)
-                for model in current.models
-            )
+            if isinstance(current.action, PlanBatch):
+                results.extend(
+                    DispatchResult(model=_member_model(member), action_kind=_action_kind(member), ok=False,
+                                   error=error)
+                    for member in current.action.members
+                )
+            else:
+                results.extend(
+                    DispatchResult(model=model, action_kind=_action_kind(current.action), ok=False, error=error)
+                    for model in current.models
+                )
         finally:
             self._running.pop(task, None)
             self._backoff.pop(task, None)
@@ -835,9 +880,11 @@ class ActionQueue:
             results.extend(_observe_skipped(queued))
             self._notify_hide_failed(queued.action, "observe_skipped")
             return None
-        if isinstance(queued.action, TransferIntent):
-            results.extend(await self._execute_transfer(queued.action))
-            return ("done", "transfer")
+        if _replannable_power(queued):
+            # One POST /v2/plans for the action (or the fused actions of one submit);
+            # re-plannable: never retried, the next tick re-plans from a new view.
+            results.extend(await self._execute_plan(_members(queued.action)))
+            return ("done", "plan")
         if isinstance(queued.action, SafeScaleCommitAction):
             converted, finished = self._stale_commit(queued, results)
             if finished is not None:
@@ -1076,7 +1123,12 @@ class ActionQueue:
         attempts = queued.failures + 1
         if isinstance(action, SafeScaleCommitAction):
             return await self._attempt_commit(queued, results)
-        result = await self._timed_dispatch(action, queued.model)
+        if isinstance(action, ScaleAction):
+            # A one-shot (SafeScale) named scale: a one-item plan, retried as is
+            # (named pods are idempotent).
+            result = (await self._run_plan((action,))).results[0]
+        else:
+            result = await self._timed_dispatch(action, queued.model)
         self._note_rescue_result(action, result)
         if not result.ok:
             if result.changed:
@@ -1090,14 +1142,30 @@ class ActionQueue:
     async def _attempt_commit(
         self, queued: QueuedAction, results: list[DispatchResult]
     ) -> tuple[DispatchResult | None, QueuedAction]:
-        """Sleep the donor's hidden pods, then (only then) bring every receiver
-        up to its absolute target. Progress is kept on the action: a retry never
-        re-sleeps a donor that slept and re-sends only the pending upscales."""
+        """One attempt = ONE plan (design 20261027-sm-plans §5.4): the sleep of the
+        donor's hidden pods (unless it already slept) plus one wake item per pending
+        receiver with its absolute target (resolved once by the plan's GET, then
+        frozen). The SM wakes a receiver on a GPU the donor frees only after the donor
+        is confirmed asleep; a receiver on a free GPU may wake even when the donor
+        sleep fails. Once posted, the SM completes the plan (an observe switch no
+        longer stops the receivers). Progress is kept on the action: a retry never
+        re-sleeps a donor that slept and re-sends only the pending receivers."""
         action: SafeScaleCommitAction = queued.action
         attempts = queued.failures + 1
-        if not action.donor_done:
+        donor: ScaleAction | None = None
+        members: list = []
+        if not action.donor_done and action.pods:
             donor = action.donor_sleep()
-            result = await self._timed_dispatch(donor, action.donor)
+            members.append(donor)
+        members.extend(action.upscales)
+        if not members:
+            return None, queued
+        run = await self._run_plan(tuple(members))
+        failure: DispatchResult | None = None
+        offset = 0
+        if donor is not None:
+            offset = 1
+            result = run.results[0]
             if not result.ok:
                 if result.changed:
                     self._record_done(action.donor, donor, result)
@@ -1106,52 +1174,23 @@ class ActionQueue:
                         action,
                         unconfirmed_pods=tuple(dict.fromkeys(action.unconfirmed_pods + result.unconfirmed)),
                     )
-                    queued = self._commit_queued(action, failures=queued.failures)
-                    self._set_running(queued)
-                return result, queued
-            self._record_done(action.donor, donor, result)
-            results.append(replace(result, attempts=attempts))
-            action = replace(action, donor_done=True)
-            queued = self._commit_queued(action, failures=queued.failures)
-            self._set_running(queued)
+                failure = result
+            else:
+                self._record_done(action.donor, donor, result)
+                results.append(replace(result, attempts=attempts))
+                action = replace(action, donor_done=True)
         remaining: list[ReceiverTarget] = []
-        failure: DispatchResult | None = None
-        for index, upscale in enumerate(action.upscales):
-            if upscale.target is None:
-                upscale, resolve_failure = await self._resolve_target(upscale)
-                if resolve_failure is not None:
-                    if resolve_failure.retriable:
-                        remaining.append(upscale)
-                        failure = failure or resolve_failure
-                    else:
-                        results.append(replace(resolve_failure, attempts=attempts))
-                    continue
-            if self._is_observe_fresh():
-                # Observe entered mid-commit (2026-09-28): the donor slept, the
-                # receivers left are NOT woken - recorded, the probe resolves.
-                stopped = replace(
-                    action,
-                    upscales=tuple(remaining) + (upscale,) + tuple(action.upscales[index + 1:]),
-                    reason=f"{action.reason}; observe_entered: follow-up upscales not issued",
-                )
-                results.extend(self._receivers_dropped(stopped, "observe_entered: receiver wake not issued"))
-                self._stats["observe_commit_stopped_total"] += 1
-                LOG.warning(
-                    json.dumps(
-                        {"event": "observe_entered_mid_commit", "donor": action.donor,
-                         "request_id": action.request_id, "donor_slept": list(action.pods),
-                         "receivers_not_woken": [item.model for item in stopped.upscales]},
-                        sort_keys=True,
-                    )
-                )
-                queued = self._commit_queued(replace(stopped, upscales=()), failures=queued.failures)
-                self._set_running(queued)
-                return None, queued
-            result = await self._timed_dispatch(upscale, upscale.model)
-            if result.ok:
+        for upscale, result in zip(run.members[offset:], run.results[offset:]):
+            if run.whole_plan_failed and not result.ok:
+                # The plan failed as a whole (refused, or its outcome unknown): every
+                # receiver stays pending with its target, as before the plan was sent.
+                remaining.append(upscale)
+                failure = failure or result
+            elif result.ok:
                 self._record_done(upscale.model, upscale, result)
                 results.append(replace(result, attempts=attempts))
             elif result.retriable:
+                # Kept with its frozen target: the retry re-sends the same target.
                 remaining.append(upscale)
                 failure = failure or result
             else:
@@ -1160,26 +1199,6 @@ class ActionQueue:
         queued = self._commit_queued(action, failures=queued.failures)
         self._set_running(queued)
         return failure, queued
-
-    async def _resolve_target(
-        self, upscale: ReceiverTarget
-    ) -> tuple[ReceiverTarget, DispatchResult | None]:
-        """No absolute target at planning time: resolve it ONCE from the SM's
-        awake count; the retry then re-sends that same target."""
-        try:
-            response = await self._client.model_awake(upscale.model)
-        except Exception as exc:  # noqa: BLE001
-            return upscale, DispatchResult(
-                model=upscale.model, action_kind="scale", ok=False,
-                error=f"dispatch_exception: {type(exc).__name__}: {exc}",
-            )
-        if not bool(response.get("ok", False)):
-            return upscale, _dispatch_result(model=upscale.model, action_kind="scale", response=response)
-        awake = int(response["awake"])
-        target = awake + max(0, int(upscale.delta))
-        if upscale.cap is not None:
-            target = min(target, max(int(upscale.cap), awake))
-        return replace(upscale, target=target), None
 
     def _revalidated_commit(
         self, queued: QueuedAction, results: list[DispatchResult]
@@ -1478,13 +1497,30 @@ class ActionQueue:
             self._running[task] = queued
             self._release_idle_models()
 
-    async def _execute_transfer(self, action: TransferIntent) -> list[DispatchResult]:
-        """One relay = one ``POST /v2/transfers`` (2026-10-02). Accounting follows the
-        response, never ``count``: the donor side by ``taken`` (donor replicas slept),
-        the receiver side by ``done`` (receivers woken); a 200 may be partial. The SM
-        completes or fails every pair under its writer lock before it answers: both
-        models are free again when the call returns (nothing is tracked afterwards)."""
-        result = await self._timed_dispatch(action, action.receiver_model)
+    async def _execute_plan(self, members: tuple) -> list[DispatchResult]:
+        """Re-plannable power actions = ONE ``POST /v2/plans`` (design 20261027-sm-plans
+        §5.2), each action exactly one item. Each member keeps its own result and
+        bookkeeping (rescue credit, F4 / scale memory, relay hold, events): a relay
+        answers a donor-side and a receiver-side result."""
+        run = await self._run_plan(members, observe_check=True)
+        if run.observe_skipped:
+            return [result for member in members for result in _member_observe_skipped(member)]
+        out: list[DispatchResult] = []
+        for member, result in zip(members, run.results):
+            if isinstance(member, TransferIntent):
+                out.extend(self._finish_transfer(member, result))
+                continue
+            self._note_rescue_result(member, result)
+            if result.ok or result.changed:
+                self._record_done(member.model, member, result)
+            out.append(result)
+        return out
+
+    def _finish_transfer(self, action: TransferIntent, result: DispatchResult) -> list[DispatchResult]:
+        """Accounting of a relay's item, by what really happened (never ``count``): the
+        donor side by ``taken`` (donor replicas slept), the receiver side by ``done``
+        (receivers woken). The SM completes the plan under its writer lock before it
+        answers: both models are free again (nothing is tracked afterwards)."""
         summary = result.transfer or {}
         donor_result = DispatchResult(
             model=action.donor_model, action_kind="transfer", ok=result.ok, error=result.error,
@@ -1494,8 +1530,8 @@ class ActionQueue:
         self._record_transfer_done(action, result)
         self._note_relay_hold(action, result)
         if result.ok and self._is_observe_fresh():
-            # Observe began while the SM ran the relay: it was sent before (the mode is
-            # read right before the call) and the SM completes it - recorded only.
+            # Observe began while the SM ran the plan: it was sent before (the mode is
+            # read right before the POST) and the SM completes it - recorded only.
             self._stats["observe_transfer_completed_total"] += 1
             LOG.warning(
                 json.dumps(
@@ -1507,33 +1543,373 @@ class ActionQueue:
             )
         return [donor_result, result]
 
+    async def _run_plan(self, members: tuple, *, observe_check: bool = False) -> "_PlanRun":
+        """ONE plan for ``members`` (each exactly one item): ONE ``GET /v2/state`` resolves
+        the relative / absolute targets (only when an item needs it), items whose target
+        is already met are answered locally (``woke_none`` / ``taken: 0``, no SM call), and
+        ONE ``POST /v2/plans`` carries the rest - none when nothing is left. Returns one
+        result per member (stamps, floor and refusal events done here, as for every SM
+        call) and the members with their targets resolved (a SafeScale receiver keeps
+        it). ``observe_check``: the mode is re-read right before the POST."""
+        started_ns = time.perf_counter_ns()
+        members = tuple(members)
+        count = len(members)
+        results: list[DispatchResult | None] = [None] * count
+        resolved_members = list(members)
+        specs: list[tuple[str, dict] | None] = [None] * count
+        for index, member in enumerate(members):
+            try:
+                spec = plan_items.plan_item(member)
+            except SleepPathRefused as exc:
+                results[index] = self._sleep_path_refused(member, exc)
+                continue
+            if spec is None:
+                results[index] = DispatchResult(
+                    model=_member_model(member), action_kind=_action_kind(member), ok=True, woke_none=True
+                )
+                continue
+            specs[index] = spec
+        counts: dict[str, tuple[int, int]] = {}
+        if any(spec is not None and plan_items.needs_state(*spec) for spec in specs):
+            state = await self._client.get_state_result()
+            if not bool(state.get("ok", False)):
+                # Nothing was sent: no member changed anything.
+                for index, member in enumerate(members):
+                    if results[index] is None:
+                        failed = _dispatch_result(model=_member_model(member), action_kind=_action_kind(member),
+                                                  response=state)
+                        results[index] = replace(failed, error=f"state_unreadable: {failed.error}", not_executed=True)
+                return self._plan_done(members, resolved_members, results, (), started_ns, whole_plan_failed=True)
+            counts = plan_items.state_counts(
+                state.get("response"),
+                {spec[1]["model"] for spec in specs if spec is not None and plan_items.needs_state(*spec)},
+            )
+        request: dict = {"sleeps": [], "wakes": []}
+        slots: dict[int, tuple[str, int]] = {}
+        for index, spec in enumerate(specs):
+            if spec is None or results[index] is not None:
+                continue
+            kind, item = spec
+            member = members[index]
+            try:
+                body = plan_items.resolve_item(kind, item, counts)
+            except plan_items.StateUnreadable as exc:
+                results[index] = DispatchResult(
+                    model=_member_model(member), action_kind=_action_kind(member), ok=False,
+                    error=str(exc), not_executed=True,
+                )
+                continue
+            if isinstance(member, ReceiverTarget) and member.target is None and body is not None:
+                resolved_members[index] = replace(member, target=int(body["at_least"]))
+            elif isinstance(member, ReceiverTarget) and member.target is None:
+                awake = counts[member.model][0]
+                resolved_members[index] = replace(member, target=awake)
+            if body is None:
+                results[index] = self._met_locally(member)
+                continue
+            slots[index] = (kind, len(request[kind + "s"]))
+            request[kind + "s"].append(body)
+        if not slots:
+            return self._plan_done(members, resolved_members, results, (), started_ns)
+        if observe_check and self._is_observe_fresh():
+            return _PlanRun(members=tuple(resolved_members), results=(), observe_skipped=True)
+        try:
+            with sm_actor(_plan_actor(members)):
+                response = await self._client.post_plan(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - review 3 P3
+            self._stats["dispatch_exceptions_total"] += 1
+            LOG.exception("POST /v2/plans for %s raised", sorted({_member_model(m) for m in members}))
+            response = {"ok": False, "error": f"dispatch_exception: {type(exc).__name__}: {exc}"}
+        body = response.get("response") if (response.get("ok") or response.get("partial")) else None
+        if not isinstance(body, dict):
+            body = None
+        if body is not None:
+            self._log_plan(request, body)
+        elif not response.get("not_executed"):
+            # Timeout, transport error, 5xx: whether anything happened is unknown.
+            LOG.warning(json.dumps({"event": "plan_outcome_unknown", "error": response.get("error"),
+                                    "status": response.get("status")}, sort_keys=True, default=str))
+        for index, (kind, position) in slots.items():
+            member = resolved_members[index]
+            if body is None:
+                results[index] = self._plan_failed_member(member, response)
+                continue
+            item = _response_item(body, kind, position)
+            if item is None:
+                results[index] = DispatchResult(
+                    model=_member_model(member), action_kind=_action_kind(member), ok=False,
+                    error="plan_item_missing: the service-manager answered without this item",
+                )
+                continue
+            results[index] = self._item_result(member, item, body.get("plan_id"))
+        return self._plan_done(members, resolved_members, results, tuple(slots), started_ns,
+                               whole_plan_failed=body is None)
+
+    def _plan_done(
+        self, members, resolved_members, results, sent: tuple[int, ...], started_ns: int, *,
+        whole_plan_failed: bool = False,
+    ) -> "_PlanRun":
+        for index in sent:
+            member, result = resolved_members[index], results[index]
+            self._note_floor_violation(result)
+            self._stamp_changes(member, _member_model(member), result)
+        if sent and self._prof is not None:
+            self._prof.record(
+                {
+                    "kind": "dispatch",
+                    "ts_ms": self._prof.now_ms(),
+                    "n_actions": len(sent),
+                    "http_ns": time.perf_counter_ns() - started_ns,
+                }
+            )
+        return _PlanRun(members=tuple(resolved_members), results=tuple(results), whole_plan_failed=whole_plan_failed)
+
+    def _sleep_path_refused(self, member, exc: Exception) -> DispatchResult:
+        # Nothing reached the SM: own counter, one error line, no traceback, and no
+        # routable-change stamp (O1 must not see a change that never was).
+        self._stats["sleep_path_refused_total"] += 1
+        LOG.error(
+            json.dumps(
+                {"event": "scale_down_without_sleep_path_refused", "model": _member_model(member),
+                 "reason": str(getattr(member, "reason", "")),
+                 "delta": getattr(member, "delta", None)},
+                sort_keys=True,
+            )
+        )
+        return DispatchResult(
+            model=_member_model(member), action_kind=_action_kind(member), ok=False,
+            error=f"sleep_path_refused: {exc}", retriable=False,
+        )
+
+    def _met_locally(self, member) -> DispatchResult:
+        """No-op fix (design §5.5): a target already met makes no SM call and changes
+        nothing - ``woke_none`` (a growth) / ``taken: 0`` (a shrink): no stamp, no last
+        action, no rescue gain beyond what the call would have reported."""
+        model = _member_model(member)
+        if isinstance(member, TransferIntent):
+            return DispatchResult(
+                model=model, action_kind="transfer", ok=False, error="noop: receiver target already met",
+                retriable=False, taken=0, done=0, woke_none=True,
+                transfer={"outcome": "noop", "done": 0, "taken": 0, "pairs": []},
+            )
+        if _action_direction(member) == "down":
+            return DispatchResult(model=model, action_kind="scale", ok=True, taken=0)
+        return DispatchResult(model=model, action_kind="scale", ok=True, woke_none=True)
+
+    def _plan_failed_member(self, member, response: dict) -> DispatchResult:
+        """A whole-plan failure seen by one member: a refusal before any change
+        (``writer_busy``, ``routable_unknown``, 400 / 404 / 503) is ``not_executed``; a
+        timeout / transport error / 5xx leaves the outcome unknown (stamped both ways)."""
+        if isinstance(member, TransferIntent):
+            outcome = "refused" if response.get("not_executed") else "unknown"
+            relay = f"{member.donor_model}->{member.receiver_model}"
+            self._stats["transfer_total"] += 1
+            self._stats["transfer_failed_total"] += 1
+            error = str(response.get("error") or "transfer_failed")
+            self._events.append(f"transfer_failed:{relay}:{outcome}:{error[:160]}")
+            return DispatchResult(
+                model=member.receiver_model, action_kind="transfer", ok=False, error=error, retriable=False,
+                taken=0 if outcome == "refused" else None, done=0 if outcome == "refused" else None,
+                transfer={"outcome": outcome, "status": response.get("status"), "code": response.get("code")},
+                not_executed=outcome == "refused",
+            )
+        return _dispatch_result(model=_member_model(member), action_kind=_action_kind(member), response=response)
+
+    def _item_result(self, member, item: dict, plan_id) -> DispatchResult:
+        if isinstance(member, TransferIntent):
+            return self._transfer_item_result(member, item, plan_id)
+        if isinstance(member, ReceiverTarget):
+            return self._receiver_item_result(member, item)
+        if member.delta < 0:
+            if member.pods:
+                return self._named_sleep_result(member, item)
+            return self._shrink_result(member, item)
+        if member.pods and not member.hint:
+            return self._named_wake_result(member, item)
+        return self._growth_result(member, item)
+
+    def _named_sleep_result(self, action: ScaleAction, item: dict) -> DispatchResult:
+        """A sleep of exactly the named bindings (SafeScale commit donor, ShrinkForSlot).
+        A failure after some pods slept is reported with them (``changed``), never as
+        "nothing happened"; unconfirmed pods (``outcomes``) must stay hidden."""
+        if item.get("status") in plan_items.SLEEP_OK_STATUSES:
+            return DispatchResult(model=action.model, action_kind="scale", ok=True)
+        result = _dispatch_result(model=action.model, action_kind="scale", response=plan_items.item_failure(item))
+        slept = plan_items.slept_ids(item)
+        if slept:
+            result = replace(result, changed=slept, not_executed=False)
+        return result
+
+    def _named_wake_result(self, action: ScaleAction, item: dict) -> DispatchResult:
+        woke = plan_items.woke_ids(item)
+        if item.get("status") in plan_items.WAKE_OK_STATUSES:
+            return DispatchResult(model=action.model, action_kind="scale", ok=True,
+                                  woke_none=item.get("status") == "noop" and not woke)
+        self._refusal_events(action.model, item)
+        result = _dispatch_result(model=action.model, action_kind="scale", response=plan_items.item_failure(item))
+        if woke:
+            result = replace(result, changed=woke, not_executed=False)
+        return result
+
+    def _shrink_result(self, action: ScaleAction, item: dict) -> DispatchResult:
+        """A model-level shrink (``at_most``). Accounted by ``taken`` (replicas really put
+        to sleep): 0 changed nothing; the SM clamps at the replica floor and reports
+        ``clamped_by_floor`` - an event (``scale_clamped_by_floor``), never a hold."""
+        if item.get("status") not in plan_items.SLEEP_OK_STATUSES:
+            result = _dispatch_result(model=action.model, action_kind="scale", response=plan_items.item_failure(item))
+            slept = plan_items.slept_ids(item)
+            return replace(result, changed=slept, not_executed=False) if slept else result
+        taken = plan_items.num(item, "taken")
+        asked = -int(action.delta)
+        if taken < asked:
+            if item.get("clamped_by_floor"):
+                self._stats["scale_clamped_by_floor_total"] += 1
+                self._events.append(f"scale_clamped_by_floor:{action.model}:taken={taken}:asked={asked}")
+            else:
+                self._events.append(f"scale_down_short:{action.model}:taken={taken}:asked={asked}")
+            LOG.info(
+                json.dumps(
+                    {"event": "scale_down_taken", "model": action.model, "asked": asked, "taken": taken,
+                     "clamped_by_floor": bool(item.get("clamped_by_floor")), "floor": item.get("floor")},
+                    sort_keys=True, default=str,
+                )
+            )
+        return DispatchResult(model=action.model, action_kind="scale", ok=True, taken=taken)
+
+    def _growth_result(self, action: ScaleAction, item: dict) -> DispatchResult:
+        """A model-level growth (``at_least``, hinted or not). ``placement_substituted``
+        for every replica the SM woke somewhere else than a hint; every refusal is a
+        ``wake_refused`` event (no cooldown since 2026-10-02). A growth filled in part is
+        not a success (relative: not retried, the planner re-plans) but what did wake is
+        reported (``changed`` / ``picked``) and stamped."""
+        entries = plan_items.woke_entries(item)
+        woke = plan_items.woke_ids(item)
+        picked = entries
+        if action.hint:
+            for entry in entries:
+                if entry.get("hinted", True) or entry.get("source") == "hint":
+                    continue
+                source = _binding_gpus(entry.get("hint_binding_id")) or "?"
+                target = f"{entry.get('node')}/{','.join(str(g) for g in entry.get('gpu_ids') or ())}"
+                self._events.append(f"placement_substituted:{action.model}:{source}->{target}")
+        self._refusal_events(action.model, item)
+        status = item.get("status")
+        unfilled = plan_items.num(item, "unfilled")
+        if status in plan_items.WAKE_OK_STATUSES and unfilled <= 0:
+            return DispatchResult(model=action.model, action_kind="scale", ok=True, picked=picked,
+                                  woke_none=status == "noop" and not woke)
+        if woke:
+            return DispatchResult(
+                model=action.model, action_kind="scale", ok=False,
+                error=f"partial: {unfilled} of {action.delta} wakes unfilled", retriable=False,
+                picked=picked, changed=woke,
+            )
+        result = _dispatch_result(model=action.model, action_kind="scale", response=plan_items.item_failure(item))
+        # Nothing woke: no O1 / view-pending stamp. ``wake_conflict`` (the first refusal)
+        # is information only - every refusal is an event already.
+        return replace(result, retriable=False, woke_none=True)
+
+    def _receiver_item_result(self, action: ReceiverTarget, item: dict) -> DispatchResult:
+        """A SafeScale receiver's absolute grow-only target. Filled in part
+        (``unfilled``) stays ok: the woken replicas are a real "up" and a re-send could
+        not place more now - the next tick re-plans from the view (``receiver_short``
+        event). Nothing woken (a no-op included) is ``woke_none`` (design §5.5): no
+        stamp, no last action. A refused / failed item keeps the item's ``retriable``."""
+        status = item.get("status")
+        woke = plan_items.woke_ids(item)
+        picked = plan_items.woke_entries(item)
+        self._refusal_events(action.model, item)
+        if status not in ("done", "noop", "partial") and not woke:
+            result = _dispatch_result(model=action.model, action_kind="scale", response=plan_items.item_failure(item))
+            return replace(result, woke_none=True)
+        unfilled = plan_items.num(item, "unfilled")
+        if unfilled > 0:
+            self._stats["receiver_short_total"] += 1
+            self._events.append(f"receiver_short:{action.model}:unfilled={unfilled}:target={action.target}")
+            LOG.info(
+                json.dumps(
+                    {"event": "receiver_short", "model": action.model, "target": action.target,
+                     "unfilled": unfilled, "woke": list(woke)},
+                    sort_keys=True,
+                )
+            )
+        return DispatchResult(model=action.model, action_kind="scale", ok=True, picked=picked,
+                              woke_none=not woke and (status == "noop" or unfilled > 0))
+
+    def _transfer_item_result(self, action: TransferIntent, item: dict, plan_id) -> DispatchResult:
+        """A relay's wake item (``donors=[{D, count}]``) -> the receiver-side result with
+        the transfer summary. ``ok`` = at least one receiver woke; ``done`` / ``taken``
+        say what really happened. Refusals, a floor clamp and ``taken: 0`` are
+        observation events only."""
+        donor, receiver = action.donor_model, action.receiver_model
+        relay = f"{donor}->{receiver}"
+        self._stats["transfer_total"] += 1
+        summary = plan_items.transfer_summary(item, plan_id)
+        done, taken, unfilled = summary["done"], summary["taken"], summary["unfilled"]
+        self._stats["transfer_pairs_done_total"] += done
+        if done < action.pairs:
+            self._stats["transfer_partial_total"] += 1
+        self._events.append(
+            f"transfer_done:{relay}:count={action.count}:done={done}:taken={taken}:unfilled={unfilled}"
+            f":id={summary['transfer_id']}"
+        )
+        for pair in summary["pairs"]:
+            self._events.append(
+                f"transfer_pair:{relay}:{'+'.join(pair['donors'])}->{pair['receiver']}"
+                f"@{pair['node']}/{','.join(str(gpu) for gpu in pair['gpu_ids'])}:{pair['status']}"
+            )
+        self._refusal_events(receiver, item)
+        if summary["clamped_by_floor"]:
+            self._stats["transfer_clamped_by_floor_total"] += 1
+            self._events.append(f"transfer_clamped_by_floor:{relay}:taken={taken}:count={action.count}")
+        if unfilled > 0:
+            skipped = ",".join(f"{key}={value}" for key, value in sorted(summary["skipped"].items()))
+            self._events.append(f"transfer_unfilled:{relay}:{unfilled}:{skipped}")
+        LOG.info(
+            json.dumps(
+                {"event": "transfer_result", "donor": donor, "receiver": receiver, "count": action.count,
+                 "reason": action.reason, **summary},
+                sort_keys=True, default=str,
+            )
+        )
+        error = None
+        if done <= 0:
+            error = (
+                "clamped_by_floor: no donor replica taken" if summary["clamped_by_floor"] and taken == 0
+                else f"partial: no receiver woken ({plan_items.item_code(item) or item.get('status')})"
+            )
+        elif done < action.pairs:
+            error = f"partial: {done} of {action.pairs} pairs done"
+        return DispatchResult(
+            model=receiver, action_kind="transfer", ok=done > 0, error=error, retriable=False,
+            picked=tuple(summary["picked"]), taken=taken, done=done, transfer=summary,
+        )
+
+    def _log_plan(self, request: dict, body: dict) -> None:
+        LOG.info(
+            json.dumps(
+                {"event": "plan_result", "plan_id": body.get("plan_id"), "status": body.get("status"),
+                 "sleeps": [[item.get("model"), item.get("status"), item.get("taken")]
+                            for item in body.get("sleeps") or () if isinstance(item, dict)],
+                 "wakes": [[item.get("model"), item.get("status"), len(item.get("woke") or ())]
+                           for item in body.get("wakes") or () if isinstance(item, dict)],
+                 "asked": {"sleeps": len(request["sleeps"]), "wakes": len(request["wakes"])},
+                 "phases_ms": body.get("phases_ms") if isinstance(body.get("phases_ms"), dict) else {}},
+                sort_keys=True, default=str,
+            )
+        )
+
     async def _timed_dispatch(self, action, model: str) -> DispatchResult:
-        """One SM call. An exception (a client bug, a malformed answer) becomes a
+        """One non-power SM call (hide / unhide / defrag). An exception (a client bug, a malformed answer) becomes a
         failed, non-retriable result instead of killing the dispatch task."""
         started_ns = time.perf_counter_ns()
-        refused = False
         try:
             with sm_actor(_actor_for(action)):
                 result = await self._dispatch(action, model)
         except asyncio.CancelledError:
             raise
-        except SleepPathRefused as exc:
-            # Nothing reached the SM: own counter, one error line, no traceback, and
-            # no routable-change stamp below (O1 must not see a change that never was).
-            refused = True
-            self._stats["sleep_path_refused_total"] += 1
-            LOG.error(
-                json.dumps(
-                    {"event": "scale_down_without_sleep_path_refused", "model": model,
-                     "reason": str(getattr(action, "reason", "")),
-                     "delta": getattr(action, "delta", None)},
-                    sort_keys=True,
-                )
-            )
-            result = DispatchResult(
-                model=model, action_kind=_action_kind(action), ok=False,
-                error=f"sleep_path_refused: {exc}", retriable=False,
-            )
         except Exception as exc:  # noqa: BLE001 - review 3 P3
             self._stats["dispatch_exceptions_total"] += 1
             LOG.exception("SM call for %s (%s) raised", model, _action_kind(action))
@@ -1544,9 +1920,7 @@ class ActionQueue:
                 error=f"dispatch_exception: {type(exc).__name__}: {exc}",
             )
         self._note_floor_violation(result)
-        self._note_wake_refused(action, result)
-        if not refused:
-            self._stamp_changes(action, model, result)
+        self._stamp_changes(action, model, result)
         if self._prof is not None:
             self._prof.record(
                 {
@@ -1562,7 +1936,7 @@ class ActionQueue:
         """O1 / view-pending stamps, after the SM answered: a failed or partial call may
         still have changed the routable set, so it is stamped too - except a call that
         certainly changed nothing (2026-10-02): a model-level shrink with ``taken: 0``,
-        a relay side without any pair, a refused / unsupported relay, a partial /
+        a relay side without any pair, a refused relay, a partial /
         unfilled growth that woke nothing (review P2-2)."""
         now = int(self._now_ms())
 
@@ -1611,34 +1985,8 @@ class ActionQueue:
                 self._inflight.discard(model)
 
     async def _dispatch(self, action, model: str) -> DispatchResult:
-        if isinstance(action, ReceiverTarget):
-            # Absolute, grow-only target: re-sending it is a no-op (review 3 P2-1).
-            response = await self._client.scale_model_to(action.model, int(action.target))
-            return self._receiver_result(action, response)
-        if isinstance(action, TransferIntent):
-            transfer = getattr(self._client, "transfer", None)
-            if not callable(transfer):
-                response = {"ok": False, "error": "service-manager client has no transfer()",
-                            "status": 404, "retriable": False, "unsupported": True}
-            else:
-                response = await transfer(
-                    action.donor_model, action.receiver_model, int(action.count), sleep_path=action.sleep_path
-                )
-            return self._transfer_result(action, response)
-        if isinstance(action, ScaleAction):
-            if action.delta > 0 and action.pods and getattr(action, "hint", False):
-                hinted = getattr(self._client, "scale_model_hinted", None)
-                if callable(hinted):
-                    # The SM may place the wake elsewhere (it serializes GPU use itself).
-                    return self._hinted_result(
-                        action, await hinted(action.model, action.delta, hints=tuple(action.pods))
-                    )
-            if action.delta != 0 and action.pods:
-                return await self._dispatch_binding_power(action)
-            response = await self._client.scale_model(
-                action.model, action.delta, **_sleep_kwargs(action)
-            )
-            return self._scale_result(action, response)
+        """One non-power SM call (hide / unhide / defrag). Power actions go through
+        :meth:`_run_plan`."""
         if isinstance(action, HideAction):
             if self._is_observe_fresh():
                 # B8 gap: a SafeScale probe start's hide queued just before the
@@ -1666,213 +2014,18 @@ class ActionQueue:
             return _dispatch_result(model=CLUSTER_MODEL, action_kind="defrag", response=response)
         return DispatchResult(model=model, action_kind="unknown", ok=False, error="unsupported_action")
 
-    def _scale_result(self, action: ScaleAction, response: dict) -> DispatchResult:
-        """A model-level ``/target`` call. A shrink reports ``taken`` (replicas really
-        put to sleep) and ``clamped_by_floor`` (2026-10-02: the SM clamps every
-        model-level shrink at the replica floor and answers 200): accounted by
-        ``taken`` - 0 changed nothing; a clamp is an event (``scale_clamped_by_floor``),
-        never a hold."""
-        result = _dispatch_result(model=action.model, action_kind="scale", response=response)
-        if action.delta > 0 and response.get("partial"):
-            # 409 ``partial`` of an exact growth (SM best effort, 2026-10-06): some
-            # replicas DID wake - reported with them (``changed`` / ``picked``),
-            # never as "nothing happened"; not retried (relative), the planner re-plans.
-            body = response.get("response") or {}
-            self._refusal_events(action.model, body)  # "partial" is no WAKE_ERROR_CODE
-            woke, picked = _woke(body), tuple(body.get("picked") or ())
-            return replace(
-                result, retriable=False, changed=woke, picked=picked, woke_none=not (woke or picked)
-            )
-        if action.delta >= 0 or not result.ok:
-            return result
-        body = response.get("response") or {}
-        if not isinstance(body, dict) or "taken" not in body:
-            return result  # no shrink planned by the SM (already at / below target)
-        try:
-            taken = max(0, int(body.get("taken") or 0))
-        except (TypeError, ValueError):
-            return result
-        asked = -int(action.delta)
-        if taken < asked:
-            if body.get("clamped_by_floor"):
-                self._stats["scale_clamped_by_floor_total"] += 1
-                self._events.append(f"scale_clamped_by_floor:{action.model}:taken={taken}:asked={asked}")
-            else:
-                self._events.append(f"scale_down_short:{action.model}:taken={taken}:asked={asked}")
-            LOG.info(
-                json.dumps(
-                    {"event": "scale_down_taken", "model": action.model, "asked": asked, "taken": taken,
-                     "clamped_by_floor": bool(body.get("clamped_by_floor")), "floor": body.get("floor")},
-                    sort_keys=True, default=str,
-                )
-            )
-        return replace(result, taken=taken)
-
-    def _transfer_result(self, action: TransferIntent, response: dict) -> DispatchResult:
-        """``POST /v2/transfers`` -> the receiver-side result with the transfer summary.
-        ``ok`` = at least one pair done; ``done`` / ``taken`` say what really happened
-        (a 200 may be partial; 409 ``partial`` = nothing completed). Refusals, a floor
-        clamp and ``taken: 0`` are observation events only."""
-        donor, receiver = action.donor_model, action.receiver_model
-        relay = f"{donor}->{receiver}"
-        self._stats["transfer_total"] += 1
-        if response.get("unsupported"):
-            # Deployed against a service-manager without the endpoint: not executed.
-            self._stats["transfer_unsupported_total"] += 1
-            self._events.append(f"transfer_unsupported:{relay}")
-            LOG.error(
-                json.dumps(
-                    {"event": "transfer_endpoint_missing", "donor": donor, "receiver": receiver,
-                     "count": action.count, "detail": "POST /v2/transfers returned 404: the controller "
-                     "must be deployed together with a service-manager that implements it",
-                     "error": response.get("error")},
-                    sort_keys=True,
-                )
-            )
-            return DispatchResult(
-                model=receiver, action_kind="transfer", ok=False,
-                error="transfer_unsupported: the service-manager has no POST /v2/transfers",
-                taken=0, done=0, transfer={"outcome": "unsupported"},
-            )
-        body = response.get("response") if (response.get("ok") or response.get("partial")) else None
-        if not isinstance(body, dict):
-            status = response.get("status")
-            # Refused before any change (400, 409 routable_unknown / writer_busy, ...):
-            # nothing happened (writer_busy: the SM writer lock wait timed out). Anything else (timeout, transport,
-            # 5xx, another 409): whether anything happened is unknown.
-            outcome = "refused" if response.get("not_executed") else "unknown"
-            self._stats["transfer_failed_total"] += 1
-            error = str(response.get("error") or "transfer_failed")
-            self._events.append(f"transfer_failed:{relay}:{outcome}:{error[:160]}")
-            return DispatchResult(
-                model=receiver, action_kind="transfer", ok=False, error=error, retriable=False,
-                taken=0 if outcome == "refused" else None, done=0 if outcome == "refused" else None,
-                transfer={"outcome": outcome, "status": status, "code": response.get("code")},
-                not_executed=outcome == "refused",
-            )
-        summary = _transfer_summary(body)
-        done, taken, unfilled = summary["done"], summary["taken"], summary["unfilled"]
-        self._stats["transfer_pairs_done_total"] += done
-        if done < action.pairs:
-            self._stats["transfer_partial_total"] += 1
-        self._events.append(
-            f"transfer_done:{relay}:count={action.count}:done={done}:taken={taken}:unfilled={unfilled}"
-            f":id={summary['transfer_id']}"
-        )
-        for pair in summary["pairs"]:
-            self._events.append(
-                f"transfer_pair:{relay}:{'+'.join(pair['donors'])}->{pair['receiver']}"
-                f"@{pair['node']}/{','.join(str(gpu) for gpu in pair['gpu_ids'])}:{pair['status']}"
-            )
-        for refusal in body.get("refusals") or ():
-            if isinstance(refusal, dict):
-                self._wake_refused_event(receiver, _refusal_conflict(refusal))
-        if summary["clamped_by_floor"]:
-            self._stats["transfer_clamped_by_floor_total"] += 1
-            self._events.append(f"transfer_clamped_by_floor:{relay}:taken={taken}:count={action.count}")
-        if unfilled > 0:
-            skipped = ",".join(f"{key}={value}" for key, value in sorted(summary["skipped"].items()))
-            self._events.append(f"transfer_unfilled:{relay}:{unfilled}:{skipped}")
-        LOG.info(
-            json.dumps(
-                {"event": "transfer_result", "donor": donor, "receiver": receiver, "count": action.count,
-                 "reason": action.reason, **summary},
-                sort_keys=True, default=str,
-            )
-        )
-        error = None
-        if done <= 0:
-            error = (
-                "clamped_by_floor: no donor replica taken" if summary["clamped_by_floor"] and taken == 0
-                else str(response.get("error") or "partial: no pair completed")
-            )
-        elif done < action.pairs:
-            error = f"partial: {done} of {action.pairs} pairs done"
-        return DispatchResult(
-            model=receiver, action_kind="transfer", ok=done > 0, error=error, retriable=False,
-            picked=tuple(body.get("picked") or ()), taken=taken, done=done, transfer=summary,
-        )
-
-    def _hinted_result(self, action: ScaleAction, response: dict) -> DispatchResult:
-        """A hinted wake's result (S5): ``placement_substituted`` for every replica the
-        SM woke somewhere else than its hint (paired by the hint's binding id, never by
-        position); the SM's refusals are ``wake_refused`` events (no cooldown since
-        2026-10-02); an unfilled growth is not a success - the planner re-plans
-        (review P2-7)."""
-        result = _dispatch_result(model=action.model, action_kind="scale", response=response)
-        body = (response.get("response") or {}) if response.get("ok") else {}
-        picked = tuple(body.get("picked") or ())
-        for entry in picked:
-            if not isinstance(entry, dict) or entry.get("hinted"):
-                continue
-            source = _binding_gpus(entry.get("hint_binding_id")) or "?"
-            target = f"{entry.get('node')}/{','.join(str(g) for g in entry.get('gpu_ids') or ())}"
-            self._events.append(f"placement_substituted:{action.model}:{source}->{target}")
-        self._refusal_events(action.model, body)
-        unfilled = int(body.get("unfilled") or 0)
-        if unfilled > 0:
-            # What did wake is reported (``changed``): stamped and recorded as "up".
-            woke = _woke(body)
-            return replace(
-                result, ok=False, error=f"partial: {unfilled} of {action.delta} wakes unfilled",
-                retriable=False, picked=picked, changed=woke, woke_none=not (woke or picked),
-            )
-        return replace(result, picked=picked)
-
-    def _receiver_result(self, action: ReceiverTarget, response: dict) -> DispatchResult:
-        """A SafeScale receiver's absolute grow-only target. A 200 the SM filled in
-        part (``unfilled``, 2026-10-06) stays ok: the donor already slept (a commit
-        is not undone), the woken replicas are a real "up", and a re-send could not
-        place more now - the next tick re-plans from the view. The short fill is an
-        event (``receiver_short``) and every refusal a ``wake_refused`` event."""
-        result = _dispatch_result(model=action.model, action_kind="scale", response=response)
-        body = (response.get("response") or {}) if result.ok else {}
-        unfilled = int(body.get("unfilled") or 0) if isinstance(body, dict) else 0
-        if unfilled <= 0:
-            return result
-        self._stats["receiver_short_total"] += 1
-        self._events.append(f"receiver_short:{action.model}:unfilled={unfilled}:target={action.target}")
-        LOG.info(
-            json.dumps(
-                {"event": "receiver_short", "model": action.model, "target": action.target,
-                 "unfilled": unfilled, "woke": list(_woke(body))},
-                sort_keys=True,
-            )
-        )
-        self._refusal_events(action.model, body)
-        picked = tuple(body.get("picked") or ())
-        return replace(result, picked=picked, woke_none=not (_woke(body) or picked))
-
     def _refusal_events(self, model: str, body: dict) -> None:
-        """``refusals[]`` of a /target response: one ``wake_refused`` event each."""
+        """``refusals[]`` of a plan wake item: one ``wake_refused`` event each."""
         for refusal in body.get("refusals") or ():
             if isinstance(refusal, dict):
-                self._wake_refused_event(model, _refusal_conflict(refusal))
-
-    async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
-        # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: the
-        # SafeScale commit of the hidden probe pods.
-        # Stops at the first failure (a retry re-sends every pod: the SM answers a
-        # binding already in the wanted power state with a no-op). A failure after
-        # some pods changed is reported with them (``changed``), never as "nothing
-        # happened" - even when the failing pod's refusal changed nothing itself.
-        changed: list[str] = []
-        for pod in action.pods:
-            response = await self._client.set_binding_power(
-                pod, awake=action.delta > 0, **_sleep_kwargs(action)
-            )
-            if not bool(response.get("ok", False)):
-                result = _dispatch_result(model=action.model, action_kind="scale", response=response)
-                if changed:
-                    result = replace(result, changed=tuple(changed), not_executed=False)
-                return result
-            changed.append(pod)
-        return DispatchResult(model=action.model, action_kind="scale", ok=True)
+                self._wake_refused_event(model, plan_items.refusal_conflict(refusal))
 
     def _record_done(self, model: str, action, result: DispatchResult) -> None:
         direction = _action_direction(action)
         if not (result.ok or result.changed) or direction is None:
             return
+        if result.woke_none and not result.changed:
+            return  # no-op fix (design §5.5): a growth that woke nothing is no "up"
         if direction == "down" and result.taken == 0:
             return  # clamped to nothing (2026-10-02): no scale-down happened
         self._last_done[model] = (int(self._now_ms()), direction)
@@ -1896,6 +2049,18 @@ class ActionQueue:
         removed: list[tuple[str, SourceLoop]] = []
         retained: deque[QueuedAction] = deque()
         for item in self._pending:
+            if isinstance(item.action, PlanBatch):
+                # A fused plan: only its fairness members of ``model`` go.
+                kept = tuple(
+                    member for member in item.action.members
+                    if not (member.source_loop == "fairness" and model in _queued_models(member))
+                )
+                removed.extend((model, "fairness") for _ in range(len(item.action.members) - len(kept)))
+                if len(kept) == len(item.action.members):
+                    retained.append(item)
+                elif kept:
+                    retained.append(self._queued(kept[0] if len(kept) == 1 else PlanBatch(kept)))
+                continue
             if model in item.models and item.source_loop == "fairness":
                 removed.append((model, item.source_loop))
                 continue
@@ -1913,9 +2078,13 @@ class ActionQueue:
             )
         if isinstance(action, SafeScaleCommitAction):
             return self._commit_queued(action)
-        if isinstance(action, TransferIntent):
+        if isinstance(action, PlanBatch):
+            # Every member's models and named pods (a relay names none).
+            models = tuple(dict.fromkeys(m for member in action.members for m in _queued_models(member)))
+            pods = tuple(pod for member in action.members for pod in (getattr(member, "pods", ()) or ()))
+        elif isinstance(action, TransferIntent):
             # Both models; no pod / GPU - the SM picks them under its writer lock.
-            models = tuple(dict.fromkeys((action.donor_model, action.receiver_model)))
+            models = _queued_models(action)
             pods = ()
         else:
             models = (action.model,)
@@ -1980,90 +2149,21 @@ def _rescue_part(action):
     return None
 
 
-def _transfer_summary(body: dict) -> dict:
-    """The accounting view of a ``POST /v2/transfers`` answer (200, or the body of a
-    409 ``partial``): what was done, with the pod names of every pair."""
-
-    def num(key: str) -> int:
-        try:
-            return max(0, int(body.get(key) or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    pairs = []
-    for item in body.get("pairs") or ():
-        if not isinstance(item, dict):
-            continue
-        donors = item.get("donors") or ([item["donor"]] if item.get("donor") else [])
-        pair = {
-            "donors": [str(pod) for pod in donors],
-            "receiver": str(item.get("receiver") or ""),
-            "node": str(item.get("node") or ""),
-            "gpu_ids": list(item.get("gpu_ids") or ()),
-            "status": str(item.get("status") or "unknown"),
-        }
-        if item.get("compensating_sleep"):
-            pair["compensating_sleep"] = item.get("compensating_sleep")
-        error = item.get("error")
-        if isinstance(error, dict) and error.get("error"):
-            pair["error"] = str(error.get("error"))
-        pairs.append(pair)
-    done = num("done") if "done" in body else sum(1 for pair in pairs if pair["status"] == "done")
-    taken = num("taken")
-    skipped = body.get("skipped") if isinstance(body.get("skipped"), dict) else {}
-    return {
-        "transfer_id": body.get("transfer_id"),
-        "outcome": "ok" if done > 0 else "partial",
-        "done": done,
-        "taken": taken,
-        "unfilled": num("unfilled"),
-        "clamped_by_floor": bool(body.get("clamped_by_floor")),
-        "pairs": pairs,
-        "refusals": len(body.get("refusals") or ()),
-        # (error code, reason) of each wake refusal: the relay hold tells a transient
-        # refusal (a Pod loading, no gpu-truth) from a fleet one (relay_hold_reason).
-        "refusal_codes": [
-            [str(item.get("error") or ""), str(item.get("reason") or "")]
-            for item in body.get("refusals") or () if isinstance(item, dict)
-        ],
-        "skipped": {str(key): value for key, value in skipped.items()},
-        "picked": [
-            entry.get("serve_id") for entry in body.get("picked") or () if isinstance(entry, dict)
-        ],
-        "phases_ms": body.get("phases_ms") if isinstance(body.get("phases_ms"), dict) else {},
-    }
-
-
 def _transfer_changed(result: DispatchResult) -> tuple[bool, bool]:
     """(donor side changed, receiver side changed) of a relay result - for the O1 /
     view-pending stamps. Unknown outcome (timeout, transport, 5xx, exception): both."""
     summary = result.transfer
     if not summary or summary.get("outcome") == "unknown":
         return True, True
-    if summary.get("outcome") in ("unsupported", "refused"):
+    if summary.get("outcome") in ("refused", "noop"):
         return False, False
     pairs = summary.get("pairs") or ()
     donor = bool(summary.get("taken")) or bool(pairs)
-    receiver = bool(summary.get("done")) or any(pair.get("status") == "receiver_wake_failed" for pair in pairs)
-    return donor, receiver
-
-
-def _woke(body: dict) -> tuple[str, ...]:
-    """Serve ids a /target response woke (its ``wake`` actions)."""
-    return tuple(
-        str(item.get("serve_id")) for item in body.get("actions") or ()
-        if isinstance(item, dict) and item.get("action") == "wake" and item.get("serve_id")
+    receiver = (
+        bool(summary.get("done")) or bool(summary.get("wake_failed"))
+        or any(pair.get("status") == "receiver_wake_failed" for pair in pairs)
     )
-
-
-def _refusal_conflict(refusal: dict) -> dict:
-    """A structured refusal body (``refusals[]`` of /target or /v2/transfers) in the
-    shape of ``ServiceManagerError.wake_conflict``."""
-    return {
-        "node": refusal.get("node"), "gpu_ids": refusal.get("gpu_ids") or refusal.get("gpu") or (),
-        "scope": refusal.get("scope"), "error": refusal.get("error"), "reason": refusal.get("reason"),
-        "blocking_binding_id": refusal.get("blocking_binding_id"),
-    }
+    return donor, receiver
 
 
 def _retry_safe(action) -> bool:
@@ -2082,11 +2182,8 @@ def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
             DispatchResult(model=model, action_kind="scale", ok=True, error="observe_skipped")
             for model in queued.models
         ]
-    if isinstance(action, TransferIntent):
-        return [
-            DispatchResult(model=model, action_kind="transfer", ok=True, error="observe_skipped")
-            for model in (action.donor_model, action.receiver_model)
-        ]
+    if isinstance(action, (PlanBatch, TransferIntent)):
+        return [result for member in _members(action) for result in _member_observe_skipped(member)]
     return [
         DispatchResult(
             model=queued.model,
@@ -2098,38 +2195,9 @@ def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
     ]
 
 
-class SleepPathRefused(ValueError):
-    """A scale-down that names no sleep path: refused before any SM call."""
-
-
-def _sleep_kwargs(action: ScaleAction) -> dict:
-    """SM sleep path + drain budget of a scale-down (plan 2026-09-27 D1).
-
-    Only non-default values are sent. A negative delta must name its path (explicitly
-    or via an "*_immediate" reason): there is no implicit "scale_down" any more.
-    "*_immediate" planner reasons are the fast-loop donor paths ("urgent").
-    """
-    if action.delta >= 0:
-        return {}
-    path = action.sleep_path or ("urgent" if str(action.reason).endswith("_immediate") else None)
-    if path is None:
-        # Every legitimate shrink names its path ("urgent" donors, "safescale_commit").
-        # A path-less one would silently take the SM default `scale_down` (SM-side
-        # drain, up to 150 s), bypassing SafeScale: refuse. ``_timed_dispatch`` turns
-        # it into one failed, non-retriable result (single error log, own counter).
-        raise SleepPathRefused(
-            f"scale-down of {action.model} ({action.reason}) has no sleep_path: "
-            "refusing the implicit SM scale_down default"
-        )
-    kwargs: dict = {}
-    if path != "scale_down":
-        kwargs["sleep_path"] = path
-    if action.drain_budget_s is not None:
-        kwargs["drain_budget_s"] = float(action.drain_budget_s)
-    return kwargs
-
-
 def _action_kind(action) -> str:
+    if isinstance(action, PlanBatch):
+        return "plan"
     if isinstance(action, SafeScaleCommitAction):
         return "safescale_commit"
     if isinstance(action, TransferIntent):
@@ -2184,6 +2252,106 @@ def _queued_action(action: QueueAction) -> QueuedAction:
     if isinstance(action, DefragAction):
         return QueuedAction(action=action, model=CLUSTER_MODEL, source_loop=action.source_loop)
     return QueuedAction(action=action, model=action.model, source_loop=action.source_loop)
+
+
+@dataclass(frozen=True)
+class PlanBatch:
+    """Re-plannable power actions (``ScaleAction``, ``TransferIntent``) of ONE
+    ``submit()`` fused into ONE ``POST /v2/plans`` (design 20261027-sm-plans §5.2, as
+    narrowed by the architect): each member is exactly one plan item and no two members
+    touch the same model (a relay's donor counts as used by its item)."""
+
+    members: tuple[Action, ...]
+
+    @property
+    def model(self) -> str:
+        return _member_model(self.members[0])
+
+    @property
+    def source_loop(self) -> SourceLoop:
+        return self.members[0].source_loop
+
+    @property
+    def reason(self) -> str:
+        return "+".join(dict.fromkeys(str(getattr(member, "reason", "")) for member in self.members))
+
+
+@dataclass(frozen=True)
+class _PlanRun:
+    """One plan dispatch: the members (SafeScale receivers with their resolved target)
+    and one result per member; ``observe_skipped`` = nothing sent (observe mode)."""
+
+    members: tuple
+    results: tuple
+    observe_skipped: bool = False
+    #: No item results: the GET or the POST failed as a whole (refused, unknown).
+    whole_plan_failed: bool = False
+
+
+def _members(action) -> tuple:
+    return tuple(action.members) if isinstance(action, PlanBatch) else (action,)
+
+
+def _member_model(action) -> str:
+    """The model a member's result is reported for (a relay: its receiver)."""
+    return str(getattr(action, "model"))
+
+
+def _queued_models(action) -> tuple[str, ...]:
+    """Every model an action changes (a relay: donor and receiver)."""
+    if isinstance(action, TransferIntent):
+        return tuple(dict.fromkeys((action.donor_model, action.receiver_model)))
+    return (action.model,)
+
+
+def _fusable(queued: QueuedAction) -> bool:
+    """A re-plannable power action that may share one plan with the other actions of
+    its submit (a SafeScale one-shot action keeps its own plan and retries)."""
+    action = queued.action
+    if queued.source_loop in ONE_SHOT_LOOPS:
+        return False
+    return isinstance(action, TransferIntent) or (isinstance(action, ScaleAction) and action.delta != 0)
+
+
+def _replannable_power(queued: QueuedAction) -> bool:
+    """Dispatched as one plan without retry: a fused batch, a relay, a re-plannable scale."""
+    action = queued.action
+    if isinstance(action, (PlanBatch, TransferIntent)):
+        return True
+    return isinstance(action, ScaleAction) and queued.source_loop not in ONE_SHOT_LOOPS
+
+
+def _member_observe_skipped(member) -> list[DispatchResult]:
+    if isinstance(member, TransferIntent):
+        return [
+            DispatchResult(model=model, action_kind="transfer", ok=True, error="observe_skipped")
+            for model in (member.donor_model, member.receiver_model)
+        ]
+    return [DispatchResult(model=_member_model(member), action_kind=_action_kind(member), ok=True,
+                           error="observe_skipped")]
+
+
+def _response_item(body: dict, kind: str, position: int) -> dict | None:
+    """The item of a plan response for request position ``position`` (by ``index``,
+    else by position)."""
+    items = [item for item in body.get(kind + "s") or () if isinstance(item, dict)]
+    for item in items:
+        if item.get("index") == position:
+            return item
+    if position < len(items) and "index" not in items[position]:
+        return items[position]
+    return None
+
+
+def _plan_actor(members: tuple) -> str:
+    """``X-TRE-Actor`` of a plan: the member's own actor, or the loop and the members'
+    reasons for a fused plan."""
+    if len(members) == 1:
+        return _actor_for(members[0])
+    loop = getattr(members[0], "source_loop", None) or "unknown"
+    reasons = "+".join(dict.fromkeys(str(getattr(member, "reason", None) or type(member).__name__)
+                                     for member in members))
+    return f"controller/{loop}/plan:{reasons}"
 
 
 #: SM sleep outcome statuses of a pod that may be asleep (review 4 P2-2).

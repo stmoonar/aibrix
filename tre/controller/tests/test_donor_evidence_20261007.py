@@ -39,7 +39,7 @@ from tre_controller.planning.safescale import ProbeWindowInputs, SafeScaleDecisi
 from tre_sm.allocator.slots import Binding, Slot
 
 from test_controller_transfer_20261002 import D, R, TOPOLOGY, _e1
-from test_drain_policy_20260929 import RecordingClient
+from plan_shim import PlanSM
 from test_planner_slot_occupancy import _cls
 from test_scaling_e2e import HEALTHY, LOW, _registry, _window
 from test_timer_cleanup_early_commit_20261002 import LONG_W, EarlyHarness
@@ -240,7 +240,7 @@ def test_the_tick_reserves_the_slot_of_an_inflight_probe():
 # ============================================================== 2. F2
 def test_a_committed_scale_down_asks_for_a_view_refresh():
     asked: list[int] = []
-    queue = ActionQueue(RecordingClient(), on_fleet_change=lambda: asked.append(1))
+    queue = ActionQueue(PlanSM(), on_fleet_change=lambda: asked.append(1))
     queue.submit((SafeScaleCommitAction(donor="m", pods=("pod-a",), reason="formal_commit_gate_passed"),))
     asyncio.run(queue.drain_once())
     assert asked

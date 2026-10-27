@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue, _sleep_kwargs
+from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.loops.plan_items import plan_item
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import (
     IMMEDIATE_DONOR_SLEEP_PATH,
@@ -25,17 +26,7 @@ from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay in
 from test_planner import _classification
 
 
-class RecordingClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-
-    async def scale_model(self, model, delta, **kwargs):
-        self.calls.append(("scale", model, delta, kwargs))
-        return {"ok": True}
-
-    async def set_binding_power(self, serve_id, *, awake, **kwargs):
-        self.calls.append(("power", serve_id, awake, kwargs))
-        return {"ok": True}
+from plan_shim import PlanSM
 
 
 def _plan():
@@ -87,8 +78,9 @@ def test_add_scale_action_passes_sleep_path_and_budget_only_for_a_shrink():
     )
     assert (actions[0].sleep_path, actions[0].drain_budget_s) == ("urgent", 5.0)
     assert (actions[1].sleep_path, actions[1].drain_budget_s) == (None, None)
-    assert _sleep_kwargs(actions[0]) == {"sleep_path": "urgent", "drain_budget_s": 5.0}
-    assert _sleep_kwargs(actions[1]) == {}
+    # The plan item carries the path; the SM never drains, so no budget is sent.
+    assert plan_item(actions[0])[1]["sleep_path"] == "urgent"
+    assert "sleep_path" not in plan_item(actions[1])[1]
 
 
 def test_idle_proactive_immediate_donor_dispatches_on_the_urgent_path():
@@ -103,18 +95,18 @@ def test_idle_proactive_immediate_donor_dispatches_on_the_urgent_path():
     shrink = next(a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "idle")
     assert shrink.reason == "idle_proactive_immediate" and shrink.sleep_path == "urgent"
 
-    client = RecordingClient()
-    queue = ActionQueue(client)
+    sm = PlanSM({"idle": 4})
+    queue = ActionQueue(sm)
     queue.submit((shrink,))
     asyncio.run(queue.drain_once())
-    assert client.calls == [("scale", "idle", shrink.delta, {"sleep_path": "urgent"})]
+    [plan] = sm.plans
+    assert plan["sleeps"] == [{"model": "idle", "reason": "idle_proactive_immediate", "sleep_path": "urgent",
+                               "at_most": 4 + shrink.delta}]
 
 
-def test_safescale_commit_keeps_its_own_path_and_the_window_budget():
-    # The SM ignores the budget while safescale_commit is a no-drain path; it is
-    # still sent so that no_drain_paths: [] restores the probe-window drain.
+def test_safescale_commit_keeps_its_own_path():
+    # The SM never drains (since 2026-10-02): a plan sleep item has no drain budget.
     commit = SafeScaleCommitAction(donor="m", pods=("pod-a",), reason="gate", drain_budget_s=60.0)
-    assert _sleep_kwargs(commit.donor_sleep()) == {
-        "sleep_path": "safescale_commit",
-        "drain_budget_s": 60.0,
-    }
+    assert plan_item(commit.donor_sleep()) == (
+        "sleep", {"model": "m", "reason": "gate", "sleep_path": "safescale_commit", "pods": ["pod-a"]}
+    )

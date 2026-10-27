@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue, DispatchResult, SubmitResult
+from tre_controller.loops.action_queue import DispatchResult, SubmitResult
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
 from tre_sm.allocator.slots import Migration, Slot
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 class FakeServiceManagerClient:

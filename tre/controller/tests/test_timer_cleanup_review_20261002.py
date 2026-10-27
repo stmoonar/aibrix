@@ -24,7 +24,6 @@ from tre_common.registry import (
 )
 from tre_controller.config import ControllerConfig
 from tre_controller.loops import cluster_view_task as cluster_view_module
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.cluster_view_task import (
     ClusterViewBox,
     StaleViewAlert,
@@ -41,6 +40,7 @@ from tre_sm.allocator.slots import Binding, Slot
 
 from test_timer_cleanup_f4_o1_20261002 import BASE, LOW, _ActionQueue, _state
 from test_o1_breakpoint_window_20261001 import GRID, O1, _registry, _snap, _ups, _view, _window
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 # ------------------------------------------------------------------ P2-1

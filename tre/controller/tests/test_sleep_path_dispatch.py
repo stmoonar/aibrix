@@ -1,4 +1,7 @@
-"""Controller -> SM sleep path + drain budget (plan 2026-09-27 D1)."""
+"""Controller -> SM sleep path (plan 2026-09-27 D1), as plan items (design 20261027-sm-plans).
+
+The drain budget is no longer sent: the SM never drains (since 2026-10-02) and a plan
+item has no budget field."""
 
 from __future__ import annotations
 
@@ -6,111 +9,69 @@ import asyncio
 
 import pytest
 
-from tre_controller.loops.action_queue import ActionQueue, _sleep_kwargs
+from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.loops.plan_items import SleepPathRefused, plan_item, sleep_path_of
 from tre_controller.planning.planner import ScaleAction
-from tre_controller.sm_client import ServiceManagerClient
+
+from plan_shim import PlanSM
 
 
-class RecordingClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-
-    async def scale_model(self, model, delta, **kwargs):
-        self.calls.append(("scale", model, delta, kwargs))
-        return {"ok": True}
-
-    async def set_binding_power(self, serve_id, *, awake, **kwargs):
-        self.calls.append(("power", serve_id, awake, kwargs))
-        return {"ok": True}
-
-
-def _dispatch(*actions):
-    client = RecordingClient()
-    queue = ActionQueue(client)
+def _dispatch(*actions, awake=None):
+    sm = PlanSM(awake if awake is not None else {"m": 2})
+    queue = ActionQueue(sm)
     for action in actions:
         queue.submit((action,))
         asyncio.run(queue.drain_once())
-    return client.calls
+    return sm
 
 
 def test_immediate_donor_paths_are_urgent():
-    calls = _dispatch(ScaleAction("m", -1, "critical_donor_immediate", "rescue"))
-    assert calls == [("scale", "m", -1, {"sleep_path": "urgent"})]
+    sm = _dispatch(ScaleAction("m", -1, "critical_donor_immediate", "rescue"))
+    assert sm.plans == [{"sleeps": [{"model": "m", "reason": "critical_donor_immediate", "sleep_path": "urgent",
+                                     "at_most": 1}], "wakes": []}]
 
 
 def test_pathless_scale_down_is_refused_not_sent_to_the_sm_default():
-    # 2026-10-02: no implicit `scale_down` path; the dispatch wrapper reports a
-    # failed result and nothing reaches the SM.
-    client = RecordingClient()
-    queue = ActionQueue(client)
+    # 2026-10-02: no implicit `scale_down` path; the dispatch reports a failed result and
+    # nothing reaches the SM (not even the plan's GET).
     action = ScaleAction("m", -1, "high_release", "fairness")
-    with pytest.raises(ValueError, match="no sleep_path"):
-        _sleep_kwargs(action)
+    with pytest.raises(SleepPathRefused, match="no sleep_path"):
+        sleep_path_of(action)
+    sm = PlanSM({"m": 2})
+    queue = ActionQueue(sm)
     queue.submit((action,))
     results = asyncio.run(queue.drain_once())
-    assert client.calls == []
+    assert sm.plans == [] and sm.state_reads == 0
     assert [r.ok for r in results] == [False]
     assert results[0].error.startswith("sleep_path_refused") and results[0].retriable is False
+    assert queue.stats()["sleep_path_refused_total"] == 1 and queue.view_changes() == {}
 
 
 def test_pathless_binding_scale_down_is_refused_too():
-    client = RecordingClient()
-    queue = ActionQueue(client)
-    queue.submit((ScaleAction("m", -1, "high_release", "fairness", pods=("pod-a",)),))
-    results = asyncio.run(queue.drain_once())
-    assert client.calls == []
-    assert [r.ok for r in results] == [False]
-    assert "no sleep_path" in results[0].error
+    sm = _dispatch(ScaleAction("m", -1, "high_release", "fairness", pods=("pod-a",)))
+    assert sm.plans == []
 
 
-def test_sleep_kwargs_keeps_explicit_paths_and_ignores_scale_ups():
-    assert _sleep_kwargs(ScaleAction("m", 1, "x", "rescue")) == {}
-    assert _sleep_kwargs(ScaleAction("m", -1, "x_immediate", "rescue")) == {"sleep_path": "urgent"}
-    assert _sleep_kwargs(ScaleAction("m", -1, "x", "safescale", sleep_path="safescale_commit")) == {
-        "sleep_path": "safescale_commit"
-    }
+def test_plan_items_keep_explicit_paths_and_scale_ups_carry_none():
+    assert plan_item(ScaleAction("m", 1, "x", "rescue")) == ("wake", {"model": "m", "reason": "x", "_delta": 1})
+    assert plan_item(ScaleAction("m", -1, "x_immediate", "rescue"))[1]["sleep_path"] == "urgent"
+    assert plan_item(ScaleAction("m", -1, "x", "safescale", sleep_path="safescale_commit"))[1]["sleep_path"] == (
+        "safescale_commit"
+    )
 
 
-def test_scale_up_sends_no_sleep_fields():
-    calls = _dispatch(ScaleAction("m", 2, "critical", "rescue"))
-    assert calls == [("scale", "m", 2, {})]
+def test_scale_up_is_an_absolute_at_least_without_sleep_fields():
+    sm = _dispatch(ScaleAction("m", 2, "critical", "rescue"))
+    assert sm.plans == [{"sleeps": [], "wakes": [{"model": "m", "reason": "critical", "at_least": 4}]}]
 
 
-def test_safescale_commit_sends_path_and_probe_window_budget():
-    calls = _dispatch(
+def test_safescale_commit_sends_its_path_for_the_named_pods():
+    sm = _dispatch(
         ScaleAction(
             "m", -1, "formal_commit_gate_passed", "safescale", pods=("pod-a",),
             sleep_path="safescale_commit", drain_budget_s=42.0,
         )
     )
-    assert calls == [
-        ("power", "pod-a", False, {"sleep_path": "safescale_commit", "drain_budget_s": 42.0})
-    ]
-
-
-class Transport:
-    def __init__(self) -> None:
-        self.calls = []
-
-    async def request(self, method, url, *, json=None, timeout_s):
-        self.calls.append((method, url, json))
-        if url.endswith("/v2/state"):
-            return {"models": {"m": {"awake": 2, "bound": 4}}}
-        return {"ok": True}
-
-
-@pytest.mark.asyncio
-async def test_sm_client_puts_sleep_fields_only_when_given():
-    transport = Transport()
-    client = ServiceManagerClient("http://sm", transport=transport)
-
-    await client.scale_model("m", -1, sleep_path="urgent", drain_budget_s=30)
-    await client.scale_model("m", -1)
-    await client.set_binding_power("p", awake=False, sleep_path="safescale_commit", drain_budget_s=12)
-
-    puts = [call for call in transport.calls if call[0] == "PUT"]
-    assert puts == [
-        ("PUT", "http://sm/v2/models/m/target", {"wake_replicas": 1, "sleep_path": "urgent", "drain_budget_s": 30.0}),
-        ("PUT", "http://sm/v2/models/m/target", {"wake_replicas": 1}),
-        ("PUT", "http://sm/v2/bindings/p/power", {"awake": False, "sleep_path": "safescale_commit", "drain_budget_s": 12.0}),
-    ]
+    assert sm.plans == [{"sleeps": [{"model": "m", "reason": "formal_commit_gate_passed",
+                                     "sleep_path": "safescale_commit", "pods": ["pod-a"]}], "wakes": []}]
+    assert sm.state_reads == 0  # named pods need no awake count

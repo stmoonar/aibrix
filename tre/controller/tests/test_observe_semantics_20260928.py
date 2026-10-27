@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.safescale_task import (
     rollback_probes_for_observe,
     run_safescale_observation_tick,
@@ -25,6 +24,7 @@ from tre_controller.store.state_store import ControllerStateStore
 
 from test_action_queue_review3 import ScriptedSM, _calls, _commit, _until
 from test_safescale_commit import FakeRedis, _machine, _metrics, _probe_records, _registry, _start_and_prime
+from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
 def _transfer():
@@ -68,7 +68,11 @@ def test_a_transfer_dispatched_in_observe_does_nothing():
 
 
 # ------------------------------------------------------------ mid-commit flip
-def test_observe_entered_after_the_commit_donor_slept_drops_the_receiver_wakes():
+def test_observe_entered_while_a_commit_plan_runs_is_completed_by_the_sm():
+    """Design 20261027-sm-plans §5.4: a commit attempt is ONE plan (donor sleep +
+    receivers). Once it is posted, the SM completes it - an observe switch during the
+    plan no longer stops the receivers (the old serial calls could stop between them)."""
+
     async def scenario():
         mode = {"observe": False}
         done = []
@@ -80,13 +84,10 @@ def test_observe_entered_after_the_commit_donor_slept_drops_the_receiver_wakes()
         mode["observe"] = True
         sm.gates["7b-1"].set()
         results = await drain
-        assert _calls(sm) == [("7b-1", "sleep")]  # no receiver target sent
-        dropped = sorted(r.model for r in results if r.error and r.error.startswith("observe_entered"))
-        assert dropped == ["14b", "8b"]
-        [(request_id, status, reason)] = done
-        assert (request_id, status) == ("7b-0", "commit")  # the donor did sleep
-        assert "observe_entered" in reason
-        assert queue.stats()["observe_commit_stopped_total"] == 1
+        assert _calls(sm) == [("7b-1", "sleep"), ("8b", "target", 3), ("14b", "target", 2)]
+        assert all(r.ok for r in results) and len(results) == 3
+        assert done == [("7b-0", "commit", "formal_commit_gate_passed")]
+        assert queue.stats()["observe_commit_stopped_total"] == 0
 
     asyncio.run(scenario())
 
