@@ -717,3 +717,34 @@ def test_sidecar_reissues_do_not_fail_the_in_tokens_check(tmp_path) -> None:
     doc = arm.run_validity({"p": text}, {"gw_bl_dropped0": 0.0}, 0.0, client_sent_in_tokens=True)
     assert doc["arrivals"]["a"]["arrivals"] == 3 and doc["arrivals"]["a"].get("nonheader_in_tokens", 0) == 0
     assert doc["events_valid"] is True, doc["invalid_because"]
+
+
+def test_a_queued_decision_is_no_up_action_until_it_is_sent(tmp_path) -> None:
+    """Review 2026-10-28 (M1): a decision waiting behind the plan in flight logs
+    ``queued_up`` (not ``up``) and counts as an ``up`` action - and for the reversals - only
+    once its result comes back; one replaced by a later tick is never counted."""
+    gate = threading.Event()
+    script = {0: {"a": 3}, 1: {"b": 2, "c": 2}, 2: {"b": 2}}
+    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy(script), dry_run=False)
+    cluster.gate = gate
+    first = shell.tick_once()
+    assert wait_until(lambda: len(cluster.plans) == 1)
+    second = shell.tick_once()   # b and c wait behind a's plan
+    third = shell.tick_once()    # b again; c no longer decided: replaced (latest wins)
+    assert [(l["model"], l["action"]) for l in first if l["action"] != "none"] == [("a", "up")]
+    assert {(l["model"], l["action"], l.get("queued")) for l in second if l["action"] != "none"} == {
+        ("b", "queued_up", True), ("c", "queued_up", True)}
+    assert [(l["model"], l["action"]) for l in third if l["action"] != "none"] == [("b", "queued_up")]
+    metrics = shell.metrics_text()
+    assert 'model="b",action="up"}' not in metrics
+    gate.set()
+    assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    after = shell.tick_once()
+    b_line = [l for l in after if l["model"] == "b"][0]
+    assert b_line["sm_result"]["queued"] is True and b_line["sm_result"]["plan_id"] == cluster.plans[1]["plan_id"]
+    assert [i["model"] for i in cluster.plans[1]["wakes"]] == ["b"]   # c was never sent
+    metrics = shell.metrics_text()
+    assert 'tre_bl_actions_total{policy="scripted",model="b",action="up"} 1' in metrics
+    assert 'tre_bl_actions_total{policy="scripted",model="b",action="queued_up"} 2' in metrics
+    assert 'model="c",action="up"}' not in metrics
+    dispatcher.close(join_s=1.0)

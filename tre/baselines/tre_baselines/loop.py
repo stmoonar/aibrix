@@ -28,8 +28,12 @@
   sleep of the same plan releases starts once that sleep is confirmed; a wake on a free GPU
   starts at once. One plan at a time: a model whose item is in the plan in flight gets
   ``inflight_skip`` (not queued); the other models' decisions go in the next plan, sent as
-  soon as the one in flight returns (line field ``queued``), and only the latest tick's
-  decisions are kept (latest wins). The tick never waits for the SM.
+  soon as the one in flight returns (action ``queued_up`` / ``queued_down``, line field
+  ``queued``), and only the latest tick's decisions are kept (latest wins). The tick never
+  waits for the SM. A queued decision is not an ``up`` / ``down`` action: the actions
+  counter (``tre_bl_actions_total``) and the direction reversals count a queued decision
+  as ``up`` / ``down`` only once it was actually sent (its result, ``sm_result.queued`` with
+  the ``plan_id``, is collected); one replaced by a later tick is never counted (2026-10-28).
 * SM refusals are logged (``sm_result`` on the model's next decision line).
 * A refused scale-up (an SM answer) is not a model-wide pause: the SM's ``retry_after_s``
   means "avoid THOSE GPUs", and the shell cannot steer the SM to other GPUs, so it waits
@@ -273,7 +277,7 @@ class BaselineShell:
 
     # -- one tick ---------------------------------------------------------------------
 
-    def _collect_results(self) -> dict[str, Completed]:
+    def _collect_results(self, now_ms: int) -> dict[str, Completed]:
         latest: dict[str, Completed] = {}
         for done in self.dispatcher.drain_results():
             dropped = done.result.error == DROPPED
@@ -284,9 +288,17 @@ class BaselineShell:
                     self.stats.sm_calls += 1  # a plan item the SM was asked for
                     if not done.result.ok:
                         self.stats.sm_failures += 1
+                    if done.queued:
+                        # A queued decision counts as an up / down action once sent.
+                        key = (done.model, done.direction)
+                        self.stats.actions[key] = self.stats.actions.get(key, 0) + 1
+            if done.queued and not dropped:
+                self._note_dispatch(done.model, done.direction, now_ms)
             if not done.result.ok and not dropped:
+                # ``plan_id`` pairs the line with the SM's plan_item_refused event, and the lines
+                # of a whole-plan refusal (writer_busy: one per model) with its one 409 line.
                 LOG.warning("SM refused %s %s->%s: %s", done.model, done.direction, done.target,
-                            done.result.as_dict())
+                            {**done.result.as_dict(), "plan_id": done.plan_id})
             latest[done.model] = done
         return latest
 
@@ -320,7 +332,7 @@ class BaselineShell:
         effective_dry = bool(self.config.dry_run or not owner or guard)
         snap = self.source.gather(self._tick)
         # After the gather: a tick whose gather raises leaves the results for the next one.
-        results = self._collect_results()
+        results = self._collect_results(snap.now_ms)
         view = self._state_view(snap.extra or {})
         version = view.key
         if version is not None and version != self._sm_version:
@@ -418,10 +430,14 @@ class BaselineShell:
             if action is None:
                 answer = taken.get(model)
                 if answer in ("sent", "queued"):
-                    action, queued = direction, answer == "queued"
+                    queued = answer == "queued"
+                    # Queued: not sent yet (and maybe replaced by a later tick) - no up /
+                    # down action, no reversal; counted when its result comes back.
+                    action = f"queued_{direction}" if queued else direction
                     if direction == "up":
                         self._submit_view[model] = view
-                    self._note_dispatch(model, direction, snap.now_ms)
+                    if not queued:
+                        self._note_dispatch(model, direction, snap.now_ms)
                 else:
                     action = "inflight_skip"
             line = {
@@ -445,7 +461,7 @@ class BaselineShell:
             refusal = self.refusals.get(model) if direction == "up" else None
             if refusal is not None:
                 line["refusal"] = refusal.as_dict(snap.now_ms)
-                if action == "up":
+                if action in ("up", "queued_up"):
                     line["retry_evidence"] = evidence
             done = results.get(model)
             if done is not None:

@@ -179,7 +179,10 @@ class FakeCluster:
                         entry.update(status="noop" if want <= before else
                                      "done" if not unfilled else "partial" if after > before else "refused",
                                      unfilled=unfilled, refusals=[error_body(SLOT_OCCUPIED)] if unfilled else [])
-                        if unfilled:
+                        if unfilled and after == before:
+                            # As the SM: ``error`` = the first refusal of an item that woke
+                            # nothing (or a failed wake); a partial item has none - its
+                            # cause is its first refusal.
                             entry["error"] = error_body(SLOT_OCCUPIED)
                     else:
                         after = min(before, int(item["at_most"]))
@@ -189,9 +192,9 @@ class FakeCluster:
                         self.awake[model] = after
                         self.version += 1
                         changed = True
+                    entry.update(awake_before=before, awake_after=after)  # both kinds (SM 2026-10-28)
                     if kind == "wakes":
-                        entry.update(awake_before=before, awake_after=after,
-                                     woke=[{"serve_id": f"{model}-{i}"} for i in range(before, after)])
+                        entry["woke"] = [{"serve_id": f"{model}-{i}"} for i in range(before, after)]
                     problems = problems or entry["status"] in ("refused", "failed")
                 out[kind].append(entry)
         with self.lock:

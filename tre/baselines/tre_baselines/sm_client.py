@@ -485,6 +485,8 @@ class Completed:
     plan_id: Optional[str] = None
     #: Items in the plan this decision went out with.
     plan_size: int = 1
+    #: The decision waited behind the plan in flight (``queued`` at its tick).
+    queued: bool = False
 
     @property
     def progressed(self) -> bool:
@@ -502,6 +504,8 @@ class Completed:
     def as_dict(self) -> dict[str, Any]:
         out = {"direction": self.direction, "target": self.target, **self.result.as_dict(),
                "plan_id": self.plan_id, "plan_size": self.plan_size}
+        if self.queued:
+            out["queued"] = True
         out.update(start=self.start, reached=self.reached)
         if self.direction == "up":
             out["partial_fill"] = self.partial_fill
@@ -516,6 +520,8 @@ class _Job:
     target: int
     #: Awake count the decision saw (scale-up), for ``Completed.start``.
     start: Optional[int]
+    #: Waited behind the plan in flight (answered ``queued``).
+    queued: bool = False
 
 
 class Dispatcher:
@@ -579,7 +585,7 @@ class Dispatcher:
                     continue
                 self._seq += 1
                 pending[model] = _Job(self._seq, model, direction, int(target),
-                                      None if start is None else int(start))
+                                      None if start is None else int(start), queued=busy)
                 self.submitted.append((self._seq, model, direction, int(target)))
                 out[model] = "queued" if busy else "sent"
             self._pending = pending
@@ -623,11 +629,13 @@ class Dispatcher:
                                   plan_item(job.model, job.direction, job.target,
                                             abort_sleep_path=self._abort_sleep_path),
                                   SMResult(ok=False, error="exception", detail=repr(exc)[:2000]), job.seq,
-                                  start=job.start, plan_size=len(jobs))
+                                  start=job.start, plan_size=len(jobs), queued=job.queued)
                         for job in jobs.values()]
-            for item in done:
-                self._results.put(item)
+            # The answers and the end of the send in ONE critical section: a tick never
+            # sees the models free again before their results are collectable (L1).
             with self._cond:
+                for item in done:
+                    self._results.put(item)
                 self._sending = {}
                 self._cond.notify_all()
 
@@ -654,7 +662,8 @@ class Dispatcher:
             start = before if isinstance(before, int) else job.start
             reached = after if isinstance(after, int) else None
             done = Completed(model, job.direction, job.target, items[model], result, job.seq,
-                             start=start, reached=reached, plan_id=plan_id, plan_size=len(models))
+                             start=start, reached=reached, plan_id=plan_id, plan_size=len(models),
+                             queued=job.queued)
             if done.partial_fill:
                 LOG.info("SM partial fill %s: %s of %s->%s, then %s", model, reached, start, job.target,
                          result.as_dict())
