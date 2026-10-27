@@ -326,7 +326,7 @@ def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
     # healthy value 290 itself instead of the interpolated 0.20 quantile 294.
     expected = EXPECTED_UNIQUE_GRID_THETA if signal == "queue_len" else EXPECTED_BALANCED_ACCURACY_THETA
     assert threshold["theta"] == pytest.approx(expected)
-    assert set(threshold) == {"theta", "direction", "delta_crit", "delta_high"}
+    assert set(threshold) == {"theta", "direction", "delta_crit", "delta_high", "basis"}
     assert payload["ranking"]["direction"] == "lower_is_healthier"
     assert payload["ranking"]["inert"] is False
     assert payload["opposite_direction_diagnostic"]["direction"] == "higher_is_healthier"
@@ -403,9 +403,13 @@ def test_v1_signals_go_through_the_same_fit_in_their_own_direction(signal: str, 
     )
     threshold = payload["alt_thresholds"][signal]
     assert threshold["direction"] == EXPECTED_SIGNAL_DIRECTIONS[signal]
-    assert set(threshold) == {"theta", "direction", "delta_crit", "delta_high"}
+    assert set(threshold) == {"theta", "direction", "delta_crit", "delta_high", "basis"}
     assert payload["ranking"]["inert"] is False
     assert payload["fit"]["balanced_accuracy"] == pytest.approx(0.90)
+    # The fit stamps what theta was fitted on (the controller checks it at start).
+    from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
+
+    assert threshold["basis"] == {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": 1000}
     # The boundary at 300 on the fixture axis: 300 ms, or headroom 1 - 0.3.
     boundary = BOUNDARY if signal == "ttft_mean" else 1.0 - BOUNDARY / 1000.0
     assert threshold["theta"] == pytest.approx(boundary, rel=0.03)
@@ -438,3 +442,13 @@ def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tm
     assert warning["kind"] == "coinciding_threshold" and warning["models"] == ["a", "b"]
     assert warning["cells_at_theta"]["a"] == warning["cells_at_theta"]["b"]
     assert report["label_def"]["e2e"] == "excluded"
+
+
+def test_alt_band_grids_span_what_the_classifier_can_use() -> None:
+    """Wider than the TSS grids (their edges clamped the 10-28 alt fit), bounded by what
+    can fire: tau_crit = 1 - delta_crit > 0, and z <= Z_MAX caps tau_high."""
+    from tre_calibration.alt_signals import ALT_DELTA_CRIT_GRID, ALT_DELTA_HIGH_GRID
+    from tre_common.alt_signals import Z_MAX
+
+    assert ALT_DELTA_CRIT_GRID[0] == 0.0 and ALT_DELTA_CRIT_GRID[-1] == pytest.approx(0.99)
+    assert ALT_DELTA_HIGH_GRID[0] == 0.0 and ALT_DELTA_HIGH_GRID[-1] == pytest.approx(Z_MAX - 1.0)

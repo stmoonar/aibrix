@@ -43,6 +43,7 @@ from typing import Any, Mapping, Sequence
 
 from tre_calibration.alt_signals import (
     INERT_AUROC,
+    alt_signal_band_grids,
     alt_signal_candidate_grid,
     alt_signal_direction,
     alt_signal_names,
@@ -128,8 +129,12 @@ class SignalSpec:
         return ThetaFitConfig(direction=self.direction, candidate_grid=self.candidate_grid)
 
     def band_kwargs(self) -> dict[str, Any]:
-        """``fit_delta_margins`` selection keywords of the fit method (none for argmax)."""
-        return named_fit_method(self.fit_method).band_kwargs()
+        """``fit_delta_margins`` keywords: the fit method's selection (none for argmax) and,
+        for an alternative signal, its own wider band grids (``alt_signal_band_grids``)."""
+        kwargs = dict(named_fit_method(self.fit_method).band_kwargs())
+        if self.signal != "tss":
+            kwargs.update(alt_signal_band_grids())
+        return kwargs
 
     def as_dict(self) -> dict[str, Any]:
         return {

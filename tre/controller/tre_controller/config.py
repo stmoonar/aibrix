@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
+from tre_common.alt_signals import alt_basis_errors
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 #: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
@@ -280,7 +281,6 @@ class ControllerConfig:
         signal_source = _get_str(values, "TRE_SIGNAL_SOURCE", "zm")
         if signal_source not in SIGNAL_SOURCES:
             raise ValueError(f"TRE_SIGNAL_SOURCE must be one of {sorted(SIGNAL_SOURCES)}")
-        _validate_signal_thresholds(registry_path, signal_source)
 
         metrics_schema = _get_str(values, "TRE_METRICS_SCHEMA", "v2")
         if metrics_schema not in METRICS_SCHEMAS:
@@ -366,6 +366,7 @@ class ControllerConfig:
         # token totals fitted on one window: their trs.theta_window_ms must equal this
         # (checked at start, tre_common.tss.theta_basis_errors).
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 20_000)
+        _validate_signal_thresholds(registry_path, signal_source, window_ms=metrics_window_ms)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
         # Round 5: the former N2 warning (a commit-gate tail of hq x W could read metrics
@@ -562,13 +563,14 @@ def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
         return SafeScaleRegistryConfig()
 
 
-def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
+def _validate_signal_thresholds(registry_path: str, signal_source: str, *, window_ms: float) -> None:
     """A fitted alternative signal runs only on its own fitted theta and band margins.
 
     Every model needs ``alt_thresholds.<signal>`` with a positive theta, the expected
     direction and both ``delta_crit`` / ``delta_high``: a missing margin would otherwise
     fall back to the plan defaults 0.2 / 0.25 (``AltThreshold.bands``) and the arm would
-    run on bands nobody fitted.
+    run on bands nobody fitted. And the ``basis`` stamp must name the signal definition
+    this controller computes and its metrics window (``alt_basis_errors``).
     """
     expected_direction = EXPECTED_SIGNAL_DIRECTIONS.get(signal_source)
     if expected_direction is None:
@@ -595,6 +597,12 @@ def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
             f"TRE_SIGNAL_SOURCE={signal_source} requires fitted alt_thresholds.{signal_source}"
             f".delta_crit and .delta_high for every model (no default bands); "
             f"missing={sorted(missing_bands)}"
+        )
+    basis_errors = alt_basis_errors(registry.models(), signal_source, window_ms=window_ms)
+    if basis_errors:
+        raise ValueError(
+            f"TRE_SIGNAL_SOURCE={signal_source}: alt_thresholds basis does not match this controller "
+            f"(refit / publish theta with its basis stamp): {'; '.join(basis_errors)}"
         )
     if invalid_direction:
         raise ValueError(

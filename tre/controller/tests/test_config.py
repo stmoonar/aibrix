@@ -133,12 +133,14 @@ FITTED_ALT_SOURCES = ["queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefi
 def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
     """The repo registry with ``alt_thresholds.<source>`` = ``fields`` on every model
     (a field set to None is left out)."""
+    from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
     from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS
 
     repo = Path(__file__).parents[2] / "deploy" / "registry.yaml"
     registry = yaml.safe_load(repo.read_text(encoding="utf-8"))
     entry = {"theta": 2.0, "direction": EXPECTED_SIGNAL_DIRECTIONS[source],
-             "delta_crit": 0.1, "delta_high": 0.3, **fields}
+             "delta_crit": 0.1, "delta_high": 0.3,
+             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000}, **fields}
     for model in registry["models"]:
         model.setdefault("alt_thresholds", {})[source] = {k: v for k, v in entry.items() if v is not None}
     path = tmp_path / "registry.yaml"
@@ -165,6 +167,27 @@ def test_alt_source_refuses_to_start_without_fitted_bands(tmp_path, source: str,
     path = _registry_with_alt(tmp_path, source, **{missing: None})
     with pytest.raises(ValueError, match="delta_crit and .delta_high.*missing=.*dsqwen-7b"):
         ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
+
+
+@pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
+@pytest.mark.parametrize("basis", [
+    None,                                              # not stamped
+    {"definition": "queue_len:old", "window_ms": 20_000},  # another definition
+    "window",                                          # fitted on another window
+])
+def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, source: str, basis) -> None:
+    from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
+
+    if basis == "window":
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000}
+    path = _registry_with_alt(tmp_path, source, basis=basis)
+    with pytest.raises(ValueError, match="basis does not match.*dsqwen-7b"):
+        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
+    # the same stamp is accepted when the controller window matches it
+    if basis is not None and basis["window_ms"] == 30_000:
+        cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
+                                         "TRE_METRICS_WINDOW_MS": "30000"})
+        assert cfg.signal_source == source
 
 
 @pytest.mark.parametrize("source", ["ttft_mean", "kv_usage"])

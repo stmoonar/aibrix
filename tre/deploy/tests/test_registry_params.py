@@ -180,3 +180,26 @@ def test_alt_threshold_bands_are_editable_and_bounded() -> None:
             _REGISTRY, {"m1": {"alt_thresholds": {"queue_len": {"delta_crit": 1.0}}}}
         )
     assert exc_info.value.errors[0]["error"] == "out_of_bounds"
+
+
+def test_alt_threshold_basis_stamp_is_settable_and_checked() -> None:
+    """The fit's basis stamp goes out with theta through params_set (the controller
+    refuses an alt arm without it); only the definition this code computes is accepted."""
+    from scripts.registry_params import parse_sets
+    from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
+    from tre_common.registry import _parse_registry
+
+    definition = ALT_SIGNAL_DEFINITIONS["ttft_mean"]
+    edits = parse_sets([
+        "m1.alt_thresholds.ttft_mean.theta=216.2", "m1.alt_thresholds.ttft_mean.direction=lower_is_healthier",
+        "m1.alt_thresholds.ttft_mean.delta_crit=0.89", "m1.alt_thresholds.ttft_mean.delta_high=7.5",
+        f"m1.alt_thresholds.ttft_mean.basis.definition={definition}",
+        "m1.alt_thresholds.ttft_mean.basis.window_ms=20000",
+    ], ["m1"])
+    new_yaml = apply_and_validate(_REGISTRY, edits)
+    spec = _parse_registry(yaml.safe_load(new_yaml)).model("m1").alt_thresholds["ttft_mean"]
+    assert (spec.basis_definition, spec.basis_window_ms, spec.delta_high) == (definition, 20000.0, 7.5)
+    with pytest.raises(ParamValidationError) as exc_info:
+        apply_and_validate(_REGISTRY, {"m1": {"alt_thresholds": {"ttft_mean": {
+            "theta": 1.0, "direction": "lower_is_healthier", "basis": {"definition": "ttft_mean:old"}}}}})
+    assert exc_info.value.errors[0]["error"] == "invalid_definition"

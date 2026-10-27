@@ -44,6 +44,20 @@ QUEUE_FLOOR_PER_REPLICA = 1.0
 TTFT_FLOOR_MS = 1.0
 KV_HEADROOM_FLOOR = 1e-3
 
+#: What each fitted alternative signal's value IS (the formulas in this module). A theta
+#: is only valid for the definition and the metrics window it was fitted on, so the fit
+#: stamps ``alt_thresholds.<signal>.basis = {definition, window_ms}`` and the controller
+#: refuses to start an alt arm on a missing or different stamp (:func:`alt_basis_errors`,
+#: the alternative-signal twin of ``tre_common.tss.theta_basis_errors``). Change an id
+#: whenever its value changes (floor, pooling, counter source, ...).
+ALT_SIGNAL_DEFINITIONS = {
+    "queue_len": "queue_len:max((running+waiting)/max(1,routable),1):20261028",
+    "ttft_mean": "ttft_mean:max(sum_pods(ttft_sum)/sum_pods(ttft_count),1ms):20261028",
+    "kv_usage": "kv_usage:max(1-min(1,sum_pods(kv_fill)/routable),0.001):20261028",
+    "decode_tps": "decode_tps:step_counter_generation_tokens/s/routable:20261028",
+    "prefill_tps": "prefill_tps:step_counter_prompt_tokens/s/routable:20261028",
+}
+
 #: Per-signal orientation (mirrors tre_common.registry.EXPECTED_SIGNAL_DIRECTIONS).
 LOWER_IS_HEALTHIER = "lower_is_healthier"
 HIGHER_IS_HEALTHIER = "higher_is_healthier"
@@ -132,7 +146,28 @@ def normalize_signal_value(
     return min(Z_MAX, normalized)
 
 
+def alt_basis_errors(models, signal: str, *, window_ms: float) -> list[str]:
+    """Why the registry's ``alt_thresholds.<signal>`` do not fit this controller, one
+    line per model (empty: they fit). Each model's threshold must carry
+    ``basis.definition == ALT_SIGNAL_DEFINITIONS[signal]`` and ``basis.window_ms ==
+    window_ms`` (TRE_METRICS_WINDOW_MS). A missing stamp is a mismatch."""
+    want = ALT_SIGNAL_DEFINITIONS.get(signal)
+    errors: list[str] = []
+    for spec in models:
+        name = getattr(spec, "name", "?")
+        threshold = (getattr(spec, "alt_thresholds", None) or {}).get(signal)
+        definition = getattr(threshold, "basis_definition", None)
+        window = getattr(threshold, "basis_window_ms", None)
+        if want is None or definition != want or window is None or float(window) != float(window_ms):
+            errors.append(
+                f"{name}: alt_thresholds.{signal}.basis definition={definition!r} window_ms={window!r}, "
+                f"controller computes definition={want!r} on TRE_METRICS_WINDOW_MS={int(window_ms)}"
+            )
+    return errors
+
+
 __all__ = (
+    "ALT_SIGNAL_DEFINITIONS",
     "EPS",
     "HIGHER_IS_HEALTHIER",
     "KV_HEADROOM_FLOOR",
@@ -140,6 +175,7 @@ __all__ = (
     "QUEUE_FLOOR_PER_REPLICA",
     "TTFT_FLOOR_MS",
     "Z_MAX",
+    "alt_basis_errors",
     "kv_headroom",
     "normalize_signal_value",
     "queue_len_per_replica",

@@ -30,6 +30,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
 from tre_common.alt_signals import (
+    Z_MAX,
     kv_headroom,
     queue_len_per_replica,
     token_rate_per_replica,
@@ -52,6 +53,22 @@ ALT_SIGNALS: Mapping[str, tuple[str | None, str]] = {
     "decode_tps": (None, "lower_is_healthier"),
     "prefill_tps": (None, "lower_is_healthier"),
 }
+
+#: Band-margin grids of every alternative signal (the one definition; ``theta_verdict``
+#: ``SignalSpec.band_kwargs`` passes them to ``fit_delta_margins`` for the merged fit and
+#: the bootstrap). Wider than the TSS defaults (0..0.5 / 0..2), whose edges the
+#: 2026-10-28 offline fit hit (ttft_mean delta_crit, queue_len delta_high): they span
+#: everything the classifier can use - ``tau_crit = 1 - delta_crit`` must stay > 0
+#: (registry: delta_crit < 1), and ``z`` is capped at ``Z_MAX``, so a ``delta_high`` above
+#: ``Z_MAX - 1`` can never fire.
+ALT_DELTA_CRIT_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(100))
+ALT_DELTA_HIGH_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(int(round((Z_MAX - 1.0) * 100)) + 1))
+
+
+def alt_signal_band_grids() -> dict[str, tuple[float, ...]]:
+    """``fit_delta_margins`` grid keywords of the alternative signals."""
+    return {"delta_crit_grid": ALT_DELTA_CRIT_GRID, "delta_high_grid": ALT_DELTA_HIGH_GRID}
+
 
 #: Window columns of the v1 signals (written by ``scripts.alt_signal_columns``).
 TTFT_MEAN_COLUMN = "ttft_server_mean_ms"

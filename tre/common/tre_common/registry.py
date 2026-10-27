@@ -52,6 +52,11 @@ class AltThreshold:
     #: ``None`` = not fitted; :meth:`bands` then falls back to the plan defaults.
     delta_crit: float | None = None
     delta_high: float | None = None
+    #: What theta was fitted on (2026-10-28, ``tre_common.alt_signals.alt_basis_errors``):
+    #: registry ``basis: {definition, window_ms}``. None = not stamped; the controller
+    #: refuses to start an alt arm unless both equal what it computes.
+    basis_definition: str | None = None
+    basis_window_ms: float | None = None
 
     def bands(self) -> tuple[float, float, bool]:
         """(delta_crit, delta_high, defaulted) - ``defaulted`` is True when either margin
@@ -1355,6 +1360,10 @@ class Registry:
                     math.isfinite(threshold.delta_high) and threshold.delta_high >= 0.0
                 ):
                     errors.append(f"model {model.name}: alt_thresholds.{signal}.delta_high must be >= 0")
+                if threshold.basis_window_ms is not None and not (
+                    math.isfinite(threshold.basis_window_ms) and threshold.basis_window_ms > 0.0
+                ):
+                    errors.append(f"model {model.name}: alt_thresholds.{signal}.basis.window_ms must be positive")
 
         seen_nodes: set[str] = set()
         for node in self._topology.nodes:
@@ -2038,6 +2047,14 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
                 direction=str(values["direction"]),
                 delta_crit=(float(values["delta_crit"]) if values.get("delta_crit") is not None else None),
                 delta_high=(float(values["delta_high"]) if values.get("delta_high") is not None else None),
+                basis_definition=(
+                    str((values.get("basis") or {}).get("definition"))
+                    if (values.get("basis") or {}).get("definition") is not None else None
+                ),
+                basis_window_ms=(
+                    float((values.get("basis") or {}).get("window_ms"))
+                    if (values.get("basis") or {}).get("window_ms") is not None else None
+                ),
             )
             for signal, values in (raw.get("alt_thresholds") or {}).items()
         },
