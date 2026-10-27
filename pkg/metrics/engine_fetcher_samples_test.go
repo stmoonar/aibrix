@@ -53,6 +53,9 @@ var treVllmMetrics = []string{
 	E2ERequestLatencySeconds,
 	RequestPromptTokens,
 	RequestGenerationTokens,
+	// TRE (2026-10-28): the TSS numerator - vLLM step counters on the histogram docs.
+	PromptTokenTotal,
+	GenerationTokenTotal,
 }
 
 func readVllmSample(t *testing.T, version string) string {
@@ -87,6 +90,16 @@ func TestEngineMetricsFetcher_RealVllmSamples(t *testing.T) {
 					version, name, def.EngineMetricsNameMapping["vllm"], result.Errors)
 				if ok && def.MetricType.Raw == Histogram {
 					assert.NotNil(t, value.GetHistogramValue(), "%s %s histogram", version, name)
+				}
+			}
+			if version == "0.30.0" {
+				// The plain counter, not prompt_tokens_by_source_total / prompt_tokens_cached_total.
+				for name, want := range map[string]float64{PromptTokenTotal: 2545, GenerationTokenTotal: 64000} {
+					value, ok := result.ModelMetrics[vllmSampleModel+"/"+name]
+					require.True(t, ok, name)
+					simple, ok := value.(*SimpleMetricValue)
+					require.True(t, ok, "%s is not a simple value", name)
+					assert.Equal(t, want, simple.GetSimpleValue(), name)
 				}
 			}
 		})

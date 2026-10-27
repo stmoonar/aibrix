@@ -256,6 +256,39 @@ func newTREMetricStoreForTest(t *testing.T) (*Store, *redis.Client) {
 	return store, client
 }
 
+// 2026-10-28 (TSS step counters): the histogram doc carries vLLM's token counters
+// under model_counter_metrics; a non-finite counter is left out (unknown), the rest
+// of the doc is written; instant docs never carry them.
+func TestTREHistogramDocCarriesTokenCounters(t *testing.T) {
+	t.Setenv("TRE_REDIS_SCHEMA", "v2")
+	store, client := newTREMetricStoreForTest(t)
+	ctx := context.Background()
+	podKey := utils.GeneratePodKey("default", "pod-a")
+	metaPod, ok := store.metaPods.Load(podKey)
+	require.True(t, ok)
+	metaPod.ModelMetrics.Store(store.getPodModelMetricName("dsqwen-7b", metrics.PromptTokenTotal), &metrics.SimpleMetricValue{Value: 2545})
+	metaPod.ModelMetrics.Store(store.getPodModelMetricName("dsqwen-7b", metrics.GenerationTokenTotal), &metrics.SimpleMetricValue{Value: math.Inf(1)})
+
+	require.NoError(t, treWrite(ctx, store, treRoundAt(12345)))
+
+	hist, err := client.ZRangeByScore(ctx, treV2HistogramKeyPrefix+podKey, &redis.ZRangeBy{Min: "12345", Max: "12345"}).Result()
+	require.NoError(t, err)
+	require.Len(t, hist, 1)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal([]byte(hist[0]), &doc))
+	counters, ok := doc["model_counter_metrics"].(map[string]any)
+	require.True(t, ok, "histogram doc without model_counter_metrics: %s", hist[0])
+	require.Equal(t, 2545.0, counters["dsqwen-7b/prompt_tokens_total"])
+	_, present := counters["dsqwen-7b/generation_tokens_total"]
+	require.False(t, present, "a non-finite counter must be left out")
+	require.Contains(t, doc, "model_histogram_metrics")
+
+	inst, err := client.ZRangeByScore(ctx, treV2InstantKeyPrefix+podKey, &redis.ZRangeBy{Min: "12345", Max: "12345"}).Result()
+	require.NoError(t, err)
+	require.Len(t, inst, 1)
+	require.NotContains(t, inst[0], "model_counter_metrics")
+}
+
 func TestTREMetricSchemaModeRejectsUnknownValue(t *testing.T) {
 	t.Setenv("TRE_REDIS_SCHEMA", "invalid")
 	_, _, err := treMetricSchemaMode()
