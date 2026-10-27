@@ -107,3 +107,17 @@ def test_params_hash_is_the_console_annotation() -> None:
     # compares correctly against Deployments the console restarted
     assert rp.params_hash("x") == "2d711642b726b044"
     assert rp.params_hash("") == rp.params_hash(None)
+
+
+def test_basis_edit_refuses_restart_without_the_flag(monkeypatch, tmp_path) -> None:
+    # M1 (10-28): a trs.numerator / theta_window_ms edit with --restart would restart the
+    # running controller image on a theta of another basis; refused, nothing written.
+    calls: list[list[str]] = []
+    monkeypatch.setattr(params_set, "read_configmap", lambda: {
+        "metadata": {"name": "tre-v2-registry", "resourceVersion": "1"}, "data": {"registry.yaml": REGISTRY}})
+    monkeypatch.setattr(params_set, "kubectl", lambda args, stdin=None: calls.append(args) or "")
+    edit = ["--set", f"{NAMES[0]}.trs.theta_window_ms=30000", "--apply", "--backup-dir", str(tmp_path)]
+    assert params_set.main([*edit, "--restart"]) == 1
+    assert calls == []
+    assert params_set.main(edit) == 0          # --apply alone publishes it
+    assert [c[0] for c in calls] == ["replace"]

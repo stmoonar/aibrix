@@ -13,6 +13,13 @@ POST /api/ops/controller/restart (2026-10-20).
                                                    was last restarted with (pending restart?)
   params_set.py --registry-file F --set ...        validate against a local file (no cluster)
 
+theta basis (trs.numerator / trs.theta_window_ms): an edit of either refuses --restart
+unless --allow-basis-change. The controller computes one basis (its image and
+TRE_METRICS_WINDOW_MS): the new controller refuses a registry stamped otherwise, the old
+controller does not check and would run a theta of another basis (every Z off). Publish
+the basis with --apply alone, then roll out the matching controller image (release steps,
+docs/design/20261028-tss-step-counters.md).
+
 Editable (deploy/scripts/registry_params.py): <model>.trs.<f> (not ema_tau_ms),
 <model>.slo.{ttft_p95_ms,tpot_p95_ms,e2e_p95_ms,ttft_idle_c_ms,ttft_idle_b_ms_per_token},
 <model>.alt_thresholds.<signal>.{theta,direction,delta_crit,delta_high},
@@ -57,6 +64,8 @@ for _p in (_TRE / "common", _TRE / "deploy"):  # after PYTHONPATH: an explicit r
 from scripts import registry_params as rp  # noqa: E402
 
 HASH_ANNOTATION = "tre.dev/params-hash"
+#: trs fields that stamp a theta's basis (tre_common.tss.theta_basis_errors).
+BASIS_FIELDS = ("trs.numerator", "trs.theta_window_ms")
 DATA_KEY = "registry.yaml"
 
 
@@ -183,6 +192,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--apply", action="store_true", help="write the ConfigMap (default: dry run)")
     parser.add_argument("--restart", action="store_true", help="restart-to-apply: SM, then controller")
     parser.add_argument("--reason", default="params_set", help="tre.dev/restart-reason annotation")
+    parser.add_argument("--allow-basis-change", action="store_true",
+                        help="allow --restart with a trs.numerator / trs.theta_window_ms edit "
+                             "(only when the running controller image computes the new basis)")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--show", nargs="?", const="", metavar="MODEL")
     parser.add_argument("--registry-file", help="validate against this file; no cluster access")
@@ -229,6 +241,14 @@ def main(argv: list[str]) -> int:
                 print("no change (values already set)")
             for model, field, old, new in changes:
                 print(f"{model}.{field}: {old} -> {new}")
+            basis = [f"{model}.{field}" for model, field, _old, _new in changes if field in BASIS_FIELDS]
+            if basis and args.restart and not args.allow_basis_change:
+                print(f"REJECTED: --restart with a theta basis edit ({', '.join(basis)}). The controller image "
+                      "must compute the stamped basis: the new controller refuses a mismatch, the old one "
+                      "runs it unchecked (every Z off). Use --apply without --restart, then roll out the "
+                      "matching controller image; or --allow-basis-change if the running image already "
+                      "computes it. Nothing written.", file=sys.stderr)
+                return 1
             if changes:
                 print(rp.unified_diff(text, new_text), end="")
             if changes and not args.apply:
