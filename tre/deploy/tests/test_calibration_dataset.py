@@ -168,7 +168,8 @@ def test_a_run_converts_into_the_standard_layout_without_touching_it(tmp_path):
     assert set(manifest["label_by_model"]) == {"dsqwen-7b", "dsllama-8b"}
     assert manifest["label"]["mode"] == "slowdown" and manifest["label"]["min_n"] == 20
     assert set(manifest["label"]["columns"].values()) == {"slo_label", "slo_label_fixed", "slo_label_k3"}
-    assert manifest["windowing"]["window_ms"] == 30000 and manifest["windowing"]["step_ms"] == 10000
+    assert manifest["windowing"]["window_ms"] == dataset.DEFAULT_WINDOW_MS == 20000
+    assert manifest["windowing"]["step_ms"] == 10000
     assert manifest["windowing"]["window_align"] == "grid"
     assert all(int(w["window_end_ms"]) % 10000 == 0 for w in windows)
     assert {"slo_label_fixed", "slo_label_k3", "ttft_len_samples"} <= set(dataset.WINDOW_COLUMNS)
@@ -196,7 +197,7 @@ def test_the_window_table_is_the_labelling_path_s_output(tmp_path):
         load_registry(str(REGISTRY_PATH)).model("dsqwen-7b"),
         label=slo_labels.label_def_for_model(
             "dsqwen-7b", ttft_p95_ms=500.0, tpot_p95_ms=75.0, registry=str(REGISTRY_PATH)),
-        window_ms=30000, step_ms=10000, window_align="grid",
+        window_ms=dataset.DEFAULT_WINDOW_MS, step_ms=10000, window_align="grid",
         percentile_mode="bucket_upper", min_latency_samples=10,
         instant_sample_interval_ms=10000, instant_grid="live",
         start_ms=guard["start_ms"], end_ms=guard["end_ms"],

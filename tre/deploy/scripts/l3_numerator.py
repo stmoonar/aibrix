@@ -51,7 +51,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -72,6 +72,14 @@ GENERATION_COUNTER = "vllm:generation_tokens_total"
 DEFAULT_MAX_GAP_MS = 2000
 #: Largest spacing of two samples inside a window (2026-10-28, see the module docstring).
 INTERIOR_GAP_MAX_MS = 10_000
+#: The online controller's rule for a window it would use (``MetricsStore``), replayed
+#: only to COUNT the windows this module voids but the controller would have used
+#: (selection-bias visibility; review M2 2026-10-28). The void rules are not changed.
+#: Baseline lookback (``TRE_HIST_BASELINE_LOOKBACK_MS`` default) and the minimum token span
+#: with the baseline inside the window (``metrics_store.MIN_TOKEN_SPAN_FACTOR``; a guard
+#: test keeps them equal).
+ONLINE_LOOKBACK_MS = 90_000
+ONLINE_MIN_SPAN_FACTOR = 0.67
 
 STATUS_OK = "ok"
 STATUS_NO_SAMPLE = "no_sample"
@@ -105,31 +113,23 @@ def counter_total(counters: Mapping[str, Any], family: str) -> Optional[float]:
 @dataclass
 class PodCounters:
     """One pod's counter samples in time order: ``(ts_ms, prompt, generation)`` (None =
-    series missing in that sample) and the timestamps of its failed scrapes."""
+    series missing in that sample). Failed scrapes are not kept: since 2026-10-28 they
+    void no window (only boundary age and holes > ``max_gap_ms`` do)."""
 
     pod: str
     samples: list[tuple[int, Optional[float], Optional[float]]]
-    errors: list[int] = field(default_factory=list)
 
     @classmethod
     def from_lines(cls, pod: str, lines: Sequence[str]) -> "PodCounters":
         from scripts.calibration_capture import decode_vllm_metrics
 
-        errors = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if "error" in row and row.get("ts_ms") is not None:
-                errors.append(int(row["ts_ms"]))
         samples = [
             (int(s["ts_ms"]), counter_total(s.get("c") or {}, PROMPT_COUNTER),
              counter_total(s.get("c") or {}, GENERATION_COUNTER))
             for s in decode_vllm_metrics(lines)
         ]
         samples.sort(key=lambda s: s[0])
-        return cls(pod=pod, samples=samples, errors=sorted(errors))
+        return cls(pod=pod, samples=samples)
 
     @classmethod
     def from_file(cls, pod: str, path: Path) -> "PodCounters":
@@ -169,13 +169,44 @@ class PodCounters:
         scale = (end_ms - start_ms) / (t1 - t0)
         return STATUS_OK, (span[-1][1] - span[0][1]) * scale, (span[-1][2] - span[0][2]) * scale
 
+    def online_usable(self, start_ms: int, end_ms: int) -> bool:
+        """Would the online controller give this pod tokens for ``(start_ms, end_ms]``?
+        Its rule (``MetricsStore._window_pod``): end = the newest sample in the window;
+        baseline = the newest sample at most ``ONLINE_LOOKBACK_MS`` before the start, else
+        the first in the window; a counter reset restarts at the first sample after the
+        last one; both samples carry both counters; a positive span, at least
+        ``ONLINE_MIN_SPAN_FACTOR`` x window when the baseline lies in the window."""
+        i1 = self._last_at_or_before(end_ms)
+        if i1 is None or self.samples[i1][0] <= start_ms or end_ms <= start_ms:
+            return False
+        i0 = self._last_at_or_before(start_ms)
+        if i0 is None or start_ms - self.samples[i0][0] > ONLINE_LOOKBACK_MS:
+            i0 = (i0 + 1) if i0 is not None else 0
+        seg = self.samples[i0:i1 + 1]
+        cut = 0
+        for k in (1, 2):
+            last = None
+            for idx, sample in enumerate(seg):
+                if sample[k] is None:
+                    continue
+                if last is not None and sample[k] < last:
+                    cut = max(cut, idx)
+                last = sample[k]
+        seg = seg[cut:]
+        first, end = seg[0], seg[-1]
+        if None in (first[1], first[2], end[1], end[2]) or end[0] <= first[0]:
+            return False
+        return not (first[0] > start_ms and end[0] - first[0] < ONLINE_MIN_SPAN_FACTOR * (end_ms - start_ms))
+
 
 class CounterTokenSource:
     """The ``token_source`` of :func:`scripts.rewindow_from_raw.label_cell` for one cell:
     the model's L3 window totals, summed over its pods; None for a void window. Counts
     every window it was asked for by status (``counts``; a void window under the first
     void status of its pods in :data:`VOID_STATUSES` order) and keeps both totals of the
-    kept ones (``kept``: ``(start, end) -> (prompt, generation)``)."""
+    kept ones (``kept``: ``(start, end) -> (prompt, generation)``). ``online_used``: per
+    void status, the voided windows the online controller would still have used (every
+    pod :meth:`PodCounters.online_usable`) - the selection bias of the void rules."""
 
     def __init__(self, pods: Sequence[PodCounters], *, max_gap_ms: int = DEFAULT_MAX_GAP_MS,
                  missing_pods: Iterable[str] = ()) -> None:
@@ -185,6 +216,7 @@ class CounterTokenSource:
         self.counts: Counter = Counter()
         self.status: dict[tuple[int, int], str] = {}
         self.kept: dict[tuple[int, int], tuple[float, float]] = {}
+        self.online_used: set[tuple[int, int]] = set()
 
     def __call__(self, start_ms: int, end_ms: int) -> Optional[tuple[float, float]]:
         key = (int(start_ms), int(end_ms))
@@ -204,6 +236,8 @@ class CounterTokenSource:
         if void:
             self.counts[void[0]] += 1
             self.status[key] = void[0]
+            if all(pod.online_usable(int(start_ms), int(end_ms)) for pod in self.pods):
+                self.online_used.add(key)
             return None
         self.counts[STATUS_OK] += 1
         self.status[key] = STATUS_OK

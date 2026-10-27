@@ -63,7 +63,8 @@ def test_accept_discloses_ranking_per_model_and_pooled_never_gating(tmp_path, ca
     assert "ranking disclosure (pressure = -Z; not gating)" in out and "| pooled |" in out
     assert res["format_revision"] == dl.ACCEPT_FORMAT_REVISION == 4
     r = res["models"][MODEL]
-    assert r["windowing"] == dl.DEFAULT_WINDOWING and res["thresholds"]["dwell_windows"] == 2
+    # the fixture's final.json predates the windowing record: the legacy 30 s windowing
+    assert r["windowing"] == dl.LEGACY_WINDOWING and res["thresholds"]["dwell_windows"] == 2
     d = r["ranking_disclosure"]
     assert d["gating"] is False and d["definition"] == rk.DEFINITIONS
     # healthy windows sit far above theta, violating ones far below: AUROC 1
@@ -116,13 +117,13 @@ def test_recheck_of_a_revision_1_result_ignores_only_the_new_keys(tmp_path, caps
     assert "models.dsqwen-7b.M.violating: stored 65 != recomputed 66" in capsys.readouterr().out
 
 
-def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_path) -> None:
+def test_a_revision_1_freeze_verifies_and_accepts_at_the_legacy_windowing(tmp_path) -> None:
     w = base._world(tmp_path)
     assert base._freeze(w) == 0
     ff = w["freeze"]
     doc = json.loads(ff.read_text())
     assert doc["format_revision"] == 3  # base._freeze re-seals the revision-4 freeze as revision 3
-    assert doc["models"][MODEL]["windowing"] == {**dl.DEFAULT_WINDOWING,
+    assert doc["models"][MODEL]["windowing"] == {**dl.LEGACY_WINDOWING,
                                                  "source": "defaults: final.json predates the windowing record"}
     # rewrite it as a revision-1 freeze (no windowing, no B' cut), re-hashed: the D22 shape
     del doc["models"][MODEL]["windowing"]
@@ -142,7 +143,7 @@ def test_a_revision_1_freeze_verifies_and_accepts_at_the_default_windowing(tmp_p
     thresholds.write_text(json.dumps({"severity_cut_train": {MODEL: 1.2}, "gate": dict(dl_b_prime().DEFAULT_GATE)}))
     assert base._accept(w, base._seal(w), "--b-prime-thresholds", str(thresholds)) == 0
     res = json.loads(dl.freeze_paths(ff)["result"].read_text())
-    assert res["models"][MODEL]["windowing"] == dl.DEFAULT_WINDOWING
+    assert res["models"][MODEL]["windowing"] == dl.LEGACY_WINDOWING
     assert res["models"][MODEL]["holdout_report"]["with_dwell"]["dwell_windows"] == 2
     # a revision the reader does not know is refused
     doc["format_revision"] = 5
@@ -211,9 +212,11 @@ def test_dt_ref_changes_alpha_and_the_step_response() -> None:
 
 
 def test_windowing_validates_and_old_documents_fall_back_to_defaults() -> None:
-    assert dl.DEFAULT_WINDOWING == {"window_ms": 30_000.0, "step_ms": 10_000.0, "dt_ref_s": 10.0,
+    # 2026-10-28: new runs default to the controller's 20 s window; a document without a
+    # windowing record predates it and was cut at 30 s
+    assert dl.DEFAULT_WINDOWING == {"window_ms": 20_000.0, "step_ms": 10_000.0, "dt_ref_s": 10.0,
                                     "horizon_ms": 30_000, "dwell_windows": 2}
-    assert dl.windowing_of({}) == dl.DEFAULT_WINDOWING
+    assert dl.windowing_of({}) == dl.LEGACY_WINDOWING == {**dl.DEFAULT_WINDOWING, "window_ms": 30_000.0}
     assert dl.windowing_of({"windowing": {"dwell_windows": 3}})["dwell_windows"] == 3
     with pytest.raises(ValueError):
         dl.windowing(dwell_windows=0)
@@ -243,7 +246,7 @@ def test_stage_flags_reach_alpha_fit_and_are_recorded(tmp_path, monkeypatch) -> 
     # defaults: the module constants, recorded as such
     assert dl.main(argv[:13]) == 0
     assert (seen["ns"].window_ms, seen["ns"].step_ms, seen["ns"].dt_ref_s, seen["ns"].dwell_windows) == (
-        30_000.0, 10_000.0, 10.0, 2)
+        20_000.0, 10_000.0, 10.0, 2)
     doc = json.loads((w["out"] / MODEL / base.ARM / "alpha.json").read_text())
     assert doc["windowing"] == dl.DEFAULT_WINDOWING
     assert doc["published_registry_fields"] == {"ema_tau_ms": 10_000.0, "ema_alpha": round(dl.alpha_of(10.0), 6)}
