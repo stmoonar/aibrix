@@ -69,6 +69,8 @@ def test_config_reads_registry_limits_through_common_readers() -> None:
     from tre_common.registry import load_registry
 
     registry = load_registry(REGISTRY)
+    # the plan-call timeout is the controller's (design s6: above the SM's worst-case call)
+    assert config.sm_timeout_s == registry.service_manager().api_call_timeout_s
     assert set(config.models) == {m.name for m in registry.models()}
     for spec in registry.models():
         lim = config.models[spec.name]
@@ -92,6 +94,8 @@ def test_config_rejects_bad_values(tmp_path) -> None:
     draining.write_text(yaml.safe_dump(doc))
     with pytest.raises(ValueError, match="drains"):
         load_config({**ENV, "TRE_REGISTRY_PATH": str(draining), "TRE_BL_ABORT_SLEEP_PATH": "scale_down"})
+    with pytest.raises(ValueError, match="TRE_BL_SM_TIMEOUT_S"):  # below the worst-case plan call
+        load_config({**ENV, "TRE_BL_SM_TIMEOUT_S": "300"})
     for retired in ("TRE_BL_SLEEP_PATH", "TRE_BL_DRAIN_BUDGET_S"):
         with pytest.raises(ValueError, match="retired"):
             load_config({**ENV, retired: "30"})
@@ -141,6 +145,6 @@ def test_arms_are_named_as_adaptations(tmp_path) -> None:
     config = make_config(tmp_path, {"a": limits("a")}, policy="chiron")
     cluster = FakeCluster(awake={"a": 1})
     policy = ChironPolicy(dataclasses.replace(config, policy_params={"theta": 0.5, "static_b": 256}))
-    shell = BaselineShell(config, FakeSource(config, cluster, FakeRedis()), policy, Dispatcher(cluster.put_target))
+    shell = BaselineShell(config, FakeSource(config, cluster, FakeRedis()), policy, Dispatcher(cluster.post_plan))
     assert {line["arm"] for line in shell.tick_once()} == {"Chiron-global"}
     assert shell.health_doc()["arm"] == "Chiron-global"

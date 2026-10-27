@@ -7,7 +7,7 @@ the existing readers in ``tre_common``:
 
 * ``min_replicas`` / scaling cap: ``ModelSpec.min_replicas`` and
   ``ModelSpec.scale_max_replicas`` (``max_awake_replicas`` else ``max_replicas``, the same
-  cap the service manager enforces on ``PUT /v2/models/{m}/target``);
+  cap the service manager enforces on every wake);
 * GPUs per replica: ``ModelSpec.tp_size``;
 * SLO: ``tre_common.slo_labels.label_def_for_model`` (the one SLO definition calibration
   labels use) fed with the registry's fixed ``slo.ttft_p95_ms`` / ``slo.tpot_p95_ms``;
@@ -34,7 +34,9 @@ Environment:
 ``TRE_BL_METRICS_PORT``     pod port serving ``/metrics``; unset = the pod's
                             ``model.aibrix.ai/port`` label, else 8000
 ``TRE_BL_SCRAPE_TIMEOUT_S`` per-pod scrape timeout (default 2.5)
-``TRE_BL_SM_TIMEOUT_S``     SM target-call timeout (default 300, the controller's)
+``TRE_BL_SM_TIMEOUT_S``     SM plan-call timeout (default: the registry's
+                            ``service_manager.api_call_timeout_s``, the controller's); refused
+                            when not above the SM's worst-case writer call (plan design s6)
 ``TRE_BL_SM_STATE_TIMEOUT_S`` SM ``/v2/state`` timeout (default 5)
 ``TRE_BL_ABORT_SLEEP_PATH`` ``sleep_path`` of scale-downs (default ``urgent``): must be one
                             of the registry's ``service_manager.sleep.no_drain_paths`` -
@@ -63,7 +65,7 @@ from typing import Any, Mapping, Optional
 
 import yaml
 
-from tre_common.registry import Registry, load_registry
+from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_common.slo_labels import TTFT_SLO_MODE_FIXED, label_def_for_model
 
 from tre_baselines.sm_client import DEFAULT_ABORT_SLEEP_PATH
@@ -110,7 +112,7 @@ class Config:
     model_namespace: str = "default"
     metrics_port: Optional[int] = None
     scrape_timeout_s: float = 2.5
-    sm_timeout_s: float = 300.0
+    sm_timeout_s: float = 360.0
     sm_state_timeout_s: float = 5.0
     #: Scale-down sleep path: a no-drain (abort) path (see ``sm_client``).
     abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH
@@ -233,6 +235,14 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
     port = env.get("TRE_BL_METRICS_PORT", "").strip()
     policy_config_path = env.get("TRE_BL_POLICY_CONFIG", "").strip() or None
     dry_run = parse_bool(env.get("TRE_BL_DRY_RUN"), True)
+    sm_config = registry.service_manager()
+    explicit_timeout = env.get("TRE_BL_SM_TIMEOUT_S", "").strip()
+    sm_timeout_s = float(explicit_timeout) if explicit_timeout else float(sm_config.api_call_timeout_s)
+    timeout_errors = sleep_call_timeout_errors(
+        sm_config, sm_timeout_s,
+        name="TRE_BL_SM_TIMEOUT_S" if explicit_timeout else "service_manager.api_call_timeout_s")
+    if timeout_errors:
+        raise ValueError("; ".join(timeout_errors))
     return Config(
         sm_url=_required(env, "TRE_SM_URL").rstrip("/"),
         redis_url=_required(env, "TRE_REDIS_URL"),
@@ -249,7 +259,7 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         model_namespace=env.get("TRE_MODEL_NAMESPACE", "").strip() or "default",
         metrics_port=int(port) if port else None,
         scrape_timeout_s=float(env.get("TRE_BL_SCRAPE_TIMEOUT_S", "").strip() or 2.5),
-        sm_timeout_s=float(env.get("TRE_BL_SM_TIMEOUT_S", "").strip() or 300.0),
+        sm_timeout_s=sm_timeout_s,
         sm_state_timeout_s=float(env.get("TRE_BL_SM_STATE_TIMEOUT_S", "").strip() or 5.0),
         abort_sleep_path=abort_path,
         max_tick_failures=int(env.get("TRE_BL_MAX_TICK_FAILURES", "").strip() or 5),

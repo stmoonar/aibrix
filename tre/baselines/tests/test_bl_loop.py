@@ -14,11 +14,11 @@ from tre_baselines.sm_client import Backoff, Dispatcher, SMClient, SMResult
 MODELS = {"a": limits("a", 1, 4), "b": limits("b", 1, 4), "c": limits("c", 1, 3, tp=2)}
 
 
-def _shell(tmp_path, policy, *, dry_run, awake=None, lock=True, redis=None, sm_put=None, **cfg):
+def _shell(tmp_path, policy, *, dry_run, awake=None, lock=True, redis=None, sm_post=None, **cfg):
     config = make_config(tmp_path, MODELS, dry_run=dry_run, **cfg)
     cluster = FakeCluster(awake=dict(awake or {"a": 2, "b": 1, "c": 1}))
     redis = redis or FakeRedis()
-    dispatcher = Dispatcher(sm_put or cluster.put_target, abort_sleep_path=config.abort_sleep_path)
+    dispatcher = Dispatcher(sm_post or cluster.post_plan, abort_sleep_path=config.abort_sleep_path)
     owner = OwnerLock(redis, config.lock_ttl_s, token="me") if lock else None
     shell = BaselineShell(config, FakeSource(config, cluster, redis), policy, dispatcher, redis, lock=owner)
     return shell, cluster, redis, dispatcher
@@ -48,7 +48,7 @@ def test_dry_run_twenty_ticks_sends_nothing(tmp_path) -> None:
     for i, policy in enumerate((StaticPolicy(), ScriptedPolicy(SCRIPT))):
         with StubSM() as sm:
             shell, cluster, redis, dispatcher = _shell(
-                tmp_path, policy, dry_run=True, sm_put=SMClient(sm.url).put_target,
+                tmp_path, policy, dry_run=True, sm_post=SMClient(sm.url).post_plan,
                 sm_url=sm.url, log_dir=str(tmp_path / f"logs{i}"))
             lines = _run(shell, dispatcher, 20)
             assert sm.requests == [] and dispatcher.submitted == []
@@ -84,39 +84,36 @@ class StickyScripted(ScriptedPolicy):
         return {m: Decision(desired=d, reason="scripted") for m, d in self._want.items()}
 
 
-def test_active_put_sequence_downs_before_ups(tmp_path) -> None:
+def test_one_plan_per_tick_covers_every_models_decision(tmp_path) -> None:
+    """A multi-model tick is ONE POST: the tick's scale-downs and scale-ups go out together
+    (the SM orders donor before dependent inside the plan), each scale-up one grow-only item."""
     shell, cluster, redis, dispatcher = _shell(tmp_path, StickyScripted(SCRIPT), dry_run=False)
     lines = _run(shell, dispatcher, 20)
     assert redis.kv[OWNER_KEY] == "me"
-    # tick 0: a down first; b and c up (c clamped to its cap 3) wait for the donor's answer
-    assert dispatcher.submitted[:1] == [(1, "a", "down", 1)]
-    assert [(l["model"], l["action"]) for l in lines[0]] == [("a", "down"), ("b", "wait_donor"), ("c", "wait_donor")]
-    assert lines[0][1]["wait_donor"] == ["a"]
-    # tick 1: the down was answered -> the scale-ups go out
-    assert [(m, d, t) for _, m, d, t in dispatcher.submitted[1:3]] == [("b", "up", 3), ("c", "up", 3)]
-    # bodies (the arrival order across models is up to the worker threads); scale-ups are
-    # stepped one replica at a time, each grow-only
-    def bodies(m):
-        return [body for model, body in cluster.calls if model == m]
-    assert bodies("a")[0] == {"wake_replicas": 1, "sleep_path": "urgent"}
-    assert bodies("b")[:2] == bodies("c")[:2] == [
-        {"wake_replicas": 2, "at_least": True}, {"wake_replicas": 3, "at_least": True}]
+    assert len(cluster.plans) == 3                                     # ticks 0, 5 and 9
+    # tick 0: a down; b and c up (c clamped to its cap 3), in the same plan
+    assert [(l["model"], l["action"]) for l in lines[0]] == [("a", "down"), ("b", "up"), ("c", "up")]
+    assert cluster.plans[0]["sleeps"] == [{"model": "a", "at_most": 1, "sleep_path": "urgent"}]
+    assert cluster.plans[0]["wakes"] == [{"model": "b", "at_least": 3}, {"model": "c", "at_least": 3}]
     # tick 3: a asks for 0, clamped to min 1 == awake -> nothing sent
     assert [l["action"] for l in lines[3]] == ["none", "none", "none"]
     assert lines[3][0]["raw_desired"] == 0 and lines[3][0]["clamped"] == 1
-    # tick 5: downs (b, c) first; the up (a) waits for them and goes at tick 6
-    assert [(m, d, t) for _, m, d, t in dispatcher.submitted[3:6]] == [
-        ("b", "down", 1), ("c", "down", 1), ("a", "up", 4)]
-    assert [l["action"] for l in lines[5]] == ["down", "down", "wait_donor"] and lines[6][0]["action"] == "up"
+    # tick 5: b and c down, a up: one plan
+    assert [l["action"] for l in lines[5]] == ["down", "down", "up"]
+    assert [i["model"] for i in cluster.plans[1]["sleeps"]] == ["b", "c"]
+    assert cluster.plans[1]["wakes"] == [{"model": "a", "at_least": 4}]
     # tick 9: b up to 2
-    assert [(m, d, t) for _, m, d, t in dispatcher.submitted[6:]] == [("b", "up", 2)]
+    assert cluster.plans[2] == {"plan_id": cluster.plans[2]["plan_id"], "sleeps": [],
+                                "wakes": [{"model": "b", "at_least": 2}]}
     assert cluster.awake == {"a": 4, "b": 2, "c": 1}
-    # results come back on the following tick's line
-    assert [l for l in lines[1] if l["model"] == "a"][0]["sm_result"]["ok"] is True
+    # results come back on the following tick's line, with the plan they went out in
+    a1 = [l for l in lines[1] if l["model"] == "a"][0]["sm_result"]
+    assert a1["ok"] is True and a1["plan_id"] == cluster.plans[0]["plan_id"] and a1["plan_size"] == 3
     metrics = shell.metrics_text()
     assert 'tre_bl_actions_total{policy="scripted",model="a",action="down"} 1' in metrics
     assert 'tre_bl_actions_total{policy="scripted",model="a",action="up"} 1' in metrics
-    # a: down at t0, up at t6 (12 s later) -> reversal; b: up, down, up -> 2 reversals
+    assert 'tre_bl_sm_calls_total{policy="scripted"} 7' in metrics       # plan items answered
+    # a: down at t0, up at t5 (10 s later) -> reversal; b: up, down, up -> 2 reversals
     assert 'tre_bl_direction_reversals_60s_total{policy="scripted",model="a"} 1' in metrics
     assert 'tre_bl_direction_reversals_60s_total{policy="scripted",model="b"} 2' in metrics
     dispatcher.close(join_s=1.0)
@@ -176,7 +173,7 @@ def test_failing_ticks_turn_healthz_503(tmp_path) -> None:
     cluster = FakeCluster(awake={"a": 1, "b": 1, "c": 1})
     redis = FakeRedis()
     source = FakeSource(config, cluster, redis, fail=lambda tick: failing["on"])
-    dispatcher = Dispatcher(cluster.put_target)
+    dispatcher = Dispatcher(cluster.post_plan)
     shell = BaselineShell(config, source, StaticPolicy(), dispatcher, redis)
     server = make_http_server(shell, 0, host="127.0.0.1")
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -316,16 +313,19 @@ def test_decision_lines_are_mirrored_to_the_stream(tmp_path) -> None:
 # ------------------------------------------------------------------ SM refusal backoff
 
 
-def _refusing_put(cluster, state, refuse_until_tick, retry_after_s=None, reason=None):
+def _refusing(cluster, state, refuse_until_tick, retry_after_s=None, reason=None):
+    """Refuse every item until ``refuse_until_tick``; returns the Dispatcher's post and the
+    ticks at which items were asked for."""
     calls = []
 
-    def put(model, body):
+    def hook(model, item):
         calls.append(state["tick"])
         if state["tick"] < refuse_until_tick:
             return SMResult(ok=False, code=409, error="gpu_busy", reason=reason, retry_after_s=retry_after_s)
-        return cluster.put_target(model, body)
+        return None
 
-    return put, calls
+    cluster.hook = hook
+    return cluster.post_plan, calls
 
 
 def _drive(shell, dispatcher, state, ticks):
@@ -340,7 +340,7 @@ def _drive(shell, dispatcher, state, ticks):
 def test_failed_scale_downs_back_off_exponentially(tmp_path) -> None:
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put, calls = _refusing_put(cluster, state, refuse_until_tick=10)
+    put, calls = _refusing(cluster, state, refuse_until_tick=10)
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)  # = FakeSource 2 s step
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
@@ -361,7 +361,7 @@ def test_failed_scale_downs_back_off_exponentially(tmp_path) -> None:
 def test_backoff_honours_retry_after_and_resets_when_desired_is_awake(tmp_path) -> None:
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put, calls = _refusing_put(cluster, state, refuse_until_tick=1, retry_after_s=9.0)
+    put, calls = _refusing(cluster, state, refuse_until_tick=1, retry_after_s=9.0)
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
@@ -370,18 +370,18 @@ def test_backoff_honours_retry_after_and_resets_when_desired_is_awake(tmp_path) 
     _drive(shell, dispatcher, state, 8)
     # a refusal /v2/state cannot explain (no reason, no blocking binding) follows the SM's
     # hint: the result is seen at tick 1 (t=2 s); 9 s later is tick 6 (t=12 s)
-    assert calls == [0, 6, 6]
+    assert calls == [0, 6]
     # a model whose desired count goes back to awake forgets its backoff
     state2 = {"tick": 0}
     cluster2 = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put2, calls2 = _refusing_put(cluster2, state2, refuse_until_tick=1, retry_after_s=9.0)
+    put2, calls2 = _refusing(cluster2, state2, refuse_until_tick=1, retry_after_s=9.0)
     dispatcher2 = Dispatcher(put2)
     redis2 = FakeRedis()
     shell2 = BaselineShell(config, FakeSource(config, cluster2, redis2),
                            ScriptedPolicy({0: {"b": 3}, 1: {"b": 1}, 2: {"b": 3}}), dispatcher2, redis2,
                            lock=None)
     lines = _drive(shell2, dispatcher2, state2, 3)
-    assert [lines[t]["b"]["action"] for t in range(3)] == ["up", "none", "up"] and calls2 == [0, 2, 2]
+    assert [lines[t]["b"]["action"] for t in range(3)] == ["up", "none", "up"] and calls2 == [0, 2]
     dispatcher.close(join_s=1.0)
     dispatcher2.close(join_s=1.0)
 
@@ -404,7 +404,7 @@ def test_livez_follows_the_loop_not_the_ticks(tmp_path) -> None:
     cluster = FakeCluster(awake={"a": 1, "b": 1, "c": 1})
     redis = FakeRedis()
     source = FakeSource(config, cluster, redis, fail=lambda tick: True)   # e.g. the SM is down
-    shell = BaselineShell(config, source, StaticPolicy(), Dispatcher(cluster.put_target), redis)
+    shell = BaselineShell(config, source, StaticPolicy(), Dispatcher(cluster.post_plan), redis)
     server = make_http_server(shell, 0, host="127.0.0.1")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -490,24 +490,10 @@ def test_owner_or_mode_change_between_decision_and_call_drops_the_call(tmp_path)
         assert shell.refusals.get("a") is None
 
 
-def test_donor_scale_down_is_answered_before_the_dependent_scale_up(tmp_path) -> None:
-    """10-04 P2 repro: submit(down a), submit(up b) used to run down_started -> up_started
-    -> down_finished. The scale-up now goes out only after the SM answered the scale-down."""
-    shell, cluster, redis, dispatcher = _shell(tmp_path, StickyScripted({0: {"a": 1, "b": 2}}), dry_run=False)
-    cluster.delay_s = 0.05
-    lines = []
-    for _ in range(4):  # ticks do not wait for the SM here
-        lines.append({l["model"]: l for l in shell.tick_once()})
-        wait_until(lambda: dispatcher.inflight_downs() == [], timeout_s=2.0)
-    assert wait_until(lambda: dispatcher.inflight_count() == 0)
-    assert cluster.trace[:4] == [("a", "start"), ("a", "end"), ("b", "start"), ("b", "end")]
-    assert lines[0]["b"]["action"] == "wait_donor" and lines[1]["b"]["action"] == "up"
-
-
 def test_refusal_backoff_clears_when_the_sm_state_changes(tmp_path) -> None:
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put, calls = _refusing_put(cluster, state, refuse_until_tick=1, reason="slot_occupied")
+    put, calls = _refusing(cluster, state, refuse_until_tick=1, reason="slot_occupied")
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
@@ -520,7 +506,7 @@ def test_refusal_backoff_clears_when_the_sm_state_changes(tmp_path) -> None:
     state["tick"] = 2
     line = {l["model"]: l for l in shell.tick_once()}["b"]
     assert wait_until(lambda: dispatcher.inflight_count() == 0)
-    assert line["action"] == "up" and calls == [0, 2, 2]                # retried at once, not after the wait
+    assert line["action"] == "up" and calls == [0, 2]                   # retried at once, not after the wait
     assert line["retry_evidence"] == "state_changed"
     dispatcher.close(join_s=1.0)
 
@@ -533,7 +519,7 @@ def test_refusal_backoff_clears_when_a_gpu_becomes_wakeable(tmp_path) -> None:
 
     state = {"tick": 0}
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    put, calls = _refusing_put(cluster, state, refuse_until_tick=2, retry_after_s=30.0, reason="slot_occupied")
+    put, calls = _refusing(cluster, state, refuse_until_tick=2, retry_after_s=30.0, reason="slot_occupied")
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
     dispatcher = Dispatcher(put)
@@ -560,32 +546,26 @@ def test_refusal_backoff_clears_when_a_gpu_becomes_wakeable(tmp_path) -> None:
     dispatcher.close(join_s=1.0)
 
 
-def test_stepped_scale_up_keeps_what_the_sm_grants(tmp_path) -> None:
-    """10-06 S4 swap: the SM refuses a whole multi-replica target when one wake is blocked.
-    The shell asks one replica at a time: granted 2 of 3, then 409 -> awake + 2, no
-    exception, logged as partial_fill, and the next tick asks again from the new count."""
+def test_partial_fill_keeps_what_the_sm_woke(tmp_path) -> None:
+    """10-06 S4 swap, now on the SM side: ONE grow-only item for 1 -> 4; the SM places 2 of
+    the 3 wakes (``partial``): awake 3, logged as partial_fill from ``awake_after``, and the
+    next tick asks again from the new count (our wakes changed the state); that call places
+    nothing (refused) and the one after waits for evidence."""
     state = {"tick": 0}
-    cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
-    granted = {"n": 0}
-
-    def put(model, body):
-        if model == "b" and granted["n"] >= 2:
-            return SMResult(ok=False, code=409, error="gpu_busy", reason="slot_occupied", retry_after_s=30.0)
-        granted["n"] += model == "b"
-        return cluster.put_target(model, body)
-
+    cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1}, place_limit={"b": 3})
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
-    dispatcher = Dispatcher(put)
+    dispatcher = Dispatcher(cluster.post_plan)
     shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 4} for t in range(4)}),
                           dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
     lines = _drive(shell, dispatcher, state, 3)
     assert cluster.awake["b"] == 3
-    assert [b["wake_replicas"] for m, b in cluster.calls if m == "b"] == [2, 3]
+    assert [i for m, i in cluster.calls if m == "b"] == [{"model": "b", "at_least": 4}] * 2
     res = lines[1]["b"]["sm_result"]
-    assert (res["start"], res["reached"], res["target"], res["partial_fill"], res["code"]) == (1, 3, 4, True, 409)
+    assert (res["start"], res["reached"], res["target"], res["partial_fill"], res["code"]) == (1, 3, 4, True, 200)
     assert lines[1]["b"]["action"] == "up" and lines[1]["b"]["awake"] == 3   # asks again, no backoff
-    assert lines[2]["b"]["sm_result"]["partial_fill"] is False             # nothing granted: plain refusal
+    assert lines[2]["b"]["sm_result"]["partial_fill"] is False             # nothing woke: plain refusal
+    assert lines[2]["b"]["sm_result"]["code"] == 409
     assert lines[2]["b"]["action"] == "wait_refusal"                       # no change since: no call
     assert shell.stats.partial_fills == {"b": 1} and shell.stats.tick_failures == 0
     assert 'tre_bl_partial_fills_total{policy="scripted",model="b"} 1' in shell.metrics_text()
@@ -610,13 +590,14 @@ def _s4_shell(tmp_path, world, state, refuse):
     cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
     calls = []
 
-    def put(model, body):
+    def hook(model, item):
         calls.append(state["tick"])
         if refuse(model):
             return SMResult(ok=False, code=409, error="gpu_busy", reason="slot_occupied", node="n", gpu_ids=(0,),
                             scope="gpu", retry_after_s=30.0, blocking_binding_id="a/n/0")
-        return cluster.put_target(model, body)
+        return None
 
+    cluster.hook = hook
     config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
     redis = FakeRedis()
     source = FakeSource(config, cluster, redis)
@@ -628,7 +609,7 @@ def _s4_shell(tmp_path, world, state, refuse):
         return replace(snap, extra={**snap.extra, **world.extra()})
 
     source.gather = gather_with_gpus
-    dispatcher = Dispatcher(put)
+    dispatcher = Dispatcher(cluster.post_plan)
     shell = BaselineShell(config, source, ScriptedPolicy({t: {"b": 2} for t in range(40)}), dispatcher, redis,
                           lock=OwnerLock(redis, 30, token="me"))
     return shell, dispatcher, cluster, calls
@@ -678,28 +659,6 @@ def _drive_from(shell, dispatcher, state, first, ticks):
         lines.append({l["model"]: l for l in shell.tick_once()})
         assert wait_until(lambda: dispatcher.inflight_count() == 0)
     return lines
-
-
-def test_scale_up_with_free_gpus_does_not_wait_for_a_donor(tmp_path) -> None:
-    """Review P2-6: only a scale-up that needs a donor waits; with wakeable GPUs it goes now."""
-    from dataclasses import replace
-
-    shell, cluster, redis, dispatcher = _shell(tmp_path, StickyScripted({0: {"a": 1, "b": 2, "c": 2}}),
-                                               dry_run=False)
-    cluster.delay_s = 0.2
-    gather = shell.source.gather
-
-    def gather_with_gpus(tick=0):
-        snap = gather(tick)
-        models = dict(snap.models)
-        models["b"] = replace(models["b"], wakeable_slots=1)   # b can wake on a free GPU
-        models["c"] = replace(models["c"], wakeable_slots=0)   # c needs a's GPU
-        return replace(snap, models=models)
-
-    shell.source.gather = gather_with_gpus
-    lines = {l["model"]: l for l in shell.tick_once()}
-    assert (lines["a"]["action"], lines["b"]["action"], lines["c"]["action"]) == ("down", "up", "wait_donor")
-    assert wait_until(lambda: dispatcher.inflight_count() == 0)
 
 
 def test_metrics_report_policy_counters_and_non_streaming_arrivals(tmp_path) -> None:
