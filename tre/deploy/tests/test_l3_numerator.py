@@ -19,8 +19,8 @@ from scripts import l3_numerator as l3
 PROMPT_RATE, GEN_RATE = 1024.0, 512.0  # tokens per second of one pod
 
 
-def _pod(samples, errors=()) -> l3.PodCounters:
-    return l3.PodCounters("ns/p", [(t, p, g) for t, p, g in samples], list(errors))
+def _pod(samples) -> l3.PodCounters:
+    return l3.PodCounters("ns/p", [(t, p, g) for t, p, g in samples])
 
 
 def _steady(t0: int, t1: int, *, reset_at: int | None = None, skip=()) -> list:
@@ -36,7 +36,7 @@ def _steady(t0: int, t1: int, *, reset_at: int | None = None, skip=()) -> list:
     return out
 
 
-def test_window_deltas_sum_pods_and_void_resets_holes_and_failed_scrapes() -> None:
+def test_window_deltas_sum_pods_and_void_resets_and_long_holes() -> None:
     a, b = _pod(_steady(0, 120_000)), _pod(_steady(0, 120_000))
     src = l3.CounterTokenSource([a, b])
     # (30 s, 60 s]: boundary samples at 29.001 / 59.001 s -> exactly 30 s of counting, x 2 pods
@@ -44,13 +44,11 @@ def test_window_deltas_sum_pods_and_void_resets_holes_and_failed_scrapes() -> No
     reset = _pod(_steady(0, 120_000, reset_at=45_500))
     hole = _pod(_steady(0, 120_000, skip={40_001, 41_001}))
     long_hole = _pod(_steady(0, 120_000, skip=set(range(40_001, 52_001, 1000))))
-    failed = _pod(_steady(0, 120_000), errors=[50_500])
     assert reset.window_delta(30_000, 60_000)[0] == l3.STATUS_RESET
     assert reset.window_delta(60_000, 90_000)[0] == l3.STATUS_OK  # after the reset: fine again
-    # 2026-10-28: a short interior hole or a failed scrape does not bias the delta (only
+    # 2026-10-28: a short interior hole (a failed scrape) does not bias the delta (only
     # the boundary samples are read, as online); a hole long enough to hide a restart does.
     assert hole.window_delta(30_000, 60_000) == (l3.STATUS_OK, 30 * PROMPT_RATE, 30 * GEN_RATE)
-    assert failed.window_delta(30_000, 60_000)[0] == l3.STATUS_OK
     assert long_hole.window_delta(30_000, 60_000)[0] == l3.STATUS_GAP
     assert a.window_delta(130_000, 160_000)[0] == l3.STATUS_NO_SAMPLE  # past the capture
     src = l3.CounterTokenSource([a, reset])
@@ -126,10 +124,15 @@ def _rows(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def man_online_used(out: Path) -> dict:
+    return json.loads((out / "manifest.json").read_text())["numerator"]["windows_void_online_used"]
+
+
 def test_the_l3_dataset_changes_only_the_numerator_and_counts_what_it_drops(tmp_path) -> None:
     root = _l3_run(tmp_path)
-    gw = dataset.build_dataset(root)
-    out = dataset.build_dataset(root, overrides={"numerator": l3.NUMERATOR_VLLM_COUNTER})
+    cut30 = {"window_ms": 30_000}  # the fixture's counts are for 30 s / 10 s windows
+    gw = dataset.build_dataset(root, overrides=cut30)
+    out = dataset.build_dataset(root, overrides={**cut30, "numerator": l3.NUMERATOR_VLLM_COUNTER})
     assert gw == root / "dataset" and out == root / "dataset_l3"
     gw_rows, l3_rows = _rows(gw / "windows.csv"), _rows(out / "windows.csv")
     assert list(gw_rows[0]) == dataset.WINDOW_COLUMNS  # the default is unchanged
@@ -153,6 +156,10 @@ def test_the_l3_dataset_changes_only_the_numerator_and_counts_what_it_drops(tmp_
     s1_cell = next(c for c in man["cells"] if c["cell_id"] == "i256_o128_c95")
     s1_gw = [r for r in gw_rows if r["cell_id"] == "i256_o128_c95"]
     assert s1_cell["numerator"]["windows_void"].get(l3.STATUS_RESET) == 3
+    # M2 (10-28): of those, the online controller would have used the one whose post-reset
+    # span reaches 0.67 windows ((+60, +90]: 23 s) - counted, not kept
+    assert s1_cell["numerator"]["windows_void_online_used"] == {l3.STATUS_RESET: 1}
+    assert man_online_used(out) == {l3.STATUS_RESET: 1}
     assert s1_cell["numerator"]["windows_kept"] == len(s1) == len(s1_gw) - 3 - s1_cell["numerator"][
         "windows_void"].get(l3.STATUS_NO_SAMPLE, 0)
     assert man["numerator"]["source"] == l3.NUMERATOR_VLLM_COUNTER
@@ -211,7 +218,7 @@ def test_the_freeze_takes_the_datasets_window_and_stamps_it(tmp_path, capsys) ->
 
 def test_trainset_refuses_datasets_of_two_windows(tmp_path) -> None:
     root = _l3_run(tmp_path)
-    d30 = dataset.build_dataset(root)
+    d30 = dataset.build_dataset(root, out_dir=tmp_path / "d30", overrides={"window_ms": 30_000})
     d20 = dataset.build_dataset(root, out_dir=tmp_path / "d20", overrides={"window_ms": 20_000})
     assert json.loads((d20 / "manifest.json").read_text())["windowing"]["window_ms"] == 20_000
     sources = [dl.DatasetSource.parse(f"a={d30}", sealed_to_h2=True),

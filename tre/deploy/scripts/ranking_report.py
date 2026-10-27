@@ -73,7 +73,7 @@ def params_from_json(path: Path, *, registry: Optional[str] = None,
               "trim_ramp_windows": int(q.get("trim_ramp_windows", dl.TRIM_RAMP_WINDOWS)),
               "fit_config": {"direction": q.get("direction", spec.direction)},
               "published": {"theta_m": float(q["theta"])}}
-        out[model] = {"vh": vh, "windowing": dl.windowing(window_ms=float(q.get("window_ms", dl.WINDOW_MS)),
+        out[model] = {"vh": vh, "windowing": dl.windowing(window_ms=float(q.get("window_ms", dl.LEGACY_WINDOW_MS)),
                                                           step_ms=float(q.get("step_ms", dl.STEP_MS)))}
     return out
 

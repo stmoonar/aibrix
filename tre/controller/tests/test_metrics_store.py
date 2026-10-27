@@ -166,6 +166,8 @@ def test_metrics_store_min_latency_samples_nulls_noisy_p95():
     redis = FakeRedis()
     pod = "default/pod-a"
     redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    # 2026-10-28 (L2): a pod needs an instant doc (unknown queue = left out)
+    add_doc(redis, "tre:v2:inst:" + pod, 11_000, inst_doc("pod-a", waiting=0, running=1, kv_hit=0.0))
     # ttft count delta = 5 - 2 = 3 observations in the window (< guard 10).
     add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 2, {"0.1": 1, "0.5": 2}))
     add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 70, 2, 3.0, 5, {"0.1": 2, "0.5": 5}))
@@ -183,6 +185,8 @@ def test_metrics_store_p95_present_when_enough_samples_with_guard():
     redis = FakeRedis()
     pod = "default/pod-a"
     redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    # 2026-10-28 (L2): a pod needs an instant doc (unknown queue = left out)
+    add_doc(redis, "tre:v2:inst:" + pod, 11_000, inst_doc("pod-a", waiting=0, running=1, kv_hit=0.0))
     # ttft count delta = 15 - 2 = 13 observations (>= guard 10) -> p95 computed.
     add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 2, {"0.1": 1, "0.5": 2}))
     add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 70, 2, 9.0, 15, {"0.1": 6, "0.5": 15}))
@@ -224,6 +228,8 @@ def test_metrics_store_uses_pre_window_v2_baseline_for_single_hist_doc_delta():
     redis = FakeRedis()
     pod = "default/pod-a"
     redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    # 2026-10-28 (L2): a pod needs an instant doc (unknown queue = left out)
+    add_doc(redis, "tre:v2:inst:" + pod, 20_000, inst_doc("pod-a", waiting=0, running=1, kv_hit=0.0))
     add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
     add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 42, 2, 4.0, 20, {"0.5": 20}))
 
@@ -442,6 +448,8 @@ def test_metrics_store_exposes_window_mean_ttft_and_tpot_with_counts():
     redis = FakeRedis()
     pod = "default/pod-a"
     redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    # 2026-10-28 (L2): a pod needs an instant doc (unknown queue = left out)
+    add_doc(redis, "tre:v2:inst:" + pod, 11_000, inst_doc("pod-a", waiting=0, running=1, kv_hit=0.0))
     add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.1": 4, "0.5": 10}))
     add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 70, 2, 8.0, 20, {"0.1": 6, "0.5": 20}))
     registry = load_registry(str(REGISTRY_PATH))

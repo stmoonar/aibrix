@@ -230,17 +230,23 @@ def test_a_lost_baseline_still_gives_the_true_token_rate(case):
     """H1: the histogram doc at the window start is lost - the delta runs from the doc
     10 s earlier (40 s of tokens, formerly 1.33x). H1b: no doc at or before the start at
     all - the baseline is the first doc inside the window (20 s of tokens, formerly
-    0.67x). Divided by the real scraped_ms span, the rate is the true one either way;
-    H1b's 20 s span is under 0.67 windows: flagged."""
+    0.67x). Divided by the real scraped_ms span, the rate is the true one for H1.
+    H1b's 20 s span is under 0.67 windows: since review L3 (10-28) the pod is unknown
+    (out of queue and tokens, flagged), not scaled up."""
     redis = _Redis()
     _write_pod(redis, "m", "m-0", running=4)
     key = "tre:v2:hist:default/m-0"
     keep = (lambda score: score != END - WINDOW) if case == "start_doc_lost" else (lambda score: score > END - WINDOW)
     redis.zsets[key] = [(score, member) for score, member in redis.zsets[key] if keep(score)]
     window = _read(_store(redis, _registry("m")))
-    assert window.generation_tokens == pytest.approx(100.0 * 30)
-    assert window.prompt_tokens == pytest.approx(50.0 * 30)
-    assert window.sample_incomplete_pods == (() if case == "start_doc_lost" else ("m-0",))
+    if case == "start_doc_lost":
+        assert window.generation_tokens == pytest.approx(100.0 * 30)
+        assert window.prompt_tokens == pytest.approx(50.0 * 30)
+        assert window.sample_incomplete_pods == ()
+    else:
+        assert window.generation_tokens is None and window.prompt_tokens is None
+        assert window.avg_running == 0.0 and window.per_pod == {}
+        assert window.sample_incomplete_pods == ("m-0",)
 
 
 # --------------------------------------------------- review round 3, default 2 s period
@@ -248,15 +254,19 @@ def test_a_lost_baseline_still_gives_the_true_token_rate(case):
 EVIDENCE_2S = 2_000
 
 
-@pytest.mark.parametrize("case", ["reset_mid_window", "reset_at_the_last_doc", "no_hist_doc_in_window"])
+@pytest.mark.parametrize(
+    "case", ["reset_early_in_window", "reset_mid_window", "reset_at_the_last_doc", "no_hist_doc_in_window"]
+)
 def test_queue_and_tokens_stay_on_one_pod_set_after_a_reset_or_a_lost_hist(case):
-    """M2 at the 2 s default. m-1's engine restarted 15 s before the end: the delta
-    restarts at the first doc after the reset (span 14 s, scaled: the true rate),
-    flagged, in queue AND tokens. A reset with no doc after it, or a pod whose
+    """M2 at the 2 s default. m-1's engine restarted 25 s before the end: the delta
+    restarts at the first doc after the reset (span 24 s >= 0.67 windows, scaled: the
+    true rate), flagged, in queue AND tokens. Restarted 15 s before the end (span 14 s,
+    below 0.67 windows; review L3 10-28), a reset with no doc after it, or a pod whose
     histogram docs are all missing from the window: out of queue AND tokens, flagged."""
     redis = _Redis()
     _write_pod(redis, "m", "m-0", running=2, gen_per_s=1_000, evidence=EVIDENCE_2S)
     kw = {
+        "reset_early_in_window": {"reset_at": END - 25_000},
         "reset_mid_window": {"reset_at": END - 15_000},
         "reset_at_the_last_doc": {"reset_at": END - 1_000},
         "no_hist_doc_in_window": {"hist_missing": frozenset(range(END - WINDOW + 1, END + 1))},
@@ -264,7 +274,7 @@ def test_queue_and_tokens_stay_on_one_pod_set_after_a_reset_or_a_lost_hist(case)
     _write_pod(redis, "m", "m-1", running=4, gen_per_s=1_000, evidence=EVIDENCE_2S, **kw)
     window = _read(_store(redis, _registry("m"), evidence=EVIDENCE_2S))
     assert window.sample_incomplete_pods == ("m-1",)
-    kept = case == "reset_mid_window"
+    kept = case == "reset_early_in_window"
     assert set(window.per_pod) == ({"m-0", "m-1"} if kept else {"m-0"})
     assert window.avg_running == pytest.approx(6.0 if kept else 2.0)
     assert window.generation_tokens == pytest.approx((2 if kept else 1) * 1_000 * 30, rel=0.02)

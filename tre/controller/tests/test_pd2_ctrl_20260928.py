@@ -360,6 +360,10 @@ def _two_pod_store(min_samples):
         add_doc(redis, key, 1_000, _e2e_doc(pod, 0, {"1": 0, "5": 0, "+Inf": 0}))
         # 6 requests per pod (< the gate of 10 each, 12 together); pod-b has one slow one.
         add_doc(redis, key, 11_000, _e2e_doc(pod, 6, {"1": 6 - slow, "5": 6, "+Inf": 6}))
+        # a queue sample (2026-10-28 L2: a pod without one is unknown, left out)
+        add_doc(redis, "tre:v2:inst:default/" + pod, 11_000, {
+            "pod_name": pod, "model_metrics": {"dsqwen-7b/num_requests_running": 1.0},
+        })
     registry = load_registry(str(REGISTRY_PATH))
     return MetricsStore(
         redis, registry, instant_sample_interval_ms=5_000, percentile_mode="bucket_upper",

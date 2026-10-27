@@ -49,8 +49,11 @@ INSTANT_METRICS = {
 }
 
 #: A token span (``scraped_ms`` of the baseline to the end histogram doc) outside
-#: [MIN, MAX] x window flags the pod (a lost baseline / end doc, no baseline in the
-#: lookback, a stalled gateway); its rate is still computed over the real span.
+#: [MIN, MAX] x window flags the pod (a lost baseline / end doc, a stalled gateway); its
+#: rate is still computed over the real span. Review L3 (2026-10-28): below MIN x window
+#: with the baseline inside the window (woken mid-window, a counter reset, nothing in the
+#: lookback) the pod is unknown and left out of queue and tokens - scaling it up would
+#: multiply its tokens.
 MIN_TOKEN_SPAN_FACTOR = 0.67
 MAX_TOKEN_SPAN_FACTOR = 1.5
 #: A pod's newest instant sample is current when it was observed at most this many
@@ -283,7 +286,9 @@ class MetricsStore:
           (end - baseline) / (their ``scraped_ms`` span) x window; the baseline is the
           newest histogram doc at or before the window start, else the first one inside
           it. A pod whose baseline or end doc lacks a counter has unknown tokens: left
-          out of queue and tokens, flagged (never read as zero tokens).
+          out of queue and tokens, flagged (never read as zero tokens). Same for a pod
+          without an instant doc (unknown queue) and a pod with its baseline inside the
+          window and a span below 0.67 x window (review L2 / L3, 2026-10-28).
         * Flags (``sample_incomplete_pods``; a donor-gate flag only): coverage =
           distinct ``scraped_ms`` in the window / (window / instant period) below
           ``min_sample_ratio``; a token span outside [0.67, 1.5] x window; a missing or
@@ -826,12 +831,17 @@ class MetricsStore:
         [0.67, 1.5] x window, or no valid span (then the unscaled delta). Without
         instant reads (the SafeScale evidence store): raw deltas, never flagged.
 
+        2026-10-28 (review L2 / L3): unknown, i.e. (None, True), out of queue AND
+        tokens - a pod without an instant doc (unknown queue, never 0), and a pod with
+        no baseline at the window start (woken mid-window, a counter reset in it) whose
+        span is below 0.67 x window or not positive: its delta is not scaled up. A short
+        span with a baseline (a scrape that froze late in the window) stays flagged.
+
         Review round 3 (M2): queue and tokens always come from the same pods. A token
         counter that went down (the engine restarted) restarts the delta at the first
         doc after the reset - its ``scraped_ms`` starts the span; flagged. A pod with no
         usable delta (no histogram doc in the window, or nothing after the reset) is left
-        out - (None, True) - of both. (A pod with histogram docs but no instant doc has
-        coverage 0: flagged by the coverage rule.)"""
+        out - (None, True) - of both."""
         reset = False
         if self._read_instant:
             hist_docs, reset = _after_counter_reset(model, hist_docs)
@@ -847,6 +857,9 @@ class MetricsStore:
             # gateway, a non-finite value) - unknown tokens: out of queue AND tokens,
             # flagged, like a pod without a usable delta.
             return None, True
+        if self._read_instant and not any(isinstance(doc.get("model_metrics"), dict) for doc in inst_docs):
+            # L2: no instant sample - the queue is unknown, not 0 (0 would raise Z).
+            return None, True
         if not self._read_instant:
             return replace(metrics, observed=_pod_observed(hist_docs, inst_docs, read_start_ms)), False
         if reset:
@@ -856,6 +869,11 @@ class MetricsStore:
             return metrics, True
         flagged = False
         span = _token_span_ms(hist_docs, read_start_ms)
+        if _baseline_in_window(hist_docs, int(span_start_ms)) and (span is None or span < MIN_TOKEN_SPAN_FACTOR * window_ms):
+            # L3: no baseline at the window start (woken mid-window, a counter reset, a
+            # single doc) and too short a span: scaling it up would multiply the tokens
+            # (up to x10) - the pod is unknown, not scaled.
+            return None, True
         if span is None:
             flagged = metrics.generation_tokens is not None or metrics.prompt_tokens is not None
         else:
@@ -1036,6 +1054,14 @@ def _token_span_ms(hist_docs: list[dict[str, Any]], read_start_ms: int) -> int |
     if first is None or last is None or last <= first:
         return None
     return last - first
+
+
+def _baseline_in_window(hist_docs: list[dict[str, Any]], window_start_ms: int) -> bool:
+    """True when the token baseline (the first histogram doc of ``hist_docs``) lies after
+    the window start: no doc at or before it (woken mid-window, nothing in the lookback)
+    or the first doc after a counter reset."""
+    docs = [doc for doc in hist_docs if isinstance(doc.get("model_histogram_metrics"), dict)]
+    return bool(docs) and _number(docs[0].get("timestamp"), 0.0) > window_start_ms
 
 
 def _suffix_with_flags(metrics: ModelWindowMetrics, pods: set[str]) -> ModelWindowMetrics:

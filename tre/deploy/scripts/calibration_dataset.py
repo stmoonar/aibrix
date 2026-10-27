@@ -83,8 +83,10 @@ README = "DATASET.md"
 #: 1: 30 s / 5 s free-phase windows, one fixed label (2026-09-23 main line).
 #: 2: 30 s / 10 s grid-aligned windows (D8), three label arms (D6'), ttft_len_samples.
 FORMAT_REVISION = 2
-#: The fitting windows of revision 2 (plan 2026-09-21 §6.11 D8).
-DEFAULT_WINDOW_MS = 30_000
+#: The fitting windows of revision 2 (plan 2026-09-21 §6.11 D8). The default window is
+#: the controller's (TRE_METRICS_WINDOW_MS, 20 s since 2026-10-28); 30 s reproduces the
+#: freezes before it (--window-ms 30000).
+DEFAULT_WINDOW_MS = 20_000
 DEFAULT_STEP_MS = 10_000
 DEFAULT_WINDOW_ALIGN = rewindow_from_raw.WINDOW_ALIGN_GRID
 
@@ -857,7 +859,9 @@ def build_dataset(
     if l3_mode and numerator_doc["windows_void"]:
         discrepancies.append(
             f"L3 numerator: {sum(numerator_doc['windows_void'].values())} window(s) of non-void attempts "
-            f"dropped ({numerator_doc['windows_void']}); see manifest numerator")
+            f"dropped ({numerator_doc['windows_void']}; the online controller would have used "
+            f"{sum(numerator_doc['windows_void_online_used'].values())} of them: "
+            f"{numerator_doc['windows_void_online_used']}); see manifest numerator")
     if reissue_summary["excluded"]:
         discrepancies.append(
             f"reissue check: {len(reissue_summary['excluded'])} attempt(s) excluded as void "
@@ -1265,14 +1269,19 @@ def l3_windows(attempt: Attempt, windows: Sequence[dict], labelled, settings: Se
         row["prompt_tokens_gateway"] = g.get("prompt_tokens_total")
         row["generation_tokens_gateway"] = g.get("generation_tokens_total")
     void: dict[str, int] = {}
+    online_used: dict[str, int] = {}
     for key in gateway:
         status = source.status.get(key) or "not_asked"
         if status != l3.STATUS_OK:
             void[status] = void.get(status, 0) + 1
+            if key in source.online_used:
+                online_used[status] = online_used.get(status, 0) + 1
     summary = source.summary()
     return rows, {"pods": summary["pods"], "missing_pods": summary["missing_pods"],
                   "windows_labelled": len(gateway), "windows_kept": len(rows),
-                  "windows_void": dict(sorted(void.items()))}
+                  "windows_void": dict(sorted(void.items())),
+                  # review M2 (10-28): voided here, used online (selection-bias visibility)
+                  "windows_void_online_used": dict(sorted(online_used.items()))}
 
 
 def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dict:
@@ -1281,6 +1290,7 @@ def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dic
         return {}
     kept = labelled = 0
     void: dict[str, int] = {}
+    online_used: dict[str, int] = {}
     no_metrics = []
     for c in manifest_cells:
         rec = c.get("numerator")
@@ -1290,10 +1300,13 @@ def numerator_summary(manifest_cells: Sequence[dict], settings: Settings) -> dic
         labelled += rec["windows_labelled"]
         for k, v in rec["windows_void"].items():
             void[k] = void.get(k, 0) + v
+        for k, v in (rec.get("windows_void_online_used") or {}).items():
+            online_used[k] = online_used.get(k, 0) + v
         if not rec["pods"] or rec["missing_pods"]:
             no_metrics.append({k: c.get(k) for k in ("model", "cell_id", "attempt")}
                               | {"missing_pods": rec["missing_pods"]})
     return {"windows_labelled": labelled, "windows_kept": kept, "windows_void": dict(sorted(void.items())),
+            "windows_void_online_used": dict(sorted(online_used.items())),
             "attempts_without_metrics": no_metrics}
 
 

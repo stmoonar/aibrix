@@ -197,7 +197,12 @@ TRIM_RAMP_WINDOWS = 1
 #: ``--dt-ref-s`` / ``--horizon-ms`` / ``--dwell-windows``, thread the values explicitly
 #: (no module state changes), record them as ``windowing`` in their outputs, and the
 #: freeze carries them to ``accept``: a different window only needs an offline re-run.
-WINDOW_MS = 30_000.0
+#: WINDOW_MS = the controller's TRE_METRICS_WINDOW_MS (20 s since 2026-10-28).
+WINDOW_MS = 20_000.0
+#: The window of every stage output / freeze written before the windowing record
+#: (2026-09-30) and the default until 2026-10-28: :func:`windowing_of` reads a record
+#: without ``window_ms`` as this, never as the current default.
+LEGACY_WINDOW_MS = 30_000.0
 STEP_MS = 10_000.0
 WINDOWING_KEYS = ("window_ms", "step_ms", "dt_ref_s", "horizon_ms", "dwell_windows")
 #: Verdict resamples: the w_p grid, the lambda check, the final verdict.
@@ -899,13 +904,15 @@ def windowing(*, window_ms: float = WINDOW_MS, step_ms: float = STEP_MS, dt_ref_
 
 
 DEFAULT_WINDOWING = windowing()
+#: The windowing of documents that predate the record (see :data:`LEGACY_WINDOW_MS`).
+LEGACY_WINDOWING = windowing(window_ms=LEGACY_WINDOW_MS)
 
 
 def windowing_of(doc: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     """The windowing a stage output / freeze entry recorded; the defaults for keys (or a
     whole block) an older document does not carry - the D22 freeze predates the record."""
     rec = (doc or {}).get("windowing") or {}
-    return {k: rec.get(k, DEFAULT_WINDOWING[k]) for k in WINDOWING_KEYS}
+    return {k: rec.get(k, LEGACY_WINDOWING[k]) for k in WINDOWING_KEYS}
 
 
 def alpha_of(tau_s: float, dt_ref_s: float = DT_REF_S) -> float:
@@ -1662,7 +1669,7 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
 # compares, never writing next to the freeze.
 
 #: 2 (2026-09-30): each model entry records its ``windowing``. Revision 1 freezes (the
-#: D22 one) still verify and accept: their windowing is :data:`DEFAULT_WINDOWING`.
+#: D22 one) still verify and accept: their windowing is :data:`LEGACY_WINDOWING`.
 #: 3 (2026-10-03): each model entry seals its B' severity cut (``b_prime``) and the
 #: document the B' gate (``b_prime_gate``). Older freezes accept only with an explicit
 #: ``--b-prime-thresholds`` file.
