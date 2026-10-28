@@ -799,3 +799,19 @@ def test_unexpected_error_in_registry_apply_fails_the_item_not_the_campaign(tmp_
     camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20", "tre"), "extra": SENS})
     assert camp.run() == 0
     assert deps.seq(k)[:3] == ["reg_apply", "reg_restore", "reset!"] and "Alternating_s1/tre" in deps.runs()
+
+
+def test_eviction_storm_guards():
+    nodes = {"items": [{"metadata": {"name": "a"}, "status": {"conditions": [{"type": "DiskPressure", "status": "False"}]}},
+                       {"metadata": {"name": "b"}, "status": {"conditions": [{"type": "DiskPressure", "status": "True"}]}}]}
+    assert C.node_pressure_problems(nodes) == ["b"]
+    pods = {"items": [{"status": {"phase": "Failed"}}, {"status": {"phase": "Running"}}, {"status": {"phase": "Failed"}}]}
+    assert C.failed_pod_count(pods) == 2
+    cfg = {"frac": 0.15, "floor_gb": 10, "nodes": {"n3": 1}}
+
+    def st(free, cap):
+        return {"node": {"fs": {"availableBytes": free * 1e9, "capacityBytes": cap * 1e9}}}
+    assert not C.node_fs_verdict(st(14, 100), cfg, "n1")[0]      # 14 < 15% of 100
+    assert C.node_fs_verdict(st(16, 100), cfg, "n1")[0]
+    assert not C.node_fs_verdict(st(9, 30), cfg, "n1")[0]        # floor 10 GB beats 15% of 30
+    assert C.node_fs_verdict(st(2, 100), cfg, "n3")[0]           # per-node override
