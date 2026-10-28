@@ -33,6 +33,10 @@ class TRSInput:
     qmin: float = 1.0
     kv_cache_hit_rate: float = 0.0
     window_ms: float | None = None
+    #: False when the window's zero tokens may be missing data, not a stall: some pod of
+    #: it has a stale scrape or incomplete samples (:func:`zero_tokens_unconfirmed`).
+    #: Then a zero-token window is treated as before 2026-10-29: Z unknown, EMA reset.
+    zero_tokens_confirmed: bool = True
 
     @classmethod
     def from_metrics(cls, metrics: ModelWindowMetrics, params: TrsParams) -> "TRSInput":
@@ -50,7 +54,19 @@ class TRSInput:
             qmin=params.qmin,
             kv_cache_hit_rate=metrics.kv_cache_hit_rate,
             window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+            zero_tokens_confirmed=not zero_tokens_unconfirmed(metrics),
         )
+
+
+def zero_tokens_unconfirmed(metrics: ModelWindowMetrics) -> bool:
+    """The window has zero tokens, but some pod of it has a stale scrape or incomplete
+    samples (frozen counters, a short token span, a pod left out): the zero may be missing
+    data. Only a zero-token window of complete, fresh samples is a stall (TSS = 0, Z = 0)."""
+    if metrics.prompt_tokens is None or metrics.generation_tokens is None:
+        return False
+    if float(metrics.prompt_tokens) + float(metrics.generation_tokens) > 0.0:
+        return False
+    return bool(getattr(metrics, "scrape_stale_pods", ()) or getattr(metrics, "sample_incomplete_pods", ()))
 
 
 @dataclass
@@ -68,6 +84,7 @@ class TRSResult:
     prev_Q_ctl: float | None = None
     #: False when TSS is undefined for this window (idle: running + waiting == 0). TRS /
     #: TRS_raw are then 0.0 and Z_m is None - never a small Z that would read CRITICAL.
+    #: A defined TSS of 0 (zero tokens with a queue: a stalled engine) is Z = 0.
     defined: bool = True
 
 
@@ -166,13 +183,20 @@ class TRSComputer:
         y_per_pod = y_total / effective_pods
         q = terms.queue
         q_ctl = terms.queue_ctl
-        # Idle rule (plan 6.4): A + W == 0 -> TSS undefined. Reported as 0.0, which the
-        # EMA passes through without advancing and compute_z_m maps to None.
+        # Idle rule (plan 6.4; the only idle rule since 2026-10-29): A + W == 0 -> TSS
+        # undefined: None to the EMA (idle reset), reported as 0.0, Z None. Zero tokens
+        # with a queue is a defined TSS of 0 -> Z = 0, unless the zero may be missing data
+        # (``zero_tokens_confirmed`` False): then as before - EMA reset, Z None.
+        unconfirmed_zero = terms.defined and terms.numerator <= 0.0 and not inp.zero_tokens_confirmed
+        defined = terms.defined and not unconfirmed_zero
+        idle = window_is_idle(inp.avg_running, inp.avg_waiting) or unconfirmed_zero
+        smoothed = self._update_ema(
+            terms.raw if defined else None, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle
+        )
         trs_raw = terms.raw if terms.raw is not None else 0.0
-        idle = window_is_idle(inp.prompt_tokens_total, inp.generation_tokens_total)
-        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle)
+        trs = smoothed if defined and smoothed is not None else 0.0
         eta = compute_eta_m(trs, effective_pods)
-        z_m = compute_z_m(trs, theta_m)
+        z_m = compute_z_m(trs, theta_m) if defined else None
         saved_prev_y = self._prev_Y
         saved_prev_q_ctl = self._prev_Q_ctl
         self._prev_Y = y_total
@@ -194,11 +218,11 @@ class TRSComputer:
 
     def _update_ema(
         self,
-        raw: float,
+        raw: float | None,
         window_end_ms: int | None = None,
         window_ms: float | None = None,
         idle: bool = False,
-    ) -> float:
+    ) -> float | None:
         if self._raw_passthrough:
             return raw
         if self._ema is not None:
@@ -215,7 +239,7 @@ class TRSComputer:
         # entry sets ema_tau_ms; this path is kept only for the golden parity tests
         # (controller/tests/golden/legacy_trs.py, test_trs_signals.py) and has no idle-gap
         # reset. Byte-identical to pre-S1.3 behaviour when window_end_ms is None (golden).
-        if not _is_finite_positive(raw):
+        if raw is None or not _is_finite_positive(raw):
             return raw
         if (
             window_end_ms is not None
@@ -263,9 +287,11 @@ def compute_eta_m(trs: float, routable_pods: int | float) -> float | None:
 
 
 def compute_z_m(trs: float, theta_m: float | None) -> float | None:
+    """Z = TSS / theta; 0 for a TSS of 0 (a stall). The caller passes only a defined TSS
+    (an undefined one is reported as 0.0 and must not become Z = 0)."""
     if theta_m is None or theta_m <= 0:
         return None
-    if not _is_finite_positive(trs):
+    if trs is None or trs != trs or trs in (float("inf"), float("-inf")) or trs < 0:
         return None
     return trs / theta_m
 
@@ -282,8 +308,8 @@ class SignalState:
     In-process only: a controller restart starts every EMA from scratch, which is exactly
     the state an idle reset leaves behind (restart duality).
 
-    **Idle reset.** One predicate, :func:`tre_common.tss.window_is_idle` (no token in the
-    window), defines an idle window everywhere: every EMA update receives it
+    **Idle reset.** One predicate, :func:`tre_common.tss.window_is_idle` (nothing in flight:
+    running + waiting == 0), defines an idle window everywhere: every EMA update receives it
     (``TssEma.update(idle=...)``) and the tick clears the model's EMAs on it
     (:meth:`reset_ema`, also the alternative signals'). Independently, ``TssEma``'s
     idle-gap rule clears an EMA when a sample arrives more than one metrics window after

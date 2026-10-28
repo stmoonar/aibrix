@@ -7,6 +7,8 @@
   view does not show yet (view-pending), blocks the model's next action.
 * A LOW receiver takes from IDLE and HIGH donors only - never from a HEALTHY one (TP1
   relay / probe, TP2 block); a CRITICAL receiver still may.
+* Stuck engine: zero tokens with a queue is TSS = 0, Z = 0, CRITICAL; a zero that may be
+  missing data (stale scrape, incomplete samples, tokens unknown) takes no action.
 """
 from __future__ import annotations
 
@@ -223,3 +225,32 @@ def test_a_low_tp2_receiver_never_takes_a_block_of_a_healthy_donor(scope):
     touched = [item for items in plans for item in items if item[1] == "h"]
     assert [item[2] for item in touched] == [["h-0"]], (plans, events)
     assert any(event.startswith("block_supply:tp2:") and ":healthy:" in event for event in events)
+
+
+# ------------------------------------------- stuck engine: TSS = 0 is Z = 0, CRITICAL
+
+
+#: Zero tokens over the whole window with a real queue (an engine that processes nothing).
+STALLED = (0.0, 4.0, 10.0, 0.0)
+
+
+def test_a_zero_token_window_with_a_queue_is_critical_and_scales_up():
+    window = _window(BASE, [STALLED] * 3, routable=1)
+    result = run_rescue_tick(_snap(window), queue=_Queue(), registry=_registry(),
+                             cluster_view=_view(1, fetched_ms=BASE + 500), signal_state=SignalState())
+    assert result.model_contexts["m"]["z_m"] == 0.0
+    assert result.classifications["m"].state.value == "critical"
+    assert [(a.model, a.delta) for a in _ups(result.actions)] == [("m", 1)]
+
+
+@pytest.mark.parametrize("missing", ["scrape_stale_pods", "sample_incomplete_pods", "tokens_missing"])
+def test_a_zero_token_window_of_missing_data_takes_no_action(missing):
+    window = _window(BASE, [STALLED] * 3, routable=1)
+    if missing == "tokens_missing":
+        window = replace(window, prompt_tokens=None, generation_tokens=None)
+    else:
+        window = replace(window, **{missing: ("m-0",)})
+    result = run_rescue_tick(_snap(window), queue=_Queue(), registry=_registry(),
+                             cluster_view=_view(1, fetched_ms=BASE + 500), signal_state=SignalState())
+    assert (result.model_contexts or {}).get("m", {}).get("z_m") is None
+    assert not _ups(result.actions)

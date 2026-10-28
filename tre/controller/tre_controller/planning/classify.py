@@ -70,7 +70,10 @@ def classify_model(
     idle_rps_eps: float = 0.05,
 ) -> ModelClassification:
     request_rate = _as_nonneg_float(request_rate_rps)
-    if request_rate is not None and request_rate < max(0.0, idle_rps_eps):
+    # Z = 0 is a TSS of 0 with a queue - nothing processed (a stalled engine, 2026-10-29),
+    # not light traffic: the low-request-rate shortcut does not hide it.
+    stalled = Z_m is not None and Z_m <= 0.0
+    if request_rate is not None and request_rate < max(0.0, idle_rps_eps) and not stalled:
         return ModelClassification(
             model_name=model_name,
             state=ModelState.HEALTHY,

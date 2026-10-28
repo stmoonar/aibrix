@@ -38,7 +38,7 @@ from tre_controller.planning.safescale import (
     format_window_event,
 )
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
-from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
+from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput, zero_tokens_unconfirmed
 from tre_sm.allocator.slots import natural_key, release_order
 
 
@@ -901,10 +901,11 @@ def compute_model_signal(
     """TSS / Z of ``metrics`` (a serving window): always the whole sliding window plus
     the model's shared EMA (TSS only, 2026-10-29, design docs/design/20261029-tss-only.md;
     v1 behaviour). A window that straddles a replica change mixes both regimes - TSS is a
-    ratio of window totals, so that only adds lag. An idle window (no token) clears the
-    model's EMAs (:meth:`SignalState.reset_ema`)."""
+    ratio of window totals, so that only adds lag. An idle window (nothing in flight), or a
+    zero-token window whose zero may be missing data (:func:`zero_tokens_unconfirmed`),
+    clears the model's EMAs (:meth:`SignalState.reset_ema`)."""
     if signal_state is not None:
-        if window_is_idle(metrics.prompt_tokens, metrics.generation_tokens):
+        if window_is_idle(metrics.avg_running, metrics.avg_waiting) or zero_tokens_unconfirmed(metrics):
             signal_state.reset_ema(model_name)
         computer = signal_state.computer_for(
             model_name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms

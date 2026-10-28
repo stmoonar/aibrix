@@ -261,7 +261,7 @@ def _thresholded_signal(
         raw_value = signal_state.smooth_signal(
             spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
             window_ms=float(ema_window_ms),
-            idle=window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
+            idle=window_is_idle(metrics.avg_running, metrics.avg_waiting),
         )
     z_m = normalize_signal(raw_value, spec.alt_thresholds.get(source))
     if z_m is None:
@@ -290,7 +290,7 @@ def _held_signal(
         held = signal_state.held_signal(
             spec.name, source, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
             window_ms=float(ema_window_ms),
-            idle=window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
+            idle=window_is_idle(metrics.avg_running, metrics.avg_waiting),
         )
     if held is None:
         return SignalValue(source, raw_value=None, z_m=None, unavailable_reason=no_sample_reason)

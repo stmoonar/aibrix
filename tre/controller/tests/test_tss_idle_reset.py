@@ -69,22 +69,24 @@ def test_gap_shorter_than_a_window_does_not_reset() -> None:
     assert ema.update(200.0, 10_000, WIN) == decay * 100.0 + (1.0 - decay) * 200.0
 
 
-def test_none_and_zero_do_not_advance_last_ms() -> None:
+def test_none_does_not_advance_last_ms_and_zero_is_a_sample() -> None:
+    # 2026-10-29: an undefined TSS is None; a TSS of 0 (a stall) is an ordinary sample.
     ema = TssEma(TAU)
     ema.update(100.0, 0, WIN)
     assert ema.update(None, 10_000, WIN) is None
-    assert ema.update(0.0, 20_000, WIN) == 0.0
     assert (ema.value, ema.last_ms) == (100.0, 0.0)
+    decay = math.exp(-20_000 / TAU)
+    assert ema.update(0.0, 20_000, WIN) == decay * 100.0
+    assert ema.last_ms == 20_000
 
 
-def test_none_and_zero_trigger_the_gap_reset() -> None:
-    for passthrough in (None, 0.0):
-        ema = TssEma(TAU)
-        ema.update(100.0, 0, WIN)
-        assert ema.update(passthrough, WIN + 5_000, WIN) == passthrough
-        assert (ema.value, ema.last_ms) == (None, None)
-        # the next defined sample - even one window after the idle one - seeds fresh
-        assert ema.update(300.0, WIN + 10_000, WIN) == 300.0
+def test_none_triggers_the_gap_reset() -> None:
+    ema = TssEma(TAU)
+    ema.update(100.0, 0, WIN)
+    assert ema.update(None, WIN + 5_000, WIN) is None
+    assert (ema.value, ema.last_ms) == (None, None)
+    # the next defined sample - even one window after the idle one - seeds fresh
+    assert ema.update(300.0, WIN + 10_000, WIN) == 300.0
 
 
 def test_alternative_signal_ema_gets_the_same_gap_rule() -> None:
@@ -267,14 +269,14 @@ def _row_of(wm: ModelWindowMetrics) -> dict:
 
 def test_sliding_40s_gap_online_equals_offline_bitwise() -> None:
     windows = _sliding_with_gap()
-    assert any(window_is_idle(w.prompt_tokens, w.generation_tokens) for w in windows)
+    assert any(window_is_idle(w.avg_running, w.avg_waiting) for w in windows)
 
     state = SignalState()
     online_tss, online_alt, results = [], [], []
     for wm in windows:
         computer = state.computer_for("m", ema_alpha=0.2485, ema_tau_ms=TAU)
         result = computer.compute(TRSInput.from_metrics(wm, _params()), window_end_ms=wm.window_end_ms)
-        idle = window_is_idle(wm.prompt_tokens, wm.generation_tokens)
+        idle = window_is_idle(wm.avg_running, wm.avg_waiting)
         online_alt.append(state.smooth_signal(
             "m", "queue_len", wm.avg_running + wm.avg_waiting, window_end_ms=wm.window_end_ms,
             tau_ms=TAU, window_ms=float(WIN), idle=idle,

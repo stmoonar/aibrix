@@ -7,7 +7,7 @@ import random
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
-from tre_common.tss import smooth_series, tss_terms
+from tre_common.tss import smooth_series, tss_terms, window_is_idle
 from tre_controller.loops.tick import _model_contexts
 from tre_controller.planning.classify import ModelState, classify_all_models
 from tre_controller.planning.planner import _paper_state_incomplete_models
@@ -45,7 +45,7 @@ def test_online_raw_is_the_shared_definition() -> None:
 def test_offline_smoothing_is_bitwise_the_online_ema() -> None:
     rng = random.Random(7)
     computer = TRSComputer(ema_tau_ms=20_000)
-    online, raws, ends = [], [], []
+    online, raws, ends, idles = [], [], [], []
     end = 30_000
     for i in range(200):
         end += rng.choice((5_000, 5_000, 10_000))
@@ -58,7 +58,8 @@ def test_offline_smoothing_is_bitwise_the_online_ema() -> None:
         online.append(result.TRS if result.defined else None)
         raws.append(result.TRS_raw if result.defined else None)
         ends.append(end)
-    assert smooth_series(raws, ends, tau_ms=20_000.0) == online  # exact, not approx
+        idles.append(window_is_idle(wm.avg_running, wm.avg_waiting))
+    assert smooth_series(raws, ends, tau_ms=20_000.0, idle=idles) == online  # exact, not approx
 
 
 def _registry(theta: float) -> Registry:

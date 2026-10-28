@@ -92,7 +92,7 @@ def smooth_rows_by_cell(
 
     Within a cell, idle periods are handled by the same ``TssEma`` rules the controller
     applies: the idle-window reset with :func:`tre_common.tss.window_is_idle` of the row's
-    ``prompt_tokens_total`` / ``generation_tokens_total`` (missing columns -> not idle), and
+    ``avg_running`` / ``avg_waiting`` (missing columns -> not idle), and
     the idle-gap rule with the row's own window (``window_end_ms - window_start_ms``;
     without a ``window_start_ms`` column the gap rule is off). The per-cell reset assumes the online EMA was reset between cells too,
     which needs more than one window of quiet between them; a cell that starts less than
@@ -123,9 +123,7 @@ def smooth_rows_by_cell(
                 close_cells.append(f"{prev_cell}->{cell} ({start - prev_end:.0f} ms)")
             ema = make_ema()
         prev_cell, prev_end = cell, end
-        idle = window_is_idle(
-            _as_float(row.get("prompt_tokens_total")), _as_float(row.get("generation_tokens_total"))
-        )
+        idle = window_is_idle(_as_float(row.get("avg_running")), _as_float(row.get("avg_waiting")))
         values.append(ema.update(raw, end, window_ms, idle))
     if close_cells:
         LOG.warning(

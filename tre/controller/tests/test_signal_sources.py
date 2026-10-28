@@ -323,7 +323,9 @@ def test_ttft_mean_idle_window_clears_the_held_value() -> None:
     get_signal(_pods_window([_pod("a", ttft_ms=50.0, ttft_n=20.0)], routable=1, end=60_000),
                spec, "ttft_mean", trs_z_m=9.0, signal_state=state)
     idle = get_signal(
-        _pods_window([_pod("a", ttft_n=0.0)], routable=1, end=70_000, prompt_tokens=0.0, generation_tokens=0.0),
+        # Idle = nothing in flight (2026-10-29; zero tokens with a queue is a stall).
+        _pods_window([_pod("a", ttft_n=0.0)], routable=1, end=70_000, prompt_tokens=0.0, generation_tokens=0.0,
+                     avg_running=0.0, avg_waiting=0.0),
         spec, "ttft_mean", trs_z_m=9.0, signal_state=state,
     )
     assert idle.z_m is None
