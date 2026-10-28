@@ -412,8 +412,22 @@ def sm_ops(d: Path, t0_iso_s) -> dict:
 
 
 # ------------------------------------------------------------------ the check
-def check(d: Path, controller_tick_s: float = 5.0, baseline_tick_s: float = 5.0, coverage_min: float = 0.9,
+def expected_rescue_interval_s(rescue_s: float = 5.0, rebalance_s: float = 10.0, snapshot_s: float = 2.0) -> float:
+    """Mean spacing of the controller's rescue decisions (single decision loop, design
+    20261028-single-loop): each period rounds UP to the snapshot grid (5 s with 2 s
+    snapshots: 6 s) and every rebalance call (10 s) also runs the rescue section, so per
+    rebalance interval there are ceil(rebalance / rescue) rescue calls. Defaults: the
+    controller's (TRE_RESCUE_INTERVAL_SECONDS, TRE_FAIRNESS_INTERVAL_SECONDS, evidence
+    period)."""
+    def grid(x: float) -> float:
+        return math.ceil(x / snapshot_s - 1e-9) * snapshot_s
+    rescue, rebalance = grid(rescue_s), grid(rebalance_s)
+    return rebalance / math.ceil(rebalance / rescue - 1e-9)
+
+
+def check(d: Path, controller_tick_s: float | None = None, baseline_tick_s: float = 5.0, coverage_min: float = 0.9,
           frozen_max: float = 0.05) -> dict:
+    controller_tick_s = expected_rescue_interval_s() if controller_tick_s is None else controller_tick_s
     meta = _read_json(d / "arm_meta.json") or {}
     arm = meta.get("arm") or d.name
     baseline = arm in ("chiron", "tokenscale", "preserve") or (d / "baseline").is_dir()
@@ -586,7 +600,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", help="write the result here (one arm dir only)")
     ap.add_argument("--text", help="also write the text here (one arm dir only)")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--controller-tick-s", type=float, default=float(os.environ.get("RUN_CHECK_CONTROLLER_TICK_S") or 5))
+    ap.add_argument("--controller-tick-s", type=float,
+                    default=float(os.environ.get("RUN_CHECK_CONTROLLER_TICK_S") or expected_rescue_interval_s()))
     ap.add_argument("--baseline-tick-s", type=float, default=float(os.environ.get("RUN_CHECK_BASELINE_TICK_S") or 5))
     ap.add_argument("--coverage-min", type=float, default=float(os.environ.get("RUN_CHECK_COVERAGE_MIN") or 0.9))
     ap.add_argument("--frozen-max", type=float, default=float(os.environ.get("RUN_CHECK_FROZEN_MAX") or 0.05))

@@ -9,7 +9,16 @@ and makes ONE planner call (:func:`run_planner_tick`) per snapshot with
   when ``rescue_interval_s`` of observation time passed since its last run;
 * the rebalance section (LOW receivers; ``fairness`` in the planner) when
   ``fairness_interval_s`` passed since its last run - never with
-  TRE_ABLATION_DISABLE_SLOW_LOOP.
+  TRE_ABLATION_DISABLE_SLOW_LOOP - and always together with the rescue section (v1:
+  the slow beat is always a fast beat too), so a LOW receiver is never planned on a
+  call that does not plan the CRITICAL ones first.
+
+The periods are counted on the snapshot grid: the observation span since a section's
+last run is snapped to the nearest whole number of snapshot (producer) periods - that
+absorbs a scrape jitter of anything below half a period, and nothing else - and the
+section is due once that reaches its period. The cadence is deterministic and rounds UP
+to the grid (5 s rescue with 2 s snapshots: every 6 s; a rebalance call, every 10 s,
+also runs the rescue section).
 
 Both sections of one call share one ledger (planned deltas, claimed GPUs, released
 donor pods) and one :class:`PaperStateCache`; the plan goes to the ActionQueue (the loop
@@ -28,7 +37,6 @@ import time
 from typing import TYPE_CHECKING, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, observed_of
-from tre_common.persistence import SPAN_TOLERANCE_MS, span_reaches
 from tre_common.registry import Registry
 from tre_controller.loops.tick import (
     ActiveProbeModels,
@@ -70,36 +78,55 @@ def observation_ms(snapshot: MetricsSnapshot) -> int:
     return max(newest) if newest else int(snapshot.ts_ms)
 
 
+def grid_span_ms(span_ms: int, producer_ms: int) -> int:
+    """``span_ms`` snapped to the nearest whole number of producer (snapshot) periods: two
+    observations k periods apart give k periods for any scrape jitter below half a period,
+    so a section never runs one snapshot early or late."""
+    period = max(1, int(producer_ms))
+    return (int(span_ms) + period // 2) // period * period
+
+
 class SectionSchedule:
-    """Which planner sections are due on a snapshot observed at ``obs_ms``: a section runs
-    once its period of observation time passed since its last run (within
-    ``tolerance_ms``, the fetch jitter of two observations). ``rebalance_ms`` None: the
-    rebalance section never runs (TRE_ABLATION_DISABLE_SLOW_LOOP). An observation time
-    older than a section's last run (the gateway clock stepped back) runs it."""
+    """Which planner sections are due on a snapshot observed at ``obs_ms`` (module
+    docstring): a section runs once its period of observation time passed since its last
+    run, counted in whole producer periods (:func:`grid_span_ms`); the rebalance section
+    only together with the rescue section. ``rebalance_ms`` None: the rebalance section
+    never runs (TRE_ABLATION_DISABLE_SLOW_LOOP). An observation time older than a
+    section's last run (the gateway clock stepped back) runs it. ``producer_ms``: the
+    snapshot producer's period, bound by the caller (the app: the sampler's); 1 = no
+    grid (exact spans)."""
 
     def __init__(
-        self, *, rescue_ms: int, rebalance_ms: int | None, tolerance_ms: int = SPAN_TOLERANCE_MS
+        self, *, rescue_ms: int, rebalance_ms: int | None, producer_ms: int = 1
     ) -> None:
         self.rescue_ms = int(rescue_ms)
         self.rebalance_ms = None if rebalance_ms is None else int(rebalance_ms)
-        self.tolerance_ms = max(0, int(tolerance_ms))
+        self.producer_ms = max(1, int(producer_ms))
         self._last_rescue_ms: int | None = None
         self._last_rebalance_ms: int | None = None
 
-    def due(self, obs_ms: int) -> tuple[bool, bool]:
-        """(rescue due, rebalance due); a due section counts as run at ``obs_ms``."""
-        rescue = self._due(self._last_rescue_ms, obs_ms, self.rescue_ms)
+    def peek(self, obs_ms: int) -> tuple[bool, bool]:
+        """(rescue due, rebalance due) without counting them as run."""
         rebalance = self.rebalance_ms is not None and self._due(self._last_rebalance_ms, obs_ms, self.rebalance_ms)
+        return rebalance or self._due(self._last_rescue_ms, obs_ms, self.rescue_ms), rebalance
+
+    def mark(self, obs_ms: int, rescue: bool, rebalance: bool) -> None:
+        """The sections that ran at ``obs_ms``."""
         if rescue:
             self._last_rescue_ms = int(obs_ms)
         if rebalance:
             self._last_rebalance_ms = int(obs_ms)
+
+    def due(self, obs_ms: int) -> tuple[bool, bool]:
+        """:meth:`peek`, the due sections counted as run at ``obs_ms``."""
+        rescue, rebalance = self.peek(obs_ms)
+        self.mark(obs_ms, rescue, rebalance)
         return rescue, rebalance
 
     def _due(self, last_ms: int | None, obs_ms: int, need_ms: int) -> bool:
         if last_ms is None or int(obs_ms) < last_ms:
             return True
-        return span_reaches(int(obs_ms) - last_ms, need_ms, tolerance_ms=self.tolerance_ms)
+        return grid_span_ms(int(obs_ms) - last_ms, self.producer_ms) >= need_ms
 
 
 class DecisionLoop:
@@ -123,7 +150,7 @@ class DecisionLoop:
         is_observe: Callable[[], bool] | None = None,
         maintenance: "MaintenanceWatch | None" = None,
         leftover_probes: SafeScaleController | None = None,
-        tolerance_ms: int = SPAN_TOLERANCE_MS,
+        producer_ms: int = 1,
         tick: Callable[..., LoopTickResult] = run_planner_tick,
     ) -> None:
         self._queue = queue
@@ -150,7 +177,7 @@ class DecisionLoop:
                 if bool(getattr(cfg, "ablation_disable_slow_loop", False))
                 else int(float(cfg.fairness_interval_s) * 1000)
             ),
-            tolerance_ms=tolerance_ms,
+            producer_ms=producer_ms,
         )
         #: True while the newest snapshot is stale or none was published for the
         #: silence limit (the alert is logged once per stale run).
@@ -171,14 +198,16 @@ class DecisionLoop:
         if key == self._last_obs:
             return None  # the same window again: nothing new to decide on
         self._last_obs = key
-        rescue_due, rebalance_due = self.schedule.due(obs_ms)
+        rescue_due, rebalance_due = self.schedule.peek(obs_ms)
         if not (rescue_due or rebalance_due):
             return None
-        loop_name = "rescue" if rescue_due else "fairness"
+        loop_name = "rescue"  # the rebalance section never runs without the rescue section
         current_view = self._current_view()
         if self._cluster_view is None and self._cluster_view_box is not None and current_view is None:
+            # Nothing decided: the sections stay due for the next snapshot.
             result = LoopTickResult(submitted=0, events=("cluster_view_unavailable",))
         else:
+            self.schedule.mark(obs_ms, rescue_due, rebalance_due)
             cfg = self._cfg
             result = self._tick(
                 snapshot,

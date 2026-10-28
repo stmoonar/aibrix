@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.gateway_inflight import instance_max_age_ms
-from tre_common.persistence import SPAN_TOLERANCE_MS
 from tre_common.rediskeys import EVIDENCE_PERIOD_MS
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_common.tss import theta_basis_errors
@@ -139,9 +138,8 @@ def build_controller_task_specs(
         is_observe=_observe_reader(deps),
         maintenance=deps.maintenance_watch,
         leftover_probes=leftover_probes,
-        # Two observations S apart are fetched S +- the fetch jitter apart; bounded by
-        # half the snapshot cadence, so a section never runs one snapshot early.
-        tolerance_ms=min(SPAN_TOLERANCE_MS, int(getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS)) // 2),
+        # The snapshot (producer) period: the sections' periods round up to its grid.
+        producer_ms=int(getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS)),
     )
     specs.append(
         ControllerTaskSpec(

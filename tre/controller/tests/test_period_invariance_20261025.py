@@ -8,7 +8,9 @@ snapshot) and SafeScale (closed loop, mock SM; requests complete in whole number
 Poisson). Checked:
 
 * single loop (design docs/design/20261028-single-loop.md, invariant 6): at a 1 s and a
-  2 s snapshot cadence the mock SM applies the same actions in the same order;
+  2 s snapshot cadence, with +-40 ms of scrape jitter, the mock SM applies the same
+  actions in the same order; the rescue section runs on a fixed grid (its 5 s rounded
+  up to the snapshot period) and the rebalance section only with it;
 
 * the key events - onset saturation rescue, first CRITICAL scale-up, O1 warm, probe
   starts and verdicts, the first stale snapshot - happen in every run; each one's
@@ -65,9 +67,13 @@ SCENARIOS = {
 }
 
 
+#: Scrape jitter (+- ms) of the single-loop runs.
+JITTER_MS = 40
+
+
 @functools.lru_cache(maxsize=None)
-def _run(name: str, period: int) -> ps.Run:
-    return ps.Sim(SCENARIOS[name], period).go()
+def _run(name: str, period: int, jitter_ms: int = 0) -> ps.Run:
+    return ps.Sim(SCENARIOS[name], period, jitter_ms).go()
 
 
 def _times(run: ps.Run, predicate) -> list[int]:
@@ -151,8 +157,24 @@ def _applied(run: ps.Run) -> list[str]:
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_one_and_two_second_snapshots_give_the_same_actions(name):
-    fine, coarse = _applied(_run(name, 1_000)), _applied(_run(name, 2_000))
+    fine, coarse = _applied(_run(name, 1_000, JITTER_MS)), _applied(_run(name, 2_000, JITTER_MS))
     assert fine and fine == coarse
+
+
+@pytest.mark.parametrize("period", (1_000, 2_000))
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_the_sections_run_on_the_snapshot_grid_whatever_the_jitter(name, period):
+    sections = _run(name, period, JITTER_MS).sections
+    assert sections
+    # The rebalance section never runs without the rescue section (LOW never first).
+    assert all(rescue for _, rescue, rebalance in sections if rebalance)
+    # Between two rebalance calls the rescue section runs every 5 s rounded up to the
+    # snapshot grid (6 s with 2 s snapshots), never one snapshot early or late.
+    step = -(-RESCUE_TICK_MS // period) * period
+    rescue_at = [t for t, rescue, _ in sections if rescue]
+    rebalance_at = {t for t, _, rebalance in sections if rebalance}
+    gaps = [b - a for a, b in zip(rescue_at, rescue_at[1:]) if b not in rebalance_at]
+    assert gaps and set(gaps) == {step}, (period, sorted(set(gaps)))
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))

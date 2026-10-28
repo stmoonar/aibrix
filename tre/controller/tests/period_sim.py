@@ -32,7 +32,6 @@ from dataclasses import dataclass, field, replace
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox, default_phase_offset_ms
-from tre_common.persistence import SPAN_TOLERANCE_MS
 from tre_controller.loops.action_queue import PlanBatch
 from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.replay import _active_probe_models
@@ -188,11 +187,15 @@ class Run:
 
     events: list = field(default_factory=list)
     verdicts: list = field(default_factory=list)
+    #: (controller ms, rescue section ran, rebalance section ran) per planner call.
+    sections: list = field(default_factory=list)
 
 
 class Sim:
-    def __init__(self, scenario: Scenario, period_ms: int) -> None:
+    def __init__(self, scenario: Scenario, period_ms: int, jitter_ms: int = 0) -> None:
         self.scenario, self.period = scenario, int(period_ms)
+        #: +- ms of scrape jitter on every observation stamp (``scraped_ms``).
+        self.jitter = int(jitter_ms)
         self.registry = registry()
         self.redis = FastRedis()
         self.pods = [_Pod(f"{m}-{g}", m, g, awake=scenario.awake[g] == m) for g in range(4) for m in MODELS]
@@ -244,7 +247,7 @@ class Sim:
             cluster_view_box=SimpleNamespace(get=self.view),
             active_probe_models=lambda: set(_active_probe_models(self.safescale)),
             safescale=self.safescale, signal_state=self.signal_state,
-            tolerance_ms=min(SPAN_TOLERANCE_MS, self.period // 2),
+            producer_ms=self.period,
         )
         self._seen_version = 0
 
@@ -295,7 +298,8 @@ class Sim:
             return
         ts = ts + self.offset  # every gateway stamp is on the gateway clock
         for pod in self.pods:
-            base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod.name, "scraped_ms": ts - 50}
+            jitter = random.Random(f"jitter:{pod.name}:{ts}").randint(-self.jitter, self.jitter) if self.jitter else 0
+            base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod.name, "scraped_ms": ts - 50 + jitter}
             running, waiting, kv = pod.gauges
             self.redis.zadd(f"tre:v2:inst:default/{pod.name}", {**base, "model_metrics": {
                 f"{pod.model}/num_requests_running": running, f"{pod.model}/num_requests_waiting": waiting,
@@ -404,7 +408,10 @@ class Sim:
         result = self.decisions.on_snapshot(snapshot)
         if result is None:
             return
-        loop = "rescue" if "rescue_skipped_by_cadence" not in result.events else "fairness"
+        rescue = "rescue_skipped_by_cadence" not in result.events
+        if "cluster_view_unavailable" not in result.events:
+            self.run.sections.append((t, rescue, "fairness_skipped_by_cadence" not in result.events))
+        loop = "rescue" if rescue else "fairness"
         for event in result.events:
             self.run.events.append((t, f"{loop}|{event}"))
         for model, context in (result.model_contexts or {}).items():
