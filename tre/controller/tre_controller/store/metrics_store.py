@@ -497,24 +497,19 @@ class MetricsStore:
 
         prompt_tokens = self._counter_delta(model, COUNTER_METRICS["prompt_tokens"], hist_docs, window_start_ms)
         generation_tokens = self._counter_delta(model, COUNTER_METRICS["generation_tokens"], hist_docs, window_start_ms)
-        ttft_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
-        tpot_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
-        e2e_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
-
-        ttft_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
-        tpot_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
-        e2e_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
-        # Ungated window histogram: the model e2e p95 merges the pods' histograms
+        # Each histogram series is scanned once (first / last entry, window presence) and
+        # its bucket delta formed once; every field below derives from that.
+        has_hist = _has_window_hist_doc(hist_docs, window_start_ms)
+        completed = _MetricWindow.read(model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms)
+        ttft = _MetricWindow.read(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
+        tpot = _MetricWindow.read(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
+        e2e = _MetricWindow.read(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
+        request_count = completed.count_delta(has_hist)
+        # Ungated window histograms: the model e2e p95 merges the pods' histograms
         # first and gates the merged count (tre_common.window_pods.aggregate_pods).
-        e2e_hist, e2e_hist_count = self._hist_window_buckets(
-            model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms
-        )
-        ttft_hist, ttft_hist_count = self._hist_window_buckets(
-            model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms
-        )
-        tpot_hist, tpot_hist_count = self._hist_window_buckets(
-            model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms
-        )
+        e2e_hist, e2e_hist_count = e2e.window_buckets()
+        ttft_hist, ttft_hist_count = ttft.window_buckets()
+        tpot_hist, tpot_hist_count = tpot.window_buckets()
 
         return PodWindowMetrics(
             pod=pod_name,
@@ -524,30 +519,24 @@ class MetricsStore:
             avg_running=self._instant_avg(model, INSTANT_METRICS["running"], inst_docs),
             avg_swapping=self._instant_avg(model, INSTANT_METRICS["swapping"], inst_docs),
             kv_cache_hit_rate=self._instant_avg(model, INSTANT_METRICS["kv_hit"], inst_docs),
-            ttft_p95_ms=_seconds_to_ms(ttft_p95_s),
-            tpot_p95_ms=_seconds_to_ms(tpot_p95_s),
-            e2e_p95_ms=_seconds_to_ms(e2e_p95_s),
-            request_count=self._hist_count_delta(
-                model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms
-            ),
-            request_count_observed=self._hist_count_delta(
-                model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms
-            ),
-            completed_prompt_tokens=self._hist_sum_delta(
-                model, HISTOGRAM_METRICS["completed_prompt_tokens"], hist_docs, window_start_ms
-            ),
+            ttft_p95_ms=_seconds_to_ms(self._p95(ttft)),
+            tpot_p95_ms=_seconds_to_ms(self._p95(tpot)),
+            e2e_p95_ms=_seconds_to_ms(self._p95(e2e)),
+            request_count=request_count,
+            request_count_observed=request_count,
+            completed_prompt_tokens=completed.sum_delta(has_hist),
             token_counter_reset=_counter_reset_index(model, hist_docs) > 0,
             instant_ticks_ms=_doc_ticks(inst_docs),
             gpu_cache_usage=self._instant_avg_optional(model, INSTANT_METRICS["gpu_cache"], inst_docs),
-            ttft_avg_ms=_seconds_to_ms(ttft_avg_s),
-            ttft_count=self._hist_count_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
+            ttft_avg_ms=_seconds_to_ms(ttft.mean()),
+            ttft_count=ttft.count_delta(has_hist),
             ttft_count_complete=self._hist_series_complete(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
-            tpot_avg_ms=_seconds_to_ms(tpot_avg_s),
-            tpot_count=self._hist_count_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms),
+            tpot_avg_ms=_seconds_to_ms(tpot.mean()),
+            tpot_count=tpot.count_delta(has_hist),
             e2e_hist=e2e_hist,
             e2e_hist_count=e2e_hist_count,
-            hist_first_ts_ms=_first_metric_doc_ts(model, HISTOGRAM_METRICS["ttft"], hist_docs),
-            hist_last_ts_ms=_last_metric_doc_ts(model, HISTOGRAM_METRICS["ttft"], hist_docs),
+            hist_first_ts_ms=ttft.first_ts_ms,
+            hist_last_ts_ms=ttft.last_ts_ms,
             ttft_hist=ttft_hist,
             ttft_hist_count=ttft_hist_count,
             tpot_hist=tpot_hist,
@@ -593,15 +582,6 @@ class MetricsStore:
             p95_rule=(self._percentile_mode, int(self._min_latency_samples)),
         )
 
-    def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
-        if not _has_window_hist_doc(docs, window_start_ms):
-            return None
-        first, last = _first_last_metric(model, metric, docs)
-        if first is None or last is None:
-            return 0.0
-        delta = _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0)
-        return delta if delta >= 0.0 else None
-
     def _counter_delta(
         self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
     ) -> float | None:
@@ -618,19 +598,6 @@ class MetricsStore:
             return None
         return last - first
 
-    def _hist_count_delta(
-        self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
-    ) -> float | None:
-        if not _has_window_hist_doc(docs, window_start_ms):
-            return None
-        first, last = _first_last_metric(model, metric, docs)
-        if first is None or last is None:
-            return 0.0
-        return max(
-            0.0,
-            _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0),
-        )
-
     def _hist_series_complete(
         self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
     ) -> bool:
@@ -643,56 +610,20 @@ class MetricsStore:
             return False
         return all(_metric_entry(model, metric, doc) is not None for doc in hist)
 
-    def _hist_avg_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
-        if not _has_window_metric(model, metric, docs, window_start_ms):
+    def _p95(self, series: "_MetricWindow") -> float | None:
+        """The window's p95 (s) of one histogram series; None without the series in the
+        window, with too few observations (N1) or without buckets."""
+        if not series.in_window:
             return None
-        first, last = _first_last_metric(model, metric, docs)
-        if first is None or last is None:
+        if self._min_latency_samples > 0 and series.count() < self._min_latency_samples:
+            # N1: too few observations for a stable p95 -> None (not 0), so the
+            # signal/safescale layer treats the latency metric as unavailable rather
+            # than deciding on noise.
             return None
-        sum_delta = max(0.0, _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0))
-        count_delta = max(0.0, _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0))
-        if count_delta <= 0.0:
+        delta = series.bucket_delta()
+        if delta is None:
             return None
-        return sum_delta / count_delta
-
-    def _hist_percentile(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
-        if not _has_window_metric(model, metric, docs, window_start_ms):
-            return None
-        first, last = _first_last_metric(model, metric, docs)
-        if first is None or last is None:
-            return None
-        if self._min_latency_samples > 0:
-            count_delta = max(0.0, _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0))
-            if count_delta < self._min_latency_samples:
-                # N1: too few observations for a stable p95 -> None (not 0), so the
-                # signal/safescale layer treats the latency metric as unavailable rather
-                # than deciding on noise.
-                return None
-        first_buckets = _normal_buckets(first.get("buckets"))
-        last_buckets = _normal_buckets(last.get("buckets"))
-        if not first_buckets or not last_buckets:
-            return None
-        delta = _bucket_delta(first_buckets, last_buckets)
         return histogram_percentile(delta.items(), 0.95, mode=self._percentile_mode)
-
-    def _hist_window_buckets(
-        self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
-    ) -> tuple[tuple[tuple[float, float], ...] | None, float | None]:
-        """The window's cumulative bucket delta ``((upper_s, count), ...)`` and its
-        observation count, without the minimum-samples gate; (None, None) when the
-        window has no such histogram."""
-        if not _has_window_metric(model, metric, docs, window_start_ms):
-            return None, None
-        first, last = _first_last_metric(model, metric, docs)
-        if first is None or last is None:
-            return None, None
-        first_buckets = _normal_buckets(first.get("buckets"))
-        last_buckets = _normal_buckets(last.get("buckets"))
-        if not first_buckets or not last_buckets:
-            return None, None
-        count = max(0.0, _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0))
-        delta = _bucket_delta(first_buckets, last_buckets)
-        return tuple(sorted(delta.items())), count
 
     def _instant_avg(self, model: str, metric: str, docs: list[dict[str, Any]]) -> float:
         """Mean of the gauge over the given instant samples; an absent value reads 0.
@@ -1026,46 +957,12 @@ def _metric_entry(model: str, metric: str, doc: dict[str, Any]) -> dict[str, Any
     return entry if isinstance(entry, dict) else None
 
 
-def _has_window_metric(model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> bool:
-    for doc in docs:
-        if _number(doc.get("timestamp"), 0.0) < window_start_ms:
-            continue
-        if _metric_entry(model, metric, doc) is not None:
-            return True
-    return False
-
-
 def _has_window_hist_doc(docs: list[dict[str, Any]], window_start_ms: int) -> bool:
     return any(
         _number(doc.get("timestamp"), 0.0) >= window_start_ms
         and isinstance(doc.get("model_histogram_metrics"), dict)
         for doc in docs
     )
-
-
-def _first_last_metric(model: str, metric: str, docs: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    entries = [_metric_entry(model, metric, doc) for doc in docs]
-    entries = [entry for entry in entries if entry is not None]
-    if not entries:
-        return None, None
-    return entries[0], entries[-1]
-
-
-def _first_metric_doc_ts(model: str, metric: str, docs: list[dict[str, Any]]) -> int | None:
-    """Timestamp of the first doc carrying ``metric`` - the doc ``_first_last_metric``
-    takes the delta's baseline from (docs are sorted, baseline doc first)."""
-    for doc in docs:
-        if _metric_entry(model, metric, doc) is not None and doc.get("timestamp") is not None:
-            return int(_number(doc.get("timestamp"), 0.0))
-    return None
-
-
-def _last_metric_doc_ts(model: str, metric: str, docs: list[dict[str, Any]]) -> int | None:
-    """Timestamp of the last doc carrying ``metric`` (the end of the delta)."""
-    for doc in reversed(docs):
-        if _metric_entry(model, metric, doc) is not None and doc.get("timestamp") is not None:
-            return int(_number(doc.get("timestamp"), 0.0))
-    return None
 
 
 def _with_baseline_doc(docs: list[dict[str, Any]], window_start_ms: int) -> list[dict[str, Any]]:
@@ -1094,19 +991,116 @@ def _normal_buckets(raw: Any) -> dict[float, float]:
     return out
 
 
-def _cumulative_at(buckets: dict[float, float], upper: float) -> float:
-    candidates = [count for bucket_upper, count in buckets.items() if bucket_upper <= upper]
-    return max(candidates) if candidates else 0.0
-
-
 def _bucket_delta(first: dict[float, float], last: dict[float, float]) -> dict[float, float]:
+    """Cumulative bucket delta on the union of both bounds, as a running maximum. A bound
+    missing on one side reads that side's cumulative count at the largest bound below it
+    (the maximum count at or below it; 0 below every bound). One pass over the sorted
+    bounds (formerly a scan of every bucket per bound, O(B^2))."""
     result: dict[float, float] = {}
     running = 0.0
+    first_at: float | None = None  # max count of ``first`` at or below the bound so far
+    last_at: float | None = None
     for upper in sorted(set(first) | set(last)):
-        delta = max(0.0, _cumulative_at(last, upper) - _cumulative_at(first, upper))
+        if upper in first and (first_at is None or first[upper] > first_at):
+            first_at = first[upper]
+        if upper in last and (last_at is None or last[upper] > last_at):
+            last_at = last[upper]
+        delta = max(0.0, (0.0 if last_at is None else last_at) - (0.0 if first_at is None else first_at))
         running = max(running, delta)
         result[upper] = running
     return result
+
+
+class _MetricWindow:
+    """One histogram series of a pod's docs, scanned once: its first and last entry (the
+    delta's baseline and end; docs sorted, baseline doc first), whether an entry lies in
+    the window, and the stamps of the first / last doc carrying it."""
+
+    __slots__ = ("first", "last", "in_window", "first_ts_ms", "last_ts_ms", "_delta")
+
+    def __init__(self) -> None:
+        self.first: dict[str, Any] | None = None
+        self.last: dict[str, Any] | None = None
+        self.in_window = False
+        self.first_ts_ms: int | None = None
+        self.last_ts_ms: int | None = None
+        self._delta: Any = _UNSET
+
+    @classmethod
+    def read(cls, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> "_MetricWindow":
+        series = cls()
+        for doc in docs:
+            entry = _metric_entry(model, metric, doc)
+            if entry is None:
+                continue
+            if series.first is None:
+                series.first = entry
+            series.last = entry
+            stamp = doc.get("timestamp")
+            if not series.in_window and not _number(stamp, 0.0) < window_start_ms:
+                series.in_window = True
+            if stamp is not None:
+                ts_ms = int(_number(stamp, 0.0))
+                if series.first_ts_ms is None:
+                    series.first_ts_ms = ts_ms
+                series.last_ts_ms = ts_ms
+        return series
+
+    def _diff(self, field: str) -> float:
+        return _number(self.last.get(field), 0.0) - _number(self.first.get(field), 0.0)
+
+    def count(self) -> float:
+        """Observations in the window (never negative); the series must be present."""
+        return max(0.0, self._diff("count"))
+
+    def count_delta(self, has_hist_doc: bool) -> float | None:
+        """None without a histogram doc in the window, 0 without the series."""
+        if not has_hist_doc:
+            return None
+        return 0.0 if self.first is None else self.count()
+
+    def sum_delta(self, has_hist_doc: bool) -> float | None:
+        """None without a histogram doc in the window or when the sum went down, 0
+        without the series."""
+        if not has_hist_doc:
+            return None
+        if self.first is None:
+            return 0.0
+        delta = self._diff("sum")
+        return delta if delta >= 0.0 else None
+
+    def mean(self) -> float | None:
+        """sum / count over the window; None without the series in the window or without
+        an observation."""
+        if not self.in_window:
+            return None
+        count = self.count()
+        if count <= 0.0:
+            return None
+        return max(0.0, self._diff("sum")) / count
+
+    def bucket_delta(self) -> dict[float, float] | None:
+        """The window's cumulative bucket delta (formed once); None without the series
+        in the window or without buckets on either end."""
+        if self._delta is _UNSET:
+            self._delta = None
+            if self.in_window:
+                first_buckets = _normal_buckets(self.first.get("buckets"))
+                last_buckets = _normal_buckets(self.last.get("buckets"))
+                if first_buckets and last_buckets:
+                    self._delta = _bucket_delta(first_buckets, last_buckets)
+        return self._delta
+
+    def window_buckets(self) -> tuple[tuple[tuple[float, float], ...] | None, float | None]:
+        """``((upper_s, count), ...)`` and the observation count, without the
+        minimum-samples gate; (None, None) without the series in the window."""
+        delta = self.bucket_delta()
+        if delta is None:
+            return None, None
+        return tuple(sorted(delta.items())), self.count()
+
+
+_UNSET = object()
 
 
 def _seconds_to_ms(value: float | None) -> float | None:
