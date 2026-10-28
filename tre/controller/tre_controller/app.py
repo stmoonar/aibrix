@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -529,7 +530,11 @@ def create_controller_dependencies(
         model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,
-        decision_writer=DecisionSnapshotWriter(redis_client),
+        # Decision records: one pipelined round trip per decision, on one worker thread
+        # (in order) - the decision loop never waits for Redis.
+        decision_writer=DecisionSnapshotWriter(
+            redis_client, executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="decision-write")
+        ),
         safescale=safescale,
         registry=registry,
         signal_state=signal_state,

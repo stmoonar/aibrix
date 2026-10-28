@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from concurrent.futures import Executor
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot
@@ -13,7 +15,7 @@ from tre_common.rediskeys import (
 )
 from tre_controller.loops.action_queue import _members
 from tre_controller.loops.tick import LoopTickResult
-from tre_controller.loops.signal_log import SignalLogWriter
+from tre_controller.loops.signal_log import SignalLogWriter, run_pipelined
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, TransferIntent, UnhideAction
 
 
@@ -40,40 +42,101 @@ def build_decision_snapshot(loop_name: str, snapshot: MetricsSnapshot, result: L
 
 
 class DecisionSnapshotWriter:
+    """Records each decision: the ``trs_calc_result`` log line (on the caller's thread,
+    in decision order), the per-model decision history and the signal log (Redis,
+    best-effort). The Redis writes of one decision go in one pipelined round trip;
+    with ``executor`` (the app: one worker thread, so decisions land in order) they run
+    off the event loop and the decision never waits for Redis. Without it (tests,
+    offline) they run inline. At most ``max_pending`` decisions wait for the executor;
+    beyond that (Redis down or slow) a decision's Redis writes are dropped and logged."""
+
     def __init__(
         self,
         redis_client: Any,
         *,
         signal_log_writer: SignalLogWriter | None = None,
+        executor: Executor | None = None,
+        max_pending: int = 32,
     ) -> None:
         self._redis = redis_client
         self._signal_log_writer = signal_log_writer or SignalLogWriter(redis_client)
+        self._executor = executor
+        self._max_pending = int(max_pending)
+        self._pending = 0
+        self._pending_lock = threading.Lock()
 
     def write(self, loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
         payload = build_decision_snapshot(loop_name, snapshot, result)
-        self._append_history(snapshot, result)
-        self._signal_log_writer.write(snapshot, result)
+        history = self._history_calls(snapshot, result)
+        signal_rows = self._signal_log_writer.claim(snapshot, result)
+        if history or signal_rows:
+            self._send(history, signal_rows)
         # ``now_ms``: wall clock of the decision (``ts_ms`` is the metrics window
         # boundary the tick read, grid-aligned) - evaluation data, log line only.
         _LOGGER.info(json.dumps({"event": "trs_calc_result", "now_ms": str(int(time.time() * 1000)), **payload},
                                 separators=(",", ":")))
 
-    def _append_history(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
+    def _send(self, history: list[tuple[str, list]], signal_rows: list) -> None:
+        if self._executor is None:
+            self._flush(history, signal_rows)
+            return
+        with self._pending_lock:
+            if self._pending >= self._max_pending:
+                full = True
+            else:
+                full = False
+                self._pending += 1
+        if full:
+            _LOGGER.warning("decision_redis_write_dropped: %d decisions waiting for redis", self._max_pending)
+            self._signal_log_writer.settle(signal_rows, [RuntimeError("dropped")] * len(signal_rows))
+            return
+        try:
+            self._executor.submit(self._flush_pending, history, signal_rows)
+        except RuntimeError as exc:  # executor shut down (controller stopping)
+            with self._pending_lock:
+                self._pending -= 1
+            self._signal_log_writer.settle(signal_rows, [exc] * len(signal_rows))
+
+    def _flush_pending(self, history: list[tuple[str, list]], signal_rows: list) -> None:
+        try:
+            self._flush(history, signal_rows)
+        finally:
+            with self._pending_lock:
+                self._pending -= 1
+
+    def _flush(self, history: list[tuple[str, list]], signal_rows: list) -> None:
+        """One round trip: every model's history calls, then the signal-log entries."""
+        calls = [call for _model, model_calls in history for call in model_calls]
+        signal_calls = self._signal_log_writer.calls(signal_rows)
+        try:
+            replies = run_pipelined(self._redis, calls + signal_calls)
+            index = 0
+            for model, model_calls in history:
+                failed = [reply for reply in replies[index:index + len(model_calls)] if isinstance(reply, Exception)]
+                index += len(model_calls)
+                if failed:
+                    _LOGGER.warning("decision_hist_write_failed:%s: %s", model, failed[0])
+            self._signal_log_writer.settle(signal_rows, replies[index:])
+        except Exception:  # noqa: BLE001 - best-effort, never stops the writer
+            _LOGGER.exception("decision redis write failed")
+
+    def _history_calls(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> list[tuple[str, list]]:
         # S5.1: per-model decision time-series, scored by window_end_ms: one member per
         # planner call (one decision loop since 2026-10-28; a re-read of the same window
         # can still leave two members at one score -> readers dedup by window_end_ms).
         # Trimmed to ~24h + TTL.
         states = _model_states(result.model_contexts, getattr(result, "classifications", {}), snapshot)
+        out: list[tuple[str, list]] = []
         for model, state in states.items():
             score = state.get("window_end_ms") or snapshot.ts_ms
             member = json.dumps({"ts": snapshot.ts_ms, "model": model, **state}, sort_keys=True, separators=(",", ":"))
             key = decision_hist_key(model)
-            try:
-                self._redis.zadd(key, {member: float(score)})
-                self._redis.zremrangebyscore(key, "-inf", int(score) - DECISION_HIST_RETENTION_MS)
-                self._redis.expire(key, DECISION_HIST_TTL_SECONDS)
-            except Exception as exc:  # noqa: BLE001 - history is best-effort, never blocks decisions.
-                _LOGGER.warning("decision_hist_write_failed:%s: %s", model, exc)
+            out.append((model, [
+                ("zadd", (key, {member: float(score)}), {}),
+                ("zremrangebyscore", (key, "-inf", int(score) - DECISION_HIST_RETENTION_MS), {}),
+                ("expire", (key, DECISION_HIST_TTL_SECONDS), {}),
+            ]))
+        return out
 
 
 def _action_to_dict(action: object) -> dict[str, Any]:

@@ -169,3 +169,104 @@ def test_decision_snapshot_writer_logs_trs_calc_result(caplog) -> None:
     assert payload["loop"] == "rescue"
     assert payload["submitted"] == "1"
     assert json.loads(payload["actions"])[0]["model"] == "m1"
+
+
+class RecordingRedis:
+    """Every command in order; with ``pipelined`` the round trips too."""
+
+    def __init__(self, pipelined: bool, fail: set[str] = frozenset()) -> None:
+        self.commands: list[tuple] = []
+        self.round_trips = 0
+        self.fail = set(fail)
+        if pipelined:
+            self.pipeline = self._pipeline
+
+    def _do(self, name, *args, **kwargs):
+        self.commands.append((name, args, tuple(sorted(kwargs.items()))))
+        if name in self.fail:
+            raise RuntimeError(f"{name} failed")
+        return 1
+
+    def __getattr__(self, name):
+        if name in ("zadd", "zremrangebyscore", "expire", "xadd"):
+            return lambda *args, **kwargs: self._do(name, *args, **kwargs)
+        raise AttributeError(name)
+
+    def _pipeline(self, transaction=True):
+        assert transaction is False
+        redis, queued = self, []
+
+        class _Pipe:
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: queued.append((name, args, kwargs))
+
+            def execute(self, raise_on_error=True):
+                assert raise_on_error is False
+                redis.round_trips += 1
+                out = []
+                for name, args, kwargs in queued:
+                    try:
+                        out.append(redis._do(name, *args, **kwargs))
+                    except RuntimeError as exc:
+                        out.append(exc)
+                return out
+
+        return _Pipe()
+
+
+def _two_model_decision(ts_ms: int):
+    from tre_common.metrics_schema import ModelWindowMetrics
+
+    models = {
+        m: ModelWindowMetrics(model=m, window_start_ms=ts_ms - 20_000, window_end_ms=ts_ms, prompt_tokens=1.0,
+                              generation_tokens=2.0, avg_waiting=0.0, avg_running=1.0, avg_swapping=0.0,
+                              kv_cache_hit_rate=0.0, ttft_p95_ms=None, tpot_p95_ms=None, e2e_p95_ms=None,
+                              routable_pods=1, assigned_replicas=1, per_pod={})
+        for m in ("m1", "m2")
+    }
+    contexts = {m: {"z_m": 1.0, "trs": 10.0, "signal_source": "zm", "routable_pods": 1} for m in models}
+    return MetricsSnapshot(ts_ms=ts_ms, stale=False, models=models), LoopTickResult(submitted=0, model_contexts=contexts)
+
+
+def test_one_decision_is_one_round_trip_with_the_same_commands() -> None:
+    inline, pipelined = RecordingRedis(pipelined=False), RecordingRedis(pipelined=True)
+    for redis in (inline, pipelined):
+        writer = DecisionSnapshotWriter(redis)
+        for ts in (20_000, 21_000):
+            writer.write("rescue", *_two_model_decision(ts))
+    assert pipelined.round_trips == 2
+    assert pipelined.commands == inline.commands
+    assert [c[0] for c in pipelined.commands[:7]] == [
+        "zadd", "zremrangebyscore", "expire", "zadd", "zremrangebyscore", "expire", "xadd"]
+
+
+def test_with_an_executor_redis_is_written_off_the_caller_in_decision_order() -> None:
+    class QueueExecutor:
+        def __init__(self) -> None:
+            self.jobs: list = []
+
+        def submit(self, fn, *args):
+            self.jobs.append((fn, args))
+
+    redis, executor = RecordingRedis(pipelined=True), QueueExecutor()
+    writer = DecisionSnapshotWriter(redis, executor=executor)
+    writer.write("rescue", *_two_model_decision(20_000))
+    writer.write("rescue", *_two_model_decision(21_000))
+    assert redis.commands == [] and len(executor.jobs) == 2  # the caller never waited for redis
+    for fn, args in executor.jobs:
+        fn(*args)
+    reference = RecordingRedis(pipelined=True)
+    inline = DecisionSnapshotWriter(reference)
+    inline.write("rescue", *_two_model_decision(20_000))
+    inline.write("rescue", *_two_model_decision(21_000))
+    assert redis.commands == reference.commands
+
+
+def test_a_failed_signal_log_entry_is_written_again_by_the_next_decision_on_its_window() -> None:
+    redis = RecordingRedis(pipelined=True, fail={"xadd"})
+    writer = DecisionSnapshotWriter(redis)
+    writer.write("rescue", *_two_model_decision(20_000))
+    redis.fail.clear()
+    writer.write("rescue", *_two_model_decision(20_000))  # same windows: written now
+    writer.write("rescue", *_two_model_decision(20_000))  # already written: not again
+    assert sum(1 for c in redis.commands if c[0] == "xadd") == 4
