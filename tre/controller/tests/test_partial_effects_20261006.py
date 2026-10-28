@@ -37,16 +37,18 @@ def test_a_binding_power_call_refused_at_its_first_pod_changed_nothing():
     assert queue.view_changes() == {} and queue.last_actions() == {}
 
 
-def test_a_relay_partly_covered_by_restored_probe_pods_is_shrunk():
+def test_relay_pairs_covered_by_restored_probe_pods_are_dropped():
     from test_c1_deficit_scaleup_20261001 import _Preempting, _snapshot
+    from tre_common.gpu_placement import GpuBlock
     from tre_controller.loops.tick import _apply_safescale
-    from tre_controller.planning.planner import TransferIntent
+    from tre_controller.planning.planner import BlockSupplyAction
 
-    relay = TransferIntent("7b", "r", 3, "critical_donor_immediate", "rescue")
-    [shrunk], events = _apply_safescale(_snapshot(5_000), (relay,), {}, safescale=_Preempting(restored=1))
-    assert (shrunk.count, shrunk.pairs) == (2, 2)  # one receiver replica came back from the probe
-    assert "safescale_probe_preempted:r:restored=1:up_needed=2" in events
-    # A TP receiver taking two single-GPU donors per pair shrinks by whole pairs.
-    tp = TransferIntent("7b", "r", 4, "critical_donor_immediate", "rescue", pairs=2)
-    [half], _ = _apply_safescale(_snapshot(5_000), (tp,), {}, safescale=_Preempting(restored=1))
-    assert (half.count, half.pairs) == (2, 1)
+    # 2026-10-28 (sm-plans section 10): one named transfer per pair.
+    relays = tuple(
+        BlockSupplyAction(receiver="r", block=GpuBlock("n", (gpu,)), receiver_pods=(f"r-{gpu}",),
+                          sleeps=(("7b", f"7b-{gpu}"),), reason="critical_donor_immediate", source_loop="rescue")
+        for gpu in range(3)
+    )
+    kept, events = _apply_safescale(_snapshot(5_000), relays, {}, safescale=_Preempting(restored=1))
+    assert len(kept) == 2  # one receiver replica came back from the probe: one pair dropped
+    assert "block_supply_covered_by_preemption:r" in events

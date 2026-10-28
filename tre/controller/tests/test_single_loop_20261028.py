@@ -44,7 +44,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RescueBasis,
     ScaleAction,
-    TransferIntent,
     build_plan,
 )
 from tre_controller.loops.decision_task import run_rescue_tick
@@ -211,18 +210,6 @@ def test_a_decision_with_a_tp_block_is_one_sm_plan():
     [plan] = sm.plans
     assert [(i["model"], i.get("pods")) for i in plan["sleeps"]] == [("d", ["d-0"])]
     assert [(i["model"], i.get("pods")) for i in plan["wakes"]] == [("tp2", ["tp2-0"]), ("r", None)]
-
-
-def test_a_tp_block_is_never_split_across_plans():
-    sm = PlanSM({"d": 3, "tp2": 1, "r": 1})
-    queue = ActionQueue(sm, now_ms=lambda: 5_000)
-    # The relay uses d first: the block starts the next plan, whole.
-    queue.submit((TransferIntent("d", "r", 1, "critical_donor_immediate", "rescue"), _release()))
-    asyncio.run(queue.drain_once())
-
-    first, second = sm.plans
-    assert [i["model"] for i in first["wakes"]] == ["r"] and first["sleeps"] == []
-    assert [i["model"] for i in second["sleeps"]] == ["d"] and [i["model"] for i in second["wakes"]] == ["tp2"]
 
 
 def test_with_safescale_the_block_is_a_probe_and_its_commit_is_that_one_plan():

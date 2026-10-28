@@ -32,7 +32,8 @@ from tre_controller.loops.cluster_view_task import (
     state_time_lower_bound,
 )
 from tre_controller.loops.tick import _o1_view_pending, run_planner_tick
-from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
+from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, UnhideAction
+from relay_view import relays
 from tre_controller.planning.safescale import CAPACITY_ROLLBACK_CODES, ProbeWindowInputs, SafeScaleStateMachine
 from tre_controller.config import SafeScaleConfig
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
@@ -284,7 +285,7 @@ def _two_tick(state, queue, *, end, awake_a, fetched, load_a, load_b):
 
 def _probed(result) -> set[str]:
     """Donors the tick starts a probe on (their pods hidden); a relay never happens."""
-    assert not [action for action in result.actions if isinstance(action, TransferIntent)]
+    assert not relays(result.actions) and not [a for a in result.actions if getattr(a, "members", ())]
     return {action.model for action in result.actions if isinstance(action, HideAction)}
 
 

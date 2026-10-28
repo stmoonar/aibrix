@@ -10,10 +10,11 @@ from dataclasses import replace
 
 import pytest
 
+from relay_view import fleet_view, transfer_members
+
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.decision_task import run_rescue_tick
-from tre_controller.planning.planner import TransferIntent
 from tre_controller.planning.safescale import SafeScaleStateMachine
 
 from test_b8_observe_probes import _probe_snapshot
@@ -39,11 +40,13 @@ def test_only_the_receiverless_high_shrink_runs_as_a_probe():
     donor = _metrics_with_pods("donor", generation=200.0, waiting=0.0, running=1.0, pods=("donor-a", "donor-b"))
     snapshot = replace(snapshot, models={**snapshot.models, "donor": donor})
     queue = FakeQueue()
-    run_rescue_tick(snapshot, queue=queue, registry=_registry_with_models("critical", "donor"),
-                    safescale=machine, safescale_scope=SCOPE)
+    registry = _registry_with_models("critical", "donor")
+    run_rescue_tick(snapshot, queue=queue, registry=registry, safescale=machine, safescale_scope=SCOPE,
+                    cluster_view=fleet_view(registry, "donor", ("donor-a", "donor-b"), "critical"))
     assert machine.active_probe("donor") is None
-    assert queue.submitted == [
-        (TransferIntent("donor", "critical", 1, "critical_high_donor_safescale_nosafescale", "rescue"),)
+    [[transfer]] = queue.submitted
+    assert [(kind, model, path) for kind, model, _, path, _ in transfer_members(transfer)] == [
+        ("sleep", "donor", "urgent"), ("wake", "critical", None)
     ]
 
 

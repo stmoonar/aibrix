@@ -30,7 +30,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     SafeScaleCommitAction,
     ScaleAction,
-    TransferIntent,
     build_plan,
     probe_reserved_gpus,
 )

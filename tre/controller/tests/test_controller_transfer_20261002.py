@@ -1,16 +1,14 @@
 """Controller side of the SM relay primitive (2026-10-02, docs/design/
 20261002-controller-transfer.md).
 
-* planner: an immediate donor -> receiver relay is a TransferIntent (a count, no pod /
-  GPU); free capacity is used first; ``pairable_count`` bounds the intent; a donor
-  gives at most its SM ``floor_headroom``; the IDLE proactive shrink is a model-level
-  shrink (a plan sleep item ``at_most``);
-* ActionQueue: an intent is one plan wake item with ``donors`` (design 20261027-sm-plans;
-  ``POST /v2/transfers`` before) - the SM completes or fails it under its writer lock
-  before answering -, accounted by done / taken / unfilled (also when partial);
-  refusals, floor clamps and ``taken: 0`` are events only; ``writer_busy`` /
-  ``routable_unknown`` / a 404 count as not executed. The queue tests drive the old
-  per-endpoint fakes through tests/plan_shim.py;
+* planner: an immediate donor -> receiver relay is a named transfer (2026-10-28,
+  sm-plans section 10: the donor pod and the receiver binding on its GPU); free capacity
+  is used first; the pairable receiver bindings bound it; a donor gives at most its SM
+  ``floor_headroom``; the IDLE proactive shrink is a model-level shrink the tick names;
+* ActionQueue: a transfer is one plan group (named sleeps + the named wake) - the SM
+  completes or fails it under its writer lock before answering; ``writer_busy`` /
+  ``routable_unknown`` count as not executed; a count shrink is accounted by ``taken``.
+  The queue tests drive the old per-endpoint fakes through tests/plan_shim.py;
 * SM view: ``routable`` / ``floor_headroom`` straight from ``/v2/state`` with a
   fallback (and an event) when the SM does not report them.
 """
@@ -22,7 +20,9 @@ from dataclasses import replace
 
 from tre_common.metrics_schema import MetricsSnapshot
 from relay_view import relays
-from tre_controller.loops.action_queue import PlanBatch
+from tre_common.gpu_placement import GpuBlock
+from tre_controller.loops.action_queue import PlanBatch, transfer_plan
+from tre_controller.planning.planner import BlockSupplyAction
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.loops.decision_snapshot import build_decision_snapshot
 from tre_controller.loops.replay import TickReplayStep, run_tick_replay
@@ -33,7 +33,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RescuePlan,
     ScaleAction,
-    TransferIntent,
     _SlotOccupancy,
     build_plan,
 )
@@ -42,7 +41,7 @@ from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.state.store import StateStore
 
-from test_action_queue_review3 import ScriptedSM, _calls, _until, transfer_body
+from test_action_queue_review3 import ScriptedSM, _calls
 from test_o1_breakpoint_window_20261001 import _registry as _o1_registry
 from test_o1_breakpoint_window_20261001 import _snap, _window
 from test_planner_slot_occupancy import TOPOLOGY, _cls
@@ -175,99 +174,12 @@ def test_tp2_receiver_pairs_with_two_single_gpu_donors_and_skips_an_uncovered_gp
 # ===================================================================== ActionQueue
 
 
-def _intent(count=1, *, rescue=None, source_loop="rescue", reason="critical_donor_immediate"):
-    return TransferIntent("7b", "8b", count, reason, source_loop, rescue=rescue)
-
-
-def test_partial_transfer_is_accounted_by_done_and_taken_not_count():
-    rescue = RescuePlan(target=3, desired=3, base=1, covered=1)
-    body = transfer_body(2, statuses=["done", "receiver_wake_failed"], unfilled=0)
-    sm = ScriptedSM(results={"transfer:7b->8b": [{"ok": True, "response": body}]})
-    queue = ActionQueue(sm, now_ms=lambda: 5_000)
-    queue.submit((_intent(2, rescue=rescue),))
-    donor, receiver = asyncio.run(queue.drain_once())
-    assert (donor.model, donor.taken, donor.action_kind) == ("7b", 2, "transfer")
-    assert (receiver.model, receiver.ok, receiver.done) == ("8b", True, 1)
-    assert receiver.error == "partial: 1 of 2 pairs done"
-    record = queue.rescue_targets()["8b"]
-    assert (record.gained, record.failures, record.covered) == (1, 1, 2)
-    assert queue.last_actions() == {"7b": (5_000, "down"), "8b": (5_000, "up")}
-    # view_changes records BOTH sides of the relay (donor down, receiver up).
-    assert queue.view_changes() == {"7b": (5_000, "down"), "8b": (5_000, "up")}
-    assert queue.routable_changes() == {"7b": (5_000, -1), "8b": (5_000, 1)}
-    events = queue.drain_events()
-    assert "transfer_done:7b->8b:count=2:done=1:taken=2:unfilled=0:id=tr-1" in events
-    # A plan wake item reports the receivers it woke (the failed one is in ``unfilled`` /
-    # ``refusals``): only the done pair is an event.
-    assert [event for event in events if event.startswith("transfer_pair:")] == [
-        "transfer_pair:7b->8b:7b-0->8b-0@n/0:done"
-    ]
-    assert queue.stats()["transfer_partial_total"] == 1
-
-
-def test_unfilled_and_refusals_are_events_and_the_next_intent_is_accepted_at_once():
-    refusal = {"error": "gpu_busy", "reason": "resident_awake", "node": "n", "gpu_ids": [3], "scope": "gpu"}
-    body = transfer_body(1, unfilled=1, refusals=[refusal], skipped={"uncovered_gpu": 1})
-    sm = ScriptedSM(results={"transfer:7b->8b": [{"ok": True, "response": body}]})
-    queue = ActionQueue(sm)
-    queue.submit((_intent(2),))
-    asyncio.run(queue.drain_once())
-    events = queue.drain_events()
-    assert "wake_refused:8b:n/3:gpu_busy" in events
-    assert "transfer_unfilled:7b->8b:1:uncovered_gpu=1" in events
-    assert queue.submit((_intent(1),)).accepted == 1  # no cooldown of any kind
-
-
-def test_clamped_by_floor_is_an_event_only_and_changes_nothing():
-    body = transfer_body(0, clamped=True, unfilled=2, skipped={"donor_floor": 2})
-    sm = ScriptedSM(results={"transfer:7b->8b": [{"ok": True, "response": body}]})
-    queue = ActionQueue(sm)
-    queue.submit((_intent(2),))
-    donor, receiver = asyncio.run(queue.drain_once())
-    assert (donor.taken, receiver.done, receiver.ok) == (0, 0, False)
-    assert receiver.error == "clamped_by_floor: no donor replica taken"
-    assert queue.last_actions() == {} and queue.view_changes() == {} and queue.routable_changes() == {}
-    assert "transfer_clamped_by_floor:7b->8b:taken=0:count=2" in queue.drain_events()
-    assert queue.stats()["transfer_clamped_by_floor_total"] == 1
-    assert queue.submit((_intent(2),)).accepted == 1
-
-
-def test_a_relay_is_finished_when_its_call_returns():
-    """Plan B (SM global writer lock): the call returns with every pair done or failed;
-    the queue frees both models at once and never looks the transfer up again."""
-    body = transfer_body(2, statuses=["done", "receiver_wake_failed"])
-    sm = ScriptedSM(results={"transfer:7b->8b": [{"ok": True, "response": body}]}, gated={"transfer:7b->8b"})
-
-    async def scenario():
-        queue = ActionQueue(sm)
-        runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
-        queue.submit((_intent(2),))
-        assert await _until(lambda: _calls(sm) == [("7b->8b", "transfer", 2)])
-        assert queue.inflight_models() == {"7b", "8b"}  # held only while the call runs
-        sm.gates["transfer:7b->8b"].set()
-        assert await _until(lambda: queue.inflight_models() == set())
-        runner.cancel()
-        await asyncio.gather(runner, return_exceptions=True)
-        return queue
-
-    queue = asyncio.run(scenario())
-    assert _calls(sm) == [("7b->8b", "transfer", 2)]
-    assert queue.view_changes().keys() == {"7b", "8b"}
-
-
-def test_plans_404_is_not_executed_for_both_sides_of_a_relay():
-    class Transport:
-        async def request(self, method, url, *, json=None, timeout_s):
-            if method == "GET":
-                return {"models": {"8b": {"awake": 1, "bound": 4}}}
-            raise ServiceManagerError("HTTP 404: Not Found", status=404, body={"detail": "Not Found"})
-
-    queue = ActionQueue(ServiceManagerClient("http://sm", transport=Transport()))
-    queue.submit((_intent(1),))
-    donor, receiver = asyncio.run(queue.drain_once())
-    assert (donor.ok, receiver.ok) == (False, False) and donor.not_executed and receiver.not_executed
-    assert queue.view_changes() == {} and queue.last_actions() == {} and queue.inflight_models() == set()
-    assert queue.drain_events() == ["transfer_failed:7b->8b:refused:HTTP 404: Not Found"]
+def _intent(*, reason="critical_donor_immediate"):
+    """A named relay pair 7b-1 -> 8b-1 as the tick sends it (one plan group)."""
+    return transfer_plan(BlockSupplyAction(
+        receiver="8b", block=GpuBlock("n", (1,)), receiver_pods=("8b-1",), sleeps=(("7b", "7b-1"),),
+        reason=reason, source_loop="rescue",
+    ))
 
 
 def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
@@ -283,13 +195,13 @@ def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
     # A 409 without an error code is not known to have changed nothing (outcome unknown).
     assert not ServiceManagerError("HTTP 409", status=409, body={"detail": "a wake of it is in progress; retry"}).not_executed
     sm = ScriptedSM(results={
-        "transfer:7b->8b": [dict(routable_unknown, retriable=False), dict(writer_busy, retriable=False)],
+        "7b-1": [dict(routable_unknown, retriable=False), dict(writer_busy, retriable=False)],
         "scale:8b": [writer_busy],
         "scale:7b": [routable_unknown],
     })
     sm.awake_counts = {"7b": 4}
     queue = ActionQueue(sm)
-    queue.submit((_intent(1),))
+    queue.submit((_intent(),))
     queue.submit((ScaleAction("9b", 1, "critical_idle_capacity", "rescue"),))
     asyncio.run(queue.drain_once())
     queue.submit((ScaleAction("8b", 1, "critical_idle_capacity", "rescue"),))
@@ -298,7 +210,7 @@ def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
     assert all(result.not_executed for result in results)
     # Nothing was executed: only the unrelated 9b scale-up is stamped; nothing cools down.
     assert set(queue.view_changes()) == {"9b"} and set(queue.last_actions()) == {"9b"}
-    assert queue.submit((_intent(1),)).accepted == 1
+    assert queue.submit((_intent(),)).accepted == 1
     results = asyncio.run(queue.drain_once())  # the relay again: writer_busy this time
     assert all(result.not_executed for result in results) and set(queue.view_changes()) == {"9b"}
 
@@ -328,10 +240,10 @@ def test_target_scale_down_is_accounted_by_taken():
     assert fresh.drain_events() == ["scale_clamped_by_floor:7b:taken=0:asked=2"]
 
 
-def test_observe_mode_skips_an_intent_before_its_single_call():
+def test_observe_mode_skips_a_transfer_before_its_single_call():
     sm = ScriptedSM()
     queue = ActionQueue(sm, is_observe=lambda: True)
-    queue.submit((_intent(1),))
+    queue.submit((_intent(),))
     results = asyncio.run(queue.drain_once())
     assert _calls(sm) == [] and [(r.model, r.error) for r in results] == [("7b", "observe_skipped"), ("8b", "observe_skipped")]
 

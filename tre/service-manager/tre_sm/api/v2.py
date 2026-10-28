@@ -7207,7 +7207,8 @@ class TargetRequest(BaseModel):
 
 
 class PlanDonor(BaseModel):
-    """Relay allowance of a wake item (as ``TransferIntent.count``)."""
+    """Relay allowance of a wake item (a count relay: the SM picks the pairs; used by the
+    release smoke script, not by the controller since 2026-10-28)."""
 
     model: str
     max: int = Field(ge=1)

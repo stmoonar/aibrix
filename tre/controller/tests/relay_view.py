@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tre_controller.planning.planner import BlockSupplyAction, ScaleAction, TransferIntent
+from tre_controller.planning.planner import BlockSupplyAction, ClusterView, ScaleAction
+from tre_sm.allocator.slots import Binding, Slot
 
 
 @dataclass(frozen=True)
@@ -38,11 +39,7 @@ def is_relay(action) -> bool:
 def relays(actions) -> list[Relay]:
     out: dict[tuple, Relay] = {}
     for action in actions:
-        if isinstance(action, TransferIntent):
-            key = (action.donor_model, action.receiver_model, action.reason, len(out))
-            out[key] = Relay(action.donor_model, action.receiver_model, int(action.count), int(action.pairs),
-                             action.reason, action.source_loop, sleep_path=action.sleep_path, rescue=action.rescue)
-        elif is_relay(action):
+        if is_relay(action):
             donor = action.donor_models[0]
             key = (donor, action.receiver, action.reason)
             pods = tuple(pod for _, pod in action.sleeps)
@@ -57,7 +54,7 @@ def relays(actions) -> list[Relay]:
 
 def expand_relays(actions) -> list:
     out: list = []
-    pending = {id(action) for action in actions if isinstance(action, TransferIntent) or is_relay(action)}
+    pending = {id(action) for action in actions if is_relay(action)}
     for action in actions:
         if id(action) not in pending:
             # A tick's plan batch (a transfer group, sm-plans section 10): its members.
@@ -99,3 +96,42 @@ def block_takes(actions) -> list[tuple[str, str, str]]:
         if isinstance(action, BlockSupplyAction) and not is_relay(action)
         for donor, pod in (*action.sleeps, *((action.probe,) if action.probe else ()))
     ]
+
+
+def fleet_view(registry, donor: str, pods, receiver: str) -> ClusterView:
+    """A fleet view for a relay: ``donor``'s ``pods`` awake on GPUs 0.., ``receiver``
+    sleeping under each (the controller names the pair from it, sm-plans section 10)."""
+    node = registry.topology().nodes[0].name
+    bindings = []
+    for gpu, pod in enumerate(pods):
+        bindings.append(Binding(pod, donor, Slot(node, (gpu,)), awake=True))
+        bindings.append(Binding(f"{receiver}-{gpu}", receiver, Slot(node, (gpu,)), awake=False))
+    return ClusterView(registry.topology(), tuple(bindings))
+
+
+def transfer_members(batch) -> list[tuple]:
+    """(kind, model, pods, sleep_path, reason) of a transfer plan group's members."""
+    return [
+        ("sleep" if member.delta < 0 else "wake", member.model, member.pods, member.sleep_path, member.reason)
+        for member in batch.members
+    ]
+
+
+def pool_view(replicas: dict[str, int], receivers=()) -> ClusterView:
+    """A fleet view for a view-less planner scenario (2026-10-28: a relay names its pods,
+    so it needs one): each model's ``replicas`` awake on their own GPUs of one node, and
+    a sleeping binding of every receiver under every other model's pod."""
+    from tre_common.registry import ClusterTopology, NodeSpec
+
+    total = sum(replicas.values())
+    topology = ClusterTopology(nodes=(NodeSpec(name="n", gpus=total,
+                                               two_gpu_slots=tuple((g, g + 1) for g in range(0, total - 1, 2))),))
+    bindings, gpu = [], 0
+    for model, count in replicas.items():
+        for index in range(count):
+            bindings.append(Binding(f"{model}-{index}", model, Slot("n", (gpu,)), awake=True))
+            for receiver in receivers:
+                if receiver != model:
+                    bindings.append(Binding(f"{receiver}@{gpu}", receiver, Slot("n", (gpu,)), awake=False))
+            gpu += 1
+    return ClusterView(topology, tuple(bindings))

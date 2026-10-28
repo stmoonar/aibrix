@@ -5,7 +5,7 @@ from tre_common.registry import ClusterTopology, NodeSpec
 from tre_common.gpu_placement import GpuBlock
 from tre_controller.planning.planner import BlockSupplyAction, ClusterView, DefragAction, PlanConfig, ScaleAction, build_plan
 from tre_sm.allocator.slots import Binding, Migration, Slot
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import expand_relays, relays, pool_view# noqa: F401 - 2026-10-02 relay intents
 
 
 def _classification(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None) -> ModelClassification:
@@ -68,6 +68,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False,
         ),
+        cluster_view=pool_view(replicas, receivers=("critical",)),
     )
 
     scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
@@ -99,6 +100,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
         ),
+        cluster_view=pool_view(replicas, receivers=("critical",)),
     )
     assert _deltas([a for a in expand_relays(guarded.actions) if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
     assert guarded.delayed_down_models == set()
@@ -182,6 +184,7 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
         ),
+        cluster_view=pool_view(replicas, receivers=("critical", "low")),
     )
 
     scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
@@ -711,8 +714,10 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
     # One step per plan: the scenario needs the HIGH donor left for its probe.
     cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
 
+    view = pool_view(replicas, receivers=("critical",))
     free = build_plan(
-        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg
+        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg,
+        cluster_view=view,
     )
     held = build_plan(
         model_contexts=contexts,
@@ -721,6 +726,7 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
         idle_gpus=0,
         cfg=cfg,
         probe_backoff_models={"hot"},
+        cluster_view=view,
     )
 
     def reasons(plan):

@@ -18,7 +18,7 @@ import tre_controller.app as app
 from tre_common.metrics_schema import MetricsSnapshot
 import pytest
 
-from relay_view import relays
+from relay_view import relays, fleet_view, transfer_members
 from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.decision_task import run_rescue_tick
@@ -29,7 +29,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RelayHold,
     ScaleAction,
-    TransferIntent,
     UnhideAction,
     build_plan,
     relay_basis,
@@ -61,13 +60,17 @@ def test_high_donor_for_a_critical_receiver_is_an_urgent_transfer():
     snapshot = replace(snapshot, models={**snapshot.models, "donor": high})
     queue = FakeQueue()
 
-    result = run_rescue_tick(snapshot, queue=queue, registry=_registry_with_models("critical", "donor"))
+    registry = _registry_with_models("critical", "donor")
+    result = run_rescue_tick(snapshot, queue=queue, registry=registry,
+                             cluster_view=fleet_view(registry, "donor", ("donor-a", "donor-b"), "critical"))
 
     assert result.classifications["donor"].state.value == "high"
-    assert queue.submitted == [
-        (TransferIntent("donor", "critical", 1, "critical_high_donor_safescale_nosafescale", "rescue"),)
-    ]
-    assert queue.submitted[0][0].sleep_path == "urgent"
+    [[transfer]] = queue.submitted
+    reason = "critical_high_donor_safescale_nosafescale"
+    sleep, wake = transfer_members(transfer)
+    gpu = {"donor-a": "0", "donor-b": "1"}[sleep[2][0]]
+    assert sleep[:2] + sleep[3:] == ("sleep", "donor", "urgent", reason)
+    assert wake == ("wake", "critical", (f"critical-{gpu}",), None, reason)  # the binding under it
 
 
 def test_high_proactive_shrink_is_an_urgent_model_level_scale_down():

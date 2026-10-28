@@ -15,7 +15,7 @@ from tre_common.rediskeys import (
 from tre_controller.loops.action_queue import _members
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.loops.signal_log import SignalLogWriter
-from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, TransferIntent, UnhideAction
+from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
 
 
 _LOGGER = logging.getLogger("tre_controller.decision")
@@ -97,33 +97,15 @@ def _action_to_dict(action: object) -> dict[str, Any]:
         }
         if action.pods:
             payload["pods"] = list(action.pods)
+        if action.group:
+            # sm-plans section 10: the transfer (plan group) this item belongs to.
+            payload["group"] = action.group
         rescue = getattr(action, "rescue", None)
         if rescue is not None:
             # C1: the absolute rescue target this scale-up belongs to.
             payload["rescue"] = {
                 "target": rescue.target, "desired": rescue.desired,
                 "base": rescue.base, "covered": rescue.covered,
-            }
-        return payload
-    if isinstance(action, TransferIntent):
-        # 2026-10-02: a relay is a count; the pods / GPUs the service-manager picked
-        # reach the decision stream as queue events of a later tick
-        # (transfer_pair:<donor>-><receiver>:<donor pods>-><receiver pod>@<node/gpus>:<status>).
-        payload = {
-            "kind": "transfer",
-            "model": action.receiver_model,
-            "donor": action.donor_model,
-            "receiver": action.receiver_model,
-            "count": action.count,
-            "pairs": action.pairs,
-            "reason": action.reason,
-            "source_loop": action.source_loop,
-            "sleep_path": action.sleep_path,
-        }
-        if action.rescue is not None:
-            payload["rescue"] = {
-                "target": action.rescue.target, "desired": action.rescue.desired,
-                "base": action.rescue.base, "covered": action.rescue.covered,
             }
         return payload
     if isinstance(action, HideAction):

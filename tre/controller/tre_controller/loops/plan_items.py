@@ -10,7 +10,6 @@ action becomes exactly ONE item (strict 1:1, no same-model merging):
 * ``ScaleAction -k`` with pods  -> sleep ``pods`` (a transfer's donor pods, a SafeScale
   commit donor, a named shrink)
 * ``ScaleAction -k``            -> sleep ``at_most = max(serving floor, awake - k)``
-* ``TransferIntent D->R``       -> wake of R ``at_least = awake_R + pairs``, ``donors=[{D, count}]``
 * ``ReceiverTarget``            -> wake ``pods`` = its bindings on the donor pods' GPUs;
   without any, ``at_least = target`` (resolved once, then frozen)
 
@@ -25,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from tre_controller.planning.planner import ReceiverTarget, ScaleAction, TransferIntent
+from tre_controller.planning.planner import ReceiverTarget, ScaleAction
 
 #: Item statuses of a plan response that changed nothing or did what was asked.
 SLEEP_OK_STATUSES = frozenset({"done", "noop", "clamped"})
@@ -75,13 +74,6 @@ def plan_item(action) -> tuple[str, dict] | None:
             item["_delta"] = max(0, int(action.delta))
             item["_cap"] = action.cap
         return "wake", item
-    if isinstance(action, TransferIntent):
-        return "wake", {
-            "model": action.receiver_model,
-            "reason": str(action.reason),
-            "_delta": int(action.pairs),
-            "donors": [{"model": action.donor_model, "max": int(action.count), "sleep_path": action.sleep_path}],
-        }
     if not isinstance(action, ScaleAction):
         raise TypeError(f"not a power action: {type(action).__name__}")
     delta = int(action.delta)
@@ -247,46 +239,3 @@ def num(item: Mapping[str, Any], key: str) -> int:
         return max(0, int(item.get(key) or 0))
     except (TypeError, ValueError):
         return 0
-
-
-def transfer_summary(item: Mapping[str, Any], plan_id: Any) -> dict:
-    """The accounting view of a relay's wake item (the summary ``POST /v2/transfers``
-    used to give): ``done`` = receivers woken, ``taken`` = donor replicas slept, one
-    pair per woken receiver with the donor bindings it took."""
-    woke = woke_entries(item)
-    donors_slept = [entry for entry in item.get("donors_slept") or () if isinstance(entry, dict)]
-    taken = sum(1 for entry in donors_slept if entry.get("status") in (None, "slept", "done"))
-    pairs = []
-    for entry in woke:
-        donors = entry.get("donor_binding_ids") or ()
-        pairs.append({
-            "donors": [str(donor) for donor in donors],
-            "receiver": str(entry.get("serve_id") or ""),
-            "node": str(entry.get("node") or ""),
-            "gpu_ids": list(entry.get("gpu_ids") or ()),
-            "status": "done",
-            "source": str(entry.get("source") or ""),
-        })
-    skipped = item.get("skipped") if isinstance(item.get("skipped"), dict) else {}
-    status = str(item.get("status") or "")
-    refusals = [entry for entry in item.get("refusals") or () if isinstance(entry, dict)]
-    # A refused item (nothing woke, no donor taken) stays outcome "partial", as a 409
-    # ``partial`` of /v2/transfers did: the relay hold reads clamped / skipped / refusal
-    # codes, the stamps skip both sides (no pair, nothing taken).
-    summary = {
-        "transfer_id": plan_id,
-        "outcome": "ok" if woke else "partial",
-        "done": len(woke),
-        "taken": taken,
-        "unfilled": num(item, "unfilled"),
-        "clamped_by_floor": bool(item.get("clamped_by_floor")),
-        "pairs": pairs,
-        "refusals": len(refusals),
-        "refusal_codes": [[str(entry.get("error") or ""), str(entry.get("reason") or "")] for entry in refusals],
-        "skipped": {str(key): value for key, value in skipped.items()},
-        "picked": [entry.get("serve_id") for entry in woke],
-        "item_status": status,
-    }
-    if status == "failed":
-        summary["wake_failed"] = True
-    return summary

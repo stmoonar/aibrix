@@ -6,7 +6,7 @@ from typing import Any
 
 from tre_common import rediskeys
 from tre_common.metrics_schema import MetricsSnapshot
-from tre_controller.planning.planner import ScaleAction, TransferIntent
+from tre_controller.planning.planner import ScaleAction
 
 SIGNAL_LOG_FIELDS = (
     "ts",
@@ -113,13 +113,6 @@ def _summarize_actions(actions: tuple[Any, ...]) -> tuple[dict[str, str], dict[s
     # A plan batch (a transfer group, fused actions): each member is one action.
     actions = tuple(member for action in actions for member in getattr(action, "members", (action,)))
     for action in actions:
-        if isinstance(action, TransferIntent):
-            # 2026-10-02: a relay is one intent; logged per side as the planned delta.
-            label = f"transfer:{action.donor_model}->{action.receiver_model}"
-            for model, delta in ((action.donor_model, -int(action.count)), (action.receiver_model, int(action.pairs))):
-                delta_by_model[model] = delta_by_model.get(model, 0) + delta
-                action_by_model[model] = label
-            continue
         if not isinstance(action, ScaleAction):
             continue
         delta_by_model[action.model] = delta_by_model.get(action.model, 0) + int(

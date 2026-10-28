@@ -2,8 +2,8 @@
 GPU, dsllama-8b CRITICAL with sleeping bindings only on those GPUs. The planner used to
 emit a critical_sleeping_capacity wake every tick that the SM rejected (WakeConflict).
 
-2026-10-02: the relay is a TransferIntent (count); ``pairable_count`` bounds it to the
-pairs the SM can form (see also test_controller_transfer_20261002)."""
+2026-10-28: the relay is a named transfer per pair (sm-plans section 10); the pairable
+receiver bindings bound it (see also test_controller_transfer_20261002)."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,6 @@ from tre_controller.planning.planner import (
     ClusterView,
     PlanConfig,
     ScaleAction,
-    TransferIntent,
     _plan_sleeping_wakes,
     _SlotOccupancy,
     build_plan,
