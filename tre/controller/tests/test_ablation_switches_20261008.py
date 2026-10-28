@@ -18,6 +18,7 @@ import tre_controller.app as app
 from tre_common.metrics_schema import MetricsSnapshot
 import pytest
 
+from relay_view import relays
 from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.decision_task import run_rescue_tick
@@ -121,16 +122,18 @@ def _two_donor_plan(relay_holds=None):
 
 def test_a_held_pair_is_not_planned_and_the_receiver_uses_the_next_donor():
     plan, view = _two_donor_plan()
-    [first] = [a for a in plan.actions if isinstance(a, TransferIntent)]
-    assert first.receiver == "r" and first.reason == "critical_high_donor_safescale_nosafescale"
+    [first] = relays(plan.actions)
+    assert first.receiver_model == "r" and first.reason == "critical_high_donor_safescale_nosafescale"
     assert not any(isinstance(a, ScaleAction) and a.requires_safescale for a in plan.actions)
-    held = {(first.donor, "r"): RelayHold(basis=relay_basis(view, first.donor, "r"), reason="refused")}
+    donor = first.donor_model
+    held = {(donor, "r"): RelayHold(basis=relay_basis(view, donor, "r"), reason="refused")}
 
     again, _ = _two_donor_plan(held)
 
-    relays = [a for a in again.actions if isinstance(a, TransferIntent)]
-    assert [(a.donor, a.receiver) for a in relays] == [({"h1": "h2", "h2": "h1"}[first.donor], "r")]
-    assert f"relay_held:{first.donor}:r:refused" in again.events
+    assert [(a.donor_model, a.receiver_model) for a in relays(again.actions)] == [
+        ({"h1": "h2", "h2": "h1"}[donor], "r")
+    ]
+    assert f"relay_held:{donor}:r:refused" in again.events
 
 
 class _AcceptingQueue:

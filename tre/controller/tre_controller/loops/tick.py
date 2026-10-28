@@ -13,7 +13,7 @@ from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
 from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
-from tre_controller.loops.action_queue import PlanBatch, receiver_upscales
+from tre_controller.loops.action_queue import PlanBatch, block_sleeps, receiver_upscales, transfer_plan
 from tre_controller.planning.classify import (
     ModelRole,
     ModelState,
@@ -328,6 +328,9 @@ def run_planner_tick(
     if callable(record_covered):
         for model, rescue in covered_targets.items():
             record_covered(model, rescue)
+    # sm-plans section 10: the controller names every pod it sleeps.
+    actions, naming_events = _name_shrink_pods(snapshot, actions, cluster_view)
+    safescale_events = tuple(safescale_events) + naming_events
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -975,7 +978,7 @@ def _apply_safescale(
         if isinstance(action, BlockSupplyAction):
             # L4 rev 2: the block's IDLE pods sleep now (their GPUs stay reserved for
             # the receiver while the probe runs, ``probe_reserved_gpus``).
-            converted.extend(_block_sleeps(action, action.reason))
+            converted.extend(block_sleeps(action, action.reason))
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
     if covered_targets is not None:
         for model, rescue in rescue_of.items():
@@ -994,17 +997,6 @@ def _rescue_of(action: Action) -> object | None:
     return None
 
 
-def _block_sleeps(action: BlockSupplyAction, reason: str) -> tuple[ScaleAction, ...]:
-    """The urgent sleeps of exactly the block's immediate donor pods."""
-    return tuple(
-        ScaleAction(
-            donor, -1, reason, action.source_loop, donor=donor, pods=(pod,),
-            sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-        )
-        for donor, pod in action.sleeps
-    )
-
-
 def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     """Without SafeScale the probe shrinks the planner still emits take the immediate
     donor path (sleep path ``urgent``, reason suffix ``_nosafescale``); a middle-zone /
@@ -1013,11 +1005,12 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
 
     * a receiver-less shrink (HIGH proactive) -> a model-level urgent scale-down (the
       SM keeps the replica floor);
-    * a TP block (:class:`BlockSupplyAction`) -> ONE plan (:class:`PlanBatch`, design
-      20261028-single-loop L4 rev 2): the urgent sleeps of exactly the block's donor
-      pods (its probe pod too) and the receiver's wake, its binding on the block as the
-      hint (it keeps its rescue target). The SM wakes the receiver once the donors
-      slept; no other receiver can take the block between."""
+    * a transfer (:class:`BlockSupplyAction`: a TP block, a TP1 relay pair) -> ONE
+      plan group (:class:`PlanBatch`, design 20261028-single-loop L4 rev 2,
+      20261027-sm-plans section 10): the urgent sleeps of exactly the donor pods (its
+      probe pod too) and the receiver's NAMED wake of its binding on the block (it keeps
+      its rescue target). The SM selects the group atomically and wakes the receiver
+      once every donor slept; no other receiver can take the block between."""
     out: list[Action] = []
     for action in actions:
         if not _requires_safescale_probe(action):
@@ -1029,13 +1022,7 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
                 reason = action.reason  # the planner named it (IDLE: no suffix)
             else:
                 action = replace(action, sleeps=(*action.sleeps, action.probe), probe=None)
-            out.append(PlanBatch((
-                *_block_sleeps(action, reason),
-                ScaleAction(
-                    action.receiver, 1, reason, action.source_loop, receiver=action.receiver,
-                    pods=action.receiver_pods, hint=bool(action.receiver_pods), rescue=action.rescue,
-                ),
-            )))
+            out.append(transfer_plan(action, reason))
         else:
             out.append(replace(
                 action, reason=reason, requires_safescale=False, sleep_path=IMMEDIATE_DONOR_SLEEP_PATH
@@ -1133,6 +1120,41 @@ def _safescale_pending_upscales(
     if isinstance(action, BlockSupplyAction):
         return {action.receiver: 1}
     return probe_upscale_plans.get(action.model, {})
+
+
+def _name_shrink_pods(
+    snapshot: MetricsSnapshot, actions: tuple[Action, ...], cluster_view: ClusterView | None
+) -> tuple[tuple[Action, ...], tuple[str, ...]]:
+    """sm-plans section 10 (2026-10-28): one decider per choice - the controller names
+    every pod it sleeps, the SM validates and executes. An immediate model-level shrink
+    the planner left unnamed (IDLE proactive, a receiver-less shrink released without
+    SafeScale) names its pods here by the shared release order (:func:`_pods_to_probe`,
+    the SM's ``shrink_order``), skipping pods another action of this tick names. Fewer
+    pods than asked: the shrink is that many; none: it is dropped
+    (``shrink_unnamed:<model>``). SafeScale probes are named when they hide."""
+    named = {
+        pod
+        for action in actions
+        for member in (action.members if isinstance(action, PlanBatch) else (action,))
+        for pod in (getattr(member, "pods", ()) or ())
+    }
+    out: list[Action] = []
+    events: list[str] = []
+    for action in actions:
+        if not (
+            isinstance(action, ScaleAction) and action.delta < 0 and not action.pods
+            and not action.requires_safescale
+        ):
+            out.append(action)
+            continue
+        candidates = _pods_to_probe(snapshot, action.model, 10**6, cluster_view=cluster_view)
+        pods = tuple(pod for pod in candidates if pod not in named)[: abs(action.delta)]
+        if not pods:
+            events.append(f"shrink_unnamed:{action.model}")
+            continue
+        named |= set(pods)
+        out.append(replace(action, delta=-len(pods), pods=pods))
+    return tuple(out), tuple(events)
 
 
 def _pods_to_probe(

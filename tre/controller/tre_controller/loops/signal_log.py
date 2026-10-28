@@ -110,6 +110,8 @@ class SignalLogWriter:
 def _summarize_actions(actions: tuple[Any, ...]) -> tuple[dict[str, str], dict[str, int]]:
     action_by_model: dict[str, str] = {}
     delta_by_model: dict[str, int] = {}
+    # A plan batch (a transfer group, fused actions): each member is one action.
+    actions = tuple(member for action in actions for member in getattr(action, "members", (action,)))
     for action in actions:
         if isinstance(action, TransferIntent):
             # 2026-10-02: a relay is one intent; logged per side as the planned delta.

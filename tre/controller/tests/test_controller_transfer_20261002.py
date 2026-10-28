@@ -21,6 +21,8 @@ import json
 from dataclasses import replace
 
 from tre_common.metrics_schema import MetricsSnapshot
+from relay_view import relays
+from tre_controller.loops.action_queue import PlanBatch
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.loops.decision_snapshot import build_decision_snapshot
 from tre_controller.loops.replay import TickReplayStep, run_tick_replay
@@ -87,19 +89,23 @@ def _plan(bindings, *, receiver_state=ModelState.CRITICAL, donor_state=ModelStat
     )
 
 
-def _intents(plan) -> list[TransferIntent]:
-    return [a for a in plan.actions if isinstance(a, TransferIntent)]
+def _intents(plan):
+    """The plan's relays (named transfers, summed per donor / receiver)."""
+    return relays(plan.actions)
 
 
 # ===================================================================== planner
 
 
-def test_crit_on_full_gpus_yields_a_transfer_intent_without_pods():
+def test_crit_on_full_gpus_yields_one_named_transfer():
+    # 2026-10-28 (sm-plans section 10): the controller names the donor pod and the
+    # receiver binding sleeping on its GPU.
     plan = _plan(_e1())
     [intent] = _intents(plan)
     assert (intent.donor_model, intent.receiver_model, intent.count, intent.pairs) == (D, R, 1, 1)
-    assert (intent.reason, intent.source_loop, intent.sleep_path) == ("critical_donor_immediate", "rescue", "urgent")
-    assert not any(isinstance(a, ScaleAction) and a.pods for a in plan.actions)
+    assert (intent.reason, intent.source_loop) == ("critical_donor_immediate", "rescue")
+    [donor_pod], [receiver_pod] = intent.donor_pods, intent.receiver_pods
+    assert donor_pod.replace("7b", "8b") == receiver_pod
     assert intent.rescue is not None and intent.rescue.target == intent.rescue.covered + 1
 
 
@@ -107,13 +113,14 @@ def test_a_free_gpu_is_used_before_a_relay_capacity_order_unchanged():
     # need 2: the free GPU node10/3 (R sleeps there) first, then one relay.
     plan = _plan(_e1(free={("node10", 3)}), need=2)
     kinds = [(type(a).__name__, getattr(a, "reason", None)) for a in plan.actions]
-    assert kinds == [("ScaleAction", "critical_sleeping_capacity"), ("TransferIntent", "critical_donor_immediate")]
-    wake, intent = plan.actions
+    assert kinds == [("ScaleAction", "critical_sleeping_capacity"), ("BlockSupplyAction", "critical_donor_immediate")]
+    wake, _ = plan.actions
     assert (wake.model, wake.delta, wake.pods) == (R, 1, ("8b-7",))
-    assert (intent.count, intent.pairs) == (1, 1)
+    [relay] = relays(plan.actions)
+    assert (relay.count, relay.pairs) == (1, 1)
 
 
-def test_pairable_count_bounds_the_intent_size():
+def test_pairable_receivers_bound_the_relay_size():
     # need 3, donor surplus 7, but R sleeps only under two 7b replicas.
     only_two = {gpu for gpu in GPUS if gpu not in {("node9", 0), ("node9", 1)}}
     plan = _plan(_e1(no_receiver=only_two), need=3)
@@ -157,8 +164,11 @@ def test_tp2_receiver_pairs_with_two_single_gpu_donors_and_skips_an_uncovered_gp
         Binding("r2-b", R, Slot("node9", (2, 3)), awake=False),  # node9/3 has no donor: uncovered
     )
     occupancy = _SlotOccupancy(ClusterView(TOPOLOGY, bindings))
-    assert occupancy.pairable_count(D, R, max_pairs=1, max_donors=1) == (0, 0)  # one pair needs two donors
-    assert occupancy.pairable_count(D, R, max_pairs=5, max_donors=5) == (1, 2)  # r2-b is not a relay
+    none = occupancy.pairable(D, R, max_pairs=1, max_donors=1)  # one pair needs two donors
+    assert (none.pairs, none.donors) == (0, 0)
+    estimate = occupancy.pairable(D, R, max_pairs=5, max_donors=5)  # r2-b is not a relay
+    assert (estimate.pairs, estimate.donors) == (1, 2)
+    assert [(binding.serve_id, pods) for binding, pods in estimate.named] == [("r2-a", ("d-0", "d-1"))]
     assert occupancy.released_donor_ids() == {"d-0", "d-1"}
 
 
@@ -373,7 +383,7 @@ def test_tick_contexts_take_routable_and_headroom_from_the_sm():
 # ===================================================================== offline replay
 
 
-def test_offline_replay_plans_an_intent_and_the_fake_sm_names_the_pods():
+def test_offline_replay_plans_a_named_transfer_the_sm_executes():
     from test_scaling_e2e import CRITICAL, IDLE_LOAD, REG_7B_8B, _registry, _window as _e2e_window
 
     registry = _registry(*REG_7B_8B)
@@ -390,26 +400,37 @@ def test_offline_replay_plans_an_intent_and_the_fake_sm_names_the_pods():
         [TickReplayStep(snapshot, rescue_due=True, fairness_due=False, cluster_view=view)],
         registry=registry, suppress_hot_proactive_probe=True,
     )
-    [intent] = [a for a in replay.actions if isinstance(a, TransferIntent)]
+    [transfer] = [a for a in replay.actions if isinstance(a, PlanBatch)]
+    sleep, wake = transfer.members
+    assert (sleep.model, sleep.delta, wake.model, wake.delta) == (D, -1, R, 1)
+    assert sleep.group == wake.group is not None
+    donor_pod, receiver_pod = sleep.pods[0], wake.pods[0]
+    assert donor_pod.replace("7b", "8b") == receiver_pod  # on the same GPU
     decision = build_decision_snapshot("rescue", snapshot, replay.results[0])
-    [payload] = [a for a in json.loads(decision["actions"]) if a["kind"] == "transfer"]
-    assert (payload["donor"], payload["receiver"], payload["count"]) == (D, R, intent.count)
-    assert "pods" not in payload
+    payloads = [a for a in json.loads(decision["actions"]) if a["kind"] == "scale"]
+    assert [(a["model"], a["delta"], a.get("pods")) for a in payloads] == [
+        (D, -1, [donor_pod]), (R, 1, [receiver_pod])
+    ]
 
     queue = ActionQueue(PlanShim(InProcessServiceManager(service), state=service.get_state))
-    queue.submit((intent,))
+    queue.submit((transfer,))
     results = asyncio.run(queue.drain_once())
     assert all(result.ok for result in results)
-    pairs = [event for event in queue.drain_events() if event.startswith("transfer_pair:")]
-    assert len(pairs) == intent.count and all(event.endswith(":done") for event in pairs)
-    # pod names come from the SM response: 7b-<i> -> 8b-<i> on the same GPU
-    donor_pod, receiver_pod = pairs[0].split(":")[2].split("@")[0].split("->")
-    assert donor_pod.replace("7b", "8b") == receiver_pod
+    awake = {b.serve_id for b in store.load().bindings if b.awake}
+    assert receiver_pod in awake and donor_pod not in awake
 
 
 def test_signal_log_records_both_sides_of_a_relay():
     from tre_controller.loops.signal_log import _summarize_actions
 
-    labels, deltas = _summarize_actions((TransferIntent("7b", "8b", 2, "critical_donor_immediate", "rescue", pairs=1),))
+    from tre_common.gpu_placement import GpuBlock
+    from tre_controller.loops.action_queue import transfer_plan
+    from tre_controller.planning.planner import BlockSupplyAction
+
+    transfer = BlockSupplyAction(
+        receiver="8b", block=GpuBlock("n", (0,)), receiver_pods=("8b-0",), sleeps=(("7b", "7b-0"),),
+        reason="critical_donor_immediate", source_loop="rescue",
+    )
+    labels, deltas = _summarize_actions((transfer_plan(transfer),))
     assert labels == {"7b": "transfer:7b->8b", "8b": "transfer:7b->8b"}
-    assert deltas == {"7b": -2, "8b": 1}
+    assert deltas == {"7b": -1, "8b": 1}

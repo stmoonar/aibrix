@@ -202,7 +202,7 @@ def test_the_planner_has_no_cooldown_inputs_and_replans_from_the_view():
     second = _wake_pods(retry)
     assert len(second) == 1 and second != first
     action = next(a for a in retry.actions if isinstance(a, ScaleAction) and a.reason == "critical_sleeping_capacity")
-    assert action.hint is True  # pure-capacity wake: the SM may substitute (S5)
+    assert action.pods == tuple(second)  # 2026-10-28: a named wake (sm-plans section 10)
     with pytest.raises(TypeError):
         _plan(unavailable_gpus={("node9", 1)})
 
@@ -213,27 +213,6 @@ def test_every_free_gpu_blocked_in_the_view_blocks_the_sleeping_capacity():
     assert "critical_sleeping_blocked:dsllama-8b" in plan.events
 
 
-# ------------------------------------------------------------------ hinted dispatch
-
-
-def test_placement_substituted_event_when_the_sm_substitutes_a_hint():
-    class HintedClient:
-        async def scale_model_hinted(self, model, delta, *, hints):
-            return {"ok": True, "response": {"picked": [
-                {"serve_id": "8b-6", "binding_id": "dsllama-8b/node10/2", "node": "node10", "gpu_ids": [2],
-                 "hinted": False, "hint_binding_id": "dsllama-8b/node9/1"},
-            ]}}
-
-    queue = ActionQueue(HintedClient())
-    queue.submit([ScaleAction(
-        "dsllama-8b", 1, "critical_sleeping_capacity", "rescue", receiver="dsllama-8b", pods=("8b-1",), hint=True,
-    )])
-    (result,) = asyncio.run(queue.drain_once())
-
-    assert result.ok and result.picked[0]["node"] == "node10"
-    assert queue.drain_events() == ["placement_substituted:dsllama-8b:node9/1->node10/2"]
-
-
 # ------------------------------------------------------------------ review fixes
 
 
@@ -242,37 +221,6 @@ def test_wake_failed_is_not_retried_at_once():
     error = ServiceManagerError("HTTP 409", status=409, body=body)
     assert error.retriable is False
     assert error.wake_conflict["error"] == "wake_failed"
-
-
-def test_refusals_of_a_partial_hinted_wake_are_events_only():
-    class PartialClient:
-        async def scale_model_hinted(self, model, delta, *, hints):
-            return {"ok": True, "response": {"picked": [], "unfilled": 1,
-                                             "actions": [{"action": "wake", "serve_id": "8b-2"}], "refusals": [
-                {"error": "gpu_busy", "reason": "gpu_truth_used", "node": "node9", "gpu_ids": [1], "scope": "gpu"},
-            ]}}
-
-    queue = ActionQueue(PartialClient(), now_ms=lambda: 3)
-    queue.submit([ScaleAction("dsllama-8b", 2, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
-    (result,) = asyncio.run(queue.drain_once())
-
-    assert result.ok is False and result.error.startswith("partial")  # not a silent success
-    assert result.changed == ("8b-2",) and queue.last_actions() == {"dsllama-8b": (3, "up")}  # what woke counts
-    assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]
-
-
-def test_hinted_wake_sends_no_avoid_gpus():
-    seen = {}
-
-    class Client:
-        async def scale_model_hinted(self, model, delta, **kwargs):
-            seen.update(kwargs)
-            return {"ok": True, "response": {"picked": []}}
-
-    queue = ActionQueue(Client())
-    queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
-    asyncio.run(queue.drain_once())
-    assert seen == {"hints": ("8b-1",)}  # GPU use is serialized by the SM, not the queue
 
 
 def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
@@ -307,18 +255,10 @@ def test_a_409_partial_growth_is_reported_with_the_replicas_that_woke():
 
 
 def test_a_partial_growth_that_woke_nothing_is_no_routable_change():
-    """Review P2-2: a 200 ``unfilled`` hinted wake / a 409 ``partial`` growth with no
-    wake and nothing picked did not change the routable set: no O1 / view stamp."""
+    """Review P2-2: a 409 ``partial`` growth with no wake and nothing picked did not
+    change the routable set: no O1 / view stamp. (2026-10-28: a sleeping-capacity wake
+    names its binding, sm-plans section 10 - the hinted form is gone.)"""
     from tre_controller.sm_client import ServiceManagerClient
-
-    class Unfilled:
-        async def scale_model_hinted(self, model, delta, *, hints):
-            return {"ok": True, "response": {"picked": [], "unfilled": 1, "actions": [], "refusals": [STRUCTURED]}}
-
-    queue = ActionQueue(Unfilled(), now_ms=lambda: 3)
-    queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
-    (result,) = asyncio.run(queue.drain_once())
-    assert result.ok is False and queue.routable_changes() == {} and queue.view_changes() == {}
 
     # Nothing changed and the item was refused: 409 ``partial`` with the item results.
     body = {"error": "partial", "plan_id": "pl-2", "status": "partial", "sleeps": [], "wakes": [{

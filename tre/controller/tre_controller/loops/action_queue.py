@@ -17,6 +17,8 @@ from tre_controller.planning.planner import (
     DefragAction,
     HideAction,
     ReceiverTarget,
+    IMMEDIATE_DONOR_SLEEP_PATH,
+    named_transfer_hold_reason,
     RelayHold,
     SafeScaleCommitAction,
     ScaleAction,
@@ -409,6 +411,13 @@ class ActionQueue:
         #: C1 review P2-1: pods a commit preemption gave back, per receiver model, not
         #: yet deducted from one of its scale-up parts (one preemption, all parts).
         restore_credit: dict[str, int] = {}
+        #: 2026-10-28 (sm-plans section 10): models in flight or queued BEFORE this
+        #: submit, and what this submit's accepted items claim. Named items of one model
+        #: (an IDLE donor giving two receivers, each its own pod) are the planner's one
+        #: choice and stay together; inside the submit the SM's request rule applies (a
+        #: pod named twice, a count item beside any other item of its model).
+        prior_models = set(self._inflight) | {model for item in self._pending for model in item.models}
+        submit_keys = _PlanKeys()
 
         for queued in queued_actions:
             if queued.source_loop == "rescue":
@@ -423,12 +432,12 @@ class ActionQueue:
                     dropped.append((queued.model, "covered_by_preempted_commit"))
                     continue
                 queued = preempted
-            elif any(
-                model in self._inflight or self._has_pending_model(model)
-                for model in queued.models
+            elif any(model in prior_models for model in queued.models) or submit_keys.clashes(
+                _PlanKeys.of(queued.action)
             ):
                 dropped.append((queued.model, "inflight"))
                 continue
+            submit_keys.add(_PlanKeys.of(queued.action))
 
             self._pending.append(queued)
             accepted_items.append(queued)
@@ -453,16 +462,16 @@ class ActionQueue:
         )
 
     def _fuse_into_plans(self, accepted: list[QueuedAction]) -> None:
-        """One decision -> one plan (design 20261027-sm-plans §5.2, narrowed by the
-        architect): the accepted re-plannable power actions of ONE submit
-        (``ScaleAction``, ``TransferIntent``) become ONE :class:`PlanBatch`, in submit
-        order, each action exactly one plan item. Only DIFFERENT models are fused: an
-        action touching a model an earlier member already uses (the same receiver
-        twice, a shared donor, a shrink and a grow of one model - possible through the
-        rescue path, which skips the inflight check) starts the next batch; the
-        batches serialize through their shared models. A batch takes the queue
-        position of its first member; a member never jumps over another accepted
-        action of one of its models. No timer: nothing waits for more actions.
+        """One decision -> one plan (design 20261027-sm-plans §5.2 and section 10): the
+        accepted re-plannable power actions of ONE submit (``ScaleAction``,
+        ``TransferIntent``, transfer groups) become ONE :class:`PlanBatch`, in submit
+        order, each action exactly one plan item. The split rule is the SM's request
+        rule (section 10): a pod named twice, or a model with a count item and any
+        other item of the plan, starts the next batch - several named items of one
+        model (an IDLE donor giving a TP1 relay and a TP2 block, each its own pod) stay
+        in ONE plan. The batches serialize through their shared models. A batch takes
+        the queue position of its first member; a member never jumps over another
+        accepted action of one of its models. No timer: nothing waits for more actions.
 
         Only members whose resources are FREE at submit time are fused (review
         2026-10-28): a rescue member whose model a running commit / plan (or an
@@ -488,20 +497,25 @@ class ActionQueue:
             held |= set(queued.resources)
         out: list = []
         batch: list[QueuedAction] | None = None
-        used: set[str] = set()
+        used = _PlanKeys()
+        #: Models of unfused actions after the batch began: a later member may not jump
+        #: over one of them on a shared model.
+        barrier: set[str] = set()
         for queued in tail:
-            models = set(queued.models)
+            keys = _PlanKeys.of(queued.action)
             if not _fusable(queued) or _conflicts(queued.resources, held):
                 out.append(queued)
-                used |= models  # a later member may not jump over it on a shared model
+                barrier |= set(queued.models)
                 continue
-            if batch is not None and not (models & used):
+            if batch is not None and not used.clashes(keys) and not (set(queued.models) & barrier):
                 batch.append(queued)
-                used |= models
+                used.add(keys)
                 continue
             batch = [queued]
             out.append(batch)
-            used = set(models)
+            used = _PlanKeys()
+            used.add(keys)
+            barrier = set()
         fused: deque[QueuedAction] = deque(list(self._pending)[:start])
         for entry in out:
             if isinstance(entry, list) and len(entry) > 1:
@@ -1541,8 +1555,26 @@ class ActionQueue:
             self._note_rescue_result(member, result)
             if result.ok or result.changed:
                 self._record_done(member.model, member, result)
+            self._note_transfer_hold(member, result)
             out.append(result)
         return out
+
+    def _note_transfer_hold(self, member, result: DispatchResult) -> None:
+        """Review P2-1 for a named transfer (sm-plans section 10): the receiver wake of
+        a transfer group refused with nothing done (``not_executed``: a group refusal,
+        a whole-plan refusal) holds the (donor, receiver) pair while the fleet view it
+        was planned from is current (:class:`RelayHold`); a wake that woke, or an
+        outcome that changed something / is unknown, clears it.
+        :func:`named_transfer_hold_reason` says why and whether only a fleet change
+        releases it."""
+        if not isinstance(member, ScaleAction) or member.group is None or member.delta <= 0 or member.donor is None:
+            return
+        pair = (member.donor, member.model)
+        if result.ok or result.changed or not result.not_executed or member.basis is None:
+            self._relay_holds.pop(pair, None)
+            return
+        reason, fleet = named_transfer_hold_reason(result.error, result.wake_conflict)
+        self._relay_holds[pair] = RelayHold(basis=member.basis, reason=reason, fleet=fleet)
 
     def _finish_transfer(self, action: TransferIntent, result: DispatchResult) -> list[DispatchResult]:
         """Accounting of a relay's item, by what really happened (never ``count``): the
@@ -1628,7 +1660,8 @@ class ActionQueue:
                 )
                 continue
             if isinstance(member, ReceiverTarget) and member.target is None and body is not None:
-                resolved_members[index] = replace(member, target=int(body["at_least"]))
+                if "at_least" in body:  # a named receiver (its bindings) has no target
+                    resolved_members[index] = replace(member, target=int(body["at_least"]))
             elif isinstance(member, ReceiverTarget) and member.target is None:
                 awake = counts[member.model][0]
                 resolved_members[index] = replace(member, target=awake)
@@ -1749,7 +1782,7 @@ class ActionQueue:
             if member.pods:
                 return self._named_sleep_result(member, item)
             return self._shrink_result(member, item)
-        if member.pods and not member.hint:
+        if member.pods:
             return self._named_wake_result(member, item)
         return self._growth_result(member, item)
 
@@ -2092,6 +2125,8 @@ class ActionQueue:
         return tuple(removed)
 
     def _queued(self, action: QueueAction) -> QueuedAction:
+        if isinstance(action, BlockSupplyAction) and action.probe is None:
+            action = transfer_plan(action)  # a transfer released at once: one plan group
         if isinstance(action, DefragAction):
             return QueuedAction(
                 action=action,
@@ -2334,11 +2369,91 @@ def _member_model(action) -> str:
     return str(getattr(action, "model"))
 
 
+def block_sleeps(action: BlockSupplyAction, reason: str, group: str | None = None) -> tuple[ScaleAction, ...]:
+    """The urgent sleeps of exactly the transfer's immediate donor pods (``group``: the
+    transfer's plan group when its receiver wakes in the same plan)."""
+    return tuple(
+        ScaleAction(
+            donor, -1, reason, action.source_loop, donor=donor, receiver=action.receiver, pods=(pod,),
+            sleep_path=IMMEDIATE_DONOR_SLEEP_PATH, group=group,
+        )
+        for donor, pod in action.sleeps
+    )
+
+
+def transfer_group(action: BlockSupplyAction) -> str:
+    """The plan group of one transfer (sm-plans section 10): unique in a plan, as a
+    receiver binding is woken by one transfer only."""
+    return f"t:{action.receiver}:{action.receiver_pods[0] if action.receiver_pods else action.block}"
+
+
+def transfer_plan(action: BlockSupplyAction, reason: str | None = None) -> PlanBatch:
+    """One transfer released at once (sm-plans section 10, design 20261028-single-loop
+    L4 rev 2) -> ONE plan group: the urgent sleeps of exactly its donor pods and the
+    receiver's NAMED wake of its binding (it keeps its rescue target). The SM selects
+    the group atomically and wakes the receiver once every donor slept; no other
+    receiver can take the GPUs between. ``action.probe`` must be None (a probe pod
+    sleeps through the SafeScale commit)."""
+    reason = action.reason if reason is None else reason
+    group = transfer_group(action)
+    return PlanBatch((
+        *block_sleeps(action, reason, group),
+        ScaleAction(
+            action.receiver, 1, reason, action.source_loop, receiver=action.receiver,
+            donor=action.donor_models[0] if action.donor_models else None,
+            pods=action.receiver_pods, rescue=action.rescue, group=group, basis=action.basis,
+        ),
+    ))
+
+
 def _queued_models(action) -> tuple[str, ...]:
     """Every model an action changes (a relay: donor and receiver)."""
     if isinstance(action, TransferIntent):
         return tuple(dict.fromkeys((action.donor_model, action.receiver_model)))
+    if isinstance(action, DefragAction):
+        return (CLUSTER_MODEL,)
+    if isinstance(action, SafeScaleCommitAction):
+        return tuple(action.touched_models) or (action.donor,)
     return (action.model,)
+
+
+class _PlanKeys:
+    """What one plan's items claim (the SM's request rules, sm-plans section 10): named
+    pods (each at most once), models of count items (at most one item per model, no
+    named item beside it) and models of named items."""
+
+    def __init__(self) -> None:
+        self.pods: set[str] = set()
+        self.count_models: set[str] = set()
+        self.named_models: set[str] = set()
+
+    @classmethod
+    def of(cls, action) -> "_PlanKeys":
+        keys = cls()
+        for member in _members(action):
+            if isinstance(member, ScaleAction) and member.pods:
+                keys.pods |= set(member.pods)
+                keys.named_models.add(member.model)
+            elif isinstance(member, BlockSupplyAction):
+                keys.pods |= {pod for _, pod in member.sleeps} | set(member.receiver_pods)
+                keys.named_models |= {*member.donor_models, member.receiver}
+            elif isinstance(member, ScaleAction):
+                keys.count_models.add(member.model)
+            else:  # a relay intent, a commit, a defrag: every model it touches
+                keys.count_models |= set(_queued_models(member))
+        return keys
+
+    def clashes(self, other: "_PlanKeys") -> bool:
+        return bool(
+            self.pods & other.pods
+            or self.count_models & (other.count_models | other.named_models)
+            or self.named_models & other.count_models
+        )
+
+    def add(self, other: "_PlanKeys") -> None:
+        self.pods |= other.pods
+        self.count_models |= other.count_models
+        self.named_models |= other.named_models
 
 
 def _fusable(queued: QueuedAction) -> bool:

@@ -11,6 +11,8 @@ import asyncio
 import pytest
 
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+from relay_view import relays
+from tre_sm.allocator.slots import release_order
 from tre_controller.loops.action_queue import ActionQueue
 from plan_shim import PlanShim  # the in-process service has no plan executor here
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
@@ -95,12 +97,16 @@ def test_e1_deadlock_idle_donor_frees_a_slot_where_receiver_sleeps() -> None:
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "critical_sleeping_capacity" for a in scale)
     assert "critical_sleeping_blocked:dsllama-8b" in plan.events
-    # 2026-10-02: the relay is ONE TransferIntent - a count, no pod and no GPU (the SM
-    # pairs 7b replicas with the 8b bindings sleeping under them).
-    [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
+    # 2026-10-28 (sm-plans section 10): the relay is ONE named transfer - the donor pod
+    # and the 8b binding sleeping under it, chosen by the controller.
+    [relay] = relays(plan.actions)
     assert (relay.donor_model, relay.receiver_model, relay.count, relay.pairs) == ("dsqwen-7b", "dsllama-8b", 1, 1)
     assert (relay.reason, relay.sleep_path) == ("critical_donor_immediate", "urgent")
-    assert not scale  # no binding-level donor sleep / receiver wake any more
+    [donor_pod] = relay.donor_pods
+    [receiver_pod] = relay.receiver_pods
+    slots = {b.serve_id: b.slot for b in _e1_bindings()}
+    assert slots[donor_pod] == slots[receiver_pod]
+    assert not scale
 
 
 @pytest.mark.parametrize(
@@ -116,9 +122,12 @@ def test_e1_deadlock_donor_probe_is_pinned_to_receiver_slot(donor_state, reason)
 
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "critical_sleeping_capacity" for a in scale)
-    assert not [a for a in plan.actions if isinstance(a, TransferIntent)]
+    assert not relays(plan.actions)
     donor = next(a for a in scale if a.model == "dsqwen-7b")
-    assert (donor.reason, donor.requires_safescale, donor.pods) == (reason, True, ("7b-0",))
+    # The probe pod is the shared release choice (the SM's release order).
+    serving = [b for b in _e1_bindings() if b.model == "dsqwen-7b" and b.awake]
+    first = release_order(serving, bindings=list(_e1_bindings()), topology=TOPOLOGY)[0].serve_id
+    assert (donor.reason, donor.requires_safescale, donor.pods) == (reason, True, (first,))
     assert plan.probe_upscale_plans.get("dsqwen-7b", {}).get("dsllama-8b") == 1
 
 
@@ -181,7 +190,7 @@ def test_low_fairness_sleeping_path_is_slot_aware() -> None:
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "low_fairness_sleeping_capacity" for a in scale)
     assert "low_fairness_sleeping_blocked:dsllama-8b" in plan.events
-    [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
+    [relay] = relays(plan.actions)
     assert (relay.donor_model, relay.receiver_model, relay.count, relay.reason) == (
         "dsqwen-7b", "dsllama-8b", 1, "low_fairness_donor_immediate"
     )
@@ -220,8 +229,7 @@ def test_e1_plan_executes_through_serial_queue_without_wake_conflict() -> None:
     [woken] = [b for b in bindings.values() if b.model == "dsllama-8b" and b.awake]
     [slept] = [b for b in bindings.values() if b.model == "dsqwen-7b" and not b.awake]
     assert woken.slot == slept.slot
-    by_model = {result.model: result for result in results}
-    assert (by_model["dsqwen-7b"].taken, by_model["dsllama-8b"].done) == (1, 1)
+    assert {result.model for result in results} == {"dsqwen-7b", "dsllama-8b"}
     assert queue.view_changes().keys() == {"dsqwen-7b", "dsllama-8b"}
 
 

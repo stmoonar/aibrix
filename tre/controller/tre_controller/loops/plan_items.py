@@ -3,13 +3,19 @@
 Every power dispatch of the ActionQueue is one ``POST /v2/plans``: each member
 action becomes exactly ONE item (strict 1:1, no same-model merging):
 
-* ``ScaleAction +k``            -> wake ``at_least = awake + k`` (``hints`` = its pods when hinted)
-* ``ScaleAction +k`` with pods  -> wake ``pods`` (exactly these bindings)
+* ``ScaleAction +k`` with pods  -> wake ``pods`` (exactly these bindings: the controller
+  names every pod, sm-plans section 10)
+* ``ScaleAction +k``            -> wake ``at_least = awake + k`` (a cold create only: the
+  receiver has no sleeping binding at the target)
+* ``ScaleAction -k`` with pods  -> sleep ``pods`` (a transfer's donor pods, a SafeScale
+  commit donor, a named shrink)
 * ``ScaleAction -k``            -> sleep ``at_most = max(serving floor, awake - k)``
-* ``ScaleAction -k`` with pods  -> sleep ``pods`` (SafeScale commit donor, a TP block's donor pods)
 * ``TransferIntent D->R``       -> wake of R ``at_least = awake_R + pairs``, ``donors=[{D, count}]``
-* ``ReceiverTarget``            -> wake ``at_least = target`` (resolved once, then frozen;
-  ``hints`` = its bindings on the donor pods' GPUs)
+* ``ReceiverTarget``            -> wake ``pods`` = its bindings on the donor pods' GPUs;
+  without any, ``at_least = target`` (resolved once, then frozen)
+
+A member's ``group`` (one transfer: donor sleeps + receiver wake) is sent as the item's
+``group``.
 
 Relative fields are resolved from ONE ``GET /v2/state`` per plan; an item whose target
 is already met is dropped locally (no SM call for it). Pure helpers: the ActionQueue
@@ -59,13 +65,15 @@ def plan_item(action) -> tuple[str, dict] | None:
     Raises :class:`SleepPathRefused` for a path-less scale-down."""
     if isinstance(action, ReceiverTarget):
         item: dict[str, Any] = {"model": action.model, "reason": RECEIVER_REASON}
+        if action.hints:
+            # Named (sm-plans section 10): a retry of an awake binding is a no-op.
+            item["pods"] = list(action.hints)
+            return "wake", item
         if action.target is not None:
             item["at_least"] = int(action.target)
         else:
             item["_delta"] = max(0, int(action.delta))
             item["_cap"] = action.cap
-        if action.hints:
-            item["hints"] = list(action.hints)
         return "wake", item
     if isinstance(action, TransferIntent):
         return "wake", {
@@ -79,12 +87,12 @@ def plan_item(action) -> tuple[str, dict] | None:
     delta = int(action.delta)
     if delta > 0:
         item = {"model": action.model, "reason": str(action.reason)}
-        if action.pods and action.hint:
-            item.update({"_delta": delta, "hints": list(action.pods)})
-        elif action.pods:
+        if action.pods:
             item["pods"] = list(action.pods)
         else:
             item["_delta"] = delta
+        if action.group:
+            item["group"] = action.group
         return "wake", item
     if delta < 0:
         item = {"model": action.model, "reason": str(action.reason), "sleep_path": sleep_path_of(action)}
@@ -92,6 +100,8 @@ def plan_item(action) -> tuple[str, dict] | None:
             item["pods"] = list(action.pods)
         else:
             item["_delta"] = delta
+        if action.group:
+            item["group"] = action.group
         return "sleep", item
     return None
 
