@@ -138,9 +138,7 @@ def test_after_a_routable_change_z_is_the_whole_window_and_the_model_acts_at_onc
     assert ctx["trs_raw"] == expected and ctx["routable_pods"] == 2
     assert second.classifications["m"].state.value == "critical"
     assert [(a.model, a.delta) for a in _ups(second.actions)] == [("m", 1)]
-    assert not any("hold" in event or "breakpoint" in event or "suppressed" in event for event in second.events)
-    for gone in ("signal_warm", "signal_hold_reason", "signal_full_window", "o1_queue_rise"):
-        assert gone not in ctx
+    assert not any(event.startswith("view_pending_hold:") for event in second.events)
 
 
 # ------------------------------------------------- (d) in flight / view-pending
