@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from typing import Any, NamedTuple
 
 from tre_common import rediskeys
@@ -43,6 +44,8 @@ class SignalLogWriter:
         self._redis = redis_client
         self._key = key
         self._maxlen = int(maxlen)
+        # claim() runs on the event loop and settle() on the writer thread.
+        self._lock = threading.Lock()
         self._last_window_by_model: dict[str, int] = {}
 
     def write(self, snapshot: MetricsSnapshot, result: Any) -> int:
@@ -67,7 +70,8 @@ class SignalLogWriter:
             window_id = int(
                 getattr(metrics, "window_end_ms", None) or snapshot.ts_ms
             )
-            previous = self._last_window_by_model.get(model)
+            with self._lock:
+                previous = self._last_window_by_model.get(model)
             if window_id <= (previous if previous is not None else -1):
                 continue
             source = str(context.get("signal_source") or "unknown")
@@ -103,7 +107,8 @@ class SignalLogWriter:
                 "eta_m": _format(context.get("eta_m")),
                 "action": action_by_model.get(model, "none"),
             }
-            self._last_window_by_model[model] = window_id
+            with self._lock:
+                self._last_window_by_model[model] = window_id
             rows.append(SignalLogRow(model, window_id, previous, fields))
         return rows
 
@@ -121,11 +126,12 @@ class SignalLogWriter:
         for row, reply in zip(rows, replies):
             if isinstance(reply, Exception):
                 _LOG.warning("signal_log_write_failed:%s: %s", row.model, reply)
-                if self._last_window_by_model.get(row.model) == row.window_id:
-                    if row.previous is None:
-                        self._last_window_by_model.pop(row.model, None)
-                    else:
-                        self._last_window_by_model[row.model] = row.previous
+                with self._lock:
+                    if self._last_window_by_model.get(row.model) == row.window_id:
+                        if row.previous is None:
+                            self._last_window_by_model.pop(row.model, None)
+                        else:
+                            self._last_window_by_model[row.model] = row.previous
                 continue
             written += 1
         return written
