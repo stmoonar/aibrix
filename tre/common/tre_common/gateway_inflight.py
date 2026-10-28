@@ -27,7 +27,12 @@ def _text(value: Any) -> str:
 
 
 def redis_now_ms(redis: Any) -> int:
-    seconds, micros = redis.time()
+    return time_reply_ms(redis.time())
+
+
+def time_reply_ms(reply: Any) -> int:
+    """A Redis ``TIME`` reply (seconds, microseconds) in ms."""
+    seconds, micros = reply
     return int(seconds) * 1000 + int(micros) // 1000
 
 
@@ -50,14 +55,25 @@ def instance_max_age_ms(registry: Any) -> int:
 def live_gateway_instances(redis: Any, *, max_age_ms: int) -> set[str]:
     """Instance ids whose last heartbeat is at most ``max_age_ms`` old (Redis TIME)."""
     now_ms = redis_now_ms(redis)
-    members = redis.zrange(rediskeys.GW_INSTANCES_KEY, 0, -1, withscores=True) or ()
-    return {_text(member) for member, score in members if now_ms - float(score) <= max_age_ms}
+    members = redis.zrange(rediskeys.GW_INSTANCES_KEY, 0, -1, withscores=True)
+    return live_instances_at(now_ms, members, max_age_ms=max_age_ms)
+
+
+def live_instances_at(now_ms: int, members: Any, *, max_age_ms: int) -> set[str]:
+    """:func:`live_gateway_instances` from replies already read: ``now_ms`` (Redis TIME)
+    and the ``GW_INSTANCES_KEY`` ZRANGE ... WITHSCORES reply."""
+    return {_text(member) for member, score in (members or ()) if now_ms - float(score) <= max_age_ms}
 
 
 def pod_inflight_fields(redis: Any, pod: str) -> dict[str, dict | None]:
     """instance id -> the parsed field value (None when unreadable)."""
+    return inflight_fields(redis.hgetall(rediskeys.gw_inflight_key(pod)))
+
+
+def inflight_fields(raw_hash: Any) -> dict[str, dict | None]:
+    """:func:`pod_inflight_fields` of an HGETALL reply already read."""
     out: dict[str, dict | None] = {}
-    for field_name, raw in (redis.hgetall(rediskeys.gw_inflight_key(pod)) or {}).items():
+    for field_name, raw in (raw_hash or {}).items():
         try:
             payload = json.loads(_text(raw))
         except (TypeError, ValueError):
@@ -72,8 +88,13 @@ def pod_inflight(redis: Any, pod: str, live_instances: Collection[str]) -> int |
     (not JSON, no integer ``total``): that instance may hold requests there. A field of
     a dead instance is ignored either way; no field at all is 0 (nothing routed). A
     caller that turns the count into demand counts unknown as no demand."""
+    return inflight_total(pod_inflight_fields(redis, pod), live_instances)
+
+
+def inflight_total(fields: dict[str, dict | None], live_instances: Collection[str]) -> int | None:
+    """:func:`pod_inflight` of the pod's parsed fields (:func:`inflight_fields`)."""
     total = 0
-    for instance, payload in pod_inflight_fields(redis, pod).items():
+    for instance, payload in fields.items():
         if instance not in live_instances:
             continue
         value = None if payload is None else payload.get("total")

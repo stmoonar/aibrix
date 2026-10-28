@@ -8,9 +8,15 @@ from typing import Any, Callable
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, Observed, PodWindowMetrics
 from tre_common.persistence import fresh
-from tre_common.gateway_inflight import instance_max_age_ms, live_gateway_instances, pod_inflight
+from tre_common.gateway_inflight import (
+    inflight_fields,
+    inflight_total,
+    instance_max_age_ms,
+    live_instances_at,
+    time_reply_ms,
+)
 from tre_common.percentile import histogram_percentile
-from tre_common.rediskeys import GATEWAY_CADENCE_KEY, hist_key, inst_key, pods_key
+from tre_common.rediskeys import GATEWAY_CADENCE_KEY, GW_INSTANCES_KEY, gw_inflight_key, hist_key, inst_key, pods_key
 from tre_controller.gateway_cadence import cadence_problem, last_hist_ms
 from tre_common.tss import window_is_idle
 from tre_common.vllm_metrics import doc_lookup
@@ -400,12 +406,21 @@ class MetricsStore:
         gateway instances (heartbeat at most the registry's
         ``service_manager.sleep.instance_staleness_s`` old); a pod's count is None when a
         live instance's field is unreadable. None = unknown: the gateway coordination
-        keys cannot be read, or no gateway instance is live."""
+        keys cannot be read, or no gateway instance is live. One pipelined round trip
+        (Redis TIME, the instance set, every pod's in-flight hash)."""
         try:
-            live = live_gateway_instances(self._redis, max_age_ms=self._gateway_instance_max_age_ms)
+            batch = _Batch(self._redis)
+            batch.add("time")
+            batch.add("zrange", GW_INSTANCES_KEY, 0, -1, withscores=True)
+            for pod in pods:
+                batch.add("hgetall", gw_inflight_key(pod))
+            replies = batch.run()
+            live = live_instances_at(
+                time_reply_ms(replies[0]), replies[1], max_age_ms=self._gateway_instance_max_age_ms
+            )
             if not live:
                 return None
-            return {pod: pod_inflight(self._redis, pod, live) for pod in pods}
+            return {pod: inflight_total(inflight_fields(raw), live) for pod, raw in zip(pods, replies[2:])}
         except Exception:  # noqa: BLE001 - unknown, never zero
             return None
 

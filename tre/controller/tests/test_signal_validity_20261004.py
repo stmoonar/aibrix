@@ -119,6 +119,29 @@ class _Redis:
         return [m for score, m in sorted(self.zsets.get(key, [])) if float(lo) <= score <= float(hi)]
 
 
+class _PipelinedRedis(_Redis):
+    """``_Redis`` with ``pipeline(transaction=False)``: records each round trip's commands."""
+
+    def __init__(self):
+        super().__init__()
+        self.round_trips: list[list[str]] = []
+
+    def pipeline(self, transaction=True):
+        assert transaction is False
+        redis, calls = self, []
+
+        class _Pipe:
+            def __getattr__(self, name):
+                getattr(redis, name)  # only the commands the fake has (the store falls back)
+                return lambda *args, **kwargs: calls.append((name, args, kwargs))
+
+            def execute(self):
+                redis.round_trips.append([name for name, _a, _k in calls])
+                return [getattr(redis, name)(*args, **kwargs) for name, args, kwargs in calls]
+
+        return _Pipe()
+
+
 class _Queue:
     def __init__(self):
         self.submitted: list = []
@@ -323,13 +346,15 @@ def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
 # ------------------------------------------ IDLE window evidence (2026-10-06 P2-2)
 
 
+@pytest.mark.parametrize("pipelined", [False, True], ids=["one_by_one", "pipelined"])
 @pytest.mark.parametrize("case", ["fresh_drained", "scrape_froze_early", "inflight", "no_live_gateway"])
-def test_an_idle_window_needs_a_last_grid_scrape_and_nothing_in_flight(case):
+def test_an_idle_window_needs_a_last_grid_scrape_and_nothing_in_flight(case, pipelined):
     """P2-2: IDLE (whole-surplus release, O1 donor-hold exemption) needs every serving
     pod scraped in the last grid of the window and zero gateway in-flight on it. A pod
     whose scrape froze early in the window repeats zero-token docs while traffic
-    arrives; an in-flight request, or no live gateway instance (unknown), is not idle."""
-    redis = _Redis()
+    arrives; an in-flight request, or no live gateway instance (unknown), is not idle.
+    2026-10-28: the in-flight read is one pipelined round trip, same answer."""
+    redis = _PipelinedRedis() if pipelined else _Redis()
     scraped = END - 25_000 if case == "scrape_froze_early" else END
     _write_pod(redis, "m", "m-0", gen_per_grid=0, prompt_per_grid=0, running=0, waiting=0, scraped_ms=scraped)
     if case != "no_live_gateway":
@@ -347,6 +372,8 @@ def test_an_idle_window_needs_a_last_grid_scrape_and_nothing_in_flight(case):
     result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
                               cluster_view=view)
     assert result.model_contexts["m"]["window_idle"] is (case == "fresh_drained")
+    if pipelined:
+        assert ["time", "zrange", "hgetall"] in redis.round_trips
 
 
 # ------------------------------- one gateway liveness bound (2026-10-06 P3-2)
