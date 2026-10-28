@@ -34,8 +34,12 @@ ROUTABLE_LABEL = "tre.aibrix.io/routable"
 MANAGED_LABEL = "tre.aibrix.io/managed"
 _VALID_STATES = {POD_STATE_AWAKE, POD_STATE_SLEEPING, POD_STATE_HIDDEN}
 _ROUTE_GEN_PATCH_ATTEMPTS = 5
-
-
+# Every Pod LIST asks the API server for unfinished Pods only. A finished Pod
+# (evicted or rejected at admission -> Failed; Succeeded) runs no container, so
+# it holds no GPU memory and serves nothing; no SM decision may count it. A
+# disk-pressure eviction storm leaves thousands of them until the Pod GC runs
+# (10-06, 10-28: ~4000 Failed model Pods, +426 MB per full LIST, SM OOMKilled).
+UNFINISHED_POD_SELECTOR = "status.phase!=Failed,status.phase!=Succeeded"
 
 
 class UnreadablePodBinding(RuntimeError):
@@ -68,7 +72,14 @@ class RequestTimeoutApi:
 
 
 class K8sApi(Protocol):
-    def list_namespaced_pod(self, *, namespace: str, label_selector: str | None = None): ...
+    def list_namespaced_pod(
+        self,
+        *,
+        namespace: str,
+        label_selector: str | None = None,
+        field_selector: str | None = None,
+        _preload_content: bool = True,
+    ): ...
 
     def patch_namespaced_pod(self, *, name: str, namespace: str, body: dict) -> None: ...
     def read_namespaced_pod(self, *, name: str, namespace: str): ...
@@ -171,18 +182,26 @@ class K8sOps:
 
     def list_pod_snapshots(self, *, model: str | None = None) -> list[K8sPodSnapshot]:
         selector = f"{MODEL_LABEL}={model}" if model else None
-        pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
-        return self._snapshots_from_pods(pods)
+        return self._snapshots_from_pods(self._list_pods(selector))
 
     def list_startup_resident_snapshots(self) -> list[K8sPodSnapshot]:
         """Include terminating residents in cold-start conflict checks."""
-        pods = _items(
-            self._api.list_namespaced_pod(
-                namespace=self._namespace,
-                label_selector=f"{MANAGED_LABEL}=true",
-            )
-        )
+        pods = self._list_pods(f"{MANAGED_LABEL}=true")
         return self._snapshots_from_pods(pods, include_terminating=True)
+
+    def _list_pods(self, label_selector: str | None, *, namespace: str | None = None) -> list:
+        """Unfinished Pods matching ``label_selector`` as plain JSON dicts
+        (camelCase, unset fields omitted). The phase filter runs in the API
+        server (:data:`UNFINISHED_POD_SELECTOR`) and the body is parsed with
+        ``json.loads`` instead of the kubernetes client's model objects (10-28,
+        4000 Pods: 561 MB retained as model objects, 152 MB as dicts)."""
+        response = self._api.list_namespaced_pod(
+            namespace=namespace or self._namespace,
+            label_selector=label_selector,
+            field_selector=UNFINISHED_POD_SELECTOR,
+            _preload_content=False,
+        )
+        return _raw_items(response)
 
     def list_model_deployments(self) -> list[ModelDeploymentRecord]:
         deployments = _items(
@@ -221,12 +240,10 @@ class K8sOps:
         return self._startup_record_from_pod(pod)
 
     def list_admitted_startup_pods(self) -> list[StartupPodRecord]:
-        pods = _items(
-            self._api.list_namespaced_pod(
-                namespace=self._namespace,
-                label_selector=f"{MANAGED_LABEL}=true",
-            )
-        )
+        """Unfinished managed Pods admitted at their startup gate. A Failed
+        admitted Pod (evicted while starting) is no start in progress: it holds
+        no GPU, so it gets no placeholder lease and masks no fleet drift."""
+        pods = self._list_pods(f"{MANAGED_LABEL}=true")
         admitted: list[StartupPodRecord] = []
         for pod in pods:
             metadata = _metadata(pod)
@@ -272,7 +289,7 @@ class K8sOps:
         ``engine_state`` (running / waiting / terminated / None) and
         ``engine_reason`` of the ``vllm-openai`` container, ``ready``, ``pod_ip``."""
         selector = f"{MANAGED_LABEL}=true" if model is None else f"{MANAGED_LABEL}=true,{MODEL_LABEL}={model}"
-        pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
+        pods = self._list_pods(selector)
         states: list[dict] = []
         for pod in pods:
             status = _status(pod)
@@ -398,12 +415,7 @@ class K8sOps:
         return uids
 
     def _live_model_pods(self) -> list:
-        pods = _items(
-            self._api.list_namespaced_pod(
-                namespace=self._namespace,
-                label_selector=f"{MANAGED_LABEL}=true",
-            )
-        )
+        pods = self._list_pods(f"{MANAGED_LABEL}=true")
         return [pod for pod in pods if _status(pod).get("phase") not in {"Succeeded", "Failed"}]
 
     def admit_startup_pod(
@@ -448,9 +460,7 @@ class K8sOps:
 
     def list_ready_pod_names(self, *, namespace: str, label_selector: str) -> set[str]:
         """Names of Running + Ready Pods (e.g. the gateway plugin instances)."""
-        pods = _items(
-            self._api.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
-        )
+        pods = self._list_pods(label_selector, namespace=namespace)
         return {
             str(_metadata(pod)["name"])
             for pod in pods
@@ -473,14 +483,13 @@ class K8sOps:
         timeout_s: float = 120.0,
         interval_s: float = 1.0,
     ) -> None:
+        """Wait until the Deployment has no unfinished, undeleted Pod. A Failed
+        Pod (evicted) runs nothing and is never deleted by its ReplicaSet, so it
+        is not waited for (before 10-28 it held this wait until the timeout)."""
         deadline = time.monotonic() + timeout_s
         selector = f"app={deployment_name}"
         while time.monotonic() < deadline:
-            pods = _items(
-                self._api.list_namespaced_pod(
-                    namespace=self._namespace, label_selector=selector
-                )
-            )
+            pods = self._list_pods(selector)
             live = [
                 pod
                 for pod in pods
@@ -535,7 +544,7 @@ class K8sOps:
             metadata = _metadata(pod)
             spec = _spec(pod)
             if (
-                _field(metadata, "deletionTimestamp", "deletion_timestamp")
+                _optional_field(metadata, "deletionTimestamp", "deletion_timestamp")
                 and not include_terminating
             ):
                 continue
@@ -620,7 +629,7 @@ class K8sOps:
         deadline = time.monotonic() + timeout_s
         selector = f"{MODEL_LABEL}={binding.model},{ROUTABLE_LABEL}=true"
         while time.monotonic() < deadline:
-            pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
+            pods = self._list_pods(selector)
             routable_names = {str(_metadata(pod).get("name")) for pod in pods}
             if binding.serve_id not in routable_names:
                 return
@@ -712,8 +721,7 @@ class K8sOps:
     def wait_pod_ready(self, serve_id: str, *, timeout_s: float = 120.0, interval_s: float = 1.0) -> K8sPodSnapshot:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=f"app={serve_id}"))
-            snapshots = self._snapshots_from_pods(pods)
+            snapshots = self._snapshots_from_pods(self._list_pods(f"app={serve_id}"))
             if snapshots:
                 return snapshots[0]
             for snapshot in self.list_pod_snapshots():
@@ -774,6 +782,20 @@ def _items(value):
     if items is not None:
         return list(items)
     return list(value)
+
+
+def _raw_items(response) -> list:
+    """Items of a LIST made with ``_preload_content=False`` (an urllib3
+    response: its JSON body); any other value (a test double) as :func:`_items`."""
+    data = getattr(response, "data", None)
+    if not isinstance(data, (bytes, bytearray, str)):
+        return _items(response)
+    try:
+        return list(json.loads(data).get("items") or [])
+    finally:
+        release = getattr(response, "release_conn", None)
+        if callable(release):
+            release()
 
 
 def _route_gen(value) -> int:
