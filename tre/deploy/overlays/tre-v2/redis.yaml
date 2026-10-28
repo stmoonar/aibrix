@@ -41,7 +41,9 @@ items:
               # 2026-10-29: no persistence. The pod has no volume, so an RDB snapshot is
               # never read back (a restarted pod starts empty either way); the periodic
               # fork + dump caused most of the container's CPU throttling.
-              command: ["redis-server", "--save", "", "--appendonly", "no"]
+              # args, not command: the image ENTRYPOINT (docker-entrypoint.sh) stays, so
+              # redis still drops root (su-exec) and sets its umask.
+              args: ["redis-server", "--save", "", "--appendonly", "no"]
               ports:
                 - containerPort: 6379
                   name: redis
