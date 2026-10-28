@@ -155,7 +155,7 @@ def test_a_long_e2e_model_never_commits_before_one_p95_e2e():
     assert decision.details["early_commit"]["min_elapsed_ms"] == 45_000
 
 
-def test_the_post_hide_evidence_follows_the_o1_warm_rule():
+def test_the_post_hide_evidence_needs_the_min_evidence_span():
     # 30 s of post-hide observation time required: 130 - 103 = 27 s is short, the
     # snapshot of 140 s (37 s) passes.
     h = EarlyHarness(early_commit_min_evidence_ms=30_000)

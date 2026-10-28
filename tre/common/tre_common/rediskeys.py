@@ -9,7 +9,7 @@ FALLBACK_TTL_SECONDS = 2 * 60 * 60
 #   controller's per-pod coverage flag counts on this grid (env
 #   TRE_INSTANT_SAMPLE_INTERVAL_MS, gateway and controller).
 # * EVIDENCE_PERIOD_MS - tre:v2:hist docs (token / latency histograms) and the legacy
-#   aibrix:pod_*_metrics_* keys; the controller's phase-aligned window grid, O1 grid and
+#   aibrix:pod_*_metrics_* keys; the controller's phase-aligned window grid and the
 #   SafeScale evidence step (env TRE_EVIDENCE_PERIOD_MS, gateway and controller). A
 #   multiple of the instant period; the metrics window must be a multiple of both.
 #

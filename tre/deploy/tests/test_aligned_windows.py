@@ -145,7 +145,7 @@ def test_online_phase_aligned_equals_offline_grid_rewindow_bitwise() -> None:
 
     sampler = PhaseAlignedSampler(store, box, window_ms=W, period_ms=P, clock_ms=lambda: now["t"],
                                   sleep=sleep, fetch=fetch)
-    state = SignalState(warmup_ms=-1)
+    state = SignalState()
     online: dict[int, float | None] = {}
 
     async def run() -> None:

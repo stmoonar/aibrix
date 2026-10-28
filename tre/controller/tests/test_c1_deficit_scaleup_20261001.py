@@ -1,7 +1,8 @@
 """Rescue targets (C1 2026-10-01; one step per plan since 2026-10-28, design
 docs/design/20261028-single-loop.md): a CRITICAL receiver's scale-up is an absolute
-target (``base + step``), and the target bookkeeping keeps a scale-up the decision
-window does not reflect yet from being repeated (queue ledger, restart memory)."""
+target (``base + step``), and the target bookkeeping keeps a scale-up the fleet view
+does not show yet from being repeated (queue ledger, restart memory; 2026-10-29: no
+wait for the metrics window or the EMA, design 20261029-tss-only)."""
 from __future__ import annotations
 
 import asyncio
@@ -173,7 +174,7 @@ def _registry(**scaling) -> Registry:
     return Registry(base.topology(), list(base.models()), scaling=ScalingRegistryConfig(**scaling))
 
 
-def test_queue_records_the_target_and_the_tick_holds_until_the_window_reflects_it():
+def test_queue_records_the_target():
     client = _Client()
     clock = _Clock(65_000)
     queue = ActionQueue(client, now_ms=clock)
@@ -186,13 +187,6 @@ def test_queue_records_the_target_and_the_tick_holds_until_the_window_reflects_i
     assert first.submitted == 1 and client.calls == [("critical", 1)]
     record = queue.rescue_targets()["critical"]
     assert (record.base, record.target, record.covered, record.done_ms) == (2, 3, 3, 65_000)
-
-    # Many ticks on windows that started before the wake completed: nothing more.
-    for start in (5_000, 20_000, 64_999):
-        held = run_rescue_tick(_snapshot(start), queue=queue, registry=registry)
-        asyncio.run(queue.drain_once())
-        assert held.submitted == 0
-    assert client.calls == [("critical", 1)]
 
 
 def test_queue_failed_target_is_replanned_on_the_next_tick():
@@ -239,7 +233,7 @@ def test_scale_up_cooldown_key_is_ignored(caplog):
     # every shipped registry) and was removed; an old registry with the key still loads.
     queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
     queue._last_done["critical"] = (65_000, "up")
-    result = run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry(), action_cooldown=True)
+    result = run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry())
     assert result.submitted == 1 and "cooldown_hold:critical" not in result.events
     with caplog.at_level(logging.WARNING):
         assert parse_scaling_config({"scale_up_cooldown_enabled": True}) == ScalingRegistryConfig()
@@ -251,22 +245,20 @@ def test_shipped_registry_scaling_section(caplog):
     assert registry.scaling() == ScalingRegistryConfig()  # built-in defaults
     raw = yaml.safe_load(open(__import__("pathlib").Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml",
                               encoding="utf-8"))
-    assert set(raw["scaling"]) == {
-        "rescue_settle_ema_k",
-        # O1 (2026-10-01): the breakpoint window, at its built-in defaults.
-        "breakpoint_window", "onset_warmup_guard", "min_evidence_ms", "min_evidence_requests",
-        "breakpoint_margin_ms", "breakpoint_hold_max_ms",
-        "gateway_clock_tolerance_ms", "gateway_clock_check_s",
-        # Onset saturation rescue (2026-10-02), at its built-in defaults.
-        "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
-        # Instant sample completeness (2026-10-25), at its built-in default.
-        "sample_min_ratio",
-    }
+    # TSS only (2026-10-29): the SafeScale evidence floor and the sample completeness,
+    # at their built-in defaults.
+    assert set(raw["scaling"]) == {"min_evidence_ms", "sample_min_ratio"}
     assert not hasattr(registry.scaling(), "donor_surplus_release")  # retired 2026-10-07 (F1-B)
     # One step per plan (2026-10-28): a live registry that still carries the retired
     # step keys loads, with one deprecation line.
+    # TSS only (2026-10-29): the same for the O1 / saturation / settle keys of the
+    # 20261029 live ConfigMap.
     retired = {"rescue_max_step_ratio": 2, "rescue_max_step_pods": 4, "breakpoint_partial_max_step": 1,
-               "breakpoint_lowevidence_requests": 20, "saturation_max_step_factor": 2}
+               "breakpoint_lowevidence_requests": 20, "saturation_max_step_factor": 2,
+               "rescue_settle_ema_k": 2.0, "breakpoint_window": True, "onset_warmup_guard": False,
+               "min_evidence_requests": 3, "breakpoint_margin_ms": 1000, "breakpoint_hold_max_ms": 50000,
+               "gateway_clock_tolerance_ms": 2000, "gateway_clock_check_s": 60, "saturation_rescue": True,
+               "saturation_kv_threshold": 0.9, "saturation_confirm_ms": 10000}
     with caplog.at_level(logging.WARNING):
         assert parse_scaling_config(retired) == ScalingRegistryConfig()
     assert sum("ignoring retired keys" in r.getMessage() for r in caplog.records) == 1
@@ -277,7 +269,7 @@ def test_shipped_registry_scaling_section(caplog):
 # ===================================================== review round (2026-10-01)
 from dataclasses import replace as _replace  # noqa: E402
 
-from tre_controller.loops.tick import _apply_safescale, _rescue_bases, rescue_settle_ms  # noqa: E402
+from tre_controller.loops.tick import _apply_safescale  # noqa: E402
 from tre_controller.planning.planner import SafeScaleCommitAction  # noqa: E402
 
 
@@ -409,12 +401,16 @@ def test_scale_memory_survives_a_controller_restart():
         before.base, before.target, before.covered, 65_000,
     )
     assert restarted.last_actions() == {"critical": (65_000, "up")}
-    # H3 exempt basis: the scale-up is restored too, as not observed by this process.
-    assert restarted.last_upscales() == {"critical": (65_000, False)}
-    # The restarted controller holds on the unreflected window instead of waking again.
-    held = run_rescue_tick(_snapshot(20_000), queue=restarted, registry=_registry())
-    assert held.submitted == 0
-    assert "rescue_target_hold:critical:desired=3:covered=3" in held.events
+    # The restored target stays in the C1 ledger (one plan never counts it twice) until
+    # a fleet view produced after its completion shows it - state only (TSS only,
+    # 2026-10-29): no wait for the metrics window to reflect it.
+    from tre_controller.loops.tick import _rescue_bases
+    from tre_controller.planning.planner import ClusterView
+
+    older = ClusterView(topology=_registry().topology(), bindings=(), state_ms=60_000)
+    snap = _snapshot(20_000)
+    assert _rescue_bases(snap, restarted, older) == {"critical": RescueBasis(base=after.base, covered=after.covered)}
+    assert _rescue_bases(snap, restarted, _replace(older, state_ms=66_000)) == {}
 
 
 def test_scale_memory_of_a_target_still_running_at_the_restart_is_done_at_load():
@@ -456,51 +452,6 @@ def test_controller_state_store_scale_memory_roundtrip():
     store = ControllerStateStore(_Redis())
     store.save_scale_memory("m", {"last_done": [1, "up"], "rescue": None})
     assert store.load_scale_memory() == {"m": {"last_done": [1, "up"], "rescue": None}}
-
-
-def _registry_with_tau(tau_ms, **scaling):
-    base = _base_registry()
-    spec = base.model("critical")
-    spec = _replace(spec, trs=_replace(spec.trs, ema_tau_ms=tau_ms))
-    return Registry(base.topology(), [spec], scaling=ScalingRegistryConfig(**scaling))
-
-
-def test_settle_waits_k_ema_time_constants_after_the_window_start():
-    queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
-    queue.record_rescue_covered("critical", RescuePlan(target=4, desired=4, base=2, covered=4))
-    registry = _registry_with_tau(10_000.0)  # default k = 2 -> 20 s
-    assert rescue_settle_ms(registry, "critical") == 20_000.0
-    assert "critical" in _rescue_bases(_snapshot(65_000), queue, registry)  # the F4 rule alone: settled
-    assert "critical" in _rescue_bases(_snapshot(84_999), queue, registry)
-    assert "critical" not in _rescue_bases(_snapshot(85_000), queue, registry)
-    no_ext = _registry_with_tau(10_000.0, rescue_settle_ema_k=0)
-    assert "critical" not in _rescue_bases(_snapshot(65_000), queue, no_ext)
-    assert rescue_settle_ms(_registry_with_tau(None), "critical") == 0.0  # legacy fixed alpha
-    for bad in (-1, "x", True):
-        with pytest.raises(ValueError):
-            parse_scaling_config({"rescue_settle_ema_k": bad})
-
-
-def test_settle_extension_applies_only_while_o1_does_not_track_the_model():
-    """Q2 (2026-10-06): while O1 tracks the model (its breakpoint restarts the EMA and the
-    evidence gate holds the receiver) a target this process dispatched settles on the
-    window-start rule alone; the k * ema_tau extension is the fallback when O1 does not
-    track it, and for a target whose done_ms is not an observed completion (covered by a
-    probe preemption whose unhide is still to come; restored after a restart)."""
-    queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
-    plan = RescuePlan(target=4, desired=4, base=2, covered=2)
-    queue.submit([ScaleAction("critical", 2, "critical_idle_capacity", "rescue", receiver="critical", rescue=plan)])
-    asyncio.run(queue.drain_once())
-    registry = _registry_with_tau(10_000.0)  # default k = 2 -> 20 s
-    tracked = {"critical": {"o1_routable_tracked": True}}
-    untracked = {"critical": {"o1_routable_tracked": False}}
-    assert "critical" not in _rescue_bases(_snapshot(65_000), queue, registry, tracked)
-    assert "critical" in _rescue_bases(_snapshot(64_999), queue, registry, tracked)  # still before it
-    assert "critical" in _rescue_bases(_snapshot(84_999), queue, registry, untracked)
-    assert "critical" not in _rescue_bases(_snapshot(85_000), queue, registry, untracked)
-    covered = ActionQueue(_Client(), now_ms=_Clock(65_000))
-    covered.record_rescue_covered("critical", RescuePlan(target=4, desired=4, base=2, covered=4))
-    assert "critical" in _rescue_bases(_snapshot(84_999), covered, registry, tracked)
 
 
 # ===================================================== review round 2 (2026-10-01)

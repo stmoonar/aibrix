@@ -154,8 +154,10 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     # P2-6 donor hold removed (2026-10-02, design 20261002-controller-transfer): the
     # deprecated key is not set any more (it would only log a deprecation warning).
     assert "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS" not in _env(controller)
-    # Timer cleanup (2026-10-02): the F4 cooldown is the fallback while O1 is not active.
-    assert _env(controller)["TRE_ACTION_COOLDOWN"] == "1"
+    # TSS only (2026-10-29): the F4 window cooldown and the onset warmup guard are gone
+    # (a set value would only log that it is ignored).
+    assert "TRE_ACTION_COOLDOWN" not in _env(controller)
+    assert "TRE_SIGNAL_WARMUP_MS" not in _env(controller)
     # 2026-09-29: SafeScale thresholds come from registry safescale.slo_mode; the env
     # values are optional overrides and must not be pinned by the overlay.
     assert "SAFE_SCALE_TTFT_P95_SLO_MS" not in _env(controller)

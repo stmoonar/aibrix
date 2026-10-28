@@ -176,7 +176,7 @@ def restrict_to_serving(
       per-replica alt signals divide by the serving count).
 
     A window with no per-pod breakdown (synthetic / offline) only gets the counts.
-    Its ``suffix_windows`` (O1) are restricted the same way.
+    Its ``suffix_windows`` (the SafeScale tail) are restricted the same way.
     """
     suffixes = tuple(
         restrict_to_serving(suffix, sleeping_pods=sleeping_pods, routable_pods=routable_pods)

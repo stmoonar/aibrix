@@ -330,7 +330,7 @@ def test_revalidation_skips_a_donor_that_already_slept() -> None:
     asyncio.run(scenario())
 
 
-def test_model_state_box_marks_unconfirmed_receivers_and_expires() -> None:
+def test_model_state_box_marks_held_contexts_unconfirmed_and_expires() -> None:
     now = {"ms": 100_000}
     box = ModelStateBox(max_age_ms=30_000, now_ms=lambda: now["ms"])
 
@@ -346,7 +346,7 @@ def test_model_state_box_marks_unconfirmed_receivers_and_expires() -> None:
             "b": cls("b", ModelState.LOW, ModelRole.RECEIVER),
             "c": cls("c", ModelState.HIGH, ModelRole.DONOR),
         },
-        {"b": {"signal_warm": False}},
+        {"b": {"sample_quality_hold": "tokens_missing"}},
         ts_ms=95_000,
     )
     assert box.get() == {"a": "critical", "b": UNCONFIRMED, "c": "high"}

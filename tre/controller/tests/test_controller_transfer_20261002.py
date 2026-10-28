@@ -42,8 +42,8 @@ from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.state.store import StateStore
 
 from test_action_queue_review3 import ScriptedSM, _calls
-from test_o1_breakpoint_window_20261001 import _registry as _o1_registry
-from test_o1_breakpoint_window_20261001 import _snap, _window
+from test_tss_only_20261029 import _registry as _o1_registry
+from test_tss_only_20261029 import _snap, _window
 from test_planner_slot_occupancy import TOPOLOGY, _cls
 from test_safescale_binding_commit import FakeRedis, InProcessServiceManager
 from plan_shim import LegacyFakeQueue as ActionQueue, PlanShim  # pre-plan fakes behind POST /v2/plans
@@ -236,7 +236,7 @@ def test_target_scale_down_is_accounted_by_taken():
     fresh.submit((down,))
     [second] = asyncio.run(fresh.drain_once())
     assert (second.ok, second.taken) == (True, 0)
-    assert fresh.last_actions() == {} and fresh.view_changes() == {} and fresh.routable_changes() == {}
+    assert fresh.last_actions() == {} and fresh.view_changes() == {}
     assert fresh.drain_events() == ["scale_clamped_by_floor:7b:taken=0:asked=2"]
 
 

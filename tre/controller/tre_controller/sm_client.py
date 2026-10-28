@@ -125,7 +125,7 @@ class ServiceManagerError(Exception):
         503 while shutting down, or a 409 whose code says it was refused up front
         (``routable_unknown``, ``floor_violation``, ``writer_busy``, a located wake
         refusal other than ``wake_failed``). The controller then records no change (no
-        view-pending / O1 stamp, no last action) and re-plans on the next tick. A 409
+        view-pending stamp, no last action) and re-plans on the next tick. A 409
         without an ``error`` code (the SM's plain RetryLater, sent only by the unhide of
         a pod not confirmed awake and the Pod startup admission) is not recognised:
         its outcome counts as unknown."""

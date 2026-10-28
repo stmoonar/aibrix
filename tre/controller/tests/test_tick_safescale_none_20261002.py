@@ -38,4 +38,4 @@ def test_a_pathless_scale_down_sends_nothing():
     assert queue.stats()["sleep_path_refused_total"] == 1
     assert queue.stats()["dispatch_exceptions_total"] == 0
     # O1 must not see a routable change that never happened.
-    assert queue.routable_changes() == {}
+    assert queue.view_changes() == {}

@@ -150,16 +150,16 @@ class DispatchResult:
     taken: int | None = None
     #: 2026-10-02: the SM refused the call before changing anything (``routable_unknown``,
     #: ``writer_busy``, ``floor_violation``, a located wake refusal, 400 / 404 / 503):
-    #: accounted as not executed - no view-pending / O1 stamp, no last action.
+    #: accounted as not executed - no view-pending stamp, no last action.
     not_executed: bool = False
     #: Review P3 (2026-10-06): pods a multi-pod binding-power call changed before a
     #: later pod failed. Such a failed result still changed the fleet: it is stamped
-    #: (O1 / view-pending), recorded as the model's last action and counted for its
+    #: (view-pending), recorded as the model's last action and counted for its
     #: rescue target.
     changed: tuple[str, ...] = ()
     #: Review P2-2 (2026-10-06): a growth the SM filled in part (409 ``partial`` /
     #: 200 ``unfilled``) that woke nothing (no ``wake`` action, nothing ``picked``):
-    #: the routable set did not change - no O1 / view-pending stamp.
+    #: the routable set did not change - no view-pending stamp.
     woke_none: bool = False
 
 
@@ -288,21 +288,10 @@ class ActionQueue:
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._last_done: dict[str, tuple[int, str]] = {}
-        #: O1: model -> epoch ms the last SM call that can change its routable count
-        #: (scale / wake / sleep / hide / unhide / receiver target) returned - ok or not.
-        #: A change the SM made during that call happened before this stamp, so it
-        #: never dates a breakpoint early. In memory only (a restart starts empty).
-        self._routable_change: dict[str, tuple[int, int]] = {}
         #: Timer cleanup review P2-1: model -> (when the last SM call that can change its
-        #: routable count returned, ok or not, "up" / "down" hold rule) for the O1
-        #: view-pending gate. An unhide (probe rollback) holds like "down": a CRITICAL
-        #: receiver passes, LOW receivers and donors wait for a view showing it.
+        #: routable count returned, ok or not, its direction) for the view-pending
+        #: guard: the model takes no new action until a fleet view newer than it.
         self._view_change: dict[str, tuple[int, str]] = {}
-        #: 2026-10-26 (H3 exempt basis): model -> (when the last SM call that may have
-        #: added routable replicas to it returned - any scale-up path: rescue, LOW,
-        #: fairness, relay receiver, SafeScale receiver target -, observed by this
-        #: process). See :meth:`last_upscales`. Durable with the scale memory.
-        self._last_upscale: dict[str, tuple[int, bool]] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
         #: Review P2-1 (2026-10-06): (donor, receiver) -> the hold of a relay the SM
@@ -333,7 +322,7 @@ class ActionQueue:
         #: action is finished for good (review 4 P2-4): the probe is resolved then.
         self._on_oneshot_done = on_oneshot_done
         # F2 (2026-10-07): called after an SM call of ours changed the fleet (every
-        # O1 / view-pending stamp below) - the app asks for a cluster-view refresh.
+        # view-pending stamp below) - the app asks for a cluster-view refresh.
         self._on_fleet_change = on_fleet_change
         #: running dispatch task -> its queued action (updated as a commit progresses)
         self._running: dict[asyncio.Future, QueuedAction] = {}
@@ -544,32 +533,12 @@ class ActionQueue:
     def last_actions(self) -> dict[str, tuple[int, str]]:
         return dict(self._last_done)
 
-    def routable_changes(self) -> dict[str, tuple[int, int]]:
-        """O1: model -> (when the last SM call that can change its routable count
-        returned, the direction it could move it: +1 / -1) - see ``_routable_change``;
-        the only breakpoint dating hint."""
-        return dict(self._routable_change)
-
     def view_changes(self) -> dict[str, tuple[int, str]]:
         """Timer cleanup review P2-1: model -> (when its last routable-changing SM call
         returned - also a failed or partial one, also an unhide -, hold direction). A
         relay records both sides (donor "down", receiver "up"); a call that changed
         nothing (``taken: 0``, a relay side with no pair) records nothing (2026-10-02)."""
         return dict(self._view_change)
-
-    def last_upscales(self) -> dict[str, tuple[int, bool]]:
-        """H3 exempt basis (2026-10-26): model -> (when its last scale-up SM call
-        returned, observed). Every call stamped with the "up" view-hold rule counts - a
-        scale-up / wake (any planner path: rescue, LOW, fairness), a relay's receiver
-        side, a SafeScale receiver target - also a failed one that changed pods; a call
-        that certainly changed nothing is not stamped (see ``_stamp_changes``). An
-        unhide is not a scale-up (it holds like "down"). ``observed`` False = restored
-        from the durable scale memory of a previous controller. Not overwritten by a
-        later scale-down. The planner tick holds the O1-exempt free-GPU step on it
-        (``_unsettled_upscales``) until the decision window starts after it (plus the
-        settle extension when not observed / not O1-tracked); the model also leaves the
-        exempt path once its signal is warm again (then the normal C1 path decides)."""
-        return dict(self._last_upscale)
 
     def relay_holds(self) -> dict[tuple[str, str], RelayHold]:
         """Review P2-1: (donor, receiver) -> :class:`RelayHold` of its last relay when
@@ -1333,17 +1302,11 @@ class ActionQueue:
                         done_ms=now if done is None or int(rescue.get("outstanding", 0)) > 0 else int(done),
                     )
                     self._restored_unchecked.add(str(model))
-                last_up = entry.get("last_up")
-                if last_up is not None and not (max_age is not None and max_age > 0 and now - int(last_up) > max_age):
-                    # Not observed by this process: the tick releases it by the window
-                    # rule with the EMA extension (like a restored rescue target).
-                    self._last_upscale[str(model)] = (int(last_up), False)
             except (KeyError, TypeError, ValueError, IndexError) as exc:
                 LOG.warning("scale memory of %s ignored: %r", model, exc)
-        if self._rescue or self._last_done or self._last_upscale:
+        if self._rescue or self._last_done:
             LOG.info(json.dumps({"event": "scale_memory_restored", "rescue": sorted(self._rescue),
-                                 "last_done": sorted(self._last_done),
-                                 "last_up": sorted(self._last_upscale)}, sort_keys=True))
+                                 "last_done": sorted(self._last_done)}, sort_keys=True))
 
     def check_restored_targets(self, routable: Mapping[str, int]) -> list[str]:
         """C1 review P3-1: once, at the first tick after a restart, drop every restored
@@ -1371,10 +1334,8 @@ class ActionQueue:
             return
         last = self._last_done.get(model)
         record = self._rescue.get(model)
-        last_up = self._last_upscale.get(model)
         entry = {
             "last_done": list(last) if last else None,
-            "last_up": int(last_up[0]) if last_up else None,
             "rescue": None if record is None else {
                 "target": record.target, "desired": record.desired, "base": record.base,
                 "covered_before": record.covered_before, "issued_ms": record.issued_ms,
@@ -1681,7 +1642,7 @@ class ActionQueue:
 
     def _sleep_path_refused(self, member, exc: Exception) -> DispatchResult:
         # Nothing reached the SM: own counter, one error line, no traceback, and no
-        # routable-change stamp (O1 must not see a change that never was).
+        # view-pending stamp (no change happened).
         self._stats["sleep_path_refused_total"] += 1
         LOG.error(
             json.dumps(
@@ -1800,7 +1761,7 @@ class ActionQueue:
                 picked=picked, changed=woke,
             )
         result = _dispatch_result(model=action.model, action_kind="scale", response=plan_items.item_failure(item))
-        # Nothing woke: no O1 / view-pending stamp. ``wake_conflict`` (the first refusal)
+        # Nothing woke: no view-pending stamp. ``wake_conflict`` (the first refusal)
         # is information only - every refusal is an event already.
         return replace(result, retriable=False, woke_none=True)
 
@@ -1878,19 +1839,15 @@ class ActionQueue:
         return result
 
     def _stamp_changes(self, action, model: str, result: DispatchResult) -> None:
-        """O1 / view-pending stamps, after the SM answered: a failed or partial call may
+        """View-pending stamps, after the SM answered: a failed or partial call may
         still have changed the routable set, so it is stamped too - except a call that
         certainly changed nothing (2026-10-02): a model-level shrink with ``taken: 0``,
         a relay side without any pair, a refused relay, a partial /
         unfilled growth that woke nothing (review P2-2)."""
         now = int(self._now_ms())
 
-        def stamp(target: str, direction: int, hold: str) -> None:
-            self._routable_change[target] = (now, direction)
+        def stamp(target: str, hold: str) -> None:
             self._view_change[target] = (now, hold)
-            if hold == "up":
-                self._last_upscale[target] = (now, True)
-                self._persist_scale_memory(target)
             if self._on_fleet_change is not None:
                 try:
                     self._on_fleet_change()
@@ -1905,7 +1862,7 @@ class ActionQueue:
             return  # a partial / unfilled growth that woke nothing (review P2-2)
         if isinstance(action, ScaleAction) and action.delta < 0 and result.ok and result.taken == 0:
             return  # the replica floor clamped the shrink to nothing: no change
-        stamp(getattr(action, "model", model), _routable_direction(action), _view_hold_direction(action))
+        stamp(getattr(action, "model", model), _view_hold_direction(action))
 
     def _still_wanted(self, action: QueueAction) -> str | None:
         if self._revalidate is None:
@@ -2119,21 +2076,9 @@ def _action_kind(action) -> str:
     return "unknown"
 
 
-def _routable_direction(action) -> int:
-    """+1 / -1: the direction an SM call can move a model's routable count."""
-    if isinstance(action, (ReceiverTarget, UnhideAction)):
-        return 1
-    if isinstance(action, HideAction):
-        return -1
-    if isinstance(action, ScaleAction):
-        return 1 if action.delta > 0 else -1
-    return 0
-
-
 def _view_hold_direction(action) -> str:
-    """O1 view-pending hold rule of a routable-changing SM call: a wake / scale-up holds
-    like "up" (no scale-down, no scale-up); a sleep, hide or unhide like "down" (a
-    CRITICAL receiver still scales up, nothing else)."""
+    """Direction of a routable-changing SM call for the view-pending guard (logged with
+    the hold): a wake / scale-up is "up"; a sleep, hide or unhide "down"."""
     if isinstance(action, ReceiverTarget):
         return "up"
     if isinstance(action, ScaleAction) and action.delta > 0:

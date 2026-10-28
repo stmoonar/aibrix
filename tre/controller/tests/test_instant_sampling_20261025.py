@@ -151,8 +151,7 @@ def test_a_flagged_serving_pod_blocks_the_donor_and_stays_in_the_window(case):
 
 def test_h2_receivers_with_slow_scrapes_scale_up_by_the_normal_step():
     """H2: every pod of the CRITICAL r scrapes only every 1 s (all flagged). The TSS is
-    computed, the rescue takes its one step on a free GPU, and the saturation rescue still
-    sees the pods' newest gauges."""
+    computed and the rescue takes its one step on a free GPU."""
     redis = _Redis()
     for pod in ("r-0", "r-1"):
         _write_pod(redis, "r", pod, running=20, waiting=10, gen_per_s=10, scraped=_slow)
@@ -170,10 +169,6 @@ def test_h2_receivers_with_slow_scrapes_scale_up_by_the_normal_step():
     up = sum(a.delta for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.model == "r"
              and a.delta > 0)
     assert up == 1
-    # The saturation rescue's input: each pod's newest gauges, observed (scraped_ms)
-    # just before the window end (round 4: the observation time, not the doc stamp).
-    for pod in snapshot.models["r"].per_pod.values():
-        assert (pod.latest_instant_ms, pod.latest_waiting) == (_slow(END), 10.0)
 
 
 def test_m1_a_serving_pod_without_any_doc_blocks_the_donor():
@@ -319,33 +314,3 @@ def test_a_round_300_ms_late_gives_no_stale():
     snapshot = store.read_snapshot(END - WINDOW, END, start_exclusive=True)
     freshness = window_freshness(snapshot, window_end_ms=END, window_ms=WINDOW, period_ms=EVIDENCE_2S)
     assert not freshness.fresh and freshness.reason.startswith(f"hist_not_written:{END}")
-
-
-def test_a_suffix_flag_survives_the_serving_restriction_and_holds_the_donor():
-    """L1 at the 2 s default: m-1 sleeps but its gateway docs are in the window; m-0
-    serves and lost 4 of the 16 instant docs of the O1 suffix (the last 8 s; the whole
-    window is fine). The decision window is that suffix; restricting it to the serving
-    pod keeps its flag, so m holds its donor evidence (no shrink / release / donor)."""
-    from tre_controller.loops.tick import _model_contexts
-    from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
-
-    bp = END - 8_000
-    redis = _Redis()
-    lost = frozenset(range(bp + INSTANT, END + 1, 4 * INSTANT))
-    _write_pod(redis, "m", "m-0", running=1, gen_per_s=100, evidence=EVIDENCE_2S, missing=lost)
-    _write_pod(redis, "m", "m-1", running=0, gen_per_s=0, evidence=EVIDENCE_2S)
-    registry = _registry("m")
-    store = _store(redis, registry, evidence=EVIDENCE_2S, suffix_period_ms=EVIDENCE_2S,
-                   suffix_breakpoint=lambda model: bp)
-    snapshot = store.read_snapshot(END - WINDOW, END, start_exclusive=True)
-    assert snapshot.models["m"].sample_incomplete_pods == ()
-    assert [w.sample_incomplete_pods for w in snapshot.models["m"].suffix_windows] == [("m-0",)]
-
-    state = SignalState(breakpoint=BreakpointWindowConfig(
-        enabled=True, onset_guard=False, min_evidence_ms=4_000))
-    state.observe_traffic("m", has_traffic=True, window_start_ms=bp - WINDOW, window_end_ms=bp)
-    view = ClusterView(topology=registry.topology(), bindings=(
-        _binding("m-0", "m", 0), _binding("m-1", "m", 1, awake=False)))
-    contexts, _events = _model_contexts(snapshot, registry, cluster_view=view, signal_state=state)
-    assert contexts["m"]["sample_quality_hold"] == "samples_incomplete"
-    assert contexts["m"]["window_idle"] is False

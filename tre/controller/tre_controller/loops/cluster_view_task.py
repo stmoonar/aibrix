@@ -195,8 +195,8 @@ async def refresh_cluster_view_once(
         # Timer cleanup review P2-2: the request time is a lower bound of the state's time.
         requested_ms = int(wall_clock_ms())
         state = await client.get_state()
-        # O1: stamped after the response arrived - every change the view shows happened
-        # at or before this time (an upper bound, so a breakpoint is never dated early).
+        # Stamped after the response arrived - every change the view shows happened at
+        # or before this time (an upper bound).
         fetched_ms = int(wall_clock_ms())
         cluster_view = replace(
             cluster_view_from_state(state, topology),

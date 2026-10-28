@@ -41,8 +41,7 @@ from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
 from tre_controller.planning.safescale_evidence import HideAnchor
-from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
-from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
+from tre_controller.signals.trs import SignalState
 from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
 from tre_sm.allocator.slots import Binding, Slot
@@ -52,7 +51,7 @@ WINDOW = 30_000
 T0 = 1_000_000_000_000  # epoch-aligned: every period divides it
 MAX_RUNNING = 16
 #: Tokens per request: d's long answers take ~20 s, so an onset on d completes nothing
-#: for a while (the TSS numerator is 0: the onset saturation rescue decides).
+#: for a while (the TSS numerator is 0 while the queue grows: Z = 0, CRITICAL).
 OUTPUT_TOKENS = {"r": 200.0, "d": 2000.0}
 PROMPT_TOKENS = 500.0
 TTFT_BOUNDS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
@@ -87,8 +86,6 @@ class Scenario:
     gateway_offset_ms: int = 0
     #: SafeScale on the direct evidence path (early commit on).
     direct: bool = False
-    #: O1 (``scaling.breakpoint_window``) on.
-    o1: bool = True
     #: SafeScale's TPOT p95 threshold (config mode).
     tpot_slo_ms: float = 100.0
 
@@ -167,11 +164,6 @@ class _Queue:
     def inflight_models(self) -> set:
         return set()
 
-    def routable_changes(self) -> dict:
-        """When the last call that could change each model's routable count returned
-        (``ActionQueue.routable_changes``): the O1 breakpoint hint."""
-        return dict(self._sim.changes)
-
     def submit(self, actions):
         actions = tuple(actions)
         for action in actions:
@@ -183,7 +175,7 @@ class _Queue:
 class Run:
     """What one run did: (sim time ms, event) - the planner loops' events prefixed
     ``rescue|`` / ``fairness|``, the SafeScale observation events, the mock SM's applied
-    actions, ``hold:<model>:<O1 hold reason>`` per planner tick, ``stale`` - and the
+    actions, ``stale`` - and the
     probe verdicts in order."""
 
     events: list = field(default_factory=list)
@@ -205,16 +197,10 @@ class Sim:
         self.now = T0
         self.rendered = T0 - WINDOW - 2 * self.period
         self.run = Run()
-        self.changes: dict = {}  # model -> (ms, routable direction) of the last applied action
         cfg = ControllerConfig.from_env({})
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
         self.offset = int(scenario.gateway_offset_ms)
-        breakpoint = BreakpointWindowConfig.from_registry(self.registry)
-        self.signal_state = SignalState(
-            warmup_ms=cfg.signal_warmup_ms,
-            breakpoint=breakpoint if scenario.o1 else replace(breakpoint, enabled=False),
-            saturation=SaturationTracker(SaturationRescueConfig.from_registry(self.registry)),
-        )
+        self.signal_state = SignalState()
         slo = dict(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=float(scenario.tpot_slo_ms))
         self.collector = None
         if scenario.direct:
@@ -238,7 +224,6 @@ class Sim:
             expected_cadence=(INSTANT, self.period), cadence_enforce=True,
             min_sample_ratio=float(self.registry.scaling().sample_min_ratio or 0.0),
             suffix_period_ms=self.period,
-            suffix_breakpoint=lambda m: self.signal_state.breakpoint_ms(m) if self.signal_state.o1_active else None,
             suffix_tail=self.safescale.tail_start_ms,
         )
         self.box = SnapshotBox()
@@ -354,9 +339,6 @@ class Sim:
                 self.apply(member)
             return
         t = self.now
-        if isinstance(action, (ScaleAction, HideAction, UnhideAction)):
-            up = isinstance(action, UnhideAction) or (isinstance(action, ScaleAction) and action.delta > 0)
-            self.changes[action.model] = (t, 1 if up else -1)
         if isinstance(action, ScaleAction) and action.delta > 0:
             if action.pods:  # a named wake (sm-plans section 10)
                 for name in action.pods:
@@ -418,9 +400,6 @@ class Sim:
         loop = "rescue" if rescue else "fairness"
         for event in result.events:
             self.run.events.append((t, f"{loop}|{event}"))
-        for model, context in (result.model_contexts or {}).items():
-            # O1: the reason the model's window decides nothing (None = it decides).
-            self.run.events.append((t, f"hold:{model}:{context.get('signal_hold_reason')}"))
 
     async def _advance(self, until: int) -> None:
         while self.now < until:

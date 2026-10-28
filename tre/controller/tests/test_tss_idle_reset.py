@@ -4,7 +4,7 @@ Online (``TRSComputer`` / ``SignalState``) and offline (``smooth_series``,
 ``smooth_rows_by_cell``, ``r3_grid.compute_window_results``) share one rule, implemented
 once in ``tre_common.tss.TssEma.update``: a sample arriving more than one metrics window
 after the last advancing sample clears the EMA first. None / zero raws take part in the gap
-check but never advance the EMA. An idle tick clears the warmup onset and the EMA together.
+check but never advance the EMA. An idle tick clears the model's EMAs (SignalState.reset_ema).
 """
 from __future__ import annotations
 
@@ -176,8 +176,8 @@ def test_offline_path_matches_signal_state_bitwise() -> None:
         computer = state.computer_for("m", ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
         result = computer.compute(TRSInput.from_metrics(wm, spec.trs), theta_m=50.0,
                                   window_end_ms=wm.window_end_ms)
-        state.observe_traffic("m", has_traffic=result.Y_m > 1e-9,
-                              window_start_ms=wm.window_start_ms, window_end_ms=wm.window_end_ms)
+        if not result.Y_m > 1e-9:
+            state.reset_ema("m")  # the tick's idle reset
         online.append(result)
     assert [r.TRS for r in offline] == [r.TRS for r in online]
     assert [r.Z_m for r in offline] == [r.Z_m for r in online]
@@ -188,17 +188,15 @@ def test_offline_path_matches_signal_state_bitwise() -> None:
     assert recomputed == [r.TRS if r.defined else None for r in online]
 
 
-def test_idle_tick_clears_onset_and_every_ema() -> None:
-    state = SignalState(warmup_ms=-1)
+def test_idle_reset_clears_every_ema_of_the_model() -> None:
+    state = SignalState()
     computer = state.computer_for("m", ema_alpha=0.2485, ema_tau_ms=TAU)
     _run(computer, [_window(60_000, gen=30_000.0, running=1.0)])
     state.smooth_signal("m", "queue_len", 5.0, window_end_ms=60_000, tau_ms=TAU, window_ms=WIN)
     state.smooth_signal("other", "queue_len", 9.0, window_end_ms=60_000, tau_ms=TAU, window_ms=WIN)
-    state.observe_traffic("m", has_traffic=True, window_start_ms=30_000, window_end_ms=60_000)
-    assert state._onset_ms["m"] == 60_000 and computer.current_ema is not None
+    assert computer.current_ema is not None
 
-    state.observe_traffic("m", has_traffic=False, window_start_ms=35_000, window_end_ms=65_000)
-    assert state._onset_ms["m"] is None
+    state.reset_ema("m")
     assert computer.current_ema is None and computer.tss_ema.last_ms is None
     assert state._signal_ema[("m", "queue_len")].value is None
     assert state._signal_ema[("other", "queue_len")].value == 9.0  # other models untouched
@@ -207,14 +205,6 @@ def test_idle_tick_clears_onset_and_every_ema() -> None:
     r = computer.compute(TRSInput.from_metrics(_window(70_000, gen=3_000.0, running=1.0), _params()),
                          window_end_ms=70_000)
     assert r.TRS == r.TRS_raw
-
-
-def test_idle_tick_resets_ema_even_with_the_warmup_guard_disabled() -> None:
-    state = SignalState(warmup_ms=0)
-    computer = state.computer_for("m", ema_alpha=0.2485, ema_tau_ms=TAU)
-    _run(computer, [_window(60_000, gen=30_000.0, running=1.0)])
-    assert state.observe_traffic("m", has_traffic=False, window_start_ms=35_000, window_end_ms=65_000)
-    assert computer.current_ema is None
 
 
 # --- offline smoothing ----------------------------------------------------------------------
@@ -279,7 +269,7 @@ def test_sliding_40s_gap_online_equals_offline_bitwise() -> None:
     windows = _sliding_with_gap()
     assert any(window_is_idle(w.prompt_tokens, w.generation_tokens) for w in windows)
 
-    state = SignalState(warmup_ms=-1)
+    state = SignalState()
     online_tss, online_alt, results = [], [], []
     for wm in windows:
         computer = state.computer_for("m", ema_alpha=0.2485, ema_tau_ms=TAU)
@@ -289,8 +279,8 @@ def test_sliding_40s_gap_online_equals_offline_bitwise() -> None:
             "m", "queue_len", wm.avg_running + wm.avg_waiting, window_end_ms=wm.window_end_ms,
             tau_ms=TAU, window_ms=float(WIN), idle=idle,
         ))
-        state.observe_traffic("m", has_traffic=not idle, window_start_ms=wm.window_start_ms,
-                              window_end_ms=wm.window_end_ms)
+        if idle:
+            state.reset_ema("m")  # the tick's idle reset
         online_tss.append(result.TRS if result.defined else None)
         results.append(result)
 

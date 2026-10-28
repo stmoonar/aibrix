@@ -12,8 +12,8 @@ from __future__ import annotations
 import time
 from typing import Callable, Mapping
 
-#: A receiver the planner would not act on this tick (signal still warming up,
-#: band dwell not yet confirmed): neither "needs" nor "does not need" capacity.
+#: A model whose level is not of the current window (a held context: tokens missing):
+#: neither "needs" nor "does not need" capacity.
 UNCONFIRMED = "unconfirmed"
 
 
@@ -40,16 +40,10 @@ class ModelStateBox:
         contexts = contexts or {}
         for model, item in classifications.items():
             state = getattr(getattr(item, "state", None), "value", None) or str(getattr(item, "state", ""))
-            role = getattr(getattr(item, "role", None), "value", None)
             ctx = contexts.get(model) or {}
-            if role == "receiver" and (
-                not ctx.get("signal_warm", True)
-            ):
-                state = UNCONFIRMED
-            elif ctx.get("signal_hold_reason") is not None:
-                # Not a level of the current window's full evidence (O1 breakpoint,
-                # tokens missing -> held context, a stale pod scrape): the planner takes
-                # no donor from it, but a receiver may still act on it (step-capped).
+            if ctx.get("sample_quality_hold") == "tokens_missing":
+                # A held context (tokens missing): not a level of the current window -
+                # the planner takes no donor from it, a receiver may still act on it.
                 state = UNCONFIRMED
             previous = self._states.get(model)
             if previous is None or previous[1] <= int(ts_ms):

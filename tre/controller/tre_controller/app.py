@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import time
-import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
@@ -14,7 +13,6 @@ from tre_common.rediskeys import EVIDENCE_PERIOD_MS
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_common.tss import theta_basis_errors
 from tre_controller.config import ControllerConfig
-from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
     ActionQueue,
@@ -42,8 +40,7 @@ from tre_controller.planning.safescale_direct import (
     cluster_view_urls,
 )
 from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
-from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
-from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
+from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
@@ -192,12 +189,6 @@ def build_controller_task_specs(
                 ),
             )
         )
-    clock_monitor = _gateway_clock_monitor(deps, cfg)
-    if clock_monitor is not None:
-        interval_s = float(deps.registry.scaling().gateway_clock_check_s)
-        specs.append(
-            ControllerTaskSpec("gateway_clock", lambda: gateway_clock_task(clock_monitor, interval_s))
-        )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
     if deps.profiler is not None:
         specs.append(ControllerTaskSpec("profile_flush", lambda: deps.profiler.flush_loop()))
@@ -210,27 +201,6 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
-
-
-def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClockMonitor | None:
-    """O1 same-clock check (review P2-3): only with O1 on, a redis-backed store and
-    ``scaling.gateway_clock_check_s`` > 0."""
-    breakpoint = getattr(deps.signal_state, "breakpoint", None)
-    redis_client = getattr(deps.store, "redis_client", None)
-    scaling = getattr(deps.registry, "scaling", None)
-    if breakpoint is None or not breakpoint.enabled or redis_client is None or not callable(scaling):
-        return None
-    config = scaling()
-    if int(getattr(config, "gateway_clock_check_s", 0) or 0) <= 0:
-        return None
-    return GatewayClockMonitor(
-        redis_client,
-        [spec.name for spec in deps.registry.models()],
-        deps.signal_state,
-        # The probe watches instant docs: wait one instant period (+ 2 s) for a new one.
-        period_ms=int(getattr(cfg, "instant_sample_interval_ms", 10_000)),
-        tolerance_ms=int(config.gateway_clock_tolerance_ms),
-    )
 
 
 def _sleeping_pods(view: Any, model: str) -> set[str]:
@@ -326,24 +296,9 @@ def create_controller_dependencies(
         if share
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
-    breakpoint_config = BreakpointWindowConfig.from_registry(registry)
-    logging.getLogger("tre_controller.signals").info(
-        json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
-    )
-    saturation_config = SaturationRescueConfig.from_registry(registry)
-    logging.getLogger("tre_controller.signals").info(
-        json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
-    )
     scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
-    o1_suffix_can_warm = int(cfg.metrics_window_ms) > int(breakpoint_config.min_evidence_ms)
-    signal_state = SignalState(
-        warmup_ms=cfg.signal_warmup_ms,
-        # O1 breakpoint window (registry scaling.breakpoint_window /
-        # onset_warmup_guard / min_evidence_*), on observation times.
-        breakpoint=breakpoint_config,
-        # Onset saturation rescue (registry scaling.saturation_*).
-        saturation=SaturationTracker(saturation_config),
-    )
+    # TSS only (2026-10-29): Z on the whole sliding window plus the shared EMA.
+    signal_state = SignalState()
     # Round 4: the SafeScale tail span source, bound once the state machine exists.
     tail_start: list = []
     store = MetricsStore(
@@ -365,17 +320,9 @@ def create_controller_dependencies(
         percentile_mode=cfg.percentile_mode,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
-        # O1 and the SafeScale tail: the suffix windows they decide on, aligned to the
-        # histogram docs (only the requested ones are built).
+        # The SafeScale commit gate's tail (round 5): the post-hide suffix of a probing
+        # model, aligned to the histogram docs - the only suffix window built.
         suffix_period_ms=cfg.evidence_period_ms,
-        # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
-        # 2026-10-28 (review L1): a suffix is strictly shorter than the window, so with
-        # window <= min_evidence_ms O1 can never warm on one - not built then (the
-        # model waits for a whole window either way; hold reason no_suffix).
-        suffix_breakpoint=lambda model: (
-            signal_state.breakpoint_ms(model) if signal_state.o1_active and o1_suffix_can_warm else None
-        ),
-        # Round 5: and the SafeScale commit gate's tail - the post-hide suffix of a probing model.
         suffix_tail=lambda model: tail_start[0](model) if tail_start else None,
     )
     sm_client = ServiceManagerClient(

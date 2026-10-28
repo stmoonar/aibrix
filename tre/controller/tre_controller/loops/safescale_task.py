@@ -20,7 +20,6 @@ from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import (
     _cluster_view_counts,
     _routable_pod_ids,
-    breakpoint_observation,
     compute_model_signal,
     serving_window,
 )
@@ -171,12 +170,6 @@ def run_safescale_observation_tick(
             signal_state=signal_state,
             hidden_pods=tuple(getattr(probe, "pods", ())),
             gateway=(gateway_counters or {}).get(probe.model),
-            # O1: the same routable-count observation the planner tick makes.
-            routable_observation=(
-                breakpoint_observation(cluster_view, queue, probe.model, metrics.window_end_ms)
-                if probe.model in _cluster_view_counts(cluster_view)
-                else None
-            ),
             tail_start_ms=_tail_start_ms(safescale, probe.model),
             # Review L2: the alt signals sum the routable pods (the probe's hidden pods out).
             routable_pod_ids=(
@@ -695,41 +688,20 @@ def _observation_from_metrics(
     signal_state: SignalState | None = None,
     hidden_pods: tuple[str, ...] = (),
     gateway: GatewayCounters | None = None,
-    routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
     tail_start_ms: int | None = None,
     routable_pod_ids: frozenset[str] | None = None,
 ) -> ProbeObservation:
-    if signal_state is not None and getattr(signal_state, "breakpoint", None) is not None:
-        # O1: the planner tick's computation (same effective window, same EMA). The hide
-        # is a breakpoint: until the post-hide evidence is warm, Z is the whole window's
-        # raw value (no EMA - never the older, pre-hide-weighted EMA); then the post-hide
-        # window's. Both are at least as strict as the pre-O1 EMA'd straddling Z.
-        computed = compute_model_signal(
-            spec.name,
-            metrics,
-            spec,
-            signal_source=signal_source,
-            signal_state=signal_state,
-            routable_observation=routable_observation,
-            routable_pod_ids=routable_pod_ids,
-        )
-        result, signal = computed.result, computed.signal
-    else:
-        if signal_state is not None:
-            computer = signal_state.computer_for(
-                spec.name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
-            )
-        else:
-            computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-        result = computer.compute(
-            TRSInput.from_metrics(metrics, spec.trs),
-            theta_m=spec.trs.theta_m,
-            window_end_ms=metrics.window_end_ms,
-        )
-        signal = get_signal(
-            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
-            routable_pod_ids=routable_pod_ids,
-        )
+    # The planner tick's computation: the whole window, the same shared EMA (2026-10-29:
+    # no breakpoint window; the commit gate's post-hide tail is the raw tail below).
+    computed = compute_model_signal(
+        spec.name,
+        metrics,
+        spec,
+        signal_source=signal_source,
+        signal_state=signal_state,
+        routable_pod_ids=routable_pod_ids,
+    )
+    result, signal = computed.result, computed.signal
     return ProbeObservation(
         ts_ms=ts_ms,
         ttft_p95_ms=metrics.ttft_p95_ms,
@@ -773,7 +745,7 @@ def _tail_terms(
     ``tail_start_ms`` (the store builds that suffix, ``MetricsStore(suffix_tail=...)``)
     to the window end; the whole window once the hide precedes it (one metrics window,
     30 s, of post-hide evidence). One value per quantity over that span: raw Z (no
-    EMA, the TSS numerator scaled to a whole window as O1 does), traffic, the remaining
+    EMA, the TSS numerator scaled to a whole window), traffic, the remaining
     pods' KV-cache fill (each pod's mean over its instant docs: time-weighted) and the
     latency p95s; plus its evidence - the observed span (``Observed``, gateway clock)
     and the requests the remaining pods completed in it (unscaled; None = unknown, a

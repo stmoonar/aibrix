@@ -16,9 +16,13 @@ from tre_controller.loops.metrics_task import REFRESH_MODES
 #: TRE_FLOOR_VIOLATION_COOLDOWN_TICKS: the P2-6 donor hold after a 409 floor_violation
 #: (design 20261002-controller-transfer; the planner bounds every donor by the SM
 #: floor_headroom).
+#: TSS only (2026-10-29, design 20261029-tss-only): TRE_ACTION_COOLDOWN (the review F4
+#: hold until a metrics window starts after a model's last action) and
+#: TRE_SIGNAL_WARMUP_MS (the ADR-0013 onset warmup guard) - signal-lag holds; only the
+#: fleet-view guard (view-pending) remains.
 REMOVED_TIMER_ENV = (
     "TRE_DWELL_WINDOWS", "TRE_DWELL_STATES", "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS",
-    "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS",
+    "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS", "TRE_ACTION_COOLDOWN", "TRE_SIGNAL_WARMUP_MS",
 )
 
 LOG = logging.getLogger(__name__)
@@ -130,9 +134,9 @@ class SafeScaleConfig:
     # instances and vLLM running + waiting) and the evidence floor holds. Rollbacks
     # unchanged.
     early_commit: bool = True
-    # Q4 (2026-10-06), the single evidence floor = registry scaling.min_evidence_ms (O1's
-    # warm rule; no separate safescale key): round 4, the observed span after the hide
-    # confirmation (early commit, with at least the donor's p95 e2e since it) and after a
+    # Q4 (2026-10-06), the single evidence floor = registry scaling.min_evidence_ms (no
+    # separate safescale key; its only reader since 2026-10-29): round 4, the observed
+    # span after the hide confirmation (early commit, with at least the donor's p95 e2e since it) and after a
     # rollback (the retry hold). No W / 2 term, no separate minimum observation time.
     early_commit_min_evidence_ms: float = 20_000.0
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
@@ -172,7 +176,6 @@ class ControllerConfig:
     percentile_mode: str
     signal_source: str
     signal_idle_rps_eps: float
-    signal_warmup_ms: int
     #: A model whose tokens are missing keeps its last context while its last good window
     #: ended at most this long before (ms, gateway window ends; TRE_PAPER_STALE_MAX_MS).
     paper_stale_max_ms: int
@@ -198,11 +201,6 @@ class ControllerConfig:
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the t1 guard.
     safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
-    # Review F4: per-model action cooldown (hold a model's next action until a metrics
-    # window starting after its last executed action). Since the timer cleanup
-    # (2026-10-02) only a fallback for models O1 does not track (O1 off / suspended, no
-    # fleet view, stale-held context); TRE_ACTION_COOLDOWN=0 disables the fallback.
-    action_cooldown: bool
     # Opt-in control-loop profiling (research toggle, off by default). When
     # profile_enabled is False the profiler object is None everywhere (zero overhead).
     profile_enabled: bool
@@ -215,8 +213,7 @@ class ControllerConfig:
     # TRE_METRICS_REFRESH_MODE: phase_aligned (default) | free_running (old loop).
     metrics_refresh_mode: str = "phase_aligned"
     # TRE_EVIDENCE_PERIOD_MS: the gateway's histogram-doc period = the phase-aligned
-    # window grid, the O1 grid, the SafeScale evidence step and the saturation "latest
-    # grid". Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (declared cadence hash) and be
+    # window grid and the SafeScale evidence step / tail grid. Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (declared cadence hash) and be
     # a multiple of instant_sample_interval_ms (the gateway's instant-doc period).
     evidence_period_ms: int = EVIDENCE_PERIOD_MS
     # TRE_METRICS_PHASE_OFFSET_MS: read at boundary + offset (a floor, see adapt).
@@ -301,11 +298,6 @@ class ControllerConfig:
         if metrics_window_mode not in WINDOW_MODES:
             raise ValueError(f"TRE_METRICS_WINDOW_MODE must be one of {sorted(WINDOW_MODES)}")
 
-        try:
-            signal_warmup_ms = int(str(values.get("TRE_SIGNAL_WARMUP_MS", "-1")).strip())
-        except (TypeError, ValueError) as exc:
-            raise ValueError("TRE_SIGNAL_WARMUP_MS must be an integer (-1 auto, 0 off, >0 ms)") from exc
-
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
         metrics_refresh_mode = _get_str(values, "TRE_METRICS_REFRESH_MODE", "phase_aligned")
@@ -338,7 +330,7 @@ class ControllerConfig:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below TRE_EVIDENCE_PERIOD_MS")
 
         safescale_registry = _safescale_registry(registry_path)
-        early_evidence_ms = _o1_min_evidence_ms(registry_path)
+        early_evidence_ms = _min_evidence_ms(registry_path)
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
             tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
@@ -427,9 +419,6 @@ class ControllerConfig:
             signal_idle_rps_eps=_get_nonneg_float(
                 values, "TRE_SIGNAL_IDLE_RPS_EPS", 0.05
             ),
-            # F-onset warmup guard: -1 auto (window fully inside traffic period),
-            # 0 disabled (A/B ablation), >0 explicit span-since-onset in ms.
-            signal_warmup_ms=signal_warmup_ms,
             paper_stale_max_ms=_get_span_ms(
                 values, "TRE_PAPER_STALE_MAX_MS", "TRE_PAPER_STALE_MAX_WINDOWS", 30_000, minimum=1
             ),
@@ -444,7 +433,6 @@ class ControllerConfig:
                 values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", False
             ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
-            action_cooldown=_get_bool(values, "TRE_ACTION_COOLDOWN", True),
             profile_enabled=_get_bool(values, "TRE_PROFILE", False),
             profile_stream_maxlen=_get_positive_int(values, "TRE_PROFILE_STREAM_MAXLEN", 200_000),
             profile_proc_sample_interval_s=_get_positive_float(
@@ -533,9 +521,9 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
     return SafeScaleConfig.min_window_ms
 
 
-def _o1_min_evidence_ms(registry_path: str) -> int:
-    """Registry scaling.min_evidence_ms (O1 warm rule; 20 s without a readable registry):
-    also the SafeScale early commit's post-hide evidence span (Q4)."""
+def _min_evidence_ms(registry_path: str) -> int:
+    """Registry scaling.min_evidence_ms (20 s without a readable registry): the SafeScale
+    early commit's post-hide evidence span and the rollback retry hold's (Q4)."""
     try:
         scaling = load_registry(registry_path).scaling()
         return int(getattr(scaling, "min_evidence_ms", 20_000) or 1)

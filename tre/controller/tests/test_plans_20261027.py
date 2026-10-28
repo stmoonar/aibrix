@@ -41,7 +41,7 @@ def test_a_target_already_met_makes_no_sm_call_and_stamps_nothing():
     by_model = {result.model: result for result in results}
     assert by_model["8b"].ok and by_model["8b"].woke_none
     assert by_model["m"].ok and by_model["m"].taken == 0
-    assert queue.view_changes() == {} and queue.routable_changes() == {} and queue.last_actions() == {}
+    assert queue.view_changes() == {} and queue.last_actions() == {}
     assert done == [("7b-0", "commit", "formal_commit_gate_passed")]
 
 

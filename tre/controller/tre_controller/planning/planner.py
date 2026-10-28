@@ -105,13 +105,13 @@ class ClusterView:
     #: ``gpus[].wakeable``. Empty with an SM that does not report it.
     blocked_gpus: frozenset = frozenset()
     #: Epoch ms the controller received this view from the SM (``refresh_cluster_view_once``);
-    #: a routable-count change it shows happened at or before it (O1 breakpoint time).
-    #: None = a synthetic view (tests / offline), see ``tick.breakpoint_observation``.
+    #: a routable-count change it shows happened at or before it.
+    #: None = a synthetic view (tests / offline).
     fetched_ms: int | None = field(default=None, compare=False)
     #: Timer cleanup review P2-2: epoch ms at or AFTER which the SM state of this view was
     #: produced (a lower bound): the time the controller sent the request (controller
     #: clock - timestamps are never compared across machines). An action that completed
-    #: at or before it is shown by the view (O1 view-pending gate). None = unknown
+    #: at or before it is shown by the view (view-pending guard). None = unknown
     #: (synthetic views): ``fetched_ms`` is used.
     state_ms: int | None = field(default=None, compare=False)
     #: 2026-10-02 (design 20261002-controller-transfer): serve ids the SM counts
@@ -443,13 +443,11 @@ def build_plan(
     active_probe_models: set[str] | None = None,
     inflight_models: set[str] | None = None,
     cluster_view: ClusterView | None = None,
-    cooldowns: Mapping[str, str] | None = None,
     probe_backoff_models: Mapping[str, str] | set[str] | None = None,
     preemptible_models: set[str] | None = None,
     rescue_bases: Mapping[str, RescueBasis] | None = None,
     view_pending: Mapping[str, str] | None = None,
     relay_holds: Mapping[tuple[str, str], RelayHold] | None = None,
-    unsettled_upscales: Mapping[str, int] | None = None,
 ) -> PlanResult:
     """One plan. Quantity only for the immediate relays (2026-10-02): a CRITICAL / LOW
     receiver's need is met first from free capacity (its sleeping bindings on free
@@ -461,8 +459,9 @@ def build_plan(
     again on the next tick from a new view (free capacity first). ``relay_holds``
     ((donor, receiver) -> :class:`RelayHold`): pairs the SM answered with nothing
     done on the fleet view that is still current - not planned again.
-    ``unsettled_upscales`` (model -> done ms): its last scale-up, of any path, that the
-    decision signal does not reflect yet - holds an O1-exempt receiver (H3)."""
+
+    ``view_pending`` (model -> direction of its last routable-changing SM call that this
+    plan's fleet view does not show yet): the model takes no new action, in any role."""
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
     # out a retry backoff. A CRITICAL receiver among them is still planned: the
@@ -499,14 +498,11 @@ def build_plan(
     # S5: GPUs the SM reports not wakeable are no wake / create capacity this tick (the
     # S3 per-GPU wake cooldown was removed on 2026-10-02: a refusal is an event only).
     occupancy = _SlotOccupancy(cluster_view) if cluster_view is not None else None
-    # Review F4 per-model cooldown (fallback since the timer cleanup 2026-10-02): model ->
-    # direction ("up"/"down") of its last executed action whose effect the decision
-    # window does not yet fully reflect - only for models O1 does not track this tick.
-    # ``view_pending`` (O1 evidence gate): models O1 tracks whose last action completed
-    # after the fleet view was fetched (no breakpoint can hold them yet), same rules.
-    # (The P2-6 floor-violation hold was removed on 2026-10-02: the donor's SM
-    # ``floor_headroom`` decides, and the SM clamps model-level shrinks.)
-    cooldown = _Cooldown(cooldowns or {}, events, view_pending=view_pending)
+    # Correctness guard (TSS only, 2026-10-29): a model whose last routable-changing SM
+    # call the fleet view does not show yet takes no new action. (The F4 window cooldown
+    # and the P2-6 floor-violation hold were removed: signal lag is accepted, the donor's
+    # SM ``floor_headroom`` decides and the SM clamps model-level shrinks.)
+    view_hold = _ViewPending(view_pending or {}, events)
 
     incomplete_models = _paper_state_incomplete_models(classifications)
     if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
@@ -521,89 +517,25 @@ def build_plan(
         events.extend(f"paper_state_incomplete_drop:{model}" for model in incomplete_models)
         classifications = [item for item in classifications if item.model_name not in incomplete_models]
 
-    # F-onset warmup guard: a receiver (CRITICAL/LOW) whose signal is not yet 'warm'
-    # (the sliding window still straddles this model's traffic onset -> TRS structurally
-    # low -> false CRITICAL/LOW) is suppressed for this tick. Applies to both receiver
-    # states, so it is consistent across rescue and fairness.
-    # ADR-0014: the former saturation bypass ("unless Q_ctl >= qsat") was removed. Warmup
-    # suppression is now unconditional; a genuine flash crowd in the warmup window is
-    # delayed at most one window (until the sliding window clears the traffic onset).
-    # O1 breakpoint window (signal_full_window present only with O1 on): a model whose
-    # metrics window still holds a breakpoint (traffic onset, routable-count change)
-    # takes part in no scale-down - neither HIGH / IDLE donor nor middle-zone donor - until
-    # a whole window lies after the breakpoint (scale-down stays cautious); as a receiver
-    # it acts once signal_warm (min_evidence_ms of observations after the breakpoint).
-    # Q3 (2026-10-06): an IDLE model whose whole current window is idle (``window_idle``:
-    # tokens known and zero, no queue, every serving pod scraped - never a held context)
-    # is exempt: no token at any replica count is the same evidence before and after
-    # the breakpoint.
-    # H3 (2026-10-06): O1 guards against over-scaling on a window that still describes
-    # the old regime. On a free GPU an over-scale costs one wake, so a CRITICAL receiver
-    # is not held: it takes free capacity only (its sleeping bindings on free GPUs, free
-    # slot groups; no donor, no SafeScale probe, no TP shrink, no defrag) and one step
-    # per decision, once its previous step is visible (``receiver_o1_exempt_pending``).
-    # 2026-10-07: no longer gated on ``o1_queue_rise`` (still computed, logged only):
-    # it compares ``waiting`` of the pods in both samples, and after a wake the old pods'
-    # waiting drains to 0 while running stays high, so it never held after a wake and
-    # the hold lasted about 20 s anyway. Without free capacity, or a LOW receiver: held.
-    # Only an O1 evidence hold is exempt (``_O1_EXEMPT_HOLD_REASONS``): a held context
-    # (``tokens_missing``), a stale scrape or a hold fallback is not current evidence.
-    warmup_suppressed: list[str] = []
-    breakpoint_held: list[str] = []
-    o1_exempt: dict[str, Mapping[str, Any] | None] = {}
-    kept: list = []
-    for item in classifications:
-        ctx = model_contexts.get(item.model_name, {})
-        if getattr(item, "saturation_rescue", False):
-            # Onset saturation rescue: CRITICAL exactly because the TSS is not warm yet
-            # (its own persistence span replaces the warmup / dwell gates).
-            kept.append(item)
-            continue
-        if item.role == ModelRole.RECEIVER:
-            if not ctx.get("signal_warm", True):
-                if (
-                    item.state == ModelState.CRITICAL
-                    and ctx.get("signal_full_window") is False
-                    and ctx.get("signal_hold_reason") in _O1_EXEMPT_HOLD_REASONS
-                ):
-                    o1_exempt[item.model_name] = ctx.get("o1_queue_rise")
-                    kept.append(item)
-                    continue
-                warmup_suppressed.append(item.model_name)
-                continue
-        elif (
-            ctx.get("signal_full_window", True) is False or ctx.get("sample_quality_hold")
-        ) and not _idle_window_evidence(item, ctx):
-            # sample_quality_hold (2026-10-25): a serving pod's samples are incomplete -
-            # no donor / shrink / release from the model (receivers are not affected).
-            breakpoint_held.append(item.model_name)
-            continue
-        kept.append(item)
-    if warmup_suppressed or breakpoint_held or o1_exempt:
-        for model in warmup_suppressed:
-            reason = model_contexts.get(model, {}).get("signal_hold_reason")
-            events.append(
-                f"receiver_held_breakpoint_window:{model}:{reason}"
-                if reason
-                else f"receiver_suppressed_signal_warmup:{model}"
-            )
-        events.extend(
-            f"donor_suppressed_samples_incomplete:{model}"
-            if model_contexts.get(model, {}).get("signal_full_window", True) is not False
-            else f"donor_suppressed_breakpoint_window:{model}"
-            for model in breakpoint_held
-        )
-        classifications = kept
-    # H3: exempt receivers that got a free-capacity step this tick (the others are
-    # reported as held at the end of the rescue section).
-    o1_exempt_planned: set[str] = set()
+    # I4 donor gate (2026-10-25): a model whose serving pods' samples are incomplete in
+    # this window, or whose context is a held one (tokens missing), gives nothing - no
+    # donor, shrink or release from it. Receivers are not affected.
+    donor_held = [
+        item.model_name
+        for item in classifications
+        if item.role != ModelRole.RECEIVER
+        and model_contexts.get(item.model_name, {}).get("sample_quality_hold")
+    ]
+    if donor_held:
+        events.extend(f"donor_suppressed_samples_incomplete:{model}" for model in donor_held)
+        classifications = [item for item in classifications if item.model_name not in donor_held]
 
-    critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]
-    # L2 (design 20261028-single-loop): TSS-confirmed CRITICAL receivers first, the most
-    # starved (lowest Z) first; onset saturation receivers after them, the most
-    # backlogged per replica (waiting / n) first; H3 O1-exempt receivers (the weakest
-    # evidence) last, lowest Z first. Never the registry order.
-    critical_receivers.sort(key=lambda item: _critical_order(item, model_contexts, o1_exempt))
+    # L2 (design 20261028-single-loop): CRITICAL receivers by Z ascending (the most
+    # starved first; 2026-10-29: TSS only, no saturation / exempt tiers). Never the
+    # registry order.
+    critical_receivers = sorted(
+        (item for item in classifications if item.state == ModelState.CRITICAL), key=receiver_sort_key
+    )
     low_receivers = sorted(
         (item for item in classifications if item.state == ModelState.LOW), key=receiver_sort_key
     )
@@ -671,7 +603,7 @@ def build_plan(
     def block_donors(receiver: str) -> dict[str, BlockDonor]:
         """L4 rev 2: the donor models a TP receiver's block may take pods of, now:
         IDLE / HIGH / HEALTHY (never LOW / CRITICAL), not the receiver, not probing, not
-        in flight, not down-blocked, above its floor after this plan's takes; a HIGH /
+        in flight, not view-pending, above its floor after this plan's takes; a HIGH /
         HEALTHY donor only while nothing of it is planned yet (one replica per plan)
         and not held by a probe of this plan or a rollback hold (scope ``all``)."""
         out: dict[str, BlockDonor] = {}
@@ -691,7 +623,7 @@ def build_plan(
             idle = item.state == ModelState.IDLE
             if not idle and (deltas.get(model, 0) != 0 or probe_held(item)):
                 continue
-            if cooldown.blocks(model, "down"):
+            if view_hold.blocks(model):
                 continue
             headroom = _donor_headroom(cfg, model, model_contexts, model_replicas) - abs(
                 min(deltas.get(model, 0), 0)
@@ -709,14 +641,13 @@ def build_plan(
     def plan_block(
         recv: ModelClassification,
         *,
-        free_only: bool,
         source_loop: SourceLoop,
         prefix: str,
         create_reason: str,
     ) -> bool:
         """L4 rev 2: one buddy block (+1 replica) for a TP receiver; False = none."""
         model = recv.model_name
-        donors = {} if free_only else block_donors(model)
+        donors = block_donors(model)
         choice = cheapest_block(model, occupancy, cluster_view, donors, cfg)
         if choice is None:
             return False
@@ -787,7 +718,7 @@ def build_plan(
         if deltas.get(recv.model_name, 0) > 0:
             # Already scaled up in this plan - one step per plan, never two.
             return None
-        if cooldown.blocks(recv.model_name, "up"):
+        if view_hold.blocks(recv.model_name):
             return None
         recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
         recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
@@ -801,7 +732,6 @@ def build_plan(
         return needed, min(needed, max(0, recv_assigned - recv_pods))
 
     rescue_bases = rescue_bases or {}
-    unsettled_upscales = unsettled_upscales or {}
     if cfg.rescue_due:
         # C1: (desired, base, covered) of each CRITICAL receiver planned this tick.
         rescue_ctx: dict[str, tuple[int, int, int]] = {}
@@ -813,6 +743,8 @@ def build_plan(
             # would wait behind it on the model resource anyway.
             if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
                 return None
+            if view_hold.blocks(recv.model_name):
+                return None
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
@@ -822,49 +754,16 @@ def build_plan(
             if recv_awake >= recv_max:
                 return None
             # L3 (design 20261028-single-loop): one step per plan. The rescue target ledger
-            # ("one deficit, one target") keeps an unreflected step from being repeated:
-            # while the decision window does not reflect the last target, the target is
-            # computed from the replicas that window describes (``base``) and only what
-            # exceeds the replicas that target added (``covered``) is planned - nothing,
-            # unless it landed nothing.
+            # ("one deficit, one target") keeps a step the fleet view does not show yet
+            # from being repeated: the target is computed from the replicas it was
+            # planned on (``base``) and only what exceeds the replicas that target added
+            # (``covered``) is planned - nothing, unless it landed nothing. State only
+            # (2026-10-29): once the view shows it, the next step follows the signal.
             basis = rescue_bases.get(recv.model_name)
-            exempt = recv.model_name in o1_exempt
-            if exempt:
-                # H3 review P1-2 / 2026-10-07: one piece of stale evidence buys one wake.
-                # An earlier rescue target O1 has not settled yet (``_rescue_bases``: no
-                # warm window after its breakpoint, landed or not), or a fleet view older
-                # than the last action (view-pending), holds the exempt receiver - released
-                # on evidence, not time.
-                # 2026-10-26: an earlier scale-up of ANY path holds it the same way
-                # (``unsettled_upscales``: LOW / fairness wakes, relays, SafeScale
-                # receiver targets leave no rescue target). Smoke 20261026: a LOW wake
-                # 1 -> 2 divided the old window's tokens by 2 (Z 0.97 -> 0.35, flat
-                # load) and the exempt path stacked a third replica 5 s later.
-                upscale_ms = unsettled_upscales.get(recv.model_name)
-                if basis is not None or upscale_ms is not None or (
-                    view_pending and recv.model_name in view_pending
-                ):
-                    events.append(
-                        f"receiver_o1_exempt_pending:{recv.model_name}"
-                        f":covered={basis.covered if basis is not None else None}:routable={recv_pods}"
-                        f":view_pending={bool(view_pending and recv.model_name in view_pending)}"
-                        f":upscale_ms={upscale_ms}"
-                    )
-                    return None
             base = basis.base if basis is not None else recv_pods
             covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
             desired = base + _scale_step(base, cfg.scale_step_ratio)
             raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
-            if getattr(recv, "saturation_rescue", False):
-                ctx = model_contexts.get(recv.model_name, {})
-                # Onset saturation rescue: no throughput evidence, the same one step; each
-                # further step re-confirms saturation on the pods the last one added.
-                events.append(
-                    f"saturation_rescue:{recv.model_name}:n={recv_pods}:target={desired}"
-                    f":waiting={_num_text(ctx.get('saturation_waiting'))}:kv={_num_text(ctx.get('saturation_kv'), 2)}"
-                    f":reason={ctx.get('saturation_reason')}:held_ms={ctx.get('saturation_held_ms')}"
-                    f":planned_max={max(0, raw_need)}"
-                )
             if raw_need <= 0:
                 if basis is not None:
                     events.append(
@@ -878,45 +777,21 @@ def build_plan(
         # Every CRITICAL receiver's sleeping-binding wakes are assigned jointly up
         # front, so an earlier receiver never takes the one free slot a later one
         # can wake into while it had another (multi-receiver slot stealing).
-        # H3 review P2-1: O1-exempt receivers (the weakest evidence) are not part of
-        # it - their wakes are assigned in a second pass, after every other CRITICAL
-        # receiver has planned its wakes and creates (the LOW receivers come after both,
-        # in the rebalance section),
-        # so they never take a free GPU a confirmed receiver needs.
         reserved_wakes = _plan_joint_wakes(
             occupancy,
-            [
-                (model, need[1])
-                for model, need in critical_needs.items()
-                if need is not None and model not in o1_exempt
-            ],
+            [(model, need[1]) for model, need in critical_needs.items() if need is not None],
             events=events,
         )
-        reserved_exempt_wakes: dict[str, list[Binding]] | None = None
         for recv in critical_receivers:
             need = critical_needs[recv.model_name]
             if need is None:
                 continue
             raw_need, wake_need = need
             first_action = len(actions)
-            # H3: an O1-exempt receiver takes free capacity only.
-            free_only = recv.model_name in o1_exempt
-            if free_only and reserved_exempt_wakes is None:
-                # Exempt receivers sort last (``_critical_order``): every confirmed
-                # receiver is planned by now.
-                reserved_exempt_wakes = _plan_joint_wakes(
-                    occupancy,
-                    [
-                        (model, item[1])
-                        for model, item in critical_needs.items()
-                        if item is not None and model in o1_exempt
-                    ],
-                    events=events,
-                )
             try:
                 gain_from_sleeping, wake_pods = _take_reserved_wakes(
                     occupancy,
-                    reserved_exempt_wakes if free_only else reserved_wakes,
+                    reserved_wakes,
                     receiver=recv.model_name,
                     need=wake_need,
                     events=events,
@@ -942,17 +817,15 @@ def build_plan(
                 if tp_size > 1 and occupancy is not None:
                     # L4 rev 2 (design 20261028-single-loop): a TP receiver takes one
                     # buddy block per plan (free GPUs, or the pods of eligible donors on
-                    # it); an H3 O1-exempt receiver free blocks only. No block: a defrag
-                    # (registry placement.defrag, off by default), else capacity_blocked.
+                    # it). No block: a defrag (registry placement.defrag, off by
+                    # default), else capacity_blocked.
                     if not plan_block(
                         recv,
-                        free_only=free_only,
                         source_loop="rescue",
                         prefix="critical",
                         create_reason="critical_empty_slot",
                     ):
-                        # H3: a migration moves other models - not free capacity.
-                        if not free_only and _plan_tp_defrag(
+                        if _plan_tp_defrag(
                             actions,
                             model=recv.model_name,
                             tp_size=tp_size,
@@ -999,8 +872,6 @@ def build_plan(
                     remaining_idle -= gain_from_idle
 
                 still_needed = raw_need - gain_from_idle
-                if free_only:
-                    continue  # H3: no donor, no middle-zone probe
                 for donor in paper_donors:
                     if still_needed <= 0:
                         break
@@ -1011,7 +882,7 @@ def build_plan(
                         or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
                     ):
                         continue
-                    if cooldown.blocks(donor.model_name, "down"):
+                    if view_hold.blocks(donor.model_name):
                         continue
                     headroom = _donor_headroom(cfg, donor.model_name, model_contexts, model_replicas)
                     if headroom <= 0:
@@ -1045,7 +916,7 @@ def build_plan(
                         or gave_this_plan(middle.model_name)  # one replica per plan (non-IDLE)
                     ):
                         continue
-                    if cooldown.blocks(middle.model_name, "down"):
+                    if view_hold.blocks(middle.model_name):
                         continue
                     headroom = _donor_headroom(cfg, middle.model_name, model_contexts, model_replicas)
                     if headroom <= 0 or probe_held(middle):
@@ -1096,24 +967,13 @@ def build_plan(
                     _tag_rescue_actions(
                         actions, first_action, recv, rescue_ctx[recv.model_name], events, probe_upscale_plans
                     )
-                if free_only:
-                    planned = sum(
-                        up[1]
-                        for up in (upscale_of(action) for action in actions[first_action:])
-                        if up is not None and up[0] == recv.model_name
-                    )
-                    if planned > 0:
-                        o1_exempt_planned.add(recv.model_name)
-                        events.append(
-                            _o1_exempt_event(recv.model_name, model_contexts, o1_exempt[recv.model_name], planned)
-                        )
 
         for idle in idle_models:
             if idle.model_name in active_probe_models or idle.model_name in inflight_models:
                 continue
             if deltas.get(idle.model_name, 0) != 0:
                 continue
-            if cooldown.blocks(idle.model_name, "down"):
+            if view_hold.blocks(idle.model_name):
                 continue
             pods = _effective_routable_replicas(idle.model_name, model_contexts, model_replicas)
             idle_min = _serving_floor(cfg, idle.model_name, model_contexts, model_replicas)
@@ -1144,7 +1004,7 @@ def build_plan(
                 continue
             if deltas.get(high.model_name, 0) != 0:
                 continue
-            if cooldown.blocks(high.model_name, "down"):
+            if view_hold.blocks(high.model_name):
                 continue
             pods = _effective_routable_replicas(high.model_name, model_contexts, model_replicas)
             high_min = _serving_floor(cfg, high.model_name, model_contexts, model_replicas)
@@ -1182,12 +1042,6 @@ def build_plan(
                 delayed_down_models.add(high.model_name)
     else:
         events.append("rescue_skipped_by_cadence")
-    for model in o1_exempt:
-        if model not in o1_exempt_planned:
-            # H3: no free-capacity step (none free, the step would need a donor, nothing
-            # needed, or no rescue this tick): held, reported as before.
-            reason = model_contexts.get(model, {}).get("signal_hold_reason")
-            events.append(f"receiver_held_breakpoint_window:{model}:{reason}")
 
     if not cfg.fairness_due:
         return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
@@ -1232,7 +1086,6 @@ def build_plan(
             # L4 rev 2: one buddy block per plan (no relay, no defrag for LOW).
             if needed > 0 and not plan_block(
                 recv,
-                free_only=False,
                 source_loop="fairness",
                 prefix="low_fairness",
                 create_reason="low_fairness_idle_capacity",
@@ -1292,7 +1145,7 @@ def build_plan(
                 or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
             ):
                 continue
-            if cooldown.blocks(donor.model_name, "down"):
+            if view_hold.blocks(donor.model_name):
                 continue
             headroom = _donor_headroom(cfg, donor.model_name, model_contexts, model_replicas)
             if headroom <= 0:
@@ -1325,7 +1178,7 @@ def build_plan(
                 or gave_this_plan(middle.model_name)  # one replica per plan (non-IDLE)
             ):
                 continue
-            if cooldown.blocks(middle.model_name, "down"):
+            if view_hold.blocks(middle.model_name):
                 continue
             headroom = _donor_headroom(cfg, middle.model_name, model_contexts, model_replicas)
             if headroom <= 0 or probe_held(middle):
@@ -1488,50 +1341,24 @@ def _plan_middle_zone_probe(
     return pairs
 
 
-class _Cooldown:
-    """Per-model holds of the planner (one gate, two sources):
+class _ViewPending:
+    """The planner's one per-model hold (TSS only, 2026-10-29): ``view_pending`` - the
+    fleet view predates the model's last routable-changing SM call, so the plan cannot
+    see that call's effect - no new action of the model in any role until a newer view
+    exists (event ``view_pending_hold:<model>:<direction of that call>``). A correctness
+    guard on state, not a timer. (The review F4 window cooldown and the P2-6
+    floor-violation hold were removed.)"""
 
-    * review F4 (``cooldowns``; fallback since the timer cleanup 2026-10-02 - only for
-      models O1 does not track): hold a model's next action until a fresh metrics window
-      reflects its last executed one;
-    * O1 evidence gate (``view_pending``): the fleet view predates the model's last
-      action, so no breakpoint holds it yet - held until a newer view exists.
-
-    (The P2-6 floor-violation hold - a timed hold after a 409 ``floor_violation`` - was
-    removed on 2026-10-02: a donor gives at most its SM ``floor_headroom``.)
-
-    F4 / view-pending direction rules: same direction is held; after a scale-up a
-    scale-down is held too; after a scale-down a scale-up is allowed only for a CRITICAL
-    receiver (safety)."""
-
-    def __init__(
-        self,
-        cooldowns: Mapping[str, str],
-        events: list[str],
-        *,
-        view_pending: Mapping[str, str] | None = None,
-    ) -> None:
-        self._cooldowns = dict(cooldowns)
+    def __init__(self, view_pending: Mapping[str, str], events: list[str]) -> None:
+        self._view_pending = dict(view_pending)
         self._events = events
-        self._view_pending = dict(view_pending or {})
 
-    def blocks(self, model: str, direction: str, *, critical: bool = False) -> bool:
-        for holds, name in ((self._cooldowns, "cooldown_hold"), (self._view_pending, "o1_view_pending_hold")):
-            last = holds.get(model)
-            if last is None:
-                continue
-            if direction == "up" and last == "down" and critical:
-                continue
-            self._event(f"{name}:{model}")
-            return True
-        return False
-
-    def _event(self, event: str) -> None:
-        if event not in self._events:
-            self._events.append(event)
-
-    def down_blocked(self) -> set[str]:
-        return set(self._cooldowns) | set(self._view_pending)
+    def blocks(self, model: str) -> bool:
+        direction = self._view_pending.get(model)
+        if direction is None:
+            return False
+        _event_once(self._events, f"view_pending_hold:{model}:{direction}")
+        return True
 
 
 class _SlotOccupancy:
@@ -2204,13 +2031,6 @@ def _plan_tp_defrag(
     return True
 
 
-def _idle_window_evidence(item: ModelClassification, ctx: Mapping[str, Any]) -> bool:
-    """Q3 (2026-10-06): an IDLE model whose whole current window is idle evidence
-    (``window_idle``, set by the tick only from this tick's fully scraped window - a
-    held, scrape-stale or tokens-missing context never carries it)."""
-    return item.state == ModelState.IDLE and ctx.get("window_idle") is True
-
-
 def _paper_state_incomplete_models(classifications: list[ModelClassification]) -> tuple[str, ...]:
     return tuple(
         item.model_name
@@ -2220,63 +2040,8 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
             item.Z_m is None
             and item.state != ModelState.IDLE
             and not getattr(item, "signal_idle", False)
-            # Onset saturation rescue: CRITICAL on the engine gauges, Z not defined yet.
-            and not getattr(item, "saturation_rescue", False)
         )
     )
-
-
-#: The O1 evidence holds (``SignalState.effective_window`` reasons) a CRITICAL receiver
-#: on free capacity is exempt from (H3).
-_O1_EXEMPT_HOLD_REASONS = frozenset(
-    {"no_suffix", "evidence_span", "evidence_tokens", "evidence_requests"}
-)
-
-
-def _o1_exempt_event(
-    model: str, model_contexts: Mapping[str, Any], rise: Mapping[str, Any] | None, planned: int
-) -> str:
-    """H3: ``receiver_o1_exempt_free_gpu`` with the hold it skipped, the breakpoint and
-    the queue-rise samples (log only, ``none`` when the queue did not rise)."""
-    ctx = model_contexts.get(model) or {}
-    queue = rise or {}
-    return (
-        f"receiver_o1_exempt_free_gpu:{model}:{ctx.get('signal_hold_reason')}:planned={planned}"
-        f":bp={queue.get('breakpoint_ms', ctx.get('signal_breakpoint_ms'))}"
-        f":q={_num_text(queue.get('base_q'), 1)}->{_num_text(queue.get('q'), 1)}"
-        f":waiting={_num_text(queue.get('base_waiting'))}->{_num_text(queue.get('waiting'))}"
-        f":sample_ms={queue.get('base_ms')}->{queue.get('sample_ms')}"
-        f":queue_rise={'yes' if rise else 'no'}"
-    )
-
-
-def _critical_order(
-    item: ModelClassification,
-    model_contexts: Mapping[str, Any],
-    o1_exempt: Mapping[str, Any] | None = None,
-) -> tuple[int, float]:
-    """(tier, key): TSS-confirmed (Z ascending), onset saturation (waiting / n
-    descending), O1-exempt (Z ascending)."""
-    if o1_exempt and item.model_name in o1_exempt:
-        return (2, receiver_sort_key(item)[1])
-    if not getattr(item, "saturation_rescue", False):
-        return (0, receiver_sort_key(item)[1])
-    ctx = model_contexts.get(item.model_name) or {}
-    try:
-        waiting = float(ctx.get("saturation_waiting") or 0.0)
-        pods = max(1, int(ctx.get("routable_pods") or 0))
-    except (TypeError, ValueError):
-        return (1, 0.0)
-    return (1, -waiting / pods)
-
-
-def _num_text(value: Any, digits: int = 0) -> str:
-    if value is None:
-        return "none"
-    try:
-        return f"{float(value):.{digits}f}"
-    except (TypeError, ValueError):
-        return "none"
 
 
 def _add_scale_action(

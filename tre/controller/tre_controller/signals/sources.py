@@ -75,9 +75,8 @@ def get_signal(
     view: every pod of the window, checked by count.
 
     ``ema_window_ms``: the EMA's idle-gap length, the configured metrics window (review
-    M2). An O1 suffix passes the whole window here, as the TSS EMA does; the suffix's own
-    span would reset the EMA to the raw suffix value on every tick after a breakpoint.
-    None = the window's own span.
+    M2): a caller computing on a suffix window passes the whole window here, as the TSS
+    EMA does. None = the window's own span (the live decision signal, 2026-10-29).
     """
     if source == "zm":
         return SignalValue(source=source, raw_value=trs_z_m, z_m=trs_z_m)

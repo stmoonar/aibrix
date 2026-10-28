@@ -221,7 +221,6 @@ class DecisionLoop:
                 disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                 prof=self._prof,
                 loop=loop_name,
-                action_cooldown=getattr(cfg, "action_cooldown", True),
                 # B8: controller mode, read per decision (ObserveModeGate, cached).
                 observe_mode=bool(self._is_observe()) if self._is_observe is not None else False,
                 # P2-3: no probe starts while the SM maintenance lock is held.

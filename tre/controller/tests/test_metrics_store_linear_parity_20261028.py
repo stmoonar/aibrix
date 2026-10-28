@@ -149,7 +149,6 @@ class _ReferenceStore(MetricsStore):
             ttft_hist_count=ttft_hist_count,
             tpot_hist=tpot_hist,
             tpot_hist_count=tpot_hist_count,
-            **self._latest_instant(model, inst_docs),
         )
 
 

@@ -274,4 +274,4 @@ def test_a_partial_growth_that_woke_nothing_is_no_routable_change():
     queue = ActionQueue(ServiceManagerClient("http://sm", transport=Transport()), now_ms=lambda: 5)
     queue.submit([ScaleAction("dsllama-8b", 2, "critical_sleeping_capacity", "rescue")])
     (result,) = asyncio.run(queue.drain_once())
-    assert result.ok is False and queue.routable_changes() == {} and queue.view_changes() == {}
+    assert result.ok is False and queue.view_changes() == {}

@@ -70,7 +70,7 @@ spec:
             # on tre-gateway-plugins (the gateway declares them in tre:v2:gateway:cadence; a
             # mismatch marks the snapshots stale). Instant docs (queue gauges): the per-pod
             # coverage grid.
-            # Evidence period (histogram docs): the sampler grid, O1 grid, SafeScale
+            # Evidence period (histogram docs): the sampler grid, the SafeScale
             # evidence step. The metrics window must be a multiple of both.
             # 2026-10-28: 1 s (was 2 s; code default still 2 s): one snapshot per second,
             # so the 5 s rescue / 10 s rebalance sections land exactly on the grid, and
@@ -150,15 +150,9 @@ spec:
             # (TRE_FLOOR_VIOLATION_COOLDOWN_TICKS was removed on 2026-10-02: the controller
             # bounds donors by the service-manager floor_headroom; a set value is logged once
             # and ignored, never validated - docs/design/20261002-controller-transfer.md.)
-            # Review F4 action cooldown, a FALLBACK since the timer cleanup (2026-10-02,
-            # docs/design/20261002-timer-cleanup.md): it holds a model until a metrics
-            # window starts after its last action only while O1 (registry
-            # scaling.breakpoint_window) does not track the model - O1 off or suspended
-            # by the gateway clock check, no fleet view, stale-held context. With O1
-            # active the routable-count change is a breakpoint and holds the model until
-            # post-change evidence exists. "0" also disables the fallback.
-            - name: TRE_ACTION_COOLDOWN
-              value: "1"
+            # TRE_ACTION_COOLDOWN / TRE_SIGNAL_WARMUP_MS are not set: the F4 window
+            # cooldown and the onset warmup guard were removed with O1 (2026-10-29, design
+            # docs/design/20261029-tss-only.md); a set value is logged once and ignored.
             # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
             - name: SAFE_SCALE_KV_CACHE_MAX
               value: "0.8"

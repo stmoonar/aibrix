@@ -1,27 +1,18 @@
 """Timer cleanup, independent review fixes (2026-10-02, docs/design/20261002-timer-cleanup.md).
 
-P2-1  the O1 view-pending gate also covers probe unhides and failed / partial SM calls
-      (``ActionQueue.view_changes``);
-P2-2  a view's time for that gate is a LOWER bound of when its SM state was produced;
+P2-1  the view-pending guard also covers probe unhides and failed / partial SM calls
+      (``ActionQueue.view_changes``); since 2026-10-29 (TSS only) it holds every model
+      in every role, CRITICAL receivers included;
+P2-2  a view's time for that guard is a LOWER bound of when its SM state was produced;
 P2-4  ``insufficient_evidence:stalled`` is a capacity rollback;
-P3-6  a fleet view older than N refresh periods only raises an alert (holds kept);
-P3-7  two models trading a pod back and forth: every hop waits for evidence."""
+P3-6  a fleet view older than N refresh periods only raises an alert (holds kept).
+(P3-7, the O1 evidence wait at every hop of two models trading a pod, went with O1.)"""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
 
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
-from tre_common.registry import (
-    ClusterTopology,
-    ModelSpec,
-    NodeSpec,
-    Registry,
-    ScalingRegistryConfig,
-    SloSpec,
-    TrsParams,
-)
 from tre_controller.config import ControllerConfig
 from tre_controller.loops import cluster_view_task as cluster_view_module
 from tre_controller.loops.cluster_view_task import (
@@ -31,16 +22,13 @@ from tre_controller.loops.cluster_view_task import (
     refresh_cluster_view_once,
     state_time_lower_bound,
 )
-from tre_controller.loops.tick import _o1_view_pending, run_planner_tick
-from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, UnhideAction
-from relay_view import relays
+from tre_controller.loops.tick import _view_pending, run_planner_tick
+from tre_controller.planning.planner import ScaleAction, UnhideAction
 from tre_controller.planning.safescale import CAPACITY_ROLLBACK_CODES, ProbeWindowInputs, SafeScaleStateMachine
 from tre_controller.config import SafeScaleConfig
-from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
-from tre_sm.allocator.slots import Binding, Slot
+from tre_controller.signals.trs import SignalState
 
-from test_timer_cleanup_f4_o1_20261002 import BASE, LOW, _ActionQueue, _state
-from test_o1_breakpoint_window_20261001 import GRID, O1, _registry, _snap, _ups, _view, _window
+from test_tss_only_20261029 import BASE, GRID, LOW_LOAD as LOW, _Queue as _ActionQueue, _registry, _snap, _ups, _view, _window
 from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind POST /v2/plans
 
 
@@ -57,15 +45,16 @@ class _UnhideQueue(_ActionQueue):
     def view_changes(self):
         return dict(self.changes)
 
-    def routable_changes(self):
-        return {m: (ms, 1) for m, (ms, _d) in self.changes.items()}
+
+def _state() -> SignalState:
+    return SignalState()
 
 
 def _low_tick(state, queue, *, end, routable, fetched, state_ms=None):
     view = replace(_view(routable, fetched_ms=fetched), state_ms=state_ms)
     return run_planner_tick(
         _snap(_window(end, [LOW] * 3, routable=routable)), queue=queue, registry=_registry(),
-        rescue_due=False, fairness_due=True, cluster_view=view, signal_state=state, action_cooldown=True,
+        rescue_due=False, fairness_due=True, cluster_view=view, signal_state=state,
     )
 
 
@@ -76,19 +65,25 @@ def test_a_rollback_unhide_holds_a_low_receiver_until_a_view_shows_it():
     _low_tick(state, queue, end=BASE - GRID, routable=1, fetched=BASE - GRID + 500, state_ms=BASE - GRID + 400)
     queue.changes["m"] = (BASE + 1_500, "down")  # rollback unhide returned at BASE + 1.5 s
     held = _low_tick(state, queue, end=BASE, routable=1, fetched=BASE + 1_000, state_ms=BASE + 900)
-    assert "o1_view_pending_hold:m" in held.events and not _ups(held.actions)
+    assert "view_pending_hold:m:down" in held.events and not _ups(held.actions)
     # Without the unhide record (the old last_actions-only gate) it scaled on the stale n.
     state2, plain = _state(), _ActionQueue()
     _low_tick(state2, plain, end=BASE - GRID, routable=1, fetched=BASE - GRID + 500)
     assert _ups(_low_tick(state2, plain, end=BASE, routable=1, fetched=BASE + 1_000).actions)
 
 
-def test_an_unhide_does_not_hold_a_critical_receiver():
+def test_an_unhide_holds_a_critical_receiver_too():
+    # 2026-10-29: the guard holds every role until a view shows the call (it lasts one
+    # view refresh - every routable-changing call asks for one).
     queue = _UnhideQueue()
     queue.changes["m"] = (BASE + 1_500, "down")
-    tracked = {"m": {"o1_routable_tracked": True}}
-    assert _o1_view_pending(queue, tracked, _view(1, fetched_ms=BASE + 1_000)) == {"m": "down"}
-    # "down" = the F4 rule that lets a CRITICAL receiver scale up (tested in the F4/O1 file).
+    assert _view_pending(queue, _view(1, fetched_ms=BASE + 1_000)) == {"m": "down"}
+    held = run_planner_tick(
+        _snap(_window(BASE, [(2000.0, 30.0, 20.0, 100.0)] * 3, routable=1)), queue=queue, registry=_registry(),
+        rescue_due=True, fairness_due=False, cluster_view=_view(1, fetched_ms=BASE + 1_000), signal_state=_state(),
+    )
+    assert held.classifications["m"].state.value == "critical"
+    assert not _ups(held.actions) and "view_pending_hold:m:down" in held.events
 
 
 class _Client:
@@ -141,7 +136,7 @@ def test_a_fast_sm_clock_never_moves_the_lower_bound(monkeypatch):
     assert (view.state_ms, view.fetched_ms) == (1_000_000, 1_000_400)
     queue = _ActionQueue()
     queue.last["m"] = (1_000_300, "up")
-    assert _o1_view_pending(queue, {"m": {"o1_routable_tracked": True}}, view) == {"m": "up"}
+    assert _view_pending(queue, view) == {"m": "up"}
 
 
 def test_refresh_stamps_request_and_response_times(monkeypatch):
@@ -160,10 +155,9 @@ def test_refresh_stamps_request_and_response_times(monkeypatch):
 def test_an_action_done_while_the_request_was_in_flight_is_pending():
     queue = _ActionQueue()
     queue.last["m"] = (1_200, "up")  # done between request (1_000) and response (1_400)
-    tracked = {"m": {"o1_routable_tracked": True}}
     view = replace(_view(1, fetched_ms=1_400), state_ms=1_000)
-    assert _o1_view_pending(queue, tracked, view) == {"m": "up"}
-    assert _o1_view_pending(queue, tracked, replace(view, state_ms=1_300)) == {}
+    assert _view_pending(queue, view) == {"m": "up"}
+    assert _view_pending(queue, replace(view, state_ms=1_300)) == {}
 
 
 # ------------------------------------------------------------------ P2-4
@@ -187,7 +181,7 @@ def test_a_stale_view_keeps_the_holds_and_only_alerts(caplog):
     queue = _ActionQueue()
     queue.last["m"] = (BASE + 1_500, "up")
     stale = _low_tick(_state(), queue, end=BASE + 10 * GRID, routable=1, fetched=BASE + 1_000)
-    assert "o1_view_pending_hold:m" in stale.events and not _ups(stale.actions)
+    assert "view_pending_hold:m:up" in stale.events and not _ups(stale.actions)
     assert not any("stale" in event for event in stale.events)
 
     alert = StaleViewAlert(30_000)
@@ -226,91 +220,3 @@ def test_stale_periods_config():
     assert ControllerConfig.from_env({}).view_stale_periods == 3
     assert ControllerConfig.from_env({"TRE_VIEW_STALE_PERIODS": "5"}).view_stale_periods == 5
     assert StaleViewAlert(0).check(None, 10**9, "down") is None
-
-
-# ------------------------------------------------------------------ P3-7
-
-THETA = 100.0
-HIGH = (60.0, 0.5, 0.0, 10.0)  # Z = 1.8 > tau_high
-
-
-def _two_model_registry() -> Registry:
-    slo = SloSpec(ttft_p95_ms=1200.0, tpot_p95_ms=100.0, e2e_p95_ms=10_000.0)
-    trs = TrsParams(
-        w_p=0.04, w_d=1.0, lambda_wait=2.625, qmin=1.0, ema_alpha=0.5, theta_m=THETA,
-        tau_crit=0.8, tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=1, ema_tau_ms=10_000.0,
-    )
-    specs = [ModelSpec(name=name, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=4,
-                       vllm_image="img", slo=slo, trs=trs) for name in ("a", "b")]
-    topology = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
-    return Registry(topology, specs, scaling=ScalingRegistryConfig())
-
-
-def _model_window(model, end, grids, routable):
-    def agg(start, gs):
-        n = max(1, (end - start) // GRID)
-        return ModelWindowMetrics(
-            model=model, window_start_ms=start, window_end_ms=end, prompt_tokens=0.0,
-            generation_tokens=float(sum(g[0] for g in gs)), avg_waiting=sum(g[2] for g in gs) / n,
-            avg_running=sum(g[1] for g in gs) / n, avg_swapping=0.0, kv_cache_hit_rate=0.0,
-            ttft_p95_ms=100.0, tpot_p95_ms=10.0, e2e_p95_ms=1000.0, routable_pods=routable,
-            assigned_replicas=routable, per_pod={}, request_count=float(sum(g[3] for g in gs)),
-        )
-
-    full = agg(end - 3 * GRID, grids)
-    return replace(full, suffix_windows=(agg(end - 2 * GRID, grids[1:]), agg(end - GRID, grids[2:])))
-
-
-def _two_view(awake_a: int, fetched: int) -> ClusterView:
-    """4 GPUs; a awake on the first ``awake_a`` GPUs, b on the rest; every model has a
-    sleeping binding on every other GPU."""
-    bindings = []
-    for gpu in range(4):
-        bindings.append(Binding(f"a-{gpu}", "a", Slot("node-a", (gpu,)), awake=gpu < awake_a, hidden=False))
-        bindings.append(Binding(f"b-{gpu}", "b", Slot("node-a", (gpu,)), awake=gpu >= awake_a, hidden=False))
-    return ClusterView(topology=_two_model_registry().topology(), bindings=tuple(bindings), fetched_ms=fetched)
-
-
-def _two_tick(state, queue, *, end, awake_a, fetched, load_a, load_b):
-    snapshot = MetricsSnapshot(ts_ms=end, stale=False, models={
-        "a": _model_window("a", end, [load_a] * 3, awake_a),
-        "b": _model_window("b", end, [load_b] * 3, 4 - awake_a),
-    })
-    # F1-B (2026-10-07): a HIGH donor gives through a SafeScale probe - a state machine
-    # per tick starts it (its hide is the move this test follows).
-    return run_planner_tick(snapshot, queue=queue, registry=_two_model_registry(), rescue_due=False,
-                            fairness_due=True, cluster_view=_two_view(awake_a, fetched), signal_state=state,
-                            action_cooldown=True, safescale=SafeScaleStateMachine(config=SafeScaleConfig()))
-
-
-def _probed(result) -> set[str]:
-    """Donors the tick starts a probe on (their pods hidden); a relay never happens."""
-    assert not relays(result.actions) and not [a for a in result.actions if getattr(a, "members", ())]
-    return {action.model for action in result.actions if isinstance(action, HideAction)}
-
-
-def test_two_models_trading_a_pod_wait_for_evidence_at_every_hop():
-    state = SignalState(warmup_ms=-1, breakpoint=O1)
-    for model in ("a", "b"):
-        state.observe_traffic(model, has_traffic=True, window_start_ms=BASE - 200_000, window_end_ms=BASE - 170_000)
-    queue = _ActionQueue()
-    # Hop 1: a LOW, b HIGH -> b gives a pod to a.
-    first = _two_tick(state, queue, end=BASE, awake_a=2, fetched=BASE + 500, load_a=LOW, load_b=HIGH)
-    assert _probed(first) == {"b"}, first.events
-    queue.last.update({"a": (BASE + 1_500, "up"), "b": (BASE + 1_500, "down")})
-    # The load flips at once: a HIGH, b LOW. Every tick until a whole window follows a's
-    # breakpoint (window end >= BASE + 40 s) a is no donor, so nothing moves back.
-    hops = {}
-    for k, (awake_a, fetched) in enumerate([(2, BASE + 1_000), (3, BASE + 2 * GRID + 500),
-                                            (3, BASE + 3 * GRID + 500), (3, BASE + 4 * GRID + 500)], start=1):
-        hops[k] = _two_tick(state, queue, end=BASE + k * GRID, awake_a=awake_a, fetched=fetched,
-                            load_a=HIGH, load_b=LOW)
-    assert _probed(hops[1]) == set()  # the view predates the hop; b's Z still mixed
-    # Hop 2: b is a LOW receiver on post-change evidence too thin to act on; hop 3: b's
-    # evidence is warm, but a (the only donor) still lacks a whole post-change window.
-    assert "receiver_held_breakpoint_window:b:evidence_span" in hops[2].events
-    for k in (2, 3):
-        assert _probed(hops[k]) == set(), (k, hops[k].events)
-        assert "donor_suppressed_breakpoint_window:a" in hops[k].events
-    # b's receiver evidence was warm from BASE + 30 s; a's whole window from BASE + 40 s.
-    assert _probed(hops[4]) == {"a"}, hops[4].events
