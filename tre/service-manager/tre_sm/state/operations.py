@@ -58,6 +58,7 @@ local record = cjson.encode({
   started_at=ARGV[5], updated_at=ARGV[5], request=cjson.decode(ARGV[6])
 })
 redis.call('HSET', KEYS[3], ARGV[3], record)
+redis.call('SADD', KEYS[7], ARGV[3])
 return {token, value}
 """
 
@@ -75,11 +76,17 @@ redis.call('PEXPIRE', KEYS[1], ARGV[2])
 return 1
 """
 
+# KEYS[3] = the running-operation index; ARGV[4] = the record's status.
 _UPDATE_SCRIPT = r"""
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+if ARGV[4] == 'running' then
+  redis.call('SADD', KEYS[3], ARGV[2])
+else
+  redis.call('SREM', KEYS[3], ARGV[2])
+end
 return 1
 """
 
@@ -88,6 +95,7 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+redis.call('SREM', KEYS[3], ARGV[2])
 redis.call('DEL', KEYS[1])
 return 1
 """
@@ -98,6 +106,10 @@ class RedisOperationClient(Protocol):
     def hgetall(self, key: str) -> Mapping[object, object]: ...
     def hget(self, key: str, field: str): ...
     def get(self, key: str): ...
+    def smembers(self, key: str): ...
+    def srem(self, key: str, *values): ...
+    def sadd(self, key: str, *values): ...
+    def hmget(self, key: str, fields: list[str]): ...
 
 
 @dataclass(frozen=True)
@@ -315,6 +327,10 @@ class OperationCoordinator:
         #: service_manager.operations.max_records); None = never trimmed.
         self.max_records = None if max_records is None else max(1, int(max_records))
         self._finished_since_trim = 0
+        #: The running index was backfilled from the journal by this process
+        #: (records an older SM wrote before the index existed, or while a
+        #: rollback ran without it).
+        self._running_index_ready = False
         self._submitted: dict[str, threading.Thread] = {}
         self._submitted_lock = threading.Lock()
         self._shutdown_error: BaseException | None = None
@@ -435,13 +451,14 @@ class OperationCoordinator:
         started_at = _utc_now()
         result = self._redis.eval(
             _ACQUIRE_SCRIPT,
-            6,
+            7,
             rediskeys.SM_WRITER_LOCK_KEY,
             rediskeys.SM_FENCE_COUNTER_KEY,
             rediskeys.SM_OPERATIONS_KEY,
             rediskeys.SM_WRITER_QUEUE_KEY,
             rediskeys.SM_WRITER_QUEUE_DEADLINES_KEY,
             rediskeys.SM_WRITER_QUEUE_SEQ_KEY,
+            rediskeys.SM_RUNNING_OPERATIONS_KEY,
             self.owner,
             str(self.lease_ttl_ms),
             operation_id,
@@ -480,29 +497,70 @@ class OperationCoordinator:
         raw = self._redis.hget(rediskeys.SM_OPERATIONS_KEY, operation_id)
         return None if raw is None else json.loads(_text(raw))
 
+    def running_operations(self) -> list[dict]:
+        """Every journal record whose status is ``running``, newest first. Reads
+        the running index and those records only, not the whole journal (which
+        the supervisor used to read several times per tick). Index entries whose
+        record is gone or no longer running are dropped."""
+        self._ensure_running_index()
+        ids = sorted(_text(item) for item in (self._redis.smembers(rediskeys.SM_RUNNING_OPERATIONS_KEY) or ()))
+        if not ids:
+            return []
+        raws = self._redis.hmget(rediskeys.SM_OPERATIONS_KEY, ids)
+        records: list[dict] = []
+        dropped: list[str] = []
+        for operation_id, raw in zip(ids, raws):
+            record = None if raw is None else json.loads(_text(raw))
+            if record is None or record.get("status") != "running":
+                dropped.append(operation_id)
+                continue
+            records.append(record)
+        if dropped:
+            self._redis.srem(rediskeys.SM_RUNNING_OPERATIONS_KEY, *dropped)
+        records.sort(key=lambda item: item.get("started_at", ""), reverse=True)
+        return records
+
+    def _ensure_running_index(self) -> None:
+        """Once per process: add every running journal record to the index (one
+        full journal scan, in chunks where the client can)."""
+        if self._running_index_ready:
+            return
+        scan = getattr(self._redis, "hscan_iter", None)
+        if callable(scan):
+            items = scan(rediskeys.SM_OPERATIONS_KEY, count=1000)
+        else:
+            items = (self._redis.hgetall(rediskeys.SM_OPERATIONS_KEY) or {}).items()
+        running = [
+            _text(operation_id)
+            for operation_id, raw in items
+            if json.loads(_text(raw)).get("status") == "running"
+        ]
+        for start in range(0, len(running), 500):
+            self._redis.sadd(rediskeys.SM_RUNNING_OPERATIONS_KEY, *running[start:start + 500])
+        self._running_index_ready = True
+
     def active_operation(self, *, kind: str | None = None) -> dict | None:
         """Return the journal record protected by the live writer lease."""
         raw_lock = self._redis.get(rediskeys.SM_WRITER_LOCK_KEY)
         if raw_lock is None:
             return None
-        lock_value = _text(raw_lock)
-        for record in self.list_operations(limit=1000):
-            expected = f"{record.get('owner')}:{record.get('fencing_token')}"
-            if expected != lock_value or record.get("status") != "running":
-                continue
-            if kind is not None and record.get("kind") != kind:
-                return None
-            return record
-        return None
+        record = _holder_record(_text(raw_lock), self.running_operations())
+        if record is not None and kind is not None and record.get("kind") != kind:
+            return None
+        return record
 
     def stale_running_operations(self, *, kind: str | None = None) -> list[dict]:
-        active = self.active_operation()
+        """Running records whose writer no longer holds the lock (its SM died),
+        newest first - however old (10-28: only the newest 1000 records were
+        looked at, so an older one stayed running for ever)."""
+        raw_lock = self._redis.get(rediskeys.SM_WRITER_LOCK_KEY)
+        running = self.running_operations()
+        active = None if raw_lock is None else _holder_record(_text(raw_lock), running)
         active_id = None if active is None else active.get("operation_id")
         return [
             record
-            for record in self.list_operations(limit=1000)
-            if record.get("status") == "running"
-            and record.get("operation_id") != active_id
+            for record in running
+            if record.get("operation_id") != active_id
             and (kind is None or record.get("kind") == kind)
         ]
 
@@ -519,21 +577,24 @@ class OperationCoordinator:
     def _update(self, fence: WriterFence, record: dict) -> bool:
         result = self._redis.eval(
             _UPDATE_SCRIPT,
-            2,
+            3,
             rediskeys.SM_WRITER_LOCK_KEY,
             rediskeys.SM_OPERATIONS_KEY,
+            rediskeys.SM_RUNNING_OPERATIONS_KEY,
             fence.lock_value,
             fence.operation_id,
             json.dumps(record, sort_keys=True, separators=(",", ":")),
+            str(record.get("status", "")),
         )
         return int(result) == 1
 
     def _finish(self, fence: WriterFence, record: dict) -> bool:
         result = self._redis.eval(
             _FINISH_SCRIPT,
-            2,
+            3,
             rediskeys.SM_WRITER_LOCK_KEY,
             rediskeys.SM_OPERATIONS_KEY,
+            rediskeys.SM_RUNNING_OPERATIONS_KEY,
             fence.lock_value,
             fence.operation_id,
             json.dumps(record, sort_keys=True, separators=(",", ":")),
@@ -607,12 +668,14 @@ class OperationCoordinator:
     ) -> bool:
         result = self._redis.eval(
             _UPDATE_SCRIPT,
-            2,
+            3,
             rediskeys.SM_WRITER_LOCK_KEY,
             rediskeys.SM_OPERATIONS_KEY,
+            rediskeys.SM_RUNNING_OPERATIONS_KEY,
             fence.lock_value,
             operation_id,
             json.dumps(record, sort_keys=True, separators=(",", ":")),
+            str(record.get("status", "")),
         )
         return int(result) == 1
 
@@ -644,6 +707,14 @@ class OperationCoordinator:
                 _CURRENT_FENCE.reset(fence_token)
                 with self._submitted_lock:
                     self._submitted.pop(handle.operation_id, None)
+
+
+def _holder_record(lock_value: str, running: list[dict]) -> dict | None:
+    """The running record whose ``owner:fencing_token`` is the lock value."""
+    for record in running:
+        if f"{record.get('owner')}:{record.get('fencing_token')}" == lock_value:
+            return record
+    return None
 
 
 def _utc_now() -> str:

@@ -608,15 +608,10 @@ def policy(**overrides) -> SleepPolicy:
         sleep_call_timeout_s=60.0,
         physical_confirm_timeout_s=15.0,
         vllm_sleep_mode_param="true",
-        hard_cap_s=150.0,
         plugin_label_selector=None,
     )
-    budgets = overrides.pop("budgets_s", None)
     base.update(overrides)
-    result = SleepPolicy(**base)
-    if budgets:
-        result.budgets_s.update(budgets)
-    return result
+    return SleepPolicy(**base)
 
 
 def trs() -> TrsParams:

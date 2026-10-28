@@ -7,7 +7,6 @@ import yaml
 
 from tre_common.bindings import MAX_BOUND_PER_GPU, render_binding_set
 from tre_common.registry import (
-    DEFAULT_SLEEP_BUDGETS_S,
     SLEEP_PATHS,
     ClusterTopology,
     ModelSpec,
@@ -27,31 +26,16 @@ def test_absent_section_means_builtin_defaults():
     config = parse_service_manager_config(None)
 
     assert config == ServiceManagerConfig()
-    assert config.sleep.hard_cap_s == 150.0
-    assert config.sleep.budgets_s == DEFAULT_SLEEP_BUDGETS_S
-    assert set(DEFAULT_SLEEP_BUDGETS_S) == set(SLEEP_PATHS)
     assert config.sleep.vllm_sleep_mode_param == "auto"
     assert config.sleep.fallback_no_plugin is False
     assert config.sleep.gateway_min_instances == 1
     assert config.wake_max_used_mib is None and config.wake_max_used_fraction == 0.2
 
 
-def test_hard_cap_defaults_to_the_gateway_route_timeout():
-    config = parse_service_manager_config({}, gateway={"route_timeout_s": 90})
-    assert config.sleep.hard_cap_s == 90.0
-
-    explicit = parse_service_manager_config({"sleep": {"hard_cap_s": 120}}, gateway={"route_timeout_s": 90})
-    assert explicit.sleep.hard_cap_s == 120.0
-
-
-def test_overrides_and_soft_budget_resolution():
+def test_overrides():
     config = parse_service_manager_config(
         {
             "sleep": {
-                "budgets_s": {"urgent": 12, "scale_down": None},
-                # Budget mechanics: every path drains (no-drain paths ignore budgets,
-                # service-manager/tests/test_sleep_no_drain.py).
-                "no_drain_paths": [],
                 "vllm_sleep_mode_param": "false",
                 "gateway_plugin_pods": {"namespace": "gw", "label_selector": None},
             },
@@ -62,29 +46,16 @@ def test_overrides_and_soft_budget_resolution():
     sleep = config.sleep
     assert sleep.vllm_sleep_mode_param == "false"
     assert sleep.plugin_namespace == "gw" and sleep.plugin_label_selector is None
-    assert sleep.soft_budget_s("urgent") == 12.0
-    assert sleep.soft_budget_s("scale_down") == sleep.hard_cap_s  # null = hard cap only
-    assert sleep.soft_budget_s("not-a-path") == 30.0  # unknown -> "default"
-    assert sleep.soft_budget_s("urgent", 999) == sleep.hard_cap_s  # caller capped
-    assert sleep.soft_budget_s("urgent", 0) == 0.0
-    with pytest.raises(ValueError):
-        sleep.soft_budget_s("urgent", -1)
     assert config.wake_max_used_mib == 4096
     assert config.clock_skew_fail_s == 30.0
 
 
-def test_unknown_sleep_path_is_rejected():
-    with pytest.raises(ValueError, match="unknown sleep path"):
-        parse_service_manager_config({"sleep": {"budgets_s": {"fast": 1}}})
-
-
 def test_validate_flags_bad_service_manager_values():
     config = parse_service_manager_config(
-        {"sleep": {"ack_timeout_s": 0, "budgets_s": {"urgent": -3}}, "wake": {"max_used_mib": 0}}
+        {"sleep": {"ack_timeout_s": 0}, "wake": {"max_used_mib": 0}}
     )
     errors = Registry(ClusterTopology(nodes=()), [], service_manager=config).validate()
     assert "service_manager.sleep.ack_timeout_s must be positive" in errors
-    assert "service_manager.sleep.budgets_s.urgent must be >= 0 or null" in errors
     assert "service_manager.wake.max_used_mib must be positive or null" in errors
 
 
@@ -161,12 +132,16 @@ def test_worst_case_lock_holds_and_the_call_bound_fit_the_api_call_timeout():
     )
 
 
-def test_the_deprecated_reservation_and_drain_settings_are_no_longer_validated():
-    old = parse_service_manager_config(
-        {"commit_lock_wait_s": 25, "sleep": {"reservation_ttl_s": 1, "hard_cap_s": 900}, "api_call_timeout_s": 1000}
-    )
-    errors = Registry(ClusterTopology(nodes=()), [], service_manager=old).validate()
-    assert not [e for e in errors if "reservation_ttl_s" in e or "hard_cap_s" in e or "commit_lock" in e]
+def test_retired_drain_keys_are_accepted_and_not_read():
+    """The live registry still carries the drain-era keys (for rollback images):
+    any value of them loads, validates and changes nothing."""
+    retired = {
+        "commit_lock_wait_s": 25,
+        "sleep": {"reservation_ttl_s": 1, "hard_cap_s": 900, "budgets_s": {"fast": -3}},
+    }
+    old = parse_service_manager_config(retired)
+    assert old == parse_service_manager_config(None)
+    assert Registry(ClusterTopology(nodes=()), [], service_manager=old).validate() == []
     probe = parse_service_manager_config({"sleep": {"probe_timeout_s": 0}})
     assert any("probe_timeout_s must be positive" in e for e in Registry(ClusterTopology(nodes=()), [], service_manager=probe).validate())
     idle = parse_service_manager_config({"sleep": {"sleep_mode_when_idle": "keep"}})

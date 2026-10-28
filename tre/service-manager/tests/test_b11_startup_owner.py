@@ -316,7 +316,7 @@ class OwnerApi:
             raise ApiError(404)
         return self.pods[name]
 
-    def list_namespaced_pod(self, *, namespace, label_selector=None):
+    def list_namespaced_pod(self, *, namespace, label_selector=None, **_kwargs):
         return list(self.pods.values())
 
     def read_namespaced_replica_set(self, *, name, namespace):

@@ -44,6 +44,10 @@ SM_WRITER_QUEUE_KEY = "tre:v2:sm:writer_queue"
 SM_WRITER_QUEUE_DEADLINES_KEY = "tre:v2:sm:writer_queue_deadlines"
 SM_WRITER_QUEUE_SEQ_KEY = "tre:v2:sm:writer_queue_seq"
 SM_OPERATIONS_KEY = "tre:v2:sm:operations"
+#: Ids of the journal records whose status is ``running`` (a set kept by the
+#: writer-lock Lua scripts on every state change; the supervisor reads only
+#: these, not the whole journal - 10-28: HLEN ~20k, 15 MB per HGETALL).
+SM_RUNNING_OPERATIONS_KEY = "tre:v2:sm:operations:running"
 SM_DESIRED_KEY = "tre:v2:sm:desired"
 SM_DESIRED_VERSION_KEY = "tre:v2:sm:desired_version"
 SM_OBSERVED_KEY = "tre:v2:sm:observed"
