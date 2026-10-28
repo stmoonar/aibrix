@@ -345,6 +345,9 @@ class ActionQueue:
         self._running: dict[asyncio.Future, QueuedAction] = {}
         #: running dispatch task -> its one-shot action waiting out a retry backoff
         self._backoff: dict[asyncio.Future, _Backoff] = {}
+        #: Set when work may be dispatchable (an accepted submit, a cancelled pending
+        #: action): wakes :meth:`run` before its poll (created by ``run``, on its loop).
+        self._wakeup: asyncio.Event | None = None
         self._closed = False
         self._stats: dict[str, int] = {
             "oneshot_retries_total": 0,
@@ -445,6 +448,8 @@ class ActionQueue:
             self._persist_scale_memory(model)
 
         self._fuse_into_plans(accepted_items)
+        if accepted:
+            self._wake()
         return SubmitResult(
             accepted=accepted,
             held=held,
@@ -737,6 +742,8 @@ class ActionQueue:
                 )
                 continue
             kept.append(item)
+        if len(kept) != len(self._pending):
+            self._wake()  # an action behind the cancelled one may be free now
         self._pending = kept
         self._release_idle_models()
         return True
@@ -769,14 +776,24 @@ class ActionQueue:
     ) -> None:
         """Start dispatch tasks without waiting for them: a slow SM call (a
         scale-down that drains for minutes) never delays an action on unrelated
-        resources. Cancelling ``run`` cancels every dispatch in progress."""
+        resources. Cancelling ``run`` cancels every dispatch in progress.
+
+        Dispatches on every accepted :meth:`submit` (2026-10-28: the submit wakes it,
+        no 0-100 ms poll delay) and, as a fallback, every ``poll_interval_s`` (mode
+        changes, anything else that frees a queued action)."""
+        wakeup = self._wakeup = asyncio.Event()
         try:
             while True:
+                wakeup.clear()
                 self._dispatch_pending([])
-                await sleep(poll_interval_s)
+                await _wait_either(wakeup, sleep(poll_interval_s))
         except asyncio.CancelledError:
             await self.shutdown()
             raise
+
+    def _wake(self) -> None:
+        if self._wakeup is not None:
+            self._wakeup.set()
 
     async def shutdown(self) -> None:
         """Stop dispatching: cancel running dispatches and wait for them to end
@@ -2534,3 +2551,18 @@ def revalidate_commit_from_signals(
         return CommitVerdict(replace(action, upscales=tuple(kept)), dropped=tuple(dropped))
 
     return check
+
+
+async def _wait_either(event: asyncio.Event, poll: Awaitable[None]) -> None:
+    """Return when ``event`` is set or ``poll`` (the poll sleep) finished, whichever
+    comes first; an exception of ``poll`` propagates."""
+    waiter = asyncio.ensure_future(event.wait())
+    sleeper = asyncio.ensure_future(poll)
+    try:
+        done, _pending = await asyncio.wait((waiter, sleeper), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (waiter, sleeper):
+            if not task.done():
+                task.cancel()
+    if sleeper in done:
+        sleeper.result()

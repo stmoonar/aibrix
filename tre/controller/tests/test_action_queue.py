@@ -130,6 +130,29 @@ def test_action_queue_run_drains_pending_actions_before_sleeping() -> None:
     assert queue.pending_actions() == ()
 
 
+def test_a_submit_is_dispatched_without_waiting_for_the_poll() -> None:
+    # 2026-10-28: the submit wakes the dispatcher; the poll (an hour here) is only a fallback.
+    async def scenario() -> list:
+        client = FakeServiceManagerClient()
+        queue = ActionQueue(client)
+        runner = asyncio.ensure_future(queue.run(poll_interval_s=3600.0))
+        await asyncio.sleep(0)  # run made its first (empty) dispatch and waits
+        queue.submit((ScaleAction("m", 1, "critical", "rescue"),))
+        assert client.calls == []  # never inline: the submitting caller is not interrupted
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if client.calls:
+                break
+        runner.cancel()
+        try:
+            await runner
+        except asyncio.CancelledError:
+            pass
+        return client.calls
+
+    assert asyncio.run(asyncio.wait_for(scenario(), 5.0)) == [("scale", "m", 1)]
+
+
 def test_action_queue_observe_mode_drains_without_dispatching() -> None:
     client = FakeServiceManagerClient()
     observe = {"on": True}
