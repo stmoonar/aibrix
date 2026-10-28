@@ -47,13 +47,16 @@ GATEWAY_AHEAD_MS = 4_000
 
 SCENARIOS = {
     # d idle (shrunk to its floor), then 40 requests at once: the onset completes
-    # nothing for ~20 s while the queue grows (Z = 0: CRITICAL); a 40 s gateway stall.
+    # nothing for ~20 s while the queue grows, then CRITICAL; a 40 s gateway stall.
     "spike": ps.Scenario(demand={"r": ((0, 8.0),), "d": ((0, 0.0), (60, 40.0))}, awake=("r", "d", "d", "d"),
                          duration_s=300, stalls=((260, 300),)),
-    # d HIGH on 3 pods: the first probe commits. The whole window still holds the
-    # 3-pod grids, so d stays HIGH and the next probe starts at once (no breakpoint
-    # wait since 2026-10-29, TSS only); it overloads the last-but-one pod and rolls
-    # back - SafeScale returns the replica the window lag took.
+    # d HIGH on 3 pods: the first probe commits (~32 s). The 20 s window still shows the
+    # old count, so d stays HIGH and a second shrink probe starts in the same tick; it
+    # overloads the last pod and is rolled back ~40 s later (~72-78 s). User decision
+    # 2026-10-29: not guarded, observed in the smoke instead (design
+    # docs/design/20261029-tss-only.md). 105 s, not 170 s: a third probe (~112-121 s)
+    # sits on the gate's edge and commits or rolls back by period, so a longer run
+    # would compare noise, not period invariance.
     "shrink": ps.Scenario(demand={"r": ((0, 8.0),), "d": ((0, 9.0),)}, awake=("r", "d", "d", "d"),
                           duration_s=105),
     # d HIGH on 2 pods: the probe overloads the last pod and rolls back; the same
