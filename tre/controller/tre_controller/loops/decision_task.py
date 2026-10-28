@@ -117,12 +117,6 @@ class SectionSchedule:
         if rebalance:
             self._last_rebalance_ms = int(obs_ms)
 
-    def due(self, obs_ms: int) -> tuple[bool, bool]:
-        """:meth:`peek`, the due sections counted as run at ``obs_ms``."""
-        rescue, rebalance = self.peek(obs_ms)
-        self.mark(obs_ms, rescue, rebalance)
-        return rescue, rebalance
-
     def _due(self, last_ms: int | None, obs_ms: int, need_ms: int) -> bool:
         if last_ms is None or int(obs_ms) < last_ms:
             return True
@@ -300,13 +294,3 @@ async def decision_task(
         snapshot = snapshot_box.get()
         if snapshot is not None:
             loop.on_snapshot(snapshot)
-
-
-def run_rescue_tick(snapshot: MetricsSnapshot, **kwargs) -> LoopTickResult:
-    """The rescue section alone on one snapshot (offline replays, tests)."""
-    return run_planner_tick(snapshot, **{"rescue_due": True, "fairness_due": False, "loop": "rescue", **kwargs})
-
-
-def run_fairness_tick(snapshot: MetricsSnapshot, **kwargs) -> LoopTickResult:
-    """The rebalance section alone on one snapshot (offline replays, tests)."""
-    return run_planner_tick(snapshot, **{"rescue_due": False, "fairness_due": True, "loop": "fairness", **kwargs})

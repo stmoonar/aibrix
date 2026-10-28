@@ -127,8 +127,8 @@ def test_state_time_is_the_controller_request_time():
 
 def test_a_fast_sm_clock_never_moves_the_lower_bound(monkeypatch):
     # The SM node's clock runs 160 s ahead (as one cluster node does): its fetched_ms is
-    # recorded for reference, the lower bound stays the controller's request time, and an
-    # action done during the request is still pending.
+    # ignored, the lower bound stays the controller's request time, and an action done
+    # during the request is still pending.
     times = iter([1_000_000, 1_000_400])
     monkeypatch.setattr(cluster_view_module, "wall_clock_ms", lambda: next(times))
 
@@ -137,7 +137,7 @@ def test_a_fast_sm_clock_never_moves_the_lower_bound(monkeypatch):
             return {"bindings": [], "fetched_ms": 1_000_200 + 160_000}
 
     view = asyncio.run(refresh_cluster_view_once(_Sm(), _registry().topology(), ClusterViewBox())).cluster_view
-    assert (view.state_ms, view.fetched_ms, view.sm_fetched_ms) == (1_000_000, 1_000_400, 1_160_200)
+    assert (view.state_ms, view.fetched_ms) == (1_000_000, 1_000_400)
     queue = _ActionQueue()
     queue.last["m"] = (1_000_300, "up")
     assert _o1_view_pending(queue, {"m": {"o1_routable_tracked": True}}, view) == {"m": "up"}

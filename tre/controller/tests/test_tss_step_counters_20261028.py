@@ -49,8 +49,8 @@ def _docs(redis, pod, counter, *, completed=lambda ts: 0.0, drop_counters=(), st
 
 
 def _read(redis, window=WINDOW):
-    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P, schema="v2")
-    return store.read_model_window(MODEL, END - window, END, use_cache=False, start_exclusive=True)
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P)
+    return store.read_model_window(MODEL, END - window, END, start_exclusive=True)
 
 
 def test_the_numerator_is_processed_tokens_not_completed_ones():
@@ -192,12 +192,12 @@ def test_online_and_offline_numerators_agree_on_clean_windows():
     for pod, f in (("a", f_a), ("b", f_b)):
         _docs(redis, pod, lambda ts, f=f: f(ts - 50), start=END - 80_000)  # scraped_ms = ts - 50
         offline.append(l3.PodCounters(f"default/{pod}", [(ts - 50, *f(ts - 50)) for ts in range(END - 80_000, END + 1, P)]))
-    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P, schema="v2")
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P)
     src = l3.CounterTokenSource(offline)
     clean = online_only = 0
     for end in range(END - 50_000, END + 1, 10_000):
         start = end - WINDOW
-        on = store.read_model_window(MODEL, start, end, use_cache=False, start_exclusive=True)
+        on = store.read_model_window(MODEL, start, end, start_exclusive=True)
         off = src(start, end)
         if off is None:
             assert src.status[(start, end)] == l3.STATUS_RESET

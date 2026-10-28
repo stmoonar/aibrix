@@ -36,6 +36,7 @@ from tre_controller.loops.action_queue import PlanBatch
 from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.replay import _active_probe_models
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
+from tre_controller.loops.tick import run_planner_tick
 from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
@@ -242,17 +243,24 @@ class Sim:
         )
         self.box = SnapshotBox()
         self.queue = _Queue(self)
+        #: (rescue due, rebalance due) of the last planner call (None: no call).
+        self._sections: tuple[bool, bool] | None = None
+
+        def tick(snapshot, **kwargs):
+            self._sections = (bool(kwargs["rescue_due"]), bool(kwargs["fairness_due"]))
+            return run_planner_tick(snapshot, **kwargs)
+
         self.decisions = DecisionLoop(
             queue=self.queue, registry=self.registry, cfg=cfg,
             cluster_view_box=SimpleNamespace(get=self.view),
             active_probe_models=lambda: set(_active_probe_models(self.safescale)),
             safescale=self.safescale, signal_state=self.signal_state,
-            producer_ms=self.period,
+            producer_ms=self.period, tick=tick,
         )
         self._seen_version = 0
 
         async def fetch(start, end):
-            return self.store.read_snapshot(start, end, use_cache=False, start_exclusive=True)
+            return self.store.read_snapshot(start, end, start_exclusive=True)
 
         self.sampler = PhaseAlignedSampler(
             self.store, self.box, window_ms=WINDOW, period_ms=self.period,
@@ -405,12 +413,14 @@ class Sim:
         if self.box.version == self._seen_version:
             return
         self._seen_version = self.box.version  # a new snapshot was published
+        self._sections = None
         result = self.decisions.on_snapshot(snapshot)
         if result is None:
             return
-        rescue = "rescue_skipped_by_cadence" not in result.events
-        if "cluster_view_unavailable" not in result.events:
-            self.run.sections.append((t, rescue, "fairness_skipped_by_cadence" not in result.events))
+        rescue = True
+        if self._sections is not None:  # the planner ran (sections due, a cluster view)
+            rescue, rebalance = self._sections
+            self.run.sections.append((t, rescue, rebalance))
         loop = "rescue" if rescue else "fairness"
         for event in result.events:
             self.run.events.append((t, f"{loop}|{event}"))

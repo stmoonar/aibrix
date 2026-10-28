@@ -191,7 +191,7 @@ class MetricsEvidenceReader:
     def read(self, model: str, *, start_ms: int, end_ms: int, exclude_pods: Collection[str]) -> EvidenceWindow:
         # (S - 1, E] half-open == docs stamped [S, E]; no lookback -> no pre-S baseline.
         metrics = self._store.read_model_window(
-            model, int(start_ms) - 1, int(end_ms), use_cache=False, start_exclusive=True
+            model, int(start_ms) - 1, int(end_ms), start_exclusive=True
         )
         excluded = set(exclude_pods)
         if self._sleeping_pods is not None:
@@ -274,8 +274,8 @@ class MetricsEvidenceReader:
     def _newest_doc_ts(self, model: str) -> tuple[int | None, bool]:
         """(newest histogram doc stamp of the model's pods or None, read failed)."""
         client = self._redis
-        if client is None or getattr(self._store, "schema", "v2") != "v2":
-            # No gateway stamps to anchor on (legacy v1 keys / no redis): unverifiable.
+        if client is None:
+            # No gateway stamps to anchor on (no redis): unverifiable.
             return None, True
         try:
             newest: int | None = None

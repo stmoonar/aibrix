@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
-from tre_common.rediskeys import DECISION_LATEST_KEY
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, PlacementConfig, Registry, SloSpec, TrsParams
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
@@ -268,9 +267,6 @@ async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chai
                                                          "at_least": 2}]}),
     ]
     assert sm_store.load().bindings[1].awake is True
-    decision_hash = redis.hgetall(DECISION_LATEST_KEY)
-    assert decision_hash[b"loop"] == b"rescue"
-    assert b"critical_idle_capacity" in decision_hash[b"actions"]
 
 
 @pytest.mark.asyncio

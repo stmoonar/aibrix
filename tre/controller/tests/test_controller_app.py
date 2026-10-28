@@ -170,7 +170,6 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.store._redis is redis
     assert deps.store._instant_sample_interval_ms == 2500
     assert deps.store._percentile_mode == "interpolated"
-    assert deps.store._schema == "v2"
     assert isinstance(deps.snapshot_box, SnapshotBox)
     assert isinstance(deps.queue, ActionQueue)
     assert deps.queue._client is deps.sm_client
@@ -221,7 +220,6 @@ def test_create_controller_dependencies_can_split_metrics_redis_from_state_redis
     deps = create_controller_dependencies(cfg, redis_client_factory=factory)
 
     assert deps.store._redis is created["redis://metrics:6379/0"]
-    assert deps.store._schema == "v2"
     assert deps.decision_writer._redis is created["redis://state:6379/0"]
     assert deps.safescale._store._redis is created["redis://state:6379/0"]
 

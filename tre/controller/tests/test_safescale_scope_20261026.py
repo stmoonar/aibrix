@@ -12,7 +12,7 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.planning.planner import TransferIntent
 from tre_controller.planning.safescale import SafeScaleStateMachine
 

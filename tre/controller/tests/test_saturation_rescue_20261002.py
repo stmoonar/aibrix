@@ -406,14 +406,14 @@ def test_store_carries_each_pods_newest_instant_sample():
 
     registry = load_registry(str(Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml"))
     store = MetricsStore(redis, registry, instant_sample_interval_ms=GRID)
-    window = store.read_model_window("dsqwen-7b", 0, 30_000, use_cache=False, start_exclusive=True)
+    window = store.read_model_window("dsqwen-7b", 0, 30_000, start_exclusive=True)
     metrics = window.per_pod["pod-a"]
     assert metrics.latest_waiting == 30.0 and metrics.latest_running == 3.0
     assert metrics.latest_gpu_cache == pytest.approx(0.9) and metrics.latest_instant_ms == 30_000
     assert metrics.avg_waiting == pytest.approx(20.0)  # the window mean is unchanged
     assert metrics.latest_current  # observed at the window end
     # Round 5 (M2): read 4 instant periods + 1 ms after its newest sample, not current.
-    later = store.read_model_window("dsqwen-7b", 0, 30_000 + 4 * GRID + 1, use_cache=False, start_exclusive=True)
+    later = store.read_model_window("dsqwen-7b", 0, 30_000 + 4 * GRID + 1, start_exclusive=True)
     assert later.per_pod["pod-a"].latest_instant_ms == 30_000 and not later.per_pod["pod-a"].latest_current
 
 

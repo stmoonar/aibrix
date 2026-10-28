@@ -36,7 +36,7 @@ def test_a_cadence_mismatch_marks_the_snapshot_stale(declared, enforce, stale, c
         expected_cadence=(500, 10_000), cadence_enforce=enforce,
     )
     with caplog.at_level(logging.ERROR, logger="tre_controller.store.metrics_store"):
-        snapshot = store.read_snapshot(1_000_000, 1_030_000, use_cache=False, start_exclusive=True)
+        snapshot = store.read_snapshot(1_000_000, 1_030_000, start_exclusive=True)
     assert snapshot.stale is stale
     assert (snapshot.stale_reason is None) is (not stale and enforce)
     if declared is not None and "last_hist_ms" not in declared and declared.get("instant_ms") == "500" and stale:

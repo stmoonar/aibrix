@@ -20,7 +20,7 @@ import pytest
 
 from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.safescale_task import rollback_left_probes_task
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import (

@@ -17,9 +17,7 @@ class FakeRedis:
     def __init__(self):
         self.sets = {}
         self.zsets = {}
-        self.strings = {}
         self.zrange_calls = 0
-        self.scan_calls = 0
 
     def sadd(self, key, *values):
         self.sets.setdefault(key, set()).update(values)
@@ -39,30 +37,12 @@ class FakeRedis:
         hi = float(maximum)
         return [member for score, member in self.zsets.get(key, []) if lo <= score <= hi]
 
-    def set(self, key, value):
-        self.strings[key] = value
-
-    def mget(self, keys):
-        return [self.strings.get(key) for key in keys]
-
-    def scan_iter(self, match):
-        self.scan_calls += 1
-        if not match.endswith("*"):
-            return iter(())
-        prefix = match[:-1]
-        return (key for key in sorted(self.strings) if key.startswith(prefix))
 
 
 def add_doc(redis, key, ts_ms, doc):
     body = dict(doc)
     body["timestamp"] = ts_ms
     redis.zadd(key, {json.dumps(body, sort_keys=True): ts_ms})
-
-
-def set_legacy_doc(redis, key, ts_ms, doc):
-    body = dict(doc)
-    body["timestamp"] = ts_ms
-    redis.set(key, json.dumps(body, sort_keys=True))
 
 
 def hist_doc(pod, prompt_sum, prompt_count, ttft_sum, ttft_count, ttft_buckets):
@@ -126,40 +106,6 @@ def test_metrics_store_reads_v2_window_with_legacy_delta_semantics():
     assert metrics.per_pod["pod-b"].ttft_p95_ms == 700.0
 
 
-def test_metrics_store_caches_completed_windows():
-    redis = FakeRedis()
-    pod = "default/pod-a"
-    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
-    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 1, 1, 1.0, 1, {"0.5": 1}))
-    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 3, 2, 2.0, 2, {"0.5": 2}))
-
-    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000)
-
-    first = store.read_model_window("dsqwen-7b", 1_000, 11_000)
-    calls_after_first = redis.zrange_calls
-    second = store.read_model_window("dsqwen-7b", 1_000, 11_000)
-
-    assert first == second
-    assert redis.zrange_calls == calls_after_first
-
-
-def test_metrics_store_sliding_reads_do_not_grow_window_cache():
-    # S1.1: sliding windows end at a moving `now`, so every [start, end] is unique.
-    # With use_cache=False the per-window cache must not accumulate entries (no leak).
-    redis = FakeRedis()
-    pod = "default/pod-a"
-    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
-    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 1, 1, 1.0, 1, {"0.5": 1}))
-    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 3, 2, 2.0, 2, {"0.5": 2}))
-
-    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000)
-
-    for end in range(11_000, 11_100):  # 100 distinct sliding windows
-        store.read_model_window("dsqwen-7b", end - 10_000, end, use_cache=False)
-
-    assert len(store._window_cache) == 0
-
-
 def test_metrics_store_min_latency_samples_nulls_noisy_p95():
     # N1: with fewer than min_latency_samples latency observations in a window, p95 is
     # too noisy -> None (not 0), so the signal/safescale layer treats it as unavailable.
@@ -194,34 +140,6 @@ def test_metrics_store_p95_present_when_enough_samples_with_guard():
 
     guarded = MetricsStore(redis, registry, instant_sample_interval_ms=5_000, min_latency_samples=10)
     assert guarded.read_model_window("dsqwen-7b", 1_000, 11_000).ttft_p95_ms is not None
-
-
-def test_metrics_store_reads_v1_legacy_keys_without_pod_set():
-    redis = FakeRedis()
-    pod = "default/pod-a"
-    start_ms = 1_700_000_001_000
-    mid_ms = 1_700_000_006_000
-    end_ms = 1_700_000_011_000
-    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{start_ms}", start_ms, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
-    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{end_ms}", end_ms, hist_doc("pod-a", 42, 2, 4.0, 20, {"0.5": 20}))
-    set_legacy_doc(redis, f"aibrix:pod_instant_metrics_{pod}_{start_ms}", start_ms, inst_doc("pod-a", waiting=2, running=3, kv_hit=0.25))
-    set_legacy_doc(redis, f"aibrix:pod_instant_metrics_{pod}_{mid_ms}", mid_ms, inst_doc("pod-a", waiting=4, running=5, kv_hit=0.75))
-
-    store = MetricsStore(
-        redis,
-        load_registry(str(REGISTRY_PATH)),
-        instant_sample_interval_ms=5_000,
-        schema="v1",
-    )
-
-    metrics = store.read_model_window("dsqwen-7b", start_ms, end_ms)
-
-    assert metrics.prompt_tokens == 32.0
-    assert metrics.avg_waiting == 3.0
-    assert metrics.avg_running == 4.0
-    assert metrics.kv_cache_hit_rate == 0.5
-    assert metrics.routable_pods == 1
-    assert redis.scan_calls == 2
 
 
 def test_metrics_store_uses_pre_window_v2_baseline_for_single_hist_doc_delta():
@@ -288,22 +206,6 @@ def test_metrics_store_returns_none_tokens_when_window_has_no_hist_docs():
     assert metrics.sample_incomplete_pods == ("pod-a",)
 
 
-def test_metrics_store_uses_pre_window_v1_baseline_for_single_hist_doc_delta():
-    redis = FakeRedis()
-    pod = "default/pod-a"
-    baseline_ms = 1_700_000_001_000
-    end_ms = 1_700_000_011_000
-    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{baseline_ms}", baseline_ms, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
-    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{end_ms}", end_ms, hist_doc("pod-a", 42, 2, 4.0, 20, {"0.5": 20}))
-
-    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000, schema="v1")
-
-    metrics = store.read_model_window("dsqwen-7b", baseline_ms + 5_000, baseline_ms + 20_000)
-
-    assert metrics.prompt_tokens == 32.0
-    assert metrics.ttft_p95_ms == 500.0
-
-
 def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
     redis = FixtureRedis()
     window = populate_edge_case_fixture(redis)
@@ -354,10 +256,10 @@ def test_read_latest_instant_captures_bucket_a_narrow_window_would_miss():
     store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000)
 
     # narrow window (old behaviour) -> zero
-    narrow = store.read_model_window("dsqwen-7b", 5_000, 10_000, use_cache=False)
+    narrow = store.read_model_window("dsqwen-7b", 5_000, 10_000)
     assert narrow.avg_running == 0.0
-    # latest read with 2x-cadence lookback -> the true value, not zero
-    snap = store.read_latest_instant("dsqwen-7b", now_ms=10_000, lookback_ms=20_000)
+    # latest read (each pod's newest doc at or before now) -> the true value, not zero
+    snap = store.read_latest_instant("dsqwen-7b", now_ms=10_000)
     assert snap["running"] == 6.0
     assert snap["waiting"] == 2.0
     assert snap["swapping"] == 0.0
@@ -374,23 +276,23 @@ def test_read_latest_instant_takes_freshest_not_average():
     add_doc(redis, "tre:v2:inst:" + pod, 10_000, inst_doc("pod-a", waiting=2, running=8, kv_hit=0.5))
 
     store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000)
-    snap = store.read_latest_instant("dsqwen-7b", now_ms=12_000, lookback_ms=20_000)
+    snap = store.read_latest_instant("dsqwen-7b", now_ms=12_000)
     assert snap["running"] == 8.0
     assert snap["waiting"] == 2.0
 
 
-def test_read_latest_instant_sums_pods_and_handles_v1():
-    # Multi-pod: latest bucket per pod, summed (matches _aggregate_model per-pod sum). Also
-    # exercises the v1 legacy-key path used by the live controller / r3 driver.
+def test_read_latest_instant_sums_pods():
+    # Multi-pod: latest bucket per pod, summed (matches _aggregate_model per-pod sum).
     redis = FakeRedis()
     ts0, ts1 = 1_700_000_000_000, 1_700_000_010_000
     for pod in ("default/pod-a", "default/pod-b"):
-        set_legacy_doc(redis, f"aibrix:pod_instant_metrics_{pod}_{ts0}", ts0, inst_doc(pod, waiting=1, running=2, kv_hit=0.5))
+        redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+        add_doc(redis, "tre:v2:inst:" + pod, ts0, inst_doc(pod, waiting=1, running=2, kv_hit=0.5))
     # only pod-a advances to a fresher bucket
-    set_legacy_doc(redis, f"aibrix:pod_instant_metrics_default/pod-a_{ts1}", ts1, inst_doc("pod-a", waiting=5, running=9, kv_hit=0.5))
+    add_doc(redis, "tre:v2:inst:default/pod-a", ts1, inst_doc("pod-a", waiting=5, running=9, kv_hit=0.5))
 
-    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000, schema="v1")
-    snap = store.read_latest_instant("dsqwen-7b", now_ms=ts1 + 2_000, lookback_ms=20_000)
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000)
+    snap = store.read_latest_instant("dsqwen-7b", now_ms=ts1 + 2_000)
     # pod-a latest running 9 + pod-b latest running 2 = 11
     assert snap["running"] == 11.0
     assert snap["waiting"] == 6.0

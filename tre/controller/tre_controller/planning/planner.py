@@ -110,9 +110,6 @@ class ClusterView:
     #: at or before it is shown by the view (O1 view-pending gate). None = unknown
     #: (synthetic views): ``fetched_ms`` is used.
     state_ms: int | None = field(default=None, compare=False)
-    #: The SM's own ``/v2/state`` ``fetched_ms`` (SM clock): reference only, never
-    #: compared with controller times.
-    sm_fetched_ms: int | None = field(default=None, compare=False)
     #: 2026-10-02 (design 20261002-controller-transfer): serve ids the SM counts
     #: routable - the same function its replica-floor check uses (``/v2/state``
     #: ``bindings[].routable``). None = not reported / not readable: the controller's
@@ -1215,7 +1212,6 @@ def build_plan(
             events.append(f"receiver_held_breakpoint_window:{model}:{reason}")
 
     if not cfg.fairness_due:
-        events.append("fairness_skipped_by_cadence")
         return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
     # A LOW receiver is never a donor, so its need does not change while earlier

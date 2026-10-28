@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller import profile_dump
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.planning.planner import ScaleAction
 from tre_controller.profiling import PROFILE_STREAM_KEY, TickProfiler, build_profiler
 

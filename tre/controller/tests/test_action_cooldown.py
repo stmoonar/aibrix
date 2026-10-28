@@ -5,7 +5,8 @@ import asyncio
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_controller.config import ControllerConfig
-from tre_controller.loops.decision_task import DecisionLoop, run_rescue_tick
+from section_ticks import run_rescue_tick
+from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import PlanConfig, ScaleAction, build_plan

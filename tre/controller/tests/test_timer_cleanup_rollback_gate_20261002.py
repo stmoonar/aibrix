@@ -17,7 +17,7 @@ import pytest
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import SafeScaleRegistryConfig, parse_safescale_config
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.planning.planner import HideAction
 from tre_controller.planning.safescale import (
     CAPACITY_ROLLBACK_CODES,

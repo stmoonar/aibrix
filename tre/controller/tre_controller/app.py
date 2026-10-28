@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -362,7 +363,6 @@ def create_controller_dependencies(
         # 2026-10-25: per-pod completeness (registry scaling.sample_min_ratio).
         min_sample_ratio=float(getattr(scaling_config, "sample_min_ratio", 0.0) or 0.0),
         percentile_mode=cfg.percentile_mode,
-        schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
         # O1 and the SafeScale tail: the suffix windows they decide on, aligned to the
@@ -406,7 +406,6 @@ def create_controller_dependencies(
                 evidence_period_ms=cfg.evidence_period_ms,
                 read_instant=False,
                 percentile_mode=cfg.percentile_mode,
-                schema=cfg.metrics_schema,
                 histogram_lookback_ms=0,
                 min_latency_samples=cfg.min_latency_samples,
             ),
@@ -531,7 +530,11 @@ def create_controller_dependencies(
         model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,
-        decision_writer=DecisionSnapshotWriter(redis_client),
+        # Decision records: one pipelined round trip per decision, on one worker thread
+        # (in order) - the decision loop never waits for Redis.
+        decision_writer=DecisionSnapshotWriter(
+            redis_client, executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="decision-write")
+        ),
         safescale=safescale,
         registry=registry,
         signal_state=signal_state,

@@ -5,8 +5,8 @@ from dataclasses import replace
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_common.registry import PlacementConfig
-from tre_controller.loops.decision_task import run_fairness_tick
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_fairness_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.tick import PaperStateCache
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.planner import HideAction, ScaleAction
