@@ -808,11 +808,17 @@ def test_eviction_storm_guards():
     assert C.node_pressure_problems(nodes) == ["b"]
     pods = {"items": [{"status": {"phase": "Failed"}}, {"status": {"phase": "Running"}}, {"status": {"phase": "Failed"}}]}
     assert C.failed_pod_count(pods) == 2
-    cfg = {"frac": 0.15, "floor_gb": 10, "nodes": {"n3": 1}}
+    cfg = {"kubelet_margin": 1.1, "nodes": {"n3": 1}}
 
     def st(free, cap):
         return {"node": {"fs": {"availableBytes": free * 1e9, "capacityBytes": cap * 1e9}}}
-    assert not C.node_fs_verdict(st(14, 100), cfg, "n1")[0]      # 14 < 15% of 100
-    assert C.node_fs_verdict(st(16, 100), cfg, "n1")[0]
-    assert not C.node_fs_verdict(st(9, 30), cfg, "n1")[0]        # floor 10 GB beats 15% of 30
-    assert C.node_fs_verdict(st(2, 100), cfg, "n3")[0]           # per-node override
+
+    def cz(v):
+        return {"kubeletconfig": {"evictionHard": {"nodefs.available": v}}}
+    assert not C.node_fs_verdict(st(10.9, 100), cfg, "n1", cz("10%"))[0]   # need 11 GB
+    assert C.node_fs_verdict(st(11.1, 100), cfg, "n1", cz("10%"))[0]
+    assert not C.node_fs_verdict(st(1.0, 100), cfg, "n1", cz("1Gi"))[0]    # quantity: 1.1 x 1Gi = 1.18 GB
+    assert C.node_fs_verdict(st(1.3, 100), cfg, "n1", cz("1Gi"))[0]
+    assert not C.node_fs_verdict(st(10.9, 100), cfg, "n1", None)[0]        # configz missing -> default 10%
+    assert C.node_fs_verdict(st(11.1, 100), cfg, "n1", {})[0]              # key absent -> default 10%
+    assert C.node_fs_verdict(st(2, 100), cfg, "n3", cz("10%"))[0]          # per-node override

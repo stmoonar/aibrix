@@ -102,9 +102,10 @@ DEFAULTS: dict = {
     "precheck": {"gpu_truth_max_age_s": 30, "breakpoint_lookback_s": 60, "wait_s": 300, "poll_s": 30,
                  "disk_min_free_gb": {"nfs": 50, "nodes": {}},
                  # 2026-10-28 eviction-storm guards (hard): node DiskPressure, Failed/Evicted pods, node root fs free
-                 # space = max(floor, frac * capacity) read from the kubelet stats (no ssh); "nodes" overrides per node
+                 # space >= kubelet_margin x the node kubelet hard-eviction threshold nodefs.available (configz; default
+                 # 10%), read through the API server (no ssh); "nodes" = per-node override in GB
                  "node_pressure": True, "failed_pods_max": 0,
-                 "node_fs_min_free": {"frac": 0.15, "floor_gb": 10, "nodes": {}}},
+                 "node_fs_min_free": {"kubelet_margin": 1.1, "nodes": {}}},
     "validity": {"fail_frac_suspect": 0.01, "fail_frac_invalid": 0.20, "sent_frac_min": 0.98,
                  "emfile": "invalid", "max_tokens_hit_min": 0.99, "clock_drift_max_s": 1.0},
     "marker": {"extend": True, "margin_s": 1800},
@@ -1168,7 +1169,11 @@ class Cluster:
             for node in names:
                 try:
                     st = json.loads(self.kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/stats/summary", timeout=60))
-                    ok, d = node_fs_verdict(st, cfg, node)
+                    try:
+                        cz = json.loads(self.kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/configz", timeout=60))
+                    except Exception:  # noqa: BLE001  configz unavailable: kubelet default threshold
+                        cz = None
+                    ok, d = node_fs_verdict(st, cfg, node, cz)
                 except Exception as exc:  # noqa: BLE001  stats unavailable: warn, do not block
                     warn.append(f"{node}: stats unavailable ({type(exc).__name__}) - not checked")
                     continue
@@ -1219,13 +1224,32 @@ def failed_pod_count(pods_json: dict) -> int:
     return sum(1 for p in pods_json.get("items", []) if p.get("status", {}).get("phase") == "Failed")
 
 
-def node_fs_verdict(stats: dict, cfg: dict, node: str) -> tuple[bool, str]:
-    """Kubelet stats/summary -> (ok, detail). Needs free >= max(floor_gb, frac * capacity); per-node override in cfg["nodes"]."""
+_QTY = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+
+
+def kubelet_nodefs_threshold(configz: Optional[dict], cap: float) -> tuple[float, str]:
+    """Kubelet hard-eviction threshold for nodefs.available in bytes: "10%" or a quantity ("1Gi");
+    configz missing or key absent -> Kubernetes default 10%."""
+    v = ((configz or {}).get("kubeletconfig") or {}).get("evictionHard", {}).get("nodefs.available")
+    if v is None:
+        return 0.10 * cap, "10% (default)"
+    v = str(v).strip()
+    if v.endswith("%"):
+        return float(v[:-1]) / 100 * cap, v
+    m = re.fullmatch(r"([0-9.]+)([A-Za-z]*)", v)
+    return float(m.group(1)) * _QTY.get(m.group(2), 1), v
+
+
+def node_fs_verdict(stats: dict, cfg: dict, node: str, configz: Optional[dict] = None) -> tuple[bool, str]:
+    """Kubelet stats/summary (+ configz) -> (ok, detail). Needs free >= kubelet_margin x kubelet nodefs.available
+    eviction threshold; per-node override in cfg["nodes"] (GB)."""
     fs = stats["node"]["fs"]
     free, cap = float(fs["availableBytes"]), float(fs["capacityBytes"])
+    thr, raw = kubelet_nodefs_threshold(configz, cap)
     want = (cfg.get("nodes") or {}).get(node)
-    want = float(want) * 1e9 if want is not None else max(float(cfg["floor_gb"]) * 1e9, float(cfg["frac"]) * cap)
-    return free >= want, f"{node} root fs {free / 1e9:.0f}/{cap / 1e9:.0f} GB free (need >= {want / 1e9:.0f})"
+    want = float(want) * 1e9 if want is not None else float(cfg.get("kubelet_margin", 1.1)) * thr
+    return free >= want, (f"{node} root fs {free / 1e9:.1f}/{cap / 1e9:.1f} GB free (kubelet threshold {raw} = "
+                          f"{thr / 1e9:.1f} GB, need >= {want / 1e9:.1f})")
 
 
 def precheck_until_ready(checks: Callable[[], list], reset: Callable[[bool], int], c: dict,
