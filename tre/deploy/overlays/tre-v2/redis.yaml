@@ -38,6 +38,10 @@ items:
             - name: redis
               image: redis:7.2-alpine
               imagePullPolicy: IfNotPresent
+              # 2026-10-29: no persistence. The pod has no volume, so an RDB snapshot is
+              # never read back (a restarted pod starts empty either way); the periodic
+              # fork + dump caused most of the container's CPU throttling.
+              command: ["redis-server", "--save", "", "--appendonly", "no"]
               ports:
                 - containerPort: 6379
                   name: redis
