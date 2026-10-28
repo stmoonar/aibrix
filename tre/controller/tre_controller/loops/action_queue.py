@@ -189,12 +189,6 @@ class RescueTargetRecord:
     def covered(self) -> int:
         return self.covered_before + self.gained
 
-    @property
-    def added_nothing(self) -> bool:
-        """Every dispatched part of this target ended (done, failed, refused, dropped in
-        observe mode) and none added a replica: the target will never land."""
-        return self.seq > 0 and self.outstanding == 0 and self.done_ms is not None and self.gained == 0
-
 
 @dataclass
 class _Backoff:

@@ -61,7 +61,6 @@ def get_signal(
     trs_z_m: float | None,
     signal_state: "SignalState | None" = None,
     routable_pod_ids: Collection[str] | None = None,
-    ema_window_ms: float | None = None,
 ) -> SignalValue:
     """``source``'s value and ``z`` for this window.
 
@@ -74,15 +73,14 @@ def get_signal(
     probe pod is left out) and are unknown unless each of them has data. None = no fleet
     view: every pod of the window, checked by count.
 
-    ``ema_window_ms``: the EMA's idle-gap length, the configured metrics window (review
-    M2): a caller computing on a suffix window passes the whole window here, as the TSS
-    EMA does. None = the window's own span (the live decision signal, 2026-10-29).
+    The EMA's idle-gap length is the window's own span (review M2; every decision window
+    is the whole metrics window since 2026-10-29).
     """
     if source == "zm":
         return SignalValue(source=source, raw_value=trs_z_m, z_m=trs_z_m)
     if source == "latency_p95":
         return _latency_signal(metrics, spec)
-    gap_ms = float(ema_window_ms) if ema_window_ms is not None else float(metrics.window_end_ms - metrics.window_start_ms)
+    gap_ms = float(metrics.window_end_ms - metrics.window_start_ms)
     if source == "queue_len":
         # Review L1 (2026-10-28): the per-pod rules leave a pod with an unknown queue or a
         # short token span out of ``per_pod``; dividing the remaining pods' sum by every

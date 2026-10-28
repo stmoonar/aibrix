@@ -347,23 +347,3 @@ def test_the_alt_signals_sum_the_routable_pods_only() -> None:
         assert get_signal(gap, _spec(), source, trs_z_m=9.0, routable_pod_ids=frozenset({"a", "b"})).z_m is None
     # ids that disagree with the routable count: fail closed
     assert get_signal(window, _spec(), "queue_len", trs_z_m=9.0, routable_pod_ids=frozenset()).z_m is None
-
-
-def test_the_alt_ema_gap_is_the_metrics_window_not_a_suffix_span() -> None:
-    """Review M2: an O1 suffix (here 5 s) decides with the EMA's idle-gap length = the
-    configured metrics window, as TSS; its own span reset the EMA to the raw suffix value
-    on every tick (dt 10 s > 5 s)."""
-    from tre_controller.signals.trs import SignalState
-
-    spec = _spec_with_tau(10_000.0)
-    out = {}
-    for gap in (None, 20_000.0):
-        state = SignalState()
-        values = []
-        for end, running in ((60_000, 2.0), (70_000, 8.0)):
-            window = _metrics(window_start_ms=end - 5_000, window_end_ms=end, avg_running=running)
-            values.append(get_signal(window, spec, "queue_len", trs_z_m=9.0, signal_state=state,
-                                     ema_window_ms=gap).raw_value)
-        out[gap] = values
-    assert out[None] == [2.0, 8.0]  # reset: the suffix span is shorter than the tick gap
-    assert out[20_000.0][0] == 2.0 and 2.0 < out[20_000.0][1] < 8.0

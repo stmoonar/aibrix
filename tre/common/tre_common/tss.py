@@ -199,9 +199,9 @@ def tss_terms(
 
 def window_is_idle(prompt_tokens: Optional[float], generation_tokens: Optional[float]) -> bool:
     """THE idle-window predicate: the window carried no traffic (no prefill and no decode
-    token). Used by the online idle tick (warmup onset, ``SignalState.observe_traffic``) and
-    by every EMA - online and offline - through ``TssEma.update(idle=...)``. Unknown token
-    totals (``None``) are not idle: nothing is known about the window.
+    token). Used by the online idle reset (``SignalState.reset_ema``) and by every EMA -
+    online and offline - through ``TssEma.update(idle=...)``. Unknown token totals
+    (``None``) are not idle: nothing is known about the window.
     """
     if prompt_tokens is None or generation_tokens is None:
         return False
