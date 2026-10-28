@@ -412,13 +412,14 @@ def sm_ops(d: Path, t0_iso_s) -> dict:
 
 
 # ------------------------------------------------------------------ the check
-def expected_rescue_interval_s(rescue_s: float = 5.0, rebalance_s: float = 10.0, snapshot_s: float = 2.0) -> float:
+def expected_rescue_interval_s(rescue_s: float = 5.0, rebalance_s: float = 10.0, snapshot_s: float = 1.0) -> float:
     """Mean spacing of the controller's rescue decisions (single decision loop, design
     20261028-single-loop): each period rounds UP to the snapshot grid (5 s with 2 s
-    snapshots: 6 s) and every rebalance call (10 s) also runs the rescue section, so per
-    rebalance interval there are ceil(rebalance / rescue) rescue calls. Defaults: the
-    controller's (TRE_RESCUE_INTERVAL_SECONDS, TRE_FAIRNESS_INTERVAL_SECONDS, evidence
-    period)."""
+    snapshots: 6 s; with the 1 s snapshots of the overlay since 2026-10-28: 5 s) and every
+    rebalance call (10 s) also runs the rescue section, so per rebalance interval there
+    are ceil(rebalance / rescue) rescue calls. Defaults: the overlay's
+    (TRE_RESCUE_INTERVAL_SECONDS, TRE_FAIRNESS_INTERVAL_SECONDS, TRE_EVIDENCE_PERIOD_MS);
+    a run on another period sets RUN_CHECK_CONTROLLER_TICK_S."""
     def grid(x: float) -> float:
         return math.ceil(x / snapshot_s - 1e-9) * snapshot_s
     rescue, rebalance = grid(rescue_s), grid(rebalance_s)

@@ -92,7 +92,8 @@ DEFAULT_RPS_WINDOW_S = 1.0
 #: against it so a capture can be replayed at either resolution.
 LIVE_GRID_MS = LEGACY_GRID_MS
 #: The grid the theta fit's windows end on (``--window-align grid``, step a multiple of
-#: it): the 10 s grid as before. The controller's windows end every evidence period (2 s),
+#: it): the 10 s grid as before. The controller's windows end every evidence period (1 s in
+#: the overlay since 2026-10-28, 2 s before),
 #: a divisor of it, so the fit windows stay a subset of the controller's windows and the
 #: fit samples the same window starts as the fits made before 2026-10-25.
 FIT_GRID_MS = LEGACY_GRID_MS
