@@ -320,7 +320,7 @@ def _run_rescue_once(*, probed: bool) -> list:
     return [action for batch in queue.submitted for action in batch]
 
 
-def test_rescue_task_excludes_actively_probed_model_from_immediate_donors() -> None:
+def test_the_decision_loop_excludes_actively_probed_model_from_immediate_donors() -> None:
     control = _run_rescue_once(probed=False)
     # F1-B (2026-10-07): the HIGH donor is taken through a SafeScale probe (its hide).
     assert any(getattr(action, "model", None) == "donor" for action in control)

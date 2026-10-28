@@ -138,7 +138,8 @@ def test_build_plan_middle_zone_shrinks_healthy_under_safescale_for_a_critical_r
     assert _deltas(scale_actions) == {"healthy": -1}
     assert plan.delayed_down_models == {"healthy"}
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
-    assert plan.events == []
+    # Review P2-3: the promised replica is the receiver's rescue step.
+    assert plan.events == ["rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1"]
     assert all(action.source_loop == "rescue" for action in plan.actions)
     shrink = next(action for action in scale_actions if action.model == "healthy")
     assert shrink.requires_safescale is True

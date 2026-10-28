@@ -112,6 +112,13 @@ def test_unrefreshed_window_recomputes_the_same_target_and_adds_nothing():
         assert "rescue_target_hold:r:desired=3:covered=3" in again.events
 
 
+def test_a_target_none_of_whose_parts_landed_is_planned_again():
+    # The earlier target 2 -> 3 added nothing (covered = the 2 before it): its step again.
+    basis = {"r": RescueBasis(base=2, covered=2)}
+    plan = _plan([_cls("r", ModelState.CRITICAL, 0.4)], {"r": 2}, idle_gpus=4, bases=basis)
+    assert _deltas(plan) == {"r": 1}
+
+
 def test_inflight_receiver_is_not_planned_again():
     plan = _plan([_cls("r", ModelState.CRITICAL, 0.1)], {"r": 2}, idle_gpus=4, inflight={"r"})
     assert _deltas(plan) == {}

@@ -1,6 +1,7 @@
 """Latest per-model signal state of the planner ticks (review 3 P2-1..P2-3).
 
-The rescue / fairness ticks publish their classifications here; the ActionQueue
+The decision loop (2026-10-28: one loop, rescue + rebalance sections) publishes its
+classifications here; the ActionQueue
 reads them to revalidate a one-shot SafeScale commit before every (re)try (the
 donor needing capacity again abandons the commit, a receiver that no longer
 needs capacity loses its upscale).

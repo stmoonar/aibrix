@@ -41,7 +41,7 @@ class StateUnreadable(ValueError):
 
 def sleep_path_of(action: ScaleAction) -> str:
     """SM sleep path of a scale-down (plan 2026-09-27 D1). A negative delta must name its
-    path (explicitly or via an "*_immediate" reason, the fast-loop donor paths:
+    path (explicitly or via an "*_immediate" reason, the rescue-section donor paths:
     "urgent"): there is no implicit "scale_down" (a path-less shrink would silently take
     the SM default - SM-side drain - and bypass SafeScale)."""
     path = action.sleep_path or ("urgent" if str(action.reason).endswith("_immediate") else None)

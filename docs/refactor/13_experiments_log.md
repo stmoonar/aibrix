@@ -34,7 +34,7 @@ Entry template:
 | R5 | Ablation matrix (no-fastloop / no-safescale / queue_len) × 3 traces | R4 | ~6h | overlays/ablation-* |
 | R6 | Replayer timing precision (real vs dry-run) | any gap | ~0.5h | replayer dual-mode |
 
-> 2026-10-08: the `no-fastloop` arm is replaced by `no-slowloop` (overlay `ablation-no-slowloop`, `TRE_ABLATION_DISABLE_SLOW_LOOP`: all decisions in the fast loop); `no-safescale` now means immediate release (no probes).
+> 2026-10-08: the `no-fastloop` arm is replaced by `no-slowloop` (overlay `ablation-no-slowloop`, `TRE_ABLATION_DISABLE_SLOW_LOOP`: all decisions in the fast loop; 2026-10-28 single decision loop: the switch now means LOW receivers get nothing, no-slowloop data before 2026-10-28 used the old meaning); `no-safescale` now means immediate release (no probes).
 
 N5 gate: this log has R1–R7 entries, each reproducible; `git tag results-v1`;
 main comparison table {old, new bucket_upper, interpolated, ablation arms} × oracle-normalized score.

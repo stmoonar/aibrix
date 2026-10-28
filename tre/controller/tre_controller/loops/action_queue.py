@@ -19,10 +19,12 @@ from tre_controller.planning.planner import (
     RelayHold,
     SafeScaleCommitAction,
     ScaleAction,
+    ShrinkForSlotAction,
     SourceLoop,
     TransferIntent,
     UnhideAction,
     relay_hold_reason,
+    upscale_of,
 )
 
 if False:  # annotations are strings (from __future__); avoids an import cycle
@@ -465,7 +467,13 @@ class ActionQueue:
         Only members whose resources are FREE at submit time are fused (review
         2026-10-28): a rescue member whose model a running commit / plan (or an
         earlier queued action) still holds would make the whole batch wait for
-        it; it stays its own queued action, as before fusion."""
+        it; it stays its own queued action, as before fusion.
+
+        A same-slot release (a :class:`PlanBatch` of its own: donor sleep + receiver
+        wake, design 20261028-single-loop L4) joins as ONE unit - both members in the
+        same plan, never split - so one decision is one plan whenever the members touch
+        different models (the SM's plan runs the receiver's wake as wave 2 after the
+        donor's sleep, ``tre/docs/design/20261027-sm-plans.md`` section 4.1)."""
         if sum(1 for queued in accepted if _fusable(queued)) < 2:
             return
         mine = {id(queued) for queued in accepted}
@@ -497,7 +505,9 @@ class ActionQueue:
         fused: deque[QueuedAction] = deque(list(self._pending)[:start])
         for entry in out:
             if isinstance(entry, list) and len(entry) > 1:
-                fused.append(self._queued(PlanBatch(tuple(item.action for item in entry))))
+                fused.append(self._queued(PlanBatch(tuple(
+                    member for item in entry for member in _members(item.action)
+                ))))
             else:
                 fused.append(entry[0] if isinstance(entry, list) else entry)
         self._pending = fused
@@ -1395,7 +1405,11 @@ class ActionQueue:
         several scale-up parts of one receiver never each count the same pods."""
         credit = {} if credit is None else credit
         action = queued.action
-        if isinstance(action, TransferIntent):
+        batch_ups = receiver_upscales(action) if isinstance(action, PlanBatch) else ()
+        if len(batch_ups) == 1:
+            # Review P2-2: a same-slot release (donor sleep + receiver wake).
+            model, delta = batch_ups[0]
+        elif isinstance(action, TransferIntent):
             model, delta = action.receiver_model, action.pairs
         elif isinstance(action, ScaleAction) and action.delta > 0:
             model, delta = action.model, action.delta
@@ -1409,8 +1423,9 @@ class ActionQueue:
         available = credit.get(model, 0) + restored
         if available <= 0:
             return queued, 0
-        if isinstance(action, TransferIntent):
-            # A relay is not split: covered entirely, or kept whole (credit kept).
+        if isinstance(action, (TransferIntent, PlanBatch)):
+            # A relay / a same-slot release is not split: covered entirely, or kept
+            # whole (credit kept).
             if available >= delta:
                 credit[model] = available - delta
                 return None, delta
@@ -2148,8 +2163,10 @@ def _runs_in_observe(queued: QueuedAction) -> bool:
 
 
 def _rescue_part(action):
-    """The C1-tagged rescue scale-up of an action (a ScaleAction or a relay intent's
-    receiver side), or None."""
+    """The C1-tagged rescue scale-up of an action (a ScaleAction, a relay intent's
+    receiver side, a PlanBatch's receiver member), or None."""
+    if isinstance(action, PlanBatch):
+        return next((part for member in action.members if (part := _rescue_part(member)) is not None), None)
     if isinstance(action, TransferIntent):
         return action if action.rescue is not None else None
     if isinstance(action, ScaleAction) and action.delta > 0 and getattr(action, "rescue", None) is not None:
@@ -2296,6 +2313,18 @@ class _PlanRun:
     whole_plan_failed: bool = False
 
 
+def receiver_upscales(action) -> tuple[tuple[str, int], ...]:
+    """(model, receiver replicas) every receiver part of an action adds: a scale-up or a
+    relay (:func:`upscale_of`), the members of a :class:`PlanBatch`, the beneficiary of a
+    same-slot release (ShrinkForSlotAction: its wake comes with the release)."""
+    if isinstance(action, PlanBatch):
+        return tuple(up for member in action.members for up in receiver_upscales(member))
+    if isinstance(action, ShrinkForSlotAction):
+        return ((action.beneficiary, 1),)
+    up = upscale_of(action)
+    return (up,) if up is not None else ()
+
+
 def _members(action) -> tuple:
     return tuple(action.members) if isinstance(action, PlanBatch) else (action,)
 
@@ -2318,6 +2347,8 @@ def _fusable(queued: QueuedAction) -> bool:
     action = queued.action
     if queued.source_loop in ONE_SHOT_LOOPS:
         return False
+    if isinstance(action, PlanBatch):  # a same-slot release: one unit
+        return True
     return isinstance(action, TransferIntent) or (isinstance(action, ScaleAction) and action.delta != 0)
 
 

@@ -43,8 +43,13 @@ Defects seen in the 10-28 campaign and review:
   (`Observed.t_last_ms`; `ts_ms` for a snapshot without windows).
 - The **rescue section** runs when `TRE_RESCUE_INTERVAL_SECONDS` (5 s) of observation
   time passed since its last run; the **rebalance section** (fairness, LOW receivers)
-  when `TRE_FAIRNESS_INTERVAL_SECONDS` (10 s) passed. Tolerance: the fetch jitter,
-  bounded by half the evidence period (`SPAN_TOLERANCE_MS` at >= 2 s).
+  when `TRE_FAIRNESS_INTERVAL_SECONDS` (10 s) passed, and only together with the rescue
+  section (v1: the slow beat is always a fast beat; a LOW receiver is never planned on
+  a call that skipped the CRITICAL ones). The span since a section's last run is
+  snapped to whole snapshot (producer) periods - that absorbs a scrape jitter below half
+  a period and nothing else - so the cadence is deterministic and rounds UP to the
+  snapshot grid: with 2 s snapshots the rescue section runs every 6 s, and at every
+  10 s rebalance call (mean rescue spacing 5 s; `first_run_check` expects that).
 - Both sections run in the SAME `run_planner_tick` call, rescue first. They share one
   ledger (planned deltas, claimed GPUs, released donor pods) and one `PaperStateCache`.
   One plan goes out through the ActionQueue (the tick never waits for the SM).
@@ -98,12 +103,15 @@ Defects seen in the 10-28 campaign and review:
 
 ### Implementation notes (2026-10-28)
 
-- L1: a section is due when its period of observation time passed since its last run,
-  within `min(SPAN_TOLERANCE_MS, evidence period / 2)`.
+- L1 (review 2026-10-28): the rebalance section runs only with the rescue section; the
+  span is snapped to the snapshot grid (`decision_task.grid_span_ms`); a call without a
+  cluster view decides nothing and leaves the sections due.
 - L3: `saturation_max_step_factor` (the bounded doubling of the onset saturation rescue)
   is retired with the other step keys.
-- L4: the middle-zone donor limit for a TP receiver is `step x tp_size` donor replicas
-  (one aligned slot of single-GPU donors; one step alone could never fill a slot).
+- L4: a non-IDLE donor gives a TP receiver one step (one replica) per decision; a slot
+  of two single-GPU replicas of one HIGH / middle-zone donor in one decision was rejected
+  (user, 2026-10-28). TP supply is to be redesigned on buddy blocks
+  (`tre_common/gpu_placement`).
 - L4: an IDLE donor's same-slot release is immediate under every scope, scope `all`
   included (only an IDLE donor is released at once): one `PlanBatch`, no probe. HIGH /
   middle-zone donors keep the scope semantics (probe under `all`; the commit's
@@ -112,11 +120,26 @@ Defects seen in the 10-28 campaign and review:
 - L4: `capacity_blocked:<model>` is recorded once at the end of a TP receiver's
   rescue, when the slot path and the relays together left it short (no longer by the
   slot path alone, which the relays may still fill).
+- L4 (review P1-1): a free slot mate is judged on the plan's ledger (awake, claimed by
+  this plan's wakes / creates / slots, blocked), never on the view alone.
+- L3 (review P2-3): a receiver an unresolved SafeScale probe promises replicas to (its
+  commit wakes them) holds that step like a queued rescue target until the probe
+  resolves (`tick._with_probe_promises`); the probe placements carry the rescue tag.
+- One decision, one SM plan: the SM's `POST /v2/plans` runs several sleeps and wakes in
+  one writer-lock hold, a wake that needs GPUs the plan's own sleeps free as wave 2
+  after them, hints first (`20261027-sm-plans.md` 4.1). So a same-slot release joins
+  the decision's fused plan as one unit (`ActionQueue._fuse_into_plans`). What still
+  splits a decision: two items of one model (the SM allows one item per model; the
+  next plan then serializes on that model) and SafeScale one-shot actions (a commit
+  keeps its own plan and retries).
 
 ## Ablation
 
 `TRE_ABLATION_DISABLE_SLOW_LOOP=true`: the rebalance section never runs (LOW receivers
-get nothing); the rescue section runs as usual. The old name
+get nothing); the rescue section runs as usual. **The name is kept, the semantics
+changed on 2026-10-28**: from 2026-10-08 to 2026-10-27 it removed the fairness task and
+every rescue tick also planned fairness (LOW receivers were served). No-slow-loop data
+recorded before 2026-10-28 is not comparable with runs after it. The old name
 `TRE_ABLATION_DISABLE_FAST_LOOP` still makes the controller refuse to start.
 
 ## Invariants (tests)

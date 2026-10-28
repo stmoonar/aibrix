@@ -177,8 +177,11 @@ class ControllerConfig:
     #: ended at most this long before (ms, gateway window ends; TRE_PAPER_STALE_MAX_MS).
     paper_stale_max_ms: int
     incomplete_policy: str
-    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-28 semantics): the decision loop never runs
-    # the rebalance section - LOW receivers get nothing; the rescue section is unchanged.
+    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-28 semantics, design 20261028-single-loop):
+    # the decision loop never runs the rebalance section - LOW receivers get nothing; the
+    # rescue section is unchanged. Data recorded before 2026-10-28 used other semantics
+    # (2026-10-08..27: no fairness task, every rescue tick also planned fairness, so LOW
+    # receivers WERE served): not comparable with no-slow-loop runs after it.
     ablation_disable_slow_loop: bool
     ablation_disable_safescale: bool
     #: TRE_SAFESCALE_SCOPE (2026-10-26): which placements run as a SafeScale probe -

@@ -13,7 +13,7 @@ from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
 from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
-from tre_controller.loops.action_queue import PlanBatch
+from tre_controller.loops.action_queue import PlanBatch, receiver_upscales
 from tre_controller.planning.classify import (
     ModelRole,
     ModelState,
@@ -293,7 +293,10 @@ def run_planner_tick(
         probe_backoff_models=_probe_backoff_models(safescale, snapshot, contexts),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
         # C1: earlier rescue targets the decision windows do not reflect yet.
-        rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
+        rescue_bases=(
+            _with_probe_promises(_rescue_bases(snapshot, queue, registry, contexts), safescale, contexts)
+            if rescue_due else None
+        ),
         # H3 exempt basis (2026-10-26): scale-ups of any path the decision signal does
         # not reflect yet - they hold the O1-exempt free-GPU step (same release rule).
         unsettled_upscales=_unsettled_upscales(snapshot, queue, registry, contexts) if rescue_due else None,
@@ -484,8 +487,9 @@ def _note_saturation_steps(
     noted: set[str] = set()
     if tracker is None:
         return noted
-    ups = [action for action in actions if upscale_of(action) is not None]
-    up = {upscale_of(action)[0] for action in ups}
+    # Review P2-2: also a same-slot release's receiver wake (receiver_upscales).
+    ups = [(action, model, delta) for action in actions for model, delta in receiver_upscales(action)]
+    up = {model for _, model, _ in ups}
     for item in classifications:
         if not getattr(item, "saturation_rescue", False) or item.model_name not in up:
             continue
@@ -494,9 +498,9 @@ def _note_saturation_steps(
             continue
         ctx = contexts.get(item.model_name) or {}
         routable = int(ctx.get("routable_pods") or 0)
-        mine = [action for action in ups if upscale_of(action)[0] == item.model_name]
-        targets = [int(action.rescue.target) for action in mine if getattr(action, "rescue", None) is not None]
-        target = max(targets) if targets else routable + sum(upscale_of(action)[1] for action in mine)
+        mine = [(action, delta) for action, model, delta in ups if model == item.model_name]
+        targets = [int(action.rescue.target) for action, _ in mine if getattr(action, "rescue", None) is not None]
+        target = max(targets) if targets else routable + sum(delta for _, delta in mine)
         if cluster_view is not None:
             # The step's pods: the routable set the added pods are later taken from.
             pods = sorted((_routable_pod_ids(cluster_view) or {}).get(item.model_name, ()))
@@ -597,6 +601,26 @@ def _rescue_bases(
     return bases
 
 
+def _with_probe_promises(
+    bases: dict[str, RescueBasis], safescale: SafeScaleController | None, contexts: dict[str, dict] | None
+) -> dict[str, RescueBasis]:
+    """Review P2-3: a receiver an unresolved SafeScale probe promises replicas to (its
+    commit wakes them: ``pending_upscales``) holds that target like a queued rescue
+    target - the step is planned, so the next calls add nothing until the probe
+    resolves (state, not time; after a commit O1 / the rescue target rules take over)."""
+    out = dict(bases)
+    for probe in _unresolved_probes(safescale):
+        for model, count in (getattr(probe, "pending_upscales", None) or {}).items():
+            if int(count) <= 0:
+                continue
+            basis = out.get(model)
+            if basis is None:
+                routable = int(((contexts or {}).get(model) or {}).get("routable_pods") or 0)
+                basis = RescueBasis(base=routable, covered=routable)
+            out[model] = RescueBasis(base=basis.base, covered=basis.covered + int(count))
+    return out
+
+
 def _scale_up_reflected(
     metrics, context: dict | None, done_ms: int, *, observed: bool, registry: Registry | None, model: str
 ) -> bool:
@@ -616,7 +640,7 @@ def _unsettled_upscales(
     contexts: dict[str, dict] | None = None,
 ) -> dict[str, int]:
     """H3 exempt basis (2026-10-26): model -> when its last scale-up (any path: rescue,
-    LOW rescue / fairness, relay receiver, SafeScale receiver target -
+    LOW rebalance, relay receiver, SafeScale receiver target -
     ``ActionQueue.last_upscales``) returned, while the model's decision signal does not
     reflect it yet (:func:`_scale_up_reflected`, the rescue-basis rule). The planner
     holds an O1-exempt CRITICAL receiver on it: one stale window buys one wake, whichever
@@ -826,13 +850,30 @@ def _apply_safescale(
     # back are deducted across all of the model's scale-up parts, in plan order.
     up_totals: dict[str, int] = {}
     for action in actions:
-        up = upscale_of(action)
-        if up is not None:
-            up_totals[up[0]] = up_totals.get(up[0], 0) + up[1]
+        for model, delta in receiver_upscales(action):
+            up_totals[model] = up_totals.get(model, 0) + delta
     restore_left: dict[str, int] = {}
     restore_used: dict[str, int] = {}
     survived: set[str] = set()
     rescue_of: dict[str, object] = {}
+
+    def preempt_once(model: str) -> None:
+        if model in restore_left:
+            return
+        preempt = getattr(safescale, "request_preemption", None)
+        restored = preempt(model, reason="receiver_need_upscale") if callable(preempt) else 0
+        restored = max(0, int(restored or 0))
+        restore_left[model] = restored
+        restore_used[model] = min(restored, up_totals.get(model, 0))
+        if restored > 0:
+            # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale),
+            # then up_needed = delta - probe_hidden. The rollback (unhide) is issued
+            # by the safescale loop's next observation, one-shot and observe-mode safe.
+            events.append(
+                f"safescale_probe_preempted:{model}:restored={restored}"
+                f":up_needed={max(0, up_totals.get(model, 0) - restored)}"
+            )
+
     for action in actions:
         if observe_mode:
             # B8: never start (or preempt) a probe while paused. The planned
@@ -843,22 +884,28 @@ def _apply_safescale(
             else:
                 converted.append(action)
             continue
+        if isinstance(action, (PlanBatch, ShrinkForSlotAction)):
+            # Review P2-2: a same-slot release wakes its receiver too (one plan, or the
+            # probe's commit): the receiver's own probe is preempted like for any
+            # scale-up; restored pods covering it make the release pointless.
+            ups = receiver_upscales(action)
+            if len(ups) == 1:
+                model, delta = ups[0]
+                preempt_once(model)
+                rescue = _rescue_of(action)
+                if rescue is not None and restore_used.get(model, 0) > 0:
+                    rescue_of[model] = replace(rescue, covered=rescue.covered + restore_used[model])
+                if restore_left[model] >= delta:
+                    restore_left[model] -= delta
+                    events.append(f"same_slot_release_covered_by_preemption:{model}")
+                    continue
+                survived.add(model)
+            if isinstance(action, PlanBatch):
+                converted.append(action)
+                continue
         if upscale_of(action) is not None:
             model, delta = upscale_of(action)
-            if model not in restore_left:
-                preempt = getattr(safescale, "request_preemption", None)
-                restored = preempt(model, reason="receiver_need_upscale") if callable(preempt) else 0
-                restored = max(0, int(restored or 0))
-                restore_left[model] = restored
-                restore_used[model] = min(restored, up_totals.get(model, 0))
-                if restored > 0:
-                    # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale),
-                    # then up_needed = delta - probe_hidden. The rollback (unhide) is issued
-                    # by the safescale loop's next observation, one-shot and observe-mode safe.
-                    events.append(
-                        f"safescale_probe_preempted:{model}:restored={restored}"
-                        f":up_needed={max(0, up_totals.get(model, 0) - restored)}"
-                    )
+            preempt_once(model)
             rescue = getattr(action, "rescue", None)
             if rescue is not None and restore_used.get(model, 0) > 0:
                 # C1: the restored pods count toward the target already.
@@ -931,6 +978,16 @@ def _apply_safescale(
             if model not in survived:
                 covered_targets[model] = rescue
     return tuple(converted), tuple(events)
+
+
+def _rescue_of(action: Action) -> object | None:
+    """The rescue target a same-slot release's receiver wake carries (PlanBatch member or
+    ShrinkForSlotAction), or None."""
+    for member in (action.members if isinstance(action, PlanBatch) else (action,)):
+        rescue = getattr(member, "rescue", None)
+        if rescue is not None and (isinstance(member, ShrinkForSlotAction) or upscale_of(member) is not None):
+            return rescue
+    return None
 
 
 def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Action, ...], tuple[str, ...]]:

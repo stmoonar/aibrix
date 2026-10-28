@@ -383,7 +383,8 @@ _compute_z_m = compute_z_m
 
 class SignalState:
     """Per-model registry of stateful ``TRSComputer`` instances shared across the
-    rescue / fairness / safescale loops (S1.3 / ADR-0011).
+    decision loop and the SafeScale loop (S1.3 / ADR-0011; one decision loop since
+    2026-10-28).
 
     The live control path previously constructed a fresh ``TRSComputer`` every
     tick, so the EMA never persisted (``TRS == TRS_raw`` always). Holding one
@@ -421,7 +422,7 @@ class SignalState:
     ) -> None:
         self._by_model: dict[str, TRSComputer] = {}
         #: Onset saturation rescue (``tre_controller.signals.saturation.SaturationTracker``;
-        #: None = off): shared by the rescue / fairness loops like the EMAs, counted once
+        #: None = off): shared by the decision and SafeScale loops like the EMAs, counted once
         #: per distinct window end. Independent of the idle reset (a numerator-zero window
         #: is exactly the case it watches).
         self.saturation = saturation
@@ -668,7 +669,7 @@ class SignalState:
 
     def note_queue_sample(self, model: str, sample: QueueSample | None) -> None:
         """Record ``model``'s queue sample of a window read (H3). One entry per stamp
-        (the rescue / fairness re-reads of a window replace it); an older stamp than the
+        (re-reads of a window replace it); an older stamp than the
         newest kept is ignored."""
         if sample is None:
             return

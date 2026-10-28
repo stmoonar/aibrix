@@ -66,10 +66,10 @@ class DecisionSnapshotWriter:
                                 separators=(",", ":")))
 
     def _append_history(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
-        # S5.1: per-model decision time-series, scored by window_end_ms. rescue and fairness
-        # both write per tick; on the same window they usually collapse to one member, but a
-        # scale action or stale-hold divergence between the two loops can leave two members at
-        # the same score (review F3) -> readers dedup by window_end_ms. Trimmed to ~24h + TTL.
+        # S5.1: per-model decision time-series, scored by window_end_ms: one member per
+        # planner call (one decision loop since 2026-10-28; a re-read of the same window
+        # can still leave two members at one score -> readers dedup by window_end_ms).
+        # Trimmed to ~24h + TTL.
         states = _model_states(result.model_contexts, getattr(result, "classifications", {}), snapshot)
         for model, state in states.items():
             score = state.get("window_end_ms") or snapshot.ts_ms
