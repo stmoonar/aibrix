@@ -27,8 +27,8 @@ Rules (one candidate pair = one receiver binding plus the donors on its GPUs):
 5. a TP=2 receiver may take two single-GPU donors: the pair weighs 2 and
    counts 2 against ``count`` (``count`` = donor replicas to hand over);
 6. the donor model keeps at least ``donor_floor`` routable replicas;
-7. order: the donor release preference of the controller planner
-   (``_release_pick``: :func:`release_pick` here), then - when one donor frees
+7. order: the donor release preference of :func:`release_pick` (the placement
+   policy's release order), then - when one donor frees
    several receivers - the receiver wake preference (``receiver_pick``, the
    service-manager's ``_wake_pick`` / ``choose_placement``);
 8. up to ``count`` donor replicas are paired; what cannot be paired is
@@ -292,9 +292,10 @@ def release_pick(
     policy: PlacementPolicy | None = None,
 ) -> tuple[Binding, ...]:
     """Among donor units (one donor, or the two single-GPU donors of a TP=2
-    receiver), the one the placement policy releases first - the controller
-    planner's ``_release_pick`` (merge gain, node load, same-model spread,
-    address; never the serve id), applied to the block each unit frees.
+    receiver), the one the placement policy releases first (merge gain, node load,
+    same-model spread, address; never the serve id), applied to the block each
+    unit frees. (The controller planner's copy, ``_release_pick``, went with the
+    same-slot shrink on 2026-10-28.)
     Unaligned units fall back to the lowest serve id."""
     if len(units) == 1:
         return units[0]

@@ -194,19 +194,6 @@ def test_release_order_is_the_planner_release_pick_not_the_serve_id():
     assert release_pick(units, fleet, TOPOLOGY)[0].serve_id == "d-b"
 
 
-def test_release_pick_matches_the_controller_planner():
-    from tre_controller.planning import planner
-
-    fleet = [
-        b("d-a", "d", (2,), awake=True), b("x-3", "x", (3,), awake=True),
-        b("d-b", "d", (0,), awake=True), b("d-c", "d", (1,), awake=True),
-    ]
-    view = SimpleNamespace(topology=TOPOLOGY, bindings=fleet, placement=None)
-    donors = [fleet[0], fleet[2], fleet[3]]
-    expected = planner._release_pick(donors, view)
-    assert release_pick([(item,) for item in donors], fleet, TOPOLOGY)[0] == expected
-
-
 def test_receiver_pick_decides_between_receivers_one_donor_frees():
     fleet = [b("d-01", "d", (0, 1), awake=True), b("r-0", "r", (0,)), b("r-1", "r", (1,))]
     chosen = select(fleet, receiver_pick=lambda receivers, planning: receivers[-1])
