@@ -698,8 +698,7 @@ def build_plan(
         if recv.model_name in inflight_models:
             return None
         if deltas.get(recv.model_name, 0) > 0:
-            # H1 (2026-10-06): already scaled up in this plan (the rescue section woke
-            # it from sleeping capacity) - one LOW step per plan, never two.
+            # Already scaled up in this plan - one step per plan, never two.
             return None
         if cooldown.blocks(recv.model_name, "up"):
             return None
@@ -1153,48 +1152,6 @@ def build_plan(
                         events.append(
                             _o1_exempt_event(recv.model_name, model_contexts, o1_exempt[recv.model_name], planned)
                         )
-
-        # H1 (2026-10-06): a LOW receiver with a sleeping binding on a free GPU is woken
-        # here, right after the snapshot is published, instead of waiting for the
-        # fairness loop's cadence (up to 10 s). Only free sleeping capacity, and only
-        # after every CRITICAL receiver has claimed its wakes; creates, donor relays and
-        # middle-zone probes for LOW stay with the fairness loop. A LOW model woken here
-        # is not planned again by the fairness section of this plan (``low_need``) and
-        # is in flight / O1-held for the next fairness tick, like any other scale-up.
-        # Without a fleet view no GPU is known to be free: LOW stays with fairness.
-        rescue_low_needs = (
-            {recv.model_name: low_need(recv) for recv in low_receivers} if occupancy is not None else {}
-        )
-        reserved_rescue_low = _plan_joint_wakes(
-            occupancy,
-            [(model, need[1]) for model, need in rescue_low_needs.items() if need is not None],
-            events=events,
-        )
-        for recv in low_receivers:
-            need = rescue_low_needs.get(recv.model_name)
-            if need is None:
-                continue
-            gain, wake_pods = _take_reserved_wakes(
-                occupancy,
-                reserved_rescue_low,
-                receiver=recv.model_name,
-                need=need[1],
-                # Not reported here: the fairness loop reports a blocked LOW wake.
-                events=[],
-                blocked_event="low_rescue_sleeping_blocked",
-            )
-            if gain > 0:
-                _add_scale_action(
-                    actions,
-                    deltas,
-                    model=recv.model_name,
-                    delta=gain,
-                    reason="low_rescue_sleeping_capacity",
-                    source_loop="rescue",
-                    receiver=recv.model_name,
-                    pods=wake_pods,
-                    hint=True,
-                )
 
         for idle in idle_models:
             if idle.model_name in active_probe_models or idle.model_name in inflight_models:

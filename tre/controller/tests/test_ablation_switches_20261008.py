@@ -4,8 +4,8 @@ TRE_ABLATION_DISABLE_SAFESCALE: SafeScale off = immediate release (as before 05f
 v1). The planner loops get no SafeScale, every shrink that would run as a probe takes
 the urgent donor path, and probes an earlier run left in Redis are rolled back once.
 
-TRE_ABLATION_DISABLE_SLOW_LOOP: every decision runs in the fast (snapshot-aligned)
-loop; no fairness task, so CRITICAL and LOW receivers are both planned there.
+TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-28 semantics): the single decision loop never
+runs the rebalance section (test_single_loop_20261028.py).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import pytest
 
 from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.rescue_task import run_rescue_tick
+from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.loops.safescale_task import rollback_left_probes_task
 from tre_controller.loops.tick import _apply_safescale
 from tre_controller.planning.classify import ModelRole, ModelState
@@ -46,22 +46,14 @@ from test_loop_ticks import FakeQueue, _metrics, _metrics_with_pods, _registry_w
 from test_safescale_commit import FakeRedis
 
 
-def _capture_planner_tasks(monkeypatch) -> dict[str, dict]:
-    seen: dict[str, dict] = {}
-    monkeypatch.setattr(app, "rescue_task", lambda *args, **kwargs: seen.setdefault("rescue", kwargs))
-    monkeypatch.setattr(app, "fairness_task", lambda *args, **kwargs: seen.setdefault("fairness", kwargs))
-    return seen
-
-
 # ------------------------------------------------------------- SafeScale off
-def test_safescale_off_planner_loops_get_no_safescale_and_no_safescale_loop_runs(monkeypatch):
-    seen = _capture_planner_tasks(monkeypatch)
+def test_safescale_off_decision_loop_gets_no_safescale_and_no_safescale_loop_runs(monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(app, "DecisionLoop", lambda **kwargs: seen.update(kwargs))
     specs = {spec.name: spec for spec in build_controller_task_specs(_deps(), _cfg(ablation_disable_safescale=True))}
 
-    assert "safescale" not in specs and "safescale_leftover_rollback" in specs
-    specs["rescue"].factory()
-    specs["fairness"].factory()
-    assert seen["rescue"]["safescale"] is None and seen["fairness"]["safescale"] is None
+    assert "safescale" not in specs and "safescale_leftover_rollback" in specs and "decision" in specs
+    assert seen["safescale"] is None and seen["leftover_probes"] is not None
 
 
 def test_high_donor_for_a_critical_receiver_is_an_urgent_transfer():
@@ -190,33 +182,3 @@ def test_startup_rolls_back_a_probe_left_in_redis():
 def test_the_removed_fast_loop_switch_fails_closed():
     with pytest.raises(ValueError, match="TRE_ABLATION_DISABLE_SLOW_LOOP"):
         ControllerConfig.from_env({"TRE_ABLATION_DISABLE_FAST_LOOP": "true"})
-
-
-def test_slow_loop_off_runs_one_loop_that_also_plans_fairness(monkeypatch):
-    seen = _capture_planner_tasks(monkeypatch)
-    specs = {spec.name: spec for spec in build_controller_task_specs(_deps(), _cfg(ablation_disable_slow_loop=True))}
-
-    assert "fairness" not in specs and "rescue" in specs
-    specs["rescue"].factory()
-    assert seen["rescue"]["fairness_due"] is True
-
-
-def test_single_loop_tick_scales_up_critical_and_low():
-    snapshot = MetricsSnapshot(
-        ts_ms=1,
-        stale=False,
-        models={
-            "critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1),
-            "low": _metrics("low", generation=90.0, waiting=0.0, running=1.0, assigned=1),
-        },
-    )
-
-    result = run_rescue_tick(
-        snapshot, queue=FakeQueue(), registry=_registry_with_models("critical", "low"), fairness_due=True
-    )
-
-    assert {model: state.state.value for model, state in result.classifications.items()} == {
-        "critical": "critical", "low": "low",
-    }
-    ups = {action.model for action in result.actions if action.delta > 0}
-    assert ups == {"critical", "low"}

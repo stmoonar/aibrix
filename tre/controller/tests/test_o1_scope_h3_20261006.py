@@ -218,7 +218,7 @@ def test_queue_rise_counts_only_pods_of_both_samples_and_ignores_jitter():
 
 def test_low_wake_holds_the_exempt_free_gpu_step_until_o1_settles():
     """Smoke 20261026 regression (any scale-up path is the exempt step's basis): a LOW
-    model woke 1 -> 2 (``low_rescue_sleeping_capacity``, no rescue target); the next
+    model woke 1 -> 2 (``low_fairness_sleeping_capacity``, no rescue target); the next
     window still straddles that breakpoint and, its old tokens spread over 2 replicas,
     shows a lower Z -> CRITICAL, O1-exempt, free GPUs. One stale window buys one wake:
     no second wake on it. Once O1 decides on evidence after the breakpoint and the
@@ -243,13 +243,13 @@ def test_low_wake_holds_the_exempt_free_gpu_step_until_o1_settles():
     now = {"ms": base}
     queue = ActionQueue(_Client(), now_ms=lambda: now["ms"])
 
-    def tick(end, grids, routable):
+    def tick(end, grids, routable, fairness=False):
         return run_planner_tick(_snap(_window(end, [grids] * 3, routable=routable)), queue=queue, registry=registry,
-                                rescue_due=True, fairness_due=False,
+                                rescue_due=True, fairness_due=fairness,
                                 cluster_view=_view(routable, fetched_ms=end + 3_000), signal_state=state)
 
-    first = tick(base, low_load, 1)
-    assert ups(first) == [("m", 1, "low_rescue_sleeping_capacity")]
+    first = tick(base, low_load, 1, fairness=True)
+    assert ups(first) == [("m", 1, "low_fairness_sleeping_capacity")]
     now["ms"] = base + 1_500
     asyncio.run(queue.drain_once())  # the wake returns: 2 routable replicas
 
@@ -295,13 +295,13 @@ def test_released_upscale_record_leaves_a_later_unrelated_breakpoint_exempt():
     now = {"ms": base}
     queue = ActionQueue(_Client(), now_ms=lambda: now["ms"])
 
-    def tick(end, grids, routable):
+    def tick(end, grids, routable, fairness=False):
         return run_planner_tick(_snap(_window(end, [grids] * 3, routable=routable)), queue=queue, registry=registry,
-                                rescue_due=True, fairness_due=False,
+                                rescue_due=True, fairness_due=fairness,
                                 cluster_view=_view(routable, fetched_ms=end + 3_000), signal_state=state)
 
-    assert [a.reason for a in tick(base, low_load, 1).actions if isinstance(a, ScaleAction)] == [
-        "low_rescue_sleeping_capacity"
+    assert [a.reason for a in tick(base, low_load, 1, fairness=True).actions if isinstance(a, ScaleAction)] == [
+        "low_fairness_sleeping_capacity"
     ]
     now["ms"] = base + 1_500
     asyncio.run(queue.drain_once())

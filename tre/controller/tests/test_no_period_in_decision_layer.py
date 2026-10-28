@@ -22,8 +22,7 @@ DECISION_LAYER = (
     *sorted((PACKAGE / "signals").glob("*.py")),
     *sorted((PACKAGE / "planning").glob("*.py")),
     PACKAGE / "loops" / "tick.py",
-    PACKAGE / "loops" / "rescue_task.py",
-    PACKAGE / "loops" / "fairness_task.py",
+    PACKAGE / "loops" / "decision_task.py",
     # Round 5 (L4): the SafeScale observation task (tail terms, observation fields).
     PACKAGE / "loops" / "safescale_task.py",
 )

@@ -19,13 +19,12 @@ Two refresh modes (``TRE_METRICS_REFRESH_MODE``):
 * ``free_running`` (fallback): the old ``refresh; sleep(metrics_refresh_interval_s)`` loop
   with a sliding window ending at ``now``.
 
-Decision cadence: snapshots change every evidence period in ``phase_aligned`` mode. The
-decision loops run on fixed timers and read the latest snapshot: the rescue (fast) loop
-every ``TRE_RESCUE_INTERVAL_SECONDS`` (5 s), the fairness (slow) loop every
-``TRE_FAIRNESS_INTERVAL_SECONDS`` (10 s) (2026-10-25: the 2026-10-06 wake-on-publish of
-the rescue loop is removed; at a 2 s evidence period a tick reads a snapshot at most about
-one period old). A re-read of the same snapshot advances neither the EMA, the band dwell
-nor any time-span rule (all keyed by ``window_end_ms``).
+Decision cadence (2026-10-28, design docs/design/20261028-single-loop.md): snapshots change
+every evidence period in ``phase_aligned`` mode. The single decision loop
+(``decision_task``) waits for each publish (:meth:`SnapshotBox.wait_newer`) and runs the
+rescue / rebalance sections once their period of observation time has passed. A re-read
+of the same snapshot advances neither the EMA, the band dwell nor any time-span rule (all
+keyed by ``window_end_ms``).
 """
 from __future__ import annotations
 
@@ -80,16 +79,46 @@ class MetricsTaskConfig(Protocol):
 
 class SnapshotBox:
     """The latest published snapshot. ``set`` is called on the event loop thread (the
-    sampler awaits its threaded fetch); the decision loops ``get`` it on their timers."""
+    sampler awaits its threaded fetch); the decision loop waits for it
+    (:meth:`wait_newer`) and reads the newest one."""
 
     def __init__(self, snapshot: MetricsSnapshot | None = None) -> None:
         self._snapshot = snapshot
+        #: Number of ``set`` calls (the initial snapshot counts as one).
+        self._version = 0 if snapshot is None else 1
+        self._waiters: list[asyncio.Future] = []
 
     def get(self) -> MetricsSnapshot | None:
         return self._snapshot
 
+    @property
+    def version(self) -> int:
+        return self._version
+
     def set(self, snapshot: MetricsSnapshot) -> None:
         self._snapshot = snapshot
+        self._version += 1
+        waiters, self._waiters = self._waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def wait_newer(self, version: int, timeout_s: float | None = None) -> bool:
+        """Wait until a snapshot newer than ``version`` (:attr:`version` of the last one
+        read) is set. Several sets in between are one wake (the caller reads the newest).
+        False = ``timeout_s`` passed without one."""
+        if self._version != version:
+            return True
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await asyncio.wait_for(waiter, timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+        return self._version != version
 
 
 def freeze_snapshot(snapshot: MetricsSnapshot) -> MetricsSnapshot:

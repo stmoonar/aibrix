@@ -18,7 +18,7 @@ import pytest
 from tre_common.alt_signals import token_rate_per_replica
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.window_pods import restrict_to_serving
-from tre_controller.loops.rescue_task import run_rescue_tick
+from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import serving_window
 from tre_controller.planning.planner import ClusterView

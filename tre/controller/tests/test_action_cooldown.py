@@ -5,8 +5,7 @@ import asyncio
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_controller.config import ControllerConfig
-from tre_controller.loops.metrics_task import SnapshotBox
-from tre_controller.loops.rescue_task import rescue_task, run_rescue_tick
+from tre_controller.loops.decision_task import DecisionLoop, run_rescue_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import PlanConfig, ScaleAction, build_plan
 
@@ -266,39 +265,15 @@ def test_action_cooldown_env_flag_defaults_on_and_can_be_disabled() -> None:
     assert ControllerConfig.from_env({"TRE_ACTION_COOLDOWN": "0"}).action_cooldown is False
 
 
-class _StopLoop(Exception):
-    pass
-
-
-async def _stop_sleep(_seconds):
-    raise _StopLoop()
 
 
 def test_rescue_task_reads_action_cooldown_from_config() -> None:
     def run(flag: bool) -> tuple[str, ...]:
         queue = ActionQueue(_OkClient(), now_ms=_Clock(65_000))
         queue._last_done["critical"] = (65_000, "up")  # a wake just completed
-        cfg = type("Cfg", (), {"rescue_interval_s": 5.0, "action_cooldown": flag})()
-        writer_events: list[tuple[str, ...]] = []
-
-        class _Writer:
-            def write(self, loop_name, snapshot, result):
-                writer_events.append(result.events)
-
-        try:
-            asyncio.run(
-                rescue_task(
-                    SnapshotBox(_critical_snapshot(5_000)),
-                    queue=queue,
-                    registry=_registry(),
-                    cfg=cfg,
-                    sleep=_stop_sleep,
-                    decision_writer=_Writer(),
-                )
-            )
-        except _StopLoop:
-            pass
-        return writer_events[0]
+        cfg = type("Cfg", (), {"rescue_interval_s": 5.0, "fairness_interval_s": 10.0, "action_cooldown": flag})()
+        result = DecisionLoop(queue=queue, registry=_registry(), cfg=cfg).on_snapshot(_critical_snapshot(5_000))
+        return result.events
 
     assert "cooldown_hold:critical" in run(True)
     assert "cooldown_hold:critical" not in run(False)

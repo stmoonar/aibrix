@@ -21,7 +21,7 @@ from tre_common.registry import (
     load_registry,
     parse_scaling_config,
 )
-from tre_controller.loops.rescue_task import run_rescue_tick
+from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import (
     ClusterView,

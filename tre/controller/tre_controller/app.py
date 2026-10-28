@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.gateway_inflight import instance_max_age_ms
+from tre_common.persistence import SPAN_TOLERANCE_MS
+from tre_common.rediskeys import EVIDENCE_PERIOD_MS
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_common.tss import theta_basis_errors
 from tre_controller.config import ControllerConfig
@@ -26,10 +28,9 @@ from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
-from tre_controller.loops.fairness_task import fairness_task
+from tre_controller.loops.decision_task import DecisionLoop, decision_task
 from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
-from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import rollback_left_probes_task, safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
@@ -101,7 +102,7 @@ def build_controller_task_specs(
     ):
         specs.append(ControllerTaskSpec("hidden_orphans", deps.hidden_orphan_detector.run))
     # 2026-10-07: no ENABLE_TRE_SCALING early return any more - the decision tasks
-    # (cluster view, rescue, fairness, SafeScale, queue) always run; whether they act is
+    # (cluster view, decision loop, SafeScale, queue) always run; whether they act is
     # the run mode's business alone (observe: compute and record, never actuate).
 
     specs.append(
@@ -120,57 +121,43 @@ def build_controller_task_specs(
     safescale_off = bool(getattr(cfg, "ablation_disable_safescale", False))
     planner_safescale = None if safescale_off else deps.safescale
     leftover_probes = deps.safescale if safescale_off else None
-    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-08): every decision runs in the fast loop -
-    # its ticks (fixed TRE_RESCUE_INTERVAL_SECONDS timer, reading the newest snapshot)
-    # plan the fairness section too, no fairness task runs.
-    # The fast loop does all the fairness task did besides planning (model state box,
-    # decision snapshot); the queue's rescue-over-fairness replacement follows each
-    # action's source_loop, which the planner sets per section.
-    slow_off = bool(getattr(cfg, "ablation_disable_slow_loop", False))
+    # Single decision loop (2026-10-28, design docs/design/20261028-single-loop.md): one
+    # task, woken by every published snapshot, plans the rescue and the rebalance
+    # (fairness) section in one call on one ledger. TRE_ABLATION_DISABLE_SLOW_LOOP: the
+    # rebalance section never runs (LOW receivers get nothing).
+    loop = DecisionLoop(
+        queue=deps.queue,
+        registry=deps.registry,
+        cfg=cfg,
+        cluster_view_box=deps.cluster_view_box,
+        active_probe_models=lambda: _active_probe_models(deps.safescale),
+        decision_writer=deps.decision_writer,
+        safescale=planner_safescale,
+        signal_state=deps.signal_state,
+        prof=deps.profiler,
+        model_state_box=deps.model_state_box,
+        is_observe=_observe_reader(deps),
+        maintenance=deps.maintenance_watch,
+        leftover_probes=leftover_probes,
+        # Two observations S apart are fetched S +- the fetch jitter apart; bounded by
+        # half the snapshot cadence, so a section never runs one snapshot early.
+        tolerance_ms=min(SPAN_TOLERANCE_MS, int(getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS)) // 2),
+    )
     specs.append(
         ControllerTaskSpec(
-            "rescue",
-            lambda: rescue_task(
+            "decision",
+            lambda: decision_task(
                 deps.snapshot_box,
-                queue=deps.queue,
-                registry=deps.registry,
-                cfg=cfg,
-                cluster_view_box=deps.cluster_view_box,
-                active_probe_models=lambda: _active_probe_models(deps.safescale),
-                decision_writer=deps.decision_writer,
-                safescale=planner_safescale,
-                signal_state=deps.signal_state,
-                prof=deps.profiler,
-                model_state_box=deps.model_state_box,
-                is_observe=_observe_reader(deps),
-                maintenance=deps.maintenance_watch,
-                fairness_due=slow_off,
-                leftover_probes=leftover_probes,
+                loop,
+                # The sampler marks the snapshot stale after its stale hold; no publish
+                # at all for that hold plus one snapshot period is the same alert.
+                silence_alert_s=(
+                    int(getattr(cfg, "metrics_stale_hold_ms", 20_000))
+                    + int(getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS))
+                ) / 1000.0,
             ),
         )
     )
-    if not slow_off:
-        specs.append(
-            ControllerTaskSpec(
-                "fairness",
-                lambda: fairness_task(
-                    deps.snapshot_box,
-                    queue=deps.queue,
-                    registry=deps.registry,
-                    cfg=cfg,
-                    cluster_view_box=deps.cluster_view_box,
-                    active_probe_models=lambda: _active_probe_models(deps.safescale),
-                    decision_writer=deps.decision_writer,
-                    safescale=planner_safescale,
-                    signal_state=deps.signal_state,
-                    prof=deps.profiler,
-                    model_state_box=deps.model_state_box,
-                    is_observe=_observe_reader(deps),
-                    maintenance=deps.maintenance_watch,
-                    leftover_probes=leftover_probes,
-                ),
-            )
-        )
     if safescale_off:
         specs.append(
             ControllerTaskSpec(

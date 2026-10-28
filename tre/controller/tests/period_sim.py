@@ -6,8 +6,9 @@ offset - is rendered into gateway docs at a given evidence period P (instant doc
 0.5 s, histogram docs every P, ``scraped_ms`` 50 ms before the write, the cadence hash
 with ``last_hist_ms``; every gateway stamp on the gateway clock = controller clock +
 ``gateway_offset_ms``) and run through the real controller path: MetricsStore ->
-PhaseAlignedSampler -> the rescue (5 s) / fairness (10 s) planner ticks
-(``loops/replay.py``, one SignalState and PaperStateCache per run) -> SafeScale
+PhaseAlignedSampler -> the single decision loop (``loops/decision_task.py``: on each
+published snapshot, the rescue section after 5 s and the rebalance section after 10 s
+of observation time; one SignalState and PaperStateCache per run) -> SafeScale
 observation ticks (2 s; with ``direct``, the direct evidence path: the real
 DirectEvidenceCollector scraping the sim pods, early commit on). A mock SM applies every
 action at once (relay, wake, sleep, hide, unhide), so the load follows the decisions.
@@ -31,9 +32,10 @@ from dataclasses import dataclass, field, replace
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox, default_phase_offset_ms
-from tre_controller.loops.replay import TickReplayStep, run_tick_replay
+from tre_common.persistence import SPAN_TOLERANCE_MS
+from tre_controller.loops.decision_task import DecisionLoop
+from tre_controller.loops.replay import _active_probe_models
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
-from tre_controller.loops.tick import PaperStateCache
 from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
@@ -200,8 +202,6 @@ class Sim:
         self.run = Run()
         self.changes: dict = {}  # model -> (ms, routable direction) of the last applied action
         cfg = ControllerConfig.from_env({})
-        self.rescue_ms = int(cfg.rescue_interval_s * 1000)
-        self.fairness_ms = int(cfg.fairness_interval_s * 1000)
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
         self.offset = int(scenario.gateway_offset_ms)
         breakpoint = BreakpointWindowConfig.from_registry(self.registry)
@@ -238,7 +238,14 @@ class Sim:
         )
         self.box = SnapshotBox()
         self.queue = _Queue(self)
-        self.papers = {loop: PaperStateCache(max_stale_ms=cfg.paper_stale_max_ms) for loop in ("rescue", "fairness")}
+        self.decisions = DecisionLoop(
+            queue=self.queue, registry=self.registry, cfg=cfg,
+            cluster_view_box=SimpleNamespace(get=self.view),
+            active_probe_models=lambda: set(_active_probe_models(self.safescale)),
+            safescale=self.safescale, signal_state=self.signal_state,
+            tolerance_ms=min(SPAN_TOLERANCE_MS, self.period // 2),
+        )
+        self._seen_version = 0
 
         async def fetch(start, end):
             return self.store.read_snapshot(start, end, use_cache=False, start_exclusive=True)
@@ -386,20 +393,18 @@ class Sim:
                 if event.startswith(("safescale_formal_commit_gate", "safescale_slo_violation",
                                      "safescale_early_commit")):
                     self.run.verdicts.append(event)
-        for loop, due in (("rescue", self.rescue_ms), ("fairness", self.fairness_ms)):
-            if (t - T0) % due:
-                continue
-            step = TickReplayStep(snapshot=snapshot, rescue_due=loop == "rescue", fairness_due=loop == "fairness",
-                                  cluster_view=self.view())
-            replay = run_tick_replay([step], registry=self.registry, safescale=self.safescale,
-                                     signal_state=self.signal_state, paper_state_cache=self.papers[loop],
-                                     queue=self.queue)
-            for event in replay.events:
-                self.run.events.append((t, f"{loop}|{event}"))
-            for result in replay.results:
-                for model, context in (result.model_contexts or {}).items():
-                    # O1: the reason the model's window decides nothing (None = it decides).
-                    self.run.events.append((t, f"hold:{model}:{context.get('signal_hold_reason')}"))
+        if self.box.version == self._seen_version:
+            return
+        self._seen_version = self.box.version  # a new snapshot was published
+        result = self.decisions.on_snapshot(snapshot)
+        if result is None:
+            return
+        loop = "rescue" if "rescue_skipped_by_cadence" not in result.events else "fairness"
+        for event in result.events:
+            self.run.events.append((t, f"{loop}|{event}"))
+        for model, context in (result.model_contexts or {}).items():
+            # O1: the reason the model's window decides nothing (None = it decides).
+            self.run.events.append((t, f"hold:{model}:{context.get('signal_hold_reason')}"))
 
     async def _advance(self, until: int) -> None:
         while self.now < until:

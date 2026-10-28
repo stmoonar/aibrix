@@ -91,9 +91,9 @@ spec:
             # Only used by TRE_METRICS_REFRESH_MODE=free_running.
             - name: TRE_METRICS_REFRESH_INTERVAL_SECONDS
               value: "5"
-            # Fixed timers (2026-10-25): the fast loop every 5 s, the slow loop every 10 s;
-            # each reads the latest snapshot (every 2 s: at most ~2 s old). A re-read of one
-            # window advances neither the EMA nor any time-span rule.
+            # Single decision loop (2026-10-28): woken by each published snapshot, it runs
+            # the rescue section after 5 s and the rebalance section after 10 s of
+            # observation time since their last runs, in one planner call.
             - name: TRE_RESCUE_INTERVAL_SECONDS
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
@@ -170,7 +170,7 @@ spec:
             # --- Ablation switches (D4); production defaults ---
             # (The scaling on/off env switch was removed 2026-10-07: actuation follows the
             # run mode tre:v2:controller:mode only.)
-            # SLOW_LOOP: one snapshot-aligned loop runs every decision (no fairness loop).
+            # SLOW_LOOP: the decision loop never runs the rebalance section (LOW gets nothing).
             # SAFESCALE: no probes - every probe shrink is released immediately (urgent).
             - name: TRE_ABLATION_DISABLE_SLOW_LOOP
               value: "false"

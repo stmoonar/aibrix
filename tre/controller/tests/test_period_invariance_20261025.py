@@ -1,10 +1,14 @@
 """Period invariance (round 4, docs/design/20261025-instant-sampling.md "Evidence, not
-ticks"): the same scenario run at evidence periods of 2, 5 and 10 s gives the same
+ticks"): the same scenario run at evidence periods of 1, 2, 5 and 10 s gives the same
 decisions at about the same times.
 
 ``period_sim`` renders each scenario into gateway docs at the period and runs it through
-the real store, sampler, planner loops and SafeScale (closed loop, mock SM; requests
-complete in whole numbers, Poisson). Checked:
+the real store, sampler, the single decision loop (2026-10-28, woken by each published
+snapshot) and SafeScale (closed loop, mock SM; requests complete in whole numbers,
+Poisson). Checked:
+
+* single loop (design docs/design/20261028-single-loop.md, invariant 6): at a 1 s and a
+  2 s snapshot cadence the mock SM applies the same actions in the same order;
 
 * the key events - onset saturation rescue, first CRITICAL scale-up, O1 warm, probe
   starts and verdicts, the first stale snapshot - happen in every run; each one's
@@ -31,7 +35,7 @@ import pytest
 import period_sim as ps
 from tre_common.persistence import SPAN_TOLERANCE_MS as TOL
 
-PERIODS = (2_000, 5_000, 10_000)
+PERIODS = (1_000, 2_000, 5_000, 10_000)
 REFERENCE = 10_000
 #: One period of the coarser run + one rescue tick.
 TOLERANCE_MS = REFERENCE + 5_000
@@ -137,6 +141,18 @@ def _ground_truth(name: str, run: ps.Run, period: int) -> list[tuple[str, int, i
             out.append(("early_commit", commit - hide, 20_000 + GATEWAY_AHEAD_MS,
                         2 * period + SAFESCALE_TICK_MS))
     return out
+
+
+def _applied(run: ps.Run) -> list[str]:
+    """The actions the mock SM applied, in order (no times)."""
+    kinds = ("scale_up:", "scale_down:", "hide:", "unhide:", "relay:")
+    return [event for _, event in run.events if event.startswith(kinds)]
+
+
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_one_and_two_second_snapshots_give_the_same_actions(name):
+    fine, coarse = _applied(_run(name, 1_000)), _applied(_run(name, 2_000))
+    assert fine and fine == coarse
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))

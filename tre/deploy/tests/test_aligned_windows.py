@@ -16,9 +16,9 @@ import pytest
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import load_registry
-from tre_controller.loops.fairness_task import run_fairness_tick
+from tre_controller.loops.decision_task import run_fairness_tick
 from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox
-from tre_controller.loops.rescue_task import run_rescue_tick
+from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.signals.trs import SignalState
 from tre_controller.store.metrics_store import MetricsStore
 from scripts import calibration_campaign as campaign

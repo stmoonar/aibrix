@@ -30,7 +30,7 @@ from tre_common.registry import (
 )
 from tre_controller.gateway_clock import GatewayClockMonitor
 from tre_controller.loops.model_state_box import UNCONFIRMED, ModelStateBox
-from tre_controller.loops.rescue_task import run_rescue_tick
+from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.loops.tick import _model_contexts, _rescue_bases, breakpoint_observation
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan

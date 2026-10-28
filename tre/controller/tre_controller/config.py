@@ -159,6 +159,9 @@ class ControllerConfig:
     runtime_state_dir: str
     monitor_interval_s: float
     metrics_refresh_interval_s: float
+    #: Single decision loop (2026-10-28): observation time between two runs of the
+    #: rescue section (TRE_RESCUE_INTERVAL_SECONDS, 5 s) and of the rebalance (fairness)
+    #: section (TRE_FAIRNESS_INTERVAL_SECONDS, 10 s; also the fleet-view refresh period).
     rescue_interval_s: float
     fairness_interval_s: float
     metrics_window_ms: int
@@ -174,7 +177,8 @@ class ControllerConfig:
     #: ended at most this long before (ms, gateway window ends; TRE_PAPER_STALE_MAX_MS).
     paper_stale_max_ms: int
     incomplete_policy: str
-    # 2026-10-08: one loop (the fast loop's timer) runs every decision (no fairness loop).
+    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-28 semantics): the decision loop never runs
+    # the rebalance section - LOW receivers get nothing; the rescue section is unchanged.
     ablation_disable_slow_loop: bool
     ablation_disable_safescale: bool
     #: TRE_SAFESCALE_SCOPE (2026-10-26): which placements run as a SafeScale probe -
@@ -267,7 +271,7 @@ class ControllerConfig:
         if str(values.get("TRE_ABLATION_DISABLE_FAST_LOOP", "")).strip().lower() in _TRUE_VALUES:
             raise ValueError(
                 "TRE_ABLATION_DISABLE_FAST_LOOP was removed (2026-10-08); "
-                "use TRE_ABLATION_DISABLE_SLOW_LOOP (all decisions in the fast loop)"
+                "TRE_ABLATION_DISABLE_SLOW_LOOP is the remaining loop ablation (no rebalance section)"
             )
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"

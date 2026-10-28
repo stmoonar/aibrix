@@ -131,8 +131,7 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
         "metrics",
         "hidden_orphans",
         "cluster_view",
-        "rescue",
-        "fairness",
+        "decision",
         "safescale",
         "action_queue",
     )
@@ -143,7 +142,7 @@ def test_removed_enable_tre_scaling_no_longer_stops_the_decision_tasks() -> None
     cleaned up) must not drop the decision pipeline - run mode alone gates actuation."""
     specs = build_controller_task_specs(_deps(), _cfg())
 
-    assert {"cluster_view", "rescue", "fairness", "safescale", "action_queue"} <= {s.name for s in specs}
+    assert {"cluster_view", "decision", "safescale", "action_queue"} <= {s.name for s in specs}
 
 
 def test_create_controller_dependencies_wires_configured_components() -> None:

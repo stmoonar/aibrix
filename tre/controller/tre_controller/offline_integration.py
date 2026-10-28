@@ -7,7 +7,7 @@ from tre_common.registry import Registry
 from tre_controller.loops.action_queue import DispatchResult
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.metrics_task import MetricsRefreshResult, SnapshotStore, refresh_metrics_once, SnapshotBox
-from tre_controller.loops.rescue_task import DecisionWriter, run_rescue_tick
+from tre_controller.loops.decision_task import DecisionWriter, run_rescue_tick
 from tre_controller.loops.tick import LoopTickResult, SafeScaleController
 from tre_controller.planning.planner import ClusterView
 
