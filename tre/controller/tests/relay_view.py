@@ -42,3 +42,16 @@ def signed_deltas(actions) -> dict[str, int]:
         if isinstance(action, ScaleAction):
             out[action.model] = out.get(action.model, 0) + action.delta
     return out
+
+
+def block_takes(actions) -> list[tuple[str, str, str]]:
+    """(donor model, receiver, donor pod) of every TP block (L4 rev 2,
+    ``BlockSupplyAction``) in a plan: its immediate sleeps and its probe pod."""
+    from tre_controller.planning.planner import BlockSupplyAction
+
+    return [
+        (donor, action.receiver, pod)
+        for action in actions
+        if isinstance(action, BlockSupplyAction)
+        for donor, pod in (*action.sleeps, *((action.probe,) if action.probe else ()))
+    ]

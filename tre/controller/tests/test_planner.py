@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_common.registry import ClusterTopology, NodeSpec
-from tre_controller.planning.planner import ClusterView, DefragAction, PlanConfig, ScaleAction, ShrinkForSlotAction, build_plan
+from tre_common.gpu_placement import GpuBlock
+from tre_controller.planning.planner import BlockSupplyAction, ClusterView, DefragAction, PlanConfig, ScaleAction, build_plan
 from tre_sm.allocator.slots import Binding, Migration, Slot
 from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
@@ -471,7 +472,7 @@ def test_tp_aware_critical_receiver_records_capacity_blocked_when_no_slot_or_def
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
     assert plan.events == ["capacity_blocked:tp2"]
 
-def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag() -> None:
+def test_tp_aware_critical_receiver_takes_a_high_block_before_a_healthy_one_or_defrag() -> None:
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
@@ -487,6 +488,8 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+            Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
+            Binding("tp2-23", "tp2", Slot("node-a", (2, 3)), awake=False),
         ),
     )
 
@@ -505,13 +508,15 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
 
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
     assert [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)] == []
+    # L4 rev 2: block tier HIGH (0-1) before HEALTHY (2-3); a probe under scope all.
     assert plan.actions == [
-        ShrinkForSlotAction(
-            donor="high",
-            beneficiary="tp2",
-            serve_id="high-0",
-            slot=Slot("node-a", (0,)),
-            reason="critical_same_slot_high_shrink",
+        BlockSupplyAction(
+            receiver="tp2",
+            block=GpuBlock("node-a", (0, 1)),
+            receiver_pods=("tp2-01",),
+            sleeps=(),
+            probe=("high", "high-0"),
+            reason="critical_block_high",
             source_loop="rescue",
         )
     ]
@@ -568,7 +573,7 @@ def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
 
 def test_critical_preemption_of_hot_donor_survives_guard() -> None:
     # Demand-driven preemption: a TP=2 CRITICAL receiver blocked on a fragmented slot with no
-    # idle capacity legitimately shrinks a HIGH donor sharing its two-GPU slot. With the guard
+    # idle capacity legitimately takes its block from a HIGH donor (L4 rev 2). With the guard
     # ON this MUST still fire, tagged with an explicit preemption reason.
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
@@ -585,6 +590,7 @@ def test_critical_preemption_of_hot_donor_survives_guard() -> None:
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+            Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
         ),
     )
 
@@ -602,17 +608,8 @@ def test_critical_preemption_of_hot_donor_survives_guard() -> None:
         cluster_view=cluster_view,
     )
 
-    assert plan.actions == [
-        ShrinkForSlotAction(
-            donor="high",
-            beneficiary="tp2",
-            serve_id="high-0",
-            slot=Slot("node-a", (0,)),
-            reason="critical_same_slot_high_shrink",
-            source_loop="rescue",
-        )
-    ]
-    assert "safescale_preemption:high->tp2:critical_same_slot_high_shrink" in plan.events
+    assert [(action.receiver, action.probe) for action in plan.actions] == [("tp2", ("high", "high-0"))]
+    assert "block_supply:tp2:node-a:0,1:high:high-0" in plan.events
     assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
 
 

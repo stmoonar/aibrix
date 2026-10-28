@@ -13,15 +13,14 @@ from tre_controller.planning.classify import (
     receiver_sort_key,
 )
 from tre_common.gpu_placement import (
+    GpuBlock,
     PlacementPolicy,
-    choose_release,
+    choose_placement,
     plan_placements,
 )
 from tre_sm.allocator.slots import (
     Binding,
-    Slot,
     SlotAllocator,
-    awake_gpus,
     awake_model_counts,
     gpu_slot_candidates,
     is_buddy_aligned,
@@ -55,7 +54,7 @@ class PlanConfig:
     # climbed, deepening saturation (routable 4->3, then CRITICAL->rescale oscillation).
     # When enabled this suppresses that receiver-less proactive probe on hot
     # (HIGH/CRITICAL) donors. Demand-driven preemption (IDLE immediate donors, HIGH donor
-    # probes for a receiver and the TP critical_same_slot_*_shrink -> CRITICAL
+    # probes for a receiver and a TP receiver's block, L4 rev 2 -> CRITICAL
     # beneficiary) is a separate path and is intentionally NOT gated. Default OFF since
     # the v1/paper alignment (A2): the path is v1's paper_high_proactive_shrink (rescue
     # tick, HIGH, replicas > floor, no active probe, not moved by another path this
@@ -358,28 +357,29 @@ class DefragAction:
 
 
 @dataclass(frozen=True)
-class ShrinkForSlotAction:
-    """A CRITICAL TP receiver's slot: one donor pod whose aligned slot mate is free.
-    Released as ONE plan (design 20261028-single-loop L4): the donor pod's sleep and
-    the receiver's wake with ``receiver_pods`` as hints (its sleeping binding on that
-    slot) - a SafeScale probe's commit (scope ``all``), or both items at once
-    (:func:`tre_controller.loops.tick._release_without_safescale`)."""
+class BlockSupplyAction:
+    """A TP receiver's buddy block taken from donors (design 20261028-single-loop L4
+    rev 2, :func:`cheapest_block`): the donor pods on the block sleep and the receiver
+    wakes there (``receiver_pods``: its binding on the block, sent as the hint) - ONE SM
+    plan (:func:`tre_controller.loops.tick._release_without_safescale`). ``sleeps``
+    sleep at once (IDLE donors, and every donor of a scope that releases without a
+    probe); ``probe`` (scope ``all``: the block's one HIGH / HEALTHY donor pod) is a
+    SafeScale probe whose commit sleeps it and wakes the receiver."""
 
-    donor: str
-    beneficiary: str
-    serve_id: str
-    slot: Slot
+    receiver: str
+    block: GpuBlock
+    receiver_pods: tuple[str, ...]
+    #: (donor model, serve id) of the pods that sleep at once.
+    sleeps: tuple[tuple[str, str], ...]
     reason: str
     source_loop: SourceLoop
-    receiver_pods: tuple[str, ...] = ()
+    #: (donor model, serve id) of the pod a SafeScale probe hides (scope ``all``).
+    probe: tuple[str, str] | None = None
     #: C1: the receiver's rescue target (bookkeeping only).
     rescue: RescuePlan | None = field(default=None, compare=False)
-    #: An IDLE donor: released at once under every scope (no probe; only an IDLE donor
-    #: is released immediately). HIGH / middle zone: a probe under scope ``all``.
-    immediate: bool = False
 
 
-Action = ScaleAction | TransferIntent | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
+Action = ScaleAction | TransferIntent | HideAction | UnhideAction | DefragAction | BlockSupplyAction
 
 
 def upscale_of(action: object) -> tuple[str, int] | None:
@@ -401,7 +401,7 @@ class ReceiverTarget:
     awake count (never from a possibly stale cluster view) plus ``delta``,
     capped at ``cap`` (the scaling cap), then frozen. ``hints``: the receiver's
     sleeping bindings on the GPUs the commit's donor pods free (L4, design
-    20261028-single-loop: a same-slot release wakes the receiver on that slot)."""
+    20261028-single-loop L4 rev 2: a block probe wakes the receiver on its block)."""
 
     model: str
     delta: int
@@ -532,7 +532,9 @@ def build_plan(
     probe_upscale_plans: dict[str, dict[str, int]] = {}
     events: list[str] = []
     remaining_idle = idle_gpus
-    slot_shrink_donors: set[str] = set()
+    # L4 rev 2: HIGH / HEALTHY donors that gave a TP receiver's block this plan - they
+    # give nothing else this plan (a non-IDLE donor gives at most one replica per plan).
+    block_donor_models: set[str] = set()
     # Sleeping-capacity deadlock fix: GPU-slot occupancy so a receiver's sleeping binding
     # only counts as wakeable capacity when its slot has no awake binding (of any model).
     # S5: GPUs the SM reports not wakeable are no wake / create capacity this tick (the
@@ -674,7 +676,7 @@ def build_plan(
         # receiver (CRITICAL ones included) waits until that probe resolves.
         if donor.model_name in delayed_down_models:
             return True
-        # One rule for every donor probe (HIGH, middle zone, same-slot shrink): a model
+        # One rule for every donor probe (HIGH, middle zone, TP block): a model
         # whose last probe rolled back is probed again only on new evidence.
         return donor_rollback_held(donor.model_name)
 
@@ -700,6 +702,108 @@ def build_plan(
         # before 2026-10-26 (hazard (d)) - logged so a rerun shows where that happened.
         if gained > 0 and cfg.release_without_safescale and model in probe_backoff_models:
             _event_once(events, f"safescale_rollback_hold_relay_ok:{model}")
+
+    def block_donors(receiver: str) -> dict[str, BlockDonor]:
+        """L4 rev 2: the donor models a TP receiver's block may take pods of, now:
+        IDLE / HIGH / HEALTHY (never LOW / CRITICAL), not the receiver, not probing, not
+        in flight, not down-blocked, above its floor after this plan's takes; a HIGH /
+        HEALTHY donor only while nothing of it is planned yet (one replica per plan)
+        and not held by a probe of this plan or a rollback hold (scope ``all``)."""
+        out: dict[str, BlockDonor] = {}
+        for item in classifications:
+            model = item.model_name
+            tier = _BLOCK_TIERS.get(item.state)
+            if tier is None or item.role == ModelRole.RECEIVER or model == receiver:
+                continue
+            if model in active_probe_models or model in inflight_models:
+                continue
+            idle = item.state == ModelState.IDLE
+            if not idle and (deltas.get(model, 0) != 0 or probe_held(item)):
+                continue
+            if cooldown.blocks(model, "down"):
+                continue
+            headroom = _donor_headroom(cfg, model, model_contexts, model_replicas) - abs(
+                min(deltas.get(model, 0), 0)
+            )
+            if headroom <= 0:
+                continue
+            out[model] = BlockDonor(
+                tier=tier,
+                z=item.Z_m,
+                limit=headroom if idle else 1,
+                probed=not idle and not cfg.release_without_safescale,
+            )
+        return out
+
+    def plan_block(
+        recv: ModelClassification,
+        *,
+        free_only: bool,
+        source_loop: SourceLoop,
+        prefix: str,
+        create_reason: str,
+    ) -> bool:
+        """L4 rev 2: one buddy block (+1 replica) for a TP receiver; False = none."""
+        model = recv.model_name
+        donors = {} if free_only else block_donors(model)
+        choice = cheapest_block(model, occupancy, cluster_view, donors, cfg)
+        if choice is None:
+            return False
+        tier = BLOCK_TIER_NAMES[choice.tier]
+        if not choice.sleeps:
+            if choice.binding is not None:
+                occupancy.claim(choice.binding)
+                _add_scale_action(
+                    actions,
+                    deltas,
+                    model=model,
+                    delta=1,
+                    reason=f"{prefix}_sleeping_capacity",
+                    source_loop=source_loop,
+                    receiver=model,
+                    pods=(choice.binding.serve_id,),
+                    hint=True,
+                )
+            else:
+                occupancy.claim_gpus(set(choice.block.keys), model)
+                _add_scale_action(
+                    actions, deltas, model=model, delta=1, reason=create_reason,
+                    source_loop=source_loop, receiver=model,
+                )
+            return True
+        probe = next(((donor, pod) for donor, pod in choice.sleeps if donors[donor].probed), None)
+        non_idle = [donor for donor, _ in choice.sleeps if donors[donor].tier > 1]
+        actions.append(
+            BlockSupplyAction(
+                receiver=model,
+                block=choice.block,
+                receiver_pods=(choice.binding.serve_id,),
+                sleeps=tuple(item for item in choice.sleeps if item != probe),
+                probe=probe,
+                # An IDLE-only block is released by policy, not for lack of SafeScale.
+                reason=f"{prefix}_block_{tier}"
+                + (NO_SAFESCALE_REASON_SUFFIX if non_idle and probe is None else ""),
+                source_loop=source_loop,
+            )
+        )
+        for donor, _ in choice.sleeps:
+            deltas[donor] = deltas.get(donor, 0) - 1
+        for donor in non_idle:
+            block_donor_models.add(donor)
+            note_relay_past_hold(donor, 1)
+        deltas[model] = deltas.get(model, 0) + 1
+        occupancy.count_released(pod for _, pod in choice.sleeps)
+        occupancy.claim(choice.binding)
+        if probe is not None:
+            # The tick commits this probe with exactly {receiver: 1}
+            # (_safescale_pending_upscales); the plan records the same promise.
+            delayed_down_models.add(probe[0])
+            pending = probe_upscale_plans.setdefault(probe[0], {})
+            pending[model] = pending.get(model, 0) + 1
+        events.append(
+            f"block_supply:{model}:{choice.block}:{tier}:" + ",".join(pod for _, pod in choice.sleeps)
+        )
+        return True
 
     def low_need(recv: ModelClassification) -> tuple[int, int] | None:
         """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
@@ -860,97 +964,20 @@ def build_plan(
                         continue
 
                 tp_size = _tp_size(cfg, recv.model_name)
-                tp_receiver = tp_size > 1 and cluster_view is not None
-                if tp_receiver:
-                    same_slot_shrink = None if free_only else _try_plan_same_slot_shrink(
-                        # L4: any donor candidate - IDLE first, then HIGH, then the
-                        # middle zone (lowest Z within a tier).
-                        donors=[
-                            *((0, item) for item in idle_models),
-                            *((1, item) for item in high_models),
-                            *((2, item) for item in middle_zone),
-                        ],
-                        model_contexts=model_contexts,
-                        model_replicas=model_replicas,
-                        cfg=cfg,
-                        cluster_view=cluster_view,
-                        receiver=recv.model_name,
-                        tp_size=tp_size,
-                        active_probe_models=active_probe_models,
-                        # One SafeScale probe per donor model at a time (the state
-                        # machine is keyed by model): a donor already shrunk or probed
-                        # for an earlier receiver this tick cannot start a second probe,
-                        # and gives nothing else this plan. A donor whose last probe
-                        # rolled back waits for new evidence while this shrink is a
-                        # probe (scope ``all``); released at once
-                        # (``release_without_safescale``, an IDLE donor) it is not held.
-                        inflight_models=(
-                            inflight_models | cooldown.down_blocked() | slot_shrink_donors
-                            | delayed_down_models
-                            | {
-                                item.model_name
-                                for item in (*high_models, *middle_zone)
-                                if donor_rollback_held(item.model_name)
-                            }
-                        ),
-                        planned_deltas=deltas,
-                        taken_serve_ids=occupancy.released_donor_ids() if occupancy is not None else set(),
-                        # P1-1 (review 2026-10-28): the plan's ledger - a mate GPU an
-                        # earlier wake / create / slot of this plan claimed is not free.
-                        occupied=occupancy.occupied() if occupancy is not None else None,
+                if tp_size > 1 and occupancy is not None:
+                    # L4 rev 2 (design 20261028-single-loop): a TP receiver takes one
+                    # buddy block per plan (free GPUs, or the pods of eligible donors on
+                    # it); an H3 O1-exempt receiver free blocks only. No block: a defrag
+                    # (registry placement.defrag, off by default), else capacity_blocked.
+                    if not plan_block(
+                        recv,
+                        free_only=free_only,
                         source_loop="rescue",
-                    )
-                    if same_slot_shrink is not None:
-                        note_relay_past_hold(same_slot_shrink.donor, 1)
-                        # Demand-driven preemption (t1): a CRITICAL receiver blocked on a
-                        # fragmented TP slot. Kept under the suppress-hot guard (it only
-                        # gates the receiver-less proactive path); the preemption reason
-                        # is logged in the decision stream.
-                        actions.append(same_slot_shrink)
-                        slot_shrink_donors.add(same_slot_shrink.donor)
-                        if not same_slot_shrink.immediate:
-                            delayed_down_models.add(same_slot_shrink.donor)
-                        # Replica floor (2026-09-29, fix C, relaxed): the shrink takes one
-                        # replica of the donor. It is recorded in the plan's deltas only, so
-                        # a later receiver's donor check counts it against the floor (two
-                        # takes from a 2-replica donor with min_replicas 1 would leave 0; a
-                        # 3-replica donor may still give one more). Its binding is marked
-                        # taken so no later action of this tick sleeps / hides the same pod.
-                        deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
-                        # Ledger (2026-10-02): the tick commits this probe with exactly
-                        # {beneficiary: 1} (_safescale_pending_upscales); the plan records the
-                        # same promise (the fairness piggyback that read it was removed on
-                        # 2026-10-07: a donor probed in this plan gives nothing else).
-                        if not same_slot_shrink.immediate:
-                            pending = probe_upscale_plans.setdefault(same_slot_shrink.donor, {})
-                            pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
-                        if occupancy is not None:
-                            occupancy.count_released((same_slot_shrink.serve_id,))
-                            # Item 3: the free slot mate the commit's wake needs is no
-                            # capacity for the rest of this plan (later ticks: the view's
-                            # blocked GPUs, probe_reserved_gpus).
-                            occupancy.claim_gpus(
-                                _slots_around(
-                                    cluster_view.topology,
-                                    {(same_slot_shrink.slot.node, gpu) for gpu in same_slot_shrink.slot.gpu_ids},
-                                    tp_size,
-                                )
-                            )
-                        events.append(
-                            f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
-                        )
-                        raw_need -= 1
-                        if raw_need <= 0:
-                            continue
-
-                    # C1: up to raw_need free slot groups (one action); a defrag plan is
-                    # still one migration at a time (it is a cluster-wide action).
-                    # Without a slot occupancy (no claims) the allocator would return
-                    # the same free slot again: one slot per tick then (review P3).
-                    empty_slots = slot_planned = 0
-                    slot_limit = raw_need if occupancy is not None else 1
-                    while slot_limit > empty_slots:
-                        tp_planned = _try_plan_tp_capacity(
+                        prefix="critical",
+                        create_reason="critical_empty_slot",
+                    ):
+                        # H3: a migration moves other models - not free capacity.
+                        if not free_only and _plan_tp_defrag(
                             actions,
                             model=recv.model_name,
                             tp_size=tp_size,
@@ -958,44 +985,22 @@ def build_plan(
                             events=events,
                             source_loop="rescue",
                             occupancy=occupancy,
-                            # H3: a migration moves other models - not free capacity.
-                            defrag_enabled=cfg.defrag_enabled and not free_only,
-                        )
-                        if tp_planned == "critical_empty_slot":
-                            empty_slots += 1
-                            continue
-                        if tp_planned:
+                            enabled=cfg.defrag_enabled,
+                        ):
                             _add_scale_action(
                                 actions,
                                 deltas,
                                 model=recv.model_name,
                                 delta=1,
-                                reason=tp_planned,
+                                reason="critical_tp_defrag",
                                 source_loop="rescue",
                                 receiver=recv.model_name,
                             )
-                            slot_planned += 1
-                        break
-                    if empty_slots:
-                        _add_scale_action(
-                            actions,
-                            deltas,
-                            model=recv.model_name,
-                            delta=empty_slots,
-                            reason="critical_empty_slot",
-                            source_loop="rescue",
-                            receiver=recv.model_name,
-                        )
-                    raw_need -= empty_slots + slot_planned
-                    if raw_need <= 0:
-                        continue
-                    # L4: the rest goes to the IDLE and the HIGH / middle-zone relays
-                    # below, which count only aligned slots whose every GPU one donor
-                    # model holds (``_SlotOccupancy.pairable``) - never a single GPU.
+                        else:
+                            _event_once(events, f"capacity_blocked:{recv.model_name}")
+                    continue
 
-                if tp_receiver:
-                    gain_from_idle = 0  # free slot groups: the TP slot path above
-                elif occupancy is not None:
+                if occupancy is not None:
                     gain_from_idle = _plan_create_capacity(
                         occupancy,
                         receiver=recv.model_name,
@@ -1020,8 +1025,6 @@ def build_plan(
 
                 still_needed = raw_need - gain_from_idle
                 if free_only:
-                    if tp_receiver and still_needed > 0:
-                        _event_once(events, f"capacity_blocked:{recv.model_name}")
                     continue  # H3: no donor, no middle-zone probe
                 for donor in paper_donors:
                     if still_needed <= 0:
@@ -1031,7 +1034,6 @@ def build_plan(
                         or donor.model_name in active_probe_models
                         or donor.model_name in inflight_models
                         or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
-                        or donor.model_name in slot_shrink_donors  # gives nothing else this plan
                     ):
                         continue
                     if cooldown.blocks(donor.model_name, "down"):
@@ -1065,6 +1067,7 @@ def build_plan(
                         middle.model_name == recv.model_name
                         or middle.model_name in active_probe_models
                         or middle.model_name in inflight_models
+                        or middle.model_name in block_donor_models  # gave a block this plan
                     ):
                         continue
                     if cooldown.blocks(middle.model_name, "down"):
@@ -1074,9 +1077,7 @@ def build_plan(
                         continue
                     middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
                     planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
-                    # One step of the donor. A non-IDLE donor gives a TP receiver no
-                    # slot of several single-GPU replicas in one decision (user
-                    # 2026-10-28; TP supply is to be redesigned on buddy blocks).
+                    # One step of the donor (TP receivers take blocks above, L4 rev 2).
                     middle_limit = min(_scale_step(middle_pods, cfg.scale_step_ratio), headroom - planned_take)
                     middle_reason = (
                         "critical_high_donor_safescale"
@@ -1115,10 +1116,6 @@ def build_plan(
                             probe_upscale_plans=probe_upscale_plans,
                         )
                     still_needed -= gained
-                if tp_receiver and still_needed > 0:
-                    # L4: no aligned slot of one donor model (a mixed-donor slot - 7b on
-                    # one GPU, 8b on the other - is not supported): nothing more.
-                    _event_once(events, f"capacity_blocked:{recv.model_name}")
             finally:
                 if recv.model_name in rescue_ctx:
                     _tag_rescue_actions(
@@ -1168,8 +1165,6 @@ def build_plan(
                 )
 
         for high in high_models:
-            if high.model_name in slot_shrink_donors:
-                continue
             if high.model_name in active_probe_models or high.model_name in inflight_models:
                 continue
             if deltas.get(high.model_name, 0) != 0:
@@ -1259,6 +1254,18 @@ def build_plan(
             )
             needed -= sleeping_gain
 
+        if occupancy is not None and _tp_size(cfg, recv.model_name) > 1:
+            # L4 rev 2: one buddy block per plan (no relay, no defrag for LOW).
+            if needed > 0 and not plan_block(
+                recv,
+                free_only=False,
+                source_loop="fairness",
+                prefix="low_fairness",
+                create_reason="low_fairness_idle_capacity",
+            ):
+                _event_once(events, f"capacity_blocked:{recv.model_name}")
+            continue
+
         if occupancy is not None:
             # P1-a: only slot groups the SM will really create into for this receiver
             # (TP-aware; none while it still has a sleeping binding the SM would try first).
@@ -1309,7 +1316,6 @@ def build_plan(
                 or donor.model_name in active_probe_models
                 or donor.model_name in inflight_models
                 or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
-                or donor.model_name in slot_shrink_donors  # released for a TP slot this plan
             ):
                 continue
             if cooldown.blocks(donor.model_name, "down"):
@@ -1338,7 +1344,12 @@ def build_plan(
         for middle in probe_donors:
             if needed <= 0:
                 break
-            if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
+            if (
+                middle.model_name == recv.model_name
+                or middle.model_name in active_probe_models
+                or middle.model_name in inflight_models
+                or middle.model_name in block_donor_models  # gave a block this plan
+            ):
                 continue
             if cooldown.blocks(middle.model_name, "down"):
                 continue
@@ -1582,7 +1593,7 @@ class _SlotOccupancy:
                     self._awake[(binding.slot.node, gpu)] = binding
         self._claimed: set[tuple[str, int]] = set()
         # Donor bindings this tick's plan already counts as released (relay estimates,
-        # a same-slot shrink's binding): never counted a second time in the same tick.
+        # a TP block's donor pods): never counted a second time in the same tick.
         # Counting only - the SM picks the donors of a relay itself.
         self._released: set[str] = set()
         # Per model: GPUs claimed by this tick's planned wakes / creates, and how many.
@@ -1629,6 +1640,20 @@ class _SlotOccupancy:
         """Every GPU an awake binding holds, a planned wake has claimed, or that is
         blocked (not wakeable / cooling down)."""
         return set(self._awake) | set(self._claimed) | set(self._blocked)
+
+    def gpu_holder(self, gpu: tuple[str, int]) -> tuple[str, Binding | None]:
+        """("free", None): no awake binding, not claimed, not blocked; ("pod", b): the
+        awake, not hidden binding ``b`` holds it and no plan item released it yet;
+        ("busy", None): anything else (claimed by this plan, blocked, a hidden pod, a
+        pod this plan already releases)."""
+        if gpu in self._claimed or gpu in self._blocked:
+            return "busy", None
+        binding = self._awake.get(gpu)
+        if binding is None:
+            return "free", None
+        if binding.hidden or binding.serve_id in self._released:
+            return "busy", None
+        return "pod", binding
 
     def wakeable(self, model: str) -> list[Binding]:
         """Sleeping bindings whose slot is free, least wasteful first."""
@@ -1965,131 +1990,131 @@ def _plan_create_capacity(
     return len(taken)
 
 
-#: Same-slot donor tiers (L4): IDLE first, then HIGH, then the middle zone.
-_SAME_SLOT_TIERS = ("idle", "high", "middle")
+#: L4 rev 2: a block's donor tiers; the worst GPU of a block ranks it (SLO risk first).
+BLOCK_TIER_NAMES = ("free", "idle", "high", "healthy")
+_BLOCK_TIERS = {ModelState.IDLE: 1, ModelState.HIGH: 2, ModelState.HEALTHY: 3}
 
 
-def _try_plan_same_slot_shrink(
-    *,
-    donors: list[tuple[int, ModelClassification]],
-    model_contexts: dict[str, dict[str, Any]],
-    model_replicas: dict[str, int],
-    cfg: PlanConfig,
-    cluster_view: ClusterView,
+@dataclass(frozen=True)
+class BlockDonor:
+    """A donor model :func:`cheapest_block` may take pods of (the caller decides who is
+    eligible: state, floor, probes, in flight, this plan's takes)."""
+
+    #: Index into :data:`BLOCK_TIER_NAMES` (1 IDLE, 2 HIGH, 3 HEALTHY).
+    tier: int
+    z: float | None
+    #: Pods it may give this plan: an IDLE donor its floor headroom, any other one.
+    limit: int
+    #: Its release is a SafeScale probe (a HIGH / HEALTHY donor under scope ``all``).
+    probed: bool = False
+
+
+@dataclass(frozen=True)
+class BlockChoice:
+    block: GpuBlock
+    #: The receiver's sleeping binding on the block (a wake); None = a cold create.
+    binding: Binding | None
+    #: (donor model, serve id) of the awake pods on the block that sleep for it.
+    sleeps: tuple[tuple[str, str], ...]
+    #: Index into :data:`BLOCK_TIER_NAMES` of the block's worst GPU.
+    tier: int
+    key: tuple
+
+
+def cheapest_block(
     receiver: str,
-    tp_size: int,
-    active_probe_models: set[str],
-    inflight_models: set[str],
-    source_loop: SourceLoop,
-    planned_deltas: Mapping[str, int] | None = None,
-    taken_serve_ids: set[str] | None = None,
-    occupied: set[tuple[str, int]] | None = None,
-) -> ShrinkForSlotAction | None:
-    """One single-GPU donor pod whose aligned slot mate is free, for a TP receiver
-    (design 20261028-single-loop L4). ``donors``: (tier, classification) of the donor
-    candidates (:data:`_SAME_SLOT_TIERS`); the first tier with a candidate wins, the
-    lowest Z within it. A candidate keeps floor headroom (with this plan's takes), is
-    not probing, not in flight (``inflight_models`` carries the plan's other holds).
-    ``occupied``: the plan ledger's occupied GPUs (:meth:`_SlotOccupancy.occupied` -
-    awake, claimed by this plan, blocked); without one, the view's awake and blocked."""
-    by_model: dict[str, tuple[int, ModelClassification]] = {}
-    for tier, item in donors:
-        by_model.setdefault(item.model_name, (tier, item))
-    candidates: list[tuple[int, float, Binding]] = []
-    # Only AWAKE bindings hold a GPU: a sleeping resident (multi-model residency)
-    # neither occupies the slot mate nor frees anything when "shrunk". A GPU the SM
-    # reports not wakeable, or one an in-flight probe reserves for its receiver
-    # (``blocked_gpus``, :func:`probe_reserved_gpus`), is no free mate either: the
-    # receiver's wake would conflict there.
-    if occupied is None:
-        occupied = awake_gpus(cluster_view.bindings) | {
-            (str(node), int(gpu)) for node, gpu in cluster_view.blocked_gpus
-        }
-
-    for binding in cluster_view.bindings:
-        if not binding.awake or binding.hidden:
-            continue
-        donor = by_model.get(binding.model)
-        if donor is None or binding.model in active_probe_models or binding.model in inflight_models:
-            continue
-        if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
-            continue
-        if binding.serve_id in (taken_serve_ids or ()):
-            continue  # this tick already counts this pod as released for another receiver
-        # Takes already planned this tick (e.g. a critical_donor_immediate of an earlier
-        # receiver) count against the donor's floor headroom too.
-        planned_take = abs(min((planned_deltas or {}).get(binding.model, 0), 0))
-        if _donor_headroom(cfg, binding.model, model_contexts, model_replicas) - planned_take <= 0:
-            continue
-        if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
-            continue
-        tier, item = donor
-        candidates.append((tier, item.Z_m if item.Z_m is not None else math.inf, binding))
-
-    if not candidates:
-        return None
-
-    best = min((tier, z_m) for tier, z_m, _ in candidates)
-    donor_binding = _release_pick(
-        [binding for tier, z_m, binding in candidates if (tier, z_m) == best], cluster_view
-    )
-    slot_gpus = _slots_around(
-        cluster_view.topology, {(donor_binding.slot.node, donor_binding.slot.gpu_ids[0])}, tp_size
-    )
-    receiver_pods = tuple(
-        binding.serve_id
-        for binding in sorted(cluster_view.bindings, key=lambda b: natural_key(b.serve_id))
-        if binding.model == receiver and not binding.awake and not binding.hidden
-        and {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids} == slot_gpus
-    )[:1]
-    return ShrinkForSlotAction(
-        donor=donor_binding.model,
-        beneficiary=receiver,
-        serve_id=donor_binding.serve_id,
-        slot=donor_binding.slot,
-        reason=f"critical_same_slot_{_SAME_SLOT_TIERS[best[0]]}_shrink",
-        source_loop=source_loop,
-        receiver_pods=receiver_pods,
-        immediate=_SAME_SLOT_TIERS[best[0]] == "idle",
-    )
-
-
-def _release_pick(bindings: list[Binding], cluster_view: ClusterView) -> Binding:
-    """Among equally ranked donor bindings, the one the placement policy releases
-    first (merge gain, node load, same-model spread, address; never serve_id)."""
-    if len(bindings) == 1:
-        return bindings[0]
-    nodes = node_gpu_counts(cluster_view.topology)
-    aligned = [binding for binding in bindings if is_buddy_aligned(binding.slot, nodes)]
-    if aligned:
-        choice = choose_release(
-            [slot_block(binding.slot) for binding in aligned],
-            nodes=nodes,
-            occupied=awake_gpus(cluster_view.bindings)
-            | {key for binding in aligned for key in slot_block(binding.slot).keys},
-            policy=cluster_view.placement,
-        )
-        if choice is not None:
-            return aligned[choice.index]
-    return min(bindings, key=lambda binding: natural_key(binding.serve_id))
-
-
-def _slot_mate_is_free(
+    ledger: _SlotOccupancy,
     cluster_view: ClusterView,
-    slot: Slot,
-    occupied: set[tuple[str, int]],
-) -> bool:
-    gpu = slot.gpu_ids[0]
-    for node in cluster_view.topology.nodes:
-        if node.name != slot.node:
-            continue
-        for pair in node.two_gpu_slots:
-            pair = tuple(pair)
-            if gpu not in pair:
+    donors: Mapping[str, BlockDonor],
+    cfg: PlanConfig,
+) -> BlockChoice | None:
+    """The buddy block a TP receiver takes for +1 replica (design 20261028-single-loop
+    L4 rev 2). Pure: the caller claims the block and releases the donor pods.
+
+    Candidates: the slot of each sleeping, not hidden binding of the receiver (a wake)
+    and, while the receiver has no unplanned sleeping binding (the SM creates only
+    then), every aligned block whose GPUs are all free (a cold create). Each GPU of a
+    candidate is free (no awake binding, not claimed by this plan, not blocked) or held
+    by one awake, not hidden, not released pod of a ``donors`` model whose slot lies in
+    the block (a pod spanning the block counts once). A donor gives at most its
+    ``limit`` pods; at most one donor of a block is ``probed`` (one probe per model, no
+    joint commit). Lexicographic choice: worst tier (free < IDLE < HIGH < HEALTHY),
+    fewer donor pods, higher donor Z (the lower one first), a wake before a create,
+    then the placement score (:func:`tre_common.gpu_placement.choose_placement`)."""
+    tp_size = _tp_size(cfg, receiver)
+    nodes = node_gpu_counts(cluster_view.topology)
+    occupied = ledger.occupied()
+    policy = ledger.policy()
+    model_occupied = ledger.model_gpus(receiver)
+    candidates: list[tuple[GpuBlock, Binding | None]] = [
+        (slot_block(binding.slot), binding)
+        for binding in ledger.sleeping(receiver)
+        if len(binding.slot.gpu_ids) == tp_size and is_buddy_aligned(binding.slot, nodes)
+    ]
+    if not ledger.has_unplanned_sleeping(receiver):
+        candidates += [(slot_block(slot), None) for slot in gpu_slot_candidates(cluster_view.topology, tp_size)]
+    best: BlockChoice | None = None
+    for block, binding in candidates:
+        keys = set(block.keys)
+        pods: dict[str, Binding] = {}
+        usable = True
+        for gpu in block.keys:
+            state, pod = ledger.gpu_holder(gpu)
+            if state == "free":
                 continue
-            mate = next(item for item in pair if item != gpu)
-            return (slot.node, mate) not in occupied
-    return False
+            if state != "pod" or binding is None or pod.model not in donors or pod.model == receiver:
+                usable = False
+                break
+            if not {(pod.slot.node, other) for other in pod.slot.gpu_ids} <= keys:
+                usable = False  # the donor pod is larger than the block
+                break
+            pods[pod.serve_id] = pod
+        if not usable:
+            continue
+        per_model: dict[str, int] = {}
+        for pod in pods.values():
+            per_model[pod.model] = per_model.get(pod.model, 0) + 1
+        if any(count > donors[model].limit for model, count in per_model.items()):
+            continue
+        if sum(1 for model in per_model if donors[model].probed) > 1:
+            continue
+        tier = max((donors[model].tier for model in per_model), default=0)
+        z_values = sorted(_block_z(donors[pod.model].z) for pod in pods.values())
+        z_key = (-z_values[0], -z_values[-1]) if z_values else (0.0, 0.0)
+        placement = choose_placement(
+            [block],
+            nodes=nodes,
+            occupied=occupied - keys,
+            tp_size=tp_size,
+            policy=policy,
+            model_occupied=model_occupied,
+        )
+        if placement is None:
+            continue
+        key = (
+            tier,
+            len(pods),
+            *z_key,
+            0 if binding is not None else 1,
+            placement.score[:-1],
+            natural_key(binding.serve_id) if binding is not None else (),
+        )
+        if best is None or key < best.key:
+            ordered = sorted(pods.values(), key=lambda pod: natural_key(pod.serve_id))
+            best = BlockChoice(
+                block=block,
+                binding=binding,
+                sleeps=tuple((pod.model, pod.serve_id) for pod in ordered),
+                tier=tier,
+                key=key,
+            )
+    return best
+
+
+def _block_z(z: float | None) -> float:
+    """A donor's Z for the block choice (higher = more surplus); an IDLE donor without
+    a Z (no traffic) has the most."""
+    return math.inf if z is None else float(z)
 
 
 def probe_reserved_gpus(
@@ -2099,8 +2124,8 @@ def probe_reserved_gpus(
     receivers (design donor-evidence-20261007, item 3): for every receiver a probe
     promises replicas to (``pending_upscales``), the aligned ``tp_size`` slot around
     each GPU of the probe pods. While a donor pod is hidden its own GPU is occupied
-    anyway; what this adds is the free slot mate a TP receiver's wake needs at commit
-    (``critical_same_slot_*_shrink``), and, between the donor's sleep and the
+    anyway; what this adds is the rest of a TP receiver's block its wake needs at commit
+    (:class:`BlockSupplyAction` probes), and, between the donor's sleep and the
     receiver's wake of a commit, the freed GPU itself. The tick adds them to the view's
     ``blocked_gpus``, so no other wake / create / relay of the plan takes them; they are
     free again once the probe is resolved (state, not time)."""
@@ -2133,7 +2158,7 @@ def _slots_around(topology: ClusterTopology, gpus: set, tp_size: int) -> set[tup
     return out
 
 
-def _try_plan_tp_capacity(
+def _plan_tp_defrag(
     actions: list[Action],
     *,
     model: str,
@@ -2141,43 +2166,30 @@ def _try_plan_tp_capacity(
     cluster_view: ClusterView,
     events: list[str],
     source_loop: SourceLoop,
-    occupancy: _SlotOccupancy | None = None,
-    defrag_enabled: bool = False,
-) -> str | None:
-    # No slot: the caller records ``capacity_blocked`` when the relays cannot fill the
-    # slot either (L4, 2026-10-28).
-    if occupancy is not None and occupancy.has_unplanned_sleeping(model):
+    occupancy: _SlotOccupancy,
+    enabled: bool,
+) -> bool:
+    """The fallback of a CRITICAL TP receiver without a block (L4 rev 2): one defrag
+    plan (registry ``placement.defrag``, off by default; a cluster-wide action)."""
+    if occupancy.has_unplanned_sleeping(model):
         # P1-a: the SM wakes existing sleeping bindings before any create/defrag target
         # is used; with a blocked one the +1 would WakeConflict every tick.
-        return None
-    allocator = SlotAllocator(
-        cluster_view.topology, list(cluster_view.bindings), policy=cluster_view.placement
-    )
-    if occupancy is not None:
-        groups = occupancy.free_groups(tp_size, model)
-        if groups:
-            occupancy.claim_gpus(groups[0], model)
-            return "critical_empty_slot"
-    elif allocator.find_slot(tp_size, model) is not None:
-        return "critical_empty_slot"
-
-    if not defrag_enabled:
+        return False
+    if not enabled:
         # Registry placement.defrag.enabled is false (default, v1 parity): no
         # automatic migration is planned (design 20260928-placement-node-balance).
         events.append(f"defrag_disabled:{model}")
-        return None
+        return False
+    allocator = SlotAllocator(
+        cluster_view.topology, list(cluster_view.bindings), policy=cluster_view.placement
+    )
     migrations = allocator.plan_defrag(tp_size)
-    if migrations:
-        actions.append(
-            DefragAction(
-                migrations=tuple(migrations),
-                reason="critical_tp_defrag",
-                source_loop=source_loop,
-            )
-        )
-        return "critical_tp_defrag"
-
-    return None
+    if not migrations:
+        return False
+    actions.append(
+        DefragAction(migrations=tuple(migrations), reason="critical_tp_defrag", source_loop=source_loop)
+    )
+    return True
 
 
 def _idle_window_evidence(item: ModelClassification, ctx: Mapping[str, Any]) -> bool:
@@ -2308,11 +2320,11 @@ def _tag_rescue_actions(
     model = recv.model_name
 
     def receiver_part(action: Action) -> int:
-        # L4: a same-slot release wakes its beneficiary in the same plan (or the commit
-        # of its probe); review P2-3: a donor probe for this receiver promises its
-        # commit's receiver replicas (``probe_upscale_plans``, one probe per donor).
-        if isinstance(action, ShrinkForSlotAction):
-            return 1 if action.beneficiary == model else 0
+        # L4 rev 2: a block wakes its receiver in the same plan (or the commit of its
+        # probe); review P2-3: a donor probe for this receiver promises its commit's
+        # receiver replicas (``probe_upscale_plans``, one probe per donor).
+        if isinstance(action, BlockSupplyAction):
+            return 1 if action.receiver == model else 0
         if (
             isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0
             and action.receiver == model

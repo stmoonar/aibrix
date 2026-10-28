@@ -502,17 +502,6 @@ def test_settle_extension_applies_only_while_o1_does_not_track_the_model():
     assert "critical" in _rescue_bases(_snapshot(84_999), covered, registry, tracked)
 
 
-def test_tp_slot_loop_without_occupancy_counts_one_slot():
-    # Defensive (build_plan always has an occupancy with a cluster view): the allocator
-    # path does not claim, so a second iteration would count the same slot again.
-    import inspect
-
-    from tre_controller.planning import planner
-
-    source = inspect.getsource(planner.build_plan)
-    assert "slot_limit = raw_need if occupancy is not None else 1" in source
-
-
 # ===================================================== review round 2 (2026-10-01)
 def _snapshot_routable(window_start_ms: int, routable: int) -> MetricsSnapshot:
     snap = _snapshot(window_start_ms)

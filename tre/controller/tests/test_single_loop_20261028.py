@@ -1,17 +1,19 @@
 """Single decision loop (design docs/design/20261028-single-loop.md): the invariants.
 
-1. A same-slot release is ONE plan: the donor pod's sleep and the receiver's wake with
-   its binding on that slot as the hint - never a bare donor sleep, under every scope;
-   an IDLE donor's release is that plan at once even under scope ``all`` (no probe).
+1. A TP block is ONE plan: the donor pods' sleeps and the receiver's wake with its
+   binding on the block as the hint - never a bare donor sleep, under every scope; an
+   IDLE-only block is that plan at once even under scope ``all`` (no probe).
 2. Order: two CRITICAL receivers compete for one free GPU - the lower Z wins whatever
    the registry order; a LOW receiver is never planned before a CRITICAL one.
 3. One step: a receiver gets at most +1 per plan however deep its Z and however much
    capacity is free; no second +1 before the window reflects the previous target.
 5. One ledger: the rescue and the rebalance section of one planner call never assign
    one free GPU twice; with TRE_ABLATION_DISABLE_SLOW_LOOP a LOW receiver gets nothing.
-4. TP2 supply: a slot of one free GPU and an IDLE donor pod, or of two pods of one
-   IDLE donor, is obtained in one plan; a mixed-donor slot gives nothing and
-   ``capacity_blocked``.
+4. TP2 supply (L4 rev 2, buddy blocks): a free block is woken into with no donor
+   touched; the block's worst donor tier decides (free < IDLE < HIGH < HEALTHY) before
+   the number of pods; a LOW / CRITICAL pod makes a block unusable; a non-IDLE donor
+   gives at most one replica per plan; under scope ``all`` a block with one HIGH donor
+   is a probe for the receiver and one that needs two probed donors is skipped.
 6. A stale snapshot (or no publish at all) gives no decision and an alert. (The same
    observation stream at a 1 s and a 2 s cadence: test_period_invariance_20261025.)
 """
@@ -24,6 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tre_common.gpu_placement import GpuBlock
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec
 from tre_controller.config import SafeScaleConfig
@@ -35,12 +38,12 @@ from tre_controller.loops.safescale_task import _commands_to_actions
 from tre_controller.loops.tick import LoopTickResult, _apply_safescale, upscale_of
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import (
+    BlockSupplyAction,
     ClusterView,
     HideAction,
     PlanConfig,
     RescueBasis,
     ScaleAction,
-    ShrinkForSlotAction,
     TransferIntent,
     build_plan,
 )
@@ -57,6 +60,7 @@ TOPOLOGY8 = ClusterTopology(nodes=(NodeSpec(name="n", gpus=8, two_gpu_slots=((0,
 CRIT = ModelState.CRITICAL, ModelRole.RECEIVER
 LOW = ModelState.LOW, ModelRole.RECEIVER
 IDLE = ModelState.IDLE, ModelRole.DONOR
+HIGH = ModelState.HIGH, ModelRole.DONOR
 HEALTHY = ModelState.HEALTHY, ModelRole.NEUTRAL
 
 
@@ -115,57 +119,68 @@ def _ups(plan) -> list[tuple[str, int, tuple[str, ...]]]:
     ]
 
 
-def _tp2(*donors: Binding):
+def _tp2(*donors: Binding, classes=None, scope="all", receivers=None):
     """CRITICAL ``tp2`` (TP2): awake on GPUs 4-5, sleeping on 0-1 and 2-3; ``x`` holds
-    6-7 at its floor; ``donors`` (IDLE, floor 0) sit on GPUs 0-3. Returns the plan
-    items the tick sends after SafeScale (scope ``all``): (kind, model, pods, hints,
-    donors) per plan, and the planner events."""
+    6-7 at its floor; ``donors`` (IDLE unless ``classes`` says otherwise, floor 0) sit
+    on GPUs 0-3. ``receivers`` replaces the tp2 bindings. Returns the plan items the
+    tick sends after SafeScale under ``scope``: (kind, model, pods, hints, donors) per
+    plan, the planner events and the SafeScale state machine."""
     bindings = [
-        _binding("tp2-4", "tp2", (4, 5), True),
-        _binding("tp2-0", "tp2", (0, 1), False),
-        _binding("tp2-2", "tp2", (2, 3), False),
+        *(receivers or (
+            _binding("tp2-4", "tp2", (4, 5), True),
+            _binding("tp2-0", "tp2", (0, 1), False),
+            _binding("tp2-2", "tp2", (2, 3), False),
+        )),
         *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (6, 7)),
         *donors,
     ]
-    models = {binding.model for binding in donors} - {"x"}
-    classes = {"tp2": (*CRIT, 0.3), "x": (*HEALTHY, 1.1), **{model: (*IDLE, 0.0) for model in models}}
-    plan = _plan(bindings, classes, topology=TOPOLOGY8, model_tp_sizes={"tp2": 2},
-                 min_replicas_by_model={"x": 2, **{model: 0 for model in models}})
+    tp = {binding.model for binding in bindings if len(binding.slot.gpu_ids) == 2}
+    models = {binding.model for binding in donors} - {"x"} - tp
+    classes = {**({} if receivers else {"tp2": (*CRIT, 0.3)}), "x": (*HEALTHY, 1.1),
+               **{model: (*IDLE, 0.0) for model in models}, **(classes or {})}
+    tp_sizes = {binding.model: 2 if binding.model in tp else 1 for binding in bindings}
+    plan = _plan(bindings, classes, topology=TOPOLOGY8, model_tp_sizes=tp_sizes,
+                 min_replicas_by_model={"x": 2, **{model: 0 for model in models}},
+                 release_without_safescale=scope != "all")
+    machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
     out, _ = _apply_safescale(
         MetricsSnapshot(ts_ms=1, models={}, stale=False), tuple(plan.actions), plan.probe_upscale_plans,
-        safescale=SafeScaleStateMachine(config=SafeScaleConfig()),
-        cluster_view=ClusterView(TOPOLOGY8, tuple(bindings)), safescale_scope="all",
+        safescale=machine, cluster_view=ClusterView(TOPOLOGY8, tuple(bindings)), safescale_scope=scope,
     )
     plans = []
     for action in out:
         items = []
         for member in (action.members if isinstance(action, PlanBatch) else (action,)):
+            if isinstance(member, HideAction):
+                items.append(("hide", member.model, list(member.pods), None, None))
+                continue
             kind, item = plan_item(member)
             items.append((kind, item["model"], item.get("pods"), item.get("hints"),
                           [(d["model"], d["max"]) for d in item.get("donors", ())] or None))
         plans.append(items)
-    return plans, plan.events
+    return plans, plan.events, machine
 
 
 # ------------------------------------------------------------------ 1. one plan
-SHRINK = ShrinkForSlotAction(
-    donor="d", beneficiary="tp2", serve_id="d-0", slot=Slot("n", (0,)),
-    reason="critical_same_slot_high_shrink", source_loop="rescue", receiver_pods=("tp2-0",),
+BLOCK = BlockSupplyAction(
+    receiver="tp2", block=GpuBlock("n", (0, 1)), receiver_pods=("tp2-0",), sleeps=(("d", "d-0"),),
+    reason="critical_block_high_nosafescale", source_loop="rescue",
 )
+PROBE_BLOCK = replace(BLOCK, sleeps=(), probe=("d", "d-0"), reason="critical_block_high")
 VIEW = ClusterView(TOPOLOGY, (
     _binding("d-0", "d", (0,), True), _binding("tp2-0", "tp2", (0, 1), False), _binding("tp2-2", "tp2", (2, 3), False),
 ))
 
 
-@pytest.mark.parametrize(("scope", "shrink"), [
-    ("receiverless_shrink", SHRINK),
-    ("off", SHRINK),
-    ("all", replace(SHRINK, reason="critical_same_slot_idle_shrink", immediate=True)),  # IDLE donor
+@pytest.mark.parametrize(("scope", "block"), [
+    ("receiverless_shrink", BLOCK),
+    ("off", PROBE_BLOCK),  # SafeScale off: even a probe form is released at once
+    ("all", replace(BLOCK, reason="critical_block_idle")),  # IDLE donor: no probe
 ])
-def test_a_same_slot_release_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope, shrink):
+def test_a_tp_block_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope, block):
     machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
 
-    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (shrink,), {},
+    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (block,), {},
                               safescale=machine, cluster_view=VIEW, safescale_scope=scope)
 
     assert machine is None or machine.active_probe("d") is None  # no probe
@@ -180,14 +195,14 @@ def test_a_same_slot_release_is_one_plan_of_the_donor_sleep_and_the_receiver_wak
 
 def _release(donor="d", receiver="tp2"):
     return PlanBatch((
-        ScaleAction(donor, -1, "critical_same_slot_idle_shrink", "rescue", donor=donor, pods=(f"{donor}-0",),
+        ScaleAction(donor, -1, "critical_block_idle", "rescue", donor=donor, pods=(f"{donor}-0",),
                     sleep_path="urgent"),
-        ScaleAction(receiver, 1, "critical_same_slot_idle_shrink", "rescue", receiver=receiver,
+        ScaleAction(receiver, 1, "critical_block_idle", "rescue", receiver=receiver,
                     pods=(f"{receiver}-0",), hint=True),
     ))
 
 
-def test_a_decision_with_a_same_slot_release_is_one_sm_plan():
+def test_a_decision_with_a_tp_block_is_one_sm_plan():
     sm = PlanSM({"d": 2, "tp2": 1, "r": 1})
     queue = ActionQueue(sm, now_ms=lambda: 5_000)
     queue.submit((_release(), ScaleAction("r", 1, "critical_idle_capacity", "rescue")))
@@ -198,10 +213,10 @@ def test_a_decision_with_a_same_slot_release_is_one_sm_plan():
     assert [(i["model"], i.get("hints")) for i in plan["wakes"]] == [("tp2", ["tp2-0"]), ("r", None)]
 
 
-def test_a_same_slot_release_is_never_split_across_plans():
+def test_a_tp_block_is_never_split_across_plans():
     sm = PlanSM({"d": 3, "tp2": 1, "r": 1})
     queue = ActionQueue(sm, now_ms=lambda: 5_000)
-    # The relay uses d first: the release starts the next plan, whole.
+    # The relay uses d first: the block starts the next plan, whole.
     queue.submit((TransferIntent("d", "r", 1, "critical_donor_immediate", "rescue"), _release()))
     asyncio.run(queue.drain_once())
 
@@ -210,11 +225,13 @@ def test_a_same_slot_release_is_never_split_across_plans():
     assert [i["model"] for i in second["sleeps"]] == ["d"] and [i["model"] for i in second["wakes"]] == ["tp2"]
 
 
-def test_with_safescale_the_release_is_a_probe_and_its_commit_is_that_one_plan():
+def test_with_safescale_the_block_is_a_probe_and_its_commit_is_that_one_plan():
     machine = SafeScaleStateMachine(config=SafeScaleConfig())
     snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=False)
-    out, _ = _apply_safescale(snapshot, (SHRINK,), {}, safescale=machine, cluster_view=VIEW, safescale_scope="all")
+    out, _ = _apply_safescale(snapshot, (PROBE_BLOCK,), {}, safescale=machine, cluster_view=VIEW,
+                              safescale_scope="all")
     assert out and all(isinstance(action, HideAction) for action in out)  # no bare sleep
+    assert machine.active_probe("d").pending_upscales == {"tp2": 1}
 
     [commit] = _commands_to_actions(
         (SafeScaleCommand("scale_down", "d", pods=("d-0",)), SafeScaleCommand("scale_up", "tp2", delta=1)),
@@ -229,28 +246,111 @@ def _wakes(plans, model):
     return [item for items in plans for item in items if item[0] == "wake" and item[1] == model]
 
 
-def test_a_free_gpu_and_an_idle_donor_pod_give_the_tp2_receiver_its_slot_in_one_plan():
-    plans, _ = _tp2(_binding("i-0", "i", (0,), True), _binding("i-2", "i", (2,), True), _binding("i-3", "i", (3,), True))
-
-    # One plan (no probe, scope all): the IDLE pod beside the free GPU sleeps, tp2 wakes there.
-    assert [("sleep", "i", ["i-0"], None, None), ("wake", "tp2", None, ["tp2-0"], None)] in plans
+def _sleeps(plans):
+    return [item for items in plans for item in items if item[0] == "sleep" and item[2]]
 
 
-def test_two_pods_of_one_idle_donor_relay_the_tp2_slot():
-    plans, events = _tp2(*(_binding(f"i-{gpu}", "i", (gpu,), True) for gpu in (0, 1)),
-                         *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)))
+def test_a_free_block_is_woken_into_and_no_donor_is_touched():
+    plans, _, _ = _tp2(_binding("i-0", "i", (0,), True))  # 0-1 half held, 2-3 free
 
-    assert _wakes(plans, "tp2") == [("wake", "tp2", None, None, [("i", 2)])]  # both pods of the slot
-    assert not any(event.startswith("capacity_blocked") for event in events)
+    assert _wakes(plans, "tp2") == [("wake", "tp2", None, ["tp2-2"], None)]
+    assert _sleeps(plans) == []
 
 
-def test_a_mixed_donor_slot_gives_the_tp2_receiver_nothing():
-    plans, events = _tp2(_binding("a-0", "a", (0,), True), _binding("b-1", "b", (1,), True),
-                         _binding("a-2", "a", (2,), True), _binding("b-3", "b", (3,), True))
+def test_the_worst_donor_tier_decides_before_the_number_of_pods():
+    # 0-1: a free GPU and a HEALTHY pod; 2-3: a HIGH 7b and a HIGH 8b pod (receiverless
+    # scope: released at once). HIGH+HIGH beats free+HEALTHY: two sleeps and the wake.
+    plans, events, _ = _tp2(
+        _binding("h-1", "h", (1,), True), _binding("s7-2", "s7", (2,), True), _binding("s8-3", "s8", (3,), True),
+        classes={"h": (*HEALTHY, 1.2), "s7": (*HIGH, 1.4), "s8": (*HIGH, 1.5)}, scope="receiverless_shrink",
+    )
 
-    assert _wakes(plans, "tp2") == []
-    assert not [item for items in plans for item in items if item[0] == "sleep" and item[2]]  # no pod named
+    assert plans == [[
+        ("sleep", "s7", ["s7-2"], None, None),
+        ("sleep", "s8", ["s8-3"], None, None),
+        ("wake", "tp2", None, ["tp2-2"], None),
+    ]]
+    assert "block_supply:tp2:n:2,3:high:s7-2,s8-3" in events
+
+
+def test_two_pods_of_one_idle_donor_or_of_two_idle_donors_give_the_block():
+    one, _, _ = _tp2(*(_binding(f"i-{gpu}", "i", (gpu,), True) for gpu in (0, 1)),
+                     *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)))
+    assert one == [[("sleep", "i", ["i-0"], None, None), ("sleep", "i", ["i-1"], None, None),
+                    ("wake", "tp2", None, ["tp2-0"], None)]]
+    mixed, _, _ = _tp2(_binding("a-0", "a", (0,), True), _binding("b-1", "b", (1,), True),
+                       *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)))
+    assert mixed == [[("sleep", "a", ["a-0"], None, None), ("sleep", "b", ["b-1"], None, None),
+                      ("wake", "tp2", None, ["tp2-0"], None)]]
+
+
+@pytest.mark.parametrize("state", [LOW, CRIT])
+def test_a_block_with_a_low_or_critical_pod_is_not_used(state):
+    plans, events, _ = _tp2(_binding("i-0", "i", (0,), True), _binding("r-1", "r", (1,), True),
+                            *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)),
+                            classes={"r": (*state, 0.9)}, scope="receiverless_shrink")
+
+    assert _wakes(plans, "tp2") == [] and _sleeps(plans) == []
     assert "capacity_blocked:tp2" in events
+
+
+@pytest.mark.parametrize("scope", ["receiverless_shrink", "all"])
+def test_a_non_idle_donor_gives_one_replica_per_plan_to_all_receivers_together(scope):
+    # Two TP2 receivers, each with a block of a free GPU and one pod of HIGH h (3 pods).
+    plans, events, _ = _tp2(
+        *(_binding(f"h-{gpu}", "h", (gpu,), True) for gpu in (0, 2)), _binding("h-4", "h", (4,), True),
+        classes={"h": (*HIGH, 1.4), "tpa": (*CRIT, 0.2), "tpb": (*CRIT, 0.3)}, scope=scope,
+        receivers=(_binding("tpa-0", "tpa", (0, 1), False), _binding("tpb-2", "tpb", (2, 3), False)),
+    )
+
+    given = [item for items in plans for item in items if item[1] == "h" and item[0] in ("sleep", "hide")]
+    assert [item[2] for item in given] == [["h-0"]]
+    assert "capacity_blocked:tpb" in events
+
+
+def test_a_high_donor_that_gave_a_block_relays_nothing_to_a_tp1_receiver_in_the_plan():
+    # Receiverless scope (relays at once, no probe hold): tp2 takes 0-1 (free GPU 1 +
+    # h-0); the TP1 receiver c sleeps on GPU 2 under h-2 - h has 3 pods, floor 0.
+    plans, _, _ = _tp2(
+        *(_binding(f"h-{gpu}", "h", (gpu,), True) for gpu in (0, 2, 3)),
+        classes={"tp2": (*CRIT, 0.3), "c": (*CRIT, 0.5), "h": (*HIGH, 1.4)}, scope="receiverless_shrink",
+        receivers=(_binding("tp2-4", "tp2", (4, 5), True), _binding("tp2-0", "tp2", (0, 1), False),
+                   _binding("c-2", "c", (2,), False)),
+    )
+
+    assert plans == [[("sleep", "h", ["h-0"], None, None), ("wake", "tp2", None, ["tp2-0"], None)]]
+
+
+def test_a_block_of_two_pods_of_one_high_donor_is_not_used():
+    plans, events, _ = _tp2(*(_binding(f"h-{gpu}", "h", (gpu,), True) for gpu in (0, 1)),
+                            *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)),
+                            classes={"h": (*HIGH, 1.4)}, scope="receiverless_shrink")
+
+    assert _wakes(plans, "tp2") == [] and _sleeps(plans) == []
+    assert "capacity_blocked:tp2" in events
+
+
+@pytest.mark.parametrize("mate", [None, "i"])
+def test_scope_all_a_block_with_one_high_donor_is_a_probe_for_the_receiver(mate):
+    # 0-1: HIGH h on GPU 1, GPU 0 free or an IDLE pod (sleeps at once); 2-3 at the floor.
+    plans, _, machine = _tp2(_binding("h-1", "h", (1,), True),
+                             *((_binding("i-0", "i", (0,), True),) if mate else ()),
+                             *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)),
+                             classes={"h": (*HIGH, 1.4)})
+
+    assert machine.active_probe("h").pending_upscales == {"tp2": 1}
+    assert _wakes(plans, "tp2") == []  # the commit wakes it
+    assert _sleeps(plans) == ([("sleep", "i", ["i-0"], None, None)] if mate else [])
+    assert [item[2] for items in plans for item in items if item[0] == "hide"] == [["h-1"]]
+
+
+def test_scope_all_a_block_that_needs_two_probed_donors_is_skipped():
+    plans, events, machine = _tp2(_binding("s7-0", "s7", (0,), True), _binding("s8-1", "s8", (1,), True),
+                                  *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)),
+                                  classes={"s7": (*HIGH, 1.4), "s8": (*HIGH, 1.5)})
+
+    assert machine.active_probe("s7") is None and machine.active_probe("s8") is None
+    assert plans == [] and "capacity_blocked:tp2" in events
 
 
 # ------------------------------------------------------------------ 2. receiver order
@@ -329,7 +429,9 @@ def test_a_freed_tp2_half_slot_goes_to_the_critical_receiver_not_to_a_low_one():
     cfg = dict(model_tp_sizes={"tp2": 2, "low": 1, "i": 1, "x": 1}, min_replicas_by_model={"x": 2, "i": 0})
 
     both = _plan(bindings, classes, **cfg)
-    assert [(a.donor, a.beneficiary) for a in both.actions if isinstance(a, ShrinkForSlotAction)] == [("i", "tp2")]
+    assert [(a.receiver, a.sleeps) for a in both.actions if isinstance(a, BlockSupplyAction)] == [
+        ("tp2", (("i", "i-0"),))
+    ]
     assert _ups(both) == []  # GPU 1 is the slot's: the LOW receiver gets nothing
     # The rebalance section alone would have woken LOW there.
     assert _ups(_plan(bindings, classes, rescue_due=False, **cfg)) == [("low", 1, ("low-1",))]
@@ -350,7 +452,7 @@ def test_a_gpu_claimed_by_an_earlier_wake_is_no_free_slot_mate():
     plan = _plan(bindings, classes, model_tp_sizes={"tp2": 2}, min_replicas_by_model={"x": 1, "d": 0})
 
     assert _ups(plan) == [("s7", 1, ("s7-1",))]
-    assert not [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
+    assert not [a for a in plan.actions if isinstance(a, BlockSupplyAction)]
     assert "capacity_blocked:tp2" in plan.events
 
 

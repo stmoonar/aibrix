@@ -564,7 +564,7 @@ def test_decision_loop_skips_when_cluster_view_box_is_not_ready() -> None:
     assert [call[2].events for call in writer.calls] == [("cluster_view_unavailable",)]
 
 
-def _registry_for_same_slot_shrink() -> Registry:
+def _registry_for_tp_block() -> Registry:
     base = _registry()
     template = base.model("critical")
     return Registry(
@@ -594,13 +594,13 @@ def _registry_for_same_slot_shrink() -> Registry:
     )
 
 
-def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None:
+def test_rescue_tick_converts_a_tp_block_with_a_high_donor_to_a_safescale_probe_hide() -> None:
     from tre_controller.planning.planner import ClusterView
     from tre_sm.allocator.slots import Binding, Slot
 
     queue = FakeQueue()
     safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
-    registry = _registry_for_same_slot_shrink()
+    registry = _registry_for_tp_block()
     snapshot = MetricsSnapshot(
         ts_ms=20_000,
         stale=False,
@@ -614,6 +614,7 @@ def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+            Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
         ),
     )
 

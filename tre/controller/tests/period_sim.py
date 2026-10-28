@@ -341,7 +341,7 @@ class Sim:
             free[0].awake = True
 
     def apply(self, action) -> None:
-        if isinstance(action, PlanBatch):  # a same-slot release: its items in order
+        if isinstance(action, PlanBatch):  # a TP block: its items in order
             for member in action.members:
                 self.apply(member)
             return

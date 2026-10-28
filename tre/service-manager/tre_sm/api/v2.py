@@ -7177,7 +7177,7 @@ class PlanDonor(BaseModel):
 
 class PlanSleepItem(BaseModel):
     model: str
-    #: Exact serve ids (SafeScale probe pods, ShrinkForSlot); one of pods / at_most.
+    #: Exact serve ids (SafeScale probe pods, a TP block's donor pods); one of pods / at_most.
     pods: list[str] | None = None
     #: Model-level shrink (clamped at the replica floor).
     at_most: int | None = Field(None, ge=0)

@@ -21,6 +21,7 @@ from tre_controller.planning.classify import (
     model_control_configs_from_registry,
 )
 from tre_controller.planning.planner import (
+    BlockSupplyAction,
     IMMEDIATE_DONOR_SLEEP_PATH,
     NO_SAFESCALE_REASON_SUFFIX,
     Action,
@@ -30,7 +31,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RescueBasis,
     ScaleAction,
-    ShrinkForSlotAction,
     TransferIntent,
     UnhideAction,
     build_plan,
@@ -182,7 +182,7 @@ def run_planner_tick(
     """One planner tick. ``safescale_scope`` (TRE_SAFESCALE_SCOPE, 2026-10-26):
     ``receiverless_shrink`` keeps a probe only for the receiver-less HIGH proactive
     shrink (:func:`_receiverless_shrink`); a donor planned for a receiver is a relay and
-    a same-slot preemption sleeps its pod at once, as with SafeScale off. ``observe_mode`` (controller mode ``observe``, B8): the
+    a TP block sleeps its donor pods at once, as with SafeScale off. ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
@@ -487,7 +487,7 @@ def _note_saturation_steps(
     noted: set[str] = set()
     if tracker is None:
         return noted
-    # Review P2-2: also a same-slot release's receiver wake (receiver_upscales).
+    # Review P2-2: also a TP block's receiver wake (receiver_upscales).
     ups = [(action, model, delta) for action in actions for model, delta in receiver_upscales(action)]
     up = {model for _, model, _ in ups}
     for item in classifications:
@@ -828,11 +828,11 @@ def _apply_safescale(
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
         return _release_without_safescale(actions)
-    # An IDLE donor's same-slot release is immediate under every scope (one plan, no
-    # probe; design 20261028-single-loop L4).
+    # L4 rev 2: a TP block without a probe (IDLE donors; a scope that releases at once)
+    # is one plan now; a block with a probe stays one until its probe starts.
     actions = tuple(
         _release_without_safescale((action,))[0][0]
-        if isinstance(action, ShrinkForSlotAction) and action.immediate else action
+        if isinstance(action, BlockSupplyAction) and action.probe is None else action
         for action in actions
     )
     if safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK:
@@ -884,10 +884,10 @@ def _apply_safescale(
             else:
                 converted.append(action)
             continue
-        if isinstance(action, (PlanBatch, ShrinkForSlotAction)):
-            # Review P2-2: a same-slot release wakes its receiver too (one plan, or the
-            # probe's commit): the receiver's own probe is preempted like for any
-            # scale-up; restored pods covering it make the release pointless.
+        if isinstance(action, (PlanBatch, BlockSupplyAction)):
+            # Review P2-2: a TP block wakes its receiver too (one plan, or the probe's
+            # commit): the receiver's own probe is preempted like for any scale-up;
+            # restored pods covering it make the release pointless.
             ups = receiver_upscales(action)
             if len(ups) == 1:
                 model, delta = ups[0]
@@ -897,7 +897,7 @@ def _apply_safescale(
                     rescue_of[model] = replace(rescue, covered=rescue.covered + restore_used[model])
                 if restore_left[model] >= delta:
                     restore_left[model] -= delta
-                    events.append(f"same_slot_release_covered_by_preemption:{model}")
+                    events.append(f"block_supply_covered_by_preemption:{model}")
                     continue
                 survived.add(model)
             if isinstance(action, PlanBatch):
@@ -972,6 +972,10 @@ def _apply_safescale(
         events.append(f"safescale_{decision.reason}:{probe_model}")
         if decision.reason == "probe_started" and getattr(decision, "details", None):
             events.append(format_window_event(probe_model, decision.details))
+        if isinstance(action, BlockSupplyAction):
+            # L4 rev 2: the block's IDLE pods sleep now (their GPUs stay reserved for
+            # the receiver while the probe runs, ``probe_reserved_gpus``).
+            converted.extend(_block_sleeps(action, action.reason))
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
     if covered_targets is not None:
         for model, rescue in rescue_of.items():
@@ -981,13 +985,24 @@ def _apply_safescale(
 
 
 def _rescue_of(action: Action) -> object | None:
-    """The rescue target a same-slot release's receiver wake carries (PlanBatch member or
-    ShrinkForSlotAction), or None."""
+    """The rescue target a TP block's receiver wake carries (PlanBatch member or
+    BlockSupplyAction), or None."""
     for member in (action.members if isinstance(action, PlanBatch) else (action,)):
         rescue = getattr(member, "rescue", None)
-        if rescue is not None and (isinstance(member, ShrinkForSlotAction) or upscale_of(member) is not None):
+        if rescue is not None and (isinstance(member, BlockSupplyAction) or upscale_of(member) is not None):
             return rescue
     return None
+
+
+def _block_sleeps(action: BlockSupplyAction, reason: str) -> tuple[ScaleAction, ...]:
+    """The urgent sleeps of exactly the block's immediate donor pods."""
+    return tuple(
+        ScaleAction(
+            donor, -1, reason, action.source_loop, donor=donor, pods=(pod,),
+            sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+        )
+        for donor, pod in action.sleeps
+    )
 
 
 def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Action, ...], tuple[str, ...]]:
@@ -998,26 +1013,26 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
 
     * a receiver-less shrink (HIGH proactive) -> a model-level urgent scale-down (the
       SM keeps the replica floor);
-    * a TP same-slot release -> ONE plan (:class:`PlanBatch`, design 20261028-single-loop
-      L4): the urgent sleep of exactly that donor pod and the receiver's wake, its
-      binding on that slot as the hint (it keeps its rescue target). The SM wakes the
-      receiver once the donor slept; no other receiver can take the slot between."""
+    * a TP block (:class:`BlockSupplyAction`) -> ONE plan (:class:`PlanBatch`, design
+      20261028-single-loop L4 rev 2): the urgent sleeps of exactly the block's donor
+      pods (its probe pod too) and the receiver's wake, its binding on the block as the
+      hint (it keeps its rescue target). The SM wakes the receiver once the donors
+      slept; no other receiver can take the block between."""
     out: list[Action] = []
     for action in actions:
         if not _requires_safescale_probe(action):
             out.append(action)
             continue
         reason = f"{action.reason}{NO_SAFESCALE_REASON_SUFFIX}"
-        if isinstance(action, ShrinkForSlotAction):
-            if action.immediate:
-                reason = action.reason  # immediate by policy (IDLE), not for lack of SafeScale
+        if isinstance(action, BlockSupplyAction):
+            if action.probe is None:
+                reason = action.reason  # the planner named it (IDLE: no suffix)
+            else:
+                action = replace(action, sleeps=(*action.sleeps, action.probe), probe=None)
             out.append(PlanBatch((
+                *_block_sleeps(action, reason),
                 ScaleAction(
-                    action.donor, -1, reason, action.source_loop, donor=action.donor,
-                    pods=(action.serve_id,), sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-                ),
-                ScaleAction(
-                    action.beneficiary, 1, reason, action.source_loop, receiver=action.beneficiary,
+                    action.receiver, 1, reason, action.source_loop, receiver=action.receiver,
                     pods=action.receiver_pods, hint=bool(action.receiver_pods), rescue=action.rescue,
                 ),
             )))
@@ -1078,15 +1093,15 @@ def _weighted_mean(metrics: ModelWindowMetrics, which: str) -> float | None:
 
 
 def _requires_safescale_probe(action: Action) -> bool:
-    return (isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0) or isinstance(
-        action, ShrinkForSlotAction
-    )
+    if isinstance(action, BlockSupplyAction):
+        return True  # a probe, or (no probe) released at once by policy
+    return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0
 
 
 def _receiverless_shrink(action: Action) -> bool:
     """A probe shrink with no receiver: the planner pairs a donor with a recipient only
-    on ``ScaleAction.receiver`` (``planner._plan_middle_zone_probe``) and on a same-slot
-    preemption's ``ShrinkForSlotAction.beneficiary``; the HIGH proactive shrink
+    on ``ScaleAction.receiver`` (``planner._plan_middle_zone_probe``) and on a TP
+    block's ``BlockSupplyAction.receiver``; the HIGH proactive shrink
     (``high_proactive_safescale``) carries neither."""
     return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0 and (
         action.receiver is None
@@ -1094,8 +1109,8 @@ def _receiverless_shrink(action: Action) -> bool:
 
 
 def _safescale_probe_model(action: Action) -> str:
-    if isinstance(action, ShrinkForSlotAction):
-        return action.donor
+    if isinstance(action, BlockSupplyAction):
+        return action.probe[0] if action.probe is not None else action.receiver
     return action.model
 
 
@@ -1104,8 +1119,8 @@ def _safescale_probe_pods(
     action: Action,
     cluster_view: ClusterView | None = None,
 ) -> tuple[str, ...]:
-    if isinstance(action, ShrinkForSlotAction):
-        return (action.serve_id,)
+    if isinstance(action, BlockSupplyAction):
+        return (action.probe[1],) if action.probe is not None else ()
     if isinstance(action, ScaleAction) and action.pods:
         return tuple(action.pods)
     return _pods_to_probe(snapshot, action.model, abs(action.delta), cluster_view=cluster_view)
@@ -1115,8 +1130,8 @@ def _safescale_pending_upscales(
     action: Action,
     probe_upscale_plans: dict[str, dict[str, int]],
 ) -> dict[str, int]:
-    if isinstance(action, ShrinkForSlotAction):
-        return {action.beneficiary: 1}
+    if isinstance(action, BlockSupplyAction):
+        return {action.receiver: 1}
     return probe_upscale_plans.get(action.model, {})
 
 

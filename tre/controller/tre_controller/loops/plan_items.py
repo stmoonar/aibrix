@@ -6,7 +6,7 @@ action becomes exactly ONE item (strict 1:1, no same-model merging):
 * ``ScaleAction +k``            -> wake ``at_least = awake + k`` (``hints`` = its pods when hinted)
 * ``ScaleAction +k`` with pods  -> wake ``pods`` (exactly these bindings)
 * ``ScaleAction -k``            -> sleep ``at_most = max(serving floor, awake - k)``
-* ``ScaleAction -k`` with pods  -> sleep ``pods`` (SafeScale commit donor, ShrinkForSlot)
+* ``ScaleAction -k`` with pods  -> sleep ``pods`` (SafeScale commit donor, a TP block's donor pods)
 * ``TransferIntent D->R``       -> wake of R ``at_least = awake_R + pairs``, ``donors=[{D, count}]``
 * ``ReceiverTarget``            -> wake ``at_least = target`` (resolved once, then frozen;
   ``hints`` = its bindings on the donor pods' GPUs)

@@ -11,9 +11,8 @@
 * P2-7: the probe-window floor moved to SAFE_SCALE_WINDOW_FLOOR_MS; the legacy
   SAFE_SCALE_MIN_WINDOW_MS stays at 60000 in the overlay for older images.
 * P3-11: W is capped at 2 x registry gateway.route_timeout_s.
-* Fix C relaxed: a same-slot shrink is counted in the plan's deltas only - a
-  3-replica donor with floor 1 serves two receivers of one tick, a 2-replica one
-  only one.
+* Fix C relaxed: a TP block is counted in the plan's deltas only; a HIGH donor
+  gives one replica per plan whatever its floor headroom (L4 rev 2, 2026-10-28).
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.loops.safescale_task import _observation_from_metrics, run_safescale_observation_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
-from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, ShrinkForSlotAction, build_plan
+from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
 from tre_controller.planning.safescale import (
     ProbeObservation,
     ProbeWindowInputs,
@@ -41,7 +40,7 @@ from tre_controller.planning.safescale import (
     format_window_event,
 )
 from tre_sm.allocator.slots import Binding, Slot
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import block_takes, expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 from test_action_queue_review3 import ScriptedSM
 from test_loop_ticks import _metrics as _tick_metrics
@@ -285,8 +284,8 @@ def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: 
 
 
 def _taken(plan, model: str) -> list[str]:
-    """Pods the plan takes from ``model`` (same-slot shrinks + negative scales)."""
-    pods = [a.serve_id for a in plan.actions if isinstance(a, ShrinkForSlotAction) and a.donor == model]
+    """Pods the plan takes from ``model`` (TP blocks + negative scales)."""
+    pods = [pod for donor, _, pod in block_takes(plan.actions) if donor == model]
     for action in plan.actions:
         if isinstance(action, ScaleAction) and action.model == model and action.delta < 0:
             pods.extend(action.pods or ("?",) * -action.delta)
@@ -294,8 +293,8 @@ def _taken(plan, model: str) -> list[str]:
 
 
 def _two_receiver_plan(high_replicas: int):
-    """tp2 (TP=2, CRITICAL) can only be served by a same-slot shrink of a HIGH
-    replica on node-a; crit1 (TP=1, CRITICAL) can only be served by the donor loop
+    """tp2 (TP=2, CRITICAL) can only be served by its block node-a 0-1 (a HIGH replica
+    on gpu 0); crit1 (TP=1, CRITICAL) can only be served by the donor loop
     with high-b1 (node-b gpu 1, on which crit1 has its sleeping binding)."""
     high_node_a = [Binding("high-0", "high", Slot("node-a", (0,)), awake=True)]
     if high_replicas >= 3:
@@ -304,6 +303,7 @@ def _two_receiver_plan(high_replicas: int):
         Binding("high-b1", "high", Slot("node-b", (1,)), awake=True),
         Binding("crit1-b0", "crit1", Slot("node-b", (0,)), awake=True),
         Binding("crit1-b1", "crit1", Slot("node-b", (1,)), awake=False),
+        Binding("tp2-a01", "tp2", Slot("node-a", (0, 1)), awake=False),
     )
     view = ClusterView(
         topology=ClusterTopology(
@@ -336,13 +336,12 @@ def _two_receiver_plan(high_replicas: int):
     )
 
 
-def test_three_replica_donor_with_a_same_slot_probe_gives_nothing_else_this_tick() -> None:
+def test_three_replica_donor_with_a_block_probe_gives_nothing_else_this_tick() -> None:
     # F1-B (2026-10-07): before, the 3-replica HIGH donor also fed crit1 through an
     # immediate relay in the same tick. A HIGH donor now gives only through a SafeScale
-    # probe, and it has one already (tp2's same-slot shrink): crit1 waits for it.
+    # probe, and at most one replica per plan (tp2's block): crit1 waits for it.
     plan = _two_receiver_plan(3)
-    shrinks = [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
-    assert shrinks == [("high", "tp2")]
+    assert [(donor, receiver) for donor, receiver, _ in block_takes(plan.actions)] == [("high", "tp2")]
     assert not [r for r in relays(plan.actions) if r.donor_model == "high"]
     assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high"]
     assert len(_taken(plan, "high")) == 1
@@ -350,22 +349,28 @@ def test_three_replica_donor_with_a_same_slot_probe_gives_nothing_else_this_tick
 
 def test_two_replica_donor_with_floor_one_is_taken_once() -> None:
     plan = _two_receiver_plan(2)
-    assert [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)] == [
-        ("high", "tp2")
-    ]
+    assert [(donor, receiver) for donor, receiver, _ in block_takes(plan.actions)] == [("high", "tp2")]
     assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "high"]
     assert len(_taken(plan, "high")) == 1
 
 
-def test_one_same_slot_probe_per_donor_model_per_tick() -> None:
-    # Two TP=2 receivers and a 3-replica HIGH donor: the SafeScale state machine holds
-    # one probe per model, so only the first receiver gets a same-slot shrink.
+def test_one_block_per_high_donor_model_per_plan() -> None:
+    # Two TP=2 receivers, each with a block of one free GPU and one pod of a 3-replica
+    # HIGH donor (floor 1): a non-IDLE donor gives one replica per plan (and holds one
+    # probe per model), so only the first receiver gets its block.
     view = ClusterView(
-        topology=ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)),
+        topology=ClusterTopology(
+            nodes=(
+                NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),
+                NodeSpec(name="node-b", gpus=2, two_gpu_slots=((0, 1),)),
+            )
+        ),
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("high-2", "high", Slot("node-a", (2,)), awake=True),
-            Binding("high-3", "high", Slot("node-a", (3,)), awake=True),
+            Binding("high-b0", "high", Slot("node-b", (0,)), awake=True),
+            Binding("tpa-01", "tpa", Slot("node-a", (0, 1)), awake=False),
+            Binding("tpb-23", "tpb", Slot("node-a", (2, 3)), awake=False),
         ),
     )
     plan = build_plan(
@@ -386,6 +391,5 @@ def test_one_same_slot_probe_per_donor_model_per_tick() -> None:
         ),
         cluster_view=view,
     )
-    assert [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)] == [
-        ("high", "tpa")
-    ]
+    assert [(donor, receiver) for donor, receiver, _ in block_takes(plan.actions)] == [("high", "tpa")]
+    assert "capacity_blocked:tpb" in plan.events

@@ -13,13 +13,13 @@ from tre_controller.loops.plan_items import SleepPathRefused
 from tre_controller.sm_client import sm_actor
 from tre_controller.planning.planner import (
     Action,
+    BlockSupplyAction,
     DefragAction,
     HideAction,
     ReceiverTarget,
     RelayHold,
     SafeScaleCommitAction,
     ScaleAction,
-    ShrinkForSlotAction,
     SourceLoop,
     TransferIntent,
     UnhideAction,
@@ -469,7 +469,7 @@ class ActionQueue:
         earlier queued action) still holds would make the whole batch wait for
         it; it stays its own queued action, as before fusion.
 
-        A same-slot release (a :class:`PlanBatch` of its own: donor sleep + receiver
+        A TP block (a :class:`PlanBatch` of its own: donor sleeps + receiver
         wake, design 20261028-single-loop L4) joins as ONE unit - both members in the
         same plan, never split - so one decision is one plan whenever the members touch
         different models (the SM's plan runs the receiver's wake as wave 2 after the
@@ -608,7 +608,7 @@ class ActionQueue:
 
     def _register_rescue(self, action, started: set[str]) -> None:
         if isinstance(action, PlanBatch):
-            # A same-slot release (L4): its receiver wake is a part of the target.
+            # A TP block (L4 rev 2): its receiver wake is a part of the target.
             for member in action.members:
                 self._register_rescue(member, started)
             return
@@ -1407,7 +1407,7 @@ class ActionQueue:
         action = queued.action
         batch_ups = receiver_upscales(action) if isinstance(action, PlanBatch) else ()
         if len(batch_ups) == 1:
-            # Review P2-2: a same-slot release (donor sleep + receiver wake).
+            # Review P2-2: a TP block (donor sleeps + receiver wake).
             model, delta = batch_ups[0]
         elif isinstance(action, TransferIntent):
             model, delta = action.receiver_model, action.pairs
@@ -1424,7 +1424,7 @@ class ActionQueue:
         if available <= 0:
             return queued, 0
         if isinstance(action, (TransferIntent, PlanBatch)):
-            # A relay / a same-slot release is not split: covered entirely, or kept
+            # A relay / a TP block is not split: covered entirely, or kept
             # whole (credit kept).
             if available >= delta:
                 credit[model] = available - delta
@@ -1754,7 +1754,7 @@ class ActionQueue:
         return self._growth_result(member, item)
 
     def _named_sleep_result(self, action: ScaleAction, item: dict) -> DispatchResult:
-        """A sleep of exactly the named bindings (SafeScale commit donor, ShrinkForSlot).
+        """A sleep of exactly the named bindings (SafeScale commit donor, a TP block's donor pods).
         A failure after some pods slept is reported with them (``changed``), never as
         "nothing happened"; unconfirmed pods (``outcomes``) must stay hidden."""
         if item.get("status") in plan_items.SLEEP_OK_STATUSES:
@@ -2315,12 +2315,12 @@ class _PlanRun:
 
 def receiver_upscales(action) -> tuple[tuple[str, int], ...]:
     """(model, receiver replicas) every receiver part of an action adds: a scale-up or a
-    relay (:func:`upscale_of`), the members of a :class:`PlanBatch`, the beneficiary of a
-    same-slot release (ShrinkForSlotAction: its wake comes with the release)."""
+    relay (:func:`upscale_of`), the members of a :class:`PlanBatch`, the receiver of a TP
+    block (BlockSupplyAction: its wake comes with the donors' release)."""
     if isinstance(action, PlanBatch):
         return tuple(up for member in action.members for up in receiver_upscales(member))
-    if isinstance(action, ShrinkForSlotAction):
-        return ((action.beneficiary, 1),)
+    if isinstance(action, BlockSupplyAction):
+        return ((action.receiver, 1),)
     up = upscale_of(action)
     return (up,) if up is not None else ()
 
@@ -2347,7 +2347,7 @@ def _fusable(queued: QueuedAction) -> bool:
     action = queued.action
     if queued.source_loop in ONE_SHOT_LOOPS:
         return False
-    if isinstance(action, PlanBatch):  # a same-slot release: one unit
+    if isinstance(action, PlanBatch):  # a TP block: one unit
         return True
     return isinstance(action, TransferIntent) or (isinstance(action, ScaleAction) and action.delta != 0)
 

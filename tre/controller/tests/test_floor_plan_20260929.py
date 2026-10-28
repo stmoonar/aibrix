@@ -1,10 +1,11 @@
 """Replica floor, controller side (fix C, 2026-09-29).
 
-The CRITICAL same-slot shrink (ShrinkForSlotAction) takes one replica of a HIGH
-donor. It must count in the plan's deltas and claim the donor for the tick, so a
-second CRITICAL receiver of the same tick - another TP>1 receiver's same-slot
-shrink, or the donor loop of a TP=1 receiver - never takes the same donor again.
-A 2-replica donor with min_replicas 1 used to be taken twice (down to 0).
+A CRITICAL TP receiver's block (L4 rev 2, BlockSupplyAction) takes one replica of a
+HIGH donor. It counts in the plan's deltas and claims the donor for the plan, so a
+second CRITICAL receiver of the same plan - another TP>1 receiver's block, or the
+donor loop of a TP=1 receiver - never takes the same donor again (a non-IDLE donor
+gives at most one replica per plan). A 2-replica donor with min_replicas 1 used to
+be taken twice (down to 0).
 """
 
 from __future__ import annotations
@@ -15,11 +16,10 @@ from tre_controller.planning.planner import (
     ClusterView,
     PlanConfig,
     ScaleAction,
-    ShrinkForSlotAction,
     build_plan,
 )
 from tre_sm.allocator.slots import Binding, Slot
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import block_takes, expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 
 def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None):
@@ -37,8 +37,8 @@ def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: 
 
 
 def _taken(plan, model: str) -> int:
-    """Replicas the plan takes from ``model`` (same-slot shrinks + negative scales)."""
-    shrinks = sum(1 for a in plan.actions if isinstance(a, ShrinkForSlotAction) and a.donor == model)
+    """Replicas the plan takes from ``model`` (TP blocks + negative scales)."""
+    shrinks = sum(1 for donor, _, _ in block_takes(plan.actions) if donor == model)
     scales = sum(-a.delta for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == model and a.delta < 0)
     return shrinks + scales
 
@@ -65,6 +65,8 @@ def test_two_tp2_critical_receivers_take_a_two_replica_donor_once():
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("high-2", "high", Slot("node-a", (2,)), awake=True),
+            Binding("tpa-01", "tpa", Slot("node-a", (0, 1)), awake=False),
+            Binding("tpb-23", "tpb", Slot("node-a", (2, 3)), awake=False),
         ),
     )
     caller_inflight: set[str] = set()
@@ -81,14 +83,14 @@ def test_two_tp2_critical_receivers_take_a_two_replica_donor_once():
         cluster_view=view,
         inflight_models=caller_inflight,
     )
-    shrinks = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
-    assert [(a.donor, a.beneficiary) for a in shrinks] == [("high", "tpa")]
+    assert [(donor, receiver) for donor, receiver, _ in block_takes(plan.actions)] == [("high", "tpa")]
+    assert "capacity_blocked:tpb" in plan.events
     assert _taken(plan, "high") == 1  # 2 replicas, floor 1: one take only
     assert caller_inflight == set()  # the caller's set is not mutated
 
 
-def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor():
-    # tp2 takes a HIGH replica through the same-slot shrink; crit1 (tp 1) cannot wake
+def test_tp_block_then_tp1_critical_donor_loop_skips_the_claimed_donor():
+    # tp2 takes a HIGH replica through its block; crit1 (tp 1) cannot wake
     # its sleeping binding (high-0 is awake on its GPU) nor create (it has a blocked
     # sleeping binding), so it reaches the donor loop - which must skip "high" now.
     classifications = [
@@ -108,6 +110,7 @@ def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor()
             Binding("high-2", "high", Slot("node-a", (2,)), awake=True),
             Binding("crit1-a0", "crit1", Slot("node-a", (0,)), awake=False),
             Binding("crit1-b0", "crit1", Slot("node-b", (0,)), awake=True),
+            Binding("tp2-a23", "tp2", Slot("node-a", (2, 3)), awake=False),
         ),
     )
     cfg = PlanConfig(
@@ -123,9 +126,7 @@ def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor()
         cfg=cfg,
         cluster_view=view,
     )
-    assert [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)] == [
-        ("high", "tp2")
-    ]
+    assert [(donor, receiver) for donor, receiver, _ in block_takes(plan.actions)] == [("high", "tp2")]
     assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "high"]
     assert _taken(plan, "high") == 1
 
@@ -145,9 +146,9 @@ def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor()
     ]
 
 
-def test_same_slot_shrink_counts_takes_planned_by_an_earlier_receiver():
+def test_tp_block_counts_takes_planned_by_an_earlier_receiver():
     # crit1 first takes one replica of "high" (a HIGH donor probe since F1-B); the TP=2
-    # receiver after it must not shrink "high" again (2 replicas, floor 1).
+    # receiver after it must not take "high" again (one replica per plan).
     classifications = [
         _cls("crit1", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _cls("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
@@ -165,6 +166,7 @@ def test_same_slot_shrink_counts_takes_planned_by_an_earlier_receiver():
             Binding("high-2", "high", Slot("node-a", (2,)), awake=True),
             Binding("crit1-a0", "crit1", Slot("node-a", (0,)), awake=False),
             Binding("crit1-b0", "crit1", Slot("node-b", (0,)), awake=True),
+            Binding("tp2-a23", "tp2", Slot("node-a", (2, 3)), awake=False),
         ),
     )
     plan = build_plan(
@@ -180,4 +182,5 @@ def test_same_slot_shrink_counts_takes_planned_by_an_earlier_receiver():
         cluster_view=view,
     )
     assert _taken(plan, "high") == 1
-    assert not [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
+    assert not block_takes(plan.actions)
+    assert "capacity_blocked:tp2" in plan.events

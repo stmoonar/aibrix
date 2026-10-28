@@ -29,7 +29,7 @@ def test_a_pathless_scale_down_sends_nothing():
 
     client = _Client()
     queue = ActionQueue(client)
-    donor = ScaleAction("donor", -1, "critical_same_slot_high_shrink", "rescue", pods=("donor-0",))
+    donor = ScaleAction("donor", -1, "critical_block_high", "rescue", pods=("donor-0",))
     queue.submit((donor,))
     [result] = asyncio.run(queue.drain_once())
     assert client.calls == []

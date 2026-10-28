@@ -9,7 +9,7 @@ from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec, PlacementConfig, Registry
 from tre_controller.loops import tick as tick_module
 from tre_controller.loops.tick import _pods_to_probe, run_planner_tick
-from tre_controller.planning.planner import ClusterView, _release_pick, _SlotOccupancy
+from tre_controller.planning.planner import ClusterView, _SlotOccupancy
 from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
 
 N1, N2 = "n1", "n2"
@@ -89,21 +89,6 @@ def test_safescale_probe_pick_releases_from_the_most_loaded_node():
     assert _pods_to_probe(snapshot, "A", 1, cluster_view=_view(bindings)) == ("a-heavy",)
     # Reference best-fit breaks the tie by the highest address instead.
     assert _pods_to_probe(snapshot, "A", 1, cluster_view=_view(bindings, placement=None)) == ("a-light",)
-
-
-def test_same_slot_shrink_tie_break_uses_the_policy_not_serve_id():
-    bindings = [
-        _b("x-1", "X", N2, (2,), awake=True),
-        _b("z-3", "Z", N2, (3,), awake=True),
-        _b("x-2", "X", N1, (0,), awake=True),
-        _b("w-1", "W", N1, (1,), awake=True),
-        _b("y-1", "Y", N1, (2,), awake=True),
-        _b("y-2", "Y", N1, (3,), awake=True),
-    ]
-    tied = [bindings[0], bindings[2]]
-    # Neither release frees a pair; n1 (2 of 2 pairs in use) is the more loaded node.
-    # The old serve_id tie-break would have picked x-1.
-    assert _release_pick(tied, _view(bindings)).serve_id == "x-2"
 
 
 class _Captured(Exception):

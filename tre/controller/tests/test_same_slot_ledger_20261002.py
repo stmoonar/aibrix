@@ -1,10 +1,11 @@
-"""Same-slot shrink vs fairness piggyback (2026-10-02, approach (a)). The piggyback was
-removed on 2026-10-07 (design donor-evidence-20261007): a donor probed in a plan gives
-no other receiver anything; these tests keep the ledger and that invariant.
+"""TP block probe vs fairness piggyback (2026-10-02, approach (a); the same-slot shrink
+became the block supply of L4 rev 2 on 2026-10-28). The piggyback was removed on
+2026-10-07 (design donor-evidence-20261007): a donor probed in a plan gives no other
+receiver anything; these tests keep the ledger and that invariant.
 
-The same-slot preemption (ShrinkForSlotAction) is committed by the tick with exactly
-``{beneficiary: 1}``. The planner's ledger records that claim, and no LOW receiver is
-ever promised the same shrink.
+A block's probe (BlockSupplyAction.probe) is committed by the tick with exactly
+``{receiver: 1}``. The planner's ledger records that claim, and no LOW receiver is
+ever promised the same probe.
 """
 
 from __future__ import annotations
@@ -16,12 +17,13 @@ from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import (
     ClusterView,
     PlanConfig,
+    BlockSupplyAction,
     ScaleAction,
-    ShrinkForSlotAction,
     build_plan,
 )
+from tre_common.gpu_placement import GpuBlock
 from tre_sm.allocator.slots import Binding, Slot
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import block_takes, expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 
 def _same_slot_plan(high_replicas: int, *, low_replicas: int = 1):
@@ -42,6 +44,7 @@ def _same_slot_plan(high_replicas: int, *, low_replicas: int = 1):
         # A sleeping binding on a GPU a HIGH replica holds awake: LOW cannot wake it, and
         # the SM tries it before creating, so there is no idle capacity for LOW.
         Binding("low-s", "low", Slot("node-a", (2,)), awake=False),
+        Binding("tp2-a01", "tp2", Slot("node-a", (0, 1)), awake=False),
     ]
     if high_replicas > 2:
         bindings.append(Binding("high-n", "high", Slot("node-b", (0,)), awake=True))
@@ -64,26 +67,25 @@ def _same_slot_plan(high_replicas: int, *, low_replicas: int = 1):
     )
 
 
-def test_same_slot_shrink_is_claimed_in_the_ledger_and_not_piggybacked_by_low():
+def test_a_block_probe_is_claimed_in_the_ledger_and_not_piggybacked_by_low():
     plan = _same_slot_plan(2)
-    shrinks = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
-    assert [(a.donor, a.beneficiary) for a in shrinks] == [("high", "tp2")]
+    assert [(donor, receiver) for donor, receiver, _ in block_takes(plan.actions)] == [("high", "tp2")]
     assert plan.probe_upscale_plans == {"high": {"tp2": 1}}
     assert "low" not in plan.probe_upscale_plans.get("high", {})
     assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
 
 
-def test_three_replica_donor_with_a_same_slot_probe_starts_no_second_probe_for_low():
+def test_three_replica_donor_with_a_block_probe_starts_no_second_probe_for_low():
     """F1-B (2026-10-07): a HIGH donor gives LOW nothing at once any more (before: an
-    immediate pair on another pod). It already has this tick's probe (the same-slot
-    shrink, claimed by tp2), and a donor gets one probe at a time."""
+    immediate pair on another pod). It already has this tick's probe (tp2's block),
+    and a donor gets one probe at a time."""
     plan = _same_slot_plan(3)
-    [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
+    [shrink] = [a for a in plan.actions if isinstance(a, BlockSupplyAction)]
     assert plan.probe_upscale_plans.get("high", {}).get("tp2") == 1
     assert "low" not in plan.probe_upscale_plans.get("high", {})
     assert not relays(plan.actions)
     assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
-    assert shrink.donor == "high"
+    assert shrink.probe == ("high", "high-0")
 
 
 def test_middle_zone_claim_leaves_nothing_unclaimed_for_a_later_low_receiver():
@@ -110,8 +112,8 @@ def test_middle_zone_claim_leaves_nothing_unclaimed_for_a_later_low_receiver():
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
 
 
-def test_tick_commits_a_same_slot_probe_with_only_the_beneficiary_upscale():
-    # Hand-built input: the ShrinkForSlotAction and the ledger are given directly.
+def test_tick_commits_a_block_probe_with_only_the_receiver_upscale():
+    # Hand-built input: the BlockSupplyAction and the ledger are given directly.
     from test_loop_ticks import _metrics_with_pods
     from tre_common.metrics_schema import MetricsSnapshot
     from tre_controller.loops.tick import _apply_safescale
@@ -122,9 +124,9 @@ def test_tick_commits_a_same_slot_probe_with_only_the_beneficiary_upscale():
         ts_ms=20_000, stale=False,
         models={"high": _metrics_with_pods("high", generation=200.0, waiting=0.0, running=1.0, pods=("high-0",))},
     )
-    shrink = ShrinkForSlotAction(
-        donor="high", beneficiary="tp2", serve_id="high-0", slot=Slot("node-a", (0,)),
-        reason="critical_same_slot_high_shrink", source_loop="rescue",
+    shrink = BlockSupplyAction(
+        receiver="tp2", block=GpuBlock("node-a", (0, 1)), receiver_pods=("tp2-a01",), sleeps=(),
+        probe=("high", "high-0"), reason="critical_block_high", source_loop="rescue",
     )
     assert _safescale_pending_upscales(shrink, {"high": {"tp2": 1}}) == {"tp2": 1}
     out, events = _apply_safescale(snapshot, (shrink,), {"high": {"tp2": 1}}, safescale=safescale)
