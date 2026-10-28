@@ -5,7 +5,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology, tp_size_error
-from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
+from tre_controller.planning.classify import (
+    ModelClassification,
+    ModelRole,
+    ModelState,
+    donor_mock_cost_key,
+    receiver_sort_key,
+)
 from tre_common.gpu_placement import (
     PlacementPolicy,
     choose_release,
@@ -633,11 +639,14 @@ def build_plan(
     o1_exempt_planned: set[str] = set()
 
     critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]
-    # TSS-confirmed CRITICAL receivers first (their order unchanged); onset saturation
-    # receivers after them, the most backlogged per replica (waiting / n) first; H3
-    # O1-exempt receivers (the weakest evidence) last.
+    # L2 (design 20261028-single-loop): TSS-confirmed CRITICAL receivers first, the most
+    # starved (lowest Z) first; onset saturation receivers after them, the most
+    # backlogged per replica (waiting / n) first; H3 O1-exempt receivers (the weakest
+    # evidence) last, lowest Z first. Never the registry order.
     critical_receivers.sort(key=lambda item: _critical_order(item, model_contexts, o1_exempt))
-    low_receivers = [item for item in classifications if item.state == ModelState.LOW]
+    low_receivers = sorted(
+        (item for item in classifications if item.state == ModelState.LOW), key=receiver_sort_key
+    )
     high_models = [item for item in classifications if item.state == ModelState.HIGH]
     idle_models = [item for item in classifications if item.state == ModelState.IDLE]
     paper_donors = [item for item in classifications if item.role == ModelRole.DONOR]
@@ -2220,10 +2229,12 @@ def _critical_order(
     model_contexts: Mapping[str, Any],
     o1_exempt: Mapping[str, Any] | None = None,
 ) -> tuple[int, float]:
+    """(tier, key): TSS-confirmed (Z ascending), onset saturation (waiting / n
+    descending), O1-exempt (Z ascending)."""
     if o1_exempt and item.model_name in o1_exempt:
-        return (2, 0.0)
+        return (2, receiver_sort_key(item)[1])
     if not getattr(item, "saturation_rescue", False):
-        return (0, 0.0)
+        return (0, receiver_sort_key(item)[1])
     ctx = model_contexts.get(item.model_name) or {}
     try:
         waiting = float(ctx.get("saturation_waiting") or 0.0)

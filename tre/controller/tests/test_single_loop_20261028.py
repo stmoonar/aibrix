@@ -1,5 +1,7 @@
 """Single decision loop (design docs/design/20261028-single-loop.md): the invariants.
 
+2. Order: two CRITICAL receivers compete for one free GPU - the lower Z wins whatever
+   the registry order; a LOW receiver is never planned before a CRITICAL one.
 5. One ledger: the rescue and the rebalance section of one planner call never assign
    one free GPU twice; with TRE_ABLATION_DISABLE_SLOW_LOOP a LOW receiver gets nothing.
 6. A stale snapshot (or no publish at all) gives no decision and an alert. (The same
@@ -80,6 +82,24 @@ def _ups(plan) -> list[tuple[str, int, tuple[str, ...]]]:
         for action in plan.actions
         if isinstance(action, ScaleAction) and upscale_of(action) is not None
     ]
+
+
+# ------------------------------------------------------------------ 2. receiver order
+@pytest.mark.parametrize("z_a, z_b, winner", [(0.5, 0.2, "b"), (0.2, 0.5, "a")])
+def test_the_lower_z_wins_the_free_gpu_whatever_the_registry_order(z_a, z_b, winner):
+    bindings = [
+        _binding("low-0", "low", (0,), False),
+        _binding("a-0", "a", (0,), False),
+        _binding("b-0", "b", (0,), False),
+        *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (1, 2, 3)),
+    ]
+    # Registry order: low, a, b - LOW (lower Z than neither) is listed first.
+    classes = {"low": (*LOW, 0.1), "a": (*CRIT, z_a), "b": (*CRIT, z_b),
+               "x": (ModelState.HEALTHY, ModelRole.NEUTRAL, 1.1)}
+
+    plan = _plan(bindings, classes)
+
+    assert _ups(plan) == [(winner, 1, (f"{winner}-0",))]
 
 
 # ------------------------------------------------------------------ 5. one ledger

@@ -280,7 +280,7 @@ def split_receivers_donors(
 ) -> tuple[list[ModelClassification], list[ModelClassification]]:
     receivers = [item for item in classifications if item.role == ModelRole.RECEIVER]
     donors = [item for item in classifications if item.role == ModelRole.DONOR]
-    receivers.sort(key=_receiver_sort_key)
+    receivers.sort(key=receiver_sort_key)
     donors.sort(
         key=lambda item: donor_mock_cost_key(
             item, disable_eta_gate=disable_eta_gate
@@ -353,7 +353,9 @@ def _natural_text_key(value: str) -> tuple[tuple[int, Any], ...]:
     )
 
 
-def _receiver_sort_key(classification: ModelClassification) -> tuple[int, float]:
+def receiver_sort_key(classification: Any) -> tuple[int, float]:
+    """Receiver order: CRITICAL before LOW, then the most starved first (raw Z
+    ascending; no Z sorts last)."""
     prio = 1 if classification.state == ModelState.CRITICAL else 2
     return (prio, classification.Z_m if classification.Z_m is not None else float("inf"))
 
