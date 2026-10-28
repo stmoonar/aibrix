@@ -100,7 +100,11 @@ DEFAULTS: dict = {
     "report": {"enabled": True, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
                "reps": 1000, "timeout_s": 900, "nice": 10, "extra_args": []},
     "precheck": {"gpu_truth_max_age_s": 30, "breakpoint_lookback_s": 60, "wait_s": 300, "poll_s": 30,
-                 "disk_min_free_gb": {"nfs": 50, "nodes": {}}},
+                 "disk_min_free_gb": {"nfs": 50, "nodes": {}},
+                 # 2026-10-28 eviction-storm guards (hard): node DiskPressure, Failed/Evicted pods, node root fs free
+                 # space = max(floor, frac * capacity) read from the kubelet stats (no ssh); "nodes" overrides per node
+                 "node_pressure": True, "failed_pods_max": 0,
+                 "node_fs_min_free": {"frac": 0.15, "floor_gb": 10, "nodes": {}}},
     "validity": {"fail_frac_suspect": 0.01, "fail_frac_invalid": 0.20, "sent_frac_min": 0.98,
                  "emfile": "invalid", "max_tokens_hit_min": 0.99, "clock_drift_max_s": 1.0},
     "marker": {"extend": True, "margin_s": 1800},
@@ -1141,6 +1145,40 @@ class Cluster:
             return not bad, "; ".join(det)
         add("disk", "hard", disk)
 
+        # 2026-10-28 eviction-storm guards (node10 DiskPressure evicted ~4000 pods; same pattern 10-06 on node9)
+        def disk_pressure():
+            bad = node_pressure_problems(json.loads(self.kubectl("get", "nodes", "-o", "json")))
+            return not bad, f"DiskPressure=True on {bad}" if bad else "no node under DiskPressure"
+        if pc.get("node_pressure", True):
+            add("node_disk_pressure", "hard", disk_pressure)
+
+        def failed_pods():
+            ns = self.e.get("MODEL_NS", "default")
+            n = failed_pod_count(json.loads(self.kubectl("-n", ns, "get", "pods", "-o", "json", timeout=120)))
+            mx = int(pc.get("failed_pods_max", 0))
+            hint = f" (clean up: kubectl -n {ns} delete pods --field-selector=status.phase=Failed)" if n > mx else ""
+            return n <= mx, f"{n} Failed/Evicted pod(s) in {ns}, max {mx}{hint}"
+        if pc.get("failed_pods_max") is not None:
+            add("failed_pods", "hard", failed_pods)
+
+        def node_fs():
+            cfg = pc["node_fs_min_free"]
+            names = [x for x in self.kubectl("get", "nodes", "-o", "jsonpath={.items[*].metadata.name}").split() if x]
+            det, bad, warn = [], [], []
+            for node in names:
+                try:
+                    st = json.loads(self.kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/stats/summary", timeout=60))
+                    ok, d = node_fs_verdict(st, cfg, node)
+                except Exception as exc:  # noqa: BLE001  stats unavailable: warn, do not block
+                    warn.append(f"{node}: stats unavailable ({type(exc).__name__}) - not checked")
+                    continue
+                det.append(d)
+                if not ok:
+                    bad.append(node)
+            return not bad, "; ".join(det + warn)
+        if pc.get("node_fs_min_free"):
+            add("node_fs_free", "hard", node_fs)
+
         # 2026-10-28: a sensitivity arm's registry perturbation still in effect (annotation on the registry
         # ConfigMap) -> full reset (reset_canonical.sh restores it); the canonical registry must be the one the
         # campaign expects (registry_expect: recalibrated registry id, required values)
@@ -1164,6 +1202,30 @@ class Cluster:
         if c.get("registry_expect"):
             add("registry_expect", "hard", registry_expect)
         return out
+
+
+def node_pressure_problems(nodes_json: dict) -> list:
+    """Nodes whose DiskPressure condition is True (from ``kubectl get nodes -o json``)."""
+    bad = []
+    for n in nodes_json.get("items", []):
+        for cond in n.get("status", {}).get("conditions", []):
+            if cond.get("type") == "DiskPressure" and cond.get("status") == "True":
+                bad.append(n["metadata"]["name"])
+    return bad
+
+
+def failed_pod_count(pods_json: dict) -> int:
+    """Pods in phase Failed (Evicted / UnexpectedAdmissionError ... all end up Failed)."""
+    return sum(1 for p in pods_json.get("items", []) if p.get("status", {}).get("phase") == "Failed")
+
+
+def node_fs_verdict(stats: dict, cfg: dict, node: str) -> tuple[bool, str]:
+    """Kubelet stats/summary -> (ok, detail). Needs free >= max(floor_gb, frac * capacity); per-node override in cfg["nodes"]."""
+    fs = stats["node"]["fs"]
+    free, cap = float(fs["availableBytes"]), float(fs["capacityBytes"])
+    want = (cfg.get("nodes") or {}).get(node)
+    want = float(want) * 1e9 if want is not None else max(float(cfg["floor_gb"]) * 1e9, float(cfg["frac"]) * cap)
+    return free >= want, f"{node} root fs {free / 1e9:.0f}/{cap / 1e9:.0f} GB free (need >= {want / 1e9:.0f})"
 
 
 def precheck_until_ready(checks: Callable[[], list], reset: Callable[[bool], int], c: dict,
