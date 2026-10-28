@@ -37,7 +37,7 @@ from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.replay import _active_probe_models
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import run_planner_tick
-from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
+from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
 from tre_controller.planning.safescale_evidence import HideAnchor
@@ -349,27 +349,21 @@ class Sim:
             free[0].awake = True
 
     def apply(self, action) -> None:
-        if isinstance(action, PlanBatch):  # a TP block: its items in order
+        if isinstance(action, PlanBatch):  # a transfer (TP block, relay pair): its items in order
             for member in action.members:
                 self.apply(member)
             return
         t = self.now
-        if isinstance(action, TransferIntent):
-            self.changes[action.donor_model] = (t, -1)
-            self.changes[action.receiver_model] = (t, 1)
-        elif isinstance(action, (ScaleAction, HideAction, UnhideAction)):
+        if isinstance(action, (ScaleAction, HideAction, UnhideAction)):
             up = isinstance(action, UnhideAction) or (isinstance(action, ScaleAction) and action.delta > 0)
             self.changes[action.model] = (t, 1 if up else -1)
-        if isinstance(action, TransferIntent):
-            donors = sorted((p for p in self.pods if p.model == action.donor_model and p.awake and not p.hidden),
-                            key=lambda p: -p.gpu)[: int(action.count)]
-            for pod in donors:
-                pod.awake = False
-                self._wake(action.receiver_model, pod.gpu)
-            self.run.events.append((t, f"relay:{action.donor_model}->{action.receiver_model}:{len(donors)}"))
-        elif isinstance(action, ScaleAction) and action.delta > 0:
-            for _ in range(action.delta):
-                self._wake(action.model)
+        if isinstance(action, ScaleAction) and action.delta > 0:
+            if action.pods:  # a named wake (sm-plans section 10)
+                for name in action.pods:
+                    self._wake(action.model, self._pod(name).gpu)
+            else:
+                for _ in range(action.delta):
+                    self._wake(action.model)
             self.run.events.append((t, f"scale_up:{action.model}:{action.delta}"))
         elif isinstance(action, ScaleAction):
             pods = [self._pod(n) for n in action.pods] or sorted(

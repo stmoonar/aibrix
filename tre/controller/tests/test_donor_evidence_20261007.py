@@ -30,13 +30,12 @@ from tre_controller.planning.planner import (
     PlanConfig,
     SafeScaleCommitAction,
     ScaleAction,
-    TransferIntent,
     build_plan,
     probe_reserved_gpus,
 )
 from tre_controller.planning.safescale import ProbeWindowInputs, SafeScaleDecision
 from tre_sm.allocator.slots import Binding, Slot
-from relay_view import block_takes
+from relay_view import block_takes, relays
 
 from test_controller_transfer_20261002 import D, R, TOPOLOGY, _e1
 from plan_shim import PlanSM
@@ -72,7 +71,7 @@ def _donor_plan(donor_state, receiver_state, *, backoff=None):
 @pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
 def test_a_high_donor_gives_nothing_without_a_probe(receiver_state):
     plan = _donor_plan(ModelState.HIGH, receiver_state)
-    assert not [a for a in plan.actions if isinstance(a, TransferIntent)]
+    assert not relays(plan.actions)
     downs = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == D and a.delta < 0]
     assert downs and all(a.requires_safescale and a.sleep_path is None for a in downs)
     assert plan.probe_upscale_plans.get(D, {}).get(R) == 1
@@ -81,7 +80,7 @@ def test_a_high_donor_gives_nothing_without_a_probe(receiver_state):
 @pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
 def test_an_idle_donor_is_still_released_at_once(receiver_state):
     plan = _donor_plan(ModelState.IDLE, receiver_state)
-    [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
+    [relay] = relays(plan.actions)
     assert (relay.donor_model, relay.receiver_model, relay.sleep_path) == (D, R, "urgent")
 
 

@@ -1,0 +1,907 @@
+{
+ "http": {
+  "apa_down": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "index": "int",
+      "model": "str",
+      "outcomes": [
+       {
+        "aborted": "NoneType",
+        "ack_latency_ms": "int",
+        "ack_mode": "str",
+        "binding_id": "str",
+        "drain_policy": "str",
+        "drained": "bool",
+        "forced_abort": "bool",
+        "forced_abort_requests": "int",
+        "non_continuable_at_sleep": "int",
+        "path": "str",
+        "plan_id": "str",
+        "previous_state": "str",
+        "reason": "NoneType",
+        "serve_id": "str",
+        "sleep_mode": "str",
+        "status": "str",
+        "waited_s": "float"
+       }
+      ],
+      "reason": "str",
+      "retriable": "bool",
+      "sleep_path": "str",
+      "status": "str",
+      "taken": "int"
+     }
+    ],
+    "status": "str",
+    "version": "int",
+    "wakes": []
+   },
+   "sleeps": [
+    {
+     "awake_after": 1,
+     "awake_before": 2,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "d",
+     "reason": "apa",
+     "retriable": false,
+     "sleep_path": "apa",
+     "slept": [
+      "d-1"
+     ],
+     "status": "done",
+     "taken": 1
+    }
+   ],
+   "status": "done",
+   "wakes": []
+  },
+  "apa_up": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [],
+    "status": "str",
+    "version": "int",
+    "wakes": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "donors_slept": [],
+      "index": "int",
+      "model": "str",
+      "reason": "str",
+      "refusals": [],
+      "retriable": "bool",
+      "skipped": {},
+      "status": "str",
+      "unfilled": "int",
+      "woke": [
+       {
+        "binding_id": "str",
+        "donor_binding_ids": [],
+        "gpu_ids": [
+         "int"
+        ],
+        "hinted": "bool",
+        "node": "str",
+        "serve_id": "str",
+        "source": "str",
+        "wave": "int"
+       }
+      ]
+     }
+    ]
+   },
+   "sleeps": [],
+   "status": "done",
+   "wakes": [
+    {
+     "awake_after": 1,
+     "awake_before": 0,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "r",
+     "reason": "apa",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "done",
+     "unfilled": 0,
+     "woke": [
+      [
+       "r-2",
+       1,
+       "free",
+       false,
+       []
+      ]
+     ]
+    }
+   ]
+  },
+  "apa_up_replay": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [],
+    "status": "str",
+    "version": "int",
+    "wakes": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "donors_slept": [],
+      "index": "int",
+      "model": "str",
+      "reason": "str",
+      "refusals": [],
+      "retriable": "bool",
+      "skipped": {},
+      "status": "str",
+      "unfilled": "int",
+      "woke": []
+     }
+    ]
+   },
+   "sleeps": [],
+   "status": "noop",
+   "wakes": [
+    {
+     "awake_after": 1,
+     "awake_before": 1,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "r",
+     "reason": "apa",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "noop",
+     "unfilled": 0,
+     "woke": []
+    }
+   ]
+  },
+  "floor_clamp": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "floor": {
+       "clamped": "bool",
+       "floor": "int",
+       "kept_awake": [
+        "str"
+       ],
+       "model": "str",
+       "removing": [
+        "str"
+       ],
+       "routable": [
+        "str"
+       ],
+       "routable_after": "int"
+      },
+      "index": "int",
+      "model": "str",
+      "outcomes": [],
+      "reason": "str",
+      "retriable": "bool",
+      "sleep_path": "str",
+      "status": "str",
+      "taken": "int"
+     }
+    ],
+    "status": "str",
+    "version": "int",
+    "wakes": []
+   },
+   "sleeps": [
+    {
+     "awake_after": 2,
+     "awake_before": 2,
+     "clamped_by_floor": true,
+     "error": null,
+     "index": 0,
+     "model": "d",
+     "reason": "",
+     "retriable": false,
+     "sleep_path": "urgent",
+     "slept": [],
+     "status": "clamped",
+     "taken": 0
+    }
+   ],
+   "status": "noop",
+   "wakes": []
+  },
+  "noop": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [],
+    "status": "str",
+    "version": "int",
+    "wakes": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "donors_slept": [],
+      "index": "int",
+      "model": "str",
+      "reason": "str",
+      "refusals": [],
+      "retriable": "bool",
+      "skipped": {},
+      "status": "str",
+      "unfilled": "int",
+      "woke": []
+     }
+    ]
+   },
+   "sleeps": [],
+   "status": "noop",
+   "wakes": [
+    {
+     "awake_after": 0,
+     "awake_before": 0,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "r",
+     "reason": "",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "noop",
+     "unfilled": 0,
+     "woke": []
+    }
+   ]
+  },
+  "preserve_multi": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "index": "int",
+      "model": "str",
+      "outcomes": [
+       {
+        "aborted": "NoneType",
+        "ack_latency_ms": "int",
+        "ack_mode": "str",
+        "binding_id": "str",
+        "drain_policy": "str",
+        "drained": "bool",
+        "forced_abort": "bool",
+        "forced_abort_requests": "int",
+        "non_continuable_at_sleep": "int",
+        "path": "str",
+        "plan_id": "str",
+        "previous_state": "str",
+        "reason": "NoneType",
+        "serve_id": "str",
+        "sleep_mode": "str",
+        "status": "str",
+        "waited_s": "float"
+       }
+      ],
+      "reason": "str",
+      "retriable": "bool",
+      "sleep_path": "str",
+      "status": "str",
+      "taken": "int"
+     }
+    ],
+    "status": "str",
+    "version": "int",
+    "wakes": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "donors_slept": [],
+      "index": "int",
+      "model": "str",
+      "reason": "str",
+      "refusals": [],
+      "retriable": "bool",
+      "skipped": {},
+      "status": "str",
+      "unfilled": "int",
+      "woke": [
+       {
+        "binding_id": "str",
+        "donor_binding_ids": [
+         "str"
+        ],
+        "gpu_ids": [
+         "int"
+        ],
+        "hinted": "bool",
+        "node": "str",
+        "serve_id": "str",
+        "source": "str",
+        "wave": "int"
+       }
+      ]
+     }
+    ]
+   },
+   "sleeps": [
+    {
+     "awake_after": 0,
+     "awake_before": 2,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "d",
+     "reason": "",
+     "retriable": false,
+     "sleep_path": "urgent",
+     "slept": [
+      "d-0",
+      "d-1"
+     ],
+     "status": "done",
+     "taken": 2
+    }
+   ],
+   "status": "done",
+   "wakes": [
+    {
+     "awake_after": 1,
+     "awake_before": 0,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "x",
+     "reason": "",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "done",
+     "unfilled": 0,
+     "woke": [
+      [
+       "x-0",
+       2,
+       "plan_sleep",
+       false,
+       [
+        "d/node-a/0"
+       ]
+      ]
+     ]
+    },
+    {
+     "awake_after": 1,
+     "awake_before": 0,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 1,
+     "model": "r",
+     "reason": "",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "done",
+     "unfilled": 0,
+     "woke": [
+      [
+       "r-1",
+       2,
+       "plan_sleep",
+       false,
+       [
+        "d/node-a/1"
+       ]
+      ]
+     ]
+    }
+   ]
+  },
+  "same_model_twice_400": {
+   "code": 400,
+   "detail": "model d appears in more than one plan item (wake)",
+   "shape": {
+    "detail": "str"
+   }
+  },
+  "tokenscale_mixed": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "index": "int",
+      "model": "str",
+      "outcomes": [
+       {
+        "aborted": "NoneType",
+        "ack_latency_ms": "int",
+        "ack_mode": "str",
+        "binding_id": "str",
+        "drain_policy": "str",
+        "drained": "bool",
+        "forced_abort": "bool",
+        "forced_abort_requests": "int",
+        "non_continuable_at_sleep": "int",
+        "path": "str",
+        "plan_id": "str",
+        "previous_state": "str",
+        "reason": "NoneType",
+        "serve_id": "str",
+        "sleep_mode": "str",
+        "status": "str",
+        "waited_s": "float"
+       }
+      ],
+      "reason": "str",
+      "retriable": "bool",
+      "sleep_path": "str",
+      "status": "str",
+      "taken": "int"
+     }
+    ],
+    "status": "str",
+    "version": "int",
+    "wakes": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "donors_slept": [],
+      "index": "int",
+      "model": "str",
+      "reason": "str",
+      "refusals": [],
+      "retriable": "bool",
+      "skipped": {},
+      "status": "str",
+      "unfilled": "int",
+      "woke": [
+       {
+        "binding_id": "str",
+        "donor_binding_ids": [],
+        "gpu_ids": [
+         "int"
+        ],
+        "hinted": "bool",
+        "node": "str",
+        "serve_id": "str",
+        "source": "str",
+        "wave": "int"
+       }
+      ]
+     }
+    ]
+   },
+   "sleeps": [
+    {
+     "awake_after": 1,
+     "awake_before": 2,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "d",
+     "reason": "",
+     "retriable": false,
+     "sleep_path": "urgent",
+     "slept": [
+      "d-1"
+     ],
+     "status": "done",
+     "taken": 1
+    }
+   ],
+   "status": "done",
+   "wakes": [
+    {
+     "awake_after": 2,
+     "awake_before": 0,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "r",
+     "reason": "",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "done",
+     "unfilled": 0,
+     "woke": [
+      [
+       "r-1",
+       2,
+       "plan_sleep",
+       false,
+       [
+        "d/node-a/1"
+       ]
+      ],
+      [
+       "r-2",
+       1,
+       "free",
+       false,
+       []
+      ]
+     ]
+    }
+   ]
+  },
+  "two_wakes_one_model_400": {
+   "code": 400,
+   "detail": "model r appears in more than one plan item (wake)",
+   "shape": {
+    "detail": "str"
+   }
+  },
+  "unknown_field_ignored": {
+   "code": 200,
+   "shape": {
+    "phases_ms": {
+     "lock_wait": "int",
+     "refresh": "int",
+     "select": "int",
+     "settle": "int",
+     "total": "int",
+     "wave1": "int",
+     "wave2": "int"
+    },
+    "plan_id": "str",
+    "sleeps": [],
+    "status": "str",
+    "version": "int",
+    "wakes": [
+     {
+      "awake_after": "int",
+      "awake_before": "int",
+      "clamped_by_floor": "bool",
+      "donors_slept": [],
+      "index": "int",
+      "model": "str",
+      "reason": "str",
+      "refusals": [],
+      "retriable": "bool",
+      "skipped": {},
+      "status": "str",
+      "unfilled": "int",
+      "woke": [
+       {
+        "binding_id": "str",
+        "donor_binding_ids": [],
+        "gpu_ids": [
+         "int"
+        ],
+        "hinted": "bool",
+        "node": "str",
+        "serve_id": "str",
+        "source": "str",
+        "wave": "int"
+       }
+      ]
+     }
+    ]
+   },
+   "sleeps": [],
+   "status": "done",
+   "wakes": [
+    {
+     "awake_after": 1,
+     "awake_before": 0,
+     "clamped_by_floor": false,
+     "error": null,
+     "index": 0,
+     "model": "r",
+     "reason": "",
+     "refusals": [],
+     "retriable": false,
+     "skipped": {},
+     "status": "done",
+     "unfilled": 0,
+     "woke": [
+      [
+       "r-2",
+       1,
+       "free",
+       false,
+       []
+      ]
+     ]
+    }
+   ]
+  },
+  "unknown_model_400": {
+   "code": 400,
+   "detail": "'unknown model: nope'",
+   "shape": {
+    "detail": "str"
+   }
+  }
+ },
+ "select": {
+  "apa_down": {
+   "sleeps": [
+    {
+     "already_asleep": [],
+     "clamped": false,
+     "index": 0,
+     "kept_awake": [],
+     "members": [
+      "d-1"
+     ],
+     "model": "d",
+     "refusal": null
+    }
+   ],
+   "wakes": []
+  },
+  "apa_up": {
+   "sleeps": [],
+   "wakes": [
+    {
+     "already_awake": [],
+     "index": 0,
+     "model": "r",
+     "picks": [
+      [
+       "r-2",
+       1,
+       [],
+       "free",
+       false,
+       []
+      ]
+     ],
+     "refusals": [],
+     "skipped": {},
+     "unfilled": 0
+    }
+   ]
+  },
+  "floor_clamp": {
+   "sleeps": [
+    {
+     "already_asleep": [],
+     "clamped": true,
+     "index": 0,
+     "kept_awake": [
+      "d-1",
+      "d-0"
+     ],
+     "members": [],
+     "model": "d",
+     "refusal": null
+    }
+   ],
+   "wakes": []
+  },
+  "noop_targets": {
+   "sleeps": [
+    {
+     "already_asleep": [],
+     "clamped": false,
+     "index": 0,
+     "kept_awake": [],
+     "members": [],
+     "model": "d",
+     "refusal": null
+    }
+   ],
+   "wakes": [
+    {
+     "already_awake": [],
+     "index": 0,
+     "model": "r",
+     "picks": [],
+     "refusals": [],
+     "skipped": {},
+     "unfilled": 0
+    }
+   ]
+  },
+  "preserve_multi": {
+   "sleeps": [
+    {
+     "already_asleep": [],
+     "clamped": false,
+     "index": 0,
+     "kept_awake": [],
+     "members": [
+      "d-1",
+      "d-0"
+     ],
+     "model": "d",
+     "refusal": null
+    }
+   ],
+   "wakes": [
+    {
+     "already_awake": [],
+     "index": 0,
+     "model": "x",
+     "picks": [],
+     "refusals": [
+      "slot_occupied by t-23"
+     ],
+     "skipped": {},
+     "unfilled": 1
+    },
+    {
+     "already_awake": [],
+     "index": 1,
+     "model": "t",
+     "picks": [
+      [
+       "t-23",
+       1,
+       [],
+       "free",
+       false,
+       []
+      ]
+     ],
+     "refusals": [],
+     "skipped": {},
+     "unfilled": 0
+    },
+    {
+     "already_awake": [],
+     "index": 2,
+     "model": "r",
+     "picks": [
+      [
+       "r-0",
+       2,
+       [
+        "d/node-a/0"
+       ],
+       "plan_sleep",
+       false,
+       []
+      ]
+     ],
+     "refusals": [],
+     "skipped": {},
+     "unfilled": 0
+    }
+   ]
+  },
+  "tokenscale_mixed": {
+   "sleeps": [
+    {
+     "already_asleep": [],
+     "clamped": false,
+     "index": 0,
+     "kept_awake": [],
+     "members": [
+      "d-1"
+     ],
+     "model": "d",
+     "refusal": null
+    }
+   ],
+   "wakes": [
+    {
+     "already_awake": [],
+     "index": 0,
+     "model": "r",
+     "picks": [
+      [
+       "r-1",
+       2,
+       [
+        "d/node-a/1"
+       ],
+       "plan_sleep",
+       false,
+       []
+      ],
+      [
+       "r-2",
+       1,
+       [],
+       "free",
+       false,
+       []
+      ]
+     ],
+     "refusals": [],
+     "skipped": {},
+     "unfilled": 0
+    }
+   ]
+  }
+ }
+}

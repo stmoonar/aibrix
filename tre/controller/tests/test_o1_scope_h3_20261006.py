@@ -17,7 +17,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RescueBasis,
     ScaleAction,
-    TransferIntent,
     build_plan,
 )
 from tre_controller.signals.trs import SignalState

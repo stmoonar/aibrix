@@ -21,7 +21,7 @@ from tre_controller.planning.planner import (
     _add_scale_action,
     build_plan,
 )
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import expand_relays, relays, pool_view# noqa: F401 - 2026-10-02 relay intents
 
 from test_planner import _classification
 
@@ -46,13 +46,14 @@ def _plan():
         model_replicas={"critical": 2, "low": 1, "idle": 4},
         idle_gpus=0,
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+        cluster_view=pool_view({"critical": 2, "low": 1, "idle": 4}, receivers=("critical", "low")),
     )
 
 
 def test_immediate_donors_carry_the_urgent_sleep_path_and_receivers_none():
     assert IMMEDIATE_DONOR_SLEEP_PATH == "urgent"
     plan = _plan()
-    # 2026-10-02: a relay is one TransferIntent carrying the donor's sleep path.
+    # A relay (a named transfer since 2026-10-28) carries the donor's sleep path.
     assert {(r.reason, r.sleep_path) for r in relays(plan.actions)} == {
         ("critical_donor_immediate", "urgent"), ("low_fairness_donor_immediate", "urgent"),
     }

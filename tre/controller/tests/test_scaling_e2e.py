@@ -17,7 +17,7 @@ from section_ticks import run_fairness_tick
 from section_ticks import run_rescue_tick
 from tre_controller.loops.tick import _idle_gpus
 from tre_controller.planning.classify import ModelState
-from tre_controller.planning.planner import ScaleAction, TransferIntent
+from tre_controller.planning.planner import ScaleAction
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.state.store import StateStore
@@ -85,8 +85,16 @@ def _scale(result) -> list[tuple[str, int, str, tuple[str, ...]]]:
 
 
 def _relays(result) -> list[tuple[str, str, int, str]]:
-    """2026-10-02: immediate relays are TransferIntents (counts); the SM places them."""
-    return [(a.donor_model, a.receiver_model, a.count, a.reason) for a in result.actions if isinstance(a, TransferIntent)]
+    """2026-10-28 (sm-plans section 10): an immediate relay is one plan group of named
+    items - the donor pods' sleeps and the receiver binding's wake."""
+    out = []
+    for action in result.actions:
+        members = getattr(action, "members", ())
+        wakes = [m for m in members if m.group is not None and m.delta > 0]
+        for wake in wakes:
+            sleeps = [m for m in members if m.group == wake.group and m.delta < 0]
+            out.append((sleeps[0].model, wake.model, len(sleeps), wake.reason))
+    return out
 
 
 def _relay_moved(before: list[Binding], awake: set[str], donor: str, receiver: str) -> list[tuple[str, str]]:
@@ -116,11 +124,11 @@ def test_e1_receiver_gets_the_slot_the_idle_donor_frees() -> None:
     assert idle == 0
     assert result.classifications["dsllama-8b"].state == ModelState.CRITICAL
     assert result.classifications["dsqwen-7b"].state == ModelState.IDLE
-    # 2026-10-02: one relay intent (a count); which 7b / 8b pair moves is the SM's
-    # choice (its placement policy), here the fake SM's pair rule.
+    # 2026-10-28: one named transfer - the controller picks the 7b / 8b pair (the
+    # shared release choice), the SM sleeps the 7b pod and wakes the 8b binding.
     assert _scale(result) == []
     assert _relays(result) == [("dsqwen-7b", "dsllama-8b", 1, "critical_donor_immediate")]
-    assert calls[0] == ("transfer", "dsqwen-7b", "dsllama-8b", 1)
+    assert [call[0] for call in calls] == ["set_binding_power", "set_binding_power"]
     assert "8b-0" in awake and len(_relay_moved(bindings, awake, "dsqwen-7b", "dsllama-8b")) == 1
 
 

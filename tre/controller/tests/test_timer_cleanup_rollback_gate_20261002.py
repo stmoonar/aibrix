@@ -167,8 +167,7 @@ def test_a_rollback_hold_blocks_probes_not_an_immediate_relay_to_a_receiver():
     # (hold active). Under scope receiverless_shrink a donor for a CRITICAL receiver is an
     # immediate relay - a different decision - so the hold does not veto it; a retry of
     # the receiver-less probe stays held. Under scope all the relay is a probe: held.
-    from tre_controller.planning.planner import TransferIntent
-
+    from relay_view import fleet_view, transfer_members
     from test_b8_observe_probes import _probe_snapshot
 
     registry = _registry_with_models("critical", "donor")
@@ -179,13 +178,14 @@ def test_a_rollback_hold_blocks_probes_not_an_immediate_relay_to_a_receiver():
 
     queue = FakeQueue()
     relay = run_rescue_tick(snapshot, queue=queue, registry=registry, safescale=machine,
-                            safescale_scope="receiverless_shrink")
+                            safescale_scope="receiverless_shrink",
+                            cluster_view=fleet_view(registry, "donor", ("donor-a", "donor-b"), "critical"))
     assert relay.classifications["critical"].state.value == "critical"
-    [(relay_intent,)] = queue.submitted
-    assert isinstance(relay_intent, TransferIntent)
-    assert (relay_intent.donor_model, relay_intent.receiver_model, relay_intent.reason) == (
-        "donor", "critical", "critical_high_donor_safescale_nosafescale"
-    )
+    [(transfer,)] = queue.submitted
+    assert [(kind, model, reason) for kind, model, _, _, reason in transfer_members(transfer)] == [
+        ("sleep", "donor", "critical_high_donor_safescale_nosafescale"),
+        ("wake", "critical", "critical_high_donor_safescale_nosafescale"),
+    ]
     assert "safescale_rollback_hold_relay_ok:donor" in relay.events
 
     alone = replace(snapshot, models={"donor": donor})

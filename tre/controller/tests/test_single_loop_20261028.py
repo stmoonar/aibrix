@@ -44,7 +44,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RescueBasis,
     ScaleAction,
-    TransferIntent,
     build_plan,
 )
 from section_ticks import run_rescue_tick
@@ -189,7 +188,7 @@ def test_a_tp_block_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope, 
     items = [plan_item(member) for member in plan.members]
     assert [(kind, item["model"], item.get("pods"), item.get("hints")) for kind, item in items] == [
         ("sleep", "d", ["d-0"], None),
-        ("wake", "tp2", None, ["tp2-0"]),
+        ("wake", "tp2", ["tp2-0"], None),
     ]
 
 
@@ -210,19 +209,7 @@ def test_a_decision_with_a_tp_block_is_one_sm_plan():
 
     [plan] = sm.plans
     assert [(i["model"], i.get("pods")) for i in plan["sleeps"]] == [("d", ["d-0"])]
-    assert [(i["model"], i.get("hints")) for i in plan["wakes"]] == [("tp2", ["tp2-0"]), ("r", None)]
-
-
-def test_a_tp_block_is_never_split_across_plans():
-    sm = PlanSM({"d": 3, "tp2": 1, "r": 1})
-    queue = ActionQueue(sm, now_ms=lambda: 5_000)
-    # The relay uses d first: the block starts the next plan, whole.
-    queue.submit((TransferIntent("d", "r", 1, "critical_donor_immediate", "rescue"), _release()))
-    asyncio.run(queue.drain_once())
-
-    first, second = sm.plans
-    assert [i["model"] for i in first["wakes"]] == ["r"] and first["sleeps"] == []
-    assert [i["model"] for i in second["sleeps"]] == ["d"] and [i["model"] for i in second["wakes"]] == ["tp2"]
+    assert [(i["model"], i.get("pods")) for i in plan["wakes"]] == [("tp2", ["tp2-0"]), ("r", None)]
 
 
 def test_with_safescale_the_block_is_a_probe_and_its_commit_is_that_one_plan():
@@ -238,7 +225,7 @@ def test_with_safescale_the_block_is_a_probe_and_its_commit_is_that_one_plan():
         cluster_view=VIEW,
     )
     assert commit.donor_sleep().pods == ("d-0",)
-    assert [plan_item(target)[1].get("hints") for target in commit.upscales] == [["tp2-0"]]
+    assert [plan_item(target)[1].get("pods") for target in commit.upscales] == [["tp2-0"]]
 
 
 # ------------------------------------------------------------------ 4. TP2 supply
@@ -253,7 +240,7 @@ def _sleeps(plans):
 def test_a_free_block_is_woken_into_and_no_donor_is_touched():
     plans, _, _ = _tp2(_binding("i-0", "i", (0,), True))  # 0-1 half held, 2-3 free
 
-    assert _wakes(plans, "tp2") == [("wake", "tp2", None, ["tp2-2"], None)]
+    assert _wakes(plans, "tp2") == [("wake", "tp2", ["tp2-2"], None, None)]
     assert _sleeps(plans) == []
 
 
@@ -268,7 +255,7 @@ def test_the_worst_donor_tier_decides_before_the_number_of_pods():
     assert plans == [[
         ("sleep", "s7", ["s7-2"], None, None),
         ("sleep", "s8", ["s8-3"], None, None),
-        ("wake", "tp2", None, ["tp2-2"], None),
+        ("wake", "tp2", ["tp2-2"], None, None),
     ]]
     assert "block_supply:tp2:n:2,3:high:s7-2,s8-3" in events
 
@@ -277,11 +264,11 @@ def test_two_pods_of_one_idle_donor_or_of_two_idle_donors_give_the_block():
     one, _, _ = _tp2(*(_binding(f"i-{gpu}", "i", (gpu,), True) for gpu in (0, 1)),
                      *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)))
     assert one == [[("sleep", "i", ["i-0"], None, None), ("sleep", "i", ["i-1"], None, None),
-                    ("wake", "tp2", None, ["tp2-0"], None)]]
+                    ("wake", "tp2", ["tp2-0"], None, None)]]
     mixed, _, _ = _tp2(_binding("a-0", "a", (0,), True), _binding("b-1", "b", (1,), True),
                        *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)))
     assert mixed == [[("sleep", "a", ["a-0"], None, None), ("sleep", "b", ["b-1"], None, None),
-                      ("wake", "tp2", None, ["tp2-0"], None)]]
+                      ("wake", "tp2", ["tp2-0"], None, None)]]
 
 
 @pytest.mark.parametrize("state", [LOW, CRIT])
@@ -318,7 +305,7 @@ def test_a_high_donor_that_gave_a_block_relays_nothing_to_a_tp1_receiver_in_the_
                    _binding("c-2", "c", (2,), False)),
     )
 
-    assert plans == [[("sleep", "h", ["h-0"], None, None), ("wake", "tp2", None, ["tp2-0"], None)]]
+    assert plans == [[("sleep", "h", ["h-0"], None, None), ("wake", "tp2", ["tp2-0"], None, None)]]
 
 
 def test_a_block_of_two_pods_of_one_high_donor_is_not_used():

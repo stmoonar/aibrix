@@ -14,7 +14,7 @@ from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_
 from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import _commands_to_actions, _idle_gpus, _pods_to_probe
-from tre_controller.planning.planner import ClusterView, TransferIntent
+from tre_controller.planning.planner import ClusterView
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_sm.allocator.slots import Binding, Slot, natural_key
 from tre_sm.api.v2 import ServiceManagerV2
@@ -324,7 +324,7 @@ def test_the_decision_loop_excludes_actively_probed_model_from_immediate_donors(
     control = _run_rescue_once(probed=False)
     # F1-B (2026-10-07): the HIGH donor is taken through a SafeScale probe (its hide).
     assert any(getattr(action, "model", None) == "donor" for action in control)
-    assert not any(isinstance(action, TransferIntent) for action in control)
+    assert not any(getattr(action, "group", None) for member in control for action in getattr(member, "members", (member,)))
 
     probed = _run_rescue_once(probed=True)
     assert not any(

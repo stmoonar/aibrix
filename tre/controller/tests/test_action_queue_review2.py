@@ -1,8 +1,9 @@
 """Review 2: donor->receiver relays, one-shot retries, resource serialization.
 
-2026-10-02: a relay is one TransferIntent (since 2026-10-27 one plan wake item with
-``donors``, before ``POST /v2/transfers``); the former
-TransferAction / fuse_transfers pair and the GPU resource keys were removed."""
+2026-10-28 (sm-plans section 10): a relay is one named transfer - one plan group of the
+donor pod's sleep and the receiver binding's wake (before: a count relay, a plan wake
+item with ``donors``); the former TransferAction / fuse_transfers pair and the GPU
+resource keys were removed."""
 
 from __future__ import annotations
 
@@ -12,9 +13,10 @@ from tre_controller.loops.action_queue import (
     RetryPolicy,
     revalidate_from_cluster_view,
 )
+from tre_common.gpu_placement import GpuBlock
 from tre_controller.planning.planner import (
+    BlockSupplyAction,
     ScaleAction,
-    TransferIntent,
     UnhideAction,
 )
 from tre_sm.allocator.slots import Binding, Slot
@@ -56,27 +58,11 @@ class GatedPowerClient:
     async def defrag(self, migrations):
         return {"ok": True}
 
-    async def transfer(self, donor_model, receiver_model, count, *, sleep_path):
-        self.events.append(("transfer_start", f"{donor_model}->{receiver_model}", count))
-        gate = self.gates.get(f"{donor_model}->{receiver_model}")
-        if gate is not None:
-            await gate.wait()
-        else:
-            await asyncio.sleep(0)
-        self.events.append(("transfer_end", f"{donor_model}->{receiver_model}", count))
-        scripted = self.results.get(f"transfer:{donor_model}->{receiver_model}")
-        if scripted:
-            return scripted.pop(0)
-        return {"ok": True, "response": {
-            "transfer_id": "tr-1", "pairs": [{"donor": "7b-1", "donors": ["7b-1"], "receiver": "8b-1",
-                                             "node": "n", "gpu_ids": [0], "status": "done"}],
-            "done": count, "taken": count, "unfilled": 0, "clamped_by_floor": False,
-            "refusals": [], "skipped": {}, "picked": [{"serve_id": "8b-1"}],
-        }}
-
 
 def _pair(donor="7b", receiver="8b"):
-    return (TransferIntent(donor, receiver, 1, "critical_donor_immediate", "rescue"),)
+    return (BlockSupplyAction(receiver=receiver, block=GpuBlock("n", (1,)), receiver_pods=(f"{receiver}-1",),
+                              sleeps=((donor, f"{donor}-1"),), reason="critical_donor_immediate",
+                              source_loop="rescue"),)
 
 
 async def _until(predicate, steps=400):
@@ -87,18 +73,18 @@ async def _until(predicate, steps=400):
     return predicate()
 
 
-def test_relay_intent_is_one_queued_action_holding_both_models() -> None:
+def test_relay_is_one_queued_action_holding_both_models_and_its_pods() -> None:
     queue = ActionQueue(GatedPowerClient())
     result = queue.submit(_pair())
     assert result.accepted == 1
     [queued] = queue.pending_actions()
     assert queued.models == ("7b", "8b")
-    assert queued.resources == frozenset({"model:7b", "model:8b"})  # no pod, no GPU key
+    assert {"model:7b", "model:8b"} <= queued.resources
 
 
 def test_relay_holds_both_models_until_the_sm_answers() -> None:
     async def scenario():
-        client = GatedPowerClient(gated={"7b->8b"})
+        client = GatedPowerClient(gated={"7b-1"})
         queue = ActionQueue(client)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
         queue.submit(_pair())
@@ -110,34 +96,30 @@ def test_relay_holds_both_models_until_the_sm_answers() -> None:
         queue.submit((ScaleAction("8b", 1, "critical", "rescue", pods=("8b-2",)),))
         await asyncio.sleep(0.01)
         assert ("start", "8b-2", True) not in client.events
-        client.gates["7b->8b"].set()
+        client.gates["7b-1"].set()
         assert await _until(lambda: ("end", "8b-2", True) in client.events)
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
-        order = [e[:2] for e in client.events if e[0] in ("transfer_end", "start")]
-        assert order == [("transfer_end", "7b->8b"), ("start", "8b-2")]
+        order = [e[:2] for e in client.events if e[0] == "end" and e[1] in ("8b-1", "8b-2")]
+        assert order == [("end", "8b-1"), ("end", "8b-2")]
         assert queue.inflight_models() == set()
         assert {m: d for m, (_, d) in queue.last_actions().items()} == {"7b": "down", "8b": "up", "14b": "up"}
 
     asyncio.run(scenario())
 
 
-def test_relay_with_no_pair_done_is_reported_and_not_retried() -> None:
+def test_relay_whose_donor_sleep_failed_is_reported_and_not_retried() -> None:
     async def scenario():
-        partial = {"transfer_id": "tr-2", "pairs": [{"donor": "7b-1", "donors": ["7b-1"], "receiver": "8b-1",
-                   "node": "n", "gpu_ids": [0], "status": "donor_sleep_failed"}],
-                   "done": 0, "taken": 0, "unfilled": 0, "clamped_by_floor": False, "refusals": [], "skipped": {}}
-        client = GatedPowerClient(results={"transfer:7b->8b": [
-            {"ok": False, "error": "HTTP 409: partial", "status": 409, "retriable": False,
-             "partial": True, "response": partial},
+        client = GatedPowerClient(results={"7b-1": [
+            {"ok": False, "error": "HTTP 409: sleep failed", "status": 409, "retriable": False},
         ]})
         queue = ActionQueue(client)
         queue.submit(_pair())
         results = await queue.drain_once()
         by_model = {r.model: r for r in results}
-        assert by_model["7b"].ok is False and by_model["7b"].taken == 0
-        assert by_model["8b"].ok is False and by_model["8b"].done == 0
-        assert [e for e in client.events if e[0] == "transfer_start"] == [("transfer_start", "7b->8b", 1)]
+        assert by_model["7b"].ok is False
+        assert by_model["8b"].ok is False
+        assert ("start", "8b-1", True) not in client.events  # the receiver never woke
         assert queue.last_actions() == {}
         assert queue.inflight_models() == set()
 

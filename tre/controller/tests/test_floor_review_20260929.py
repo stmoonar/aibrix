@@ -5,9 +5,10 @@
   ``tail_observation_count``), from the metrics-window timestamps each observation
   now carries.
 * P2-6 (superseded 2026-10-02, design 20261002-controller-transfer): the timed hold
-  of a donor after a 409 floor_violation was removed. The SM clamps a model-level
-  shrink at the floor (200, ``taken`` / ``clamped_by_floor``), the queue records an
-  event only, and the planner bounds every donor by the SM ``floor_headroom``.
+  of a donor after a 409 floor_violation was removed: the queue records an event
+  only, and the planner bounds every donor by the SM ``floor_headroom``. (Since
+  2026-10-28 the controller names the pods it sleeps; the SM's floor clamp of a
+  count shrink is the baselines' path, sm-plans section 10.)
 * P2-7: the probe-window floor moved to SAFE_SCALE_WINDOW_FLOOR_MS; the legacy
   SAFE_SCALE_MIN_WINDOW_MS stays at 60000 in the overlay for older images.
 * P3-11: W is capped at 2 x registry gateway.route_timeout_s.
@@ -145,39 +146,25 @@ def _idle_warm_snapshot() -> MetricsSnapshot:
     )
 
 
-FLOOR_CLAMP = {"ok": True, "response": {"model": "warm", "wake_replicas": 1, "actions": [], "taken": 0,
-                                         "clamped_by_floor": True,
-                                         "floor": {"clamped": True, "min_replicas": 1, "kept_awake": 1}}}
-
-
-def test_a_floor_clamp_is_an_event_and_the_next_tick_replans_without_a_hold() -> None:
-    registry = _registry_with_model_bounds({"warm": (1, 4)})
-    sm = ScriptedSM(results={"scale:warm": [FLOOR_CLAMP]})
-    queue = ActionQueue(sm)
-
-    first = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
-    assert [(a.model, a.delta) for a in first.actions] == [("warm", -1)]
-    [clamped] = asyncio.run(queue.drain_once())
-    assert (clamped.ok, clamped.taken) == (True, 0)
-    # taken 0 changed nothing: no scale-down recorded, no view-pending stamp.
-    assert queue.last_actions() == {} and queue.view_changes() == {} and queue.routable_changes() == {}
-    assert queue.stats()["scale_clamped_by_floor_total"] == 1
-
-    # The next tick plans from its (new) view again - no timed hold; the clamp is an event.
-    second = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
-    assert [(a.model, a.delta) for a in second.actions] == [("warm", -1)]
-    assert "scale_clamped_by_floor:warm:taken=0:asked=1" in second.events
-    assert not any(event.startswith("floor_violation_hold") for event in second.events)
+def _warm_view(registry) -> ClusterView:
+    """2026-10-28 (sm-plans section 10): the tick names the pods it sleeps from the view."""
+    node = registry.topology().nodes[0].name
+    return ClusterView(registry.topology(), tuple(
+        Binding(f"warm-{gpu}", "warm", Slot(node, (gpu,)), awake=True) for gpu in (0, 1)
+    ))
 
 
 def test_a_409_floor_violation_is_counted_and_logged_but_holds_nothing() -> None:
     registry = _registry_with_model_bounds({"warm": (1, 4)})
-    queue = ActionQueue(ScriptedSM(results={"scale:warm": [FLOOR_REFUSAL]}))
-    run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
+    view = _warm_view(registry)
+    queue = ActionQueue(ScriptedSM(results={pod: [FLOOR_REFUSAL] for pod in ("warm-0", "warm-1")}))
+    planned = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry, cluster_view=view)
+    [shrink] = planned.actions
+    assert (shrink.model, shrink.delta, len(shrink.pods)) == ("warm", -1, 1)  # a named sleep
     [refused] = asyncio.run(queue.drain_once())
     assert (refused.ok, refused.floor_violation) == (False, True)
     assert queue.stats()["floor_violation_total"] == 1
-    again = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
+    again = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry, cluster_view=view)
     assert [(a.model, a.delta) for a in again.actions] == [("warm", -1)]
     assert "floor_violation:warm" in again.events
 

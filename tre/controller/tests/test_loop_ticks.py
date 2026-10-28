@@ -9,7 +9,8 @@ from section_ticks import run_fairness_tick
 from section_ticks import run_rescue_tick
 from tre_controller.loops.tick import PaperStateCache
 from tre_controller.config import SafeScaleConfig
-from tre_controller.planning.planner import HideAction, ScaleAction
+from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction
+from tre_sm.allocator.slots import Binding, Slot
 from tre_controller.planning.safescale import SafeScaleStateMachine
 
 
@@ -346,17 +347,25 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
     # (good latency) and the proactive scale-down is the observable proving the signal was
     # applied. The t1 suppress-hot-proactive guard is disabled here so that observable remains;
     # the guard's own behaviour is covered in test_planner.py.
-    # 2026-10-08: with no SafeScale the probe-requiring shrink is released immediately.
+    # 2026-10-08: with no SafeScale the probe-requiring shrink is released immediately;
+    # 2026-10-28: the tick names its pod from the fleet view (sm-plans section 10).
+    registry = _registry()
+    node = registry.topology().nodes[0].name
+    view = ClusterView(registry.topology(), tuple(
+        Binding(f"critical-{gpu}", "critical", Slot(node, (gpu,)), awake=True) for gpu in (0, 1)
+    ))
     result = run_rescue_tick(
         snapshot,
         queue=queue,
-        registry=_registry(),
+        registry=registry,
         signal_source="latency_p95",
         suppress_hot_proactive_probe=False,
+        cluster_view=view,
     )
 
     [action] = result.actions
     assert (action.model, action.reason) == ("critical", "high_proactive_safescale_nosafescale")
+    assert len(action.pods) == 1
 
 
 def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:

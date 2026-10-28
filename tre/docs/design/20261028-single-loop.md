@@ -189,6 +189,10 @@ and the relays (`pairable` pairs) of L4. TP1 receivers are unchanged for now.
   splits a decision: two items of one model (the SM allows one item per model; the
   next plan then serializes on that model) and SafeScale one-shot actions (a commit
   keeps its own plan and retries).
+- Plan groups (2026-10-28, `20261027-sm-plans.md` section 10, review A-1 / A-2): every
+  transfer - a TP block or a TP1 relay pair - is named and is one plan group; several
+  named items of one model share a plan, so a block and a relay taking two pods of one
+  IDLE donor are one SM plan (only a pod named twice splits it).
 
 ## Ablation
 

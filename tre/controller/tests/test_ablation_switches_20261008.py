@@ -18,6 +18,7 @@ import tre_controller.app as app
 from tre_common.metrics_schema import MetricsSnapshot
 import pytest
 
+from relay_view import relays, fleet_view, transfer_members
 from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from section_ticks import run_rescue_tick
@@ -28,7 +29,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RelayHold,
     ScaleAction,
-    TransferIntent,
     UnhideAction,
     build_plan,
     relay_basis,
@@ -60,13 +60,17 @@ def test_high_donor_for_a_critical_receiver_is_an_urgent_transfer():
     snapshot = replace(snapshot, models={**snapshot.models, "donor": high})
     queue = FakeQueue()
 
-    result = run_rescue_tick(snapshot, queue=queue, registry=_registry_with_models("critical", "donor"))
+    registry = _registry_with_models("critical", "donor")
+    result = run_rescue_tick(snapshot, queue=queue, registry=registry,
+                             cluster_view=fleet_view(registry, "donor", ("donor-a", "donor-b"), "critical"))
 
     assert result.classifications["donor"].state.value == "high"
-    assert queue.submitted == [
-        (TransferIntent("donor", "critical", 1, "critical_high_donor_safescale_nosafescale", "rescue"),)
-    ]
-    assert queue.submitted[0][0].sleep_path == "urgent"
+    [[transfer]] = queue.submitted
+    reason = "critical_high_donor_safescale_nosafescale"
+    sleep, wake = transfer_members(transfer)
+    gpu = {"donor-a": "0", "donor-b": "1"}[sleep[2][0]]
+    assert sleep[:2] + sleep[3:] == ("sleep", "donor", "urgent", reason)
+    assert wake == ("wake", "critical", (f"critical-{gpu}",), None, reason)  # the binding under it
 
 
 def test_high_proactive_shrink_is_an_urgent_model_level_scale_down():
@@ -121,16 +125,18 @@ def _two_donor_plan(relay_holds=None):
 
 def test_a_held_pair_is_not_planned_and_the_receiver_uses_the_next_donor():
     plan, view = _two_donor_plan()
-    [first] = [a for a in plan.actions if isinstance(a, TransferIntent)]
-    assert first.receiver == "r" and first.reason == "critical_high_donor_safescale_nosafescale"
+    [first] = relays(plan.actions)
+    assert first.receiver_model == "r" and first.reason == "critical_high_donor_safescale_nosafescale"
     assert not any(isinstance(a, ScaleAction) and a.requires_safescale for a in plan.actions)
-    held = {(first.donor, "r"): RelayHold(basis=relay_basis(view, first.donor, "r"), reason="refused")}
+    donor = first.donor_model
+    held = {(donor, "r"): RelayHold(basis=relay_basis(view, donor, "r"), reason="refused")}
 
     again, _ = _two_donor_plan(held)
 
-    relays = [a for a in again.actions if isinstance(a, TransferIntent)]
-    assert [(a.donor, a.receiver) for a in relays] == [({"h1": "h2", "h2": "h1"}[first.donor], "r")]
-    assert f"relay_held:{first.donor}:r:refused" in again.events
+    assert [(a.donor_model, a.receiver_model) for a in relays(again.actions)] == [
+        ({"h1": "h2", "h2": "h1"}[donor], "r")
+    ]
+    assert f"relay_held:{donor}:r:refused" in again.events
 
 
 class _AcceptingQueue:

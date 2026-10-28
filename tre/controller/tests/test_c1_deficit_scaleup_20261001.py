@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import expand_relays, relays, pool_view# noqa: F401 - 2026-10-02 relay intents
 
 import pytest
 import yaml
@@ -92,7 +92,8 @@ def test_idle_donor_gives_the_step_at_once_and_a_high_donor_only_a_probe():
     an idle window is evidence at any replica count); a HIGH donor gives it only through
     a SafeScale probe (the receiver's replica comes with the commit)."""
     idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
-    assert _deltas(_plan(idle, {"r": 3, "i": 4})) == {"r": 1, "i": -1}  # one step per plan
+    view = pool_view({"r": 3, "i": 4}, receivers=("r",))
+    assert _deltas(_plan(idle, {"r": 3, "i": 4}, cluster_view=view)) == {"r": 1, "i": -1}  # one step per plan
     high = [_cls("r", ModelState.CRITICAL, 0.4), _cls("d", ModelState.HIGH, 2.5, tier="surplus")]
     plan = _plan(high, {"r": 2, "d": 4})
     assert _deltas(plan) == {"d": -1}

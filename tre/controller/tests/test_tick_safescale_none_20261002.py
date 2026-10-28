@@ -23,8 +23,8 @@ class _Client:
 
 
 def test_a_pathless_scale_down_sends_nothing():
-    # (2026-10-02: the former donor/receiver pair is a TransferIntent, which always
-    # carries its sleep path; a path-less shrink is still refused before the SM.)
+    # (A transfer's donor sleeps always carry their sleep path; a path-less shrink is
+    # still refused before the SM.)
     from tre_controller.loops.action_queue import ActionQueue
 
     client = _Client()

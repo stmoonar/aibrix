@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import asyncio
 
+from tre_common.gpu_placement import GpuBlock
 from tre_controller.loops.action_queue import (
+    transfer_plan,
     RetryPolicy,
     revalidate_commit_from_signals,
 )
@@ -19,7 +21,7 @@ from tre_controller.planning.planner import (
     ReceiverTarget,
     SafeScaleCommitAction,
     ScaleAction,
-    TransferIntent,
+    BlockSupplyAction,
     build_plan,
 )
 from tre_controller.planning.safescale import SafeScaleCommand
@@ -72,36 +74,6 @@ class ScriptedSM:
 
     async def defrag(self, migrations):
         return await self._call("defrag", ("cluster", "defrag"))
-
-    async def transfer(self, donor_model, receiver_model, count, *, sleep_path="urgent"):
-        relay = f"{donor_model}->{receiver_model}"
-        result = await self._call(f"transfer:{relay}", (relay, "transfer", count))
-        if result == {"ok": True}:  # nothing scripted: every pair done
-            return {"ok": True, "response": transfer_body(count)}
-        return result
-
-
-def transfer_body(count, *, done=None, taken=None, unfilled=0, clamped=False, statuses=None,
-                  refusals=(), skipped=None, transfer_id="tr-1"):
-    """A legacy ``POST /v2/transfers`` response body (answered by the fake's ``transfer``,
-    translated to a plan wake item by tests/plan_shim.py): ``count`` pairs 7b-i -> 8b-i on n/i."""
-    statuses = list(statuses) if statuses is not None else ["done"] * count
-    pairs = []
-    for index, status in enumerate(statuses):
-        pair = {"donor": f"7b-{index}", "donors": [f"7b-{index}"], "donor_binding_ids": [f"7b/n/{index}"],
-                "receiver": f"8b-{index}", "receiver_binding_id": f"8b/n/{index}", "node": "n",
-                "gpu_ids": [index], "status": status}
-        pairs.append(pair)
-    done = sum(1 for status in statuses if status == "done") if done is None else done
-    taken = sum(1 for status in statuses if status != "donor_sleep_failed") if taken is None else taken
-    return {
-        "transfer_id": transfer_id, "donor_model": "7b", "receiver_model": "8b", "count": count,
-        "pairs": pairs, "done": done, "taken": taken, "clamped_by_floor": clamped,
-        "unfilled": unfilled,
-        "refusals": list(refusals), "skipped": dict(skipped or {}),
-        "picked": [{"serve_id": pair["receiver"]} for pair in pairs if pair["status"] == "done"],
-        "phases_ms": {"L1": 1, "U1": 2, "L2": 1, "U2": 2, "L3": 1},
-    }
 
 
 def _commit(*, donor="7b", pods=("7b-1",), upscales=(("8b", 1, 3),)):
@@ -550,9 +522,12 @@ def test_worker_exception_becomes_a_failed_result_and_frees_the_model() -> None:
 
 def test_transfer_exception_is_a_failed_result_for_both_models() -> None:
     async def scenario():
-        sm = ScriptedSM(raises={"transfer:7b->8b": ConnectionResetError("reset")})
+        sm = ScriptedSM(raises={"7b-1": ConnectionResetError("reset")})
         queue = ActionQueue(sm)
-        queue.submit((TransferIntent("7b", "8b", 1, "critical_donor_immediate", "rescue"),))
+        queue.submit((transfer_plan(BlockSupplyAction(
+            receiver="8b", block=GpuBlock("n", (1,)), receiver_pods=("8b-1",), sleeps=(("7b", "7b-1"),),
+            reason="critical_donor_immediate", source_loop="rescue",
+        )),))
         results = await queue.drain_once()
         by_model = {r.model: r for r in results}
         assert by_model["7b"].error.startswith("dispatch_exception: ConnectionResetError")

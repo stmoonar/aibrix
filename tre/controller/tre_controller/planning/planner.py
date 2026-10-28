@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping
@@ -16,10 +18,12 @@ from tre_common.gpu_placement import (
     GpuBlock,
     PlacementPolicy,
     choose_placement,
+    choose_release,
     plan_placements,
 )
 from tre_sm.allocator.slots import (
     Binding,
+    Slot,
     SlotAllocator,
     awake_model_counts,
     gpu_slot_candidates,
@@ -174,13 +178,18 @@ class ScaleAction:
     # Drain budget (s) passed to the SM sleep; ignored there since 2026-10-02 (the SM never
     # drains on any path: hide -> ack -> /sleep mode=abort). None = none passed.
     drain_budget_s: float | None = None
-    # S5 (2026-09-30): ``pods`` of a pure-capacity wake are placement HINTS - the SM
-    # picks the GPUs itself (registry placement policy) and substitutes a hint it
-    # cannot wake. False = exactly these pods (SafeScale probes / commits).
+    # S5 (2026-09-30): the planner picked ``pods`` of a pure-capacity wake by placement.
+    # Since 2026-10-28 (sm-plans section 10) every wake with pods is sent NAMED (the
+    # controller names every pod, the SM validates): the flag is bookkeeping only.
     hint: bool = False
     # C1: the rescue target this scale-up belongs to (a CRITICAL receiver's wakes /
     # creates / relay wakes). Bookkeeping only: not part of the action's identity.
     rescue: RescuePlan | None = field(default=None, compare=False)
+    # Plan group (sm-plans section 10): the items of one transfer - its donor sleeps and
+    # its receiver wake - are atomic in the SM's selection. None = no group.
+    group: str | None = None
+    # The fleet-view inputs a transfer's receiver wake was planned from (RelayHold).
+    basis: "RelayBasis | None" = field(default=None, compare=False)
 
 
 #: SM sleep path of the rescue-section "*_immediate" donors (CRIT donor, idle proactive,
@@ -190,6 +199,29 @@ IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
 #: Reason suffix of a shrink that would have run as a SafeScale probe and is released
 #: immediately because SafeScale is off (TRE_ABLATION_DISABLE_SAFESCALE, 2026-10-08).
 NO_SAFESCALE_REASON_SUFFIX = "_nosafescale"
+
+
+#: Refusal codes of a NAMED transfer (sm-plans section 10) that follow from the SM's
+#: own books - the replica floor, the scaling cap, another binding awake on the
+#: receiver GPUs (``slot_occupied``): only a new SM state version or floor view
+#: releases its hold. Everything else (code-less, ``writer_busy``,
+#: ``routable_unknown``, ``donor_sleep_failed``, the transient wake refusals) passes
+#: with any newer view.
+FLEET_NAMED_TRANSFER_REFUSALS = frozenset({"floor_violation", "max_awake_replicas", "slot_occupied"})
+
+
+def named_transfer_hold_reason(error: object, conflict: Mapping[str, Any] | None = None) -> tuple[str, bool]:
+    """(reason, fleet) of a named transfer answered with nothing done, from its item
+    error (``"<status>: <code> (<detail>)"``; a ``group_refused`` detail names the
+    refused item's own code) and its first wake refusal."""
+    text = str(error or "")
+    words = {word.strip("():,;'\"") for word in text.replace(":", " ").split()}
+    words |= {str(value) for value in (conflict or {}).values() if isinstance(value, str)}
+    found = [code for code in re.findall(r"(?:refused|failed): ([a-z_]+)", text) if code != "group_refused"]
+    reason = found[0] if found else (text.split(" (")[0].replace(": ", ":") or "refused")
+    if words & TRANSIENT_RELAY_WAKE_REFUSALS:
+        return reason, False
+    return reason, bool(words & FLEET_NAMED_TRANSFER_REFUSALS)
 
 
 @dataclass(frozen=True)
@@ -218,52 +250,19 @@ def relay_basis(view: "ClusterView | None", donor: str, receiver: str) -> RelayB
     )
 
 
-#: SM refusal codes (409) of a relay that say something about the fleet: the replica
-#: floor of the SM's own view. Every other refusal - code-less (a 503 while the SM
-#: shuts down, a 400), ``writer_busy``, ``routable_unknown`` - says nothing about it.
-FLEET_RELAY_REFUSALS = frozenset({"floor_violation"})
-#: Wake refusals inside a no-pair answer that pass without a fleet change (SM wake
-#: error codes ``resident_loading`` / ``truth_unavailable`` / ``lease_conflict``, reason
+#: Wake refusals of a transfer that pass without a fleet change (SM wake error codes
+#: ``resident_loading`` / ``truth_unavailable`` / ``lease_conflict``, reason
 #: ``resident_unknown``): a Pod still loading, a gpu-truth sample missing, a lease held.
 TRANSIENT_RELAY_WAKE_REFUSALS = frozenset({"resident_loading", "truth_unavailable", "lease_conflict", "resident_unknown"})
-#: SM transfer skip reasons only a fleet change undoes (``occupant_*``: the receiver's
-#: GPUs hold another model / a hidden / a busy occupant; ``receiver_cap``).
-FLEET_RELAY_SKIP_PREFIX = "occupant_"
-FLEET_RELAY_SKIPS = frozenset({"receiver_cap"})
-
-
-def relay_hold_reason(summary: Mapping[str, Any]) -> tuple[str, bool]:
-    """(reason, fleet) of a relay answered with nothing done, from its transfer
-    summary (review 2026-10-06 P2-1). ``fleet``: the answer follows from the fleet
-    view the relay was planned from (``floor_violation``, ``clamped_by_floor``, a
-    pair tried and failed, unfilled for ``occupant_*`` / ``receiver_cap`` only), so only a new SM state version or floor view releases its
-    hold. Anything else is transient: any newer view releases it."""
-    outcome = summary.get("outcome")
-    if outcome == "refused":
-        code = summary.get("code")
-        return str(code or "refused"), code in FLEET_RELAY_REFUSALS
-    if summary.get("clamped_by_floor"):
-        return "clamped_by_floor", True
-    if summary.get("pairs"):
-        return "no_pair_done", True
-    skipped = sorted(str(key) for key in (summary.get("skipped") or {}))
-    reason = "unfilled" + (f"({','.join(skipped)})" if skipped else "")
-    for codes in summary.get("refusal_codes") or ():
-        if set(map(str, codes)) & TRANSIENT_RELAY_WAKE_REFUSALS:
-            return reason, False
-    fleet = bool(skipped) and all(
-        key.startswith(FLEET_RELAY_SKIP_PREFIX) or key in FLEET_RELAY_SKIPS for key in skipped
-    )
-    return reason, fleet
 
 
 @dataclass(frozen=True)
 class RelayHold:
-    """A relay the SM answered with nothing done (``done == 0``: refused, vetoed,
-    floor-clamped, unfilled - never an unknown outcome) is not planned again for the
-    same donor -> receiver pair while the fleet view it was planned from is still
-    current (review P2-1: no new writer-lock call for the same answer). A state gate,
-    not a timer: for a fleet-derived answer (:func:`relay_hold_reason`) a new SM state
+    """A relay the SM answered with nothing done (its transfer group refused - never an
+    unknown outcome) is not planned again for the same donor -> receiver pair while
+    the fleet view it was planned from is still current (review P2-1: no new
+    writer-lock call for the same answer). A state gate, not a timer: for a
+    fleet-derived answer (:func:`named_transfer_hold_reason`) a new SM state
     version or a changed floor view of either model releases it; a transient answer,
     or a view without an SM version, is released by any newer view."""
 
@@ -277,50 +276,6 @@ class RelayHold:
         if not self.fleet or current.sm_version is None or self.basis.sm_version is None:
             return current == self.basis
         return replace(current, view_ms=None) == replace(self.basis, view_ms=None)
-
-
-@dataclass(frozen=True)
-class TransferIntent:
-    """An immediate donor -> receiver relay expressed as a COUNT (2026-10-02, design
-    20261002-controller-transfer). The controller decides the quantity - how many
-    replicas, from which model, to which model, in which order; the service-manager
-    (a ``POST /v2/plans`` wake item with ``donors``) decides the placement - which donor pods, which receiver
-    bindings, which GPUs - and keeps the replica floor and "one awake model per GPU"
-    under its writer lock. No pod or GPU is named here.
-
-    ``count`` = donor replicas to hand over (the plan donor's ``max``); ``pairs`` = receiver
-    replicas the planner expects from them (equal unless a TP receiver needs several
-    single-GPU donors). The SM may complete fewer: the ActionQueue accounts by the
-    response's ``done`` / ``taken`` / ``unfilled``, never by ``count``."""
-
-    donor_model: str
-    receiver_model: str
-    count: int
-    reason: str
-    source_loop: SourceLoop
-    sleep_path: str = IMMEDIATE_DONOR_SLEEP_PATH
-    pairs: int = 0
-    #: C1: the rescue target the receiver side belongs to (bookkeeping only).
-    rescue: RescuePlan | None = field(default=None, compare=False)
-    #: The fleet-view inputs it was planned from (:class:`RelayHold`; None = no view).
-    basis: RelayBasis | None = field(default=None, compare=False)
-
-    def __post_init__(self) -> None:
-        if self.pairs <= 0:
-            object.__setattr__(self, "pairs", int(self.count))
-
-    @property
-    def model(self) -> str:
-        """The receiver (the model the relay serves; queue / rescue key)."""
-        return self.receiver_model
-
-    @property
-    def donor(self) -> str:
-        return self.donor_model
-
-    @property
-    def receiver(self) -> str:
-        return self.receiver_model
 
 
 @dataclass(frozen=True)
@@ -355,13 +310,15 @@ class DefragAction:
 
 @dataclass(frozen=True)
 class BlockSupplyAction:
-    """A TP receiver's buddy block taken from donors (design 20261028-single-loop L4
-    rev 2, :func:`cheapest_block`): the donor pods on the block sleep and the receiver
-    wakes there (``receiver_pods``: its binding on the block, sent as the hint) - ONE SM
-    plan (:func:`tre_controller.loops.tick._release_without_safescale`). ``sleeps``
-    sleep at once (IDLE donors, and every donor of a scope that releases without a
-    probe); ``probe`` (scope ``all``: the block's one HIGH / HEALTHY donor pod) is a
-    SafeScale probe whose commit sleeps it and wakes the receiver."""
+    """A transfer: the receiver's binding on a block taken from donors - a TP
+    receiver's buddy block (design 20261028-single-loop L4 rev 2,
+    :func:`cheapest_block`) or a TP1 relay pair (:func:`_plan_transfers`). The donor
+    pods on the block sleep and the receiver wakes there (``receiver_pods``: its
+    binding, a named wake) - ONE plan group (design 20261027-sm-plans section 10,
+    :func:`tre_controller.loops.tick._release_without_safescale`). ``sleeps`` sleep
+    at once (IDLE donors, and every donor of a scope that releases without a probe);
+    ``probe`` (scope ``all``: the block's one HIGH / HEALTHY donor pod) is a SafeScale
+    probe whose commit sleeps it and wakes the receiver."""
 
     receiver: str
     block: GpuBlock
@@ -374,18 +331,23 @@ class BlockSupplyAction:
     probe: tuple[str, str] | None = None
     #: C1: the receiver's rescue target (bookkeeping only).
     rescue: RescuePlan | None = field(default=None, compare=False)
+    #: The fleet-view inputs a relay pair was planned from (:class:`RelayHold`).
+    basis: RelayBasis | None = field(default=None, compare=False)
+
+    @property
+    def donor_models(self) -> tuple[str, ...]:
+        pods = (*self.sleeps, *((self.probe,) if self.probe else ()))
+        return tuple(dict.fromkeys(model for model, _ in pods))
 
 
-Action = ScaleAction | TransferIntent | HideAction | UnhideAction | DefragAction | BlockSupplyAction
+Action = ScaleAction | HideAction | UnhideAction | DefragAction | BlockSupplyAction
 
 
 def upscale_of(action: object) -> tuple[str, int] | None:
     """(model, receiver replicas) a planned action adds, or None: a ScaleAction with a
-    positive delta, or a TransferIntent's receiver side (its expected ``pairs``)."""
+    positive delta (a transfer's receiver: :func:`receiver_upscales`)."""
     if isinstance(action, ScaleAction) and action.delta > 0:
         return action.model, int(action.delta)
-    if isinstance(action, TransferIntent):
-        return action.receiver_model, int(action.pairs)
     return None
 
 
@@ -491,8 +453,8 @@ def build_plan(
 ) -> PlanResult:
     """One plan. Quantity only for the immediate relays (2026-10-02): a CRITICAL / LOW
     receiver's need is met first from free capacity (its sleeping bindings on free
-    GPUs, then free slot groups), then by :class:`TransferIntent` s from IDLE donors
-    (count only; the SM places them), then by SafeScale probes of HIGH and middle-zone
+    GPUs, then free slot groups), then by named relays from IDLE donors (one transfer
+    per pair, the controller names the pods - sm-plans section 10), then by SafeScale probes of HIGH and middle-zone
     donors (F1-B 2026-10-07: no HIGH donor is released without a probe). A
     donor gives at most its ``floor_headroom`` (SM count, ``_donor_headroom``) minus
     what this tick already took from it. Whatever the relays cannot cover is planned
@@ -1040,7 +1002,7 @@ def build_plan(
                         continue
                     donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
                     planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
-                    gained = _plan_transfer_intent(
+                    gained = _plan_relays(
                         actions,
                         deltas,
                         occupancy,
@@ -1082,7 +1044,7 @@ def build_plan(
                         else "critical_middle_zone_safescale"
                     )
                     if cfg.release_without_safescale:
-                        gained = _plan_transfer_intent(
+                        gained = _plan_relays(
                             actions,
                             deltas,
                             occupancy,
@@ -1321,7 +1283,7 @@ def build_plan(
                 continue
             donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
             planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
-            needed -= _plan_transfer_intent(
+            needed -= _plan_relays(
                 actions,
                 deltas,
                 occupancy,
@@ -1361,7 +1323,7 @@ def build_plan(
                 else "low_fairness_middle_zone_safescale"
             )
             if cfg.release_without_safescale:
-                gained = _plan_transfer_intent(
+                gained = _plan_relays(
                     actions,
                     deltas,
                     occupancy,
@@ -1396,7 +1358,7 @@ def build_plan(
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
 
-def _plan_transfer_intent(
+def _plan_relays(
     actions: list[Action],
     deltas: dict[str, int],
     occupancy: "_SlotOccupancy | None",
@@ -1411,11 +1373,11 @@ def _plan_transfer_intent(
     view: ClusterView | None = None,
     relay_holds: Mapping[tuple[str, str], RelayHold] | None = None,
 ) -> int:
-    """One immediate relay as a :class:`TransferIntent` (count only). With a cluster
-    view its size is bounded by :meth:`_SlotOccupancy.pairable_count` - pairs the SM
-    can form (receiver bindings whose every GPU this donor holds awake) - so no intent
-    is sent that cannot be filled; without one, by ``need`` / ``donor_limit``.
-    No relay while the SM reported its routable view unreadable (``routable_error``
+    """Immediate relays as named transfers (2026-10-28, sm-plans section 10): one
+    :class:`BlockSupplyAction` per pair :meth:`_SlotOccupancy.pairable` names (a
+    receiver binding whose every GPU this donor holds awake, and those donor pods - the
+    shared release choice), bounded by ``need`` / ``donor_limit``. No fleet view: no
+    relay (nothing to name). No relay while the SM reported its routable view unreadable (``routable_error``
     other than ``routable_missing``, a state without the field: the SM refuses the
     relay with 409 ``routable_unknown`` - ``relay_skipped_routable_unknown``) or while the pair is held (:class:`RelayHold`:
     ``relay_held:<donor>:<receiver>:<reason>``).
@@ -1431,29 +1393,28 @@ def _plan_transfer_intent(
         _event_once(events, f"relay_held:{donor}:{receiver}:{hold.reason}")
         return 0
     if occupancy is None:
-        pairs = count = min(need, donor_limit)
-    else:
-        pairs, count = occupancy.pairable_count(donor, receiver, max_pairs=need, max_donors=donor_limit)
-        if pairs <= 0:
-            event = f"donor_no_slot_match:{donor}:{receiver}"
-            if event not in events:
-                events.append(event)
-            return 0
-    deltas[donor] = deltas.get(donor, 0) - count
-    deltas[receiver] = deltas.get(receiver, 0) + pairs
-    actions.append(
-        TransferIntent(
-            donor_model=donor,
-            receiver_model=receiver,
-            count=count,
-            pairs=pairs,
-            reason=reason,
-            source_loop=source_loop,
-            sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-            basis=basis,
+        return 0  # no fleet view, no pod to name (production decides nothing then)
+    # 2026-10-28 (sm-plans section 10): one named transfer per pair - the donor pods
+    # and the receiver binding are this plan's choice, the SM validates them.
+    estimate = occupancy.pairable(donor, receiver, max_pairs=need, max_donors=donor_limit)
+    if estimate.pairs <= 0:
+        _event_once(events, f"donor_no_slot_match:{donor}:{receiver}")
+        return 0
+    for receiver_binding, donor_pods in estimate.named:
+        actions.append(
+            BlockSupplyAction(
+                receiver=receiver,
+                block=slot_block(receiver_binding.slot),
+                receiver_pods=(receiver_binding.serve_id,),
+                sleeps=tuple((donor, pod) for pod in donor_pods),
+                reason=reason,
+                source_loop=source_loop,
+                basis=basis,
+            )
         )
-    )
-    return pairs
+    deltas[donor] = deltas.get(donor, 0) - estimate.donors
+    deltas[receiver] = deltas.get(receiver, 0) + estimate.pairs
+    return estimate.pairs
 
 
 def _event_once(events: list[str], event: str) -> None:
@@ -1565,9 +1526,9 @@ class _SlotOccupancy:
     with WakeConflict (the E1 dsllama-8b deadlock). Slots claimed by a planned wake (or
     counted for a planned relay) are not counted twice in one tick.
 
-    Since 2026-10-02 it only COUNTS relay capacity (:meth:`pairable_count`): which donor
-    pods and receiver bindings a relay uses is the service-manager's choice
-    (a plan wake item with ``donors``); nothing it counts here is sent to the SM.
+    Since 2026-10-28 (sm-plans section 10) it also NAMES each relay pair
+    (:meth:`pairable`): the donor pods (the shared release choice) and the receiver
+    binding on their GPU - the plan's choice, which the SM validates and executes.
     """
 
     def __init__(self, cluster_view: ClusterView) -> None:
@@ -1758,68 +1719,107 @@ class _SlotOccupancy:
     def pairable(
         self, donor: str, receiver: str, *, max_pairs: int, max_donors: int
     ) -> "PairEstimate":
-        """How many relay pairs ``donor`` -> ``receiver`` the SM can form (the same rule
-        as its pair selection, design 20261002-sm-transfer section 3): a sleeping, not
-        hidden receiver binding on GPUs not claimed / blocked, EVERY one of which an
-        awake, not hidden binding of ``donor`` holds (a GPU without one is
-        ``uncovered_gpu``: no relay; a GPU with no occupant at all is a plain wake).
-        A pair consumes all its occupants (a TP receiver may take two single-GPU donors).
-        At most ``max_pairs`` pairs and ``max_donors`` donor replicas; pairs with fewer
-        donors first. The pairs found are counted (receiver GPUs claimed, donors
-        released) so a later relay / wake of this tick does not count them again."""
+        """The relay pairs ``donor`` -> ``receiver`` this plan names (2026-10-28,
+        sm-plans section 10: the controller names every pod): a sleeping, not hidden
+        receiver binding on GPUs not claimed / blocked, EVERY one of which an awake,
+        not hidden, not released binding of ``donor`` holds (a GPU without one is a
+        plain wake, a GPU of another model no relay). A pair consumes all its
+        occupants. At most ``max_pairs`` pairs and ``max_donors`` donor replicas;
+        pairs with fewer donors first, then the donor unit the placement policy
+        releases first (:func:`tre_common.gpu_placement.choose_release`, the release
+        choice the SM uses), then the receiver's serve id. Each pair is claimed
+        (receiver GPUs) and its donors released in the ledger."""
         if max_pairs <= 0 or max_donors <= 0:
             return PairEstimate(0, 0, ())
-        candidates: list[tuple[Binding, tuple[Binding, ...]]] = []
-        for receiver_binding in self.sleeping(receiver):
-            gpus = self._gpus(receiver_binding)
-            if any(gpu in self._claimed or gpu in self._blocked for gpu in gpus):
-                continue
-            if not all(gpu in self._awake for gpu in gpus):
-                continue  # no occupant (plain wake) or uncovered_gpu (no relay)
-            occupants = {self._awake[gpu].serve_id: self._awake[gpu] for gpu in gpus}
-            if any(
-                occupant.model != donor or occupant.hidden or occupant.serve_id in self._released
-                for occupant in occupants.values()
-            ):
-                continue
-            candidates.append(
-                (receiver_binding, tuple(sorted(occupants.values(), key=lambda b: natural_key(b.serve_id))))
-            )
-        candidates.sort(key=lambda item: (len(item[1]), natural_key(item[0].serve_id)))
-        pairs = donors = 0
-        donor_pods: list[str] = []
-        for receiver_binding, occupants in candidates:
-            if pairs >= max_pairs:
+        found: list[tuple[Binding, tuple[Binding, ...]]] = []
+        donors = 0
+        while len(found) < max_pairs:
+            candidates: list[tuple[Binding, tuple[Binding, ...]]] = []
+            for receiver_binding in self.sleeping(receiver):
+                gpus = self._gpus(receiver_binding)
+                if any(gpu in self._claimed or gpu in self._blocked for gpu in gpus):
+                    continue
+                if not all(gpu in self._awake for gpu in gpus):
+                    continue  # no occupant (plain wake) or uncovered_gpu (no relay)
+                occupants = {self._awake[gpu].serve_id: self._awake[gpu] for gpu in gpus}
+                if any(
+                    occupant.model != donor or occupant.hidden or occupant.serve_id in self._released
+                    for occupant in occupants.values()
+                ):
+                    continue
+                if donors + len(occupants) > max_donors:
+                    continue
+                candidates.append(
+                    (receiver_binding, tuple(sorted(occupants.values(), key=lambda b: natural_key(b.serve_id))))
+                )
+            if not candidates:
                 break
-            ids = [occupant.serve_id for occupant in occupants]
-            if any(serve_id in self._released for serve_id in ids) or donors + len(ids) > max_donors:
-                continue
+            fewest = min(len(units) for _, units in candidates)
+            receiver_binding, units = self._release_choice(
+                [item for item in candidates if len(item[1]) == fewest]
+            )
             self.claim(receiver_binding)
-            self._released.update(ids)
-            pairs += 1
-            donors += len(ids)
-            donor_pods.extend(ids)
-        return PairEstimate(pairs, donors, tuple(donor_pods))
+            self._released.update(unit.serve_id for unit in units)
+            found.append((receiver_binding, units))
+            donors += len(units)
+        return PairEstimate(
+            len(found),
+            donors,
+            tuple(unit.serve_id for _, units in found for unit in units),
+            tuple((receiver_binding, tuple(unit.serve_id for unit in units)) for receiver_binding, units in found),
+        )
 
-    def pairable_count(
-        self, donor: str, receiver: str, *, max_pairs: int, max_donors: int
-    ) -> tuple[int, int]:
-        """(pairs, donor replicas) of :meth:`pairable`: the size of a relay intent that
-        the SM can fill on this view (an intent larger than that would come back
-        ``unfilled``)."""
-        estimate = self.pairable(donor, receiver, max_pairs=max_pairs, max_donors=max_donors)
-        return estimate.pairs, estimate.donors
+    def _release_choice(
+        self, candidates: list[tuple[Binding, tuple[Binding, ...]]]
+    ) -> tuple[Binding, tuple[Binding, ...]]:
+        """Among relay pairs, the donor unit the placement policy releases first
+        (:func:`choose_release` on the block each unit frees: merge gain, node load,
+        same-model spread, address), then the receiver with the lowest serve id. A
+        unit that frees no aligned block ranks after the aligned ones."""
+        units = list(dict.fromkeys(units for _, units in candidates))
+        blocks = [_unit_block(unit, self._nodes) for unit in units]
+        aligned = [(unit, block) for unit, block in zip(units, blocks) if block is not None]
+        chosen = None
+        if aligned:
+            occupied = {gpu for gpu, binding in self._awake.items() if binding.serve_id not in self._released}
+            choice = choose_release(
+                [block for _, block in aligned],
+                nodes=self._nodes,
+                occupied=occupied | {key for _, block in aligned for key in block.keys},
+                policy=self.policy(),
+            )
+            if choice is not None:
+                chosen = aligned[choice.index][0]
+        if chosen is None:
+            chosen = min(units, key=lambda unit: natural_key(unit[0].serve_id))
+        return min(
+            (item for item in candidates if item[1] == chosen), key=lambda item: natural_key(item[0].serve_id)
+        )
 
 
 @dataclass(frozen=True)
 class PairEstimate:
     """:meth:`_SlotOccupancy.pairable`: receiver replicas (``pairs``), donor replicas
-    they consume (``donors``) and those donor pods (used only to name a middle-zone
-    SafeScale probe's pods; a relay intent names none)."""
+    they consume (``donors``), those donor pods, and each pair as (receiver binding,
+    its donor pods)."""
 
     pairs: int
     donors: int
     donor_pods: tuple[str, ...]
+    named: tuple[tuple[Binding, tuple[str, ...]], ...] = ()
+
+
+def _unit_block(unit: tuple[Binding, ...], nodes: Mapping[str, int]) -> GpuBlock | None:
+    """The aligned GPU block a donor unit frees (one donor's slot, or the contiguous
+    union of several donors' slots on one node), None when it frees no aligned block."""
+    node = unit[0].slot.node
+    if any(item.slot.node != node for item in unit):
+        return None
+    gpus = sorted({int(gpu) for item in unit for gpu in item.slot.gpu_ids})
+    if gpus != list(range(gpus[0], gpus[0] + len(gpus))):
+        return None
+    slot = Slot(node, tuple(gpus))
+    return slot_block(slot) if is_buddy_aligned(slot, nodes) else None
 
 
 def _plan_sleeping_wakes(
