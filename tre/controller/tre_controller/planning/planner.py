@@ -460,6 +460,9 @@ def build_plan(
     ((donor, receiver) -> :class:`RelayHold`): pairs the SM answered with nothing
     done on the fleet view that is still current - not planned again.
 
+    Donors (2026-10-29, design 20261029-tss-only): a CRITICAL receiver may take from IDLE,
+    HIGH and HEALTHY (middle-zone) donors; a LOW receiver from IDLE and HIGH donors only
+    (no relay, probe or TP block of a HEALTHY donor for a LOW receiver).
     ``view_pending`` (model -> direction of its last routable-changing SM call that this
     plan's fleet view does not show yet): the model takes no new action, in any role."""
     active_probe_models = active_probe_models or set()
@@ -559,7 +562,12 @@ def build_plan(
     # once: an idle window is evidence that does not depend on the replica count, while
     # "Z > tau_high now" says nothing about Z with one replica less (n = 2: half the
     # capacity).
-    probe_donors = [item for item in paper_donors if item.state == ModelState.HIGH] + middle_zone
+    high_donors = [item for item in paper_donors if item.state == ModelState.HIGH]
+    # CRITICAL rescue: HIGH, then the middle zone. LOW rebalance (2026-10-29): HIGH only -
+    # a HEALTHY model never gives a replica to a LOW receiver (Tight_pool smoke
+    # 20261029: LOW taking from HEALTHY made a 14b oscillate 1 <-> 2 five times).
+    critical_probe_donors = high_donors + middle_zone
+    low_probe_donors = high_donors
 
     def probe_held(donor: ModelClassification) -> bool:
         # One SafeScale probe per donor model (the state machine is keyed by model): a
@@ -600,17 +608,20 @@ def build_plan(
         if gained > 0 and cfg.release_without_safescale and model in probe_backoff_models:
             _event_once(events, f"safescale_rollback_hold_relay_ok:{model}")
 
-    def block_donors(receiver: str) -> dict[str, BlockDonor]:
+    def block_donors(receiver: str, *, critical: bool) -> dict[str, BlockDonor]:
         """L4 rev 2: the donor models a TP receiver's block may take pods of, now:
-        IDLE / HIGH / HEALTHY (never LOW / CRITICAL), not the receiver, not probing, not
-        in flight, not view-pending, above its floor after this plan's takes; a HIGH /
-        HEALTHY donor only while nothing of it is planned yet (one replica per plan)
-        and not held by a probe of this plan or a rollback hold (scope ``all``)."""
+        IDLE / HIGH, and HEALTHY only for a CRITICAL receiver (2026-10-29; never LOW /
+        CRITICAL), not the receiver, not probing, not in flight, not view-pending, above
+        its floor after this plan's takes; a HIGH / HEALTHY donor only while nothing of
+        it is planned yet (one replica per plan) and not held by a probe of this plan or
+        a rollback hold (scope ``all``)."""
         out: dict[str, BlockDonor] = {}
         for item in classifications:
             model = item.model_name
             tier = _BLOCK_TIERS.get(item.state)
             if tier is None or item.role == ModelRole.RECEIVER or model == receiver:
+                continue
+            if item.state == ModelState.HEALTHY and not critical:
                 continue
             if model in active_probe_models or model in inflight_models:
                 continue
@@ -647,7 +658,7 @@ def build_plan(
     ) -> bool:
         """L4 rev 2: one buddy block (+1 replica) for a TP receiver; False = none."""
         model = recv.model_name
-        donors = block_donors(model)
+        donors = block_donors(model, critical=recv.state == ModelState.CRITICAL)
         choice = cheapest_block(model, occupancy, cluster_view, donors, cfg)
         if choice is None:
             return False
@@ -906,7 +917,7 @@ def build_plan(
                     )
                     still_needed -= gained
 
-                for middle in probe_donors:
+                for middle in critical_probe_donors:
                     if still_needed <= 0:
                         break
                     if (
@@ -1168,7 +1179,7 @@ def build_plan(
                 relay_holds=relay_holds,
             )
 
-        for middle in probe_donors:
+        for middle in low_probe_donors:
             if needed <= 0:
                 break
             if (
@@ -1186,11 +1197,7 @@ def build_plan(
             donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
             planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
             middle_limit = min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take)
-            middle_reason = (
-                "low_fairness_high_donor_safescale"
-                if middle.state == ModelState.HIGH
-                else "low_fairness_middle_zone_safescale"
-            )
+            middle_reason = "low_fairness_high_donor_safescale"
             if cfg.release_without_safescale:
                 gained = _plan_relays(
                     actions,

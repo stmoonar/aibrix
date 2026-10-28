@@ -5,10 +5,14 @@
   rescue section (no breakpoint hold, no saturation / exempt path, no window-start wait).
 * The only per-model hold is a correctness guard: an action in flight, or one the fleet
   view does not show yet (view-pending), blocks the model's next action.
+* A LOW receiver takes from IDLE and HIGH donors only - never from a HEALTHY one (TP1
+  relay / probe, TP2 block); a CRITICAL receiver still may.
 """
 from __future__ import annotations
 
 from dataclasses import replace
+
+import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import (
@@ -25,6 +29,8 @@ from tre_controller.loops.tick import compute_model_signal, serving_window
 from tre_controller.planning.planner import ClusterView, ScaleAction
 from tre_controller.signals.trs import SignalState
 from tre_sm.allocator.slots import Binding, Slot
+
+from test_single_loop_20261028 import CRIT, HEALTHY, HIGH, LOW, _binding, _plan, _tp2
 
 GRID = 10_000
 W = 30_000
@@ -161,3 +167,61 @@ def test_a_model_with_an_action_in_flight_takes_no_new_action():
         result = tick(_snap(_window(BASE, [BURST] * 3, routable=1)), queue=queue, registry=_registry(),
                       cluster_view=_view(1, fetched_ms=BASE + 500), signal_state=SignalState())
         assert result.actions == ()
+
+
+# ------------------------------------------------- (b) / (c) donors by receiver band
+
+
+def _tp1(receiver_state, donor_state, **cfg):
+    """``r`` awake on GPU 0 and sleeping on GPU 1, where donor ``d`` (2 replicas, GPUs 1
+    and 2, floor 0) is awake; ``x`` holds GPU 3 at its floor."""
+    bindings = [
+        _binding("r-0", "r", (0,), True),
+        _binding("r-1", "r", (1,), False),
+        _binding("d-1", "d", (1,), True),
+        _binding("d-2", "d", (2,), True),
+        _binding("x-3", "x", (3,), True),
+    ]
+    classes = {"r": receiver_state, "d": donor_state, "x": (*HEALTHY, 1.1)}
+    return _plan(bindings, classes, min_replicas_by_model={"x": 1, "d": 0}, **cfg)
+
+
+def _donor_moves(plan) -> list:
+    moves = []
+    for action in plan.actions:
+        if isinstance(action, ScaleAction) and action.model == "d" and action.delta < 0:
+            moves.append(action.reason)
+        for donor, _pod in getattr(action, "sleeps", ()) or ():
+            if donor == "d":
+                moves.append(action.reason)
+    return moves
+
+
+@pytest.mark.parametrize("release_without_safescale", [False, True])
+def test_a_low_receiver_never_takes_from_a_healthy_tp1_donor(release_without_safescale):
+    plan = _tp1((*LOW, 0.9), (*HEALTHY, 1.1), release_without_safescale=release_without_safescale)
+    assert _donor_moves(plan) == [] and not plan.probe_upscale_plans
+    # The same donor HIGH: the LOW receiver gets its replica (probe, or a relay at once).
+    high = _tp1((*LOW, 0.9), (*HIGH, 1.4), release_without_safescale=release_without_safescale)
+    assert _donor_moves(high) and all(reason.startswith("low_fairness_high_donor") for reason in _donor_moves(high))
+
+
+@pytest.mark.parametrize("release_without_safescale", [False, True])
+def test_a_critical_receiver_still_takes_from_a_healthy_tp1_donor(release_without_safescale):
+    plan = _tp1((*CRIT, 0.3), (*HEALTHY, 1.1), release_without_safescale=release_without_safescale)
+    reasons = _donor_moves(plan)
+    assert reasons and all(reason.startswith("critical_middle_zone_safescale") for reason in reasons)
+
+
+@pytest.mark.parametrize("scope", ["all", "receiverless_shrink"])
+def test_a_low_tp2_receiver_never_takes_a_block_of_a_healthy_donor(scope):
+    # Block 0-1 = a free GPU (1) and a pod of HEALTHY h (0): the only usable block.
+    donors = (_binding("h-0", "h", (0,), True), _binding("h-2", "h", (2,), True), _binding("h-3", "h", (3,), True))
+    plans, events, _ = _tp2(*donors, classes={"tp2": (*LOW, 0.9), "h": (*HEALTHY, 1.1)}, scope=scope)
+    touched = [item for items in plans for item in items if item[1] == "h"]
+    assert touched == [] and "capacity_blocked:tp2" in events
+    # A CRITICAL TP2 receiver takes that block (the HEALTHY tier stays for rescue).
+    plans, events, _ = _tp2(*donors, classes={"tp2": (*CRIT, 0.3), "h": (*HEALTHY, 1.1)}, scope=scope)
+    touched = [item for items in plans for item in items if item[1] == "h"]
+    assert [item[2] for item in touched] == [["h-0"]], (plans, events)
+    assert any(event.startswith("block_supply:tp2:") and ":healthy:" in event for event in events)

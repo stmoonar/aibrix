@@ -84,8 +84,14 @@ def test_an_idle_donor_is_still_released_at_once(receiver_state):
     assert (relay.donor_model, relay.receiver_model, relay.sleep_path) == (D, R, "urgent")
 
 
-@pytest.mark.parametrize("donor_state", [ModelState.HIGH, ModelState.HEALTHY], ids=["high", "middle_zone"])
-@pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
+# (No fairness + middle-zone case since 2026-10-29: a HEALTHY donor never gives to a
+# LOW receiver - test_tss_only_20261029.)
+@pytest.mark.parametrize(
+    ("receiver_state", "donor_state"),
+    [(ModelState.CRITICAL, ModelState.HIGH), (ModelState.CRITICAL, ModelState.HEALTHY),
+     (ModelState.LOW, ModelState.HIGH)],
+    ids=["rescue-high", "rescue-middle_zone", "fairness-high"],
+)
 def test_a_donor_whose_probe_rolled_back_waits_for_new_evidence(receiver_state, donor_state):
     plan = _donor_plan(donor_state, receiver_state, backoff={D: "same_evidence"})
     assert not [a for a in plan.actions if getattr(a, "model", None) == D or getattr(a, "donor_model", None) == D]
