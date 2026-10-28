@@ -421,13 +421,19 @@ def cmd_mark_replay(env: Env, a: argparse.Namespace) -> int:
         env.say("# dry print (nothing executed); add --execute to run")
         env.say(f"# gateway dropped events now: {_cmd(_pods_argv(env, a.gw_namespace, a.gw_selector))}, then "
                 f"{_cmd(_proxy_metrics_argv(env, a.gw_namespace, '<pod>', a.gw_metrics_port))}")
-        env.say(f"# t0_ms = Redis TIME (ms) at execution; SET {REPLAY_T0_KEY} to:")
-        env.say(replay_marker(0, a.trace, a.seed).replace('"t0_ms": 0', '"t0_ms": <redis TIME ms>'))
+        env.say(f"# SET {REPLAY_T0_KEY} (explicit first-arrival t0, or current Redis TIME if omitted):")
+        if a.t0_ms is not None:
+            env.say(replay_marker(a.t0_ms, a.trace, a.seed))
+        else:
+            env.say(replay_marker(0, a.trace, a.seed).replace('"t0_ms": 0', '"t0_ms": <redis TIME ms>'))
         return EXIT_OK
     gw0 = gateway_bl_dropped(env, a)
     if gw0 is None:
         env.say("# warning: gateway dropped-event counter unreadable; the run's event validity is unknown")
-    t0 = env.redis.time_ms()
+    now = env.redis.time_ms()
+    t0 = a.t0_ms if a.t0_ms is not None else now
+    if t0 < 0 or t0 > now:
+        raise ArmError("t0-ms must be a nonnegative Redis timestamp no later than now", EXIT_REFUSED)
     value = replay_marker(t0, a.trace, a.seed, gw0)
     env.redis.set(REPLAY_T0_KEY, value)
     env.say(f"{REPLAY_T0_KEY} = {value}")
@@ -471,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     dis.add_argument("--selector", default=None,
                      help="label selector of the scaler pods (default app.kubernetes.io/name=<deployment>)")
     mk = sub.add_parser("mark-replay", parents=[common], help=f"write {REPLAY_T0_KEY}")
+    mk.add_argument("--t0-ms", type=int, default=None, help="first arrival's Redis timestamp; default: current Redis TIME")
     mk.add_argument("--trace", required=True)
     mk.add_argument("--seed", required=True, type=int)
     return ap

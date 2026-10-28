@@ -17,6 +17,7 @@ limitations under the License.
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,7 +54,7 @@ import (
 //
 //	kind=arr   once the target pod is chosen: req_id client_id reissue gw_local_ms pod
 //	           in_tokens in_src(header|estimate|token_ids) max_tokens stream
-//	kind=ft    first non-empty response body frame of a non-error response:
+//	kind=ft    first generated text/reasoning/tool-argument token of a non-error response:
 //	           req_id client_id reissue gw_local_ms pod dt_arr_ms
 //	kind=done  exactly once per request that had arr, when its ext_proc stream ends
 //	           (completion, upstream error, abort, shutdown): req_id client_id reissue
@@ -106,7 +107,7 @@ const (
 var (
 	blReqEventsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "tre_gateway_bl_req_events_dropped_total",
-		Help: "Baseline request events not written (reason=buffer_full|redis_error).",
+		Help: "Baseline request events not written (reason=buffer_full|redis_error|ft_frame_oversize).",
 	}, []string{"reason"})
 	blReqEventsWritten = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "tre_gateway_bl_req_events_written_total",
@@ -348,6 +349,7 @@ type blReqState struct {
 	pod      string
 	arrAt    time.Time
 	ftSent   bool
+	ftBuffer []byte // bounded SSE line fragment, retained only until the first token
 	doneSent bool
 	// outTokens is the completion token count from usage, or -1 when none was seen.
 	outTokens int64
@@ -471,14 +473,18 @@ func (s *Server) blOnResponseHeaders(st *processState) {
 	}
 }
 
-// blOnResponseBody emits ft on the first non-empty body frame of a non-error response.
-// It does not parse the frame.
+// blOnResponseBody emits ft on the first generated token, not on a role-only,
+// keepalive, usage or error frame. This is the start of PreServe's decode map.
 func (s *Server) blOnResponseBody(st *processState, frame []byte) {
 	b := st.bl
-	if b == nil || b.ftSent || st.isRespError || len(frame) == 0 || s.blEvents == nil {
+	if b == nil || b.ftSent || b.doneSent || st.isRespError || len(frame) == 0 || s.blEvents == nil {
+		return
+	}
+	if !b.firstToken(frame) {
 		return
 	}
 	b.ftSent = true
+	b.ftBuffer = nil
 	now := time.Now()
 	s.blEvents.enqueue(blReqEvent{stream: b.stream, values: []string{
 		"kind", blKindFT,
@@ -489,6 +495,60 @@ func (s *Server) blOnResponseBody(st *processState, frame []byte) {
 		"pod", b.pod,
 		"dt_arr_ms", blDurMs(now.Sub(b.arrAt)),
 	}})
+}
+
+// Only the prefix before the first generated token is examined. SSE boundaries can
+// cross HTTP frames; retain at most 64 KiB of an unfinished line.
+func (b *blReqState) firstToken(frame []byte) bool {
+	data := frame
+	if len(b.ftBuffer) != 0 {
+		data = append(b.ftBuffer, frame...)
+	}
+	b.ftBuffer = nil
+	if json.Valid(data) { // non-streaming response (also accepted by the gateway)
+		return blHasGeneratedToken(data)
+	}
+	for {
+		i := bytes.IndexByte(data, '\n')
+		if i < 0 {
+			// Bound only the unfinished line, not a coalesced HTTP frame containing
+			// many complete SSE records. Copy so a tail cannot retain a large frame.
+			if len(data) > 65536 {
+				blReqEventsDropped.WithLabelValues("ft_frame_oversize").Inc()
+			} else if len(data) != 0 {
+				b.ftBuffer = append([]byte(nil), data...)
+			}
+			return false
+		}
+		line := bytes.TrimSpace(data[:i])
+		if bytes.HasPrefix(line, []byte("data:")) && blHasGeneratedToken(bytes.TrimSpace(line[5:])) {
+			return true
+		}
+		data = data[i+1:]
+	}
+}
+
+func blHasGeneratedToken(data []byte) bool {
+	if !json.Valid(data) {
+		return false
+	}
+	found := false
+	gjson.GetBytes(data, "choices").ForEach(func(_, choice gjson.Result) bool {
+		for _, field := range []string{"text", "delta.content", "delta.reasoning_content", "message.content", "message.reasoning_content"} {
+			if choice.Get(field).String() != "" {
+				found = true
+				return false
+			}
+		}
+		choice.Get("delta.tool_calls").ForEach(func(_, call gjson.Result) bool {
+			if call.Get("function.arguments").String() != "" {
+				found = true
+			}
+			return !found
+		})
+		return !found
+	})
+	return found
 }
 
 func (s *Server) blOnOutTokens(st *processState, out int64) {

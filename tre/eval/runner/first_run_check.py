@@ -18,10 +18,10 @@ Sections (text: one screen; JSON: the same, machine readable):
    baseline scaler: ticks during the load / (load duration / tick) >= ``--coverage-min``),
    frozen-tick share of a baseline that reports frozen ticks (``frozen`` true at top level or in
    ``inputs``, or a reason containing ``frozen``; not reported -> null) <= ``--frozen-max``;
-4. latency - E2E / TTFT / TPOT p50 / p90 / p95 / p99 (ms) per model and ALL, successful requests;
+4. latency - E2E / TTFT / TPOT p50 / p90 / p95 / p99 (ms) per model and ALL, strictly complete requests;
 5. replicas - mean awake / routable replicas per model over the load window (SM layout, 1 s);
 6. scale actions - by decision source, direction and reason; SM operations by kind / actor / status;
-7. abnormal - timeouts (e2e >= 149 s or stream cut), HTTP 5xx, client failures, stale snapshots,
+7. abnormal - truncated responses (partial output without strict completion), HTTP 5xx, client failures, stale snapshots,
    EMFILE, SM 5xx, controller ERROR lines, truncated logs, missing collectors.
 
 Times: the reference clock (this host); the baseline decisions' ``ts_ms`` is the Redis clock.
@@ -39,6 +39,9 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tre_eval.metrics import completion_status
 
 E2E_CUT_S = 149.0
 LOG_START_SLACK_S = 90.0
@@ -345,7 +348,8 @@ def latency(reqs: list[dict]) -> dict:
         by["ALL"].append(r)
     out = {}
     for m, rs in sorted(by.items(), key=lambda x: (x[0] == "ALL", x[0])):
-        ok = [r for r in rs if r.get("success")]
+        statuses = Counter(completion_status(r) for r in rs)
+        ok = [r for r in rs if completion_status(r) == "complete"]
         e2e = [r["e2e_latency"] * 1000 for r in ok if _num(r.get("e2e_latency")) is not None]
         ttft = [r["ttft"] * 1000 for r in ok if _num(r.get("ttft")) is not None]
         tpot = []
@@ -354,9 +358,9 @@ def latency(reqs: list[dict]) -> dict:
             if e is not None and t is not None and n > 1:
                 tpot.append((e - t) * 1000 / (n - 1))
         status = Counter(str(r.get("http_status")) for r in rs if r.get("http_status") not in (200, None))
-        cut = sum(1 for r in rs if (_num(r.get("e2e_latency")) or 0) >= E2E_CUT_S or r.get("stream_interrupted")
-                  or "RemoteProtocolError" in str(r.get("error_message") or r.get("stream_error") or ""))
+        cut = statuses["truncated"]
         out[m] = {"n": len(rs), "fail": len(rs) - len(ok), "timeouts_or_cuts": cut,
+                  "completion_status": dict(statuses), "scoring_basis": "strict-completion-v1",
                   "http_5xx": sum(v for k, v in status.items() if k.startswith("5")), "http_other": dict(status),
                   **{f"{name}_p{p}": pct(xs, p) for name, xs in (("e2e", e2e), ("ttft", ttft), ("tpot", tpot))
                      for p in (50, 90, 95, 99)}}

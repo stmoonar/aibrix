@@ -279,21 +279,38 @@ class InflightTracker:
 
     def __init__(self) -> None:
         self._where: dict[str, str] = {}
+        self._clients: dict[str, tuple[str, bool]] = {}
+        self._latest: dict[str, str] = {}
         #: pod -> req_id -> [arr ts, done ts or None]
         self._pods: dict[str, dict[str, list]] = {}
 
     def apply(self, event: RequestEvent) -> None:
         if event.kind == "arr" and event.pod:
+            if event.client_id:
+                previous = self._latest.get(event.client_id)
+                if previous and previous != event.req_id:
+                    if event.reissue != "none":
+                        self._end(previous, event.ts_ms)
+                    elif self._clients.get(previous, (None, False))[1]:
+                        return  # delayed parent arr after a sidecar reissue
+                self._latest[event.client_id] = event.req_id
+                self._clients[event.req_id] = (event.client_id, event.reissue != "none")
             old = self._where.get(event.req_id)
             if old is not None:
                 self._pods.get(old, {}).pop(event.req_id, None)
             self._where[event.req_id] = event.pod
             self._pods.setdefault(event.pod, {})[event.req_id] = [int(event.ts_ms), None]
         elif event.kind == "done":
-            pod = self._where.pop(event.req_id, None)
-            entry = self._pods.get(pod, {}).get(event.req_id) if pod is not None else None
-            if entry is not None:
-                entry[1] = int(event.ts_ms)
+            self._end(event.req_id, event.ts_ms)
+
+    def _end(self, req_id: str, ts_ms: int) -> None:
+        pod = self._where.pop(req_id, None)
+        entry = self._pods.get(pod, {}).get(req_id) if pod is not None else None
+        if entry is not None:
+            entry[1] = int(ts_ms)
+        client = self._clients.pop(req_id, None)
+        if client and self._latest.get(client[0]) == req_id:
+            self._latest.pop(client[0], None)
 
     def count(self, pod: str, since_ms: int) -> int:
         return sum(1 for _arr, done in self._pods.get(pod, {}).values() if done is None or done >= since_ms)
@@ -313,7 +330,7 @@ class InflightTracker:
         gone = [r for r, (arr, done) in reqs.items() if done is None and arr <= at_ms]
         for req_id in gone:
             reqs.pop(req_id, None)
-            self._where.pop(req_id, None)
+            self._end(req_id, at_ms)
         return len(gone)
 
 

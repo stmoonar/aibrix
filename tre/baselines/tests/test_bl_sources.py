@@ -325,3 +325,15 @@ def test_parse_event_stream_flag() -> None:
     assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r", "stream": "false"}).stream is False
     assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r", "stream": "true"}).stream is True
     assert parse_event("m", "1-0", {"kind": "arr", "req_id": "r"}).stream is None
+
+def test_reissue_ends_engine_attempt_even_while_parent_http_stream_is_open():
+    from tre_baselines.sources import InflightTracker, parse_event
+    tracker = InflightTracker()
+    def event(kind, req, pod, ts, reissue="none"):
+        return parse_event("m", f"{ts}-0", {"kind": kind, "req_id": req, "pod": pod,
+            "client_id": "client-r", "reissue": reissue, "in_tokens": "100", "max_tokens": "20"})
+    tracker.apply(event("arr", "parent", "p0", 1000))
+    tracker.apply(event("arr", "child", "p1", 2000, "retried"))
+    assert tracker.count("p0", 2100) == 0 and tracker.count("p1", 2100) == 1
+    tracker.apply(event("done", "parent", "p0", 3000))
+    assert tracker.count("p1", 3100) == 1

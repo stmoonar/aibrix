@@ -1,8 +1,8 @@
 """Metric definitions (the spec's "derived metrics" section is the normative text).
 
-Request scoring reproduces ``pilot-e1-20261005/tools/score_pilot.py`` exactly (same trim,
-same thresholds, same percentile interpolation, same rounding) so the numbers can be
-checked against every existing ``score.json``. Everything else here is additive.
+The runner and reports share this scorer. Since 2026-10-29 only success_strict proves
+completion; older rows without that field are unknown. All scored requests remain
+in the violation denominator; latency distributions use complete requests only.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import numpy as np
 
 from .load import Arm, parse_binding
 
-E2E_CENSOR_MS = 149000.0  # streams cut by the 150 s route timeout are recorded as success by the client
+E2E_CENSOR_MS = 149000.0  # diagnostic threshold only; strict completion determines truncation
 ALL = "ALL"
 
 
@@ -47,10 +47,27 @@ def ttft_threshold_ms(slo: dict, input_tokens: float) -> float:
     return slo["ttft_p95_ms"]
 
 
+def completion_status(r: dict) -> str:
+    """Only the client's strict terminal result proves completion; old rows are unknown.
+
+    A normal finish_reason=length is complete, not truncated. A failed request that
+    delivered output is truncated; failure before any output is failed.
+    """
+    strict = r.get("success_strict")
+    if strict is True:
+        return "complete"
+    if strict is not False:
+        return "unknown"
+    if (r.get("output_tokens") or 0) > 0 or r.get("first_token_field") or r.get("ttft_strict_s") is not None:
+        return "truncated"
+    return "failed"
+
+
 def score_request(r: dict, slo: dict) -> dict:
-    """Per-request scored record (times in ms). V_req = fail or TTFT>thr or TPOT>tpot_p95 or e2e>=149 s."""
+    """Per-request scored record (times in ms). V_req = not strictly complete or TTFT>thr or TPOT>tpot_p95."""
     L = r.get("input_tokens") or 0
-    ok = bool(r.get("success"))
+    completion = completion_status(r)
+    ok = completion == "complete"
     ttft = r["ttft"] * 1000 if r.get("ttft") is not None else None
     e2e = r["e2e_latency"] * 1000 if r.get("e2e_latency") is not None else None
     out = r.get("output_tokens") or 0
@@ -59,9 +76,11 @@ def score_request(r: dict, slo: dict) -> dict:
     v_tt = ttft is not None and ttft > thr
     v_tp = tpot is not None and tpot > slo["tpot_p95_ms"]
     v_e2e = e2e is not None and e2e > slo["e2e_p95_ms"]
-    censored = e2e is not None and e2e >= E2E_CENSOR_MS
-    viol = (not ok) or v_tt or v_tp or censored
-    return {"ok": ok, "ttft_ms": ttft, "tpot_ms": tpot, "e2e_ms": e2e, "out": out, "in": L,
+    # Duration alone cannot prove truncation. A normal long completion remains complete.
+    censored = completion == "truncated"
+    long_e2e = e2e is not None and e2e >= E2E_CENSOR_MS
+    viol = (not ok) or v_tt or v_tp
+    return {"ok": ok, "completion": completion, "long_e2e": long_e2e, "ttft_ms": ttft, "tpot_ms": tpot, "e2e_ms": e2e, "out": out, "in": L,
             "ttft_thr_ms": thr, "v_ttft": v_tt, "v_tpot": v_tp, "v_e2e": v_e2e, "censored": censored,
             "viol": viol, "viol_with_e2e": viol or v_e2e,
             "tpot_v1_ms": r["tpot"] * 1000 if (ok and r.get("tpot") is not None) else None,
@@ -114,12 +133,18 @@ def score_requests(rows: list[dict], slo_by_model: dict[str, dict], trim_s: floa
             c["v_tpot"] += s["v_tpot"]
             c["viol"] += s["viol"]
             c["viol_with_e2e"] += s["viol_with_e2e"]
-            c["censored_ge_149s"] += s["censored"]
+            c["censored_ge_149s"] += s["censored"] and s["long_e2e"]
+            c["e2e_ge_149s"] += s["long_e2e"]
+            for status in ("complete", "truncated", "failed", "unknown"):
+                c[status] += s["completion"] == status
             c["http_502"] += s["http_502"]
             c["output_tokens_sum"] += s["out"]
             if s["ok"]:
                 c["max_tokens_unknown"] += mt is None
                 c["max_tokens_hit"] += (mt is not None and s["out"] == mt)
+                if mt is not None:
+                    c["max_tokens_known_uncens"] += 1
+                    c["max_tokens_hit_uncens"] += s["out"] == mt
                 lat[k]["ttft"].append(s["ttft_ms"])
                 lat[k]["tpot"].append(s["tpot_ms"])
                 lat[k]["e2e"].append(s["e2e_ms"])
@@ -134,7 +159,7 @@ def score_requests(rows: list[dict], slo_by_model: dict[str, dict], trim_s: floa
         c = acc[key]
         n = max(c["n"], 1)
         ok_known = c["n"] - c["fail"] - c["max_tokens_unknown"]
-        row: dict[str, Any] = {**c, "V_req_pct": round(100 * c["viol"] / n, 3),
+        row: dict[str, Any] = {**c, "n": c["n"], "good": c["good"], "fail": c["fail"], "V_req_pct": round(100 * c["viol"] / n, 3),
                                "max_tokens_hit_frac": round(c["max_tokens_hit"] / ok_known, 5) if ok_known > 0 else None,
                                "V_req_with_e2e_pct": round(100 * c["viol_with_e2e"] / n, 3),
                                **{f"{m}_p{p}_ms": pct(lat[key][m], p) for m in ("ttft", "tpot", "e2e") for p in (50, 95, 99)}}
@@ -146,6 +171,10 @@ def score_requests(rows: list[dict], slo_by_model: dict[str, dict], trim_s: floa
             row[f"{m}_max_ms"] = round(max(v), 3) if v else None
         for p in (50, 95, 99):
             row[f"tpot_v1_p{p}_ms"] = pct(lat[key]["tpot_v1"], p)
+        row["completion_rate_pct"] = round(100 * c["complete"] / n, 3) if c["n"] else None
+        row["truncation_rate_pct"] = round(100 * c["truncated"] / n, 3) if c["n"] else None
+        row["scoring_basis"] = "strict-completion-v1"
+        row["max_tokens_hit_frac_uncensored"] = row["max_tokens_hit_frac"]
         row["slo_attainment_pct"] = round(100 - row["V_req_pct"], 3) if c["n"] else None
         row["scored_window_s"] = round(window, 3)
         row["goodput_rps"] = round(c["good"] / window, 4) if window > 0 else None

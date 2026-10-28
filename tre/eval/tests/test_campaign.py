@@ -773,7 +773,7 @@ def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
     assert all(C.arm_def(b, i.arm).controller_env["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for i in plan)
     for c in (a, b):
         probs = C.AR.expect_spec_problems(c["registry_expect"])
-        assert len(probs) == 1 and "registry_id is not filled in" in probs[0], probs   # every present path parses
+        assert probs == [], probs   # release 20261028 already pins the published registry id
         assert {"*.trs.numerator", "*.trs.theta_window_ms"} <= set(c["registry_expect"]["present"])
     assert {f"*.alt_thresholds.{s}.basis.{f}" for s in ("queue_len", "ttft_mean", "kv_usage")
             for f in ("definition", "window_ms", "ema_tau_ms")} <= set(a["registry_expect"]["present"])

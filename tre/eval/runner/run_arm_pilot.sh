@@ -138,8 +138,8 @@ GW_PARITY="${GW_PARITY:-1}"                      # 1: every arm gets event strea
 GW_EVENTS_KEEP="${GW_EVENTS_KEEP:-0}"            # 1: stream left on at the end (the next arm wants it on too)
 BL_CM_FILE="${BL_CM_FILE:-}"                     # frozen policy-configmaps.yaml (feat/baseline-params-20261006); empty = check live only
 BL_CM_APPLY="${BL_CM_APPLY:-0}"                  # 1: kubectl apply BL_CM_FILE when the live ConfigMap differs
-BL_SEED="${BL_SEED:-0}"                          # TRE_BL_SEED of the shell + the replay marker's seed (policy RNGs)
-MARK_AT="${MARK_AT:-first-send}"                 # first-send: marker after the first gateway `arr`; pre-load: just before loadgen
+BL_SEED="${BL_SEED:-0}"                          # policy error RNG only; replay marker uses TRACE_SEED
+MARK_AT="${MARK_AT:-first-send}"                 # first-send only: marker uses the first gateway `arr` timestamp
 WANT_EVENTS=0; SEND_IN_TOKENS=0
 if [ "$IS_BL" = 1 ] || [ "$GW_PARITY" = 1 ]; then WANT_EVENTS=1; SEND_IN_TOKENS=1; fi
 
@@ -182,7 +182,7 @@ if [ -e "$D/client/performance_metrics.json" ]; then
 fi
 if [ "$IS_BL" = 1 ]; then
   [ "$IGNORE_EOS" = 1 ] || { echo "baseline arms run with --ignore-eos (IGNORE_EOS=1)" >&2; exit 2; }
-  case "$MARK_AT" in first-send|pre-load) ;; *) echo "MARK_AT must be first-send|pre-load" >&2; exit 2;; esac
+  [ "$MARK_AT" = first-send ] || { echo "MARK_AT must be first-send (first arrival defines replay t0)" >&2; exit 2; }
   grep -q -- "client-sent-in-tokens" "$TRE/baselines/tre_baselines/tools/arm.py" \
     || { echo "$TRE has no baselines arm tool with --client-sent-in-tokens" >&2; exit 2; }
   R=$(kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}') \
@@ -376,9 +376,14 @@ probe_clocks() { python3 "$TOOLS/clock_probe.py" "$D/clock_offsets.json" "$1" >>
 record_components() { python3 "$TOOLS/components.py" "$D/components.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN components ($1) failed"; }
 BLT() { python3 "$TOOLS/bl_tools.py" "$@"; }
 BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET; CTL_ENV_TOUCHED=0
-GWLOG_PID=""
+GWLOG_PID=""; LGPID=""; SAMPLER=""
 on_exit() {   # safety net: never leave a baseline shell actuating or the stream flipped after a crash
   local rc=$?
+  if [ -n "$LGPID" ]; then
+    kill "$LGPID" 2>/dev/null || true
+    wait "$LGPID" 2>/dev/null || true
+  fi
+  [ -z "$SAMPLER" ] || touch "$D/STOP"
   [ -z "$GWLOG_PID" ] || kill "$GWLOG_PID" 2>/dev/null || true
   if [ "$BL_ENABLED" = 1 ]; then
     log "TRAP rc=$rc: disabling the baseline shell"
@@ -526,28 +531,21 @@ if [ "$ARM" = apa ]; then
 fi
 NOW=$(date +%s); W=$(( T_IDLE0 + IDLE_S - NOW )); [ $W -gt 0 ] && sleep $W
 log "idle done ($(( $(date +%s) - T_RESTART )) s after controller restart); awake: $(awake_set); mode: $(bash $TRE/deploy/scripts/set_run_mode.sh status | tr '\n' ' ')"
-if [ "$IS_BL" = 1 ] && [ "$MARK_AT" = pre-load ]; then
-  ARM_TOOL mark-replay --trace "$TRACE" --seed "$BL_SEED" --execute >> "$D/runner.log" 2>&1 || { log "ERROR mark-replay failed"; exit 4; }
-fi
 if [ "$IS_BL" = 1 ]; then BLT redis-ms --redis "$REDIS_HOST" > "$D/load_start_redis_ms"; fi
 T_LOAD=$(date +%s); echo "$T_LOAD" > "$D/load_start_epoch"; log "load start (loadgen flags: ${LG_FLAGS[*]:-none})"
 set +e
-run_loadgen() {
-  ( cd "$LG/loadgen_v1" && PYTHONPATH="$LG/loadgen_v1" python3 -m tre_loadgen_v1 --stage all \
-      --config "$CFG" --trace-file "$TRACE" --base-url "$GW" --max-retries 0 ${LG_FLAGS[@]+"${LG_FLAGS[@]}"} --output "$D/client" ) > "$D/client.log" 2>&1
-}
-if [ "$IS_BL" = 1 ] && [ "$MARK_AT" = first-send ]; then
-  run_loadgen &   # baseline arms: the replay marker is written at the first send (gateway arr event)
-  LGPID=$!
+# The child execs Python, so the exit trap can stop exactly this loadgen on marker failure.
+( cd "$LG/loadgen_v1" && exec env PYTHONPATH="$LG/loadgen_v1" python3 -m tre_loadgen_v1 --stage all \
+    --config "$CFG" --trace-file "$TRACE" --base-url "$GW" --max-retries 0 ${LG_FLAGS[@]+"${LG_FLAGS[@]}"} --output "$D/client" ) > "$D/client.log" 2>&1 &
+LGPID=$!
+if [ "$IS_BL" = 1 ]; then
   FIRST=$(BLT wait-first-arr --redis "$REDIS_HOST" --since-ms "$(cat "$D/load_start_redis_ms")" --models "$MODELS" --timeout-s 300)
-  [ -n "$FIRST" ] || log "WARN no gateway arr event within 300 s of load start; marking now"
-  ARM_TOOL mark-replay --trace "$TRACE" --seed "$BL_SEED" --execute >> "$D/runner.log" 2>&1 || log "ERROR mark-replay failed (PreServe Tier-1 inactive)"
-  echo "${FIRST:-null}" > "$D/first_arr_redis_ms"
-  log "replay marker written after the first arr (first arr redis ms ${FIRST:-none})"
-  wait $LGPID; RC=$?
-else
-  run_loadgen; RC=$?   # tre / apa: foreground, as before
+  [ -n "$FIRST" ] || { log "ERROR no first arrival; refusing an invented replay t0"; exit 4; }
+  ARM_TOOL mark-replay --trace "$TRACE" --seed "${TRACE_SEED:-0}" --t0-ms "$FIRST" --execute >> "$D/runner.log" 2>&1 || { log "ERROR mark-replay failed"; exit 4; }
+  echo "$FIRST" > "$D/first_arr_redis_ms"
+  log "replay marker uses first arr Redis ms $FIRST"
 fi
+wait "$LGPID"; RC=$?; LGPID=""
 set -e
 T_END=$(date +%s); echo "$T_END" > "$D/load_end_epoch"; log "load end rc=$RC ($(( T_END - T_LOAD )) s)"
 if [ "$SEND_IN_TOKENS" = 1 ]; then

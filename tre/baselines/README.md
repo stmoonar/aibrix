@@ -106,7 +106,7 @@ default.
 ```bash
 python3 -m tre_baselines.tools.arm enable --policy chiron|tokenscale|preserve [--dry-run-shell] [--models a,b] [--execute]
 python3 -m tre_baselines.tools.arm disable --collect-dir <dir> [--execute]   # or --skip-collect
-python3 -m tre_baselines.tools.arm mark-replay --trace <path> --seed <int> [--execute]
+python3 -m tre_baselines.tools.arm mark-replay --trace <path> --seed <trace-seed> --t0-ms <first-arrival-redis-ms> [--execute]
 ```
 
 Without `--execute` it only prints the `kubectl` commands. With it, `enable` first checks
@@ -117,7 +117,8 @@ lock; `disable` first copies the decision logs out of the pod (`kubectl cp
 <ns>/<pod>:/var/log/tre-baselines <collect-dir>/<pod>`, `--collect-dir` required with
 `--execute` unless `--skip-collect`; a failed copy aborts before scaling), then scales to 0
 and waits for the lock to go; `mark-replay` writes
-`tre:v2:bl:replay_t0` = `{t0_ms (Redis TIME), trace_path, seed}`. Options `--namespace`,
+`tre:v2:bl:replay_t0` = `{t0_ms, trace_path, seed}`. The runner supplies the first
+arrival timestamp; the manual tool defaults to current Redis TIME only when `--t0-ms` is omitted. Options `--namespace`,
 `--deployment`, `--redis-url` (env `TRE_REDIS_URL`; else `kubectl exec` into
 `--redis-deploy`). Nothing about the cluster is hard-coded.
 
@@ -218,39 +219,17 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   to a character-count estimate (poor for Chinese text). Keep the header in the plan:
   until clients send it, TokenScale sits in `degraded_estimate_frac` (it refuses to trust
   a window where more than `max_estimate_frac` of the counts are estimates).
-- **Replay t0.** `arm mark-replay` stamps `t0_ms` when it runs; the replayer's own warm-up
-  can make that t0 lead the first real send. The replayer should write the marker at its
-  first send (not done: `tre/replayer` is outside this line); until then PreServe Tier-1
-  windows may start early by the warm-up.
-- **PreServe map** (2026-10-26, v1 parity). A request enters the look-ahead map at its `arr`
-  event, which the gateway writes once the target pod is chosen (v1 `routed`): `P` = `in_tokens`,
-  `D_hat` = `max_tokens` (or its load-error prediction), the head starting at the `arr` time.
-  So requests queued inside vLLM (waiting, or in prefill) count too, and non-streaming requests
-  are in the map. v1 discloses this as a strengthening against the paper, which books a request
-  at prefill done; v2 booked at `ft` (first token) until this date. `ft` no longer changes the
-  map. A reissue (sidecar retry / continuation) is a new gateway request: a new entry with its
-  own `in_tokens` / `max_tokens` (Tier-1 does not count it). A request leaves on its `done`
-  (completion or abort), when its pod leaves the snapshot, or when the engine reports nothing in
-  flight at a scrape at least 1 s after its `arr` (v1's margin: a request routed just before
-  the scrape may not have reached the engine yet). A request without `done` after
-  `max(D_hat, max_tokens) x done_tpot_bound_s + done_margin_s` (0.2 s/token + 180 s, v1 D65:
-  above the 150 s route timeout) is expired as a lost done (`expired_routed`), and Tier-2 holds
-  for one window (gap `done_lost`), as v1.
-- **PreServe slept pods** (2026-10-26). A pod that leaves the snapshot drops its map and its
-  buffered events, and any event for it stamped at or before the last tick that saw it absent
-  is discarded (also when read later, and also an `arr` the gateway routed to it until the
-  hide receipt), so a woken pod starts with an empty map. A `done` of such a request counts as
-  `done_pod_gone` (not `unknown_req`). Before this fix, events buffered while the pod slept were
-  applied at its wake (smoke 2026-10-26: 51 stale requests, map U0 0.23 vs engine KV 0.011).
-  Cost: an `arr` routed to a just-woken pod before the first tick that lists it is discarded too
-  (at most one tick of requests on that pod, an under-count); a pod never listed before still
-  has its early events buffered.
-- **PreServe deviations from v1** (2026-10-26). (a) v1 `_apply_pending` applied the events
-  buffered while a pod slept at its wake (the same bug as above); v2 drops them. (b) A
-  `reissue=retried` request whose original pod stays listed is in the map twice (original and
-  retry) until the original's `done`; v1 ended the original at its interruption. (c) v1's
-  `arr` de-duplication and its done-before-routed tombstones are not needed: the v2 gateway
-  writes `arr` once per request, and `arr` and `done` come in order from one gateway.
+- **Replay t0 (2026-10-29).** The runner passes the first arrival's Redis timestamp
+  through `arm mark-replay --t0-ms`, with the trace seed separate from policy RNG seeds.
+  PreServe retains bounded pre-marker arrivals and backfills its first observation window.
+  The runner rejects the old `MARK_AT=pre-load` option and stops loadgen on marker failure.
+- **PreServe execution attempts (2026-10-29).** `arr` keeps pending work; the first
+  generated-token `ft` enters the decode map. A sidecar reissue linked by `client_id`
+  replaces the previous `(gateway req_id, pod)` execution even if its forwarding HTTP
+  stream remains open. Late parent events cannot end the child. Requests arriving before
+  the first awake snapshot are retained; no absence-tick cutoff drops them. Lost events
+  and the existing time/ITL progress approximation remain observable limitations.
+
 - **T1 schema.** The service manager's structured 409 body and the new `/v2/state` fields
   are provisional (the T1 line is not merged); the shell parses both plain and structured
   refusals (and honours `retry_after_s` when present).
@@ -262,3 +241,26 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
   handling the request; closing it needs the SM to reject a stale owner generation.
 - The E1 trace format and where the `*.effective.json` (per-request schedule) lands are
   not verified; PreServe Tier-1 needs the trace of the replay and its seed.
+
+## Causal histories and strict evaluation (2026-10-29)
+
+For a `tre-frozen-suite-v1` suite, generate independent histories without reading test
+requests or inferring their average rate/length:
+
+```bash
+python3 -m tre_baselines.tools.preserve_history_frozen --spec <frozen-suite.json> \
+  --dataset-root <azure-root> --out-root <history-root>
+```
+
+Real models use their own preceding 25 x 30 s interval, frozen sampling and input floor.
+The frozen suite lengths are already chat-template-inclusive; no extra template offset
+is added. Synthetic history explicitly extends the initial baseline or sinusoid into
+the past. Source hashes, exact intervals and retained counts accompany every history.
+Set the campaign's `preserve.history_root`, or place `preserve_history.json` beside the
+trace. The old `preserve_history real` command reproduces historical v1 results only;
+it uses test-set statistics and must not prepare new causal experiments.
+
+The runner and report now share `tre_eval.metrics`: `success_strict=True` alone proves
+completion. Partial failures, failures before output and unknown old completion status
+are reported separately. All scored requests remain in the SLO denominator; only complete
+ones enter latency percentiles. The scoring basis is recorded as `strict-completion-v1`.

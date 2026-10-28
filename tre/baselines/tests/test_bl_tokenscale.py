@@ -219,7 +219,7 @@ def test_arrivals_without_an_input_count_count_like_estimates():
 def test_degraded_estimate_fraction():
     evs = [_ev(99_000, src="estimate")] + [_ev(99_000) for _ in range(9)]
     d = _policy().decide(_snap(100_000, evs, awake=4))[M]
-    assert d.reason == "degraded_estimate_frac" and d.desired == 4 and d.inputs["estimate_frac"] == 0.1
+    assert d.reason == "degraded_estimate_frac" and d.desired == 9 and d.inputs["estimate_frac"] == 0.1
     ok = [_ev(99_000, src="estimate")] + [_ev(99_000) for _ in range(99)]  # 1 % <= 5 %
     assert _policy().decide(_snap(100_000, ok, awake=4))[M].reason == "velocity"
 
@@ -270,3 +270,12 @@ def test_registry_models_must_all_have_velocity():
 def test_example_params_load():
     path = Path(__file__).resolve().parents[1] / "examples" / "tokenscale.yaml"
     build_policy("tokenscale", _cfg(yaml.safe_load(path.read_text(encoding="utf-8"))))
+
+def test_estimates_neither_create_scaleup_evidence_nor_allow_scaledown():
+    only_estimates = [_ev(99_000, src="estimate") for _ in range(200)]
+    d = _policy().decide(_snap(100_000, only_estimates, awake=3))[M]
+    assert d.reason == "degraded_estimate_frac" and d.desired == 3
+
+def test_unknown_input_source_cannot_prove_a_scaleup():
+    d = _policy().decide(_snap(100_000, [_ev(99_000, src=None) for _ in range(200)], awake=3))[M]
+    assert d.reason == "degraded_estimate_frac" and d.desired == 3

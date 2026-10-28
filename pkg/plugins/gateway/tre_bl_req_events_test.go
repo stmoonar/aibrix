@@ -537,7 +537,7 @@ func TestBLReqEvents_DoneExactlyOnceOnEveryEnding(t *testing.T) {
 				srv.On("Recv").Return(blRespBody("data: {\"usage\": broken\n\n", false), nil).Once()
 				srv.On("Recv").Return((*extProcPb.ProcessingRequest)(nil), status.Error(codes.Canceled, "done")).Once()
 			},
-			wantKinds: []string{"arr", "ft", "done"}, wantStatus: "500",
+			wantKinds: []string{"arr", "done"}, wantStatus: "500",
 		},
 		"completed": {
 			script: func(srv *mockProcessServer) {
@@ -637,7 +637,7 @@ func TestBLReqEvents_StreamEndHookIdempotent(t *testing.T) {
 	s.blOnResponseBody(st, []byte("x"))
 	s.blOnResponseBody(st, []byte("y"))
 	s.blEvents.close()
-	assert.Equal(t, []string{"done", "ft"}, blKinds(r.events(t, "m")))
+	assert.Equal(t, []string{"done"}, blKinds(r.events(t, "m")))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -834,5 +834,27 @@ func (h blPipelineCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) r
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		h.fn()
 		return next(ctx, cmds)
+	}
+}
+
+func TestBLReqEvents_FirstTokenSkipsRoleAndBuffersSplitSSE(t *testing.T) {
+	for _, coalesced := range []bool{false, true} {
+		e := &blReqEmitter{ch: make(chan blReqEvent, 4)}
+		s := &Server{blEvents: e}
+		st := &processState{bl: &blReqState{stream: BLReqEventsKeyPrefix + "m", arrAt: time.Now()}}
+		s.blOnResponseBody(st, []byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"))
+		s.blOnResponseBody(st, []byte(": keepalive\n\ndata: {\"choices\":[],\"usage\":{}}\n\n"))
+		assert.Empty(t, e.ch, "role, usage and heartbeat must not emit ft")
+		prefix := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hel"
+		if coalesced {
+			prefix = strings.Repeat(": keepalive\n\n", 6000) + prefix
+		}
+		s.blOnResponseBody(st, []byte(prefix))
+		assert.Empty(t, e.ch, "partial JSON must wait for its next frame")
+		s.blOnResponseBody(st, []byte("lo\"}}]}\n\n"))
+		require.Len(t, e.ch, 1, "exactly one ft on first generated content")
+		assert.Equal(t, "ft", (<-e.ch).values[1])
+		s.blOnResponseBody(st, []byte("data: {\"choices\":[{\"delta\":{\"content\":\"later\"}}]}\n\n"))
+		assert.Empty(t, e.ch, "later content must not repeat ft")
 	}
 }
