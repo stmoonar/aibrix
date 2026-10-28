@@ -19,7 +19,7 @@ from tre_controller.planning.planner import BlockSupplyAction, ClusterView, Scal
 from tre_sm.allocator.slots import release_order
 
 from plan_shim import PlanSM
-from test_single_loop_20261028 import CRIT, HEALTHY, HIGH, IDLE, TOPOLOGY, _binding, _tp2
+from test_single_loop_20261028 import CRIT, HEALTHY, HIGH, IDLE, LOW, TOPOLOGY, _binding, _tp2
 
 
 
@@ -124,3 +124,42 @@ def test_an_immediate_shrink_names_its_pods_by_the_shared_release_order():
     # No fleet view and no metrics pods: nothing to name - dropped, with an event.
     dropped, events = _name_shrink_pods(snapshot, (shrink,), None)
     assert dropped == () and events == ("shrink_unnamed:i",)
+
+
+# ------------------------------------------- one replica per plan of a non-IDLE donor
+def _h_gives(receivers, scope):
+    """HIGH ``h`` on GPUs 0-2 (floor 0), ``x`` on GPU 3; each TP1 receiver sleeps
+    under every h pod. Returns the h pods the plan takes (sleeps and probe hides) and
+    the receivers it wakes, after the tick SafeScale step under ``scope``."""
+    from tre_controller.config import SafeScaleConfig
+    from tre_controller.planning.safescale import SafeScaleStateMachine
+    from test_single_loop_20261028 import _plan
+
+    bindings = [*(_binding(f"h-{gpu}", "h", (gpu,), True) for gpu in range(3)), _binding("x-3", "x", (3,), True)]
+    bindings += [_binding(f"{model}-{gpu}", model, (gpu,), False) for model in receivers for gpu in range(3)]
+    plan = _plan(bindings, {**receivers, "h": (*HIGH, 1.4), "x": (*HEALTHY, 1.1)},
+                 min_replicas_by_model={"x": 1, "h": 0}, release_without_safescale=scope != "all")
+    machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
+    snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=False)
+    out, _ = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=machine,
+                              cluster_view=ClusterView(TOPOLOGY, tuple(bindings)), safescale_scope=scope)
+    taken, woken = [], []
+    for action in out:
+        for member in getattr(action, "members", (action,)):
+            if member.model == "h":
+                taken.extend(member.pods)
+            elif isinstance(member, ScaleAction) and member.delta > 0:
+                woken.append(member.model)
+    return taken, woken
+
+
+@pytest.mark.parametrize("scope", ["receiverless_shrink", "off", "all"])
+@pytest.mark.parametrize("receivers", [
+    {"a": (*CRIT, 0.1), "b": (*CRIT, 0.2)},       # two CRITICAL receivers
+    {"c": (*CRIT, 0.1), "l": (*LOW, 0.9)},       # a CRITICAL and a LOW receiver
+], ids=["two_critical", "critical_and_low"])
+def test_a_non_idle_donor_gives_one_replica_per_plan_across_receivers(receivers, scope):
+    taken, woken = _h_gives(receivers, scope)
+    assert len(taken) == 1, (taken, woken)
+    if scope != "all":  # released at once: one transfer to the most critical receiver
+        assert woken == [min(receivers, key=lambda model: receivers[model][2])]

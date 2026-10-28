@@ -656,6 +656,12 @@ def build_plan(
         _event_once(events, f"safescale_rollback_hold:{model}:{probe_backoff_models[model]}")
         return True
 
+    def gave_this_plan(model: str) -> bool:
+        # User rule (2026-10-28): a non-IDLE donor gives at most ONE replica per plan,
+        # across all receivers and both sections - a relay, a block or a probe of it
+        # already planned (its delta, its block) ends its giving for this plan.
+        return deltas.get(model, 0) < 0 or model in block_donor_models
+
     def note_relay_past_hold(model: str, gained: int) -> None:
         # An immediate relay took a donor whose probe rollback hold would have vetoed it
         # before 2026-10-26 (hazard (d)) - logged so a rerun shows where that happened.
@@ -1026,7 +1032,7 @@ def build_plan(
                         middle.model_name == recv.model_name
                         or middle.model_name in active_probe_models
                         or middle.model_name in inflight_models
-                        or middle.model_name in block_donor_models  # gave a block this plan
+                        or gave_this_plan(middle.model_name)  # one replica per plan (non-IDLE)
                     ):
                         continue
                     if cooldown.blocks(middle.model_name, "down"):
@@ -1051,7 +1057,7 @@ def build_plan(
                             donor=middle.model_name,
                             receiver=recv.model_name,
                             need=still_needed,
-                            donor_limit=middle_limit,
+                            donor_limit=min(1, middle_limit),  # one replica per plan
                             reason=f"{middle_reason}{NO_SAFESCALE_REASON_SUFFIX}",
                             source_loop="rescue",
                             events=events,
@@ -1306,7 +1312,7 @@ def build_plan(
                 middle.model_name == recv.model_name
                 or middle.model_name in active_probe_models
                 or middle.model_name in inflight_models
-                or middle.model_name in block_donor_models  # gave a block this plan
+                or gave_this_plan(middle.model_name)  # one replica per plan (non-IDLE)
             ):
                 continue
             if cooldown.blocks(middle.model_name, "down"):
@@ -1330,7 +1336,7 @@ def build_plan(
                     donor=middle.model_name,
                     receiver=recv.model_name,
                     need=needed,
-                    donor_limit=middle_limit,
+                    donor_limit=min(1, middle_limit),  # one replica per plan
                     reason=f"{middle_reason}{NO_SAFESCALE_REASON_SUFFIX}",
                     source_loop="fairness",
                     events=events,
