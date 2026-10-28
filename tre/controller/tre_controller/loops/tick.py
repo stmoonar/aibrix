@@ -804,6 +804,13 @@ def _apply_safescale(
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
         return _release_without_safescale(actions)
+    # An IDLE donor's same-slot release is immediate under every scope (one plan, no
+    # probe; design 20261028-single-loop L4).
+    actions = tuple(
+        _release_without_safescale((action,))[0][0]
+        if isinstance(action, ShrinkForSlotAction) and action.immediate else action
+        for action in actions
+    )
     if safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK:
         # TRE_SAFESCALE_SCOPE=receiverless_shrink (2026-10-26): only a receiver-less
         # shrink stays a probe; any other probe placement is released at once.
@@ -945,6 +952,8 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
             continue
         reason = f"{action.reason}{NO_SAFESCALE_REASON_SUFFIX}"
         if isinstance(action, ShrinkForSlotAction):
+            if action.immediate:
+                reason = action.reason  # immediate by policy (IDLE), not for lack of SafeScale
             out.append(PlanBatch((
                 ScaleAction(
                     action.donor, -1, reason, action.source_loop, donor=action.donor,

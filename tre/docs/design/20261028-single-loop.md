@@ -104,9 +104,11 @@ Defects seen in the 10-28 campaign and review:
   is retired with the other step keys.
 - L4: the middle-zone donor limit for a TP receiver is `step x tp_size` donor replicas
   (one aligned slot of single-GPU donors; one step alone could never fill a slot).
-- L4: under scope `all` every same-slot release is a probe, an IDLE donor's too (the
-  design says "probe first" for that scope); the receiver target of the commit carries
-  the hints (the receiver's sleeping bindings on the GPUs of the probe pods).
+- L4: an IDLE donor's same-slot release is immediate under every scope, scope `all`
+  included (only an IDLE donor is released at once): one `PlanBatch`, no probe. HIGH /
+  middle-zone donors keep the scope semantics (probe under `all`; the commit's
+  receiver target carries the hints - the receiver's sleeping bindings on the GPUs of
+  the probe pods).
 - L4: `capacity_blocked:<model>` is recorded once at the end of a TP receiver's
   rescue, when the slot path and the relays together left it short (no longer by the
   slot path alone, which the relays may still fill).

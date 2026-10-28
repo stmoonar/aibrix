@@ -374,6 +374,9 @@ class ShrinkForSlotAction:
     receiver_pods: tuple[str, ...] = ()
     #: C1: the receiver's rescue target (bookkeeping only).
     rescue: RescuePlan | None = field(default=None, compare=False)
+    #: An IDLE donor: released at once under every scope (no probe; only an IDLE donor
+    #: is released immediately). HIGH / middle zone: a probe under scope ``all``.
+    immediate: bool = False
 
 
 Action = ScaleAction | TransferIntent | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
@@ -879,13 +882,13 @@ def build_plan(
                         # and gives nothing else this plan. A donor whose last probe
                         # rolled back waits for new evidence while this shrink is a
                         # probe (scope ``all``); released at once
-                        # (``release_without_safescale``) it is not held.
+                        # (``release_without_safescale``, an IDLE donor) it is not held.
                         inflight_models=(
                             inflight_models | cooldown.down_blocked() | slot_shrink_donors
                             | delayed_down_models
                             | {
                                 item.model_name
-                                for item in (*idle_models, *high_models, *middle_zone)
+                                for item in (*high_models, *middle_zone)
                                 if donor_rollback_held(item.model_name)
                             }
                         ),
@@ -901,7 +904,8 @@ def build_plan(
                         # is logged in the decision stream.
                         actions.append(same_slot_shrink)
                         slot_shrink_donors.add(same_slot_shrink.donor)
-                        delayed_down_models.add(same_slot_shrink.donor)
+                        if not same_slot_shrink.immediate:
+                            delayed_down_models.add(same_slot_shrink.donor)
                         # Replica floor (2026-09-29, fix C, relaxed): the shrink takes one
                         # replica of the donor. It is recorded in the plan's deltas only, so
                         # a later receiver's donor check counts it against the floor (two
@@ -913,8 +917,9 @@ def build_plan(
                         # {beneficiary: 1} (_safescale_pending_upscales); the plan records the
                         # same promise (the fairness piggyback that read it was removed on
                         # 2026-10-07: a donor probed in this plan gives nothing else).
-                        pending = probe_upscale_plans.setdefault(same_slot_shrink.donor, {})
-                        pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
+                        if not same_slot_shrink.immediate:
+                            pending = probe_upscale_plans.setdefault(same_slot_shrink.donor, {})
+                            pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
                         if occupancy is not None:
                             occupancy.count_released((same_slot_shrink.serve_id,))
                             # Item 3: the free slot mate the commit's wake needs is no
@@ -2036,6 +2041,7 @@ def _try_plan_same_slot_shrink(
         reason=f"critical_same_slot_{_SAME_SLOT_TIERS[best[0]]}_shrink",
         source_loop=source_loop,
         receiver_pods=receiver_pods,
+        immediate=_SAME_SLOT_TIERS[best[0]] == "idle",
     )
 
 

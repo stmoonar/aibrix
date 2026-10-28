@@ -1,7 +1,8 @@
 """Single decision loop (design docs/design/20261028-single-loop.md): the invariants.
 
 1. A same-slot release is ONE plan: the donor pod's sleep and the receiver's wake with
-   its binding on that slot as the hint - never a bare donor sleep, under every scope.
+   its binding on that slot as the hint - never a bare donor sleep, under every scope;
+   an IDLE donor's release is that plan at once even under scope ``all`` (no probe).
 2. Order: two CRITICAL receivers compete for one free GPU - the lower Z wins whatever
    the registry order; a LOW receiver is never planned before a CRITICAL one.
 3. One step: a receiver gets at most +1 per plan however deep its Z and however much
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -134,13 +136,18 @@ VIEW = ClusterView(TOPOLOGY, (
 ))
 
 
-@pytest.mark.parametrize("scope", ["receiverless_shrink", "off"])
-def test_a_same_slot_release_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope):
+@pytest.mark.parametrize(("scope", "shrink"), [
+    ("receiverless_shrink", SHRINK),
+    ("off", SHRINK),
+    ("all", replace(SHRINK, reason="critical_same_slot_idle_shrink", immediate=True)),  # IDLE donor
+])
+def test_a_same_slot_release_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope, shrink):
     machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
 
-    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (SHRINK,), {},
-                              safescale=machine, safescale_scope=scope)
+    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (shrink,), {},
+                              safescale=machine, cluster_view=VIEW, safescale_scope=scope)
 
+    assert machine is None or machine.active_probe("d") is None  # no probe
     [plan] = out
     assert isinstance(plan, PlanBatch)
     items = [plan_item(member) for member in plan.members]
@@ -169,8 +176,8 @@ def test_a_free_gpu_and_an_idle_donor_pod_give_the_tp2_receiver_its_slot_in_one_
     plan = _tp2(_binding("i-0", "i", (0,), True), _binding("i-2", "i", (2,), True), _binding("i-3", "i", (3,), True))
 
     shrinks = [action for action in plan.actions if isinstance(action, ShrinkForSlotAction)]
-    assert [(a.donor, a.serve_id, a.beneficiary, a.receiver_pods, a.reason) for a in shrinks] == [
-        ("i", "i-0", "tp2", ("tp2-0",), "critical_same_slot_idle_shrink")
+    assert [(a.donor, a.serve_id, a.beneficiary, a.receiver_pods, a.reason, a.immediate) for a in shrinks] == [
+        ("i", "i-0", "tp2", ("tp2-0",), "critical_same_slot_idle_shrink", True)
     ]
     assert shrinks[0].rescue is not None and shrinks[0].rescue.target == 2
 
