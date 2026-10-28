@@ -242,8 +242,7 @@ def gpu_memory_utilization(spec: Any) -> float:
 
 #: Sleep paths (plan 2026-09-27 D1): every caller that puts a binding to sleep names
 #: one (recorded with the outcome; replica-floor rules). The service-manager never
-#: drains on any path (2026-10-02), so ``service_manager.sleep.budgets_s`` keyed by
-#: them is ignored.
+#: drains on any path (2026-10-02).
 SLEEP_PATHS = (
     "safescale_commit",  # SafeScale commit of a hidden probe pod
     "urgent",  # controller *_immediate donor paths (fast loop)
@@ -255,36 +254,22 @@ SLEEP_PATHS = (
     "default",  # any caller that names no path
 )
 
-#: DEPRECATED (2026-10-02): the service-manager never drains - every sleep is
-#: hide -> gateway ack -> one load read -> /sleep, all under its writer lock
-#: (design docs/design/20261002-sm-wholelock.md). ``budgets_s``, ``no_drain_paths``,
-#: ``hard_cap_s`` and ``reservation_ttl_s`` still parse (live registries and the
-#: controller still carry them) but the service-manager ignores them and logs a
-#: deprecation line at start. Former meaning: soft drain budgets (s), ``None`` =
-#: only the hard cap.
-DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
-    # The caller passes the probe window as drain_budget_s; without one, hard cap.
-    "safescale_commit": None,
-    "urgent": 30.0,
-    # No deadline pressure: wait for in-flight requests up to the hard cap. The same
-    # budget applies to TRE and APA scale-downs (both arms drain identically).
-    "scale_down": None,
-    # APA scale-downs (was "scale_down" before 2026-09-29; through /scale_service until
-    # 2026-10-27, now a POST /v2/plans sleep item with this path): with "apa" in
-    # no_drain_paths (default) the budget is unused; without it, the old hard-cap drain.
-    "apa": None,
-    "defrag": 30.0,
-    "repair": 30.0,
-    "startup": 30.0,
-    "default": 30.0,
-}
+#: Retired 2026-10-28 (the service-manager never drains since 2026-10-02 and has no
+#: sleep reservation or separate commit phase; design docs/design/20261002-sm-wholelock.md):
+#: ``service_manager.sleep.budgets_s`` / ``hard_cap_s`` / ``reservation_ttl_s`` and
+#: ``service_manager.commit_lock_wait_s``. The shipped registry still carries them for
+#: rollback images that read them (deploy/tests/test_registry_compat_20261006.py), so a
+#: registry with them loads; they are not read, validated or logged.
+RETIRED_SLEEP_KEYS = frozenset({"budgets_s", "hard_cap_s", "reservation_ttl_s"})
+RETIRED_SERVICE_MANAGER_KEYS = frozenset({"commit_lock_wait_s"})
 
 #: DEPRECATED (2026-10-02): ``service_manager.sleep.no_drain_paths``, the sleep paths
 #: that skipped the drain (hide -> gateway ack -> /sleep ``mode=abort`` at once; the
 #: reissue sidecar continues what it can). Every path is a no-drain path now and the
-#: service-manager ignores the key (still parsed and validated). The default lists
-#: every path, like the live registry, so an older image (a rollback) that still
-#: reads it never drains either.
+#: service-manager ignores the key; it is still parsed and validated because the
+#: baseline scaler checks its abort path against it at start
+#: (tre_baselines.config). The default lists every path, like the live registry, so
+#: an older image (a rollback) that still reads it never drains either.
 DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = SLEEP_PATHS
 
 #: Connect timeout (s) of one Kubernetes API call of the service-manager; the
@@ -314,7 +299,7 @@ K8S_CALLS_WAVE1_RECORD = 2
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
-#: the default of the deprecated (ignored) ``service_manager.sleep.hard_cap_s``.
+#: the drain hard cap of images before 2026-10-02.
 DEFAULT_ROUTE_TIMEOUT_S = 150.0
 
 #: Default ``gateway.upstream_idle_timeout_s``: how long the tre-v2 Envoy keeps an idle
@@ -948,45 +933,18 @@ class SleepPolicy:
     #: scheduling and waits for the running queue, an HTTP timeout does not
     #: cancel it, and the waiting queue stays frozen.
     sleep_mode_when_idle: str = "abort"
-    #: DEPRECATED, ignored (2026-10-02: no drain). Parsed for compatibility;
-    #: defaults to gateway.route_timeout_s.
-    hard_cap_s: float = DEFAULT_ROUTE_TIMEOUT_S
-    #: DEPRECATED, ignored (2026-10-02: no sleep reservation - every sleep holds
-    #: the writer lock from the hide to the bookkeeping). Parsed for compatibility.
-    #: 40 (2026-10-06): the registry ships this value for the previous image
-    #: (ba5b558f), which requires it above writer_lock_wait_s + poll_interval_s +
-    #: probe_timeout_s + io_margin_s (37.5 s with the defaults).
-    reservation_ttl_s: float = 40.0
     #: Gateway plugin pods that must ack, besides advancing heartbeats: a plugin
     #: with Redis trouble may still route while its heartbeat stalls, so Ready pods
     #: matching this selector count as live too. None = heartbeats only.
     plugin_namespace: str = "tre-v2"
     plugin_label_selector: str | None = "app=tre-gateway-plugins"
-    budgets_s: dict[str, float | None] = field(
-        default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
-    )
-    #: DEPRECATED, ignored (2026-10-02): see DEFAULT_NO_DRAIN_PATHS.
+    #: DEPRECATED, ignored by the service-manager (2026-10-02): see DEFAULT_NO_DRAIN_PATHS.
     no_drain_paths: tuple[str, ...] = DEFAULT_NO_DRAIN_PATHS
 
     def no_drain(self, path: str) -> bool:
         """DEPRECATED (2026-10-02): what ``no_drain_paths`` configures. The
         service-manager no longer reads it - it never drains on any path."""
         return path in self.no_drain_paths
-
-    def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
-        """DEPRECATED (2026-10-02): the drain budget the old configuration would
-        give. The service-manager no longer reads it - it never drains."""
-        if requested_s is not None:
-            budget = float(requested_s)
-            if not math.isfinite(budget) or budget < 0:
-                raise ValueError(f"drain budget must be a finite number >= 0, got {requested_s!r}")
-        if self.no_drain(path):
-            return 0.0
-        if requested_s is None:
-            key = path if path in self.budgets_s else "default"
-            raw = self.budgets_s.get(key)
-            budget = self.hard_cap_s if raw is None else float(raw)
-        return min(budget, self.hard_cap_s)
 
 
 #: Accepted values of ``service_manager.log_level`` (and TRE_SM_LOG_LEVEL).
@@ -1034,8 +992,6 @@ class ServiceManagerConfig:
     #: hung engine) a caller gets 409 writer_busy and retries on its next tick.
     #: Waiters are served first-come first-served.
     writer_lock_wait_s: float = 30.0
-    #: DEPRECATED, ignored (2026-10-02: a sleep has no separate commit phase).
-    commit_lock_wait_s: float | None = None
     #: ``service_manager.wake.call_timeout_s``: HTTP timeout of one /wake_up call
     #: (single attempt; measured 1.5-3 s). A call without an answer leaves the
     #: wake journaled (the engine may still wake) for the journal recovery.
@@ -1674,10 +1630,8 @@ def parse_service_manager_config(
     raw: dict[str, Any] | None, *, gateway: dict[str, Any] | None = None
 ) -> ServiceManagerConfig:
     """Parse the optional ``service_manager:`` registry section (all keys optional).
-
-    ``sleep.hard_cap_s`` defaults to ``gateway.route_timeout_s`` (the gateway's
-    request timeout: no request can outlive it anyway), else 150 s.
-    """
+    The retired keys (:data:`RETIRED_SLEEP_KEYS`, :data:`RETIRED_SERVICE_MANAGER_KEYS`)
+    are accepted and not read. ``gateway`` is accepted for callers that pass it."""
     raw = raw or {}
     sleep_raw = raw.get("sleep") or {}
     wake_raw = raw.get("wake") or {}
@@ -1702,17 +1656,6 @@ def parse_service_manager_config(
         )
     defaults = SleepPolicy()
     plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
-    hard_cap = sleep_raw.get("hard_cap_s")
-    if hard_cap is None:
-        hard_cap = (gateway or {}).get("route_timeout_s")
-    budgets = dict(DEFAULT_SLEEP_BUDGETS_S)
-    for path, value in (sleep_raw.get("budgets_s") or {}).items():
-        if str(path) not in SLEEP_PATHS:
-            raise ValueError(
-                f"service_manager.sleep.budgets_s: unknown sleep path {path!r} "
-                f"(known: {', '.join(SLEEP_PATHS)})"
-            )
-        budgets[str(path)] = None if value is None else float(value)
     no_drain_raw = sleep_raw.get("no_drain_paths", DEFAULT_NO_DRAIN_PATHS)
     if no_drain_raw is None:
         no_drain_raw = ()
@@ -1753,9 +1696,6 @@ def parse_service_manager_config(
         sleep_mode_when_idle=str(
             sleep_raw.get("sleep_mode_when_idle", defaults.sleep_mode_when_idle)
         ).strip().lower(),
-        hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
-        reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
-        budgets_s=budgets,
         no_drain_paths=no_drain_paths,
         plugin_namespace=str(plugin_pods_raw.get("namespace", defaults.plugin_namespace)),
         plugin_label_selector=plugin_pods_raw.get(
@@ -1779,9 +1719,6 @@ def parse_service_manager_config(
             pressure_raw.get("registry_nodes_only", base.pressure_registry_nodes_only)
         ),
         writer_lock_wait_s=_num(raw, "writer_lock_wait_s", base.writer_lock_wait_s),
-        commit_lock_wait_s=(
-            None if raw.get("commit_lock_wait_s") is None else float(raw["commit_lock_wait_s"])
-        ),
         wake_call_timeout_s=_num(wake_raw, "call_timeout_s", base.wake_call_timeout_s),
         api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
         log_level=(
@@ -1893,19 +1830,12 @@ def _validate_service_manager(
         errors.append("service_manager.wake.call_timeout_s must be positive")
     if not math.isfinite(config.k8s_request_timeout_s) or config.k8s_request_timeout_s <= 0:
         errors.append("service_manager.k8s_request_timeout_s must be positive")
-    for path, value in sleep.budgets_s.items():
-        if path not in SLEEP_PATHS:
-            errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
-        elif value is not None and (not math.isfinite(value) or value < 0):
-            errors.append(f"service_manager.sleep.budgets_s.{path} must be >= 0 or null")
     for path in sleep.no_drain_paths:
         if path not in SLEEP_PATHS:
             errors.append(f"service_manager.sleep.no_drain_paths: unknown sleep path {path}")
     if gateway is not None:
         if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
             errors.append("gateway.route_timeout_s must be positive")
-        # sleep.hard_cap_s is no longer checked against the route timeout: it is
-        # deprecated and ignored (2026-10-02, the service-manager never drains).
     if not (0.0 < config.wake_max_used_fraction <= 1.0):
         errors.append("service_manager.wake.max_used_fraction must be in (0, 1]")
     if config.wake_max_used_mib is not None and config.wake_max_used_mib <= 0:

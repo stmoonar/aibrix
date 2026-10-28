@@ -197,27 +197,6 @@ def sleep_mode_supported(version: str | None) -> bool:
     return parsed is not None and parsed >= SLEEP_MODE_MIN_VERSION
 
 
-def log_ignored_drain_settings(policy: SleepPolicy, logger: logging.Logger | None = None) -> str:
-    """One deprecation line at service-manager start (2026-10-02): the drain and
-    reservation settings still parse (live registries and the controller still
-    carry them) but the service-manager ignores them. Returns the message."""
-    message = (
-        "deprecated and IGNORED: service_manager.sleep.budgets_s=%s, "
-        "service_manager.sleep.no_drain_paths=%s, service_manager.sleep.hard_cap_s=%g, "
-        "service_manager.sleep.reservation_ttl_s=%g, service_manager.commit_lock_wait_s and "
-        "the drain_budget_s request field - the service-manager never drains and holds its "
-        "writer lock through every sleep (hide, gateway ack, one load read, one /sleep, "
-        "physical confirmation)"
-    ) % (
-        json.dumps(dict(policy.budgets_s), sort_keys=True),
-        list(policy.no_drain_paths),
-        float(policy.hard_cap_s),
-        float(policy.reservation_ttl_s),
-    )
-    (logger or LOG).warning(message)
-    return message
-
-
 def _text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
