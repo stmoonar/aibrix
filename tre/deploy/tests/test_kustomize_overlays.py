@@ -118,17 +118,29 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_PAPER_STALE_MAX_MS"] == "30000"  # the former 3 windows of 10 s
     # 2026-10-25: the gateway's two TRE doc periods, pinned on both sides and equal (a
     # mismatch with the gateway's declared cadence makes every snapshot stale).
-    for name, value in (("TRE_INSTANT_SAMPLE_INTERVAL_MS", "500"), ("TRE_EVIDENCE_PERIOD_MS", "2000")):
-        gateway_env = {
-            item["name"]: item.get("value")
-            for item in gateway_plugins["spec"]["template"]["spec"]["containers"][0].get("env", [])
-        }
+    # 2026-10-28: evidence period 1 s on both sides (code default stays 2 s).
+    gateway_env = {
+        item["name"]: item.get("value")
+        for item in gateway_plugins["spec"]["template"]["spec"]["containers"][0].get("env", [])
+    }
+    for name, value in (("TRE_INSTANT_SAMPLE_INTERVAL_MS", "500"), ("TRE_EVIDENCE_PERIOD_MS", "1000")):
         assert _env(controller)[name] == gateway_env[name] == value
+    instant, period = int(gateway_env["TRE_INSTANT_SAMPLE_INTERVAL_MS"]), int(gateway_env["TRE_EVIDENCE_PERIOD_MS"])
+    window = int(_env(controller)["TRE_METRICS_WINDOW_MS"])
+    # The gateway falls back to its defaults (and the controller refuses to start) unless
+    # the instant period divides the evidence period; phase_aligned falls back to
+    # free_running unless the evidence period divides the metrics window.
+    assert period % instant == 0 and window % period == 0
     assert _env(controller)["TRE_METRICS_SCHEMA"] == "v2"  # D7 (09-22): gateway zsets, no legacy SCAN
     # D8 (09-22): phase-aligned sampler, pinned explicitly. Band dwell OFF (v1/paper
     # alignment A5), also pinned: "1" = act on the first window.
     assert _env(controller)["TRE_METRICS_REFRESH_MODE"] == "phase_aligned"
-    assert _env(controller)["TRE_METRICS_PHASE_OFFSET_MS"] == "1000"  # min(2 s, period / 2)
+    offset = int(_env(controller)["TRE_METRICS_PHASE_OFFSET_MS"])
+    retry = int(_env(controller)["TRE_METRICS_PHASE_RETRY_MS"])
+    assert offset == min(2_000, period // 2) == 500
+    # At least one re-read before the next boundary is due (the sampler gives a window up
+    # once read time + retry reaches it).
+    assert offset + retry < period
     # Timer cleanup (2026-10-02): the band dwell was removed; older images default to off.
     assert "TRE_DWELL_WINDOWS" not in _env(controller)
     # A2 (v1/paper alignment): receiver-less HIGH proactive SafeScale shrink live.

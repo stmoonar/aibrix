@@ -72,22 +72,33 @@ spec:
             # coverage grid.
             # Evidence period (histogram docs): the sampler grid, O1 grid, SafeScale
             # evidence step. The metrics window must be a multiple of both.
+            # 2026-10-28: 1 s (was 2 s; code default still 2 s): one snapshot per second,
+            # so the 5 s rescue / 10 s rebalance sections land exactly on the grid, and
+            # the windows match the theta calibration (1 Hz counters, 20 s windows).
+            # Changes together with the gateway's value (else every snapshot is stale).
             - name: TRE_INSTANT_SAMPLE_INTERVAL_MS
               value: "500"
             - name: TRE_EVIDENCE_PERIOD_MS
-              value: "2000"
+              value: "1000"
             # D8 (09-22): phase-aligned sampler. Sleeps to the next evidence boundary +
-            # offset and reads (boundary-30s, boundary]: a full 30 s token span per
+            # offset and reads (boundary-W, boundary]: a full W token span per
             # window, one new snapshot per evidence period. The offset (default
             # min(2 s, evidence period / 2), TRE_METRICS_PHASE_OFFSET_MS) is a floor: the
-            # sampler re-reads until the boundary tick exists and adapts.
+            # sampler re-reads every TRE_METRICS_PHASE_RETRY_MS until the boundary round
+            # exists (or the next boundary is due) and adapts.
             # free_running = the old refresh loop (TRE_METRICS_REFRESH_INTERVAL_SECONDS +
             # TRE_METRICS_WINDOW_MODE).
             - name: TRE_METRICS_REFRESH_MODE
               value: phase_aligned
             # Pinned; must stay below TRE_EVIDENCE_PERIOD_MS (min(2 s, period / 2)).
             - name: TRE_METRICS_PHASE_OFFSET_MS
-              value: "1000"
+              value: "500"
+            # Re-read period while the boundary round is missing (code default 500 ms).
+            # 250 at the 1 s period: offset + retry < period leaves one re-read per
+            # window (500 would give the window up after the first read) and lets the
+            # offset adapt up to period - retry = 750 ms.
+            - name: TRE_METRICS_PHASE_RETRY_MS
+              value: "250"
             # Only used by TRE_METRICS_REFRESH_MODE=free_running.
             - name: TRE_METRICS_REFRESH_INTERVAL_SECONDS
               value: "5"
