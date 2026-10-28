@@ -45,6 +45,17 @@ Rules:
    deferred until the donors are used, then taken if still short.
    Named wakes: each feasible as above, else refused;
 4. every pick updates R and P (GPU use and cap across items).
+
+Plan groups (2026-10-28, design section 11): an item may carry a ``group`` (scope:
+the plan). A group is one transfer - donor sleeps and the receiver wake - and is
+atomic in the selection: when any of its items is refused (a sleep's pod, floor or
+journal check; a wake's account, gate, veto or cap), every item of the group is
+refused with ``group_refused`` and the selection is redone without the group, so
+its sleeps never enter S and its wakes take no GPU; items outside the group are
+selected as if the group had not been asked. A group's wake picks depend on every
+sleep of the group (wave 2). A plan without groups takes exactly the path above.
+Named sleep items of one model are cumulative against its replica floor (the second
+one sees the first one's members gone); a single named item is checked as before.
 """
 
 from __future__ import annotations
@@ -84,6 +95,8 @@ class SleepItem:
     pods: tuple[str, ...] | None = None
     at_most: int | None = None
     reason: str = ""
+    #: Plan group (one transfer): atomic in the selection; None = no group.
+    group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +108,12 @@ class WakeItem:
     avoid_gpus: tuple[str, ...] = ()
     donors: tuple[Donor, ...] = ()
     reason: str = ""
+    #: Plan group (one transfer): atomic in the selection; None = no group.
+    group: str | None = None
+
+
+#: Refusal reason of every item of a group one of whose items was refused.
+GROUP_REFUSED = "group_refused"
 
 
 @dataclass(frozen=True)
@@ -194,6 +213,75 @@ def select_plan(
     *,
     sleeps: Sequence[SleepItem] = (),
     wakes: Sequence[WakeItem] = (),
+    **kwargs,
+) -> PlanSelection:
+    """Select the sleep set and the wake picks of one plan (see the module doc and
+    :func:`_select_plan` for the arguments). A plan without a ``group`` is exactly
+    one :func:`_select_plan`; with groups, :func:`_select_grouped`."""
+    if not any(item.group for item in (*sleeps, *wakes)):
+        return _select_plan(bindings, sleeps=sleeps, wakes=wakes, **kwargs)
+    return _select_grouped(bindings, sleeps=sleeps, wakes=wakes, **kwargs)
+
+
+def _select_grouped(bindings, *, sleeps, wakes, **kwargs) -> PlanSelection:
+    """Group atomicity: select; a group with a refused item is refused as a whole
+    and the selection is redone without it (its sleeps out of S, its wakes taking no
+    GPU), until no new group fails - at most one round per group. Then every wake
+    pick of a group waits for every sleep of its group (wave 2)."""
+    refused: dict[str, Refusal] = {}
+    while True:
+        selection = _select_plan(bindings, sleeps=sleeps, wakes=wakes, refused_groups=refused, **kwargs)
+        failed = _failed_groups(selection, refused)
+        if not failed:
+            break
+        refused.update(failed)
+    members: dict[str, list[str]] = {}
+    for choice in selection.sleeps:
+        if choice.item.group and choice.item.group not in refused:
+            members.setdefault(choice.item.group, []).extend(b.binding_id for b in choice.members)
+    for choice in selection.wakes:
+        group_ids = members.get(choice.item.group or "")
+        if not group_ids:
+            continue
+        choice.picks = [
+            replace(pick, wave=2, depends_on=tuple(dict.fromkeys((*pick.depends_on, *group_ids))))
+            for pick in choice.picks
+        ]
+    return selection
+
+
+def _failed_groups(selection: "PlanSelection", refused: Mapping[str, Refusal]) -> dict[str, Refusal]:
+    """Groups not refused yet with a refused item: the group's ``group_refused``
+    refusal, its detail naming the first refused item (sleeps, then wakes)."""
+    failed: dict[str, Refusal] = {}
+    items: list[tuple[str, object, object | None]] = [
+        ("sleep", choice, choice.refusal) for choice in selection.sleeps
+    ] + [
+        ("wake", choice, (choice.refusals[-1] if choice.refusals else None) if choice.unfilled > 0 else None)
+        for choice in selection.wakes
+    ]
+    for kind, choice, refusal in items:
+        group = choice.item.group
+        if not group or group in refused or group in failed or refusal is None:
+            continue
+        reason = refusal_reason(refusal)
+        failed[group] = Refusal(
+            reason=GROUP_REFUSED,
+            detail=f"group {group}: {kind} item {choice.index} ({choice.item.model}) refused: {reason}: {refusal}",
+            binding_id=getattr(refusal, "binding_id", None) or getattr(refusal, "receiver_binding_id", None),
+            node=getattr(refusal, "node", None),
+            gpu_ids=tuple(getattr(refusal, "gpu_ids", None) or getattr(refusal, "gpus", None) or ()),
+            blocking_binding_id=getattr(refusal, "blocking_binding_id", None),
+        )
+    return failed
+
+
+def _select_plan(
+    bindings: Sequence[Binding],
+    *,
+    sleeps: Sequence[SleepItem] = (),
+    wakes: Sequence[WakeItem] = (),
+    refused_groups: Mapping[str, Refusal] | None = None,
     topology,
     policy: PlacementPolicy | None = None,
     floors: Mapping[str, tuple[int | None, Iterable[str]]] | None = None,
@@ -208,6 +296,8 @@ def select_plan(
     reserve_violation: ReserveViolation | None = None,
 ) -> PlanSelection:
     """Select the sleep set and the wake picks of one plan (see the module doc).
+    ``refused_groups``: group -> its ``group_refused`` refusal (items of those
+    groups are refused without being selected).
 
     ``bindings``: the store's view (every model). ``floors``: model -> (replica
     floor or None = not enforced, its routable binding ids), for every sleep and
@@ -233,12 +323,22 @@ def select_plan(
     books = {binding.serve_id: binding for binding in bindings}
     selection = PlanSelection()
 
+    refused_groups = refused_groups or {}
     # The view the shrink order sees: earlier sleep items' members asleep.
     asleep_view = dict(books)
+    #: Model -> binding ids earlier NAMED sleep items of this plan put to sleep (the
+    #: cumulative floor of a second named item of one model).
+    named_taken: dict[str, set[str]] = {}
     for index, item in enumerate(sleeps):
+        if item.group and item.group in refused_groups:
+            selection.sleeps.append(SleepChoice(index=index, item=item, refusal=refused_groups[item.group]))
+            continue
         choice = _select_sleep(
-            index, item, books, asleep_view, floors.get(item.model), journaled, can_sleep, shrink_order
+            index, item, books, asleep_view, floors.get(item.model), journaled, can_sleep, shrink_order,
+            earlier=named_taken.get(item.model, set()) if item.pods is not None else set(),
         )
+        if item.pods is not None:
+            named_taken.setdefault(item.model, set()).update(b.binding_id for b in choice.members)
         selection.sleeps.append(choice)
         for member in choice.members:
             asleep_view[member.serve_id] = replace(member, awake=False, hidden=False)
@@ -366,6 +466,12 @@ def select_plan(
             awake = [b for b in planning.values() if b.model == item.model and b.awake]
             choice.awake_before = sum(1 for b in books.values() if b.model == item.model and b.awake)
             budget = max(0, int(caps.get(item.model, 1 << 30)) - len(awake))
+            if item.group and item.group in refused_groups:
+                choice.refusals.append(refused_groups[item.group])
+                choice.unfilled = len(item.pods) if item.pods is not None else max(
+                    0, int(item.at_least or 0) - len(awake)
+                )
+                continue
             if item.pods is not None:
                 for name in item.pods:
                     binding = planning.get(name)
@@ -488,10 +594,15 @@ def _select_sleep(
     journaled: frozenset[str],
     can_sleep: frozenset[str] | None,
     shrink_order: ShrinkOrder | None,
+    earlier: set[str] = frozenset(),
 ) -> SleepChoice:
+    """``earlier``: binding ids earlier named sleep items of the same model put to
+    sleep in this plan (non-empty only for a second named item: cumulative floor)."""
     choice = SleepChoice(index=index, item=item)
     floor, routable = floor_entry if floor_entry is not None else (None, ())
     routable = set(routable)
+    if earlier:
+        routable -= set(earlier)
     if item.pods is not None:
         members = []
         for name in item.pods:
