@@ -125,8 +125,10 @@ def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
             for x in t["actions"]:
                 if isinstance(x, dict) and x.get("reason") != "probe_started":   # probes are counted above
                     cls = action_class(x.get("reason"))
-                    if cls == "urgent" and not (x.get("receiver") or (x.get("delta") or 0) > 0):
-                        cls = "other"     # donor side of a CRITICAL action: v1 counted the gain only
+                    if cls == "urgent" and not (x.get("delta") or 0) > 0:
+                        # Donor side of a CRITICAL action (a transfer's donor sleeps carry
+                        # the receiver too): v1 counted the gain only.
+                        cls = "other"
                     acts[cls] += 1
                     by_reason[str(x.get("reason"))] += 1
     row.update({f"act_{name}": acts.get(name, 0) for name, _ in ACTION_CLASSES})
