@@ -9,7 +9,6 @@ from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.rediskeys import (
     DECISION_HIST_RETENTION_MS,
     DECISION_HIST_TTL_SECONDS,
-    DECISION_LATEST_KEY,
     decision_hist_key,
 )
 from tre_controller.loops.action_queue import _members
@@ -44,20 +43,14 @@ class DecisionSnapshotWriter:
     def __init__(
         self,
         redis_client: Any,
-        key: str = DECISION_LATEST_KEY,
         *,
         signal_log_writer: SignalLogWriter | None = None,
     ) -> None:
         self._redis = redis_client
-        self._key = key
         self._signal_log_writer = signal_log_writer or SignalLogWriter(redis_client)
 
     def write(self, loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
         payload = build_decision_snapshot(loop_name, snapshot, result)
-        try:
-            self._redis.hset(self._key, mapping=payload)
-        except Exception as exc:
-            _LOGGER.warning("decision_snapshot_redis_write_failed: %s", exc)
         self._append_history(snapshot, result)
         self._signal_log_writer.write(snapshot, result)
         # ``now_ms``: wall clock of the decision (``ts_ms`` is the metrics window

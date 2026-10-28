@@ -13,8 +13,8 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_controller.loops.action_queue import ActionQueue
 from plan_shim import PlanShim  # the in-process service has no plan executor here
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
-from tre_controller.loops.decision_task import run_fairness_tick
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_fairness_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.tick import _idle_gpus
 from tre_controller.planning.classify import ModelState
 from tre_controller.planning.planner import ScaleAction, TransferIntent

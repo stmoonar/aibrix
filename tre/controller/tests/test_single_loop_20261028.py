@@ -47,7 +47,7 @@ from tre_controller.planning.planner import (
     TransferIntent,
     build_plan,
 )
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleStateMachine
 from tre_sm.allocator.slots import Binding, Slot
 

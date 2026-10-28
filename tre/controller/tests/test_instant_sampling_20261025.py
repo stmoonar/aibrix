@@ -87,11 +87,11 @@ def _store(redis, registry, min_sample_ratio=0.9, evidence=EVIDENCE, **kw):
 
 
 def _read(store, model="m"):
-    return store.read_model_window(model, END - WINDOW, END, use_cache=False, start_exclusive=True)
+    return store.read_model_window(model, END - WINDOW, END, start_exclusive=True)
 
 
 def _snapshot(redis, registry):
-    return _store(redis, registry).read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
+    return _store(redis, registry).read_snapshot(END - WINDOW, END, start_exclusive=True)
 
 
 def _binding(pod, model, gpu, awake=True, node="n"):
@@ -298,7 +298,7 @@ def test_a_round_300_ms_late_gives_no_stale():
         "last_hist_ms": str(END), "version": "t",
     }
     store = _store(redis, _registry("m"), evidence=EVIDENCE_2S, expected_cadence=(INSTANT, EVIDENCE_2S))
-    snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
+    snapshot = store.read_snapshot(END - WINDOW, END, start_exclusive=True)
     assert END not in snapshot.models["m"].instant_ticks_ms and not snapshot.stale
     assert window_freshness(snapshot, window_end_ms=END, window_ms=WINDOW, period_ms=EVIDENCE_2S).fresh
 
@@ -316,7 +316,7 @@ def test_a_round_300_ms_late_gives_no_stale():
     assert sampler.consecutive_stale == 0 and box.get().ts_ms == END and not box.get().stale
 
     redis.hashes["tre:v2:gateway:cadence"]["last_hist_ms"] = str(END - EVIDENCE_2S)
-    snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
+    snapshot = store.read_snapshot(END - WINDOW, END, start_exclusive=True)
     freshness = window_freshness(snapshot, window_end_ms=END, window_ms=WINDOW, period_ms=EVIDENCE_2S)
     assert not freshness.fresh and freshness.reason.startswith(f"hist_not_written:{END}")
 
@@ -337,7 +337,7 @@ def test_a_suffix_flag_survives_the_serving_restriction_and_holds_the_donor():
     registry = _registry("m")
     store = _store(redis, registry, evidence=EVIDENCE_2S, suffix_period_ms=EVIDENCE_2S,
                    suffix_breakpoint=lambda model: bp)
-    snapshot = store.read_snapshot(END - WINDOW, END, use_cache=False, start_exclusive=True)
+    snapshot = store.read_snapshot(END - WINDOW, END, start_exclusive=True)
     assert snapshot.models["m"].sample_incomplete_pods == ()
     assert [w.sample_incomplete_pods for w in snapshot.models["m"].suffix_windows] == [("m-0",)]
 

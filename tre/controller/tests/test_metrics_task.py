@@ -12,13 +12,9 @@ class FakeStore:
         self.snapshot = snapshot
         self.exc = exc
         self.calls: list[tuple[int, int]] = []
-        self.use_cache_calls: list[bool] = []
 
-    def read_snapshot(
-        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
-    ) -> MetricsSnapshot:
+    def read_snapshot(self, window_start_ms: int, window_end_ms: int) -> MetricsSnapshot:
         self.calls.append((window_start_ms, window_end_ms))
-        self.use_cache_calls.append(use_cache)
         if self.exc is not None:
             raise self.exc
         assert self.snapshot is not None
@@ -84,7 +80,7 @@ def test_sliding_window_ends_at_now_without_alignment() -> None:
     # Contrast with tumbling for the same inputs (returns (60_000, 120_000)).
 
 
-def test_refresh_metrics_once_sliding_reads_now_minus_w_to_now_without_cache() -> None:
+def test_refresh_metrics_once_sliding_reads_now_minus_w_to_now() -> None:
     snapshot = _snapshot(125_000)
     store = FakeStore(snapshot=snapshot)
     box = SnapshotBox()
@@ -94,11 +90,10 @@ def test_refresh_metrics_once_sliding_reads_now_minus_w_to_now_without_cache() -
     assert result.window_start_ms == 65_000
     assert result.window_end_ms == 125_000
     assert store.calls == [(65_000, 125_000)]
-    assert store.use_cache_calls == [False]  # sliding must not populate the per-window cache
     assert box.get() == snapshot
 
 
-def test_refresh_metrics_once_tumbling_default_uses_cache() -> None:
+def test_refresh_metrics_once_tumbling_default_reads_last_complete_window() -> None:
     snapshot = _snapshot(120_000)
     store = FakeStore(snapshot=snapshot)
     box = SnapshotBox()
@@ -106,7 +101,6 @@ def test_refresh_metrics_once_tumbling_default_uses_cache() -> None:
     refresh_metrics_once(store, box, now_ms=125_999, window_ms=60_000)  # default tumbling
 
     assert store.calls == [(60_000, 120_000)]
-    assert store.use_cache_calls == [True]
 
 
 def test_refresh_metrics_once_marks_previous_snapshot_stale_on_read_failure() -> None:
@@ -154,7 +148,6 @@ def test_metrics_task_refreshes_on_refresh_interval_not_monitor_interval() -> No
 
     assert intervals == [5.0]
     assert box.get() is not None  # a refresh happened before the first sleep
-    assert store.use_cache_calls == [False]  # sliding default from cfg
 
 
 def test_refresh_metrics_once_creates_empty_stale_snapshot_without_previous_data() -> None:

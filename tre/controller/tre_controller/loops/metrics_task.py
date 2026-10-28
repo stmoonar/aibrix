@@ -66,7 +66,7 @@ DEFAULT_PHASE_RELEARN_MS = 600_000
 
 class SnapshotStore(Protocol):
     def read_snapshot(
-        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+        self, window_start_ms: int, window_end_ms: int
     ) -> MetricsSnapshot: ...
 
 
@@ -292,7 +292,7 @@ class PhaseAlignedSampler:
 
     async def _threaded_fetch(self, start_ms: int, end_ms: int) -> MetricsSnapshot:
         return await asyncio.to_thread(
-            self._store.read_snapshot, start_ms, end_ms, use_cache=False, start_exclusive=True
+            self._store.read_snapshot, start_ms, end_ms, start_exclusive=True
         )
 
     async def run_forever(self) -> None:
@@ -478,15 +478,9 @@ def refresh_metrics_once(
         window_start_ms, window_end_ms = _sliding_window(now_ms, window_ms)
     else:
         window_start_ms, window_end_ms = _last_complete_window(now_ms, window_ms)
-    # Tumbling calls read_snapshot with its original signature (no use_cache) so existing
-    # SnapshotStore fakes keep working; only sliding opts out of the per-window cache
-    # (every sliding window is unique -> the cache never hits and would grow, S1.1).
     _fetch_t0 = time.perf_counter_ns() if prof is not None else 0
     try:
-        if sliding:
-            snapshot = store.read_snapshot(window_start_ms, window_end_ms, use_cache=False)
-        else:
-            snapshot = store.read_snapshot(window_start_ms, window_end_ms)
+        snapshot = store.read_snapshot(window_start_ms, window_end_ms)
     except Exception as exc:  # noqa: BLE001 - metrics loop degrades through stale snapshots.
         snapshot = _stale_snapshot(snapshot_box.get(), fallback_ts_ms=window_end_ms)
         snapshot_box.set(snapshot)

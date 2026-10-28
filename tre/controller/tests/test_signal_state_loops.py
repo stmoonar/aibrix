@@ -10,8 +10,8 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
-from tre_controller.loops.decision_task import run_fairness_tick
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_fairness_tick
+from section_ticks import run_rescue_tick
 from tre_controller.signals.trs import SignalState
 
 

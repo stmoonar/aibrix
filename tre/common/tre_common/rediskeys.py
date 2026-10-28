@@ -29,7 +29,6 @@ LEGACY_GRID_MS = SCRAPE_INTERVAL_MS
 # by the gateway in the MULTI of every round (review round 1, M4/L6).
 GATEWAY_CADENCE_KEY = "tre:v2:gateway:cadence"
 
-DECISION_LATEST_KEY = "tre:v2:decision:latest"
 # S5.1: per-model decision time-series (score = window_end_ms). Backs the UI timelines
 # and post-hoc experiment analysis. Retained ~24h with a TTL backstop.
 DECISION_HIST_RETENTION_MS = 24 * 60 * 60 * 1000

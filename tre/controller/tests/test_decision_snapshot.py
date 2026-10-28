@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 
 from tre_common.metrics_schema import MetricsSnapshot
-from tre_common.rediskeys import DECISION_LATEST_KEY
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter, build_decision_snapshot
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.planning.planner import DefragAction, ScaleAction
@@ -12,12 +11,7 @@ from tre_sm.allocator.slots import Migration, Slot
 
 class FakeRedis:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str]]] = []
         self.zadds: list[tuple[str, dict]] = []
-
-    def hset(self, name: str, mapping: dict[str, str]) -> int:
-        self.calls.append((name, mapping))
-        return len(mapping)
 
     def zadd(self, name: str, mapping: dict) -> int:
         self.zadds.append((name, mapping))
@@ -117,30 +111,6 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
     ]
 
 
-def test_decision_snapshot_writer_writes_latest_hash() -> None:
-    redis = FakeRedis()
-    writer = DecisionSnapshotWriter(redis)
-    snapshot = MetricsSnapshot(ts_ms=42, stale=True, models={})
-    result = LoopTickResult(submitted=0, events=("snapshot_stale",))
-
-    writer.write("fairness", snapshot, result)
-
-    assert redis.calls == [
-        (
-            DECISION_LATEST_KEY,
-            {
-                "ts_ms": "42",
-                "loop": "fairness",
-                "stale": "true",
-                "submitted": "0",
-                "actions": "[]",
-                "events": '["snapshot_stale"]',
-                "model_states": "{}",
-            },
-        )
-    ]
-
-
 def test_decision_snapshot_writer_appends_per_model_history() -> None:
     from tre_common.rediskeys import decision_hist_key
 
@@ -166,12 +136,15 @@ def test_decision_snapshot_writer_logs_even_when_redis_write_fails(caplog) -> No
     import logging
 
     class FailingRedis(FakeRedis):
-        def hset(self, name: str, mapping: dict[str, str]) -> int:
+        def zadd(self, name: str, mapping: dict) -> int:
+            raise RuntimeError("redis unavailable")
+
+        def xadd(self, *args, **kwargs):
             raise RuntimeError("redis unavailable")
 
     writer = DecisionSnapshotWriter(FailingRedis())
     snapshot = MetricsSnapshot(ts_ms=42, stale=False, models={})
-    result = LoopTickResult(submitted=0, events=("redis_unavailable",))
+    result = LoopTickResult(submitted=0, events=("redis_unavailable",), model_contexts={"m": {"z_m": 1.0}})
 
     with caplog.at_level(logging.INFO, logger="tre_controller.decision"):
         writer.write("rescue", snapshot, result)

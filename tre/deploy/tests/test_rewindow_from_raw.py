@@ -157,7 +157,7 @@ def _build_online_store(records: list[dict], instant: list[dict], mode: str, win
     registry = load_registry(str(REGISTRY_PATH))
     return MetricsStore(
         redis, registry, instant_sample_interval_ms=5_000,
-        percentile_mode=mode, schema="v2", min_latency_samples=0,
+        percentile_mode=mode, min_latency_samples=0,
     )
 
 

@@ -196,7 +196,7 @@ def test_frozen_scrape_is_unknown_not_a_zero_token_window(gateway_writes_scraped
         }}, ts)
     registry = _registry()
     store = MetricsStore(redis, registry, instant_sample_interval_ms=10_000)
-    snapshot = store.read_snapshot(end - 30_000, end, use_cache=False, start_exclusive=True)
+    snapshot = store.read_snapshot(end - 30_000, end, start_exclusive=True)
     view = ClusterView(topology=registry.topology(),
                        bindings=(Binding(serve_id="m-0", model="m", slot=Slot("n", (0,)), awake=True),
                                  Binding(serve_id="m-1", model="m", slot=Slot("n", (1,)), awake=False)))
@@ -229,7 +229,7 @@ def test_a_stale_serving_pod_makes_no_donor(stale):
         _write_pod(redis, "r", pod, gen_per_grid=100, running=20, waiting=10, scraped_ms=fresh)
     registry = _registry("m", "r")
     snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
-        END - 30_000, END, use_cache=False, start_exclusive=True
+        END - 30_000, END, start_exclusive=True
     )
 
     def binding(pod, model, gpu, awake=True):
@@ -261,7 +261,7 @@ def test_o1_suffixes_keep_the_window_pod_set_and_flag_a_pod_without_new_data():
     redis = _Redis()
     _write_pod(redis, "m", "m-0", gen_per_grid=1_000, running=4, waiting=0, scraped_ms=END - 15_000)
     store = MetricsStore(redis, _registry("m"), instant_sample_interval_ms=10_000, suffix_period_ms=10_000)
-    window = store.read_model_window("m", END - 30_000, END, use_cache=False, start_exclusive=True)
+    window = store.read_model_window("m", END - 30_000, END, start_exclusive=True)
     assert window.generation_tokens is not None
     last_20s, last_10s = window.suffix_windows
     assert set(last_20s.per_pod) == set(last_10s.per_pod) == {"m-0"}
@@ -299,7 +299,7 @@ def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
     }
     registry = _registry("m", "o")
     snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
-        END - 30_000, END, use_cache=False, start_exclusive=True
+        END - 30_000, END, start_exclusive=True
     )
 
     def binding(pod, model, gpu, awake=True):
@@ -339,7 +339,7 @@ def test_an_idle_window_needs_a_last_grid_scrape_and_nothing_in_flight(case):
     }
     registry = _registry("m")
     snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
-        END - 30_000, END, use_cache=False, start_exclusive=True
+        END - 30_000, END, start_exclusive=True
     )
     assert (snapshot.models["m"].prompt_tokens, snapshot.models["m"].generation_tokens) == (0.0, 0.0)
     view = ClusterView(topology=registry.topology(),
@@ -374,7 +374,7 @@ def test_every_inflight_reader_uses_the_registry_instance_staleness(tmp_path, he
     redis.instances = {"gw": redis.now_ms - heartbeat_age_ms}
     redis.hashes[rediskeys.gw_inflight_key("m-0")] = {"gw": json.dumps({"total": 3, "non_continuable": 0, "ts": 1})}
     window = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_model_window(
-        "m", END - 30_000, END, use_cache=False, start_exclusive=True
+        "m", END - 30_000, END, start_exclusive=True
     )
     assert window.scrape_stale_pods == ("m-0",)
     assert window.scrape_stale_inflight.get("m-0", 0) == (3 if counted else 0)

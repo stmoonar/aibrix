@@ -7,8 +7,8 @@ from tre_common.registry import Registry
 from tre_controller.loops.action_queue import DispatchResult
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.metrics_task import MetricsRefreshResult, SnapshotStore, refresh_metrics_once, SnapshotBox
-from tre_controller.loops.decision_task import DecisionWriter, run_rescue_tick
-from tre_controller.loops.tick import LoopTickResult, SafeScaleController
+from tre_controller.loops.decision_task import DecisionWriter
+from tre_controller.loops.tick import LoopTickResult, SafeScaleController, run_planner_tick
 from tre_controller.planning.planner import ClusterView
 
 
@@ -45,8 +45,11 @@ async def run_offline_integration_step(
     2026-10-08, before it was dropped)."""
     snapshot_box = SnapshotBox()
     metrics = refresh_metrics_once(store, snapshot_box, now_ms=now_ms, window_ms=window_ms)
-    decision = run_rescue_tick(
+    decision = run_planner_tick(
         metrics.snapshot,
+        rescue_due=True,
+        fairness_due=False,
+        loop="rescue",
         queue=queue,
         registry=registry,
         cluster_view=cluster_view,

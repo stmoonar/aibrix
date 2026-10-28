@@ -16,9 +16,9 @@ import pytest
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import load_registry
-from tre_controller.loops.decision_task import run_fairness_tick
+from section_ticks import run_fairness_tick
 from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.signals.trs import SignalState
 from tre_controller.store.metrics_store import MetricsStore
 from scripts import calibration_campaign as campaign
@@ -101,7 +101,7 @@ def _online_store(records: list[dict], sidecar: list[dict]) -> MetricsStore:
             f"{MODEL}/request_prompt_tokens": {"sum": float(sum(r["input_tokens"] for r in done)), "count": len(done), "buckets": {}},
             f"{MODEL}/request_generation_tokens": {"sum": float(sum(r["output_tokens"] for r in done)), "count": len(done), "buckets": {}},
         }})
-    return MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P, schema="v2",
+    return MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P,
                         min_latency_samples=0)
 
 
@@ -141,7 +141,7 @@ def test_online_phase_aligned_equals_offline_grid_rewindow_bitwise() -> None:
         now["t"] += int(round(seconds * 1000))
 
     async def fetch(start: int, end: int) -> MetricsSnapshot:
-        return store.read_snapshot(start, end, use_cache=False, start_exclusive=True)
+        return store.read_snapshot(start, end, start_exclusive=True)
 
     sampler = PhaseAlignedSampler(store, box, window_ms=W, period_ms=P, clock_ms=lambda: now["t"],
                                   sleep=sleep, fetch=fetch)

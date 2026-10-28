@@ -30,7 +30,7 @@ from tre_common.registry import (
 )
 from tre_controller.gateway_clock import GatewayClockMonitor
 from tre_controller.loops.model_state_box import UNCONFIRMED, ModelStateBox
-from tre_controller.loops.decision_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.tick import _model_contexts, _rescue_bases, breakpoint_observation
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
@@ -158,13 +158,13 @@ def test_store_suffix_windows_equal_a_read_of_the_shorter_window():
     redis = _store_fixture()
     store = MetricsStore(redis, registry, instant_sample_interval_ms=GRID, suffix_period_ms=GRID)
     plain = MetricsStore(redis, registry, instant_sample_interval_ms=GRID)
-    full = store.read_model_window("dsqwen-7b", 10_000, 40_000, use_cache=False, start_exclusive=True)
+    full = store.read_model_window("dsqwen-7b", 10_000, 40_000, start_exclusive=True)
     assert [s.window_start_ms for s in full.suffix_windows] == [20_000, 30_000]
-    reference_full = plain.read_model_window("dsqwen-7b", 10_000, 40_000, use_cache=False, start_exclusive=True)
+    reference_full = plain.read_model_window("dsqwen-7b", 10_000, 40_000, start_exclusive=True)
     assert full == reference_full and reference_full.suffix_windows == ()
     for suffix in full.suffix_windows:
         direct = plain.read_model_window(
-            "dsqwen-7b", suffix.window_start_ms, 40_000, use_cache=False, start_exclusive=True
+            "dsqwen-7b", suffix.window_start_ms, 40_000, start_exclusive=True
         )
         assert suffix == direct
         assert suffix.prompt_tokens == direct.prompt_tokens and suffix.avg_running == direct.avg_running
@@ -177,7 +177,7 @@ def test_store_suffixes_off_unaligned_or_v1():
     registry = load_registry(str(Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml"))
     redis = _store_fixture()
     store = MetricsStore(redis, registry, instant_sample_interval_ms=GRID, suffix_period_ms=GRID)
-    assert store.read_model_window("dsqwen-7b", 5_000, 35_000, use_cache=False).suffix_windows == ()
+    assert store.read_model_window("dsqwen-7b", 5_000, 35_000).suffix_windows == ()
     with pytest.raises(ValueError):
         MetricsStore(redis, registry, instant_sample_interval_ms=GRID, suffix_period_ms=-1)
 
@@ -825,8 +825,8 @@ def test_store_full_window_bitwise_equal_with_suffixes_on_or_off():
     redis = _store_fixture()
     on = MetricsStore(redis, registry, instant_sample_interval_ms=GRID, suffix_period_ms=GRID)
     off = MetricsStore(redis, registry, instant_sample_interval_ms=GRID)
-    a = on.read_model_window("dsqwen-7b", 10_000, 40_000, use_cache=False, start_exclusive=True)
-    b = off.read_model_window("dsqwen-7b", 10_000, 40_000, use_cache=False, start_exclusive=True)
+    a = on.read_model_window("dsqwen-7b", 10_000, 40_000, start_exclusive=True)
+    b = off.read_model_window("dsqwen-7b", 10_000, 40_000, start_exclusive=True)
     for field in dataclasses.fields(a):
         if field.name != "suffix_windows":
             assert getattr(a, field.name) == getattr(b, field.name), field.name
