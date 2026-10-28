@@ -682,6 +682,12 @@ def build_plan(
                 continue
             if model in active_probe_models or model in inflight_models:
                 continue
+            # Review P2-1 for blocks (2026-10-29): a block of this donor the SM refused
+            # with nothing done is not planned again on the same fleet view.
+            hold = (relay_holds or {}).get((model, receiver))
+            if hold is not None and hold.holds(relay_basis(cluster_view, model, receiver)):
+                _event_once(events, f"relay_held:{model}:{receiver}:{hold.reason}")
+                continue
             idle = item.state == ModelState.IDLE
             if not idle and (deltas.get(model, 0) != 0 or probe_held(item)):
                 continue
@@ -738,17 +744,21 @@ def build_plan(
             return True
         probe = next(((donor, pod) for donor, pod in choice.sleeps if donors[donor].probed), None)
         non_idle = [donor for donor, _ in choice.sleeps if donors[donor].tier > 1]
+        immediate = tuple(item for item in choice.sleeps if item != probe)
         actions.append(
             BlockSupplyAction(
                 receiver=model,
                 block=choice.block,
                 receiver_pods=(choice.binding.serve_id,),
-                sleeps=tuple(item for item in choice.sleeps if item != probe),
+                sleeps=immediate,
                 probe=probe,
                 # An IDLE-only block is released by policy, not for lack of SafeScale.
                 reason=f"{prefix}_block_{tier}"
                 + (NO_SAFESCALE_REASON_SUFFIX if non_idle and probe is None else ""),
                 source_loop=source_loop,
+                # The hold key of the transfer group (its first donor, as the tick's
+                # transfer_plan names it): a refused block is held like a relay.
+                basis=relay_basis(cluster_view, (*immediate, *((probe,) if probe else ()))[0][0], model),
             )
         )
         for donor, _ in choice.sleeps:

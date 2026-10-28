@@ -163,3 +163,36 @@ def test_a_non_idle_donor_gives_one_replica_per_plan_across_receivers(receivers,
     assert len(taken) == 1, (taken, woken)
     if scope != "all":  # released at once: one transfer to the most critical receiver
         assert woken == [min(receivers, key=lambda model: receivers[model][2])]
+
+
+def test_a_block_the_sm_refused_for_a_fleet_reason_is_held_on_the_same_view():
+    """Review P3 (2026-10-29): a TP block is a transfer group like a relay - a
+    ``group_refused`` with nothing done (here the donor's floor) holds the (donor,
+    receiver) pair until the fleet view changes, instead of resending every decision."""
+    from test_single_loop_20261028 import _plan
+
+    bindings = [_binding("i-0", "i", (0,), True), _binding("i-1", "i", (1,), True),
+                _binding("x-2", "x", (2,), True), _binding("x-3", "x", (3,), True),
+                _binding("tp2-0", "tp2", (0, 1), False), _binding("tp2-2", "tp2", (2, 3), False)]
+    classes = {"tp2": (*CRIT, 0.3), "i": (*IDLE, 0.0), "x": (*HEALTHY, 1.1)}
+    kwargs = dict(model_tp_sizes={"tp2": 2, "i": 1, "x": 1}, min_replicas_by_model={"x": 2, "i": 0})
+    [block] = [a for a in _plan(bindings, classes, **kwargs).actions if isinstance(a, BlockSupplyAction)]
+    assert block.basis is not None
+
+    def refused(request):
+        detail = "group g: sleep item 0 (i) refused: floor_violation: floor"
+        item = {"status": "refused", "error": {"error": "group_refused", "detail": detail}, "retriable": False,
+                "woke": [], "unfilled": 0, "refusals": []}
+        body = {"plan_id": "pl", "status": "refused",
+                "sleeps": [dict(item, index=k, model=s["model"]) for k, s in enumerate(request["sleeps"])],
+                "wakes": [dict(item, index=k, model=w["model"]) for k, w in enumerate(request["wakes"])]}
+        return {"ok": False, "partial": True, "status": 409, "response": body}
+
+    queue = ActionQueue(PlanSM({"i": 2, "tp2": 0}, respond=refused), now_ms=lambda: 5_000)
+    queue.submit((block,))
+    asyncio.run(queue.drain_once())
+    assert set(queue.relay_holds()) == {("i", "tp2")}
+
+    again = _plan(bindings, classes, relay_holds=queue.relay_holds(), **kwargs)
+    assert not [a for a in again.actions if isinstance(a, BlockSupplyAction)]
+    assert "relay_held:i:tp2:floor_violation" in again.events

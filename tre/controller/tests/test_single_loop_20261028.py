@@ -74,7 +74,8 @@ def _binding(serve_id: str, model: str, gpus: tuple[int, ...], awake: bool) -> B
     return Binding(serve_id, model, Slot("n", gpus), awake=awake)
 
 
-def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, topology=TOPOLOGY, **cfg):
+def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, topology=TOPOLOGY,
+          relay_holds=None, **cfg):
     """One planner call on the bindings; ``x`` fills the other GPUs at its floor."""
     awake, bound = {}, {}
     for binding in bindings:
@@ -98,6 +99,7 @@ def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, 
         ),
         cluster_view=ClusterView(topology, tuple(bindings)),
         rescue_bases=bases,
+        relay_holds=relay_holds,
     )
 
 
