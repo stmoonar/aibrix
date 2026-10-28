@@ -1,5 +1,7 @@
 # Timer cleanup: state and evidence gates instead of fixed waits (2026-10-02)
 
+> **Status 2026-10-29:** F4 (`TRE_ACTION_COOLDOWN`) and the onset warmup guard (`TRE_SIGNAL_WARMUP_MS`) are removed (env names retired, warn and ignore); the view-pending guard now holds every model. See [20261029-tss-only.md](20261029-tss-only.md).
+
 Branch `feat/timer-cleanup-20261002` (based on the onset saturation rescue branch).
 One commit per item, so each can be rebased on its own.
 

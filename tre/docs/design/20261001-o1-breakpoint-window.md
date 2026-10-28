@@ -1,5 +1,7 @@
 # O1: breakpoint-aware decision window (2026-10-01)
 
+> **Status 2026-10-29: removed.** O1 (breakpoint window, holds, suspend, clock check) is gone; Z always comes from the whole window plus the EMA. See [20261029-tss-only.md](20261029-tss-only.md).
+
 User decision (2026-10-01): replace the ADR-0013 onset warmup guard with a
 **breakpoint-aware effective window**. Branch `feat/o1-breakpoint-window-20261001`
 (on top of C1, `feat/c1-deficit-scaleup-20261001` @ 57510356). ADR-0015 in
