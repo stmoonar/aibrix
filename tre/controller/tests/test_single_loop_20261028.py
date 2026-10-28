@@ -1,11 +1,16 @@
 """Single decision loop (design docs/design/20261028-single-loop.md): the invariants.
 
+1. A same-slot release is ONE plan: the donor pod's sleep and the receiver's wake with
+   its binding on that slot as the hint - never a bare donor sleep, under every scope.
 2. Order: two CRITICAL receivers compete for one free GPU - the lower Z wins whatever
    the registry order; a LOW receiver is never planned before a CRITICAL one.
 3. One step: a receiver gets at most +1 per plan however deep its Z and however much
    capacity is free; no second +1 before the window reflects the previous target.
 5. One ledger: the rescue and the rebalance section of one planner call never assign
    one free GPU twice; with TRE_ABLATION_DISABLE_SLOW_LOOP a LOW receiver gets nothing.
+4. TP2 supply: a slot of one free GPU and an IDLE donor pod, or of two pods of one
+   IDLE donor, is obtained in one plan; a mixed-donor slot gives nothing and
+   ``capacity_blocked``.
 6. A stale snapshot (or no publish at all) gives no decision and an alert. (The same
    observation stream at a 1 s and a 2 s cadence: test_period_invariance_20261025.)
 """
@@ -19,16 +24,33 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec
+from tre_controller.config import SafeScaleConfig
+from tre_controller.loops.action_queue import PlanBatch
 from tre_controller.loops.decision_task import DecisionLoop, decision_task
 from tre_controller.loops.metrics_task import SnapshotBox
-from tre_controller.loops.tick import LoopTickResult, upscale_of
+from tre_controller.loops.plan_items import plan_item
+from tre_controller.loops.safescale_task import _commands_to_actions
+from tre_controller.loops.tick import LoopTickResult, _apply_safescale, upscale_of
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
-from tre_controller.planning.planner import ClusterView, PlanConfig, RescueBasis, ScaleAction, build_plan
+from tre_controller.planning.planner import (
+    ClusterView,
+    HideAction,
+    PlanConfig,
+    RescueBasis,
+    ScaleAction,
+    ShrinkForSlotAction,
+    TransferIntent,
+    build_plan,
+)
+from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleStateMachine
 from tre_sm.allocator.slots import Binding, Slot
 
 TOPOLOGY = ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
+TOPOLOGY8 = ClusterTopology(nodes=(NodeSpec(name="n", gpus=8, two_gpu_slots=((0, 1), (2, 3), (4, 5), (6, 7))),))
 CRIT = ModelState.CRITICAL, ModelRole.RECEIVER
 LOW = ModelState.LOW, ModelRole.RECEIVER
+IDLE = ModelState.IDLE, ModelRole.DONOR
+HEALTHY = ModelState.HEALTHY, ModelRole.NEUTRAL
 
 
 def _cls(model: str, state: ModelState, role: ModelRole, z: float | None) -> ModelClassification:
@@ -42,7 +64,7 @@ def _binding(serve_id: str, model: str, gpus: tuple[int, ...], awake: bool) -> B
     return Binding(serve_id, model, Slot("n", gpus), awake=awake)
 
 
-def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, **cfg):
+def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, topology=TOPOLOGY, **cfg):
     """One planner call on the bindings; ``x`` fills the other GPUs at its floor."""
     awake, bound = {}, {}
     for binding in bindings:
@@ -61,11 +83,10 @@ def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, 
             max_replicas_per_model=4,
             rescue_due=rescue_due,
             fairness_due=fairness_due,
-            min_replicas_by_model={"x": 3},
             suppress_hot_proactive_probe=True,
-            **cfg,
+            **{"min_replicas_by_model": {"x": 3}, **cfg},
         ),
-        cluster_view=ClusterView(TOPOLOGY, tuple(bindings)),
+        cluster_view=ClusterView(topology, tuple(bindings)),
         rescue_bases=bases,
     )
 
@@ -85,6 +106,91 @@ def _ups(plan) -> list[tuple[str, int, tuple[str, ...]]]:
         for action in plan.actions
         if isinstance(action, ScaleAction) and upscale_of(action) is not None
     ]
+
+
+def _tp2(*donors: Binding):
+    """CRITICAL ``tp2`` (TP2): awake on GPUs 4-5, sleeping on 0-1 and 2-3; ``x`` holds
+    6-7 at its floor; ``donors`` (IDLE, floor 0) sit on GPUs 0-3."""
+    bindings = [
+        _binding("tp2-4", "tp2", (4, 5), True),
+        _binding("tp2-0", "tp2", (0, 1), False),
+        _binding("tp2-2", "tp2", (2, 3), False),
+        *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (6, 7)),
+        *donors,
+    ]
+    models = {binding.model for binding in donors} - {"x"}
+    classes = {"tp2": (*CRIT, 0.3), "x": (*HEALTHY, 1.1), **{model: (*IDLE, 0.0) for model in models}}
+    return _plan(bindings, classes, topology=TOPOLOGY8, model_tp_sizes={"tp2": 2},
+                 min_replicas_by_model={"x": 2, **{model: 0 for model in models}})
+
+
+# ------------------------------------------------------------------ 1. one plan
+SHRINK = ShrinkForSlotAction(
+    donor="d", beneficiary="tp2", serve_id="d-0", slot=Slot("n", (0,)),
+    reason="critical_same_slot_high_shrink", source_loop="rescue", receiver_pods=("tp2-0",),
+)
+VIEW = ClusterView(TOPOLOGY, (
+    _binding("d-0", "d", (0,), True), _binding("tp2-0", "tp2", (0, 1), False), _binding("tp2-2", "tp2", (2, 3), False),
+))
+
+
+@pytest.mark.parametrize("scope", ["receiverless_shrink", "off"])
+def test_a_same_slot_release_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope):
+    machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
+
+    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (SHRINK,), {},
+                              safescale=machine, safescale_scope=scope)
+
+    [plan] = out
+    assert isinstance(plan, PlanBatch)
+    items = [plan_item(member) for member in plan.members]
+    assert [(kind, item["model"], item.get("pods"), item.get("hints")) for kind, item in items] == [
+        ("sleep", "d", ["d-0"], None),
+        ("wake", "tp2", None, ["tp2-0"]),
+    ]
+
+
+def test_with_safescale_the_release_is_a_probe_and_its_commit_is_that_one_plan():
+    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=False)
+    out, _ = _apply_safescale(snapshot, (SHRINK,), {}, safescale=machine, cluster_view=VIEW, safescale_scope="all")
+    assert out and all(isinstance(action, HideAction) for action in out)  # no bare sleep
+
+    [commit] = _commands_to_actions(
+        (SafeScaleCommand("scale_down", "d", pods=("d-0",)), SafeScaleCommand("scale_up", "tp2", delta=1)),
+        cluster_view=VIEW,
+    )
+    assert commit.donor_sleep().pods == ("d-0",)
+    assert [plan_item(target)[1].get("hints") for target in commit.upscales] == [["tp2-0"]]
+
+
+# ------------------------------------------------------------------ 4. TP2 supply
+def test_a_free_gpu_and_an_idle_donor_pod_give_the_tp2_receiver_its_slot_in_one_plan():
+    plan = _tp2(_binding("i-0", "i", (0,), True), _binding("i-2", "i", (2,), True), _binding("i-3", "i", (3,), True))
+
+    shrinks = [action for action in plan.actions if isinstance(action, ShrinkForSlotAction)]
+    assert [(a.donor, a.serve_id, a.beneficiary, a.receiver_pods, a.reason) for a in shrinks] == [
+        ("i", "i-0", "tp2", ("tp2-0",), "critical_same_slot_idle_shrink")
+    ]
+    assert shrinks[0].rescue is not None and shrinks[0].rescue.target == 2
+
+
+def test_two_pods_of_one_idle_donor_relay_the_tp2_slot():
+    plan = _tp2(*(_binding(f"i-{gpu}", "i", (gpu,), True) for gpu in (0, 1)),
+                *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)))
+
+    relays = [action for action in plan.actions if isinstance(action, TransferIntent)]
+    assert [(a.donor_model, a.receiver_model, a.count, a.pairs) for a in relays] == [("i", "tp2", 2, 1)]
+    assert not any(event.startswith("capacity_blocked") for event in plan.events)
+
+
+def test_a_mixed_donor_slot_gives_the_tp2_receiver_nothing():
+    plan = _tp2(_binding("a-0", "a", (0,), True), _binding("b-1", "b", (1,), True),
+                _binding("a-2", "a", (2,), True), _binding("b-3", "b", (3,), True))
+
+    assert not [action for action in plan.actions if upscale_of(action) is not None
+                or isinstance(action, ShrinkForSlotAction)]
+    assert "capacity_blocked:tp2" in plan.events
 
 
 # ------------------------------------------------------------------ 2. receiver order

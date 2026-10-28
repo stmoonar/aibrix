@@ -33,7 +33,7 @@ from tre_controller.planning.planner import (
     ScaleAction,
     UnhideAction,
     _SlotOccupancy,
-    _try_plan_same_slot_high_shrink,
+    _try_plan_same_slot_shrink,
     build_plan,
 )
 from tre_controller.store.metrics_store import MetricsStore
@@ -309,13 +309,14 @@ def test_same_slot_high_shrink_ignores_sleeping_bindings():
         Binding("other-1", "other", Slot("n", (1,)), awake=False),  # sleeping: not occupancy
         Binding("high-2", "high", Slot("n", (2,)), awake=False),  # sleeping: never a donor
     )
-    shrink = _try_plan_same_slot_high_shrink(
-        classifications=[_cls("high", ModelState.HIGH, ModelRole.DONOR, 2.0, "surplus")],
+    shrink = _try_plan_same_slot_shrink(
+        donors=[(1, _cls("high", ModelState.HIGH, ModelRole.DONOR, 2.0, "surplus"))],
         model_contexts={"high": {"routable_pods": 2, "assigned_replicas": 2}},
         model_replicas={"high": 2},
         cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=4, model_tp_sizes={"tp2": 2, "high": 1}),
         cluster_view=ClusterView(ONE_NODE, bindings),
         receiver="tp2",
+        tp_size=2,
         active_probe_models=set(),
         inflight_models=set(),
         source_loop="rescue",

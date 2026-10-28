@@ -22,14 +22,12 @@ from tre_controller.app import build_controller_task_specs
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.decision_task import run_rescue_tick
 from tre_controller.loops.safescale_task import rollback_left_probes_task
-from tre_controller.loops.tick import _apply_safescale
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import (
     ClusterView,
     PlanConfig,
     RelayHold,
     ScaleAction,
-    ShrinkForSlotAction,
     TransferIntent,
     UnhideAction,
     build_plan,
@@ -42,7 +40,7 @@ from tre_sm.allocator.slots import Binding, Slot
 from test_b8_observe_probes import _probe_snapshot
 from test_controller_app import _cfg, _deps
 from test_floor_plan_20260929 import _cls, _topology
-from test_loop_ticks import FakeQueue, _metrics, _metrics_with_pods, _registry_with_models
+from test_loop_ticks import FakeQueue, _metrics_with_pods, _registry_with_models
 from test_safescale_commit import FakeRedis
 
 
@@ -85,18 +83,6 @@ def test_high_proactive_shrink_is_an_urgent_model_level_scale_down():
     assert (action.model, action.delta, action.sleep_path) == ("high", -1, "urgent")
     assert action.reason == "high_proactive_safescale_nosafescale" and not action.requires_safescale
     assert not any(event.startswith("safescale_probe") for event in result.events)
-
-
-def test_same_slot_preemption_only_sleeps_the_donor_pod_this_tick():
-    same_slot = ShrinkForSlotAction(
-        donor="high", beneficiary="tp2", serve_id="high-0", slot=None,
-        reason="critical_same_slot_high_shrink", source_loop="rescue",
-    )
-
-    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (same_slot,), {}, safescale=None)
-
-    [sleep] = out
-    assert (sleep.model, sleep.delta, sleep.pods, sleep.sleep_path) == ("high", -1, ("high-0",), "urgent")
 
 
 def _two_donor_plan(relay_holds=None):

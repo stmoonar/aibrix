@@ -8,7 +8,8 @@ action becomes exactly ONE item (strict 1:1, no same-model merging):
 * ``ScaleAction -k``            -> sleep ``at_most = max(serving floor, awake - k)``
 * ``ScaleAction -k`` with pods  -> sleep ``pods`` (SafeScale commit donor, ShrinkForSlot)
 * ``TransferIntent D->R``       -> wake of R ``at_least = awake_R + pairs``, ``donors=[{D, count}]``
-* ``ReceiverTarget``            -> wake ``at_least = target`` (resolved once, then frozen)
+* ``ReceiverTarget``            -> wake ``at_least = target`` (resolved once, then frozen;
+  ``hints`` = its bindings on the donor pods' GPUs)
 
 Relative fields are resolved from ONE ``GET /v2/state`` per plan; an item whose target
 is already met is dropped locally (no SM call for it). Pure helpers: the ActionQueue
@@ -63,6 +64,8 @@ def plan_item(action) -> tuple[str, dict] | None:
         else:
             item["_delta"] = max(0, int(action.delta))
             item["_cap"] = action.cap
+        if action.hints:
+            item["hints"] = list(action.hints)
         return "wake", item
     if isinstance(action, TransferIntent):
         return "wake", {

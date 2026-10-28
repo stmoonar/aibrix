@@ -55,7 +55,7 @@ class PlanConfig:
     # climbed, deepening saturation (routable 4->3, then CRITICAL->rescale oscillation).
     # When enabled this suppresses that receiver-less proactive probe on hot
     # (HIGH/CRITICAL) donors. Demand-driven preemption (IDLE immediate donors, HIGH donor
-    # probes for a receiver and the TP critical_same_slot_high_shrink -> CRITICAL
+    # probes for a receiver and the TP critical_same_slot_*_shrink -> CRITICAL
     # beneficiary) is a separate path and is intentionally NOT gated. Default OFF since
     # the v1/paper alignment (A2): the path is v1's paper_high_proactive_shrink (rescue
     # tick, HIGH, replicas > floor, no active probe, not moved by another path this
@@ -359,12 +359,21 @@ class DefragAction:
 
 @dataclass(frozen=True)
 class ShrinkForSlotAction:
+    """A CRITICAL TP receiver's slot: one donor pod whose aligned slot mate is free.
+    Released as ONE plan (design 20261028-single-loop L4): the donor pod's sleep and
+    the receiver's wake with ``receiver_pods`` as hints (its sleeping binding on that
+    slot) - a SafeScale probe's commit (scope ``all``), or both items at once
+    (:func:`tre_controller.loops.tick._release_without_safescale`)."""
+
     donor: str
     beneficiary: str
     serve_id: str
     slot: Slot
     reason: str
     source_loop: SourceLoop
+    receiver_pods: tuple[str, ...] = ()
+    #: C1: the receiver's rescue target (bookkeeping only).
+    rescue: RescuePlan | None = field(default=None, compare=False)
 
 
 Action = ScaleAction | TransferIntent | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
@@ -387,12 +396,15 @@ class ReceiverTarget:
     on the client is never applied twice. ``target`` None (the planned form,
     review 4 P2-1): resolved ONCE at the first dispatch from the SM's current
     awake count (never from a possibly stale cluster view) plus ``delta``,
-    capped at ``cap`` (the scaling cap), then frozen."""
+    capped at ``cap`` (the scaling cap), then frozen. ``hints``: the receiver's
+    sleeping bindings on the GPUs the commit's donor pods free (L4, design
+    20261028-single-loop: a same-slot release wakes the receiver on that slot)."""
 
     model: str
     delta: int
     target: int | None = None
     cap: int | None = None
+    hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -844,25 +856,38 @@ def build_plan(
                         continue
 
                 tp_size = _tp_size(cfg, recv.model_name)
-                if tp_size > 1 and cluster_view is not None:
-                    same_slot_shrink = None if free_only else _try_plan_same_slot_high_shrink(
-                        classifications=classifications,
+                tp_receiver = tp_size > 1 and cluster_view is not None
+                if tp_receiver:
+                    same_slot_shrink = None if free_only else _try_plan_same_slot_shrink(
+                        # L4: any donor candidate - IDLE first, then HIGH, then the
+                        # middle zone (lowest Z within a tier).
+                        donors=[
+                            *((0, item) for item in idle_models),
+                            *((1, item) for item in high_models),
+                            *((2, item) for item in middle_zone),
+                        ],
                         model_contexts=model_contexts,
                         model_replicas=model_replicas,
                         cfg=cfg,
                         cluster_view=cluster_view,
                         receiver=recv.model_name,
+                        tp_size=tp_size,
                         active_probe_models=active_probe_models,
                         # One SafeScale probe per donor model at a time (the state
-                        # machine is keyed by model): a donor already shrunk for an earlier
-                        # receiver this tick cannot start a second probe, and gives nothing
-                        # else this plan (the immediate loop below takes IDLE donors only).
-                        # A donor whose last probe rolled back waits for new evidence
-                        # while this shrink is a probe (scope ``all``); as an immediate
-                        # relay (``release_without_safescale``) it is not held.
+                        # machine is keyed by model): a donor already shrunk or probed
+                        # for an earlier receiver this tick cannot start a second probe,
+                        # and gives nothing else this plan. A donor whose last probe
+                        # rolled back waits for new evidence while this shrink is a
+                        # probe (scope ``all``); released at once
+                        # (``release_without_safescale``) it is not held.
                         inflight_models=(
                             inflight_models | cooldown.down_blocked() | slot_shrink_donors
-                            | {item.model_name for item in high_models if donor_rollback_held(item.model_name)}
+                            | delayed_down_models
+                            | {
+                                item.model_name
+                                for item in (*idle_models, *high_models, *middle_zone)
+                                if donor_rollback_held(item.model_name)
+                            }
                         ),
                         planned_deltas=deltas,
                         taken_serve_ids=occupancy.released_donor_ids() if occupancy is not None else set(),
@@ -870,11 +895,10 @@ def build_plan(
                     )
                     if same_slot_shrink is not None:
                         note_relay_past_hold(same_slot_shrink.donor, 1)
-                        # t1: this IS a legitimate scale-down probe on a hot (HIGH) donor, but
-                        # it is demand-driven preemption -- a CRITICAL receiver blocked on a
-                        # fragmented TP slot and no idle capacity. Keep it (the suppress-hot
-                        # guard only gates the receiver-less proactive path) and log the
-                        # preemption reason explicitly in the decision stream.
+                        # Demand-driven preemption (t1): a CRITICAL receiver blocked on a
+                        # fragmented TP slot. Kept under the suppress-hot guard (it only
+                        # gates the receiver-less proactive path); the preemption reason
+                        # is logged in the decision stream.
                         actions.append(same_slot_shrink)
                         slot_shrink_donors.add(same_slot_shrink.donor)
                         delayed_down_models.add(same_slot_shrink.donor)
@@ -906,7 +930,6 @@ def build_plan(
                         events.append(
                             f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
                         )
-                        # C1: a multi-replica deficit also takes free slot pairs below.
                         raw_need -= 1
                         if raw_need <= 0:
                             continue
@@ -915,7 +938,7 @@ def build_plan(
                     # still one migration at a time (it is a cluster-wide action).
                     # Without a slot occupancy (no claims) the allocator would return
                     # the same free slot again: one slot per tick then (review P3).
-                    empty_slots = 0
+                    empty_slots = slot_planned = 0
                     slot_limit = raw_need if occupancy is not None else 1
                     while slot_limit > empty_slots:
                         tp_planned = _try_plan_tp_capacity(
@@ -942,6 +965,7 @@ def build_plan(
                                 source_loop="rescue",
                                 receiver=recv.model_name,
                             )
+                            slot_planned += 1
                         break
                     if empty_slots:
                         _add_scale_action(
@@ -953,9 +977,16 @@ def build_plan(
                             source_loop="rescue",
                             receiver=recv.model_name,
                         )
-                    continue
+                    raw_need -= empty_slots + slot_planned
+                    if raw_need <= 0:
+                        continue
+                    # L4: the rest goes to the IDLE and the HIGH / middle-zone relays
+                    # below, which count only aligned slots whose every GPU one donor
+                    # model holds (``_SlotOccupancy.pairable``) - never a single GPU.
 
-                if occupancy is not None:
+                if tp_receiver:
+                    gain_from_idle = 0  # free slot groups: the TP slot path above
+                elif occupancy is not None:
                     gain_from_idle = _plan_create_capacity(
                         occupancy,
                         receiver=recv.model_name,
@@ -980,6 +1011,8 @@ def build_plan(
 
                 still_needed = raw_need - gain_from_idle
                 if free_only:
+                    if tp_receiver and still_needed > 0:
+                        _event_once(events, f"capacity_blocked:{recv.model_name}")
                     continue  # H3: no donor, no middle-zone probe
                 for donor in paper_donors:
                     if still_needed <= 0:
@@ -989,6 +1022,7 @@ def build_plan(
                         or donor.model_name in active_probe_models
                         or donor.model_name in inflight_models
                         or donor.state != ModelState.IDLE  # F1-B: HIGH donors probe below
+                        or donor.model_name in slot_shrink_donors  # gives nothing else this plan
                     ):
                         continue
                     if cooldown.blocks(donor.model_name, "down"):
@@ -1031,7 +1065,12 @@ def build_plan(
                         continue
                     middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
                     planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
-                    middle_limit = min(_scale_step(middle_pods, cfg.scale_step_ratio), headroom - planned_take)
+                    # One step of the donor; a TP receiver's slot takes ``tp_size``
+                    # single-GPU donors (L4: one aligned slot of one donor model).
+                    middle_limit = min(
+                        _scale_step(middle_pods, cfg.scale_step_ratio) * (tp_size if tp_receiver else 1),
+                        headroom - planned_take,
+                    )
                     middle_reason = (
                         "critical_high_donor_safescale"
                         if middle.state == ModelState.HIGH
@@ -1069,6 +1108,10 @@ def build_plan(
                             probe_upscale_plans=probe_upscale_plans,
                         )
                     still_needed -= gained
+                if tp_receiver and still_needed > 0:
+                    # L4: no aligned slot of one donor model (a mixed-donor slot - 7b on
+                    # one GPU, 8b on the other - is not supported): nothing more.
+                    _event_once(events, f"capacity_blocked:{recv.model_name}")
             finally:
                 if recv.model_name in rescue_ctx:
                     _tag_rescue_actions(actions, first_action, recv, rescue_ctx[recv.model_name], events)
@@ -1912,27 +1955,39 @@ def _plan_create_capacity(
     return len(taken)
 
 
-def _try_plan_same_slot_high_shrink(
+#: Same-slot donor tiers (L4): IDLE first, then HIGH, then the middle zone.
+_SAME_SLOT_TIERS = ("idle", "high", "middle")
+
+
+def _try_plan_same_slot_shrink(
     *,
-    classifications: list[ModelClassification],
+    donors: list[tuple[int, ModelClassification]],
     model_contexts: dict[str, dict[str, Any]],
     model_replicas: dict[str, int],
     cfg: PlanConfig,
     cluster_view: ClusterView,
     receiver: str,
+    tp_size: int,
     active_probe_models: set[str],
     inflight_models: set[str],
     source_loop: SourceLoop,
     planned_deltas: Mapping[str, int] | None = None,
     taken_serve_ids: set[str] | None = None,
 ) -> ShrinkForSlotAction | None:
-    high_by_model = {item.model_name: item for item in classifications if item.state == ModelState.HIGH}
-    candidates: list[tuple[float, Binding]] = []
+    """One single-GPU donor pod whose aligned slot mate is free, for a TP receiver
+    (design 20261028-single-loop L4). ``donors``: (tier, classification) of the donor
+    candidates (:data:`_SAME_SLOT_TIERS`); the first tier with a candidate wins, the
+    lowest Z within it. A candidate keeps floor headroom (with this plan's takes), is
+    not probing, not in flight (``inflight_models`` carries the plan's other holds)."""
+    by_model: dict[str, tuple[int, ModelClassification]] = {}
+    for tier, item in donors:
+        by_model.setdefault(item.model_name, (tier, item))
+    candidates: list[tuple[int, float, Binding]] = []
     # Only AWAKE bindings hold a GPU: a sleeping resident (multi-model residency)
     # neither occupies the slot mate nor frees anything when "shrunk". A GPU the SM
     # reports not wakeable, or one an in-flight probe reserves for its receiver
     # (``blocked_gpus``, :func:`probe_reserved_gpus`), is no free mate either: the
-    # commit's wake would conflict there.
+    # receiver's wake would conflict there.
     occupied = awake_gpus(cluster_view.bindings) | {
         (str(node), int(gpu)) for node, gpu in cluster_view.blocked_gpus
     }
@@ -1940,8 +1995,8 @@ def _try_plan_same_slot_high_shrink(
     for binding in cluster_view.bindings:
         if not binding.awake or binding.hidden:
             continue
-        high = high_by_model.get(binding.model)
-        if high is None or binding.model in active_probe_models or binding.model in inflight_models:
+        donor = by_model.get(binding.model)
+        if donor is None or binding.model in active_probe_models or binding.model in inflight_models:
             continue
         if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
             continue
@@ -1954,22 +2009,33 @@ def _try_plan_same_slot_high_shrink(
             continue
         if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
             continue
-        candidates.append((high.Z_m if high.Z_m is not None else math.inf, binding))
+        tier, item = donor
+        candidates.append((tier, item.Z_m if item.Z_m is not None else math.inf, binding))
 
     if not candidates:
         return None
 
-    best_z = min(z_m for z_m, _ in candidates)
+    best = min((tier, z_m) for tier, z_m, _ in candidates)
     donor_binding = _release_pick(
-        [binding for z_m, binding in candidates if z_m == best_z], cluster_view
+        [binding for tier, z_m, binding in candidates if (tier, z_m) == best], cluster_view
     )
+    slot_gpus = _slots_around(
+        cluster_view.topology, {(donor_binding.slot.node, donor_binding.slot.gpu_ids[0])}, tp_size
+    )
+    receiver_pods = tuple(
+        binding.serve_id
+        for binding in sorted(cluster_view.bindings, key=lambda b: natural_key(b.serve_id))
+        if binding.model == receiver and not binding.awake and not binding.hidden
+        and {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids} == slot_gpus
+    )[:1]
     return ShrinkForSlotAction(
         donor=donor_binding.model,
         beneficiary=receiver,
         serve_id=donor_binding.serve_id,
         slot=donor_binding.slot,
-        reason="critical_same_slot_high_shrink",
+        reason=f"critical_same_slot_{_SAME_SLOT_TIERS[best[0]]}_shrink",
         source_loop=source_loop,
+        receiver_pods=receiver_pods,
     )
 
 
@@ -2019,7 +2085,7 @@ def probe_reserved_gpus(
     promises replicas to (``pending_upscales``), the aligned ``tp_size`` slot around
     each GPU of the probe pods. While a donor pod is hidden its own GPU is occupied
     anyway; what this adds is the free slot mate a TP receiver's wake needs at commit
-    (``critical_same_slot_high_shrink``), and, between the donor's sleep and the
+    (``critical_same_slot_*_shrink``), and, between the donor's sleep and the
     receiver's wake of a commit, the freed GPU itself. The tick adds them to the view's
     ``blocked_gpus``, so no other wake / create / relay of the plan takes them; they are
     free again once the probe is resolved (state, not time)."""
@@ -2063,10 +2129,11 @@ def _try_plan_tp_capacity(
     occupancy: _SlotOccupancy | None = None,
     defrag_enabled: bool = False,
 ) -> str | None:
+    # No slot: the caller records ``capacity_blocked`` when the relays cannot fill the
+    # slot either (L4, 2026-10-28).
     if occupancy is not None and occupancy.has_unplanned_sleeping(model):
         # P1-a: the SM wakes existing sleeping bindings before any create/defrag target
         # is used; with a blocked one the +1 would WakeConflict every tick.
-        events.append(f"capacity_blocked:{model}")
         return None
     allocator = SlotAllocator(
         cluster_view.topology, list(cluster_view.bindings), policy=cluster_view.placement
@@ -2083,7 +2150,6 @@ def _try_plan_tp_capacity(
         # Registry placement.defrag.enabled is false (default, v1 parity): no
         # automatic migration is planned (design 20260928-placement-node-balance).
         events.append(f"defrag_disabled:{model}")
-        events.append(f"capacity_blocked:{model}")
         return None
     migrations = allocator.plan_defrag(tp_size)
     if migrations:
@@ -2096,7 +2162,6 @@ def _try_plan_tp_capacity(
         )
         return "critical_tp_defrag"
 
-    events.append(f"capacity_blocked:{model}")
     return None
 
 
@@ -2225,17 +2290,19 @@ def _tag_rescue_actions(
     from ``actions[first:]`` and log the decision (``rescue_target``)."""
     desired, base, covered = ctx
     model = recv.model_name
-    planned = 0
-    for action in actions[first:]:
+
+    def receiver_part(action: Action) -> int:
+        # L4: a same-slot release wakes its beneficiary in the same plan.
+        if isinstance(action, ShrinkForSlotAction):
+            return 1 if action.beneficiary == model else 0
         up = upscale_of(action)
-        if up is not None and up[0] == model:
-            planned += up[1]
+        return up[1] if up is not None and up[0] == model else 0
+
+    planned = sum(receiver_part(action) for action in actions[first:])
     plan = RescuePlan(target=covered + planned, desired=desired, base=base, covered=covered)
     for index in range(first, len(actions)):
-        action = actions[index]
-        up = upscale_of(action)
-        if up is not None and up[0] == model:
-            actions[index] = replace(action, rescue=plan)
+        if receiver_part(actions[index]) > 0:
+            actions[index] = replace(actions[index], rescue=plan)
     if planned <= 0:
         return  # nothing planned: the capacity events of the paths say why
     z_text = "none" if recv.Z_m is None else f"{recv.Z_m:.4f}"

@@ -33,6 +33,7 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox, default_phase_offset_ms
 from tre_common.persistence import SPAN_TOLERANCE_MS
+from tre_controller.loops.action_queue import PlanBatch
 from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.replay import _active_probe_models
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -336,6 +337,10 @@ class Sim:
             free[0].awake = True
 
     def apply(self, action) -> None:
+        if isinstance(action, PlanBatch):  # a same-slot release: its items in order
+            for member in action.members:
+                self.apply(member)
+            return
         t = self.now
         if isinstance(action, TransferIntent):
             self.changes[action.donor_model] = (t, -1)

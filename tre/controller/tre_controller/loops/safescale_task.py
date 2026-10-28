@@ -35,6 +35,7 @@ from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, DirectPoll
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
+from tre_sm.allocator.slots import natural_key
 
 
 LOG = logging.getLogger("tre_controller.safescale")
@@ -876,12 +877,16 @@ def _commands_to_actions(
     cluster view (refreshed every ~10 s, so possibly stale - review 4 P2-1): the
     queue resolves it once from the SM's awake count at the first dispatch
     (current + delta, capped at the scaling cap carried here) and freezes it, so
-    a retry is still idempotent. ``cluster_view`` is kept for callers."""
-    del cluster_view
+    a retry is still idempotent. ``cluster_view``: the receivers' hints - their
+    sleeping bindings on the GPUs the donor pods free (L4, design 20261028-single-loop)."""
     actions: list[Action] = []
     donor = next((command for command in commands if command.kind == "scale_down"), None)
     upscales = tuple(
-        ReceiverTarget(command.model, int(command.delta), None, _scaling_cap(command.model, registry))
+        ReceiverTarget(
+            command.model, int(command.delta), None, _scaling_cap(command.model, registry),
+            hints=_receiver_hints(cluster_view, command.model, donor.pods if donor is not None else (),
+                                  int(command.delta)),
+        )
         for command in commands
         if command.kind == "scale_up" and command.delta > 0
     )
@@ -915,6 +920,29 @@ def _commands_to_actions(
             )
         )
     return tuple(actions)
+
+
+def _receiver_hints(
+    cluster_view: ClusterView | None, receiver: str, donor_pods: tuple[str, ...], count: int
+) -> tuple[str, ...]:
+    """Up to ``count`` sleeping, not hidden bindings of ``receiver`` that sit on a GPU of
+    ``donor_pods`` (a TP receiver: its binding on the slot around the donor pod)."""
+    if cluster_view is None or not donor_pods or count <= 0:
+        return ()
+    pods = set(donor_pods)
+    freed = {
+        (binding.slot.node, gpu)
+        for binding in cluster_view.bindings
+        if binding.serve_id in pods
+        for gpu in binding.slot.gpu_ids
+    }
+    hints = [
+        binding.serve_id
+        for binding in sorted(cluster_view.bindings, key=lambda binding: natural_key(binding.serve_id))
+        if binding.model == receiver and not binding.awake and not binding.hidden
+        and any((binding.slot.node, gpu) in freed for gpu in binding.slot.gpu_ids)
+    ]
+    return tuple(hints[:count])
 
 
 def _scaling_cap(model: str, registry: Registry | None) -> int | None:

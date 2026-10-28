@@ -13,6 +13,7 @@ from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
 from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
+from tre_controller.loops.action_queue import PlanBatch
 from tre_controller.planning.classify import (
     ModelRole,
     ModelState,
@@ -933,9 +934,10 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
 
     * a receiver-less shrink (HIGH proactive) -> a model-level urgent scale-down (the
       SM keeps the replica floor);
-    * a TP same-slot preemption -> only the urgent sleep of exactly that donor pod; the
-      next tick wakes the receiver on the freed slot through the planner's normal
-      free-capacity path (C1 target, O1 evidence gate)."""
+    * a TP same-slot release -> ONE plan (:class:`PlanBatch`, design 20261028-single-loop
+      L4): the urgent sleep of exactly that donor pod and the receiver's wake, its
+      binding on that slot as the hint (it keeps its rescue target). The SM wakes the
+      receiver once the donor slept; no other receiver can take the slot between."""
     out: list[Action] = []
     for action in actions:
         if not _requires_safescale_probe(action):
@@ -943,10 +945,16 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
             continue
         reason = f"{action.reason}{NO_SAFESCALE_REASON_SUFFIX}"
         if isinstance(action, ShrinkForSlotAction):
-            out.append(ScaleAction(
-                action.donor, -1, reason, action.source_loop, donor=action.donor,
-                pods=(action.serve_id,), sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-            ))
+            out.append(PlanBatch((
+                ScaleAction(
+                    action.donor, -1, reason, action.source_loop, donor=action.donor,
+                    pods=(action.serve_id,), sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+                ),
+                ScaleAction(
+                    action.beneficiary, 1, reason, action.source_loop, receiver=action.beneficiary,
+                    pods=action.receiver_pods, hint=bool(action.receiver_pods), rescue=action.rescue,
+                ),
+            )))
         else:
             out.append(replace(
                 action, reason=reason, requires_safescale=False, sleep_path=IMMEDIATE_DONOR_SLEEP_PATH

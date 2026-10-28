@@ -96,6 +96,21 @@ Defects seen in the 10-28 campaign and review:
 - Mixed-donor pairs (7b on one GPU, 8b on the other) stay unsupported: nothing is
   planned, `capacity_blocked:<model>` is recorded.
 
+### Implementation notes (2026-10-28)
+
+- L1: a section is due when its period of observation time passed since its last run,
+  within `min(SPAN_TOLERANCE_MS, evidence period / 2)`.
+- L3: `saturation_max_step_factor` (the bounded doubling of the onset saturation rescue)
+  is retired with the other step keys.
+- L4: the middle-zone donor limit for a TP receiver is `step x tp_size` donor replicas
+  (one aligned slot of single-GPU donors; one step alone could never fill a slot).
+- L4: under scope `all` every same-slot release is a probe, an IDLE donor's too (the
+  design says "probe first" for that scope); the receiver target of the commit carries
+  the hints (the receiver's sleeping bindings on the GPUs of the probe pods).
+- L4: `capacity_blocked:<model>` is recorded once at the end of a TP receiver's
+  rescue, when the slot path and the relays together left it short (no longer by the
+  slot path alone, which the relays may still fill).
+
 ## Ablation
 
 `TRE_ABLATION_DISABLE_SLOW_LOOP=true`: the rebalance section never runs (LOW receivers

@@ -597,6 +597,11 @@ class ActionQueue:
         return record
 
     def _register_rescue(self, action, started: set[str]) -> None:
+        if isinstance(action, PlanBatch):
+            # A same-slot release (L4): its receiver wake is a part of the target.
+            for member in action.members:
+                self._register_rescue(member, started)
+            return
         part = _rescue_part(action)
         if part is None:
             return

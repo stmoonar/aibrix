@@ -12,6 +12,7 @@ from tre_common.rediskeys import (
     DECISION_LATEST_KEY,
     decision_hist_key,
 )
+from tre_controller.loops.action_queue import _members
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.loops.signal_log import SignalLogWriter
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, TransferIntent, UnhideAction
@@ -26,7 +27,10 @@ def build_decision_snapshot(loop_name: str, snapshot: MetricsSnapshot, result: L
         "loop": loop_name,
         "stale": "true" if snapshot.stale else "false",
         "submitted": str(result.submitted),
-        "actions": json.dumps([_action_to_dict(action) for action in result.actions], separators=(",", ":")),
+        "actions": json.dumps(
+            [_action_to_dict(member) for action in result.actions for member in _members(action)],
+            separators=(",", ":"),
+        ),
         "events": json.dumps(list(result.events), separators=(",", ":")),
         "model_states": json.dumps(
             _model_states(result.model_contexts, getattr(result, "classifications", {}), snapshot),
