@@ -484,19 +484,10 @@ class ScalingRegistryConfig:
     controller start, restart-to-apply). Older images ignore the whole section
     (the registry loader only reads the sections it knows).
 
-    C1 (2026-10-01, design 20261001-c1-deficit-scaleup): the fast-loop rescue of a
-    CRITICAL receiver asks for its whole deficit at once,
-    ``desired = min(max(n + 1, ceil(n * tau_crit / Z)), max(n + 1, floor(ratio * n)),
-    scaling cap, capacity found)`` with ``n`` its routable replicas, instead of one
-    ``ceil(0.1 * n)`` step per window."""
+    L3 (2026-10-28, design 20261028-single-loop): a receiver gets one step per plan
+    (``max(1, ceil(0.1 * n))``, v1 ``scale_step``); the C1 deficit target and its caps
+    were retired (:data:`RETIRED_SCALING_KEYS`)."""
 
-    #: ``ratio`` above: the rescue target is at most ``ratio x n`` (never below n + 1).
-    #: 0 = the legacy one-step rescue (``ceil(0.1 * n)`` per decision window).
-    rescue_max_step_ratio: float = 2.0
-    #: The rescue target may also reach ``n + rescue_max_step_pods`` (HPA's default
-    #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
-    #: floor(ratio * n), n + pods). 0 = the ratio alone.
-    rescue_max_step_pods: int = 0
     # ``donor_surplus_release`` was retired on 2026-10-07 (F1-B, design
     # donor-evidence-20261007): no HIGH donor is released without a SafeScale probe any
     # more. An old registry carrying the key still loads (unknown keys are only warned about).
@@ -524,13 +515,6 @@ class ScalingRegistryConfig:
     #: O1: added to a routable-count change time (the gateway applies the SM's routable
     #: label through its pod informer).
     breakpoint_margin_ms: int = 1000
-    #: O1 (review P2-1, evidence-gated): a C1 rescue decided on a partial
-    #: (post-breakpoint) window with fewer than ``breakpoint_lowevidence_requests``
-    #: completed requests adds at most ``breakpoint_partial_max_step`` replicas; with at
-    #: least that many it asks for the whole deficit (ratio / step_pods caps apply).
-    #: ``breakpoint_partial_max_step: 0`` = no cap at all.
-    breakpoint_partial_max_step: int = 1
-    breakpoint_lowevidence_requests: int = 10
     #: O1: after its windows have been held this long (round 4: from the first to the
     #: newest held observation, ms) a receiver decides on the whole window again (donors
     #: still need a clean one) - a model whose routable count keeps changing is not
@@ -547,12 +531,13 @@ class ScalingRegistryConfig:
     #: completed) or the O1 evidence gate holds it - a model whose engines are full
     #: (``num_requests_waiting`` summed over its routable pods > 0, or their mean KV-cache
     #: fill >= ``saturation_kv_threshold``, latest gateway sample) on every window for
-    #: ``saturation_confirm_ms`` of observation time is a CRITICAL receiver. Its fast-loop target is ``min(max(n + 1, floor(factor * n)),
-    #: max_awake_replicas)``; each further step needs the condition again on windows
-    #: after the routable count changed (the pods the last step added must be full
-    #: themselves); the KV condition alone also needs >= 2 running requests; an O1 hold
-    #: only counts for the traffic onset or the rescue's own steps. Off: the TSS rules
-    #: alone (numerator zero = no decision until requests complete). Factor in [1, 4].
+    #: ``saturation_confirm_ms`` of observation time is a CRITICAL receiver. It gets one
+    #: step per plan (2026-10-28, like every receiver); each further step needs the
+    #: condition again on windows after the routable count changed (the pods the last
+    #: step added must be full themselves); the KV condition alone also needs >= 2
+    #: running requests; an O1 hold only counts for the traffic onset or the rescue's own
+    #: steps. Off: the TSS rules alone (numerator zero = no decision until requests
+    #: complete).
     saturation_rescue: bool = True
     saturation_kv_threshold: float = 0.9
     #: Confirmation span (ms of observation time, round 4): "full" from the first full
@@ -560,7 +545,6 @@ class ScalingRegistryConfig:
     #: the former ``saturation_consecutive_ticks: 2`` on the 10 s grid (deprecated alias,
     #: (N - 1) x 10 s: the first full window starts the span).
     saturation_confirm_ms: int = 10_000
-    saturation_max_step_factor: float = 2.0
     #: Sampling coverage (2026-10-25, design docs/design/20261025-instant-sampling.md):
     #: a pod's coverage = distinct ``scraped_ms`` in the window / (window / instant
     #: period); below ``sample_min_ratio`` the pod is flagged (no donor / shrink /
@@ -609,16 +593,24 @@ def _scaling_span_ms(raw: dict[str, Any], key: str, default: int, minimum: int) 
 
 
 SCALING_KEYS = frozenset({
-    "rescue_max_step_ratio", "rescue_max_step_pods",
     "rescue_settle_ema_k",
     "breakpoint_window", "onset_warmup_guard", "min_evidence_ms", "min_evidence_requests",
-    "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
+    "breakpoint_margin_ms",
     "breakpoint_hold_max_ms",
     "gateway_clock_tolerance_ms", "gateway_clock_check_s",
     "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
-    "saturation_max_step_factor",
     "sample_min_ratio",
 }) | frozenset(SCALING_COUNT_ALIASES)
+
+#: Keys retired on 2026-10-28 (design 20261028-single-loop, L3: one step per plan): the
+#: C1 deficit target caps, its partial-window / low-evidence step caps and the saturation
+#: rescue's doubling factor. A registry that still carries them (the live ConfigMap until
+#: its next structural replace) loads; they are ignored with one deprecation line.
+RETIRED_SCALING_KEYS = frozenset({
+    "rescue_max_step_ratio", "rescue_max_step_pods",
+    "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
+    "saturation_max_step_factor",
+})
 
 
 def _scaling_number(raw: dict[str, Any], key: str, default: float, *, low: float, high: float | None = None) -> float:
@@ -665,29 +657,16 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         return ScalingRegistryConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"scaling must be a mapping, got {raw!r}")
-    unknown = sorted(str(key) for key in set(raw) - SCALING_KEYS)
+    retired = sorted(str(key) for key in set(raw) & RETIRED_SCALING_KEYS)
+    if retired:
+        LOG.warning(
+            "registry scaling: ignoring retired keys %s (2026-10-28: one step per plan, "
+            "design 20261028-single-loop)", retired,
+        )
+    unknown = sorted(str(key) for key in set(raw) - SCALING_KEYS - RETIRED_SCALING_KEYS)
     if unknown:
         LOG.warning("registry scaling: ignoring unknown keys %s (known: %s)", unknown, sorted(SCALING_KEYS))
     defaults = ScalingRegistryConfig()
-    ratio_raw = raw.get("rescue_max_step_ratio")
-    if isinstance(ratio_raw, bool):
-        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}")
-    try:
-        ratio = float(defaults.rescue_max_step_ratio if ratio_raw is None else ratio_raw)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}") from exc
-    if not math.isfinite(ratio) or ratio < 0 or 0 < ratio < 1:
-        raise ValueError(
-            f"scaling.rescue_max_step_ratio must be 0 (legacy step) or at least 1, got {ratio_raw!r}"
-        )
-    pods_raw = raw.get("rescue_max_step_pods")
-    pods = defaults.rescue_max_step_pods if pods_raw is None else pods_raw
-    try:
-        valid_pods = not isinstance(pods, bool) and float(pods) == int(float(pods)) and int(float(pods)) >= 0
-    except (TypeError, ValueError, OverflowError):
-        valid_pods = False
-    if not valid_pods:
-        raise ValueError(f"scaling.rescue_max_step_pods must be a non-negative integer, got {pods_raw!r}")
     k_raw = raw.get("rescue_settle_ema_k")
     if isinstance(k_raw, bool):
         raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}")
@@ -698,8 +677,6 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
     if not math.isfinite(settle_k) or settle_k < 0:
         raise ValueError(f"scaling.rescue_settle_ema_k must be a non-negative number, got {k_raw!r}")
     return ScalingRegistryConfig(
-        rescue_max_step_ratio=ratio,
-        rescue_max_step_pods=int(float(pods)),
         rescue_settle_ema_k=settle_k,
         breakpoint_window=_scaling_bool(raw, "breakpoint_window", defaults.breakpoint_window),
         onset_warmup_guard=_scaling_bool(raw, "onset_warmup_guard", defaults.onset_warmup_guard),
@@ -708,12 +685,6 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
             raw, "min_evidence_requests", defaults.min_evidence_requests, 0
         ),
         breakpoint_margin_ms=_scaling_count(raw, "breakpoint_margin_ms", defaults.breakpoint_margin_ms, 0),
-        breakpoint_partial_max_step=_scaling_count(
-            raw, "breakpoint_partial_max_step", defaults.breakpoint_partial_max_step, 0
-        ),
-        breakpoint_lowevidence_requests=_scaling_count(
-            raw, "breakpoint_lowevidence_requests", defaults.breakpoint_lowevidence_requests, 0
-        ),
         breakpoint_hold_max_ms=_scaling_span_ms(
             raw, "breakpoint_hold_max_ms", defaults.breakpoint_hold_max_ms, 0
         ),
@@ -728,9 +699,6 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         ),
         saturation_confirm_ms=_scaling_span_ms(
             raw, "saturation_confirm_ms", defaults.saturation_confirm_ms, 0
-        ),
-        saturation_max_step_factor=_scaling_number(
-            raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0, high=4.0
         ),
         sample_min_ratio=_scaling_number(raw, "sample_min_ratio", defaults.sample_min_ratio, low=0.0, high=1.0),
     )

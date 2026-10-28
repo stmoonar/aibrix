@@ -191,9 +191,9 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     action = queue.submitted[0][0]
     assert isinstance(action, ScaleAction)
     assert action.model == "critical"
-    # C1: the whole deficit at once - n=2, Z far below tau_crit -> target 2n = 4.
-    assert action.delta == 2
-    assert action.rescue is not None and action.rescue.target == 4
+    # One step per plan (2026-10-28): n=2 -> target 3, whatever the Z.
+    assert action.delta == 1
+    assert action.rescue is not None and action.rescue.target == 3
     assert action.source_loop == "rescue"
     assert result.model_contexts["critical"]["z_m"] is not None
     assert result.model_contexts["critical"]["signal_source"] == "zm"

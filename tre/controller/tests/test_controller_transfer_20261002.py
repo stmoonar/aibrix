@@ -81,7 +81,7 @@ def _plan(bindings, *, receiver_state=ModelState.CRITICAL, donor_state=ModelStat
         # Legacy step rescue with ratio 1.0: the receiver needs exactly ``need`` replicas.
         cfg=cfg or PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=8, suppress_hot_proactive_probe=True,
-            rescue_max_step_ratio=2.0, scale_step_ratio=1.0,
+            scale_step_ratio=1.0,
         ),
         cluster_view=ClusterView(TOPOLOGY, bindings),
     )

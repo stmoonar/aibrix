@@ -8,7 +8,7 @@ the new rule would have fired, how far it would have scaled, and compares that w
 recorded first scale-up. It writes nothing but its report (stdout, or ``--json``).
 
 The decision itself is the controller's code (``SaturationTracker``,
-``eligibility_reason``-equivalent on the logged contexts, ``saturation_target``); the
+``eligibility_reason``-equivalent on the logged contexts, one step per decision); the
 inputs are reconstructed. Approximations (also printed with the report):
 
 A1 "engine full" is read from the external 5 s gauge sampler (``pod_gauges.jsonl``),
@@ -27,8 +27,7 @@ A4 a planned step lands ``--wake-s`` seconds after the tick (sleeping-replica wa
 A5 one decision per window, on the first rescue tick of the window (the controller's
    rescue loop reads each window twice; the tracker counts it once);
 A6 once the simulated model's TSS is warm again and the recorded tick says CRITICAL, the
-   C1 hand-off is estimated with ``rescue_desired`` on the recorded Z rescaled to the
-   simulated replica count (Z ~ n at fixed load, the C1 assumption);
+   C1 hand-off is one step (2026-10-28, design 20261028-single-loop: +1 per plan);
 A7 the idle windows (which re-open the O1-hold path) are approximated by the recorded
    windows with numerator 0 and Q at qmin; after a simulated step the pods it would
    add are not in the recording, so the "added pods full" check never confirms a second
@@ -50,7 +49,6 @@ from pathlib import Path
 from typing import Any
 
 from tre_common.registry import load_registry
-from tre_controller.planning.planner import rescue_desired
 from tre_controller.signals.saturation import (
     PodSample,
     REASON_NUMERATOR_ZERO,
@@ -58,7 +56,6 @@ from tre_controller.signals.saturation import (
     SaturationRescueConfig,
     SaturationSample,
     SaturationTracker,
-    saturation_target,
 )
 
 APPROXIMATIONS = (
@@ -67,7 +64,7 @@ APPROXIMATIONS = (
     "A3 after the first simulated step the gauges are the recorded run's (different replica count): indicative",
     "A4 a step lands --wake-s after the tick; capacity always found",
     "A5 one decision per window (first rescue tick of the window)",
-    "A6 after the TSS warms again: C1 hand-off estimated from the recorded Z rescaled to the simulated n",
+    "A6 after the TSS warms again: C1 hand-off is one step (+1)",
     "A7 idle ~ recorded numerator 0 and Q at qmin; simulated added pods are not recorded (no 2nd saturation step)",
 )
 
@@ -285,14 +282,8 @@ def replay_run(
                     simulated and reason is None and landing is None and n_sim < cap
                     and state.get("state") == "critical" and state.get("z_m") is not None
                 ):
-                    # A6: C1 hand-off on the warm TSS.
-                    spec = registry.model(model)
-                    scaling = registry.scaling()
-                    z = float(state["z_m"]) * n_sim / max(1, recorded_n)
-                    desired = min(cap, rescue_desired(
-                        n_sim, z, float(spec.trs.tau_crit), float(scaling.rescue_max_step_ratio),
-                        int(scaling.rescue_max_step_pods),
-                    ))
+                    # A6: C1 hand-off on the warm TSS: one step.
+                    desired = min(cap, n_sim + 1)
                     if desired > n_sim:
                         report.steps.append({**info, "target": desired, "path": "c1"})
                         landing = (tick_ts + wake_s, desired)
@@ -300,7 +291,7 @@ def replay_run(
             report.triggers.append(info)
             if n_view >= cap or landing is not None:
                 continue
-            target = saturation_target(n_view, config.max_step_factor, cap)
+            target = min(n_view + 1, cap)  # one step per decision (2026-10-28)
             report.steps.append({**info, "target": target, "path": "saturation"})
             tracker.note_step(model, window_end_ms=end_ms, routable=n_view, target=target,
                               pods=[pod.pod for pod in sample.per_pod] if sample is not None else ())

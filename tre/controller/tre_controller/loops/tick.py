@@ -142,8 +142,7 @@ class PaperStateCache:
                 # donor gate), and the UI shows the model UNCONFIRMED.
                 "signal_full_window": False,
                 "signal_hold_reason": "tokens_missing",
-                # ... and no evidence count either: a held receiver's rescue is capped
-                # like a thin partial window (planner partial_window_max_step).
+                # ... and no evidence count either.
                 "signal_evidence_requests": None,
                 # ... and never idle evidence (Q3: the O1 donor-hold exemption).
                 "window_idle": False,
@@ -270,7 +269,6 @@ def run_planner_tick(
         disable_eta_gate=disable_eta_gate,
         release_without_safescale=safescale is None or safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK,
         defrag_enabled=_defrag_enabled(registry),
-        **_scaling_options(registry),
     )
     plan = build_plan(
         model_contexts=contexts,
@@ -374,24 +372,6 @@ def run_planner_tick(
 def _defrag_enabled(registry: Registry) -> bool:
     placement = getattr(registry, "placement", None)
     return bool(getattr(placement(), "defrag_enabled", False)) if callable(placement) else False
-
-
-def _scaling_options(registry: Registry) -> dict:
-    """Registry ``scaling:`` (C1) as PlanConfig keywords; a registry without the
-    section (tests, older loaders) keeps the PlanConfig defaults."""
-    scaling = getattr(registry, "scaling", None)
-    if not callable(scaling):
-        return {}
-    config = scaling()
-    return {
-        "rescue_max_step_ratio": float(config.rescue_max_step_ratio),
-        "rescue_max_step_pods": int(getattr(config, "rescue_max_step_pods", 0)),
-        "partial_window_max_step": int(getattr(config, "breakpoint_partial_max_step", 0) or 0)
-        if bool(getattr(config, "breakpoint_window", False))
-        else 0,
-        "partial_window_lowevidence_requests": int(getattr(config, "breakpoint_lowevidence_requests", 0) or 0),
-        "saturation_max_step_factor": float(getattr(config, "saturation_max_step_factor", 2.0) or 2.0),
-    }
 
 
 def _apply_saturation_rescue(

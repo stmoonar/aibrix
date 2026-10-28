@@ -242,7 +242,7 @@ def _two_model_registry() -> Registry:
     specs = [ModelSpec(name=name, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=4,
                        vllm_image="img", slo=slo, trs=trs) for name in ("a", "b")]
     topology = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
-    return Registry(topology, specs, scaling=ScalingRegistryConfig(rescue_max_step_pods=4))
+    return Registry(topology, specs, scaling=ScalingRegistryConfig())
 
 
 def _model_window(model, end, grids, routable):

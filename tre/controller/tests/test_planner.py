@@ -57,8 +57,8 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     }
     replicas = {"critical": 2, "idle": 3, "high": 2}
 
-    # Legacy one-step rescue (C1 off): the scenario below is the one-replica transfer
-    # plus the HIGH donor's proactive probe. The C1 default is asserted at the end.
+    # One step per plan (L3, 2026-10-28): the one-replica transfer plus the HIGH donor's
+    # proactive probe.
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -66,7 +66,6 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         idle_gpus=0,
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False,
-            rescue_max_step_ratio=0,
         ),
     )
 
@@ -76,7 +75,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     assert _deltas(scale_actions) == {"idle": -1, "critical": 1, "high": -1}
     assert plan.delayed_down_models == {"high"}
     assert plan.probe_upscale_plans == {}
-    assert plan.events == []
+    assert plan.events == ["rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1"]
     assert all(action.source_loop == "rescue" for action in plan.actions)
     assert {(a.model, a.reason, a.requires_safescale) for a in scale_actions} == {
         ("idle", "critical_donor_immediate", False),
@@ -98,27 +97,14 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         idle_gpus=0,
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
-            rescue_max_step_ratio=0,
         ),
     )
     assert _deltas([a for a in expand_relays(guarded.actions) if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
     assert guarded.delayed_down_models == set()
-    assert guarded.events == ["safescale_probe_suppressed_hot:high"]
-
-    # C1 default: n=2, Z=0.5, tau_crit=0.8 -> target ceil(2*0.8/0.5)=4. The idle donor
-    # gives its whole surplus (Q3: 2 above its floor), which covers the need; the high
-    # donor is then probed proactively (one step, SafeScale), not relayed.
-    c1 = build_plan(
-        model_contexts=contexts,
-        classifications=classifications,
-        model_replicas=replicas,
-        idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
-    )
-    c1_actions = [a for a in expand_relays(c1.actions) if isinstance(a, ScaleAction)]
-    assert _deltas(c1_actions) == {"idle": -2, "critical": 2, "high": -1}
-    assert {a.reason for a in c1_actions} == {"critical_donor_immediate", "high_proactive_safescale"}
-    assert c1.events == ["rescue_target:critical:n=2:z=0.5000:desired=4:covered=2:planned=2"]
+    assert guarded.events == [
+        "rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1",
+        "safescale_probe_suppressed_hot:high",
+    ]
 
 
 def test_build_plan_middle_zone_shrinks_healthy_under_safescale_for_a_critical_receiver() -> None:
@@ -189,11 +175,10 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         classifications=classifications,
         model_replicas=replicas,
         idle_gpus=0,
-        # Legacy one-step rescue (C1 off): the scenario is the idle donor drained by
-        # both loops in one tick, one replica each.
+        # One step per plan: the idle donor drained by both sections of one call, one
+        # replica each.
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
-            rescue_max_step_ratio=0,
         ),
     )
 
@@ -208,7 +193,10 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         ("low", 1, "low_fairness_donor_immediate", "fairness", "idle", "low"),
     }
     assert not any(event.startswith("fairness_blocked_unsaturated") for event in plan.events)
-    assert plan.events == ["safescale_probe_suppressed_hot:high"]
+    assert plan.events == [
+        "rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1",
+        "safescale_probe_suppressed_hot:high",
+    ]
     assert plan.delayed_down_models == set()
 
 
@@ -722,8 +710,8 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
         "hot": {"assigned_replicas": 4, "routable_pods": 4},
     }
     replicas = {"critical": 2, "idle": 3, "hot": 4}
-    # Legacy one-step rescue: the scenario needs the HIGH donor left for its probe.
-    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_max_step_ratio=0)
+    # One step per plan: the scenario needs the HIGH donor left for its probe.
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
 
     free = build_plan(
         model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg

@@ -3,8 +3,8 @@
 While a model's TSS cannot decide (window numerator zero, or the O1 evidence gate holds
 it), a model whose engines are full - requests waiting in vLLM, or KV cache >= 0.9, on
 the latest gateway sample - on 2 consecutive metrics windows is a CRITICAL receiver;
-the fast loop doubles its routable count (bounded), and every further step needs the
-condition again after the routable count changed."""
+the rescue section adds one step (+1, design 20261028-single-loop), and every further
+step needs the condition again after the routable count changed."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from tre_common.registry import (
 from tre_common.window_pods import aggregate_pods
 from tre_controller.loops.action_queue import RescueTargetRecord
 from tre_controller.loops.decision_snapshot import _model_states
-from tre_controller.loops.tick import _scaling_options, run_planner_tick
+from tre_controller.loops.tick import run_planner_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
 from tre_controller.signals.saturation import (
@@ -36,7 +36,6 @@ from tre_controller.signals.saturation import (
     SaturationTracker,
     eligibility_reason,
     saturation_sample,
-    saturation_target,
 )
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.store.metrics_store import MetricsStore
@@ -261,10 +260,10 @@ def test_eligibility_reason():
     assert eligibility_reason({"tss_defined": True, "Y_m": 0.0, "signal_source": "running"}) is None
 
 
-# --------------------------------------------------------- bounded doubling
+# --------------------------------------------------------- one step at a time
 
 
-def test_bounded_doubling_needs_two_fresh_windows_after_each_step():
+def test_each_step_needs_two_fresh_windows_after_the_last_one():
     state = _state()
     queue = _Queue()
     sat = [STARTING] * 3
@@ -283,38 +282,15 @@ def test_bounded_doubling_needs_two_fresh_windows_after_each_step():
     once = tick(7, 2)
     assert not once.actions and once.model_contexts["m"]["saturation_held_ms"] == 0
     step2 = tick(8, 2)
-    assert _planned(step2) == 2  # 2 -> 4
-    assert any(e.startswith("saturation_rescue:m:n=2:target=4") for e in step2.events)
-    tick(9, 4)
-    tick(10, 4)
-    capped = tick(11, 4)  # 4 = max_awake_replicas: nothing more
+    assert _planned(step2) == 1  # 2 -> 3: one step, never a doubling
+    assert any(e.startswith("saturation_rescue:m:n=2:target=3") for e in step2.events)
+    tick(9, 3)
+    tick(10, 3)
+    assert _planned(tick(11, 3)) == 1  # 3 -> 4
+    tick(12, 4)
+    tick(13, 4)
+    capped = tick(14, 4)  # 4 = max_awake_replicas: nothing more
     assert not capped.actions
-
-
-def test_step_is_capped_by_max_awake_replicas():
-    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, saturation_max_step_factor=2.0)
-    for n, planned in ((1, 1), (2, 2), (3, 1)):
-        ctx = {"m": {"assigned_replicas": 8, "routable_pods": n, "awake_replicas": n, "signal_warm": False,
-                     "saturation_rescue": True}}
-        plan = build_plan(model_contexts=ctx, classifications=[_sat_cls("m")], model_replicas={"m": 8},
-                          idle_gpus=8, cfg=cfg)
-        assert sum(a.delta for a in _ups(plan.actions)) == planned, n
-    assert saturation_target(1, 2.0, 8) == 2 and saturation_target(3, 2.0, 8) == 6
-    assert saturation_target(3, 1.0, 8) == 4  # factor 1: still n + 1
-    assert saturation_target(5, 2.0, 8) == 8
-
-
-def test_zero_z_never_jumps_to_the_cap():
-    """Unlike C1's ceil(n * tau_crit / Z) (a Z near 0 asks for the cap), the step is n -> 2n,
-    and the O1 low-evidence cap does not apply to it (its own re-confirmation bounds it)."""
-    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8, rescue_max_step_pods=4,
-                     partial_window_max_step=1, partial_window_lowevidence_requests=10)
-    ctx = {"m": {"assigned_replicas": 8, "routable_pods": 2, "awake_replicas": 2, "signal_warm": False,
-                 "signal_full_window": False, "signal_evidence_requests": 0.0, "saturation_rescue": True}}
-    plan = build_plan(model_contexts=ctx, classifications=[_sat_cls("m", z=0.01)], model_replicas={"m": 8},
-                      idle_gpus=8, cfg=cfg)
-    assert sum(a.delta for a in _ups(plan.actions)) == 2  # 2 -> 4, not 2 -> 6 and not 2 -> 3
-    assert not any(e.startswith("rescue_low_evidence_step") for e in plan.events)
 
 
 def test_await_releases_after_a_step_that_never_lands():
@@ -446,55 +422,26 @@ def test_store_carries_each_pods_newest_instant_sample():
 
 def test_scaling_config_defaults_and_validation():
     defaults = parse_scaling_config({})
-    assert (defaults.saturation_rescue, defaults.saturation_kv_threshold, defaults.saturation_confirm_ms,
-            defaults.saturation_max_step_factor) == (True, 0.9, 10_000, 2.0)
+    assert (defaults.saturation_rescue, defaults.saturation_kv_threshold, defaults.saturation_confirm_ms) == (
+        True, 0.9, 10_000)
     custom = parse_scaling_config({"saturation_rescue": False, "saturation_kv_threshold": 0.95,
-                                   "saturation_confirm_ms": 30_000, "saturation_max_step_factor": 1.5})
-    assert (custom.saturation_rescue, custom.saturation_kv_threshold, custom.saturation_confirm_ms,
-            custom.saturation_max_step_factor) == (False, 0.95, 30_000, 1.5)
+                                   "saturation_confirm_ms": 30_000})
+    assert (custom.saturation_rescue, custom.saturation_kv_threshold, custom.saturation_confirm_ms) == (
+        False, 0.95, 30_000)
     # Round 4: the deprecated count key (N windows in a row) reads as (N - 1) x 10 s.
     assert parse_scaling_config({"saturation_consecutive_ticks": 3}).saturation_confirm_ms == 20_000
     assert parse_scaling_config({"saturation_consecutive_ticks": 1}).saturation_confirm_ms == 0
     assert parse_scaling_config({"saturation_confirm_ms": 0}).saturation_confirm_ms == 0
     for bad in ({"saturation_rescue": "yes"}, {"saturation_kv_threshold": 0}, {"saturation_kv_threshold": 1.5},
                 {"saturation_kv_threshold": True}, {"saturation_kv_threshold": "x"},
-                {"saturation_confirm_ms": -1}, {"saturation_consecutive_ticks": 1.5},
-                {"saturation_max_step_factor": 0.5}, {"saturation_max_step_factor": float("nan")}):
+                {"saturation_confirm_ms": -1}, {"saturation_consecutive_ticks": 1.5}):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
-    registry = _registry(saturation_kv_threshold=0.8, saturation_confirm_ms=30_000, saturation_max_step_factor=3)
+    registry = _registry(saturation_kv_threshold=0.8, saturation_confirm_ms=30_000)
     config = SaturationRescueConfig.from_registry(registry)
-    assert (config.enabled, config.kv_threshold, config.confirm_ms, config.max_step_factor) == (True, 0.8, 30_000, 3.0)
+    assert (config.enabled, config.kv_threshold, config.confirm_ms) == (True, 0.8, 30_000)
     assert config.await_timeout_ms == 30_000
-    assert _scaling_options(registry)["saturation_max_step_factor"] == 3.0
     assert not SaturationRescueConfig.from_registry(_registry(saturation_rescue=False)).enabled
-
-
-# ------------------------------------- partial_max_step wiring (2026-10-02 check)
-
-
-def test_partial_max_step_is_wired_from_the_registry_through_the_tick():
-    """``scaling.breakpoint_partial_max_step`` reaches the planner (ScalingRegistryConfig
-    -> _scaling_options -> PlanConfig) and ``signal_evidence_requests`` reaches it through
-    the tick's context: a warm partial window with < 10 completed requests adds +1; with
-    >= 10 the whole C1 deficit (A-smoke-tre 18:02: n = 1, Z = 0.298, ~hundreds of
-    completed requests in the 20 s suffix -> planned 2 is the uncapped case)."""
-
-    def run(requests_per_grid: float) -> int:
-        state = SignalState(breakpoint=BreakpointWindowConfig(enabled=True, min_evidence_ms=2 * GRID,
-                                                              min_evidence_requests=3))
-        registry = _registry(rescue_max_step_pods=4, breakpoint_partial_max_step=1,
-                             breakpoint_lowevidence_requests=10, saturation_rescue=False)
-        burst = (200.0, 30.0, 20.0, requests_per_grid)
-        planned = []
-        for i, grids in ((3, [IDLE, IDLE, burst]), (4, [IDLE, burst, burst]), (5, [burst, burst, burst])):
-            result = _tick(state, _window(BASE + i * GRID, grids, (20.0, 1.0)), awake=1, registry=registry)
-            planned.append(_planned(result))
-        return planned
-
-    # The first two (held) ticks: one free-GPU step each (CRITICAL exemption, 2026-10-07).
-    assert run(2.0) == [1, 1, 1]  # 4 completed in the 20 s suffix: +1 (rescue_low_evidence_step)
-    assert run(10.0) == [1, 1, 3]  # 20 completed: the whole deficit (capped by max_awake 4)
 
 
 # ======================================================= review fixes (2026-10-02)
@@ -560,7 +507,7 @@ def test_an_idle_window_reopens_the_o1_hold_path():
 
 def test_backlog_on_the_old_pod_does_not_confirm_the_next_step():
     """P2-a: after 1 -> 2 the old pod still drains its backlog (waiting is per pod); the
-    added pod has room -> no second step; once the added pod is full itself -> 2 -> 4."""
+    added pod has room -> no second step; once the added pod is full itself -> 2 -> 3."""
     state = _state()
     queue = _Queue()
     sat = [STARTING] * 3
@@ -580,7 +527,7 @@ def test_backlog_on_the_old_pod_does_not_confirm_the_next_step():
         assert result.model_contexts["m"]["saturation_waiting"] == 50.0  # the sum alone would say full
     busy_new = {"m-0": (50.0, 0.98), "m-1": (4.0, 0.5)}
     assert not tick(10, 2, busy_new).actions
-    assert _planned(tick(11, 2, busy_new)) == 2
+    assert _planned(tick(11, 2, busy_new)) == 1
 
 
 def test_single_long_request_filling_the_kv_cache_does_not_trigger():
@@ -740,9 +687,6 @@ def test_config_is_read_from_the_registry_every_tick():
                for i in (3, 4, 5)]
     assert planned == [0, 0, 1]  # full from the first to the third window: 20 s
     assert state.saturation.config.confirm_ms == 20_000
-    with pytest.raises(ValueError):
-        parse_scaling_config({"saturation_max_step_factor": 4.5})
-    assert parse_scaling_config({"saturation_max_step_factor": 4}).saturation_max_step_factor == 4.0
 
 
 def test_decision_snapshot_exports_the_rescue_state():
@@ -808,21 +752,21 @@ def test_step_pods_come_from_the_fleet_view_not_the_fresh_samples():
 
     tick(3, 2, stale=("m-1",))
     step1 = tick(4, 2, stale=("m-1",))
-    assert _planned(step1) == 2 and step1.model_contexts["m"]["saturation_pods"] == 1  # 2 -> 4
-    tick(5, 4)  # landed
-    # m-1 (old) has room now; the added m-2, m-3 are full themselves -> next step 4 -> 8.
-    pods = {"m-0": (8.0, 0.6), "m-1": (0.0, 0.1), "m-2": (5.0, 0.6), "m-3": (5.0, 0.6)}
-    tick(6, 4, latest_by_pod=pods)
-    assert _planned(tick(7, 4, latest_by_pod=pods)) == 4
+    assert _planned(step1) == 1 and step1.model_contexts["m"]["saturation_pods"] == 1  # 2 -> 3
+    tick(5, 3)  # landed
+    # m-1 (old) has room now; the added m-2 is full itself -> next step 3 -> 4.
+    pods = {"m-0": (8.0, 0.6), "m-1": (0.0, 0.1), "m-2": (5.0, 0.6)}
+    tick(6, 3, latest_by_pod=pods)
+    assert _planned(tick(7, 3, latest_by_pod=pods)) == 1
 
 
 def test_an_added_pod_without_a_fresh_sample_blocks_the_next_step():
     """2026-10-04 (I3): the added pods come from the fleet view's routable set. After
-    1 -> 3, the added m-1 is full but m-2 has no fresh sample (unknown, not "room" and not
-    skipped) -> no further step; once m-2 is sampled and full the next step follows."""
+    1 -> 2, the added m-1 has no fresh sample (unknown, not "room" and not skipped) -> no
+    further step; once m-1 is sampled and full the next step follows."""
     state = _state()
     queue = _Queue()
-    registry = _registry(max_awake=8, saturation_max_step_factor=3.0)
+    registry = _registry(max_awake=8)
     sat = [STARTING] * 3
 
     def tick(i, awake, stale=()):
@@ -833,14 +777,14 @@ def test_an_added_pod_without_a_fresh_sample_blocks_the_next_step():
         return _tick(state, replace(w, per_pod=per_pod), awake=awake, queue=queue, registry=registry)
 
     tick(3, 1)
-    assert _planned(tick(4, 1)) == 2  # 1 -> 3
-    tick(5, 3, stale=("m-2",))  # landed
+    assert _planned(tick(4, 1)) == 1  # 1 -> 2
+    tick(5, 2, stale=("m-1",))  # landed
     for i in (6, 7, 8):
-        result = tick(i, 3, stale=("m-2",))
+        result = tick(i, 2, stale=("m-1",))
         assert not _ups(result.actions)
         assert result.model_contexts["m"]["saturation_held_ms"] is None
-    tick(9, 3)
-    assert _planned(tick(10, 3)) > 0
+    tick(9, 2)
+    assert _planned(tick(10, 2)) > 0
 
 
 def test_events_are_reported_once_per_window():

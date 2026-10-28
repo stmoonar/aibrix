@@ -2,6 +2,8 @@
 
 2. Order: two CRITICAL receivers compete for one free GPU - the lower Z wins whatever
    the registry order; a LOW receiver is never planned before a CRITICAL one.
+3. One step: a receiver gets at most +1 per plan however deep its Z and however much
+   capacity is free; no second +1 before the window reflects the previous target.
 5. One ledger: the rescue and the rebalance section of one planner call never assign
    one free GPU twice; with TRE_ABLATION_DISABLE_SLOW_LOOP a LOW receiver gets nothing.
 6. A stale snapshot (or no publish at all) gives no decision and an alert. (The same
@@ -21,7 +23,7 @@ from tre_controller.loops.decision_task import DecisionLoop, decision_task
 from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.tick import LoopTickResult, upscale_of
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
-from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
+from tre_controller.planning.planner import ClusterView, PlanConfig, RescueBasis, ScaleAction, build_plan
 from tre_sm.allocator.slots import Binding, Slot
 
 TOPOLOGY = ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
@@ -40,7 +42,7 @@ def _binding(serve_id: str, model: str, gpus: tuple[int, ...], awake: bool) -> B
     return Binding(serve_id, model, Slot("n", gpus), awake=awake)
 
 
-def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, **cfg):
+def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, bases=None, **cfg):
     """One planner call on the bindings; ``x`` fills the other GPUs at its floor."""
     awake, bound = {}, {}
     for binding in bindings:
@@ -64,6 +66,7 @@ def _plan(bindings, classes, *, rescue_due=True, fairness_due=True, **cfg):
             **cfg,
         ),
         cluster_view=ClusterView(TOPOLOGY, tuple(bindings)),
+        rescue_bases=bases,
     )
 
 
@@ -100,6 +103,23 @@ def test_the_lower_z_wins_the_free_gpu_whatever_the_registry_order(z_a, z_b, win
     plan = _plan(bindings, classes)
 
     assert _ups(plan) == [(winner, 1, (f"{winner}-0",))]
+
+
+# ------------------------------------------------------------------ 3. one step
+def test_a_receiver_gets_one_step_per_plan_and_none_before_the_window_reflects_it():
+    def bindings(awake_count):
+        return [_binding(f"crit-{gpu}", "crit", (gpu,), gpu < awake_count) for gpu in range(4)]
+
+    classes = {"crit": (*CRIT, 0.05)}  # deep CRITICAL, three free GPUs it sleeps on
+
+    first = _plan(bindings(1), classes)
+    assert [(model, delta) for model, delta, _pods in _ups(first)] == [("crit", 1)]
+    # The target (1 -> 2) is issued; the window still describes 1 replica.
+    held = _plan(bindings(1), classes, bases={"crit": RescueBasis(base=1, covered=2)})
+    assert _ups(held) == [] and "rescue_target_hold:crit:desired=2:covered=2" in held.events
+    # The window moved (2 replicas): the next single step.
+    reflected = _plan(bindings(2), classes)
+    assert [(model, delta) for model, delta, _pods in _ups(reflected)] == [("crit", 1)]
 
 
 # ------------------------------------------------------------------ 5. one ledger

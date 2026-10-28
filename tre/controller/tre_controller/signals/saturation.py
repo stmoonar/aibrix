@@ -37,9 +37,8 @@ CRITICAL receiver anyway:
   window" for the first; a window whose newest observation did not move adds nothing).
   10 s = the former 2 windows of the 10 s grid, at any evidence period;
 * after a rescue step the span restarts and only windows after the routable count rose
-  above the decision's count count again (bounded doubling 1 -> 2 -> 4); a step may land
-  in parts over several windows (2 -> 3 -> 4 for target 4), every rise up to its target is
-  the step's own. A step that never lands is released on its dispatch result: when the
+  above the decision's count count again (one step per plan since 2026-10-28:
+  1 -> 2 -> 3); every rise up to the step's target is the step's own. A step that never lands is released on its dispatch result: when the
   ActionQueue reports that every part of the step's rescue target ended without adding a
   replica (refused, failed, not executed, dropped in observe mode), the wait ends at once
   (``saturation_step_failed``). ``await_timeout_ms`` is only the fallback for a result
@@ -66,9 +65,6 @@ REASON_O1_HOLD = "o1_hold"
 #: Fires on the first such window, one replica per step (planner).
 REASON_SCRAPE_STALE_INFLIGHT = "scrape_stale_inflight"
 
-#: Upper bound of ``scaling.saturation_max_step_factor`` (the registry enforces it too).
-MAX_STEP_FACTOR_LIMIT = 4.0
-
 
 @dataclass(frozen=True)
 class SaturationRescueConfig:
@@ -79,7 +75,6 @@ class SaturationRescueConfig:
     #: Confirmation span (ms of observation time): full from the first full observation
     #: to the newest one (``scaling.saturation_confirm_ms``; 0 = the first full window).
     confirm_ms: int = 10_000
-    max_step_factor: float = 2.0
     #: The KV condition alone also needs this many running requests (summed over the
     #: routable pods; per pod for the added-pods check).
     kv_min_running: int = 2
@@ -105,10 +100,6 @@ class SaturationRescueConfig:
             enabled=bool(getattr(config, "saturation_rescue", self.enabled)),
             kv_threshold=float(getattr(config, "saturation_kv_threshold", self.kv_threshold)),
             confirm_ms=max(0, int(getattr(config, "saturation_confirm_ms", self.confirm_ms))),
-            max_step_factor=min(
-                MAX_STEP_FACTOR_LIMIT,
-                max(1.0, float(getattr(config, "saturation_max_step_factor", self.max_step_factor))),
-            ),
         )
 
 
@@ -221,12 +212,6 @@ def eligibility_reason(context: Mapping[str, Any] | None) -> str | None:
     if context.get("signal_warm") is False:
         return REASON_O1_HOLD
     return None
-
-
-def saturation_target(n: int, factor: float, cap: int) -> int:
-    """Bounded doubling: ``min(max(n + 1, floor(factor * n)), cap)``."""
-    n = max(0, int(n))
-    return min(max(n + 1, int(float(factor) * n + 1e-9)), int(cap))
 
 
 @dataclass

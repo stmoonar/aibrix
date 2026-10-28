@@ -41,7 +41,7 @@ def _plan(view, queue=None):
         model_replicas={D: 8, R: 8},
         idle_gpus=0,
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8, suppress_hot_proactive_probe=True,
-                       rescue_max_step_ratio=2.0, scale_step_ratio=1.0),
+                       scale_step_ratio=1.0),
         cluster_view=view,
         relay_holds=queue.relay_holds() if queue is not None else None,
     )

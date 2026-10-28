@@ -540,7 +540,7 @@ def _run(state: SignalState | None, pattern: list, registry: Registry) -> list[t
 
 
 def test_trickle_from_idle_never_scales_and_a_burst_scales_after_two_grids():
-    registry = _registry(10_000.0, rescue_max_step_pods=4)
+    registry = _registry(10_000.0)
     onset = 1_000_000 + 4 * GRID
     trickle = [IDLE, IDLE, IDLE] + [TRICKLE] * 8
     # No guard at all: the filling window reads CRITICAL (the ADR-0013 failure).
@@ -630,8 +630,7 @@ def test_shipped_registry_enables_o1_with_the_default_evidence():
     scaling = load_registry().scaling()
     assert scaling.breakpoint_window is True and scaling.onset_warmup_guard is False
     assert scaling.min_evidence_ms == 20_000 and scaling.min_evidence_requests == 3
-    assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_ms == 50_000
-    assert scaling.breakpoint_lowevidence_requests == 10
+    assert scaling.breakpoint_hold_max_ms == 50_000
     assert scaling.gateway_clock_tolerance_ms == 2000 and scaling.gateway_clock_check_s == 60
     assert json.dumps(sorted(ScalingRegistryConfig.__dataclass_fields__))  # serialisable names
     assert BreakpointWindowConfig().hold_max_ms == scaling.breakpoint_hold_max_ms
@@ -668,44 +667,11 @@ def test_partial_window_needs_three_completed_requests_by_default():
     assert state.effective_window("m", _window(50_000, [IDLE, TRICKLE, TRICKLE])).warm
 
 
-def _c1_plan(full: bool | None, *, step: int = 1, z: float = 0.05, requests: float | None = 5.0,
-             low: int = 10):
-    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8, rescue_max_step_ratio=2.0,
-                     rescue_max_step_pods=4, partial_window_max_step=step,
-                     partial_window_lowevidence_requests=low)
-    ctx = {"assigned_replicas": 1, "routable_pods": 1, "awake_replicas": 1, "signal_warm": True}
-    if full is not None:
-        ctx["signal_full_window"] = full
-        ctx["signal_evidence_requests"] = None if full else requests
-    return build_plan(model_contexts={"m": ctx}, classifications=[_cls("m", ModelState.CRITICAL, z)],
-                      model_replicas={"m": 1}, idle_gpus=6, cfg=cfg)
-
-
-def test_c1_step_is_capped_only_on_low_evidence_partial_windows():
-    """P2-1 (evidence-gated): +1 on a partial window with < 10 completed requests (a
-    low-QPS heavy-tailed load), the whole deficit (+4) with enough requests or a whole window."""
-    low = _c1_plan(False, requests=4.0)
-    assert sum(a.delta for a in _ups(low.actions)) == 1
-    assert any(e.startswith("rescue_low_evidence_step:m:4->1:requests=4.0") for e in low.events)
-    assert sum(a.delta for a in _ups(_c1_plan(False, requests=10.0).actions)) == 4
-    assert sum(a.delta for a in _ups(_c1_plan(False, requests=None).actions)) == 1  # unknown = low
-    assert sum(a.delta for a in _ups(_c1_plan(True).actions)) == 4
-    assert sum(a.delta for a in _ups(_c1_plan(None).actions)) == 4  # pre-O1 contexts
-    assert sum(a.delta for a in _ups(_c1_plan(False, requests=4.0, step=0).actions)) == 4  # cap off
-    from tre_controller.loops.tick import _scaling_options
-
-    options = _scaling_options(_registry())
-    assert options["partial_window_max_step"] == 1 and options["partial_window_lowevidence_requests"] == 10
-    assert _scaling_options(_registry(breakpoint_window=False))["partial_window_max_step"] == 0
-    assert parse_scaling_config({"breakpoint_lowevidence_requests": 0}).breakpoint_lowevidence_requests == 0
-    with pytest.raises(ValueError):
-        parse_scaling_config({"breakpoint_lowevidence_requests": -1})
-
-
 def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
     """0.1-0.3 rps with long requests: the 20 s suffix holds 3-9 completions; a short one
-    done and long ones running reads Z far below tau_crit - the rescue adds +1, not +4."""
-    registry = _registry(10_000.0, rescue_max_step_pods=4)
+    done and long ones running reads Z far below tau_crit - the rescue adds +1, not +4
+    (L3 2026-10-28: one step per plan, whatever the evidence)."""
+    registry = _registry(10_000.0)
     state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig())
     thin = (12.0, 4.0, 2.0, 2.0)  # 2 short completions per grid, 4 long requests running
     queue = _Queue()
@@ -716,7 +682,7 @@ def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
     ups = _ups(queue.submitted)
     # One step per decision (this queue models no in-flight target, so every tick may step).
     assert ups and all(a.delta == 1 for a in ups)
-    # A deep overload (Z = 0.10) with 10+ completions in the suffix: the whole deficit.
+    # A deep overload (Z = 0.10) with 10+ completions in the suffix: still one step.
     DEEP = (1000.0, 30.0, 100.0, 100.0)
     state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig())
     queue = _Queue()
@@ -724,9 +690,8 @@ def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
         end = 1_000_000 + (i + 1) * GRID
         run_rescue_tick(_snap(_window(end, ([IDLE] * 3 + [DEEP] * 3)[i - 2 : i + 1])), queue=queue,
                         registry=registry, signal_state=state)
-    # Held ticks: +1 each (CRITICAL free-GPU exemption); the warm one the whole deficit,
-    # 1 -> 4 (scaling cap; this queue keeps routable at 1).
-    assert [a.delta for a in _ups(queue.submitted)] == [1, 1, 3]
+    # Held ticks: +1 each (CRITICAL free-GPU exemption); the warm one +1 too.
+    assert [a.delta for a in _ups(queue.submitted)] == [1, 1, 1]
 
 
 def test_starving_receiver_falls_back_to_the_whole_window_after_hold_max_windows():

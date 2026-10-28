@@ -6,6 +6,7 @@ import asyncio
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_controller.config import ControllerConfig
 from tre_controller.loops.decision_task import DecisionLoop, run_rescue_tick
+from tre_controller.loops.tick import LoopTickResult
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import PlanConfig, ScaleAction, build_plan
 
@@ -17,11 +18,10 @@ from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind PO
 
 
 def _registry(**scaling) -> Registry:
-    """The test_loop_ticks registry; by default with C1 off (legacy one-step rescue),
-    the only rescue the F4 hold still applies to a CRITICAL receiver's scale-up (the
-    opt-in scale_up_cooldown_enabled switch was removed in the timer cleanup)."""
+    """The test_loop_ticks registry. (A CRITICAL receiver's scale-up is held by its rescue
+    target, never by the F4 cooldown: the legacy C1-off step it applied to was retired
+    on 2026-10-28.)"""
     base = _base_registry()
-    scaling.setdefault("rescue_max_step_ratio", 0.0)
     return Registry(base.topology(), list(base.models()), scaling=ScalingRegistryConfig(**scaling))
 
 
@@ -85,71 +85,33 @@ def _woken(queue_client: _OkClient) -> int:
     return sum(delta for model, delta in queue_client.calls if model == "critical" and delta > 0)
 
 
-def test_repeated_critical_ticks_wake_once_until_window_rolls_past_the_wake() -> None:
+def test_c1_without_cooldown_wakes_one_step_once_until_the_window_reflects_it() -> None:
+    """One step per plan (L3): one wake (2 -> 3), then the rescue target bookkeeping
+    holds every tick whose window predates the wake; the first window starting after it
+    is planned afresh (here still CRITICAL at n=2 in the fake snapshot, so the target is
+    re-issued)."""
     client = _OkClient()
     clock = _Clock(65_000)
     queue = ActionQueue(client, now_ms=clock)
     registry = _registry()
 
     first = run_rescue_tick(_critical_snapshot(5_000), queue=queue, registry=registry, action_cooldown=True)
-    asyncio.run(queue.drain_once())  # wake completes at t=65_000
-    assert first.submitted == 1 and _wakes(client) == 1
-    assert queue.last_actions() == {"critical": (65_000, "up")}
-
-    # Still CRITICAL, but every window that starts before t=65_000 predates the wake.
-    for start in (10_000, 30_000, 64_999):
-        held = run_rescue_tick(_critical_snapshot(start), queue=queue, registry=registry, action_cooldown=True)
-        asyncio.run(queue.drain_once())
-        assert held.submitted == 0
-        assert "cooldown_hold:critical" in held.events
-    assert _wakes(client) == 1
-
-    fresh = run_rescue_tick(_critical_snapshot(65_000), queue=queue, registry=registry, action_cooldown=True)
     asyncio.run(queue.drain_once())
-    assert fresh.submitted == 1 and _wakes(client) == 2
-
-
-def test_c1_without_cooldown_wakes_the_deficit_once_until_the_window_reflects_it() -> None:
-    """C1 default (no scale-up cooldown): one wake of the whole deficit (2 -> 4), then the
-    rescue target bookkeeping holds every tick whose window predates the wake; the first
-    window starting after it is planned afresh (here still CRITICAL at n=2 in the fake
-    snapshot, so the target is re-issued)."""
-    client = _OkClient()
-    clock = _Clock(65_000)
-    queue = ActionQueue(client, now_ms=clock)
-    registry = _registry(rescue_max_step_ratio=2.0)
-
-    first = run_rescue_tick(_critical_snapshot(5_000), queue=queue, registry=registry, action_cooldown=True)
-    asyncio.run(queue.drain_once())
-    assert first.submitted == 1 and _wakes(client) == 1 and _woken(client) == 2
+    assert first.submitted == 1 and _wakes(client) == 1 and _woken(client) == 1
     record = queue.rescue_targets()["critical"]
-    assert (record.base, record.target, record.covered, record.done_ms) == (2, 4, 4, 65_000)
+    assert (record.base, record.target, record.covered, record.done_ms) == (2, 3, 3, 65_000)
 
     for start in (10_000, 30_000, 64_999):
         held = run_rescue_tick(_critical_snapshot(start), queue=queue, registry=registry, action_cooldown=True)
         asyncio.run(queue.drain_once())
         assert held.submitted == 0
-        assert "rescue_target_hold:critical:desired=4:covered=4" in held.events
+        assert "rescue_target_hold:critical:desired=3:covered=3" in held.events
         assert not any(event.startswith("cooldown_hold") for event in held.events)
     assert _wakes(client) == 1
 
     fresh = run_rescue_tick(_critical_snapshot(65_000), queue=queue, registry=registry, action_cooldown=True)
     asyncio.run(queue.drain_once())
     assert fresh.submitted == 1 and _wakes(client) == 2
-
-
-def test_cooldown_disabled_keeps_legacy_repeat_behaviour() -> None:
-    client = _OkClient()
-    queue = ActionQueue(client, now_ms=_Clock(65_000))
-    # Legacy one-step rescue (rescue_max_step_ratio 0) without the cooldown.
-    registry = _registry(rescue_max_step_ratio=0.0)
-
-    for start in (5_000, 10_000):
-        result = run_rescue_tick(_critical_snapshot(start), queue=queue, registry=registry)
-        asyncio.run(queue.drain_once())
-        assert result.submitted == 1
-        assert not any(event.startswith("cooldown_hold") for event in result.events)
-    assert _wakes(client) == 2
 
 
 def test_failed_dispatch_does_not_start_a_cooldown() -> None:
@@ -171,7 +133,7 @@ def _cls(model, state, role, z, tier=None):
     )
 
 
-def _plan(classifications, cooldowns, *, idle_gpus=0, rescue_due=True, scale_up_cooldown=True):
+def _plan(classifications, cooldowns, *, idle_gpus=0, rescue_due=True):
     contexts = {item.model_name: {"routable_pods": 3, "assigned_replicas": 3} for item in classifications}
     return build_plan(
         model_contexts=contexts,
@@ -184,8 +146,6 @@ def _plan(classifications, cooldowns, *, idle_gpus=0, rescue_due=True, scale_up_
             max_replicas_per_model=4,
             rescue_due=rescue_due,
             suppress_hot_proactive_probe=True,
-            # C1 off = the legacy step, which keeps the F4 hold of a CRITICAL scale-up.
-            rescue_max_step_ratio=0.0 if scale_up_cooldown else 2.0,
         ),
         cooldowns=cooldowns,
     )
@@ -199,23 +159,19 @@ def _deltas(plan):
     return out
 
 
-def test_critical_scale_up_allowed_during_scale_down_cooldown_but_not_after_scale_up() -> None:
+def test_the_f4_cooldown_never_holds_a_critical_receiver() -> None:
     receiver = [_cls("r", ModelState.CRITICAL, ModelRole.RECEIVER, 0.4)]
 
-    assert _deltas(_plan(receiver, {"r": "down"}, idle_gpus=1)) == {"r": 1}
-    held = _plan(receiver, {"r": "up"}, idle_gpus=1)
-    assert _deltas(held) == {}
-    assert held.events == ["cooldown_hold:r"]
-    # C1 (default): the F4 cooldown never holds a CRITICAL receiver.
-    free = _plan(receiver, {"r": "up"}, idle_gpus=1, scale_up_cooldown=False)
-    assert _deltas(free) == {"r": 1}
-    assert not any(event.startswith("cooldown_hold") for event in free.events)
+    for direction in ("down", "up"):
+        free = _plan(receiver, {"r": direction}, idle_gpus=1)
+        assert _deltas(free) == {"r": 1}
+        assert not any(event.startswith("cooldown_hold") for event in free.events)
 
 
 def test_low_receiver_keeps_the_scale_up_cooldown_under_c1() -> None:
     receiver = [_cls("r", ModelState.LOW, ModelRole.RECEIVER, 0.9)]
 
-    held = _plan(receiver, {"r": "up"}, idle_gpus=1, rescue_due=False, scale_up_cooldown=False)
+    held = _plan(receiver, {"r": "up"}, idle_gpus=1, rescue_due=False)
     assert _deltas(held) == {}
     assert "cooldown_hold:r" in held.events
 
@@ -267,28 +223,12 @@ def test_action_cooldown_env_flag_defaults_on_and_can_be_disabled() -> None:
 
 
 
-def test_rescue_task_reads_action_cooldown_from_config() -> None:
-    def run(flag: bool) -> tuple[str, ...]:
-        queue = ActionQueue(_OkClient(), now_ms=_Clock(65_000))
-        queue._last_done["critical"] = (65_000, "up")  # a wake just completed
+def test_the_decision_loop_reads_action_cooldown_from_config() -> None:
+    seen = []
+    for flag in (True, False):
         cfg = type("Cfg", (), {"rescue_interval_s": 5.0, "fairness_interval_s": 10.0, "action_cooldown": flag})()
-        result = DecisionLoop(queue=queue, registry=_registry(), cfg=cfg).on_snapshot(_critical_snapshot(5_000))
-        return result.events
-
-    assert "cooldown_hold:critical" in run(True)
-    assert "cooldown_hold:critical" not in run(False)
-
-
-def test_action_queue_records_direction_per_model_on_success_but_not_unhide() -> None:
-    from tre_controller.planning.planner import DefragAction, HideAction, UnhideAction
-
-    clock = _Clock(1_000)
-    queue = ActionQueue(_OkClient(), now_ms=clock)
-    queue.submit([HideAction("a", ("a-1",), "probe_started", "rescue"), DefragAction((), "d", "rescue")])
-    asyncio.run(queue.drain_once())
-    clock.now = 2_000
-    queue.submit([UnhideAction("b", ("b-1",), "slo_violation", "safescale")])
-    asyncio.run(queue.drain_once())
-
-    # Unhide (probe rollback) restores capacity and is not a cooldown-starting action.
-    assert queue.last_actions() == {"a": (1_000, "down")}
+        DecisionLoop(
+            queue=object(), registry=_registry(), cfg=cfg,
+            tick=lambda snapshot, **kwargs: seen.append(kwargs["action_cooldown"]) or LoopTickResult(submitted=0),
+        ).on_snapshot(_critical_snapshot(5_000))
+    assert seen == [True, False]

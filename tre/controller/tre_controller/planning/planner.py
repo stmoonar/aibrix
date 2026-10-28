@@ -38,6 +38,9 @@ IncompletePolicy = Literal["drop_model", "drop_all"]
 class PlanConfig:
     min_replicas_per_model: int
     max_replicas_per_model: int
+    #: L3 (design 20261028-single-loop): every receiver gets at most
+    #: ``max(1, ceil(scale_step_ratio * n))`` replicas per plan (v1 ``scale_step``; +1
+    #: below 10 replicas), in the rescue and the rebalance section.
     scale_step_ratio: float = 0.1
     rescue_due: bool = True
     fairness_due: bool = True
@@ -70,25 +73,6 @@ class PlanConfig:
     # Registry placement.defrag.enabled: gates the critical_tp_defrag migration plan.
     # Off by default, as in v1 (design 20260928-placement-node-balance).
     defrag_enabled: bool = False
-    # C1 (registry scaling.rescue_max_step_ratio): a CRITICAL receiver's rescue asks for
-    # its whole deficit at once - target min(max(n+1, ceil(n*tau_crit/Z)),
-    # max(n+1, floor(ratio*n)), scaling cap, capacity found). 0 = legacy one step
-    # (ceil(scale_step_ratio * n)) per decision window.
-    rescue_max_step_ratio: float = 2.0
-    # C1 (registry scaling.rescue_max_step_pods): the rescue target may also reach
-    # n + this many replicas (HPA-style "max(ratio x n, n + pods)"); 0 = ratio only.
-    rescue_max_step_pods: int = 0
-    #: O1 review P2-1 (evidence-gated): a C1 rescue decided on a partial
-    #: (post-breakpoint) window - ``signal_full_window`` False - whose
-    #: ``signal_evidence_requests`` is below ``partial_window_lowevidence_requests``
-    #: adds at most ``partial_window_max_step`` replicas (0 = no cap); with more
-    #: evidence the whole deficit at once.
-    partial_window_max_step: int = 0
-    partial_window_lowevidence_requests: int = 0
-    #: Onset saturation rescue (registry scaling.saturation_max_step_factor): a
-    #: ``saturation_rescue`` CRITICAL receiver's target is min(max(n + 1,
-    #: floor(factor * n)), scaling cap) - bounded doubling without throughput evidence.
-    saturation_max_step_factor: float = 2.0
 
     def __post_init__(self) -> None:
         # No silent fallback for a bad tp_size (the registry rejects it at load; this
@@ -166,10 +150,10 @@ class RescuePlan:
 @dataclass(frozen=True)
 class RescueBasis:
     """An earlier rescue scale-up of a model whose effect its decision window does not
-    reflect yet (C1): the next desired is computed from ``base`` (the replicas the
-    window's Z still describes) and only the part above ``covered`` (what that
-    scale-up achieved) is planned - an unrefreshed window yields the same desired, so
-    nothing is added; a deeper CRITICAL (load still rising) raises the target."""
+    reflect yet (C1): the next target is ``base + step`` (``base`` = the replicas the
+    window still describes) and only the part above ``covered`` (what that scale-up
+    achieved) is planned - an unrefreshed window yields the same target, so nothing is
+    added until the window moves (one step per plan, 2026-10-28)."""
 
     base: int
     covered: int
@@ -724,7 +708,6 @@ def build_plan(
 
     rescue_bases = rescue_bases or {}
     unsettled_upscales = unsettled_upscales or {}
-    c1 = cfg.rescue_max_step_ratio > 0
     if cfg.rescue_due:
         # C1: (desired, base, covered) of each CRITICAL receiver planned this tick.
         rescue_ctx: dict[str, tuple[int, int, int]] = {}
@@ -736,12 +719,6 @@ def build_plan(
             # would wait behind it on the model resource anyway.
             if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
                 return None
-            # Legacy one-step rescue (C1 off) only: without the C1 target bookkeeping the
-            # F4 / O1 holds keep an unreflected scale-up from being repeated. With C1 the
-            # rescue target ledger does (the opt-in scale_up_cooldown_enabled switch was
-            # removed in the timer cleanup 2026-10-02).
-            if not c1 and cooldown.blocks(recv.model_name, "up", critical=True):
-                return None
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
@@ -750,16 +727,12 @@ def build_plan(
             recv_awake = _awake_replicas(recv.model_name, model_contexts, model_replicas)
             if recv_awake >= recv_max:
                 return None
-            if getattr(recv, "saturation_rescue", False):
-                return saturation_need(recv, recv_pods, recv_assigned, recv_max, recv_awake)
-            if not c1:
-                raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
-                if raw_need <= 0:
-                    return None
-                return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
-            # C1: one absolute target for the whole deficit. With an earlier scale-up
-            # the window does not reflect yet, the target is computed from the replicas
-            # the window's Z describes and only what exceeds that scale-up is planned.
+            # L3 (design 20261028-single-loop): one step per plan. The rescue target ledger
+            # ("one deficit, one target") keeps an unreflected step from being repeated:
+            # while the decision window does not reflect the last target, the target is
+            # computed from the replicas that window describes (``base``) and only what
+            # exceeds the replicas that target added (``covered``) is planned - nothing,
+            # unless it landed nothing.
             basis = rescue_bases.get(recv.model_name)
             exempt = recv.model_name in o1_exempt
             if exempt:
@@ -767,11 +740,9 @@ def build_plan(
                 # An earlier rescue target O1 has not settled yet (``_rescue_bases``: no
                 # warm window after its breakpoint, landed or not), or a fleet view older
                 # than the last action (view-pending), holds the exempt receiver - released
-                # on evidence, not time. Before, a landed target released it and the next
-                # step re-asked rescue_desired from the new count with the old window's Z
-                # (the old count's): it climbed to max_awake on one stale window.
+                # on evidence, not time.
                 # 2026-10-26: an earlier scale-up of ANY path holds it the same way
-                # (``unsettled_upscales``: LOW rescue / fairness wakes, relays, SafeScale
+                # (``unsettled_upscales``: LOW / fairness wakes, relays, SafeScale
                 # receiver targets leave no rescue target). Smoke 20261026: a LOW wake
                 # 1 -> 2 divided the old window's tokens by 2 (Z 0.97 -> 0.35, flat
                 # load) and the exempt path stacked a third replica 5 s later.
@@ -788,31 +759,18 @@ def build_plan(
                     return None
             base = basis.base if basis is not None else recv_pods
             covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
-            desired = rescue_desired(
-                base, recv.Z_m, recv.tau.tau_crit, cfg.rescue_max_step_ratio, cfg.rescue_max_step_pods
-            )
+            desired = base + _scale_step(base, cfg.scale_step_ratio)
             raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
-            recv_ctx = model_contexts.get(recv.model_name, {})
-            evidence = recv_ctx.get("signal_evidence_requests")
-            if (
-                cfg.partial_window_max_step > 0
-                and raw_need > cfg.partial_window_max_step
-                and recv_ctx.get("signal_full_window") is False
-                and (evidence is None or float(evidence) < cfg.partial_window_lowevidence_requests)
-            ):
-                # O1 review P2-1: a partial window with few completed requests is thin
-                # evidence (tokens count at completion) - one step now; with enough
-                # requests (or on a whole window) the whole deficit at once.
+            if getattr(recv, "saturation_rescue", False):
+                ctx = model_contexts.get(recv.model_name, {})
+                # Onset saturation rescue: no throughput evidence, the same one step; each
+                # further step re-confirms saturation on the pods the last one added.
                 events.append(
-                    f"rescue_low_evidence_step:{recv.model_name}:{raw_need}->{cfg.partial_window_max_step}"
-                    f":requests={evidence}"
+                    f"saturation_rescue:{recv.model_name}:n={recv_pods}:target={desired}"
+                    f":waiting={_num_text(ctx.get('saturation_waiting'))}:kv={_num_text(ctx.get('saturation_kv'), 2)}"
+                    f":reason={ctx.get('saturation_reason')}:held_ms={ctx.get('saturation_held_ms')}"
+                    f":planned_max={max(0, raw_need)}"
                 )
-                raw_need = cfg.partial_window_max_step
-            if exempt:
-                # H3: Z is the held window's (old regime) value - one step per decision,
-                # like a thin partial window; each step is a new breakpoint, and the next
-                # waits until this one is visible (``receiver_o1_exempt_pending``).
-                raw_need = min(raw_need, max(1, cfg.partial_window_max_step))
             if raw_need <= 0:
                 if basis is not None:
                     events.append(
@@ -820,42 +778,6 @@ def build_plan(
                     )
                 return None
             rescue_ctx[recv.model_name] = (desired, base, covered)
-            return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
-
-        def saturation_need(
-            recv: ModelClassification, recv_pods: int, recv_assigned: int, recv_max: int, recv_awake: int
-        ) -> tuple[int, int] | None:
-            """Onset saturation rescue: bounded doubling of the routable count (no
-            throughput evidence: never ``ceil(n * tau_crit / Z)``, which a zero Z sends
-            to the cap). The O1 low-evidence step cap does not apply (it bounds a TSS
-            decision on a thin partial window; this path is not a TSS decision and
-            re-confirms saturation after every step instead). An earlier rescue target
-            the routable count does not show yet counts as covered (C1 bookkeeping)."""
-            basis = rescue_bases.get(recv.model_name)
-            covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
-            ctx = model_contexts.get(recv.model_name, {})
-            if ctx.get("saturation_reason") == "scrape_stale_inflight":
-                # Frozen scrape (no engine sample, demand only): one replica per step.
-                desired = min(recv_pods + 1, recv_max)
-            else:
-                desired = min(
-                    max(recv_pods + 1, math.floor(cfg.saturation_max_step_factor * recv_pods + 1e-9)), recv_max
-                )
-            raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
-            kv = ctx.get("saturation_kv")
-            events.append(
-                f"saturation_rescue:{recv.model_name}:n={recv_pods}:target={desired}"
-                f":waiting={_num_text(ctx.get('saturation_waiting'))}:kv={_num_text(kv, 2)}"
-                f":reason={ctx.get('saturation_reason')}:held_ms={ctx.get('saturation_held_ms')}"
-                f":planned_max={max(0, raw_need)}"
-            )
-            if raw_need <= 0:
-                if basis is not None:
-                    events.append(
-                        f"rescue_target_hold:{recv.model_name}:desired={desired}:covered={covered}"
-                    )
-                return None
-            rescue_ctx[recv.model_name] = (desired, recv_pods, covered)
             return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
 
         critical_needs ={recv.model_name: critical_need(recv) for recv in critical_receivers}
@@ -2290,23 +2212,6 @@ def _add_scale_action(
             hint=bool(hint and delta > 0 and pods),
         )
     )
-
-
-def rescue_desired(
-    n: int, z_m: float | None, tau_crit: float, ratio: float, step_pods: int = 0
-) -> int:
-    """C1 rescue target (routable replicas) of a CRITICAL receiver with ``n`` routable
-    replicas and decision-window signal ``z_m``: the replicas that bring Z back to
-    ``tau_crit`` under Z proportional to n at fixed load, ``ceil(n * tau_crit / Z)``,
-    at least n + 1 and at most ``max(n + 1, floor(ratio * n), n + step_pods)``. Z
-    missing / <= 0 or n <= 0: n + 1."""
-    n = max(0, int(n))
-    floor_target = n + 1
-    cap = max(floor_target, math.floor(float(ratio) * n + 1e-9), n + max(0, int(step_pods)))
-    if n <= 0 or z_m is None or not math.isfinite(z_m) or z_m <= 0 or tau_crit <= 0:
-        return floor_target
-    want = math.ceil(n * float(tau_crit) / float(z_m) - 1e-9)
-    return min(max(want, floor_target), cap)
 
 
 def _tag_rescue_actions(

@@ -47,8 +47,7 @@ def _held(**extra) -> dict:
 
 
 def _plan(contexts: dict, states: dict, *, idle_gpus: int, bases=None, **kwargs):
-    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_max_step_ratio=2.0,
-                     partial_window_max_step=1, partial_window_lowevidence_requests=10)
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
     return build_plan(
         model_contexts=contexts,
         classifications=[_cls(model, state, z) for model, (state, z) in states.items()],
