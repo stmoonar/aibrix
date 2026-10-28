@@ -82,8 +82,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     controller = _load_yaml(overlay / "controller.yaml")
     sm = _load_yaml(overlay / "service-manager.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20261028-e891d29b"
-    assert _image(sm) == "tre-v2-service-manager:20261028-e891d29b"
+    assert _image(controller) == "tre-v2-controller:20261029-75042088"
+    assert _image(sm) == "tre-v2-service-manager:20261029-75042088"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     # Review P1-2: single writer across rollouts, and a grace period derived from
     # the registry sleep policy (a sleep past /sleep finishes; drains roll back).
