@@ -186,6 +186,8 @@ def build(arm: Arm, recs: list[dict], capacity: dict[str, float] | None = None) 
         for m, st in (tk.get("model_states") or {}).items():
             if m not in res or not isinstance(st, dict):
                 continue
+            # saturation_* (latest engine sample): only in runs before 2026-10-29 (the
+            # controller's saturation rescue was removed then); absent -> NaN.
             for f, k in (("ctrl_z", "z_m"), ("ctrl_kv", "saturation_kv"), ("ctrl_running", "saturation_running"),
                          ("ctrl_waiting", "saturation_waiting"), ("ctrl_routable", "routable_pods")):
                 if st.get(k) is not None:

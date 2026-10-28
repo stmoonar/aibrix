@@ -10,7 +10,7 @@ Sections (text: one screen; JSON: the same, machine readable):
 1. completeness - collector files present / size / lines; logs whose first line starts too late
    after the arm start (container log rotated or truncated);
 2. signal loss - controller ticks per loop, stale snapshots, ``metrics_window_stale`` by reason,
-   ``samples_incomplete`` events, ticks with ``sample_quality_hold`` / ``signal_hold_reason`` /
+   ``samples_incomplete`` events, ticks with ``sample_quality_hold`` /
    ``signal_unavailable_reason`` per model, gateway cadence (declared or not, pod-samples with
    fewer instant / hist docs than declared, write lag, scrape age), sampler error rows, baseline
    event validity and ``inputs.gaps``;
@@ -221,11 +221,9 @@ def controller_scan(p: Path, t0, t1) -> dict:
             for model, st in (states or {}).items():
                 if not isinstance(st, dict):
                     continue
-                for key in ("sample_quality_hold", "signal_hold_reason", "signal_unavailable_reason"):
+                for key in ("sample_quality_hold", "signal_unavailable_reason"):
                     if st.get(key):
                         holds[model][f"{key}={st[key]}"] += 1
-                if st.get("signal_warm") is False:
-                    holds[model]["signal_warm=false"] += 1
     return {"ticks": dict(ticks), "ticks_load": dict(ticks_load), "stale_ticks": stale_ticks,
             "metrics_window_stale": dict(stale_reasons), "error_lines": errors, "first_errors": first_err,
             "events": dict(events.most_common(25)), "holds": {m: dict(c) for m, c in sorted(holds.items())},

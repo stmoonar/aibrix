@@ -11,7 +11,7 @@ next trace. The arm order inside a trace is rotated per trace (Williams Latin sq
 every arm in every position, first-order carry-over balanced over a full square) and recorded.
 
 Per arm: pre-checks (marker, run mode, canonical awake layout, decision source NONE, gpu-truth
-fresh, no ``breakpoint_window_suspended``, disk) -> ``run_arm_pilot.sh`` (all collectors of the
+fresh, disk) -> ``run_arm_pilot.sh`` (all collectors of the
 eval spec) -> validity verdict -> ``campaign_manifest.json`` + done marker -> post-arm reset to
 the canonical state -> report for the arm + cross-arm report of the trace + campaign index
 (plot failures are logged, never stop the campaign). A failed / invalid arm gets one automatic
@@ -99,7 +99,9 @@ DEFAULTS: dict = {
                  "history_root": None},   # Real_* history files: <history_root>/<trace>/seed<k>/preserve_history.json
     "report": {"enabled": True, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
                "reps": 1000, "timeout_s": 900, "nice": 10, "extra_args": []},
-    "precheck": {"gpu_truth_max_age_s": 30, "breakpoint_lookback_s": 60, "wait_s": 300, "poll_s": 30,
+    # precheck.breakpoint_lookback_s (older campaign files): accepted and ignored - the O1
+    # breakpoint window and its clock check were removed (2026-10-29, design 20261029-tss-only).
+    "precheck": {"gpu_truth_max_age_s": 30, "wait_s": 300, "poll_s": 30,
                  "disk_min_free_gb": {"nfs": 50, "nodes": {}},
                  # 2026-10-28 eviction-storm guards (hard): node DiskPressure, Failed/Evicted pods, node root fs free
                  # space >= kubelet_margin x the node kubelet hard-eviction threshold nodefs.available (configz; default
@@ -1114,13 +1116,6 @@ class Cluster:
             return not bad, "; ".join(det)
         add("gpu_truth", "wait", gpu_truth)
 
-        def breakpoint_ok():
-            logs = self.kubectl("-n", self.e.get("TRE_NS", "tre-v2"), "logs", f"deploy/{self.e.get('CONTROLLER_DEPLOY', 'tre-v2-controller')}",
-                                f"--since={int(pc['breakpoint_lookback_s'])}s", timeout=60)
-            n = logs.count("breakpoint_window_suspended")
-            return n == 0, f"{n} breakpoint_window_suspended line(s) in the last {pc['breakpoint_lookback_s']} s"
-        add("breakpoint_window", "wait", breakpoint_ok)
-
         def disk():
             want = pc.get("disk_min_free_gb") or {}
             det, bad = [], []
@@ -1256,7 +1251,7 @@ def precheck_until_ready(checks: Callable[[], list], reset: Callable[[bool], int
                          log: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
                          clock: Callable[[], float] = time.time) -> tuple[bool, list]:
     """Pre-checks with recovery: a ``reset`` failure triggers one full reset, a ``wait`` failure
-    (gpu-truth stale, O1 window suspended) is polled up to precheck.wait_s, a ``hard`` failure
+    (gpu-truth stale) is polled up to precheck.wait_s, a ``hard`` failure
     (marker, disk) blocks at once. Returns (ready, last results)."""
     pc = c["precheck"]
     deadline = clock() + float(pc["wait_s"])
