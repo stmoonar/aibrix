@@ -113,7 +113,9 @@ class World:
         self.kv_capacity_tokens = float(kv_capacity_tokens)
         self.models = list(models)
         self.max_pods = max_pods
-        self.awake = {m: MIN_R for m in models}
+        #: Awake pod indices and, among them, the hidden ones (no new requests).
+        self.up = {m: set(range(MIN_R)) for m in models}
+        self.hidden: dict[str, set] = {m: set() for m in models}
         self.load = {m: LOW for m in models}
         self.version = 1
         self.counters = {(m, i): Counters() for m in models for i in range(max_pods)}
@@ -125,31 +127,54 @@ class World:
     def pod_name(model: str, i: int) -> str:
         return f"{model}-{i}"
 
-    def awake_pods(self, model: str) -> list[str]:
+    @property
+    def awake(self) -> dict[str, int]:
         with self.lock:
-            return [self.pod_name(model, i) for i in range(self.awake[model])]
+            return {m: len(self.up[m]) for m in self.models}
+
+    def awake_pods(self, model: str) -> list[str]:
+        """Awake, not hidden pods (where new requests go)."""
+        with self.lock:
+            return [self.pod_name(model, i) for i in sorted(self.up[model] - self.hidden[model])]
+
+    def hidden_pods(self, model: str) -> list[str]:
+        with self.lock:
+            return [self.pod_name(model, i) for i in sorted(self.hidden[model] & self.up[model])]
+
+    def set_hidden(self, model: str, names: list[str]) -> None:
+        """``PUT /v2/models/{model}/routable``: the model's whole hidden set (awake pods)."""
+        with self.lock:
+            self.hidden[model] = {int(n.rsplit("-", 1)[1]) for n in names} & self.up[model]
+            self.version += 1
 
     def state_doc(self) -> dict:
         with self.lock:
             return {
                 "version": self.version,
-                "models": {m: {"awake": self.awake[m], "bound": self.max_pods} for m in self.models},
+                "models": {m: {"awake": len(self.up[m]), "bound": self.max_pods} for m in self.models},
                 "bindings": [
                     {"serve_id": self.pod_name(m, i), "model": m, "node": "node-a", "gpu_ids": [i],
-                     "awake": i < self.awake[m], "hidden": False}
+                     "awake": i in self.up[m], "hidden": i in self.hidden[m] and i in self.up[m]}
                     for m in self.models for i in range(self.max_pods)
                 ],
             }
 
     def apply_item(self, item: dict) -> dict:
-        """One plan item (wake ``at_least`` grow-only, sleep ``at_most``) -> its result."""
+        """One plan item (wake ``at_least`` grow-only, sleep ``at_most`` or named ``pods``) ->
+        its result. A wake takes the lowest sleeping indices, a count sleep the highest awake."""
         with self.lock:
-            model, before = item["model"], self.awake[item["model"]]
+            model = item["model"]
+            up, before = self.up[model], len(self.up[model])
             if "at_least" in item:
-                after = max(before, min(int(item["at_least"]), self.max_pods))
+                for i in sorted(set(range(self.max_pods)) - up)[:max(0, int(item["at_least"]) - before)]:
+                    up.add(i)
+            elif "pods" in item:
+                up -= {int(n.rsplit("-", 1)[1]) for n in item["pods"]}
             else:
-                after = min(before, int(item["at_most"]))
-            self.awake[model] = after
+                for i in sorted(up, reverse=True)[:max(0, before - int(item["at_most"]))]:
+                    up.discard(i)
+            self.hidden[model] &= up
+            after = len(up)
             self.version += 1
             out = {"model": model, "status": "done" if after != before else "noop"}
             if "at_least" in item:
@@ -160,7 +185,7 @@ class World:
 
     def running_waiting(self, model: str, i: int) -> tuple[float, float]:
         with self.lock:
-            if i >= self.awake[model]:
+            if i not in self.up[model]:
                 return 0.0, 0.0
             n = float(self.inflight.get(self.pod_name(model, i), 0))
             return min(n, self.CAP), max(0.0, n - self.CAP)
@@ -348,9 +373,11 @@ class Harness:
         self.policy_name = policy
         self.world = World([A, B], MAX_R, (num_gpu_blocks or 20381) * 16)
         self.puts: list[tuple[str, dict, int]] = []  # (model, plan item, http status of its plan)
+        self.routables: list[tuple[str, list]] = []  # (model, hidden_pods) per PUT .../routable
         self._hook = hook
         self._put_seq = 0
-        self.sm = StubSM(responder=self._responder, delay_s=sm_delay_s, state=self.world.state_doc())
+        self.sm = StubSM(responder=self._responder, delay_s=sm_delay_s, state=self.world.state_doc(),
+                         routable=self._routable)
         self.farm = MetricsFarm(self.world, num_gpu_blocks)
         self.config = make_config(
             tmp_path, {A: limits(A, MIN_R, MAX_R), B: limits(B, MIN_R, MAX_R)}, policy=policy,
@@ -358,8 +385,10 @@ class Harness:
             lock_ttl_s=5.0, max_tick_failures=3,
         )
         client = SMClient(self.sm.url, timeout_s=10.0)
-        self.dispatcher = Dispatcher(client.post_plan, abort_sleep_path=self.config.abort_sleep_path)
-        self.source = LiveSource(self.config, redis, client.get_state, self._list_pods)
+        self.dispatcher = Dispatcher(client.post_plan, abort_sleep_path=self.config.abort_sleep_path,
+                                     update_hidden=client.update_hidden)
+        self.source = LiveSource(self.config, redis, client.get_state, self._list_pods,
+                                 list_hidden=self._list_hidden)
         self.shell = BaselineShell(
             self.config, self.source, build_policy(policy, self.config), self.dispatcher, redis,
             lock=OwnerLock(redis, self.config.lock_ttl_s), decision_log=DecisionLog(self.config.log_dir, policy),
@@ -384,9 +413,19 @@ class Harness:
         doc = {"plan_id": body.get("plan_id"), "status": "done", "sleeps": sleeps, "wakes": wakes}
         return 200, json.dumps(doc).encode(), "application/json"
 
+    def _routable(self, model: str, body: dict):
+        self.world.set_hidden(model, list(body.get("hidden_pods") or ()))
+        self.sm.state = self.world.state_doc()
+        self.routables.append((model, sorted(body.get("hidden_pods") or ())))
+        return 200, json.dumps({"model": model, "hidden_pods": body.get("hidden_pods")}).encode(), "application/json"
+
     def _list_pods(self) -> list[PodEndpoint]:
         return [PodEndpoint(name=p, model=m, ip="127.0.0.1", port=self.farm.port(p), ready=True)
                 for m in self.world.models for p in self.world.awake_pods(m)]
+
+    def _list_hidden(self) -> list[PodEndpoint]:
+        return [PodEndpoint(name=p, model=m, ip="127.0.0.1", port=self.farm.port(p), ready=True)
+                for m in self.world.models for p in self.world.hidden_pods(m)]
 
     def _simulate(self) -> None:
         last = time.monotonic()
@@ -530,9 +569,11 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     # isolates below the high window's Tier-1 N)
     assert any(ln["action"] == "up" and high <= ln["ts_ms"] < low2 for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
-    assert not any(ln["action"] == "down" and high <= ln["ts_ms"] < low2 - 500 for ln in mine), [
+    # PreServe drains (2026-10-29): its shrink is a hide; the named sleep follows once empty.
+    shrink = ("down", "hide")
+    assert not any(ln["action"] in shrink and high <= ln["ts_ms"] < low2 - 500 for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
-    assert any(ln["action"] == "down" and ln["ts_ms"] >= low2 - 500 for ln in mine), [
+    assert any(ln["action"] in shrink and ln["ts_ms"] >= low2 - 500 for ln in mine), [
         (ln["ts_ms"] - high, ln["action"], ln["reason"]) for ln in mine if ln["action"] != "none"]
     assert max(ln["awake"] for ln in mine) >= 2
     assert not any(ln["action"] == "up" for ln in other)          # the quiet model is left alone
@@ -540,15 +581,23 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     # every dispatched action reached the stub SM as one plan item with the contract's body:
     # one item per decision (no steps; a queued decision a later tick replaced is never sent),
     # at most one plan per tick
-    dispatched = [ln for ln in lines if ln["action"] in ("up", "down")]
+    dispatched = [ln for ln in lines if ln["action"] in ("up", "down", "hide", "unhide")]
     assert 0 < len(h.puts) <= len(dispatched)
-    assert len(h.sm.requests) <= len({ln["tick"] for ln in dispatched})
+    plans = [r for r in h.sm.requests if r[0] == "POST"]
+    assert len(plans) <= len({ln["tick"] for ln in dispatched})
     for model, item, status in h.puts:
         assert status == 200
         assert item in ({"model": model, "at_least": item.get("at_least")},
-                        {"model": model, "at_most": item.get("at_most"), "sleep_path": "urgent"}), item
-        assert 1 <= item.get("at_least", item.get("at_most")) <= MAX_R
-    assert any("at_least" in i for _, i, _ in h.puts) and any("at_most" in i for _, i, _ in h.puts)
+                        {"model": model, "at_most": item.get("at_most"), "sleep_path": "urgent"},
+                        {"model": model, "pods": item.get("pods"), "sleep_path": "urgent"}), item
+        if "pods" not in item:
+            assert 1 <= item.get("at_least", item.get("at_most")) <= MAX_R
+    assert any("at_least" in i for _, i, _ in h.puts)
+    if policy == "preserve":   # a drain: hidden first, never a count shrink
+        assert any(hidden for m, hidden in h.routables if m == A), h.routables
+        assert not any("at_most" in i for _, i, _ in h.puts)
+    else:
+        assert any("at_most" in i for _, i, _ in h.puts) and not h.routables
     # the decision is mirrored to Redis (TTL) and the stream saw all three kinds
     assert redis.ttl(f"tre:v2:bl:decision:{A}") > 0
     # every decision line is also in the stream (evidence that survives the pod)

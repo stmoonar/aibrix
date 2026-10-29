@@ -284,16 +284,18 @@ class ScriptedPolicy:
 class StubSM:
     """Stub SM HTTP server on 127.0.0.1: records ``POST /v2/plans`` bodies; the reply per call
     comes from ``responder(body) -> (status, body_bytes, content_type)`` (default: every item
-    done); optional delay."""
+    done); optional delay. ``PUT /v2/models/{model}/routable`` goes to ``routable(model, body)``
+    (same answer shape; 404 without one)."""
 
     def __init__(self, responder=None, delay_s: float = 0.0,
-                 state: Optional[dict] = None) -> None:
+                 state: Optional[dict] = None, routable=None) -> None:
         self.requests: list[tuple[str, str, dict, dict]] = []
         #: time.monotonic() at which each POST arrived (same order as ``requests``).
         self.arrivals: list[float] = []
         self.responder = responder or (lambda body: (200, json.dumps(plan_done(body)).encode(), "application/json"))
         self.delay_s = delay_s
         self.state = state or {"version": 1, "models": {}, "bindings": []}
+        self.routable = routable
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -318,6 +320,17 @@ class StubSM:
                     self._send(status, payload, ctype)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+
+            def do_PUT(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                stub.requests.append(("PUT", self.path, body, {k.lower(): v for k, v in self.headers.items()}))
+                parts = self.path.strip("/").split("/")
+                if stub.routable is None or len(parts) != 4 or parts[:2] != ["v2", "models"] or parts[3] != "routable":
+                    self._send(404, b"{}", "application/json")
+                    return
+                status, payload, ctype = stub.routable(parts[2], body)
+                self._send(status, payload, ctype)
 
             def _send(self, code, payload, ctype):
                 self.send_response(code)
