@@ -1,0 +1,99 @@
+# 2026-10-30 baselines on the 7 ICSE (v1 paper) traces (user 10-29/10-30): APA, TokenScale, PreServe; no TRE arm.
+# Release 20261029 (baseline P0 + PreServe drain + tss-suffix; main 7fe2d216): gateway-plugins 20261029-8b60253f-nozmq2,
+# SM / controller 20261029-d9fa1571, baseline-scaler 20261029-8b60253f.
+# 7 traces x seed 1 x 3 arms = 21 runs (~1000 s each, ~6 h + reports).
+#
+# Traces: the ICSE effective files replayed as published (CustomTraceGenerator/config/icse_final), copied with a
+# manifest into /data/nfs_shared_data/xxy/traces-icse-20261030/<trace>/seed1/ by the workspace script
+# docs/scripts/icse_suite_20261030/build_icse_suite.py; loadgen configs: loadgen_v1/configs/traces_v14 (the ICSE ones).
+# PreServe history (preserve_history.json next to each trace; user 10-30: it must not see the trace):
+#   synthetic = the keyframe in force at t = 0 held for the 750 s before t0 (no previous period);
+#   Real_*    = v1's counts of the Azure seconds right before each slice (v1 affine map), slice mean lengths.
+# TokenScale: frozen policy-configmaps.yaml (paper bucket edges; centers / V calibrated 10-26 on the 720 s suite, kept).
+# PreServe: frozen mLSTM + mu, drain on (paper section 4.3.2, release 20261029).
+#
+#   tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-icse-bl-20261030.yaml --dry-run --probe
+#   nohup tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-icse-bl-20261030.yaml > /data/nfs_shared_data/xxy/campaign-icse-bl-20261030.out 2>&1 &
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/<arm>      # after run 1, then every 50 min
+# NOTE: results_root, the trace / config roots and the other absolute paths below are site-specific; edit them for another cluster.
+name: campaign-icse-bl-20261030
+round: campaign-icse-bl-20261030
+results_root: /data/nfs_shared_data/xxy/campaign-icse-bl-20261030
+trace_root: /data/nfs_shared_data/xxy/traces-icse-20261030
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [preserve, tokenscale, apa]   # first run = PreServe: checks P0 + drain first
+order: williams
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 280, report_s: 150}
+
+registry_expect:
+  registry_id: af9aef4701804743     # live registry (unchanged since the 10-28 release publication)
+  present:
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  preserve:
+    base: preserve
+    label: PreServe                 # faithful (mLSTM, load errors), drain on
+    policy: {tier1: mlstm}          # history: preserve_history.json next to the trace
+
+preserve:
+  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: apa
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Sinusoidal_demand
+  - trace: Alternating_hot_model_periodic_A
+  - trace: Simultaneous_spike_ramp_twice_tps1o2
+  - trace: Prefill_mixed_corner_decode_mix
+  - trace: Decode_heavy_burst
+  - trace: Real_code_2024_slice_a_tok70
+  - trace: Real_conv_2023_slice_a_tok70
