@@ -87,14 +87,15 @@ def test_commits_at_the_first_poll_that_meets_every_condition():
     h.start()
     at, decision = _first_terminal(h, HIDE + LONG_W)
     # Polls every 2 s from 105 s: 20 samples are there early; the newest snapshot's
-    # newest observation (130 s) is 20 s after the post-hide start (110 s: the first
+    # newest observation (120 s) is 10 s after the post-hide start (110 s: the first
     # gateway boundary after the newest doc at the hide, 100 s; round 5 M1 - the gateway
-    # clock, not the controller-clock confirmation) - >= the 20 s min_evidence_ms - from
-    # the 131 s poll (at 121 s it is 10 s), and one p95 e2e has long passed -> 131 s.
-    assert (at, decision.status, decision.reason) == (131_000, "commit", "formal_commit_gate_passed")
+    # clock, not the controller-clock confirmation) - >= the 10 s settle span
+    # (scaling.settle_ms, 2026-10-29) - from the 121 s poll, and one p95 e2e has long
+    # passed -> 121 s.
+    assert (at, decision.status, decision.reason) == (121_000, "commit", "formal_commit_gate_passed")
     early = decision.details["early_commit"]
-    assert early["elapsed_ms"] == 28_000 and early["min_elapsed_ms"] < 28_000 and early["samples"] >= 20
-    assert early["post_hide_observed_ms"] == 20_000
+    assert early["elapsed_ms"] == 18_000 and early["min_elapsed_ms"] < 18_000 and early["samples"] >= 20
+    assert early["post_hide_observed_ms"] == 10_000
     assert early["planned_deadline_ms"] == HIDE + LONG_W
     assert (early["hidden_in_flight"], early["gateway_in_flight"]) == (0.0, 0.0)
     assert decision.commands[0].kind == "scale_down" and decision.commands[0].pods == ("m-1",)
@@ -155,7 +156,7 @@ def test_a_long_e2e_model_never_commits_before_one_p95_e2e():
     assert decision.details["early_commit"]["min_elapsed_ms"] == 45_000
 
 
-def test_the_post_hide_evidence_follows_the_o1_warm_rule():
+def test_the_post_hide_evidence_needs_the_min_evidence_span():
     # 30 s of post-hide observation time required: 130 - 103 = 27 s is short, the
     # snapshot of 140 s (37 s) passes.
     h = EarlyHarness(early_commit_min_evidence_ms=30_000)
@@ -226,7 +227,7 @@ def test_the_state_machine_logs_a_json_event(caplog):
     with caplog.at_level(logging.INFO, logger="tre_controller.safescale"):
         _first_terminal(h, HIDE + LONG_W)
     events = [json.loads(r.getMessage()) for r in caplog.records if "safescale_early_commit" in r.getMessage()]
-    assert events and events[0]["model"] == MODEL and events[0]["elapsed_ms"] == 28_000
+    assert events and events[0]["model"] == MODEL and events[0]["elapsed_ms"] == 18_000
 
 
 NOW_MS = 1_000_000
@@ -285,17 +286,22 @@ def test_registry_and_config_keys(tmp_path):
     assert SafeScaleRegistryConfig().early_commit is True
     shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))
     assert shipped.safescale().early_commit is True and shipped.scaling().min_evidence_ms == 20_000
+    assert shipped.scaling().settle_ms == 10_000
     assert parse_safescale_config({"early_commit": False}).early_commit is False
     with pytest.raises(ValueError):
         parse_safescale_config({"early_commit": "yes"})
-    # Q4: the post-hide span is O1's scaling.min_evidence_ms; a registry that still
-    # carries the removed safescale.early_commit_min_grids loads (unknown key: a warning),
-    # and the deprecated scaling.min_evidence_grids: N is read as N x 10 s (2026-10-25).
+    # The post-hide span is scaling.settle_ms (2026-10-29), the rollback retry floor
+    # scaling.min_evidence_ms; a registry that still carries the removed
+    # safescale.early_commit_min_grids loads (unknown key: a warning), and the deprecated
+    # scaling.min_evidence_grids: N is read as N x 10 s (2026-10-25).
     text = (TRE_DIR / "deploy" / "registry.yaml").read_text()
     assert "\n  min_evidence_ms: 20000\n" in text and "\n  early_commit: true\n" in text
+    assert "\n  settle_ms: 10000\n" in text
     text = text.replace("\n  min_evidence_ms: 20000\n", "\n  min_evidence_grids: 3\n")
+    text = text.replace("\n  settle_ms: 10000\n", "\n  settle_ms: 15000\n")
     text = text.replace("\n  early_commit: true\n", "\n  early_commit: true\n  early_commit_min_grids: 5\n")
     path = tmp_path / "registry.yaml"
     path.write_text(text)
     cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)}).safescale
-    assert cfg.early_commit is True and cfg.early_commit_min_evidence_ms == 30_000
+    assert cfg.early_commit is True and cfg.early_commit_min_evidence_ms == 15_000
+    assert cfg.rollback_retry_min_evidence_ms == 30_000

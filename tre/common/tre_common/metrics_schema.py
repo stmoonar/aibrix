@@ -128,22 +128,6 @@ class PodWindowMetrics:
     ttft_hist_count: float | None = field(default=None, compare=False)
     tpot_hist: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
     tpot_hist_count: float | None = field(default=None, compare=False)
-    #: The pod's NEWEST gateway instant sample in the window (not a window average):
-    #: vLLM ``num_requests_waiting`` / ``num_requests_running`` / KV-cache fill (0..1,
-    #: None when the doc does not carry it) and when it was observed (ms; round 4: the
-    #: doc's ``scraped_ms``, the doc stamp only for a doc without one). Read by the
-    #: controller's onset saturation rescue (design 20261002-saturation-onset-rescue),
-    #: which judges "engine full" on the latest sample, not on the 30 s mean. None = no
-    #: instant doc in the window. Excluded from equality.
-    latest_waiting: float | None = field(default=None, compare=False)
-    latest_running: float | None = field(default=None, compare=False)
-    latest_gpu_cache: float | None = field(default=None, compare=False)
-    latest_instant_ms: int | None = field(default=None, compare=False)
-    #: Round 5 (M2): the newest sample is current - observed within the producer's
-    #: cadence of the window end (the store's ``scrape_current_pods`` rule). A stale one
-    #: is not a sample of the engine now (saturation rescue). True for windows the store
-    #: did not build (synthetic / offline).
-    latest_current: bool = field(default=True, compare=False)
     #: Round 4: the pod's observation of the window (:class:`Observed`); None = not
     #: read on the observation clock (v1 schema, offline / synthetic windows).
     observed: Observed | None = field(default=None, compare=False)
@@ -195,19 +179,17 @@ class ModelWindowMetrics:
     #: the model level); carried so a re-aggregation (``restrict_to_serving``)
     #: applies the same one. None = max of the per-pod p95s (no histograms).
     p95_rule: P95Rule | None = field(default=None, compare=False)
-    #: O1 (breakpoint-aware window, 2026-10-01): the same model window read over its
-    #: grid-aligned suffixes ``(s, window_end_ms]``, one per gateway boundary ``s``
-    #: strictly inside the window, ascending by ``s`` (for a 30 s window on the 10 s
-    #: grid: the last 20 s and the last 10 s). Built from the docs the full read
-    #: already fetched (``MetricsStore(suffix_period_ms=...)``); empty when off, for
-    #: unaligned windows and for offline / synthetic windows. The controller decides on
-    #: a suffix only while a breakpoint (traffic onset, routable-count change) lies
-    #: inside the window. Excluded from equality.
+    #: The same model window read over grid-aligned suffixes ``(s, window_end_ms]``, one
+    #: per gateway boundary ``s`` strictly inside the window, ascending by ``s``. Built
+    #: from the docs the full read already fetched (``MetricsStore(suffix_period_ms=...)``);
+    #: live, only the SafeScale commit gate's post-hide tail of a probing model (2026-10-29:
+    #: the decision signal always uses the whole window). Empty when off, for unaligned
+    #: windows and for offline / synthetic windows. Excluded from equality.
     suffix_windows: tuple["ModelWindowMetrics", ...] = field(default=(), compare=False)
     #: I3 (2026-10-04; 2026-10-25 the sample rule): pods left out of this window
     #: because no sample of them was observed in it (no ``scraped_ms`` in the window -
-    #: their docs repeat frozen values). Frozen-scrape rescue evidence; also in
-    #: ``sample_incomplete_pods``. Excluded from equality.
+    #: their docs repeat frozen values). Also in ``sample_incomplete_pods`` (a donor-gate
+    #: flag). Excluded from equality.
     scrape_stale_pods: tuple[str, ...] = field(default=(), compare=False)
     #: 2026-10-25 (review round 1 D2): flagged pods - samples (distinct ``scraped_ms``
     #: in the window) below ``scaling.sample_min_ratio`` x (window / instant period), a
@@ -216,21 +198,6 @@ class ModelWindowMetrics:
     #: pod serves, the controller takes no donor / shrink / release from the model.
     #: Excluded from equality.
     sample_incomplete_pods: tuple[str, ...] = field(default=(), compare=False)
-    #: Some pod of this model (sleeping ones included) has a successful gateway scrape
-    #: inside the window: the gateway scraper is alive. False for an old gateway.
-    scrape_fresh: bool = field(default=False, compare=False)
-    #: ``scrape_stale_pods`` -> routed, unfinished requests on the pod (gateway in-flight
-    #: mirror, live gateway instances only; ``tre_common.gateway_inflight``).
-    scrape_stale_inflight: dict[str, int] = field(default_factory=dict, compare=False)
-    #: Review 2026-10-06 P2-2: pods whose newest successful gateway scrape
-    #: (``scraped_ms``) is fresh at the window end (round 4: at most 4 instant sample
-    #: periods old, gateway clock). An idle window needs every serving pod here.
-    scrape_current_pods: frozenset[str] = field(default=frozenset(), compare=False)
-    #: P2-2: the gateway in-flight count of each pod with docs in the window (live
-    #: gateway instances; ``tre_common.gateway_inflight``), read only when the window has
-    #: no token and no running / waiting request. None = not read or unknown (a pod's
-    #: count is None when unknown).
-    gateway_inflight: dict[str, int | None] | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -245,6 +212,10 @@ class MetricsSnapshot:
     #: freshness rule: a window ending at ``E`` is complete once this is >= ``E``.
     #: None = not read (no cadence check, v1 schema, offline).
     gateway_last_hist_ms: int | None = field(default=None, compare=False)
+    #: Controller clock (ms) when the sampler read this snapshot (its last fetch
+    #: attempt); None = not from the sampler. TSS suffix (2026-10-29): a pod-set change
+    #: is dated against it, never against a gateway stamp (``SignalState.note_snapshot``).
+    read_ms: int | None = field(default=None, compare=False)
 
 
 def mean_completed_prompt_tokens(metrics: Any) -> float | None:

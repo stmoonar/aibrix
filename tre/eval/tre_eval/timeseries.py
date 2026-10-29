@@ -18,8 +18,7 @@ from . import metrics as M
 
 TS_FIELDS = ("awake", "routable", "hidden", "gpus_awake", "target", "offered_rps", "rho", "sent_rps",
              "completed_rps", "gen_tok_s", "viol_frac_10s", "ttft_p95_10s_ms", "kv_mean", "kv_max",
-             "running", "waiting", "pods_sampled", "z", "tss", "theta", "queue_len", "ctrl_z", "ctrl_kv",
-             "ctrl_running", "ctrl_waiting", "ctrl_routable")
+             "running", "waiting", "pods_sampled", "z", "tss", "theta", "queue_len", "ctrl_z", "ctrl_routable")
 # columns from the newer collectors; written only when the arm has their source file (old arms: unchanged CSV)
 TS_FIELDS_NEW = ("routable_sm", "routable_label", "kv_mean_all", "running_all", "waiting_all",
                  "pods_hidden_sampled", "gen_tok_s_engine", "preemptions")
@@ -186,8 +185,7 @@ def build(arm: Arm, recs: list[dict], capacity: dict[str, float] | None = None) 
         for m, st in (tk.get("model_states") or {}).items():
             if m not in res or not isinstance(st, dict):
                 continue
-            for f, k in (("ctrl_z", "z_m"), ("ctrl_kv", "saturation_kv"), ("ctrl_running", "saturation_running"),
-                         ("ctrl_waiting", "saturation_waiting"), ("ctrl_routable", "routable_pods")):
+            for f, k in (("ctrl_z", "z_m"), ("ctrl_routable", "routable_pods")):
                 if st.get(k) is not None:
                     res[m][f][j] = st[k]
     return res

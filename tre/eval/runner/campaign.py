@@ -11,7 +11,7 @@ next trace. The arm order inside a trace is rotated per trace (Williams Latin sq
 every arm in every position, first-order carry-over balanced over a full square) and recorded.
 
 Per arm: pre-checks (marker, run mode, canonical awake layout, decision source NONE, gpu-truth
-fresh, no ``breakpoint_window_suspended``, disk) -> ``run_arm_pilot.sh`` (all collectors of the
+fresh, disk) -> ``run_arm_pilot.sh`` (all collectors of the
 eval spec) -> validity verdict -> ``campaign_manifest.json`` + done marker -> post-arm reset to
 the canonical state -> report for the arm + cross-arm report of the trace + campaign index
 (plot failures are logged, never stop the campaign). A failed / invalid arm gets one automatic
@@ -73,7 +73,14 @@ CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_S
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
 # 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source);
 # TRE_DISABLE_ETA_GATE is a switch (default false; logged as disable_eta_gate).
-SAFESCALE_SCOPES = ("all", "receiverless_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
+# 2026-10-29 (design 20261029-tss-suffix rule 5): healthy_and_shrink = IDLE donors at once, a HIGH donor
+# relays to a receiver at once, a HEALTHY donor gives only to a CRITICAL receiver through a probe, the
+# receiverless HIGH shrink is a probe. Example arm def:
+#   arm_defs:
+#     tre-hs:
+#       base: tre
+#       controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+SAFESCALE_SCOPES = ("all", "receiverless_shrink", "healthy_and_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
 # = tre_controller.config.SIGNAL_SOURCES (feat/alt-signals-20261028: ttft_mean / kv_usage added, kv_cache removed);
 # an image without a value refuses to start -> the startup-line check fails the arm
 SIGNAL_SOURCES = ("zm", "queue_len", "ttft_mean", "kv_usage", "latency_p95", "decode_tps", "prefill_tps")
@@ -99,8 +106,15 @@ DEFAULTS: dict = {
                  "history_root": None},   # Real_* history files: <history_root>/<trace>/seed<k>/preserve_history.json
     "report": {"enabled": True, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
                "reps": 1000, "timeout_s": 900, "nice": 10, "extra_args": []},
-    "precheck": {"gpu_truth_max_age_s": 30, "breakpoint_lookback_s": 60, "wait_s": 300, "poll_s": 30,
-                 "disk_min_free_gb": {"nfs": 50, "nodes": {}}},
+    # precheck.breakpoint_lookback_s (older campaign files): accepted and ignored - the O1
+    # breakpoint window and its clock check were removed (2026-10-29, design 20261029-tss-only).
+    "precheck": {"gpu_truth_max_age_s": 30, "wait_s": 300, "poll_s": 30,
+                 "disk_min_free_gb": {"nfs": 50, "nodes": {}},
+                 # 2026-10-28 eviction-storm guards (hard): node DiskPressure, Failed/Evicted pods, node root fs free
+                 # space >= kubelet_margin x the node kubelet hard-eviction threshold nodefs.available (configz; default
+                 # 10%), read through the API server (no ssh); "nodes" = per-node override in GB
+                 "node_pressure": True, "failed_pods_max": 0,
+                 "node_fs_min_free": {"kubelet_margin": 1.1, "nodes": {}}},
     "validity": {"fail_frac_suspect": 0.01, "fail_frac_invalid": 0.20, "sent_frac_min": 0.98,
                  "emfile": "invalid", "max_tokens_hit_min": 0.99, "clock_drift_max_s": 1.0},
     "marker": {"extend": True, "margin_s": 1800},
@@ -1109,13 +1123,6 @@ class Cluster:
             return not bad, "; ".join(det)
         add("gpu_truth", "wait", gpu_truth)
 
-        def breakpoint_ok():
-            logs = self.kubectl("-n", self.e.get("TRE_NS", "tre-v2"), "logs", f"deploy/{self.e.get('CONTROLLER_DEPLOY', 'tre-v2-controller')}",
-                                f"--since={int(pc['breakpoint_lookback_s'])}s", timeout=60)
-            n = logs.count("breakpoint_window_suspended")
-            return n == 0, f"{n} breakpoint_window_suspended line(s) in the last {pc['breakpoint_lookback_s']} s"
-        add("breakpoint_window", "wait", breakpoint_ok)
-
         def disk():
             want = pc.get("disk_min_free_gb") or {}
             det, bad = [], []
@@ -1140,6 +1147,44 @@ class Cluster:
                     bad.append(node)
             return not bad, "; ".join(det)
         add("disk", "hard", disk)
+
+        # 2026-10-28 eviction-storm guards (node10 DiskPressure evicted ~4000 pods; same pattern 10-06 on node9)
+        def disk_pressure():
+            bad = node_pressure_problems(json.loads(self.kubectl("get", "nodes", "-o", "json")))
+            return not bad, f"DiskPressure=True on {bad}" if bad else "no node under DiskPressure"
+        if pc.get("node_pressure", True):
+            add("node_disk_pressure", "hard", disk_pressure)
+
+        def failed_pods():
+            ns = self.e.get("MODEL_NS", "default")
+            n = failed_pod_count(json.loads(self.kubectl("-n", ns, "get", "pods", "-o", "json", timeout=120)))
+            mx = int(pc.get("failed_pods_max", 0))
+            hint = f" (clean up: kubectl -n {ns} delete pods --field-selector=status.phase=Failed)" if n > mx else ""
+            return n <= mx, f"{n} Failed/Evicted pod(s) in {ns}, max {mx}{hint}"
+        if pc.get("failed_pods_max") is not None:
+            add("failed_pods", "hard", failed_pods)
+
+        def node_fs():
+            cfg = pc["node_fs_min_free"]
+            names = [x for x in self.kubectl("get", "nodes", "-o", "jsonpath={.items[*].metadata.name}").split() if x]
+            det, bad, warn = [], [], []
+            for node in names:
+                try:
+                    st = json.loads(self.kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/stats/summary", timeout=60))
+                    try:
+                        cz = json.loads(self.kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/configz", timeout=60))
+                    except Exception:  # noqa: BLE001  configz unavailable: kubelet default threshold
+                        cz = None
+                    ok, d = node_fs_verdict(st, cfg, node, cz)
+                except Exception as exc:  # noqa: BLE001  stats unavailable: warn, do not block
+                    warn.append(f"{node}: stats unavailable ({type(exc).__name__}) - not checked")
+                    continue
+                det.append(d)
+                if not ok:
+                    bad.append(node)
+            return not bad, "; ".join(det + warn)
+        if pc.get("node_fs_min_free"):
+            add("node_fs_free", "hard", node_fs)
 
         # 2026-10-28: a sensitivity arm's registry perturbation still in effect (annotation on the registry
         # ConfigMap) -> full reset (reset_canonical.sh restores it); the canonical registry must be the one the
@@ -1166,11 +1211,54 @@ class Cluster:
         return out
 
 
+def node_pressure_problems(nodes_json: dict) -> list:
+    """Nodes whose DiskPressure condition is True (from ``kubectl get nodes -o json``)."""
+    bad = []
+    for n in nodes_json.get("items", []):
+        for cond in n.get("status", {}).get("conditions", []):
+            if cond.get("type") == "DiskPressure" and cond.get("status") == "True":
+                bad.append(n["metadata"]["name"])
+    return bad
+
+
+def failed_pod_count(pods_json: dict) -> int:
+    """Pods in phase Failed (Evicted / UnexpectedAdmissionError ... all end up Failed)."""
+    return sum(1 for p in pods_json.get("items", []) if p.get("status", {}).get("phase") == "Failed")
+
+
+_QTY = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+
+
+def kubelet_nodefs_threshold(configz: Optional[dict], cap: float) -> tuple[float, str]:
+    """Kubelet hard-eviction threshold for nodefs.available in bytes: "10%" or a quantity ("1Gi");
+    configz missing or key absent -> Kubernetes default 10%."""
+    v = ((configz or {}).get("kubeletconfig") or {}).get("evictionHard", {}).get("nodefs.available")
+    if v is None:
+        return 0.10 * cap, "10% (default)"
+    v = str(v).strip()
+    if v.endswith("%"):
+        return float(v[:-1]) / 100 * cap, v
+    m = re.fullmatch(r"([0-9.]+)([A-Za-z]*)", v)
+    return float(m.group(1)) * _QTY.get(m.group(2), 1), v
+
+
+def node_fs_verdict(stats: dict, cfg: dict, node: str, configz: Optional[dict] = None) -> tuple[bool, str]:
+    """Kubelet stats/summary (+ configz) -> (ok, detail). Needs free >= kubelet_margin x kubelet nodefs.available
+    eviction threshold; per-node override in cfg["nodes"] (GB)."""
+    fs = stats["node"]["fs"]
+    free, cap = float(fs["availableBytes"]), float(fs["capacityBytes"])
+    thr, raw = kubelet_nodefs_threshold(configz, cap)
+    want = (cfg.get("nodes") or {}).get(node)
+    want = float(want) * 1e9 if want is not None else float(cfg.get("kubelet_margin", 1.1)) * thr
+    return free >= want, (f"{node} root fs {free / 1e9:.1f}/{cap / 1e9:.1f} GB free (kubelet threshold {raw} = "
+                          f"{thr / 1e9:.1f} GB, need >= {want / 1e9:.1f})")
+
+
 def precheck_until_ready(checks: Callable[[], list], reset: Callable[[bool], int], c: dict,
                          log: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
                          clock: Callable[[], float] = time.time) -> tuple[bool, list]:
     """Pre-checks with recovery: a ``reset`` failure triggers one full reset, a ``wait`` failure
-    (gpu-truth stale, O1 window suspended) is polled up to precheck.wait_s, a ``hard`` failure
+    (gpu-truth stale) is polled up to precheck.wait_s, a ``hard`` failure
     (marker, disk) blocks at once. Returns (ready, last results)."""
     pc = c["precheck"]
     deadline = clock() + float(pc["wait_s"])

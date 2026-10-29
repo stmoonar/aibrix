@@ -10,8 +10,8 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
-from tre_controller.loops.fairness_task import run_fairness_tick
-from tre_controller.loops.rescue_task import run_rescue_tick
+from section_ticks import run_fairness_tick
+from section_ticks import run_rescue_tick
 from tre_controller.signals.trs import SignalState
 
 
@@ -88,21 +88,21 @@ def _snapshot_tokens_missing(*, window_end_ms: int) -> MetricsSnapshot:
     return MetricsSnapshot(ts_ms=window_end_ms, models={"m": metrics}, stale=False)
 
 
-def test_tokens_missing_holds_traffic_onset_cursor() -> None:
-    # F1: a metrics scrape gap (tokens missing) must NOT reset the traffic-onset cursor,
-    # else a genuinely-loaded model is re-suppressed for a full window after metrics recover.
+def test_tokens_missing_keeps_the_ema_and_an_idle_window_resets_it() -> None:
+    # F1: a metrics scrape gap (tokens missing) is not idle evidence: the EMA is kept;
+    # a genuinely idle window (tokens present, zero) clears it.
     from tre_controller.loops.tick import _model_contexts
 
-    state = SignalState(warmup_ms=-1)
+    state = SignalState()
     registry = _registry(20_000)
     _model_contexts(_snapshot(window_end_ms=60_000, generation=200.0, running=2.0), registry, signal_state=state)
-    assert state._onset_ms["m"] == 60_000
-    # scrape gap: tokens missing -> onset held (not reset)
+    computer = state._by_model["m"]
+    ema = computer.current_ema
+    assert ema is not None
     _model_contexts(_snapshot_tokens_missing(window_end_ms=65_000), registry, signal_state=state)
-    assert state._onset_ms["m"] == 60_000
-    # genuine idle (tokens present, zero) DOES reset
+    assert computer.current_ema == ema
     _model_contexts(_snapshot(window_end_ms=70_000, generation=0.0, running=0.0), registry, signal_state=state)
-    assert state._onset_ms["m"] is None
+    assert computer.current_ema is None
 
 
 def test_shared_signal_state_persists_ema_across_ticks() -> None:

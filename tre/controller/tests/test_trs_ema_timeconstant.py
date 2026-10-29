@@ -82,17 +82,15 @@ def test_duplicate_window_does_not_advance() -> None:
     assert r2.TRS == pytest.approx(r1.TRS)
 
 
-def test_non_finite_raw_passthrough_no_state_change() -> None:
+def test_nothing_in_flight_is_idle_and_resets_the_ema() -> None:
+    # 2026-10-29: the idle rule is running + waiting == 0 (TSS undefined), tokens or not:
+    # the EMA resets, so the next real sample seeds fresh.
     c = TRSComputer(ema_tau_ms=20_000)
-    c.compute(_inp(generation=200.0, running=2.0), window_end_ms=0)  # seed 100, cursor=0
-    # tokens but nothing in flight: TSS undefined (raw 0) yet not an idle window (an idle,
-    # token-free window would reset the EMA - see test_tss_idle_reset.py) -> passthrough
+    c.compute(_inp(generation=200.0, running=2.0), window_end_ms=0)  # seed 100
     r = c.compute(_inp(generation=50.0, running=0.0), window_end_ms=5_000)
-    assert r.TRS == 0.0
-    # cursor/state untouched: the next real sample decays from the seed (dt from 0).
+    assert r.TRS == 0.0 and not r.defined and r.Z_m is None
     r2 = c.compute(_inp(generation=400.0, running=2.0), window_end_ms=10_000)
-    decay = math.exp(-10_000 / 20_000)
-    assert r2.TRS == pytest.approx(decay * 100.0 + (1 - decay) * 200.0)
+    assert r2.TRS == pytest.approx(200.0)
 
 
 def test_legacy_alpha_branch_when_tau_none() -> None:

@@ -137,9 +137,8 @@ def test_every_route_timeout_equals_the_registry_route_timeout(tmp_path: Path) -
     for router in sorted((DEPLOY_ROOT / "models").glob("*-router.yaml")):
         route = next(d for d in _docs(router) if d["kind"] == "HTTPRoute")
         assert {r["timeouts"]["request"] for r in route["spec"]["rules"]} == {expected}, router.name
-    # the SM drain can never outlast the route
-    for name, registry in registries.items():
-        assert registry.service_manager().sleep.hard_cap_s <= timeouts[name], name
+    # (the SM never drains since 2026-10-02; the hard cap a rollback image reads is
+    # checked by test_registry_compat_20261006.py)
 
 
 # --- retry / continuation sidecar (plan D2, D5, D6) ---------------------------------

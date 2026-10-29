@@ -60,7 +60,7 @@ def _online_store() -> MetricsStore:
                 f"{MODEL}/num_requests_running": x["running"], f"{MODEL}/num_requests_waiting": x["waiting"],
                 f"{MODEL}/gpu_cache_usage_perc": x["kv"],
             }}): ts})
-    return MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P, schema="v2")
+    return MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P)
 
 
 def _offline_pods():
@@ -104,7 +104,7 @@ def test_controller_and_fit_compute_the_same_alt_signal_values():
     for end in range(T0 + 40_000, END + 1, P):
         start = end - WINDOW
         serving = ["a"] + (["b"] if not _sample("b", end)["asleep"] else [])
-        raw = store.read_model_window(MODEL, start, end, use_cache=False, start_exclusive=True)
+        raw = store.read_model_window(MODEL, start, end, start_exclusive=True)
         window = restrict_to_serving(raw, sleeping_pods=[] if "b" in serving else ["b"], routable_pods=len(serving))
         row = {**columns(start, end), **_offline_queue(serving, start, end)}
         for source in ("queue_len", "ttft_mean", "kv_usage"):
@@ -129,7 +129,7 @@ def test_a_missing_ttft_histogram_is_unknown_not_no_first_token():
     """Review L3: the TTFT count of a pod whose docs lack the histogram is unknown (the pod
     is unusable, the model's ttft_mean unknown), not 0 (silently skipped)."""
     store = _online_store()
-    w = store.read_model_window(MODEL, NO_TTFT - 10_000, NO_TTFT + 10_000, use_cache=False, start_exclusive=True)
+    w = store.read_model_window(MODEL, NO_TTFT - 10_000, NO_TTFT + 10_000, start_exclusive=True)
     [pod_a] = [pod for pod in w.per_pod.values() if pod.pod == "a"]
     assert pod_a.ttft_count_complete is False
     window = restrict_to_serving(w, sleeping_pods=[], routable_pods=2)
@@ -145,14 +145,14 @@ def test_missing_ttft_histogram_leaves_safescale_ttft_count_as_before():
 
     store = _online_store()
     start, end = NO_TTFT - 10_000, NO_TTFT + 10_000
-    w = store.read_model_window(MODEL, start, end, use_cache=False, start_exclusive=True)
+    w = store.read_model_window(MODEL, start, end, start_exclusive=True)
     [pod_a] = [pod for pod in w.per_pod.values() if pod.pod == "a"]
     assert pod_a.ttft_count_complete is False
     assert pod_a.ttft_count is not None and pod_a.ttft_count > 0.0  # not unknown, as before
     ev_store = MetricsStore(store.redis_client, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=P,
-                            schema="v2", histogram_lookback_ms=0)  # as the controller builds it
+                            histogram_lookback_ms=0)  # as the controller builds it
     reader = MetricsEvidenceReader(ev_store, redis_client=store.redis_client)
     evidence = reader.read(MODEL, start_ms=start, end_ms=end, exclude_pods=())
-    w0 = ev_store.read_model_window(MODEL, start - 1, end, use_cache=False, start_exclusive=True)
+    w0 = ev_store.read_model_window(MODEL, start - 1, end, start_exclusive=True)
     assert evidence.ttft_count > 0.0
     assert evidence.ttft_count == pytest.approx(sum(p.ttft_count or 0.0 for p in w0.per_pod.values()))

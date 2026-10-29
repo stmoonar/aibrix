@@ -9,16 +9,26 @@ from typing import Mapping
 
 from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
 from tre_common.alt_signals import alt_basis_errors
-from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
+from tre_common.registry import (
+    EXPECTED_SIGNAL_DIRECTIONS,
+    POD_SERVING_PORT,
+    SafeScaleRegistryConfig,
+    ScalingRegistryConfig,
+    load_registry,
+)
 from tre_controller.loops.metrics_task import REFRESH_MODES
 #: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
 #: logged once and otherwise ignored (no validation): an old overlay still starts.
 #: TRE_FLOOR_VIOLATION_COOLDOWN_TICKS: the P2-6 donor hold after a 409 floor_violation
 #: (design 20261002-controller-transfer; the planner bounds every donor by the SM
 #: floor_headroom).
+#: TSS only (2026-10-29, design 20261029-tss-only): TRE_ACTION_COOLDOWN (the review F4
+#: hold until a metrics window starts after a model's last action) and
+#: TRE_SIGNAL_WARMUP_MS (the ADR-0013 onset warmup guard) - signal-lag holds; only the
+#: fleet-view guard (view-pending) remains.
 REMOVED_TIMER_ENV = (
     "TRE_DWELL_WINDOWS", "TRE_DWELL_STATES", "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS",
-    "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS",
+    "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS", "TRE_ACTION_COOLDOWN", "TRE_SIGNAL_WARMUP_MS",
 )
 
 LOG = logging.getLogger(__name__)
@@ -118,7 +128,7 @@ class SafeScaleConfig:
     donor_min_requests: float = 20.0
     # Timer cleanup (registry safescale.rollback_retry_z_margin): after a capacity
     # rollback (SLO violation, formal commit gate, donor health) the next receiver-less
-    # HIGH probe of the model needs early_commit_min_evidence_ms of observations after the
+    # HIGH probe of the model needs rollback_retry_min_evidence_ms of observations after the
     # rollback (round 4; any window ending after it before) AND either
     # a routable count different from the one the failed probe started from or a Z at
     # least this much above the Z that started it. Other rollbacks (evidence gaps,
@@ -130,11 +140,14 @@ class SafeScaleConfig:
     # instances and vLLM running + waiting) and the evidence floor holds. Rollbacks
     # unchanged.
     early_commit: bool = True
-    # Q4 (2026-10-06), the single evidence floor = registry scaling.min_evidence_ms (O1's
-    # warm rule; no separate safescale key): round 4, the observed span after the hide
-    # confirmation (early commit, with at least the donor's p95 e2e since it) and after a
-    # rollback (the retry hold). No W / 2 term, no separate minimum observation time.
-    early_commit_min_evidence_ms: float = 20_000.0
+    # The observed span after the hide confirmation an early commit needs (with at least
+    # the donor's p95 e2e since it) = registry scaling.settle_ms (2026-10-29, design
+    # 20261029-tss-suffix: the remaining pods' post-hide suffix decides once it spans the
+    # settle span, like every model's Z after a pod-set change). No W / 2 term.
+    early_commit_min_evidence_ms: float = 10_000.0
+    # The observed span after a rollback before a retry (the rollback hold) = registry
+    # scaling.min_evidence_ms (Q4, round 4).
+    rollback_retry_min_evidence_ms: float = 20_000.0
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
     # queued behind a long action, or re-submitted after a controller restart - is not run
@@ -159,6 +172,9 @@ class ControllerConfig:
     runtime_state_dir: str
     monitor_interval_s: float
     metrics_refresh_interval_s: float
+    #: Single decision loop (2026-10-28): observation time between two runs of the
+    #: rescue section (TRE_RESCUE_INTERVAL_SECONDS, 5 s) and of the rebalance (fairness)
+    #: section (TRE_FAIRNESS_INTERVAL_SECONDS, 10 s; also the fleet-view refresh period).
     rescue_interval_s: float
     fairness_interval_s: float
     metrics_window_ms: int
@@ -169,17 +185,22 @@ class ControllerConfig:
     percentile_mode: str
     signal_source: str
     signal_idle_rps_eps: float
-    signal_warmup_ms: int
     #: A model whose tokens are missing keeps its last context while its last good window
     #: ended at most this long before (ms, gateway window ends; TRE_PAPER_STALE_MAX_MS).
     paper_stale_max_ms: int
     incomplete_policy: str
-    # 2026-10-08: one loop (the fast loop's timer) runs every decision (no fairness loop).
+    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-28 semantics, design 20261028-single-loop):
+    # the decision loop never runs the rebalance section - LOW receivers get nothing; the
+    # rescue section is unchanged. Data recorded before 2026-10-28 used other semantics
+    # (2026-10-08..27: no fairness task, every rescue tick also planned fairness, so LOW
+    # receivers WERE served): not comparable with no-slow-loop runs after it.
     ablation_disable_slow_loop: bool
     ablation_disable_safescale: bool
     #: TRE_SAFESCALE_SCOPE (2026-10-26): which placements run as a SafeScale probe -
     #: ``all``, ``receiverless_shrink`` (only the receiver-less HIGH proactive shrink;
-    #: every other probe placement is released at once, as with ``off``) or ``off``.
+    #: every other probe placement is released at once, as with ``off``),
+    #: ``healthy_and_shrink`` (2026-10-29: HEALTHY donors and the receiver-less HIGH
+    #: shrink probe; a HIGH donor for a receiver is released at once) or ``off``.
     #: ``ablation_disable_safescale`` is ``safescale_scope == "off"``.
     safescale_scope: str
     disable_eta_gate: bool
@@ -191,11 +212,6 @@ class ControllerConfig:
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the t1 guard.
     safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
-    # Review F4: per-model action cooldown (hold a model's next action until a metrics
-    # window starting after its last executed action). Since the timer cleanup
-    # (2026-10-02) only a fallback for models O1 does not track (O1 off / suspended, no
-    # fleet view, stale-held context); TRE_ACTION_COOLDOWN=0 disables the fallback.
-    action_cooldown: bool
     # Opt-in control-loop profiling (research toggle, off by default). When
     # profile_enabled is False the profiler object is None everywhere (zero overhead).
     profile_enabled: bool
@@ -208,8 +224,7 @@ class ControllerConfig:
     # TRE_METRICS_REFRESH_MODE: phase_aligned (default) | free_running (old loop).
     metrics_refresh_mode: str = "phase_aligned"
     # TRE_EVIDENCE_PERIOD_MS: the gateway's histogram-doc period = the phase-aligned
-    # window grid, the O1 grid, the SafeScale evidence step and the saturation "latest
-    # grid". Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (declared cadence hash) and be
+    # window grid and the SafeScale evidence step / tail grid. Must equal the gateway's TRE_EVIDENCE_PERIOD_MS (declared cadence hash) and be
     # a multiple of instant_sample_interval_ms (the gateway's instant-doc period).
     evidence_period_ms: int = EVIDENCE_PERIOD_MS
     # TRE_METRICS_PHASE_OFFSET_MS: read at boundary + offset (a floor, see adapt).
@@ -267,7 +282,7 @@ class ControllerConfig:
         if str(values.get("TRE_ABLATION_DISABLE_FAST_LOOP", "")).strip().lower() in _TRUE_VALUES:
             raise ValueError(
                 "TRE_ABLATION_DISABLE_FAST_LOOP was removed (2026-10-08); "
-                "use TRE_ABLATION_DISABLE_SLOW_LOOP (all decisions in the fast loop)"
+                "TRE_ABLATION_DISABLE_SLOW_LOOP is the remaining loop ablation (no rebalance section)"
             )
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"
@@ -293,11 +308,6 @@ class ControllerConfig:
         metrics_window_mode = _get_str(values, "TRE_METRICS_WINDOW_MODE", "sliding")
         if metrics_window_mode not in WINDOW_MODES:
             raise ValueError(f"TRE_METRICS_WINDOW_MODE must be one of {sorted(WINDOW_MODES)}")
-
-        try:
-            signal_warmup_ms = int(str(values.get("TRE_SIGNAL_WARMUP_MS", "-1")).strip())
-        except (TypeError, ValueError) as exc:
-            raise ValueError("TRE_SIGNAL_WARMUP_MS must be an integer (-1 auto, 0 off, >0 ms)") from exc
 
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
@@ -331,7 +341,7 @@ class ControllerConfig:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below TRE_EVIDENCE_PERIOD_MS")
 
         safescale_registry = _safescale_registry(registry_path)
-        early_evidence_ms = _o1_min_evidence_ms(registry_path)
+        scaling_registry = _scaling_registry(registry_path)
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
             tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
@@ -356,7 +366,8 @@ class ControllerConfig:
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             early_commit=bool(safescale_registry.early_commit),
-            early_commit_min_evidence_ms=float(early_evidence_ms),
+            early_commit_min_evidence_ms=float(scaling_registry.settle_ms),
+            rollback_retry_min_evidence_ms=float(scaling_registry.min_evidence_ms),
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),
@@ -420,9 +431,6 @@ class ControllerConfig:
             signal_idle_rps_eps=_get_nonneg_float(
                 values, "TRE_SIGNAL_IDLE_RPS_EPS", 0.05
             ),
-            # F-onset warmup guard: -1 auto (window fully inside traffic period),
-            # 0 disabled (A/B ablation), >0 explicit span-since-onset in ms.
-            signal_warmup_ms=signal_warmup_ms,
             paper_stale_max_ms=_get_span_ms(
                 values, "TRE_PAPER_STALE_MAX_MS", "TRE_PAPER_STALE_MAX_WINDOWS", 30_000, minimum=1
             ),
@@ -437,7 +445,6 @@ class ControllerConfig:
                 values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", False
             ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
-            action_cooldown=_get_bool(values, "TRE_ACTION_COOLDOWN", True),
             profile_enabled=_get_bool(values, "TRE_PROFILE", False),
             profile_stream_maxlen=_get_positive_int(values, "TRE_PROFILE_STREAM_MAXLEN", 200_000),
             profile_proc_sample_interval_s=_get_positive_float(
@@ -526,14 +533,14 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
     return SafeScaleConfig.min_window_ms
 
 
-def _o1_min_evidence_ms(registry_path: str) -> int:
-    """Registry scaling.min_evidence_ms (O1 warm rule; 20 s without a readable registry):
-    also the SafeScale early commit's post-hide evidence span (Q4)."""
+def _scaling_registry(registry_path: str) -> ScalingRegistryConfig:
+    """Registry ``scaling:`` (the defaults without a readable registry): ``settle_ms`` is
+    the SafeScale early commit's post-hide span, ``min_evidence_ms`` the rollback retry
+    hold's (Q4)."""
     try:
-        scaling = load_registry(registry_path).scaling()
-        return int(getattr(scaling, "min_evidence_ms", 20_000) or 1)
+        return load_registry(registry_path).scaling()
     except Exception:  # noqa: BLE001 - the registry load fails loudly elsewhere
-        return 20_000
+        return ScalingRegistryConfig()
 
 
 def _get_span_ms(
@@ -632,13 +639,19 @@ def _get_str(env: Mapping[str, str], key: str, default: str) -> str:
 SAFESCALE_SCOPE_ALL = "all"
 SAFESCALE_SCOPE_RECEIVERLESS_SHRINK = "receiverless_shrink"
 SAFESCALE_SCOPE_OFF = "off"
-SAFESCALE_SCOPES = (SAFESCALE_SCOPE_ALL, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK, SAFESCALE_SCOPE_OFF)
+#: 2026-10-29 (design 20261029-tss-suffix): probes = HEALTHY donors (only a CRITICAL
+#: receiver takes them) + the receiver-less HIGH shrink; a HIGH donor for a receiver is an
+#: immediate relay; IDLE donors are immediate as in every scope.
+SAFESCALE_SCOPE_HEALTHY_AND_SHRINK = "healthy_and_shrink"
+SAFESCALE_SCOPES = (
+    SAFESCALE_SCOPE_ALL, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK, SAFESCALE_SCOPE_HEALTHY_AND_SHRINK, SAFESCALE_SCOPE_OFF,
+)
 
 
 def _safescale_scope(env: Mapping[str, str]) -> str:
     """TRE_SAFESCALE_SCOPE (default ``all``). TRE_ABLATION_DISABLE_SAFESCALE=true is
     the alias of ``off``; when both are set they must agree (true with ``off``, false
-    with ``all`` / ``receiverless_shrink``), else the controller refuses to start - an
+    with ``all`` / ``receiverless_shrink`` / ``healthy_and_shrink``), else the controller refuses to start - an
     arm must never run a scope it did not ask for."""
     raw = str(env.get("TRE_SAFESCALE_SCOPE") or "").strip().lower()
     if raw and raw not in SAFESCALE_SCOPES:

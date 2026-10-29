@@ -36,7 +36,6 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.percentile_mode == "bucket_upper"
     assert config.signal_source == "zm"
     assert config.signal_idle_rps_eps == 0.05
-    assert config.signal_warmup_ms == -1
     assert config.sm_slow_timeout_s is None  # -> registry service_manager.api_call_timeout_s
     assert config.paper_stale_max_ms == 30_000
     assert config.incomplete_policy == "drop_model"

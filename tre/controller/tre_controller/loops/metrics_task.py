@@ -19,13 +19,12 @@ Two refresh modes (``TRE_METRICS_REFRESH_MODE``):
 * ``free_running`` (fallback): the old ``refresh; sleep(metrics_refresh_interval_s)`` loop
   with a sliding window ending at ``now``.
 
-Decision cadence: snapshots change every evidence period in ``phase_aligned`` mode. The
-decision loops run on fixed timers and read the latest snapshot: the rescue (fast) loop
-every ``TRE_RESCUE_INTERVAL_SECONDS`` (5 s), the fairness (slow) loop every
-``TRE_FAIRNESS_INTERVAL_SECONDS`` (10 s) (2026-10-25: the 2026-10-06 wake-on-publish of
-the rescue loop is removed; at a 2 s evidence period a tick reads a snapshot at most about
-one period old). A re-read of the same snapshot advances neither the EMA, the band dwell
-nor any time-span rule (all keyed by ``window_end_ms``).
+Decision cadence (2026-10-28, design docs/design/20261028-single-loop.md): snapshots change
+every evidence period in ``phase_aligned`` mode. The single decision loop
+(``decision_task``) waits for each publish (:meth:`SnapshotBox.wait_newer`) and runs the
+rescue / rebalance sections once their period of observation time has passed. A re-read
+of the same snapshot advances neither the EMA, the band dwell nor any time-span rule (all
+keyed by ``window_end_ms``).
 """
 from __future__ import annotations
 
@@ -67,7 +66,7 @@ DEFAULT_PHASE_RELEARN_MS = 600_000
 
 class SnapshotStore(Protocol):
     def read_snapshot(
-        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+        self, window_start_ms: int, window_end_ms: int
     ) -> MetricsSnapshot: ...
 
 
@@ -80,16 +79,46 @@ class MetricsTaskConfig(Protocol):
 
 class SnapshotBox:
     """The latest published snapshot. ``set`` is called on the event loop thread (the
-    sampler awaits its threaded fetch); the decision loops ``get`` it on their timers."""
+    sampler awaits its threaded fetch); the decision loop waits for it
+    (:meth:`wait_newer`) and reads the newest one."""
 
     def __init__(self, snapshot: MetricsSnapshot | None = None) -> None:
         self._snapshot = snapshot
+        #: Number of ``set`` calls (the initial snapshot counts as one).
+        self._version = 0 if snapshot is None else 1
+        self._waiters: list[asyncio.Future] = []
 
     def get(self) -> MetricsSnapshot | None:
         return self._snapshot
 
+    @property
+    def version(self) -> int:
+        return self._version
+
     def set(self, snapshot: MetricsSnapshot) -> None:
         self._snapshot = snapshot
+        self._version += 1
+        waiters, self._waiters = self._waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def wait_newer(self, version: int, timeout_s: float | None = None) -> bool:
+        """Wait until a snapshot newer than ``version`` (:attr:`version` of the last one
+        read) is set. Several sets in between are one wake (the caller reads the newest).
+        False = ``timeout_s`` passed without one."""
+        if self._version != version:
+            return True
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await asyncio.wait_for(waiter, timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+        return self._version != version
 
 
 def freeze_snapshot(snapshot: MetricsSnapshot) -> MetricsSnapshot:
@@ -100,7 +129,7 @@ def freeze_snapshot(snapshot: MetricsSnapshot) -> MetricsSnapshot:
         name: replace(
             window,
             per_pod=MappingProxyType(dict(window.per_pod)),
-            # O1 suffix windows are read-only too.
+            # Suffix windows (the SafeScale tail) are read-only too.
             suffix_windows=tuple(
                 replace(suffix, per_pod=MappingProxyType(dict(suffix.per_pod)))
                 for suffix in window.suffix_windows
@@ -263,7 +292,7 @@ class PhaseAlignedSampler:
 
     async def _threaded_fetch(self, start_ms: int, end_ms: int) -> MetricsSnapshot:
         return await asyncio.to_thread(
-            self._store.read_snapshot, start_ms, end_ms, use_cache=False, start_exclusive=True
+            self._store.read_snapshot, start_ms, end_ms, start_exclusive=True
         )
 
     async def run_forever(self) -> None:
@@ -371,7 +400,7 @@ class PhaseAlignedSampler:
         self.last_fresh_end_ms = end
         self.stale_since_ms = None
         assert snapshot is not None
-        published = freeze_snapshot(replace(snapshot, ts_ms=end, stale=False))
+        published = freeze_snapshot(replace(snapshot, ts_ms=end, stale=False, read_ms=int(started)))
         self._box.set(published)
         return SampleOutcome("published", end, attempts, missed, reason, self.offset_ms)
 
@@ -449,15 +478,9 @@ def refresh_metrics_once(
         window_start_ms, window_end_ms = _sliding_window(now_ms, window_ms)
     else:
         window_start_ms, window_end_ms = _last_complete_window(now_ms, window_ms)
-    # Tumbling calls read_snapshot with its original signature (no use_cache) so existing
-    # SnapshotStore fakes keep working; only sliding opts out of the per-window cache
-    # (every sliding window is unique -> the cache never hits and would grow, S1.1).
     _fetch_t0 = time.perf_counter_ns() if prof is not None else 0
     try:
-        if sliding:
-            snapshot = store.read_snapshot(window_start_ms, window_end_ms, use_cache=False)
-        else:
-            snapshot = store.read_snapshot(window_start_ms, window_end_ms)
+        snapshot = store.read_snapshot(window_start_ms, window_end_ms)
     except Exception as exc:  # noqa: BLE001 - metrics loop degrades through stale snapshots.
         snapshot = _stale_snapshot(snapshot_box.get(), fallback_ts_ms=window_end_ms)
         snapshot_box.set(snapshot)

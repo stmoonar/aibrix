@@ -223,7 +223,7 @@ class PodApi:
         self.pods = pods
         self.selectors = []
 
-    def list_namespaced_pod(self, *, namespace, label_selector=None):
+    def list_namespaced_pod(self, *, namespace, label_selector=None, **_kwargs):
         self.selectors.append((namespace, label_selector))
         return self.pods
 

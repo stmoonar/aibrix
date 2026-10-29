@@ -8,11 +8,12 @@ if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
 
 from tre_common.gpu_placement import placement_policy_from_registry
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_of, observed_requests
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, observed_of
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
-from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
+from tre_controller.config import SAFESCALE_SCOPE_HEALTHY_AND_SHRINK, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
+from tre_controller.loops.action_queue import PlanBatch, receiver_upscales, transfer_plan
 from tre_controller.planning.classify import (
     ModelRole,
     ModelState,
@@ -20,6 +21,7 @@ from tre_controller.planning.classify import (
     model_control_configs_from_registry,
 )
 from tre_controller.planning.planner import (
+    BlockSupplyAction,
     IMMEDIATE_DONOR_SLEEP_PATH,
     NO_SAFESCALE_REASON_SUFFIX,
     Action,
@@ -29,8 +31,6 @@ from tre_controller.planning.planner import (
     PlanConfig,
     RescueBasis,
     ScaleAction,
-    ShrinkForSlotAction,
-    TransferIntent,
     UnhideAction,
     build_plan,
     probe_reserved_gpus,
@@ -42,15 +42,8 @@ from tre_controller.planning.safescale import (
     SafeScaleDecision,
     format_window_event,
 )
-from tre_controller.signals.saturation import (
-    REASON_SCRAPE_STALE_INFLIGHT,
-    PodSample,
-    SaturationSample,
-    eligibility_reason,
-    saturation_sample,
-)
-from tre_controller.signals.sources import get_signal, per_replica_token_rate
-from tre_controller.signals.trs import QueueSample, SignalState, TRSComputer, TRSInput
+from tre_controller.signals.sources import SignalValue, get_signal, per_replica_token_rate
+from tre_controller.signals.trs import SignalState, SuffixWindow, TRSComputer, TRSInput, zero_tokens_unconfirmed
 from tre_sm.allocator.slots import natural_key, release_order
 
 
@@ -69,7 +62,11 @@ class SafeScaleController(Protocol):
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
         window_inputs: ProbeWindowInputs | None = None,
+        companions: tuple[tuple[str, str], ...] = (),
+        block_id: str | None = None,
     ) -> SafeScaleDecision: ...
+
+    def discard_probe(self, model: str, *, reason: str, now_ms: int) -> bool: ...
 
 
 # A static set (tests) or a live provider read every tick (app wiring: the models the
@@ -132,23 +129,10 @@ class PaperStateCache:
                 # 2026-10-02: the SM floor headroom of THIS tick's view (never a held one).
                 "floor": context.get("floor"),
                 "floor_headroom": context.get("floor_headroom"),
-                # Timer cleanup (2026-10-02): a held context was not recomputed - O1 saw
-                # no routable change this tick, so the F4 cooldown applies again.
-                "o1_routable_tracked": False,
-                # This tick's frozen-scrape demand (never a held one).
-                "scrape_stale_inflight": context.get("scrape_stale_inflight"),
                 # I4 (2026-10-04): a held level was not computed from tokens of the
                 # current window - never scale-down / release evidence (the planner's
-                # donor gate), and the UI shows the model UNCONFIRMED.
-                "signal_full_window": False,
-                "signal_hold_reason": "tokens_missing",
-                # ... and no evidence count either: a held receiver's rescue is capped
-                # like a thin partial window (planner partial_window_max_step).
-                "signal_evidence_requests": None,
-                # ... and never idle evidence (Q3: the O1 donor-hold exemption).
-                "window_idle": False,
-                # ... nor queue evidence (H3: the O1 receiver-hold exemption).
-                "o1_queue_rise": None,
+                # donor gate), and the commit revalidation reads the model UNCONFIRMED.
+                "sample_quality_hold": "tokens_missing",
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
@@ -173,7 +157,6 @@ def run_planner_tick(
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
-    action_cooldown: bool = False,
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
     leftover_probes: SafeScaleController | None = None,
@@ -182,7 +165,10 @@ def run_planner_tick(
     """One planner tick. ``safescale_scope`` (TRE_SAFESCALE_SCOPE, 2026-10-26):
     ``receiverless_shrink`` keeps a probe only for the receiver-less HIGH proactive
     shrink (:func:`_receiverless_shrink`); a donor planned for a receiver is a relay and
-    a same-slot preemption sleeps its pod at once, as with SafeScale off. ``observe_mode`` (controller mode ``observe``, B8): the
+    a TP block sleeps its donor pods at once, as with SafeScale off.
+    ``healthy_and_shrink`` (2026-10-29): probes for HEALTHY donors (CRITICAL receivers
+    only) and the receiver-less HIGH shrink; a HIGH donor for a receiver is a relay
+    (``PlanConfig.relay_high_donors``). ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
@@ -226,10 +212,9 @@ def run_planner_tick(
         _ru_u0, _ru_s0 = prof.rusage_ms()
         _phase_t0 = _tick_t0
 
-    tracker = getattr(signal_state, "saturation", None)
-    if tracker is not None:
-        # Onset saturation rescue: scaling.saturation_* read every tick, like PlanConfig.
-        tracker.configure(registry)
+    if signal_state is not None and cluster_view is not None:
+        # TSS suffix (2026-10-29): date every pod-set change the fleet view shows.
+        _note_pod_sets(signal_state, snapshot, queue, cluster_view)
     contexts, paper_events = _model_contexts(
         snapshot,
         registry,
@@ -237,7 +222,6 @@ def run_planner_tick(
         cluster_view=cluster_view,
         paper_state_cache=paper_state_cache,
         signal_state=signal_state,
-        queue=queue,
     )
     # Without model_control_configs every model silently falls back to the generic
     # delta_crit=0.2 / delta_high=0.25 and the fitted per-model bands in registry.yaml
@@ -247,11 +231,18 @@ def run_planner_tick(
         model_control_configs=model_control_configs_from_registry(registry, signal_source),
         signal_idle_rps_eps=signal_idle_rps_eps,
     )
-    # Onset saturation rescue (the D8 band dwell that ran before it was removed in the
-    # timer cleanup 2026-10-02; it had been off since the v1 alignment A5).
-    classifications, saturation_events = _apply_saturation_rescue(
-        classifications, contexts, snapshot, signal_state, cluster_view, queue
-    )
+    # TSS suffix (2026-10-29, design 20261029-tss-suffix rule 3): a settling model takes
+    # no action in either direction - no receiver, no donor, no probe. It is reported
+    # UNKNOWN (the commit revalidation then keeps a plan) and left out of the plan; its
+    # episode is logged once at start and end (SignalState), not per plan.
+    settling = {model for model, ctx in contexts.items() if ctx.get("settling")}
+    if settling:
+        classifications = [
+            replace(item, state=ModelState.UNKNOWN, role=ModelRole.UNKNOWN, Z_m=None, signal_idle=False)
+            if item.model_name in settling else item
+            for item in classifications
+        ]
+    settling_events = signal_state.drain_events() if signal_state is not None else ()
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -269,40 +260,36 @@ def run_planner_tick(
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
         release_without_safescale=safescale is None or safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK,
+        relay_high_donors=safescale_scope == SAFESCALE_SCOPE_HEALTHY_AND_SHRINK,
         defrag_enabled=_defrag_enabled(registry),
-        **_scaling_options(registry),
     )
     plan = build_plan(
         model_contexts=contexts,
-        classifications=classifications,
+        classifications=[item for item in classifications if item.model_name not in settling],
         model_replicas=replicas,
         idle_gpus=_idle_gpus(snapshot, registry, cluster_view),
         cfg=cfg,
         active_probe_models=active_probe_models or set(),
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
-        # F4 cooldown: only for models O1 does not track this tick (O1 off / suspended,
-        # no fleet view, stale-held context, hold fallback) - timer cleanup 2026-10-02.
-        cooldowns=_action_cooldowns(snapshot, queue, contexts) if action_cooldown else None,
-        # O1 evidence gate: the fleet view predates the model's last action. A view that
-        # stops refreshing keeps holding (conservative on missing data, review P3-6;
-        # cluster_view_task raises the cluster_view_stale alert).
-        view_pending=_o1_view_pending(queue, contexts, cluster_view),
+        # Correctness guard (TSS only, 2026-10-29): the fleet view predates the model's
+        # last routable-changing SM call - no new action of the model until a newer
+        # view shows it. A view that stops refreshing keeps holding (conservative on
+        # missing data, review P3-6; cluster_view_task raises the cluster_view_stale
+        # alert). No signal-lag hold: the window's lag is accepted.
+        view_pending=_view_pending(queue, cluster_view),
         # 2026-10-02: no floor-violation hold and no GPU wake cooldown any more - a
         # donor's SM floor_headroom bounds it, refusals are events (queue events below).
         # Timer cleanup (2026-10-02): rolled-back probes wait for new evidence (no 60 s backoff).
         probe_backoff_models=_probe_backoff_models(safescale, snapshot, contexts),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
-        # C1: earlier rescue targets the decision windows do not reflect yet.
-        rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
-        # H3 exempt basis (2026-10-26): scale-ups of any path the decision signal does
-        # not reflect yet - they hold the O1-exempt free-GPU step (same release rule).
-        unsettled_upscales=_unsettled_upscales(snapshot, queue, registry, contexts) if rescue_due else None,
+        # C1: earlier rescue targets the fleet view does not show yet (no double count).
+        rescue_bases=(
+            _with_probe_promises(_rescue_bases(snapshot, queue, cluster_view, contexts), safescale, contexts)
+            if rescue_due else None
+        ),
         # Review P2-1: relays the SM answered with nothing done on a still-current view.
         relay_holds=_relay_holds(queue),
-    )
-    saturation_steps = _note_saturation_steps(
-        plan.actions, classifications, contexts, snapshot, signal_state, cluster_view
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -326,6 +313,9 @@ def run_planner_tick(
     if callable(record_covered):
         for model, rescue in covered_targets.items():
             record_covered(model, rescue)
+    # sm-plans section 10: the controller names every pod it sleeps.
+    actions, naming_events = _name_shrink_pods(snapshot, actions, cluster_view)
+    safescale_events = tuple(safescale_events) + naming_events
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -334,10 +324,7 @@ def run_planner_tick(
     # *_clamped_by_floor, placement_substituted) - no timer follows any of them.
     queue_events = tuple(queue_events) + tuple(_drain_queue_events(queue))
     if actions:
-        before = _rescue_seqs(queue) if saturation_steps else {}
         queue.submit(actions)
-        if saturation_steps:
-            _link_saturation_steps(queue, signal_state, saturation_steps, before)
     if _prof_on:
         _submit_ns = time.perf_counter_ns() - _phase_t0
         _ru_u1, _ru_s1 = prof.rusage_ms()
@@ -363,7 +350,7 @@ def run_planner_tick(
         submitted=len(actions),
         actions=actions,
         events=(
-            paper_events + reserve_events + tuple(saturation_events) + tuple(plan.events)
+            paper_events + settling_events + reserve_events + tuple(plan.events)
             + safescale_events + queue_events
         ),
         model_contexts=contexts,
@@ -376,216 +363,19 @@ def _defrag_enabled(registry: Registry) -> bool:
     return bool(getattr(placement(), "defrag_enabled", False)) if callable(placement) else False
 
 
-def _scaling_options(registry: Registry) -> dict:
-    """Registry ``scaling:`` (C1) as PlanConfig keywords; a registry without the
-    section (tests, older loaders) keeps the PlanConfig defaults."""
-    scaling = getattr(registry, "scaling", None)
-    if not callable(scaling):
-        return {}
-    config = scaling()
-    return {
-        "rescue_max_step_ratio": float(config.rescue_max_step_ratio),
-        "rescue_max_step_pods": int(getattr(config, "rescue_max_step_pods", 0)),
-        "partial_window_max_step": int(getattr(config, "breakpoint_partial_max_step", 0) or 0)
-        if bool(getattr(config, "breakpoint_window", False))
-        else 0,
-        "partial_window_lowevidence_requests": int(getattr(config, "breakpoint_lowevidence_requests", 0) or 0),
-        "saturation_max_step_factor": float(getattr(config, "saturation_max_step_factor", 2.0) or 2.0),
-    }
-
-
-def _apply_saturation_rescue(
-    classifications: list,
-    contexts: dict[str, dict],
-    snapshot: MetricsSnapshot,
-    signal_state: SignalState | None,
-    cluster_view: ClusterView | None = None,
-    queue: PlannerQueue | None = None,
-) -> tuple[list, tuple[str, ...]]:
-    """Onset saturation rescue (design 20261002-saturation-onset-rescue): a model whose
-    TSS cannot decide yet (numerator zero / receiver gate not warm) and whose engines are
-    full on every window across ``saturation_confirm_ms`` becomes a CRITICAL
-    receiver (``saturation_rescue``). A warm TSS is never overridden. A step whose rescue
-    target the queue reports as ended without adding a replica is released at once."""
-    tracker = getattr(signal_state, "saturation", None)
-    if tracker is None or not tracker.config.enabled:
-        return classifications, ()
-    routable_by_model = _routable_pod_ids(cluster_view)
-    targets = getattr(queue, "rescue_targets", None)
-    failed_dispatch = (
-        {model: record.seq for model, record in targets().items() if getattr(record, "added_nothing", False)}
-        if callable(targets)
-        else {}
-    )
-    events: list[str] = []
-    out: list = []
-    for item in classifications:
-        model = item.model_name
-        ctx = contexts.get(model)
-        metrics = snapshot.models.get(model)
-        if ctx is None or metrics is None:
-            out.append(item)
-            continue
-        tokens = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
-        reason = eligibility_reason(ctx)
-        if not tokens and reason != REASON_SCRAPE_STALE_INFLIGHT:
-            reason = None
-        tss_warm = bool(
-            tokens and reason is None and "tss_defined" in ctx and ctx.get("signal_source", "zm") == "zm"
-        )
-        verdict = tracker.observe(
-            model,
-            window_end_ms=int(metrics.window_end_ms),
-            routable=int(ctx.get("routable_pods") or 0),
-            reason=reason,
-            sample=_context_sample(ctx),
-            tss_warm=tss_warm,
-            idle=bool(tokens and window_is_idle(metrics.prompt_tokens, metrics.generation_tokens)),
-            routable_ids=(
-                routable_by_model.get(model, frozenset()) if routable_by_model is not None else None
-            ),
-            failed_dispatch=failed_dispatch.get(model),
-            observed_ms=observed_of(metrics).t_last_ms,
-        )
-        events.extend(verdict.events)
-        sample = verdict.sample
-        ctx["saturation_held_ms"] = verdict.held_ms
-        ctx["saturation_reason"] = verdict.reason
-        ctx["saturation_awaiting_step"] = verdict.awaiting_step
-        ctx["saturation_count_after"] = verdict.count_after
-        if verdict.fire:
-            ctx["saturation_rescue"] = True
-            item = replace(
-                item, state=ModelState.CRITICAL, role=ModelRole.RECEIVER, donor_tier=None, saturation_rescue=True
-            )
-        elif verdict.full and sample is not None:
-            events.append(
-                f"saturation_pending:{model}:held_ms={verdict.held_ms}/{int(tracker.config.confirm_ms)}"
-                f":reason={verdict.reason}"
-                f":waiting={sample.waiting:.0f}:kv={'none' if sample.kv is None else f'{sample.kv:.2f}'}"
-            )
-        out.append(item)
-    return out, tuple(events)
-
-
-def _context_sample(ctx: dict) -> SaturationSample | None:
-    if ctx.get("saturation_sample_ms") is None:
-        return None
-    return SaturationSample(
-        waiting=float(ctx.get("saturation_waiting") or 0.0),
-        kv=ctx.get("saturation_kv"),
-        pods=int(ctx.get("saturation_pods") or 0),
-        sample_ms=int(ctx["saturation_sample_ms"]),
-        running=float(ctx.get("saturation_running") or 0.0),
-        per_pod=tuple(
-            PodSample(pod=str(item["pod"]), waiting=float(item["waiting"]), kv=item.get("kv"),
-                      running=float(item.get("running") or 0.0))
-            for item in ctx.get("saturation_pod_samples") or ()
-        ),
-    )
-
-
-def _note_saturation_steps(
-    actions,
-    classifications: list,
-    contexts: dict[str, dict],
-    snapshot: MetricsSnapshot,
-    signal_state: SignalState | None,
-    cluster_view: ClusterView | None = None,
-) -> set[str]:
-    """A planned saturation-rescue scale-up restarts the model's count: the next step
-    needs the condition again on windows after its routable count rose, and the pods it
-    added must be full. The pods before the step are the model's awake, not hidden
-    bindings of the fleet view (the sampled pods without one); the target is the step's
-    rescue target (the routable count plus its planned scale-ups without one). Returns
-    the models whose step was noted."""
-    tracker = getattr(signal_state, "saturation", None)
-    noted: set[str] = set()
-    if tracker is None:
-        return noted
-    ups = [action for action in actions if upscale_of(action) is not None]
-    up = {upscale_of(action)[0] for action in ups}
-    for item in classifications:
-        if not getattr(item, "saturation_rescue", False) or item.model_name not in up:
-            continue
-        metrics = snapshot.models.get(item.model_name)
-        if metrics is None:
-            continue
-        ctx = contexts.get(item.model_name) or {}
-        routable = int(ctx.get("routable_pods") or 0)
-        mine = [action for action in ups if upscale_of(action)[0] == item.model_name]
-        targets = [int(action.rescue.target) for action in mine if getattr(action, "rescue", None) is not None]
-        target = max(targets) if targets else routable + sum(upscale_of(action)[1] for action in mine)
-        if cluster_view is not None:
-            # The step's pods: the routable set the added pods are later taken from.
-            pods = sorted((_routable_pod_ids(cluster_view) or {}).get(item.model_name, ()))
-        else:
-            pods = [sample["pod"] for sample in ctx.get("saturation_pod_samples") or ()]
-        tracker.note_step(
-            item.model_name,
-            window_end_ms=int(metrics.window_end_ms),
-            routable=routable,
-            pods=pods,
-            target=target,
-        )
-        ctx["saturation_awaiting_step"] = True
-        noted.add(item.model_name)
-    return noted
-
-
-def _rescue_seqs(queue: PlannerQueue) -> dict[str, int]:
-    targets = getattr(queue, "rescue_targets", None)
-    return {model: int(getattr(record, "seq", 0)) for model, record in targets().items()} if callable(targets) else {}
-
-
-def _link_saturation_steps(
-    queue: PlannerQueue, signal_state: SignalState | None, models: set[str], before: dict[str, int]
-) -> None:
-    """Link each saturation step noted this tick to the rescue target its submit started
-    in the queue: the target's dispatch result releases the step's wait. A step whose
-    submit started no target (covered by a probe preemption, planned behind a probe) is
-    not linked: the tracker's time bound is its fallback."""
-    tracker = getattr(signal_state, "saturation", None)
-    if tracker is None:
-        return
-    for model, seq in _rescue_seqs(queue).items():
-        if model in models and seq > 0 and seq != before.get(model):
-            tracker.link_step(model, seq)
-
-
-def rescue_settle_ms(registry: Registry | None, model: str) -> float:
-    """C1 review P2-3, fallback only (Q2, 2026-10-06): how long after a rescue target
-    completed the decision window must start before it counts as reflected while O1
-    does NOT track the model (O1 off / suspended, no fleet view, stale-held context,
-    hold fallback) - ``scaling.rescue_settle_ema_k`` times the model's
-    ``trs.ema_tau_ms`` (the EMA'd Z lags the raw window by about its time constant).
-    While O1 tracks the model the extension is 0 for a target this process dispatched
-    (:func:`_rescue_bases`): the routable change is a breakpoint that restarts the EMA
-    and the O1 evidence gate holds the receiver until post-change evidence exists. 0 without a registry, a scaling section or
-    a tau (legacy fixed-alpha)."""
-    scaling = getattr(registry, "scaling", None)
-    if registry is None or not callable(scaling):
-        return 0.0
-    k = float(getattr(scaling(), "rescue_settle_ema_k", 0.0) or 0.0)
-    if k <= 0:
-        return 0.0
-    try:
-        tau = registry.model(model).trs.ema_tau_ms
-    except Exception:  # noqa: BLE001 - unknown model: no extension
-        return 0.0
-    return k * float(tau) if tau is not None and float(tau) > 0 else 0.0
-
-
 def _rescue_bases(
     snapshot: MetricsSnapshot,
     queue: PlannerQueue,
-    registry: Registry | None = None,
+    cluster_view: ClusterView | None = None,
     contexts: dict[str, dict] | None = None,
 ) -> dict[str, RescueBasis]:
-    """C1: per model, the last rescue target the queue issued whose effect the model's
-    decision signal does not fully reflect yet: still running, or the window starts
-    before it completed (the F4 rule) plus, only while O1 does not track the model,
-    ``rescue_settle_ms`` for the EMA (Q2: with O1 the evidence gate replaces it)."""
+    """C1 ledger: per model, the last rescue target the queue issued that the fleet view
+    of this tick does not show yet - still running, or completed after the SM state of
+    the view was produced (``state_ms``, else ``fetched_ms``). The planner counts its
+    replicas as covered, so one target is never planned twice. State only (TSS only,
+    2026-10-29): once the view shows the target, the model's next step follows its
+    signal - no wait for the metrics window or the EMA to reflect it. A view without a
+    time (synthetic / offline) shows every completed target."""
     targets = getattr(queue, "rescue_targets", None)
     if not callable(targets):
         return {}
@@ -597,86 +387,45 @@ def _rescue_bases(
             for model, ctx in contexts.items()
             if ctx.get("routable_pods") is not None
         })
+    bound = _view_bound(cluster_view)
     bases: dict[str, RescueBasis] = {}
     for model, record in targets().items():
-        metrics = snapshot.models.get(model)
-        if metrics is None:
+        if snapshot.models.get(model) is None:
             continue
-        context = (contexts or {}).get(model)
-        # Q2: no EMA-lag extension while O1 tracks the model and done_ms is an observed
-        # completion (a target this process dispatched: seq > 0). A restored target (done
-        # stamped at the restart, the SM may still be waking - review P2-a) or one covered
-        # by a probe preemption (its unhide still to come) keeps the fallback.
-        observed = int(getattr(record, "seq", 0) or 0) > 0
-        if record.done_ms is not None and _scale_up_reflected(
-            metrics, context, int(record.done_ms), observed=observed, registry=registry, model=model
-        ):
-            continue
+        done = record.done_ms
+        if done is not None and (bound is None or int(done) <= bound):
+            continue  # the fleet view shows it
         bases[model] = RescueBasis(base=int(record.base), covered=int(record.covered))
     return bases
 
 
-def _scale_up_reflected(
-    metrics, context: dict | None, done_ms: int, *, observed: bool, registry: Registry | None, model: str
-) -> bool:
-    """C1 / H3 settle rule of a completed scale-up: the decision window starts after it
-    (plus ``rescue_settle_ms`` unless O1 tracks the model and this process observed the
-    completion), or O1 decided on evidence gathered after its breakpoint."""
-    settle_ms = 0.0 if observed and _o1_tracks(context) else rescue_settle_ms(registry, model)
-    if metrics.window_start_ms >= done_ms + settle_ms:
-        return True  # settled: the signal describes the new replica count
-    return _o1_settled(context, done_ms)  # O1: evidence gathered after the breakpoint
+def _view_bound(cluster_view: ClusterView | None) -> int | None:
+    """When the SM state of ``cluster_view`` was produced at the latest (a lower bound:
+    ``state_ms``, else ``fetched_ms``); None for a synthetic view."""
+    bound = getattr(cluster_view, "state_ms", None)
+    if bound is None:
+        bound = getattr(cluster_view, "fetched_ms", None)
+    return int(bound) if bound is not None else None
 
 
-def _unsettled_upscales(
-    snapshot: MetricsSnapshot,
-    queue: PlannerQueue,
-    registry: Registry | None = None,
-    contexts: dict[str, dict] | None = None,
-) -> dict[str, int]:
-    """H3 exempt basis (2026-10-26): model -> when its last scale-up (any path: rescue,
-    LOW rescue / fairness, relay receiver, SafeScale receiver target -
-    ``ActionQueue.last_upscales``) returned, while the model's decision signal does not
-    reflect it yet (:func:`_scale_up_reflected`, the rescue-basis rule). The planner
-    holds an O1-exempt CRITICAL receiver on it: one stale window buys one wake, whichever
-    path made the earlier one. Only the exempt path reads it - C1's base / covered stay
-    the rescue targets'. For that consumer the ``_o1_settled`` branch never fires (an
-    exempt receiver is not warm): the record releases by the window rule (window start
-    >= done + settle), or the model leaves the exempt path by warming. A later breakpoint
-    of another cause (traffic onset, a scale-down) that keeps the model exempt after the
-    window rule released the record reopens the exempt step - its own stale window."""
-    read = getattr(queue, "last_upscales", None)
-    if not callable(read):
-        return {}
-    pending: dict[str, int] = {}
-    for model, (done_ms, observed) in read().items():
-        metrics = snapshot.models.get(model)
-        if metrics is None:
-            continue
-        if not _scale_up_reflected(
-            metrics, (contexts or {}).get(model), int(done_ms), observed=bool(observed), registry=registry,
-            model=model,
-        ):
-            pending[model] = int(done_ms)
-    return pending
-
-
-def _o1_settled(context: dict | None, done_ms: int) -> bool:
-    """O1 (C1 settle): the routable-count change of a completed rescue target is a
-    breakpoint; once the model's signal is warm on a window starting at or after it,
-    that signal describes the new replica count with a freshly restarted EMA - the
-    ``rescue_settle_ema_k`` extension (EMA lag) is not needed. The breakpoint carries
-    the target's ``done_ms`` (or a later observation time), never an earlier one, so
-    ``breakpoint >= done_ms`` means the change of this target (or a later one) was seen.
-    Only breakpoints this process saw happen count (``signal_settle_ms``: the onset, or a
-    count change between two views - never the first observation after a restart, whose
-    date is a guess, review P2-a).
-    A target that changed nothing (every part failed) never moves the breakpoint and
-    settles by the window-start rule above."""
-    if not context or "signal_settle_ms" not in context:
-        return False
-    point = context.get("signal_settle_ms")
-    return point is not None and int(point) >= done_ms and bool(context.get("signal_warm"))
+def _with_probe_promises(
+    bases: dict[str, RescueBasis], safescale: SafeScaleController | None, contexts: dict[str, dict] | None
+) -> dict[str, RescueBasis]:
+    """Review P2-3: a receiver an unresolved SafeScale probe promises replicas to (its
+    commit wakes them: ``pending_upscales``) holds that target like a queued rescue
+    target - the step is planned, so the next calls add nothing until the probe
+    resolves (state, not time; after a commit the rescue target rules take over)."""
+    out = dict(bases)
+    for probe in _unresolved_probes(safescale):
+        for model, count in (getattr(probe, "pending_upscales", None) or {}).items():
+            if int(count) <= 0:
+                continue
+            basis = out.get(model)
+            if basis is None:
+                routable = int(((contexts or {}).get(model) or {}).get("routable_pods") or 0)
+                basis = RescueBasis(base=routable, covered=routable)
+            out[model] = RescueBasis(base=basis.base, covered=basis.covered + int(count))
+    return out
 
 
 def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
@@ -737,57 +486,29 @@ def _drain_queue_events(queue: PlannerQueue) -> list[str]:
     return list(drain()) if callable(drain) else []
 
 
-def _o1_tracks(context: dict | None) -> bool:
-    """Timer cleanup (2026-10-02): O1 covers this model's last action - O1 is active,
-    the model's routable count came from this tick's fleet view and its signal was
-    computed this tick (not a stale-held context, not a hold fallback)."""
-    return bool(context) and context.get("o1_routable_tracked") is True
+def _note_pod_sets(
+    signal_state: SignalState, snapshot: MetricsSnapshot, queue: PlannerQueue, cluster_view: ClusterView
+) -> None:
+    """TSS suffix (2026-10-29): hand the fleet view's pod set of every model (awake and
+    not hidden: :func:`_routable_pod_ids`) to :meth:`SignalState.note_pod_sets`, with the
+    view's time and the ``done_ms`` of each model's last routable-changing SM call of
+    ours (``ActionQueue.view_changes`` / ``last_actions``, the later one - the same
+    sources as the view-pending guard)."""
+    signal_state.note_snapshot(snapshot)
+    routable = _routable_pod_ids(cluster_view) or {}
+    # Only the models the view lists (review P2: a partial / empty SM view is no change).
+    models = {binding.model for binding in cluster_view.bindings}
+    windows = [int(m.window_end_ms) - int(m.window_start_ms) for m in snapshot.models.values()]
+    signal_state.note_pod_sets(
+        {model: routable.get(model, frozenset()) for model in models},
+        view_ms=_view_bound(cluster_view),
+        done_ms={model: done for model, (done, _direction) in _last_changes(queue).items()},
+        window_ms=max(windows) if windows else None,
+    )
 
 
-def _action_cooldowns(
-    snapshot: MetricsSnapshot, queue: PlannerQueue, contexts: dict[str, dict] | None = None
-) -> dict[str, str]:
-    """Review F4 (fallback since the timer cleanup 2026-10-02): models whose decision
-    window starts before their last executed action completed (the window does not yet
-    fully reflect it) -> direction of that action.
-
-    Only for models O1 does not track this tick (:func:`_o1_tracks`): with O1 active the
-    routable-count change of the action is a breakpoint, and the model takes part in no
-    scale-down until a whole window follows it and is a receiver only on
-    ``min_evidence_ms`` of post-change evidence - the window-start rule would
-    only add a fixed wait on top. While O1 is off or suspended (gateway clock check),
-    without a fleet view of the model or on a stale-held context this rule still holds."""
-    last_actions = getattr(queue, "last_actions", None)
-    if last_actions is None:
-        return {}
-    cooldowns: dict[str, str] = {}
-    for model, (done_ms, direction) in last_actions().items():
-        if _o1_tracks((contexts or {}).get(model)):
-            continue
-        metrics = snapshot.models.get(model)
-        if metrics is not None and metrics.window_start_ms < done_ms:
-            cooldowns[model] = direction
-    return cooldowns
-
-
-def _o1_view_pending(
-    queue: PlannerQueue, contexts: dict[str, dict] | None, cluster_view: ClusterView | None
-) -> dict[str, str]:
-    """O1 evidence gate (timer cleanup 2026-10-02): models O1 tracks whose last
-    routable-changing SM call returned after the SM state of this tick's fleet view was
-    produced -> hold direction. That view cannot show the change yet, so no breakpoint
-    holds the model; it is held (F4 direction rules) until a newer view exists.
-
-    Sources (review P2-1): ``ActionQueue.view_changes`` - every routable-changing call,
-    failed / partial ones and probe unhides included (an unhide holds like "down") -
-    and ``last_actions``; the later one per model decides. The view's time is its lower
-    bound ``state_ms`` (review P2-2; ``fetched_ms`` for a view without one). A view
-    without either (synthetic / offline) holds nothing."""
-    bound = getattr(cluster_view, "state_ms", None)
-    if bound is None:
-        bound = getattr(cluster_view, "fetched_ms", None)
-    if bound is None:
-        return {}
+def _last_changes(queue: PlannerQueue) -> dict[str, tuple[int, str]]:
+    """model -> (done_ms, direction) of its last routable-changing SM call of ours."""
     latest: dict[str, tuple[int, str]] = {}
     for source in ("view_changes", "last_actions"):
         read = getattr(queue, source, None)
@@ -797,11 +518,25 @@ def _o1_view_pending(
             current = latest.get(model)
             if current is None or int(done_ms) > current[0]:
                 latest[model] = (int(done_ms), str(direction))
-    pending: dict[str, str] = {}
-    for model, (done_ms, direction) in latest.items():
-        if _o1_tracks((contexts or {}).get(model)) and done_ms > int(bound):
-            pending[model] = direction
-    return pending
+    return latest
+
+
+def _view_pending(queue: PlannerQueue, cluster_view: ClusterView | None) -> dict[str, str]:
+    """Correctness guard (timer cleanup 2026-10-02; every model since 2026-10-29): models
+    whose last routable-changing SM call returned after the SM state of this tick's fleet
+    view was produced -> that call's direction. The view cannot show the change yet, so
+    the model takes no new action until a newer view exists (F2: every such call asks
+    for a refresh).
+
+    Sources (review P2-1): ``ActionQueue.view_changes`` - every routable-changing call,
+    failed / partial ones and probe unhides included - and ``last_actions``; the later
+    one per model decides. The view's time is its lower bound ``state_ms`` (review
+    P2-2; ``fetched_ms`` for a view without one). A view without either (synthetic /
+    offline) holds nothing."""
+    bound = _view_bound(cluster_view)
+    if bound is None:
+        return {}
+    return {model: direction for model, (done_ms, direction) in _last_changes(queue).items() if done_ms > bound}
 
 
 def _apply_safescale(
@@ -823,6 +558,13 @@ def _apply_safescale(
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
         return _release_without_safescale(actions)
+    # L4 rev 2: a TP block without a probe (IDLE donors; a scope that releases at once)
+    # is one plan now; a block with a probe stays one until its probe starts.
+    actions = tuple(
+        _release_without_safescale((action,))[0][0]
+        if isinstance(action, BlockSupplyAction) and action.probe is None else action
+        for action in actions
+    )
     if safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK:
         # TRE_SAFESCALE_SCOPE=receiverless_shrink (2026-10-26): only a receiver-less
         # shrink stays a probe; any other probe placement is released at once.
@@ -838,13 +580,30 @@ def _apply_safescale(
     # back are deducted across all of the model's scale-up parts, in plan order.
     up_totals: dict[str, int] = {}
     for action in actions:
-        up = upscale_of(action)
-        if up is not None:
-            up_totals[up[0]] = up_totals.get(up[0], 0) + up[1]
+        for model, delta in receiver_upscales(action):
+            up_totals[model] = up_totals.get(model, 0) + delta
     restore_left: dict[str, int] = {}
     restore_used: dict[str, int] = {}
     survived: set[str] = set()
     rescue_of: dict[str, object] = {}
+
+    def preempt_once(model: str) -> None:
+        if model in restore_left:
+            return
+        preempt = getattr(safescale, "request_preemption", None)
+        restored = preempt(model, reason="receiver_need_upscale") if callable(preempt) else 0
+        restored = max(0, int(restored or 0))
+        restore_left[model] = restored
+        restore_used[model] = min(restored, up_totals.get(model, 0))
+        if restored > 0:
+            # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale),
+            # then up_needed = delta - probe_hidden. The rollback (unhide) is issued
+            # by the safescale loop's next observation, one-shot and observe-mode safe.
+            events.append(
+                f"safescale_probe_preempted:{model}:restored={restored}"
+                f":up_needed={max(0, up_totals.get(model, 0) - restored)}"
+            )
+
     for action in actions:
         if observe_mode:
             # B8: never start (or preempt) a probe while paused. The planned
@@ -855,45 +614,33 @@ def _apply_safescale(
             else:
                 converted.append(action)
             continue
+        if isinstance(action, (PlanBatch, BlockSupplyAction)):
+            # Review P2-2: a TP block wakes its receiver too (one plan, or the probe's
+            # commit): the receiver's own probe is preempted like for any scale-up;
+            # restored pods covering it make the release pointless.
+            ups = receiver_upscales(action)
+            if len(ups) == 1:
+                model, delta = ups[0]
+                preempt_once(model)
+                rescue = _rescue_of(action)
+                if rescue is not None and restore_used.get(model, 0) > 0:
+                    rescue_of[model] = replace(rescue, covered=rescue.covered + restore_used[model])
+                if restore_left[model] >= delta:
+                    restore_left[model] -= delta
+                    events.append(f"block_supply_covered_by_preemption:{model}")
+                    continue
+                survived.add(model)
+            if isinstance(action, PlanBatch):
+                converted.append(action)
+                continue
         if upscale_of(action) is not None:
             model, delta = upscale_of(action)
-            if model not in restore_left:
-                preempt = getattr(safescale, "request_preemption", None)
-                restored = preempt(model, reason="receiver_need_upscale") if callable(preempt) else 0
-                restored = max(0, int(restored or 0))
-                restore_left[model] = restored
-                restore_used[model] = min(restored, up_totals.get(model, 0))
-                if restored > 0:
-                    # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale),
-                    # then up_needed = delta - probe_hidden. The rollback (unhide) is issued
-                    # by the safescale loop's next observation, one-shot and observe-mode safe.
-                    events.append(
-                        f"safescale_probe_preempted:{model}:restored={restored}"
-                        f":up_needed={max(0, up_totals.get(model, 0) - restored)}"
-                    )
+            preempt_once(model)
             rescue = getattr(action, "rescue", None)
             if rescue is not None and restore_used.get(model, 0) > 0:
                 # C1: the restored pods count toward the target already.
                 rescue = replace(rescue, covered=rescue.covered + restore_used[model])
                 rescue_of[model] = rescue
-            if isinstance(action, TransferIntent):
-                # Covered entirely by restored pods: dropped. Partly covered (review P3,
-                # 2026-10-06): shrunk by the covered receiver pairs when every pair takes
-                # the same number of donors (count = pairs x donors per pair, the SM's
-                # donor count); otherwise kept whole.
-                left = restore_left[model]
-                if left >= delta:
-                    restore_left[model] -= delta
-                    continue
-                per_pair, uneven = divmod(int(action.count), int(action.pairs))
-                if left > 0 and not uneven:
-                    restore_left[model] = 0
-                    action = replace(action, pairs=delta - left, count=(delta - left) * per_pair)
-                if rescue is not getattr(action, "rescue", None):
-                    action = replace(action, rescue=rescue)
-                survived.add(model)
-                converted.append(action)
-                continue
             take = min(restore_left[model], action.delta)
             if take > 0:
                 restore_left[model] -= take
@@ -922,6 +669,9 @@ def _apply_safescale(
             events.append(f"safescale_probe_skipped:{_safescale_probe_model(action)}:{probe_block_reason}")
             continue
 
+        if isinstance(action, BlockSupplyAction):
+            converted.extend(_start_block_probes(snapshot, action, safescale, contexts, cluster_view, events))
+            continue
         probe_model = _safescale_probe_model(action)
         pods = _safescale_probe_pods(snapshot, action, cluster_view)
         decision = safescale.start_probe(
@@ -945,6 +695,69 @@ def _apply_safescale(
     return tuple(converted), tuple(events)
 
 
+def _start_block_probes(
+    snapshot: MetricsSnapshot,
+    action: BlockSupplyAction,
+    safescale: SafeScaleController,
+    contexts: dict[str, dict] | None,
+    cluster_view: ClusterView | None,
+    events: list[str],
+) -> tuple[Action, ...]:
+    """The probe(s) of a TP block (L4 rev 2; 2026-10-29, design 20261029-tss-suffix
+    rules 5-6). The leader probe (``action.probe``) carries the receiver's promise and the
+    block's immediate pods (``companions``: IDLE / HIGH pods that sleep at its commit, not
+    now, so a rollback wastes none of them). A joint block (``joint_probe``: a second
+    probed donor of another model) starts both per-model probes under one block id - the
+    member first; when one cannot start, none runs. Returns their hide actions."""
+    block_id = None
+    if action.joint_probe is not None:
+        block_id = f"block:{action.receiver}:{action.receiver_pods[0] if action.receiver_pods else action.block}" \
+            f"@{int(snapshot.ts_ms)}"
+    starts = []
+    if action.joint_probe is not None:
+        starts.append((action.joint_probe, {}, ()))
+    starts.append((action.probe, {action.receiver: 1}, tuple(action.sleeps)))
+    out: list[Action] = []
+    started: list[tuple[str, str]] = []
+    for (model, pod), pending, companions in starts:
+        kwargs = {"companions": companions} if companions else {}
+        if block_id is not None:
+            kwargs["block_id"] = block_id
+        decision = safescale.start_probe(
+            model=model,
+            pods=(pod,),
+            now_ms=snapshot.ts_ms,
+            pending_upscales=pending,
+            window_inputs=probe_window_inputs(snapshot, model, contexts, cluster_view),
+            **kwargs,
+        )
+        if decision.status == "none":
+            events.append(f"safescale_probe_skipped:{model}:{decision.reason}")
+            for other, other_pod in started:
+                # A joint block runs whole or not at all: the partner never hid (its
+                # hide is not submitted) - dropped at once, no rollback-evidence hold.
+                safescale.discard_probe(other, reason="block_partner_not_started", now_ms=snapshot.ts_ms)
+            return ()
+        events.append(f"safescale_{decision.reason}:{model}")
+        if decision.reason == "probe_started" and getattr(decision, "details", None):
+            events.append(format_window_event(model, decision.details))
+        started.append((model, pod))
+        out.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
+    if block_id is not None:
+        events.append(f"safescale_block_probe_started:{action.receiver}:{block_id}")
+    return tuple(out)
+
+
+def _rescue_of(action: Action) -> object | None:
+    """The rescue target a TP block's receiver wake carries (PlanBatch member or
+    BlockSupplyAction), or None."""
+    for member in (action.members if isinstance(action, PlanBatch) else (action,)):
+        rescue = getattr(member, "rescue", None)
+        if rescue is not None and (isinstance(member, BlockSupplyAction) or upscale_of(member) is not None):
+            return rescue
+    return None
+
+
 def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     """Without SafeScale the probe shrinks the planner still emits take the immediate
     donor path (sleep path ``urgent``, reason suffix ``_nosafescale``); a middle-zone /
@@ -953,20 +766,25 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
 
     * a receiver-less shrink (HIGH proactive) -> a model-level urgent scale-down (the
       SM keeps the replica floor);
-    * a TP same-slot preemption -> only the urgent sleep of exactly that donor pod; the
-      next tick wakes the receiver on the freed slot through the planner's normal
-      free-capacity path (C1 target, O1 evidence gate)."""
+    * a transfer (:class:`BlockSupplyAction`: a TP block, a TP1 relay pair) -> ONE
+      plan group (:class:`PlanBatch`, design 20261028-single-loop L4 rev 2,
+      20261027-sm-plans section 10): the urgent sleeps of exactly the donor pods (its
+      probe pod too) and the receiver's NAMED wake of its binding on the block (it keeps
+      its rescue target). The SM selects the group atomically and wakes the receiver
+      once every donor slept; no other receiver can take the block between."""
     out: list[Action] = []
     for action in actions:
         if not _requires_safescale_probe(action):
             out.append(action)
             continue
         reason = f"{action.reason}{NO_SAFESCALE_REASON_SUFFIX}"
-        if isinstance(action, ShrinkForSlotAction):
-            out.append(ScaleAction(
-                action.donor, -1, reason, action.source_loop, donor=action.donor,
-                pods=(action.serve_id,), sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-            ))
+        if isinstance(action, BlockSupplyAction):
+            if action.probe is None:
+                reason = action.reason  # the planner named it (IDLE: no suffix)
+            else:
+                probes = tuple(item for item in (action.probe, action.joint_probe) if item is not None)
+                action = replace(action, sleeps=(*action.sleeps, *probes), probe=None, joint_probe=None)
+            out.append(transfer_plan(action, reason))
         else:
             out.append(replace(
                 action, reason=reason, requires_safescale=False, sleep_path=IMMEDIATE_DONOR_SLEEP_PATH
@@ -1024,15 +842,15 @@ def _weighted_mean(metrics: ModelWindowMetrics, which: str) -> float | None:
 
 
 def _requires_safescale_probe(action: Action) -> bool:
-    return (isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0) or isinstance(
-        action, ShrinkForSlotAction
-    )
+    if isinstance(action, BlockSupplyAction):
+        return True  # a probe, or (no probe) released at once by policy
+    return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0
 
 
 def _receiverless_shrink(action: Action) -> bool:
     """A probe shrink with no receiver: the planner pairs a donor with a recipient only
-    on ``ScaleAction.receiver`` (``planner._plan_middle_zone_probe``) and on a same-slot
-    preemption's ``ShrinkForSlotAction.beneficiary``; the HIGH proactive shrink
+    on ``ScaleAction.receiver`` (``planner._plan_middle_zone_probe``) and on a TP
+    block's ``BlockSupplyAction.receiver``; the HIGH proactive shrink
     (``high_proactive_safescale``) carries neither."""
     return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0 and (
         action.receiver is None
@@ -1040,8 +858,8 @@ def _receiverless_shrink(action: Action) -> bool:
 
 
 def _safescale_probe_model(action: Action) -> str:
-    if isinstance(action, ShrinkForSlotAction):
-        return action.donor
+    if isinstance(action, BlockSupplyAction):
+        return action.probe[0] if action.probe is not None else action.receiver
     return action.model
 
 
@@ -1050,8 +868,6 @@ def _safescale_probe_pods(
     action: Action,
     cluster_view: ClusterView | None = None,
 ) -> tuple[str, ...]:
-    if isinstance(action, ShrinkForSlotAction):
-        return (action.serve_id,)
     if isinstance(action, ScaleAction) and action.pods:
         return tuple(action.pods)
     return _pods_to_probe(snapshot, action.model, abs(action.delta), cluster_view=cluster_view)
@@ -1061,9 +877,42 @@ def _safescale_pending_upscales(
     action: Action,
     probe_upscale_plans: dict[str, dict[str, int]],
 ) -> dict[str, int]:
-    if isinstance(action, ShrinkForSlotAction):
-        return {action.beneficiary: 1}
     return probe_upscale_plans.get(action.model, {})
+
+
+def _name_shrink_pods(
+    snapshot: MetricsSnapshot, actions: tuple[Action, ...], cluster_view: ClusterView | None
+) -> tuple[tuple[Action, ...], tuple[str, ...]]:
+    """sm-plans section 10 (2026-10-28): one decider per choice - the controller names
+    every pod it sleeps, the SM validates and executes. An immediate model-level shrink
+    the planner left unnamed (IDLE proactive, a receiver-less shrink released without
+    SafeScale) names its pods here by the shared release order (:func:`_pods_to_probe`,
+    the SM's ``shrink_order``), skipping pods another action of this tick names. Fewer
+    pods than asked: the shrink is that many; none: it is dropped
+    (``shrink_unnamed:<model>``). SafeScale probes are named when they hide."""
+    named = {
+        pod
+        for action in actions
+        for member in (action.members if isinstance(action, PlanBatch) else (action,))
+        for pod in (getattr(member, "pods", ()) or ())
+    }
+    out: list[Action] = []
+    events: list[str] = []
+    for action in actions:
+        if not (
+            isinstance(action, ScaleAction) and action.delta < 0 and not action.pods
+            and not action.requires_safescale
+        ):
+            out.append(action)
+            continue
+        candidates = _pods_to_probe(snapshot, action.model, 10**6, cluster_view=cluster_view)
+        pods = tuple(pod for pod in candidates if pod not in named)[: abs(action.delta)]
+        if not pods:
+            events.append(f"shrink_unnamed:{action.model}")
+            continue
+        named |= set(pods)
+        out.append(replace(action, delta=-len(pods), pods=pods))
+    return tuple(out), tuple(events)
 
 
 def _pods_to_probe(
@@ -1137,39 +986,13 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
 class ModelSignal:
     """One model's decision signal of one window (planner tick and SafeScale observation
     share it, so both read the same Z and advance the shared EMA identically).
-
-    ``window`` is the O1 effective window (None without O1); ``metrics`` the window the
-    signal was computed on (the full serving window or its post-breakpoint suffix);
-    ``warm`` the receiver gate (O1 evidence and/or the ADR-0013 onset guard)."""
+    ``settling``: why the model's post-change suffix is not decision-valid yet (Z is
+    then unknown; :class:`tre_controller.signals.trs.SuffixWindow`), None = it decides."""
 
     result: object
     signal: object
     metrics: ModelWindowMetrics
-    warm: bool
-    window: object | None = None
-    #: O1 review P2-2: the model's windows have been held for ``hold_max_ms`` of
-    #: observation time (the held span, ms) - a receiver decides on the whole window
-    #: (donors still need a clean one). 0 = no fallback.
-    hold_fallback: int = 0
-
-
-def breakpoint_observation(
-    cluster_view: ClusterView | None, queue: object | None, model: str, fallback_ms: int
-) -> tuple[int, tuple[int | None, ...]]:
-    """(observed_ms, done hints) for :meth:`SignalState.note_routable`: the fleet view's
-    fetch time (``fallback_ms`` for a view without one - synthetic / test views) and the
-    time the controller's last SM call that can change ``model``'s routable count
-    returned (``ActionQueue.routable_changes``: scale / wake / sleep / hide / unhide,
-    stamped after the answer, ok or not). Never a rescue target's ``done_ms``: a target
-    covered by a probe preemption is stamped when planned, before its unhide ran."""
-    observed = getattr(cluster_view, "fetched_ms", None)
-    hints: list = []
-    changes = getattr(queue, "routable_changes", None)
-    if callable(changes):
-        stamp = changes().get(model)
-        if stamp is not None:
-            hints.append(tuple(stamp) if isinstance(stamp, (tuple, list)) else int(stamp))
-    return (int(observed) if observed is not None else int(fallback_ms)), tuple(hints)
+    settling: str | None = None
 
 
 def compute_model_signal(
@@ -1179,124 +1002,53 @@ def compute_model_signal(
     *,
     signal_source: str,
     signal_state: SignalState | None,
-    routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
-    observe_onset: bool = True,
     routable_pod_ids: frozenset[str] | None = None,
 ) -> ModelSignal:
-    """TSS / Z of ``metrics`` (a serving window) with the O1 breakpoint window.
-
-    Without O1 (no ``signal_state`` or its ``breakpoint`` None) this is the pre-O1
-    computation: the full window, EMA advanced, ``warm`` = the onset guard.
-
-    With O1: the onset is recorded and the routable count noted (``routable_observation``
-    = (observed_ms, done hints), None when no fleet view knows the model), then the
-    effective window decides: a full window is computed exactly as before; a warm
-    suffix is computed with its numerator scaled to a whole window
-    (``numerator_scale = W / span``), its own queue average and the EMA restarted at
-    the breakpoint; a window without enough post-breakpoint evidence reports the full
-    window's raw value and leaves every EMA untouched (it decides nothing)."""
-    o1 = signal_state is not None and getattr(signal_state, "breakpoint", None) is not None
-    legacy_warm = True
-    if signal_state is not None and observe_onset:
-        # F-onset warmup guard (ADR-0013): see SignalState.observe_traffic. Called before
-        # the TSS so the onset is known to O1; on an idle window it resets the EMAs the
-        # TSS update would reset anyway (same state either order).
-        legacy_warm = signal_state.observe_traffic(
-            model_name,
-            has_traffic=not window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
-            window_start_ms=metrics.window_start_ms,
-            window_end_ms=metrics.window_end_ms,
+    """TSS / Z of ``metrics`` (a serving window: awake, not hidden pods) plus the model's
+    shared EMA. TSS suffix (2026-10-29, design docs/design/20261029-tss-suffix.md): after a
+    change of the model's pod set inside the window, Z is computed on the samples since
+    the change only (:meth:`SignalState.suffix_window`; tokens scaled to a whole window,
+    queue = the suffix's own mean); until that suffix spans ``settle_ms`` the model is
+    settling - Z unknown, the EMA untouched (it restarted at the change and seeds on the
+    first decision-valid suffix). An idle window (nothing in flight), or a zero-token
+    window whose zero may be missing data (:func:`zero_tokens_unconfirmed`), clears the
+    model's EMAs (:meth:`SignalState.reset_ema`)."""
+    window = (
+        signal_state.suffix_window(model_name, metrics, routable_pod_ids)
+        if signal_state is not None else SuffixWindow(metrics)
+    )
+    used = window.metrics
+    if window.settling is not None and (used.prompt_tokens is None or used.generation_tokens is None):
+        used, window = metrics, replace(window, metrics=metrics, scale=1.0)
+    inp = TRSInput.from_metrics(used, spec.trs)
+    if window.scale != 1.0:
+        whole = float(metrics.window_end_ms - metrics.window_start_ms)
+        inp = replace(
+            inp,
+            prompt_tokens_total=inp.prompt_tokens_total * window.scale,
+            generation_tokens_total=inp.generation_tokens_total * window.scale,
+            window_ms=whole,
         )
+    if window.settling is not None:
+        # Settling: the raw values for the record, no EMA step, Z unknown (never 0).
+        result = TRSComputer(ema_tau_ms=0.0).compute(inp, theta_m=spec.trs.theta_m)
+        result = replace(result, TRS=0.0, Z_m=None, eta_m=None)
+        signal = SignalValue(source=signal_source, raw_value=None, z_m=None, unavailable_reason="settling")
+        return ModelSignal(result=result, signal=signal, metrics=used, settling=window.settling)
     if signal_state is not None:
+        if window_is_idle(used.avg_running, used.avg_waiting) or zero_tokens_unconfirmed(used):
+            signal_state.reset_ema(model_name)
         computer = signal_state.computer_for(
             model_name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
         )
     else:
         computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-    if not o1:
-        result = computer.compute(
-            TRSInput.from_metrics(metrics, spec.trs),
-            theta_m=spec.trs.theta_m,
-            window_end_ms=metrics.window_end_ms,
-        )
-        signal = get_signal(
-            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
-            routable_pod_ids=routable_pod_ids,
-        )
-        return ModelSignal(result=result, signal=signal, metrics=metrics, warm=legacy_warm)
-
-    if routable_observation is not None:
-        observed_ms, hints = routable_observation
-        signal_state.note_routable(
-            model_name, int(metrics.routable_pods), observed_ms=observed_ms, done_hints=hints
-        )
-    window = signal_state.effective_window(model_name, metrics)
-    guard_warm = legacy_warm if signal_state.onset_guard_applies() else True
-    # Review P2-2: how long the windows have been held (a full or warm window resets it),
-    # on the window's newest observation (round 4).
-    t_obs = observed_of(metrics).t_last_ms
-    held = signal_state.note_hold(
-        model_name, int(t_obs if t_obs is not None else metrics.window_end_ms), not window.warm
-    )
-    if window.full:
-        result = computer.compute(
-            TRSInput.from_metrics(metrics, spec.trs),
-            theta_m=spec.trs.theta_m,
-            window_end_ms=metrics.window_end_ms,
-        )
-        signal = get_signal(
-            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
-            routable_pod_ids=routable_pod_ids,
-        )
-        return ModelSignal(result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window)
-    if not window.warm and held > 0:
-        # Review P2-2: the routable count keeps changing (crash loop, probes): after
-        # ``hold_max_ms`` of held windows a receiver decides on the whole window as
-        # before O1 (EMA advanced); donors keep waiting for a clean one (window.full).
-        result = computer.compute(
-            TRSInput.from_metrics(metrics, spec.trs),
-            theta_m=spec.trs.theta_m,
-            window_end_ms=metrics.window_end_ms,
-        )
-        signal = get_signal(
-            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
-            routable_pod_ids=routable_pod_ids,
-        )
-        return ModelSignal(
-            result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window, hold_fallback=held
-        )
-    if not window.warm:
-        # No decision on this window: the full window's raw value for the record only.
-        result = computer.compute(
-            TRSInput.from_metrics(metrics, spec.trs),
-            theta_m=spec.trs.theta_m,
-            window_end_ms=metrics.window_end_ms,
-            advance_ema=False,
-        )
-        signal = get_signal(
-            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=None,
-            routable_pod_ids=routable_pod_ids,
-        )
-        return ModelSignal(result=result, signal=signal, metrics=metrics, warm=False, window=window)
-    suffix = window.metrics
-    inp = TRSInput.from_metrics(suffix, spec.trs)
-    scale = window.numerator_scale
-    inp = replace(
-        inp,
-        prompt_tokens_total=inp.prompt_tokens_total * scale,
-        generation_tokens_total=inp.generation_tokens_total * scale,
-        # The EMA's idle-gap rule keeps the configured metrics window.
-        window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
-    )
-    result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=suffix.window_end_ms)
-    # Review M2 (2026-10-28): the alt EMA's idle-gap rule keeps the configured metrics
-    # window too (the suffix span reset it to the raw suffix value on every tick).
+    result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=used.window_end_ms)
     signal = get_signal(
-        suffix, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+        used, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
         routable_pod_ids=routable_pod_ids,
-        ema_window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
     )
-    return ModelSignal(result=result, signal=signal, metrics=suffix, warm=guard_warm, window=window)
+    return ModelSignal(result=result, signal=signal, metrics=used)
 
 
 def _model_contexts(
@@ -1307,13 +1059,9 @@ def _model_contexts(
     cluster_view: ClusterView | None = None,
     paper_state_cache: PaperStateCache | None = None,
     signal_state: SignalState | None = None,
-    queue: object | None = None,
 ) -> tuple[dict[str, dict], tuple[str, ...]]:
     contexts: dict[str, dict] = {}
     events: list[str] = []
-    suspended = getattr(signal_state, "breakpoint_window_suspended", None)
-    if suspended:
-        events.append(f"breakpoint_window_suspended:{suspended}")
     routable_error = getattr(cluster_view, "routable_error", None)
     if cluster_view is not None and routable_error:
         # The SM did not report its routable view (older SM, or it could not read the
@@ -1321,10 +1069,7 @@ def _model_contexts(
         events.append(f"sm_routable_fallback:{routable_error}")
     cluster_counts = _cluster_view_counts(cluster_view)
     awake_counts = _awake_including_hidden(cluster_view)
-    hidden_pods = _hidden_pods(cluster_view)
     routable_by_model = _routable_pod_ids(cluster_view)
-    # The gateway scraper is alive: some pod of some model was scraped in the window.
-    scraper_alive = any(getattr(window, "scrape_fresh", False) for window in snapshot.models.values())
     for model_name, metrics in snapshot.models.items():
         raw_metrics = metrics
         spec = registry.model(model_name)
@@ -1332,7 +1077,7 @@ def _model_contexts(
         if stale_pods:
             # I3 (2026-10-25: merged into the sample rule): no sample of these pods was
             # observed in the window; they are left out (no pod left -> tokens missing,
-            # not zero) and are the frozen-scrape rescue evidence below.
+            # not zero) and hold the model as a donor (I4 below).
             events.append(f"scrape_stale:{model_name}:{','.join(stale_pods)}")
         incomplete_pods = getattr(metrics, "sample_incomplete_pods", ())
         if incomplete_pods:
@@ -1358,11 +1103,6 @@ def _model_contexts(
                 spec,
                 signal_source=signal_source,
                 signal_state=signal_state,
-                routable_observation=(
-                    breakpoint_observation(cluster_view, queue, model_name, metrics.window_end_ms)
-                    if counts is not None
-                    else None
-                ),
                 # Review L2: the alt signals sum the routable pods only (hidden probes out).
                 routable_pod_ids=(
                     (routable_by_model or {}).get(model_name, frozenset())
@@ -1370,16 +1110,10 @@ def _model_contexts(
                     else None
                 ),
             )
-            result, signal, signal_warm = computed.result, computed.signal, computed.warm
-            window = computed.window
-            if computed.hold_fallback:
-                events.append(f"breakpoint_hold_fallback:{model_name}:{computed.hold_fallback}")
-            if window is not None and not window.full:
-                # Rates of the post-breakpoint window (the decision window).
-                request_rate_rps = _request_rate_rps(computed.metrics)
-                decode_tps = per_replica_token_rate(computed.metrics, computed.metrics.generation_tokens)
-                prefill_tps = per_replica_token_rate(computed.metrics, computed.metrics.prompt_tokens)
+            result, signal = computed.result, computed.signal
             context = {
+                # TSS suffix (2026-10-29): why the post-change suffix does not decide yet.
+                "settling": computed.settling,
                 "trs": result.TRS,
                 # Pre-EMA TSS, read-only: exposed so a capture can store raw TSS, EMA and Z
                 # of the same tick (the replica factor it includes is not otherwise exposed).
@@ -1399,53 +1133,14 @@ def _model_contexts(
                 "y_m": result.y_m,
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
-                "signal_warm": signal_warm,
                 "request_rate_rps": request_rate_rps,
                 "decode_tps": decode_tps,
                 "prefill_tps": prefill_tps,
             }
-            if window is not None:
-                # O1: a scale-down needs a whole window after the breakpoint
-                # (signal_full_window); a scale-up the evidence (signal_warm).
-                context.update(
-                    {
-                        "signal_full_window": window.full,
-                        "signal_breakpoint_ms": window.breakpoint_ms,
-                        # Review P2-1: a hold fallback decides on the whole window (old
-                        # replica count inside): C1 keeps its window-start rule.
-                        "signal_settle_ms": (
-                            None if computed.hold_fallback else signal_state.settle_breakpoint_ms(model_name)
-                        ),
-                        "signal_window_start_ms": window.start_ms,
-                        "signal_evidence_ms": window.evidence_ms,
-                        "signal_hold_reason": None if computed.hold_fallback else window.reason,
-                        # Completed requests of the post-breakpoint window (the C1 step
-                        # cap's evidence); None on a whole window.
-                        "signal_evidence_requests": (
-                            None if window.full else observed_requests(window.metrics)
-                        ),
-                        # Timer cleanup (2026-10-02): O1 is active and saw this model's
-                        # routable count in the fleet view this tick, so a change of it
-                        # holds the model until post-change evidence exists - the F4
-                        # cooldown is then not applied (``_action_cooldowns``). Not on a
-                        # hold fallback (the whole window decides again).
-                        "o1_routable_tracked": bool(
-                            signal_state.o1_active and counts is not None and not computed.hold_fallback
-                        ),
-                    }
-                )
-                context["o1_queue_rise"] = _o1_queue_rise(
-                    signal_state, model_name, metrics, spec, window, signal_warm,
-                    hidden_pods.get(model_name, ()),
-                )
         else:
-            window = None
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
             # not that the model is idle (a live idle pod reports zero-delta tokens, which is the
-            # tokens branch above with Y_m<=1e-9). Do NOT touch the traffic-onset cursor here:
-            # resetting on a transient scrape hiccup would re-suppress a genuinely-CRITICAL model
-            # for a full window after metrics recover (review F1). Hold the cursor.
-            pass
+            # tokens branch above with Y_m<=1e-9): the EMA is left alone.
             context = {
                 "trs": 0.0,
                 "trs_raw": None,
@@ -1474,9 +1169,6 @@ def _model_contexts(
         context.update(_sm_floor_context(cluster_view, model_name))
         serving_now = routable_by_model.get(model_name, frozenset()) if routable_by_model is not None else None
         flagged = set(incomplete_pods)
-        if window is not None and not window.full:
-            # The decision window is an O1 suffix: its own flags count too.
-            flagged |= set(getattr(window.metrics, "sample_incomplete_pods", ()) or ())
         if serving_now is None:
             held_incomplete = flagged | set(stale_pods)
         elif raw_metrics.per_pod:
@@ -1490,110 +1182,25 @@ def _model_contexts(
         if tokens_available and held_incomplete:
             # I4 (review round 1): a serving pod's data is incomplete in this window -
             # no scale-down / release / donor evidence (the planner's donor gate). Only
-            # that: the level, the receiver steps and the O1 window are unchanged.
+            # that: the level and the receiver steps are unchanged.
             missing = held_incomplete - set(raw_metrics.per_pod or ())
             context["sample_quality_hold"] = (
                 "scrape_stale" if missing & set(stale_pods)
                 else "pod_missing" if missing
                 else "samples_incomplete"
             )
-            context["window_idle"] = False
-        else:
-            # Q3 (2026-10-06): the whole current serving window is idle - tokens known
-            # and zero, no running / waiting request - with every serving pod scraped
-            # recently (``scrape_current_pods``) and nothing in flight on it at the
-            # gateway (P2-2).
-            # The same at any replica count: an IDLE model is exempt from the O1 donor
-            # hold on it (planner). Never on a held or tokens-missing context.
-            context["window_idle"] = bool(
-                tokens_available
-                and window_is_idle(metrics.prompt_tokens, metrics.generation_tokens)
-                and float(metrics.avg_running or 0.0) + float(metrics.avg_waiting or 0.0) <= 1e-9
-                and _serving_pods_drained(raw_metrics, routable_by_model, model_name)
-            )
-        if not tokens_available and stale_pods and scraper_alive:
-            demand = _frozen_scrape_demand(raw_metrics, routable_by_model, model_name)
-            if demand is not None:
-                # No serving pod answered /metrics in the whole window while the scraper
-                # works: saturation-rescue evidence when requests are in flight.
-                context["scrape_stale_inflight"] = demand
-        tracker = getattr(signal_state, "saturation", None)
-        if tracker is not None and tracker.config.enabled:
-            # Onset saturation rescue: the routable pods' newest gateway samples (the
-            # serving window minus hidden probe pods), not the window averages.
-            sample = saturation_sample(metrics, hidden_pods=hidden_pods.get(model_name, ()))
-            context.update(
-                {
-                    "saturation_waiting": sample.waiting if sample is not None else None,
-                    "saturation_kv": sample.kv if sample is not None else None,
-                    "saturation_running": sample.running if sample is not None else None,
-                    "saturation_pods": sample.pods if sample is not None else 0,
-                    "saturation_sample_ms": sample.sample_ms if sample is not None else None,
-                    "saturation_pod_samples": [
-                        {"pod": pod.pod, "waiting": pod.waiting, "kv": pod.kv, "running": pod.running}
-                        for pod in (sample.per_pod if sample is not None else ())
-                    ],
-                }
-            )
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(
                 model_name, context, tokens_available=tokens_available, window_end_ms=int(metrics.window_end_ms)
             )
             events.extend(model_events)
+        if not tokens_available and signal_state is not None and int(
+            signal_state.change_ms(model_name) or 0
+        ) > int(metrics.window_start_ms):
+            # A pod-set change inside a window without tokens: no held context decides.
+            context = {**context, "settling": "tokens_unknown", "z_m": None, "trs_z_m": None}
         contexts[model_name] = context
     return contexts, tuple(events)
-
-
-def _queue_sample(
-    metrics: ModelWindowMetrics, hidden_pods, after_ms: int | None, lambda_wait: float
-) -> QueueSample | None:
-    """H3: the routable pods' (serving window minus hidden probe pods) newest instant
-    samples, those observed after ``after_ms`` only (None: all), as one
-    :class:`QueueSample` (with the per-pod values: a rise is measured on the pods of
-    both samples, review P1-1)."""
-    sample = saturation_sample(metrics, hidden_pods=hidden_pods, after_ms=after_ms)
-    if sample is None:
-        return None
-    lam = float(lambda_wait)
-    return QueueSample(
-        sample_ms=int(sample.sample_ms),
-        q=float(sample.running) + lam * float(sample.waiting),
-        waiting=float(sample.waiting),
-        pods=int(sample.pods),
-        per_pod=tuple(
-            (str(pod.pod), float(pod.running) + lam * float(pod.waiting), float(pod.waiting))
-            for pod in sample.per_pod
-        ),
-    )
-
-
-def _o1_queue_rise(
-    signal_state: SignalState,
-    model_name: str,
-    metrics: ModelWindowMetrics,
-    spec: ModelSpec,
-    window,
-    signal_warm: bool,
-    hidden_pods,
-) -> dict | None:
-    """H3 (2026-10-06): queue evidence for the O1 receiver-hold exemption (planner).
-
-    Every O1-tracked read records the window's queue sample (each pod's newest sample
-    in the window, observed at ``scraped_ms``) - the baselines. On a held window
-    (``signal_warm`` False, breakpoint inside the window) the current sample takes only
-    pods observed after the breakpoint and is compared with the newest recorded sample
-    observed at or before it (:meth:`SignalState.queue_rise`). The instant gauges do
-    not wait for completions, so a sample after the breakpoint is evidence the token
-    window cannot give yet."""
-    if getattr(signal_state, "breakpoint", None) is None:
-        return None
-    lam = float(spec.trs.lambda_wait)
-    signal_state.note_queue_sample(model_name, _queue_sample(metrics, hidden_pods, None, lam))
-    point = getattr(window, "breakpoint_ms", None)
-    if signal_warm or window is None or window.full or point is None:
-        return None
-    current = _queue_sample(metrics, hidden_pods, int(point), lam)
-    return signal_state.queue_rise(model_name, int(point), current)
 
 
 def _signal_theta(spec: ModelSpec, source: str) -> float | None:
@@ -1618,32 +1225,28 @@ def serving_window(
     *,
     counts: tuple[int, int] | None = None,
 ) -> ModelWindowMetrics:
-    """The model's window restricted to its serving pods (``restrict_to_serving``):
-    docs of pods the fleet state reports asleep are dropped and routable/assigned become
-    the awake-and-not-hidden count. Without a fleet view (or a model it does not list) the
-    raw window is returned unchanged. Used by the planner tick and the safescale
-    observation, so both decide on the same window."""
+    """The model's window restricted to its serving pods (``restrict_to_serving``): docs
+    of pods the fleet state reports asleep OR hidden are dropped (TSS suffix 2026-10-29,
+    rule 1: TSS is the service speed of the pod set the gateway routes to - a hidden pod
+    draining a SafeScale probe is out of the numerator and the queue, so the probe judges
+    its donor on the remaining pods) and routable/assigned become the awake-and-not-hidden
+    count. Without a fleet view (or a model it does not list) the raw window is returned
+    unchanged. Used by the planner tick and the safescale observation, so both decide on
+    the same window."""
     if cluster_view is None:
         return metrics
     if counts is None:
         counts = _cluster_view_counts(cluster_view).get(metrics.model)
         if counts is None:
             return metrics
-    sleeping = {
+    # One pod-set definition (review P2): the SM's routable set (:func:`_is_routable`).
+    routable_ids = getattr(cluster_view, "routable_ids", None)
+    out_of_set = {
         binding.serve_id
         for binding in cluster_view.bindings
-        if binding.model == metrics.model and not binding.awake
+        if binding.model == metrics.model and not _is_routable(binding, routable_ids)
     }
-    return restrict_to_serving(metrics, sleeping_pods=sleeping, routable_pods=counts[0])
-
-
-def _hidden_pods(cluster_view: ClusterView | None) -> dict[str, set[str]]:
-    """model -> serve_ids (== pod names) of its hidden (probe) bindings."""
-    hidden: dict[str, set[str]] = {}
-    for binding in getattr(cluster_view, "bindings", ()) or ():
-        if binding.hidden:
-            hidden.setdefault(binding.model, set()).add(binding.serve_id)
-    return hidden
+    return restrict_to_serving(metrics, sleeping_pods=out_of_set, routable_pods=counts[0])
 
 
 def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
@@ -1655,36 +1258,6 @@ def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
         if binding.awake:
             counts[binding.model] += 1
     return counts
-
-
-def _serving_pods_drained(
-    metrics: ModelWindowMetrics, routable_by_model: dict[str, frozenset[str]] | None, model: str
-) -> bool:
-    """P2-2 (2026-10-06, I3): every serving pod's newest successful scrape is fresh at
-    the window end (``scrape_current_pods``) and the gateway has no request in flight
-    on it (``gateway_inflight``). A pod scraped only earlier in the window, or an unknown
-    in-flight count, is not idle evidence. Without a fleet view the pods with valid
-    docs serve."""
-    serving = set(routable_by_model.get(model, ())) if routable_by_model is not None else set(metrics.per_pod or ())
-    inflight = getattr(metrics, "gateway_inflight", None)
-    if not serving or inflight is None or not serving <= set(getattr(metrics, "scrape_current_pods", ())):
-        return False
-    return all(inflight.get(pod) == 0 for pod in serving)
-
-
-def _frozen_scrape_demand(
-    metrics: ModelWindowMetrics, routable_by_model: dict[str, frozenset[str]] | None, model: str
-) -> int | None:
-    """The gateway in-flight requests on the model's serving pods when every serving pod
-    is scrape-stale for the window; None when some serving pod has valid data (or none
-    serves). Without a fleet view every pod with docs counts as serving."""
-    valid = set(metrics.per_pod or ())
-    stale = set(getattr(metrics, "scrape_stale_pods", ()))
-    serving = set(routable_by_model.get(model, frozenset())) if routable_by_model is not None else valid | stale
-    if not serving or serving & valid:
-        return None
-    inflight = getattr(metrics, "scrape_stale_inflight", None) or {}
-    return sum(int(inflight.get(pod, 0)) for pod in serving)
 
 
 def _routable_pod_ids(cluster_view: ClusterView | None) -> dict[str, frozenset[str]] | None:

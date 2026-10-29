@@ -13,8 +13,8 @@ Centralized values:
 - Registry and runtime state paths: `TRE_REGISTRY_PATH`, `TRE_RUNTIME_STATE_DIR`.
 - Loop cadence: `TRE_MONITOR_INTERVAL_SECONDS`, `TRE_RESCUE_INTERVAL_SECONDS`, `TRE_FAIRNESS_INTERVAL_SECONDS`.
 - Metrics windowing: `TRE_METRICS_WINDOW_MS`, `TRE_INSTANT_SAMPLE_INTERVAL_MS`, `TRE_PERCENTILE_MODE`.
-- P5 ablation switches: `TRE_ABLATION_DISABLE_SLOW_LOOP`, `TRE_ABLATION_DISABLE_SAFESCALE` (`ENABLE_TRE_SCALING` removed 2026-10-07: actuation follows the run mode only).
-  - `TRE_ABLATION_DISABLE_SAFESCALE` (semantics 2026-10-08): SafeScale off = immediate release, as before 05f489f1 / v1. No SafeScale loop and no probe; the planner loops run with `safescale=None`, and every shrink that would start a probe takes the urgent donor path (reason suffix `_nosafescale`): a middle-zone / HIGH donor for a receiver is planned by the planner as an immediate relay (`PlanConfig.release_without_safescale`, same gates as an IDLE donor: relay holds, routable view, C1 tagging); a receiver-less HIGH proactive shrink becomes a model-level urgent scale-down; a TP same-slot preemption only the urgent sleep of that pod (the next tick wakes the receiver on the freed slot). Probes an earlier run left in Redis are rolled back once at startup (`rollback_left_probes_task`); their GPUs stay reserved meanwhile (`leftover_probes`). A true `TRE_ABLATION_DISABLE_FAST_LOOP` refuses to start (renamed).
+- P5 ablation switches (2026-10-28: one decision loop; `TRE_ABLATION_DISABLE_SLOW_LOOP` now means the rebalance section never runs and LOW receivers get nothing - data before 2026-10-28 used the older semantics below; design `tre/docs/design/20261028-single-loop.md`): `TRE_ABLATION_DISABLE_SLOW_LOOP`, `TRE_ABLATION_DISABLE_SAFESCALE` (`ENABLE_TRE_SCALING` removed 2026-10-07: actuation follows the run mode only).
+  - `TRE_ABLATION_DISABLE_SAFESCALE` (semantics 2026-10-08): SafeScale off = immediate release, as before 05f489f1 / v1. No SafeScale loop and no probe; the planner loops run with `safescale=None`, and every shrink that would start a probe takes the urgent donor path (reason suffix `_nosafescale`): a middle-zone / HIGH donor for a receiver is planned by the planner as an immediate relay (`PlanConfig.release_without_safescale`, same gates as an IDLE donor: relay holds, routable view, C1 tagging); a receiver-less HIGH proactive shrink becomes a model-level urgent scale-down; a TP same-slot preemption only the urgent sleep of that pod (the next tick wakes the receiver on the freed slot; 2026-10-28: replaced - a same-slot release is one plan, donor sleep + receiver wake, design `tre/docs/design/20261028-single-loop.md`). Probes an earlier run left in Redis are rolled back once at startup (`rollback_left_probes_task`); their GPUs stay reserved meanwhile (`leftover_probes`). A true `TRE_ABLATION_DISABLE_FAST_LOOP` refuses to start (renamed).
 - Signal source switch: `TRE_SIGNAL_SOURCE=zm|latency_p95|queue_len|kv_cache`.
 - Legacy controller constants found in the frozen upstream controller: `PROACTIVE_RELEASE_MIN_TRS` and all `SAFE_SCALE_*` knobs.
 
@@ -441,7 +441,7 @@ Implemented pieces:
 
 - `ControllerDependencies` groups the metrics store, `SnapshotBox`, `ActionQueue`, and registry used by runtime tasks.
 - `build_controller_task_specs()` always starts `metrics`; starts `rescue`, `fairness`, and `action_queue` always (2026-10-07; before: only with `ENABLE_TRE_SCALING` true) - run mode observe makes them compute and record only; and honors `TRE_ABLATION_DISABLE_SLOW_LOOP` (2026-10-08; it replaces `TRE_ABLATION_DISABLE_FAST_LOOP`, which omitted `rescue` and left CRITICAL models without any scale-up) by omitting only `fairness`: every `rescue` tick then plans with `fairness_due=True` too, so one snapshot-aligned loop runs every decision.
-- `rescue_task()` and `fairness_task()` are long-running async wrappers over the tested single-tick functions. They read only `SnapshotBox`, submit through the queue, and sleep for the configured interval.
+- (Superseded 2026-10-28: one `decision_task` replaces both, design `tre/docs/design/20261028-single-loop.md`.) `rescue_task()` and `fairness_task()` are long-running async wrappers over the tested single-tick functions. They read only `SnapshotBox`, submit through the queue, and sleep for the configured interval.
 - `ActionQueue.run()` repeatedly drains pending actions and sleeps, keeping service-manager HTTP calls confined to the queue boundary.
 
 This slice intentionally does not create the concrete Redis client, service-manager client, cluster-view refresh path, decision snapshot writer, or `ControllerConfig.from_env()` bootstrap. Those remain separate P5 app-wiring slices.
@@ -523,7 +523,7 @@ Implemented pieces:
 - `ClusterViewBox` holds the latest cached cluster view and supports whole-view replacement.
 - `refresh_cluster_view_once()` calls `ServiceManagerClient.get_state()`, replaces the cached view on success, and keeps the previous view on failure.
 - `cluster_view_task()` polls state at the fairness interval; app task assembly starts it whenever scaling is enabled.
-- `rescue_task()` and `fairness_task()` now read the latest `ClusterViewBox` value per tick and still perform no direct HTTP calls.
+- `rescue_task()` and `fairness_task()` (2026-10-28: `decision_task`) now read the latest `ClusterViewBox` value per tick and still perform no direct HTTP calls.
 
 ### P5-CTRL-013 cluster-view cache
 

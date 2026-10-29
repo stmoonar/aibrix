@@ -4402,13 +4402,18 @@ class ServiceManagerV2:
 
     def _validated_plan(self, sleeps, wakes, plan_id: str | None) -> "_Plan":
         """The request rules (design section 3): at least one item, known models,
-        each model in at most ONE item (a relay donor counts as its model's sleep
-        side), external sleep paths, exactly one of pods / at_most (sleep) and
-        at_least / pods (wake)."""
+        each model in at most ONE count item (``at_most`` / ``at_least``; a relay
+        donor counts as its model's sleep side), external sleep paths, exactly one
+        of pods / at_most (sleep) and at_least / pods (wake). Named items (``pods``,
+        2026-10-28 section 11): a model may have several, each pod is named at most
+        once per plan; a count item and a named item of one model: 400
+        ``mixed_items``. ``group``: a non-empty label."""
         sleeps, wakes = list(sleeps or ()), list(wakes or ())
         if not sleeps and not wakes:
             raise ValueError("a plan needs at least one sleep or wake item")
         seen: set[str] = set()
+        named_models: set[str] = set()
+        named_pods: set[str] = set()
 
         def unique(values, what: str) -> None:
             # A pod named twice would get two parallel /sleep (or /wake_up) calls.
@@ -4420,10 +4425,32 @@ class ServiceManagerV2:
             self._registry.model(model)  # KeyError: unknown model (400)
             if model in seen:
                 raise ValueError(f"model {model} appears in more than one plan item ({what})")
+            if model in named_models:
+                raise ValueError(f"mixed_items: model {model} has a named item and a count item ({what})")
             seen.add(model)
 
+        def claim_named(model: str, pods, what: str) -> None:
+            self._registry.model(model)  # KeyError: unknown model (400)
+            if model in seen:
+                raise ValueError(f"mixed_items: model {model} has a count item and a named item ({what})")
+            for pod in pods or ():
+                if pod in named_pods:
+                    raise ValueError(f"pod {pod} is named in more than one plan item ({what})")
+            named_pods.update(pods or ())
+            named_models.add(model)
+
+        def check_group(item, what: str) -> None:
+            group = getattr(item, "group", None)
+            if group is not None and not str(group).strip():
+                raise ValueError(f"{what}: group must not be empty")
+
         for item in sleeps:
-            claim(item.model, "sleep")
+            check_group(item, f"sleep item of {item.model}")
+            if item.pods is not None:
+                unique(item.pods, f"sleep item of {item.model}: pods")
+                claim_named(item.model, item.pods, "sleep")
+            else:
+                claim(item.model, "sleep")
             _sleep_path(item.sleep_path)
             if (item.pods is None) == (item.at_most is None):
                 raise ValueError(f"sleep item of {item.model}: exactly one of pods / at_most")
@@ -4433,7 +4460,12 @@ class ServiceManagerV2:
             if item.at_most is not None and item.at_most < 0:
                 raise ValueError(f"sleep item of {item.model}: at_most must be non-negative")
         for item in wakes:
-            claim(item.model, "wake")
+            check_group(item, f"wake item of {item.model}")
+            if item.pods is not None:
+                unique(item.pods, f"wake item of {item.model}: pods")
+                claim_named(item.model, item.pods, "wake")
+            else:
+                claim(item.model, "wake")
             if (item.pods is None) == (item.at_least is None):
                 raise ValueError(f"wake item of {item.model}: exactly one of at_least / pods")
             if item.pods is not None and not item.pods:
@@ -4973,6 +5005,8 @@ class ServiceManagerV2:
                 "outcomes": [], "_check": choice.floor_check,
                 "_members": list(choice.members),
             }
+            if item.group:
+                entry["group"] = item.group
             if choice.floor_check is not None and (choice.clamped or choice.refusal is not None):
                 entry["floor"] = {
                     "clamped": choice.clamped,
@@ -5054,6 +5088,8 @@ class ServiceManagerV2:
             }
             if compensating:
                 entry["compensating_sleep"] = compensating
+            if item.group:
+                entry["group"] = item.group
             if status in ("refused", "failed"):
                 entry["not_executed"] = status == "refused"
             wakes.append(entry)
@@ -6881,6 +6917,7 @@ class WakeConflict(ValueError):
         "routable_unknown": "routable_unknown",
         # Plan refusals (2026-10-27).
         "donor_sleep_failed": "donor_sleep_failed",
+        "group_refused": "group_refused",
         "no_binding": "no_binding",
         "max_awake_replicas": "max_awake_replicas",
         "pod_not_found": "pod_not_found",
@@ -7097,6 +7134,8 @@ def _plan_item_brief(item) -> dict:
         brief["hints"] = list(item.hints)
     if getattr(item, "donors", ()):
         brief["donors"] = [{"model": d.model, "max": d.max, "sleep_path": d.sleep_path} for d in item.donors]
+    if getattr(item, "group", None):
+        brief["group"] = item.group
     return brief
 
 
@@ -7168,7 +7207,8 @@ class TargetRequest(BaseModel):
 
 
 class PlanDonor(BaseModel):
-    """Relay allowance of a wake item (as ``TransferIntent.count``)."""
+    """Relay allowance of a wake item (a count relay: the SM picks the pairs; used by the
+    release smoke script, not by the controller since 2026-10-28)."""
 
     model: str
     max: int = Field(ge=1)
@@ -7177,13 +7217,15 @@ class PlanDonor(BaseModel):
 
 class PlanSleepItem(BaseModel):
     model: str
-    #: Exact serve ids (SafeScale probe pods, ShrinkForSlot); one of pods / at_most.
+    #: Exact serve ids (SafeScale probe pods, a TP block's donor pods); one of pods / at_most.
     pods: list[str] | None = None
     #: Model-level shrink (clamped at the replica floor).
     at_most: int | None = Field(None, ge=0)
     sleep_path: str
     #: Caller label, echoed in the results.
     reason: str = ""
+    #: Plan group (one transfer, scope: the plan): atomic in the selection.
+    group: str | None = None
 
 
 class PlanWakeItem(BaseModel):
@@ -7195,6 +7237,8 @@ class PlanWakeItem(BaseModel):
     avoid_gpus: list[str] = []
     donors: list[PlanDonor] = []
     reason: str = ""
+    #: Plan group (one transfer, scope: the plan): atomic in the selection.
+    group: str | None = None
 
 
 class PlanRequest(BaseModel):
@@ -7209,7 +7253,7 @@ class PlanRequest(BaseModel):
                 PlanSleep(
                     model=item.model, sleep_path=item.sleep_path,
                     pods=None if item.pods is None else tuple(item.pods),
-                    at_most=item.at_most, reason=item.reason,
+                    at_most=item.at_most, reason=item.reason, group=item.group,
                 )
                 for item in self.sleeps
             ],
@@ -7219,7 +7263,7 @@ class PlanRequest(BaseModel):
                     pods=None if item.pods is None else tuple(item.pods),
                     hints=tuple(item.hints), avoid_gpus=tuple(item.avoid_gpus),
                     donors=tuple(PlanDonorSpec(d.model, d.max, d.sleep_path) for d in item.donors),
-                    reason=item.reason,
+                    reason=item.reason, group=item.group,
                 )
                 for item in self.wakes
             ],

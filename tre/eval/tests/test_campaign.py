@@ -746,9 +746,9 @@ def test_trace_set_is_one_setting_switchable_from_the_environment(tmp_path):
 def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
     """The shipped 10-28 specs: (A) Tight_pool / Simul_spike / Real_conv x {TSS, queue, ttft_mean, kv_usage}, SafeScale
     receiverless_shrink everywhere, the eta gate off exactly on the alternative-signal arms; (B) Simul_spike /
-    Real_conv x {base, theta / lambda / w_p / tau x0.8 x1.2, WP-ABS1}, one parameter per arm. Both refuse to start
-    until registry_expect.registry_id (the recalibrated registry) is filled in, and the A spec requires the refitted
-    alt thresholds of its three signals."""
+    Real_conv x {base, theta / lambda / w_p / tau x0.8 x1.2, WP-ABS1}, one parameter per arm. Both pin
+    registry_expect.registry_id to the published recalibrated registry (one id for both), and the A spec requires the
+    refitted alt thresholds of its three signals."""
     env = {"TRE_REPO": str(tmp_path)}
     a = C.load_campaign(RUNNER / "campaigns" / "campaign-signal-ablation-20261028.yaml", environ=env)
     plan = C.build_plan(a)
@@ -771,9 +771,10 @@ def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
         f"*.trs.{p} x{f}" for p in ("theta_m", "lambda_wait", "w_p") for f in ("0.8", "1.2")}
     assert all(len(r) <= 1 for k, r in rules.items() if k != "sens-wp-abs1")   # one parameter per arm
     assert all(C.arm_def(b, i.arm).controller_env["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for i in plan)
+    assert a["registry_expect"]["registry_id"] == b["registry_expect"]["registry_id"]
     for c in (a, b):
-        probs = C.AR.expect_spec_problems(c["registry_expect"])
-        assert len(probs) == 1 and "registry_id is not filled in" in probs[0], probs   # every present path parses
+        # registry_id filled in (16 hex digits) and every present path parses.
+        assert C.AR.expect_spec_problems(c["registry_expect"]) == []
         assert {"*.trs.numerator", "*.trs.theta_window_ms"} <= set(c["registry_expect"]["present"])
     assert {f"*.alt_thresholds.{s}.basis.{f}" for s in ("queue_len", "ttft_mean", "kv_usage")
             for f in ("definition", "window_ms", "ema_tau_ms")} <= set(a["registry_expect"]["present"])
@@ -799,3 +800,25 @@ def test_unexpected_error_in_registry_apply_fails_the_item_not_the_campaign(tmp_
     camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sens-theta-m20", "tre"), "extra": SENS})
     assert camp.run() == 0
     assert deps.seq(k)[:3] == ["reg_apply", "reg_restore", "reset!"] and "Alternating_s1/tre" in deps.runs()
+
+
+def test_eviction_storm_guards():
+    nodes = {"items": [{"metadata": {"name": "a"}, "status": {"conditions": [{"type": "DiskPressure", "status": "False"}]}},
+                       {"metadata": {"name": "b"}, "status": {"conditions": [{"type": "DiskPressure", "status": "True"}]}}]}
+    assert C.node_pressure_problems(nodes) == ["b"]
+    pods = {"items": [{"status": {"phase": "Failed"}}, {"status": {"phase": "Running"}}, {"status": {"phase": "Failed"}}]}
+    assert C.failed_pod_count(pods) == 2
+    cfg = {"kubelet_margin": 1.1, "nodes": {"n3": 1}}
+
+    def st(free, cap):
+        return {"node": {"fs": {"availableBytes": free * 1e9, "capacityBytes": cap * 1e9}}}
+
+    def cz(v):
+        return {"kubeletconfig": {"evictionHard": {"nodefs.available": v}}}
+    assert not C.node_fs_verdict(st(10.9, 100), cfg, "n1", cz("10%"))[0]   # need 11 GB
+    assert C.node_fs_verdict(st(11.1, 100), cfg, "n1", cz("10%"))[0]
+    assert not C.node_fs_verdict(st(1.0, 100), cfg, "n1", cz("1Gi"))[0]    # quantity: 1.1 x 1Gi = 1.18 GB
+    assert C.node_fs_verdict(st(1.3, 100), cfg, "n1", cz("1Gi"))[0]
+    assert not C.node_fs_verdict(st(10.9, 100), cfg, "n1", None)[0]        # configz missing -> default 10%
+    assert C.node_fs_verdict(st(11.1, 100), cfg, "n1", {})[0]              # key absent -> default 10%
+    assert C.node_fs_verdict(st(2, 100), cfg, "n3", cz("10%"))[0]          # per-node override

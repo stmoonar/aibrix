@@ -35,7 +35,7 @@
 
 Scrapes run in a dedicated thread pool (stdlib ``urllib``, as the controller's other
 HTTP reads; no new dependency) and are awaited asynchronously: the event loop and the
-fast loop never block on them. ``scrape_timeout_s`` counts from the moment a pool thread
+decision loop never block on them. ``scrape_timeout_s`` counts from the moment a pool thread
 starts the read (time queued behind other scrapes is not a pod timeout); the queue wait
 itself is bounded by one more timeout (``pool_saturated``), and a busy pool is logged.
 Only samples labelled with the probe's ``model_name`` are read (a pod IP reused by

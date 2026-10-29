@@ -181,18 +181,9 @@ def state_time_lower_bound(state: dict, requested_ms: int, fetched_ms: int) -> i
     """When the SM state was produced, as a lower bound on the controller clock: the time
     the request was sent. Timestamps are never compared across machines: the SM's own
     ``fetched_ms`` is on the SM clock (which may run ahead or behind; a fast SM clock
-    clamped into the request interval would become an upper bound), so it is kept on
-    the view for reference only (:func:`sm_state_ms`) and decides nothing."""
+    clamped into the request interval would become an upper bound), so it decides
+    nothing."""
     return int(requested_ms)
-
-
-def sm_state_ms(state: dict) -> int | None:
-    """The SM's own ``/v2/state`` ``fetched_ms`` (SM clock): logs / snapshots only."""
-    raw = state.get("fetched_ms") if isinstance(state, dict) else None
-    try:
-        return int(float(raw)) if raw is not None and not isinstance(raw, bool) else None
-    except (TypeError, ValueError, OverflowError):
-        return None
 
 
 async def refresh_cluster_view_once(
@@ -204,14 +195,13 @@ async def refresh_cluster_view_once(
         # Timer cleanup review P2-2: the request time is a lower bound of the state's time.
         requested_ms = int(wall_clock_ms())
         state = await client.get_state()
-        # O1: stamped after the response arrived - every change the view shows happened
-        # at or before this time (an upper bound, so a breakpoint is never dated early).
+        # Stamped after the response arrived - every change the view shows happened at
+        # or before this time (an upper bound).
         fetched_ms = int(wall_clock_ms())
         cluster_view = replace(
             cluster_view_from_state(state, topology),
             fetched_ms=fetched_ms,
             state_ms=state_time_lower_bound(state, requested_ms, fetched_ms),
-            sm_fetched_ms=sm_state_ms(state),
         )
     except Exception as exc:  # noqa: BLE001 - cached view is a conservative fallback.
         return ClusterViewRefreshResult(

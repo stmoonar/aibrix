@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any
+import threading
+from typing import Any, NamedTuple
 
 from tre_common import rediskeys
 from tre_common.metrics_schema import MetricsSnapshot
-from tre_controller.planning.planner import ScaleAction, TransferIntent
+from tre_controller.planning.planner import ScaleAction
 
 SIGNAL_LOG_FIELDS = (
     "ts",
@@ -43,21 +44,35 @@ class SignalLogWriter:
         self._redis = redis_client
         self._key = key
         self._maxlen = int(maxlen)
+        # claim() runs on the event loop and settle() on the writer thread.
+        self._lock = threading.Lock()
         self._last_window_by_model: dict[str, int] = {}
 
     def write(self, snapshot: MetricsSnapshot, result: Any) -> int:
+        """Write this decision's entries now (one pipelined round trip); the number
+        written."""
+        rows = self.claim(snapshot, result)
+        return self.settle(rows, run_pipelined(self._redis, self.calls(rows)))
+
+    def claim(self, snapshot: MetricsSnapshot, result: Any) -> list[SignalLogRow]:
+        """This decision's entries: one per model whose window was not written yet. Each
+        model's window is marked written now (so a decision built before this write
+        lands does not repeat it); :meth:`settle` unmarks it when the write fails, as if
+        it had never been marked."""
         contexts = getattr(result, "model_contexts", {}) or {}
         classifications = getattr(result, "classifications", {}) or {}
         action_by_model, delta_by_model = _summarize_actions(
             getattr(result, "actions", ()) or ()
         )
-        written = 0
+        rows: list[SignalLogRow] = []
         for model, context in sorted(contexts.items()):
             metrics = snapshot.models.get(model)
             window_id = int(
                 getattr(metrics, "window_end_ms", None) or snapshot.ts_ms
             )
-            if window_id <= self._last_window_by_model.get(model, -1):
+            with self._lock:
+                previous = self._last_window_by_model.get(model)
+            if window_id <= (previous if previous is not None else -1):
                 continue
             source = str(context.get("signal_source") or "unknown")
             if source == "zm":
@@ -92,32 +107,80 @@ class SignalLogWriter:
                 "eta_m": _format(context.get("eta_m")),
                 "action": action_by_model.get(model, "none"),
             }
-            try:
-                self._redis.xadd(
-                    self._key,
-                    fields,
-                    maxlen=self._maxlen,
-                    approximate=True,
-                )
-            except Exception as exc:
-                _LOG.warning("signal_log_write_failed:%s: %s", model, exc)
+            with self._lock:
+                self._last_window_by_model[model] = window_id
+            rows.append(SignalLogRow(model, window_id, previous, fields))
+        return rows
+
+    def calls(self, rows: list[SignalLogRow]) -> list[tuple[str, tuple, dict]]:
+        """The XADD of each entry."""
+        return [
+            ("xadd", (self._key, row.fields), {"maxlen": self._maxlen, "approximate": True})
+            for row in rows
+        ]
+
+    def settle(self, rows: list[SignalLogRow], replies: list[Any]) -> int:
+        """The replies of :meth:`calls`: a failed entry is logged and its window
+        unmarked (the next decision on it writes it again); the number written."""
+        written = 0
+        for row, reply in zip(rows, replies):
+            if isinstance(reply, Exception):
+                _LOG.warning("signal_log_write_failed:%s: %s", row.model, reply)
+                with self._lock:
+                    if self._last_window_by_model.get(row.model) == row.window_id:
+                        if row.previous is None:
+                            self._last_window_by_model.pop(row.model, None)
+                        else:
+                            self._last_window_by_model[row.model] = row.previous
                 continue
-            self._last_window_by_model[model] = window_id
             written += 1
         return written
+
+
+class SignalLogRow(NamedTuple):
+    model: str
+    window_id: int
+    #: The model's last written window before this entry claimed it (None: none).
+    previous: int | None
+    fields: dict[str, str]
+
+
+def run_pipelined(client: Any, calls: list[tuple[str, tuple, dict]]) -> list[Any]:
+    """Each call's reply, or the exception it raised, in order: one
+    ``pipeline(transaction=False)`` round trip (``raise_on_error=False``: one failed
+    command does not void the others; a failed round trip fails every call). Clients
+    without ``pipeline`` (test fakes) run the calls one by one."""
+    if not calls:
+        return []
+    make = getattr(client, "pipeline", None)
+    pipe = None
+    if callable(make):
+        try:
+            pipe = make(transaction=False)
+        except TypeError:
+            pipe = None
+    if pipe is not None:
+        try:
+            for name, args, kwargs in calls:
+                getattr(pipe, name)(*args, **kwargs)
+            return list(pipe.execute(raise_on_error=False))
+        except Exception as exc:  # noqa: BLE001 - best-effort writes: every call failed
+            return [exc] * len(calls)
+    out: list[Any] = []
+    for name, args, kwargs in calls:
+        try:
+            out.append(getattr(client, name)(*args, **kwargs))
+        except Exception as exc:  # noqa: BLE001 - best-effort writes
+            out.append(exc)
+    return out
 
 
 def _summarize_actions(actions: tuple[Any, ...]) -> tuple[dict[str, str], dict[str, int]]:
     action_by_model: dict[str, str] = {}
     delta_by_model: dict[str, int] = {}
+    # A plan batch (a transfer group, fused actions): each member is one action.
+    actions = tuple(member for action in actions for member in getattr(action, "members", (action,)))
     for action in actions:
-        if isinstance(action, TransferIntent):
-            # 2026-10-02: a relay is one intent; logged per side as the planned delta.
-            label = f"transfer:{action.donor_model}->{action.receiver_model}"
-            for model, delta in ((action.donor_model, -int(action.count)), (action.receiver_model, int(action.pairs))):
-                delta_by_model[model] = delta_by_model.get(model, 0) + delta
-                action_by_model[model] = label
-            continue
         if not isinstance(action, ScaleAction):
             continue
         delta_by_model[action.model] = delta_by_model.get(action.model, 0) + int(

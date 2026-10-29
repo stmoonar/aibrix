@@ -4,15 +4,15 @@ import asyncio
 import json
 import logging
 import time
-import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.gateway_inflight import instance_max_age_ms
+from tre_common.rediskeys import EVIDENCE_PERIOD_MS
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_common.tss import theta_basis_errors
 from tre_controller.config import ControllerConfig
-from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
     ActionQueue,
@@ -26,10 +26,9 @@ from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
-from tre_controller.loops.fairness_task import fairness_task
+from tre_controller.loops.decision_task import DecisionLoop, decision_task
 from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
-from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import rollback_left_probes_task, safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
@@ -41,8 +40,7 @@ from tre_controller.planning.safescale_direct import (
     cluster_view_urls,
 )
 from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
-from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
-from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
+from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
@@ -101,7 +99,7 @@ def build_controller_task_specs(
     ):
         specs.append(ControllerTaskSpec("hidden_orphans", deps.hidden_orphan_detector.run))
     # 2026-10-07: no ENABLE_TRE_SCALING early return any more - the decision tasks
-    # (cluster view, rescue, fairness, SafeScale, queue) always run; whether they act is
+    # (cluster view, decision loop, SafeScale, queue) always run; whether they act is
     # the run mode's business alone (observe: compute and record, never actuate).
 
     specs.append(
@@ -120,57 +118,42 @@ def build_controller_task_specs(
     safescale_off = bool(getattr(cfg, "ablation_disable_safescale", False))
     planner_safescale = None if safescale_off else deps.safescale
     leftover_probes = deps.safescale if safescale_off else None
-    # TRE_ABLATION_DISABLE_SLOW_LOOP (2026-10-08): every decision runs in the fast loop -
-    # its ticks (fixed TRE_RESCUE_INTERVAL_SECONDS timer, reading the newest snapshot)
-    # plan the fairness section too, no fairness task runs.
-    # The fast loop does all the fairness task did besides planning (model state box,
-    # decision snapshot); the queue's rescue-over-fairness replacement follows each
-    # action's source_loop, which the planner sets per section.
-    slow_off = bool(getattr(cfg, "ablation_disable_slow_loop", False))
+    # Single decision loop (2026-10-28, design docs/design/20261028-single-loop.md): one
+    # task, woken by every published snapshot, plans the rescue and the rebalance
+    # (fairness) section in one call on one ledger. TRE_ABLATION_DISABLE_SLOW_LOOP: the
+    # rebalance section never runs (LOW receivers get nothing).
+    loop = DecisionLoop(
+        queue=deps.queue,
+        registry=deps.registry,
+        cfg=cfg,
+        cluster_view_box=deps.cluster_view_box,
+        active_probe_models=lambda: _active_probe_models(deps.safescale),
+        decision_writer=deps.decision_writer,
+        safescale=planner_safescale,
+        signal_state=deps.signal_state,
+        prof=deps.profiler,
+        model_state_box=deps.model_state_box,
+        is_observe=_observe_reader(deps),
+        maintenance=deps.maintenance_watch,
+        leftover_probes=leftover_probes,
+        # The snapshot (producer) period: the sections' periods round up to its grid.
+        producer_ms=int(getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS)),
+    )
     specs.append(
         ControllerTaskSpec(
-            "rescue",
-            lambda: rescue_task(
+            "decision",
+            lambda: decision_task(
                 deps.snapshot_box,
-                queue=deps.queue,
-                registry=deps.registry,
-                cfg=cfg,
-                cluster_view_box=deps.cluster_view_box,
-                active_probe_models=lambda: _active_probe_models(deps.safescale),
-                decision_writer=deps.decision_writer,
-                safescale=planner_safescale,
-                signal_state=deps.signal_state,
-                prof=deps.profiler,
-                model_state_box=deps.model_state_box,
-                is_observe=_observe_reader(deps),
-                maintenance=deps.maintenance_watch,
-                fairness_due=slow_off,
-                leftover_probes=leftover_probes,
+                loop,
+                # The sampler marks the snapshot stale after its stale hold; no publish
+                # at all for that hold plus one snapshot period is the same alert.
+                silence_alert_s=(
+                    int(getattr(cfg, "metrics_stale_hold_ms", 20_000))
+                    + int(getattr(cfg, "evidence_period_ms", EVIDENCE_PERIOD_MS))
+                ) / 1000.0,
             ),
         )
     )
-    if not slow_off:
-        specs.append(
-            ControllerTaskSpec(
-                "fairness",
-                lambda: fairness_task(
-                    deps.snapshot_box,
-                    queue=deps.queue,
-                    registry=deps.registry,
-                    cfg=cfg,
-                    cluster_view_box=deps.cluster_view_box,
-                    active_probe_models=lambda: _active_probe_models(deps.safescale),
-                    decision_writer=deps.decision_writer,
-                    safescale=planner_safescale,
-                    signal_state=deps.signal_state,
-                    prof=deps.profiler,
-                    model_state_box=deps.model_state_box,
-                    is_observe=_observe_reader(deps),
-                    maintenance=deps.maintenance_watch,
-                    leftover_probes=leftover_probes,
-                ),
-            )
-        )
     if safescale_off:
         specs.append(
             ControllerTaskSpec(
@@ -206,12 +189,6 @@ def build_controller_task_specs(
                 ),
             )
         )
-    clock_monitor = _gateway_clock_monitor(deps, cfg)
-    if clock_monitor is not None:
-        interval_s = float(deps.registry.scaling().gateway_clock_check_s)
-        specs.append(
-            ControllerTaskSpec("gateway_clock", lambda: gateway_clock_task(clock_monitor, interval_s))
-        )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
     if deps.profiler is not None:
         specs.append(ControllerTaskSpec("profile_flush", lambda: deps.profiler.flush_loop()))
@@ -224,27 +201,6 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
-
-
-def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClockMonitor | None:
-    """O1 same-clock check (review P2-3): only with O1 on, a redis-backed store and
-    ``scaling.gateway_clock_check_s`` > 0."""
-    breakpoint = getattr(deps.signal_state, "breakpoint", None)
-    redis_client = getattr(deps.store, "redis_client", None)
-    scaling = getattr(deps.registry, "scaling", None)
-    if breakpoint is None or not breakpoint.enabled or redis_client is None or not callable(scaling):
-        return None
-    config = scaling()
-    if int(getattr(config, "gateway_clock_check_s", 0) or 0) <= 0:
-        return None
-    return GatewayClockMonitor(
-        redis_client,
-        [spec.name for spec in deps.registry.models()],
-        deps.signal_state,
-        # The probe watches instant docs: wait one instant period (+ 2 s) for a new one.
-        period_ms=int(getattr(cfg, "instant_sample_interval_ms", 10_000)),
-        tolerance_ms=int(config.gateway_clock_tolerance_ms),
-    )
 
 
 def _sleeping_pods(view: Any, model: str) -> set[str]:
@@ -340,24 +296,11 @@ def create_controller_dependencies(
         if share
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
-    breakpoint_config = BreakpointWindowConfig.from_registry(registry)
-    logging.getLogger("tre_controller.signals").info(
-        json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
-    )
-    saturation_config = SaturationRescueConfig.from_registry(registry)
-    logging.getLogger("tre_controller.signals").info(
-        json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
-    )
     scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
-    o1_suffix_can_warm = int(cfg.metrics_window_ms) > int(breakpoint_config.min_evidence_ms)
-    signal_state = SignalState(
-        warmup_ms=cfg.signal_warmup_ms,
-        # O1 breakpoint window (registry scaling.breakpoint_window /
-        # onset_warmup_guard / min_evidence_*), on observation times.
-        breakpoint=breakpoint_config,
-        # Onset saturation rescue (registry scaling.saturation_*).
-        saturation=SaturationTracker(saturation_config),
-    )
+    # TSS suffix (2026-10-29, design 20261029-tss-suffix): Z on the window since the
+    # model's last pod-set change, decision-valid once that spans scaling.settle_ms.
+    # A change is dated in the gateway domain (SignalState.note_snapshot, review P1-2).
+    signal_state = SignalState(settle_ms=int(getattr(scaling_config, "settle_ms", 10_000) or 10_000))
     # Round 4: the SafeScale tail span source, bound once the state machine exists.
     tail_start: list = []
     store = MetricsStore(
@@ -377,21 +320,14 @@ def create_controller_dependencies(
         # 2026-10-25: per-pod completeness (registry scaling.sample_min_ratio).
         min_sample_ratio=float(getattr(scaling_config, "sample_min_ratio", 0.0) or 0.0),
         percentile_mode=cfg.percentile_mode,
-        schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
-        # O1 and the SafeScale tail: the suffix windows they decide on, aligned to the
-        # histogram docs (only the requested ones are built).
+        # The suffix windows built, aligned to the histogram docs: the SafeScale commit
+        # gate's tail (round 5: the post-hide suffix of a probing model) and the TSS
+        # suffix (2026-10-29: the part of the window after the model's last pod-set change).
         suffix_period_ms=cfg.evidence_period_ms,
-        # ... only the one suffix O1 decides on (the model's breakpoint inside the window).
-        # 2026-10-28 (review L1): a suffix is strictly shorter than the window, so with
-        # window <= min_evidence_ms O1 can never warm on one - not built then (the
-        # model waits for a whole window either way; hold reason no_suffix).
-        suffix_breakpoint=lambda model: (
-            signal_state.breakpoint_ms(model) if signal_state.o1_active and o1_suffix_can_warm else None
-        ),
-        # Round 5: and the SafeScale commit gate's tail - the post-hide suffix of a probing model.
         suffix_tail=lambda model: tail_start[0](model) if tail_start else None,
+        suffix_change=signal_state.change_ms,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -421,7 +357,6 @@ def create_controller_dependencies(
                 evidence_period_ms=cfg.evidence_period_ms,
                 read_instant=False,
                 percentile_mode=cfg.percentile_mode,
-                schema=cfg.metrics_schema,
                 histogram_lookback_ms=0,
                 min_latency_samples=cfg.min_latency_samples,
             ),
@@ -475,6 +410,7 @@ def create_controller_dependencies(
         "slo_mode": cfg.safescale.slo_mode,
         "early_commit": cfg.safescale.early_commit,
         "early_commit_min_evidence_ms": cfg.safescale.early_commit_min_evidence_ms,
+        "rollback_retry_min_evidence_ms": cfg.safescale.rollback_retry_min_evidence_ms,
         "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
     }, sort_keys=True))
     # The effective ablation switches (production: both false).
@@ -546,7 +482,11 @@ def create_controller_dependencies(
         model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,
-        decision_writer=DecisionSnapshotWriter(redis_client),
+        # Decision records: one pipelined round trip per decision, on one worker thread
+        # (in order) - the decision loop never waits for Redis.
+        decision_writer=DecisionSnapshotWriter(
+            redis_client, executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="decision-write")
+        ),
         safescale=safescale,
         registry=registry,
         signal_state=signal_state,

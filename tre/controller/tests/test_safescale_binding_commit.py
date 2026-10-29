@@ -11,11 +11,10 @@ from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue
 from plan_shim import PlanShim  # the in-process service has no plan executor here
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_from_state
-from tre_controller.loops.metrics_task import SnapshotBox
-from tre_controller.loops.rescue_task import rescue_task
+from tre_controller.loops.decision_task import DecisionLoop
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import _commands_to_actions, _idle_gpus, _pods_to_probe
-from tre_controller.planning.planner import ClusterView, TransferIntent
+from tre_controller.planning.planner import ClusterView
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_sm.allocator.slots import Binding, Slot, natural_key
 from tre_sm.api.v2 import ServiceManagerV2
@@ -272,12 +271,6 @@ def test_idle_gpus_counts_gpus_without_awake_binding_from_cluster_view() -> None
     assert _idle_gpus(snapshot, registry, view) == 2
 
 
-class _StopLoop(Exception):
-    pass
-
-
-async def _stop_sleep(_seconds):
-    raise _StopLoop()
 
 
 class _Queue:
@@ -316,29 +309,22 @@ def _run_rescue_once(*, probed: bool) -> list:
     if probed:
         machine.start_probe(model="donor", pods=("donor-3",), now_ms=0)
     queue = _Queue()
-    try:
-        asyncio.run(
-            rescue_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=registry,
-                cfg=type("Cfg", (), {"rescue_interval_s": 5.0})(),
-                sleep=_stop_sleep,
-                cluster_view_box=ClusterViewBox(view),
-                active_probe_models=lambda: _active_probe_models(machine),
-                safescale=machine,
-            )
-        )
-    except _StopLoop:
-        pass
+    DecisionLoop(
+        queue=queue,
+        registry=registry,
+        cfg=type("Cfg", (), {"rescue_interval_s": 5.0, "fairness_interval_s": 10.0})(),
+        cluster_view_box=ClusterViewBox(view),
+        active_probe_models=lambda: _active_probe_models(machine),
+        safescale=machine,
+    ).on_snapshot(snapshot)
     return [action for batch in queue.submitted for action in batch]
 
 
-def test_rescue_task_excludes_actively_probed_model_from_immediate_donors() -> None:
+def test_the_decision_loop_excludes_actively_probed_model_from_immediate_donors() -> None:
     control = _run_rescue_once(probed=False)
     # F1-B (2026-10-07): the HIGH donor is taken through a SafeScale probe (its hide).
     assert any(getattr(action, "model", None) == "donor" for action in control)
-    assert not any(isinstance(action, TransferIntent) for action in control)
+    assert not any(getattr(action, "group", None) for member in control for action in getattr(member, "members", (member,)))
 
     probed = _run_rescue_once(probed=True)
     assert not any(

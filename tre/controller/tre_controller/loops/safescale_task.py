@@ -15,12 +15,11 @@ from tre_common.metrics_schema import (
     observed_requests,
 )
 from tre_common.registry import Registry
-from tre_common.window_pods import pooled_p95_ms
+from tre_common.window_pods import pooled_p95_ms, restrict_to_serving
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import (
     _cluster_view_counts,
     _routable_pod_ids,
-    breakpoint_observation,
     compute_model_signal,
     serving_window,
 )
@@ -35,6 +34,7 @@ from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, DirectPoll
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
+from tre_sm.allocator.slots import natural_key
 
 
 LOG = logging.getLogger("tre_controller.safescale")
@@ -160,8 +160,10 @@ def run_safescale_observation_tick(
         if metrics is None:
             events.append(f"safescale_observation_missing:{probe.model}")
             continue
-        # Same serving-pod window as the planner tick (sleeping pods' docs and count out).
-        metrics = serving_window(metrics, cluster_view)
+        # Same serving-pod window as the planner tick (sleeping and hidden pods' docs and
+        # count out), and the probe's own hidden pods out even when the view does not show
+        # the hide yet (TSS suffix rule 5: the donor is judged on its remaining pods only).
+        metrics = _remaining_window(serving_window(metrics, cluster_view), tuple(getattr(probe, "pods", ())))
         observation = _observation_from_metrics(
             snapshot.ts_ms,
             metrics,
@@ -170,12 +172,6 @@ def run_safescale_observation_tick(
             signal_state=signal_state,
             hidden_pods=tuple(getattr(probe, "pods", ())),
             gateway=(gateway_counters or {}).get(probe.model),
-            # O1: the same routable-count observation the planner tick makes.
-            routable_observation=(
-                breakpoint_observation(cluster_view, queue, probe.model, metrics.window_end_ms)
-                if probe.model in _cluster_view_counts(cluster_view)
-                else None
-            ),
             tail_start_ms=_tail_start_ms(safescale, probe.model),
             # Review L2: the alt signals sum the routable pods (the probe's hidden pods out).
             routable_pod_ids=(
@@ -193,7 +189,7 @@ def run_safescale_observation_tick(
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms, **extra)
         events.append(f"safescale_{decision.reason}:{probe.model}")
         early = (getattr(decision, "details", None) or {}).get("early_commit")
-        if early:
+        if early and getattr(decision, "status", "") == "commit":
             # Timer cleanup (2026-10-02): committed before the probe's deadline.
             events.append(
                 f"safescale_early_commit:{probe.model}:elapsed_ms={int(early.get('elapsed_ms', 0))}"
@@ -673,6 +669,18 @@ def _gate_failures(safescale: SafeScaleObserver, model: str, decision) -> tuple[
     return tuple(_terminal_details(safescale, model).get("gate_failures") or ())
 
 
+def _remaining_window(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...]) -> ModelWindowMetrics:
+    """``metrics`` without the docs of ``hidden_pods`` (a probe's pods), the serving
+    count lowered by those still in it; unchanged when none is."""
+    hidden = set(hidden_pods)
+    present = sum(1 for key, pod in (metrics.per_pod or {}).items() if key in hidden or pod.pod in hidden)
+    if not present:
+        return metrics
+    return restrict_to_serving(
+        metrics, sleeping_pods=hidden_pods, routable_pods=max(0, int(metrics.routable_pods) - present)
+    )
+
+
 def remaining_pods_kv_cache(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...] = ()) -> float | None:
     """A12: mean KV-cache fill (0..1) over the donor's pods that still serve - the
     window's pods (sleeping ones already dropped by serving_window) minus the probe's
@@ -694,41 +702,20 @@ def _observation_from_metrics(
     signal_state: SignalState | None = None,
     hidden_pods: tuple[str, ...] = (),
     gateway: GatewayCounters | None = None,
-    routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
     tail_start_ms: int | None = None,
     routable_pod_ids: frozenset[str] | None = None,
 ) -> ProbeObservation:
-    if signal_state is not None and getattr(signal_state, "breakpoint", None) is not None:
-        # O1: the planner tick's computation (same effective window, same EMA). The hide
-        # is a breakpoint: until the post-hide evidence is warm, Z is the whole window's
-        # raw value (no EMA - never the older, pre-hide-weighted EMA); then the post-hide
-        # window's. Both are at least as strict as the pre-O1 EMA'd straddling Z.
-        computed = compute_model_signal(
-            spec.name,
-            metrics,
-            spec,
-            signal_source=signal_source,
-            signal_state=signal_state,
-            routable_observation=routable_observation,
-            routable_pod_ids=routable_pod_ids,
-        )
-        result, signal = computed.result, computed.signal
-    else:
-        if signal_state is not None:
-            computer = signal_state.computer_for(
-                spec.name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
-            )
-        else:
-            computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-        result = computer.compute(
-            TRSInput.from_metrics(metrics, spec.trs),
-            theta_m=spec.trs.theta_m,
-            window_end_ms=metrics.window_end_ms,
-        )
-        signal = get_signal(
-            metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
-            routable_pod_ids=routable_pod_ids,
-        )
+    # The planner tick's computation: the whole window, the same shared EMA (2026-10-29:
+    # no breakpoint window; the commit gate's post-hide tail is the raw tail below).
+    computed = compute_model_signal(
+        spec.name,
+        metrics,
+        spec,
+        signal_source=signal_source,
+        signal_state=signal_state,
+        routable_pod_ids=routable_pod_ids,
+    )
+    result, signal = computed.result, computed.signal
     return ProbeObservation(
         ts_ms=ts_ms,
         ttft_p95_ms=metrics.ttft_p95_ms,
@@ -772,7 +759,7 @@ def _tail_terms(
     ``tail_start_ms`` (the store builds that suffix, ``MetricsStore(suffix_tail=...)``)
     to the window end; the whole window once the hide precedes it (one metrics window,
     30 s, of post-hide evidence). One value per quantity over that span: raw Z (no
-    EMA, the TSS numerator scaled to a whole window as O1 does), traffic, the remaining
+    EMA, the TSS numerator scaled to a whole window), traffic, the remaining
     pods' KV-cache fill (each pod's mean over its instant docs: time-weighted) and the
     latency p95s; plus its evidence - the observed span (``Observed``, gateway clock)
     and the requests the remaining pods completed in it (unscaled; None = unknown, a
@@ -876,12 +863,21 @@ def _commands_to_actions(
     cluster view (refreshed every ~10 s, so possibly stale - review 4 P2-1): the
     queue resolves it once from the SM's awake count at the first dispatch
     (current + delta, capped at the scaling cap carried here) and freezes it, so
-    a retry is still idempotent. ``cluster_view`` is kept for callers."""
-    del cluster_view
+    a retry is still idempotent. ``cluster_view``: the receivers' hints - their
+    sleeping bindings on the GPUs the donor pods free (L4, design 20261028-single-loop)."""
     actions: list[Action] = []
     donor = next((command for command in commands if command.kind == "scale_down"), None)
+    # A TP block's companion pods (2026-10-29): they sleep in the same plan, before the
+    # receivers wake, and free the rest of the receiver's block.
+    companions = tuple(
+        (command.model, pod) for command in commands if command.kind == "companion_sleep" for pod in command.pods
+    )
+    freed = (tuple(donor.pods) if donor is not None else ()) + tuple(pod for _model, pod in companions)
     upscales = tuple(
-        ReceiverTarget(command.model, int(command.delta), None, _scaling_cap(command.model, registry))
+        ReceiverTarget(
+            command.model, int(command.delta), None, _scaling_cap(command.model, registry),
+            hints=_receiver_hints(cluster_view, command.model, freed, int(command.delta)),
+        )
         for command in commands
         if command.kind == "scale_up" and command.delta > 0
     )
@@ -900,6 +896,7 @@ def _commands_to_actions(
                 drain_budget_s=donor.drain_budget_s,
                 request_id=request_id,
                 decided_ms=decided_ms,
+                companions=companions,
             )
         )
     elif upscales:
@@ -915,6 +912,29 @@ def _commands_to_actions(
             )
         )
     return tuple(actions)
+
+
+def _receiver_hints(
+    cluster_view: ClusterView | None, receiver: str, donor_pods: tuple[str, ...], count: int
+) -> tuple[str, ...]:
+    """Up to ``count`` sleeping, not hidden bindings of ``receiver`` that sit on a GPU of
+    ``donor_pods`` (a TP receiver: its binding on the slot around the donor pod)."""
+    if cluster_view is None or not donor_pods or count <= 0:
+        return ()
+    pods = set(donor_pods)
+    freed = {
+        (binding.slot.node, gpu)
+        for binding in cluster_view.bindings
+        if binding.serve_id in pods
+        for gpu in binding.slot.gpu_ids
+    }
+    hints = [
+        binding.serve_id
+        for binding in sorted(cluster_view.bindings, key=lambda binding: natural_key(binding.serve_id))
+        if binding.model == receiver and not binding.awake and not binding.hidden
+        and any((binding.slot.node, gpu) in freed for gpu in binding.slot.gpu_ids)
+    ]
+    return tuple(hints[:count])
 
 
 def _scaling_cap(model: str, registry: Registry | None) -> int | None:
@@ -945,6 +965,7 @@ def recovered_actions(probe) -> tuple[Action, ...]:
                 request_id=probe.request_id,
                 # B8: aged from the original decision, not from the re-submission.
                 decided_ms=getattr(probe, "committing_ms", None),
+                companions=tuple(getattr(probe, "companions", ()) or ()),
             ),
         )
     return (

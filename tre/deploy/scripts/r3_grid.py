@@ -1328,7 +1328,9 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "campaign passes grid with --step-ms 10000). none: free-phase windows "
                          "from the drive's start, [start, end)")
     ap.add_argument("--redis-url", default=_capture.DEFAULT_REDIS_URL)
-    ap.add_argument("--metrics-schema", default="v1")
+    # The gateway's v2 docs only (the v1 legacy keys are no longer read); kept so existing
+    # command lines (calibration_campaign.py, ttft_idle_capture.py) still parse.
+    ap.add_argument("--metrics-schema", default="v2", choices=["v2"])
     # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
     # An offline rewindow_from_raw of this capture must be passed --instant-sample-ms
     # equal to the value used here. Closed-loop default: the gateway's instant period.
@@ -1618,7 +1620,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         redis_client, registry,
         instant_sample_interval_ms=args.store_instant_sample_ms,
         percentile_mode=args.percentile_mode,
-        schema=args.metrics_schema,
         min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard
     )
     # read_latest_instant takes each pod's newest doc (no lookback) and reports its age.

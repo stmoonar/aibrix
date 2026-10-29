@@ -18,7 +18,7 @@ import pytest
 from tre_common.alt_signals import token_rate_per_replica
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.window_pods import restrict_to_serving
-from tre_controller.loops.rescue_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import serving_window
 from tre_controller.planning.planner import ClusterView
@@ -70,7 +70,7 @@ def _store(pods: dict[str, bool]) -> MetricsStore:
     for pod, busy in pods.items():
         _pod_docs(redis, pod, busy=busy)
     registry = SimpleNamespace(models=lambda: [SimpleNamespace(name="m")])
-    return MetricsStore(redis, registry, instant_sample_interval_ms=P, schema="v2")
+    return MetricsStore(redis, registry, instant_sample_interval_ms=P)
 
 
 def _view(awake: list[str], asleep: list[str]) -> ClusterView:
@@ -81,7 +81,7 @@ def _view(awake: list[str], asleep: list[str]) -> ClusterView:
 
 
 def _read(store: MetricsStore):
-    return store.read_snapshot(END - 30_000, END, use_cache=False, start_exclusive=True)
+    return store.read_snapshot(END - 30_000, END, start_exclusive=True)
 
 
 def test_raw_window_counts_sleeping_pods() -> None:

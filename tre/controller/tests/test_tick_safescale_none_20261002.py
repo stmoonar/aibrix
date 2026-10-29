@@ -23,13 +23,13 @@ class _Client:
 
 
 def test_a_pathless_scale_down_sends_nothing():
-    # (2026-10-02: the former donor/receiver pair is a TransferIntent, which always
-    # carries its sleep path; a path-less shrink is still refused before the SM.)
+    # (A transfer's donor sleeps always carry their sleep path; a path-less shrink is
+    # still refused before the SM.)
     from tre_controller.loops.action_queue import ActionQueue
 
     client = _Client()
     queue = ActionQueue(client)
-    donor = ScaleAction("donor", -1, "critical_same_slot_high_shrink", "rescue", pods=("donor-0",))
+    donor = ScaleAction("donor", -1, "critical_block_high", "rescue", pods=("donor-0",))
     queue.submit((donor,))
     [result] = asyncio.run(queue.drain_once())
     assert client.calls == []
@@ -38,4 +38,4 @@ def test_a_pathless_scale_down_sends_nothing():
     assert queue.stats()["sleep_path_refused_total"] == 1
     assert queue.stats()["dispatch_exceptions_total"] == 0
     # O1 must not see a routable change that never happened.
-    assert queue.routable_changes() == {}
+    assert queue.view_changes() == {}

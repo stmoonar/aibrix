@@ -12,7 +12,7 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import (
     ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams,
 )
-from tre_controller.loops.rescue_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.planning.classify import ModelState
 from tre_controller.planning.planner import ScaleAction
 from tre_controller.signals.trs import SignalState
@@ -103,8 +103,7 @@ def _snap(end: int, z: float | None, *, idle: bool = False) -> MetricsSnapshot:
 
 
 def _tick(state: SignalState, snap: MetricsSnapshot, *, loop=run_rescue_tick, queue=None):
-    return loop(snap, queue=queue or _Queue(), registry=_registry(), signal_state=state,
-                action_cooldown=queue is not None)
+    return loop(snap, queue=queue or _Queue(), registry=_registry(), signal_state=state)
 
 
 def _ups(result) -> list:
@@ -114,8 +113,8 @@ def _ups(result) -> list:
 def test_the_controller_has_no_band_dwell_any_more() -> None:
     # Timer cleanup (2026-10-02): CRITICAL / HIGH act on the first window that shows them,
     # whatever TRE_DWELL_WINDOWS says (it is ignored).
-    state = SignalState(warmup_ms=0)
+    state = SignalState()
     r = _tick(state, _snap(E, 0.3))
     assert r.classifications["m"].state == ModelState.CRITICAL and _ups(r)
     assert not any(e.startswith(("dwell_hold", "receiver_suppressed_dwell")) for e in r.events)
-    assert _tick(SignalState(warmup_ms=0), _snap(E, 2.0)).classifications["m"].state == ModelState.HIGH
+    assert _tick(SignalState(), _snap(E, 2.0)).classifications["m"].state == ModelState.HIGH

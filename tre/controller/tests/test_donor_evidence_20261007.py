@@ -5,8 +5,8 @@
    rolled back waits for new evidence.
 2. F2: an SM call of the controller that changed the fleet refreshes the cluster view
    at once (event-driven; the period is the fallback).
-3. A slot an in-flight probe counts on for its receiver (the free mate of a TP
-   same-slot shrink) is no capacity for any other wake of the plan.
+3. A slot an in-flight probe counts on for its receiver (the rest of the block of a
+   TP block) is no capacity for any other wake of the plan.
 4. F4: while another model is CRITICAL, an early commit does not wait for the hidden
    pods to drain (a cost: their requests are re-issued); every evidence condition
    (samples, one p95 e2e, post-hide grids, gates) stays.
@@ -30,13 +30,12 @@ from tre_controller.planning.planner import (
     PlanConfig,
     SafeScaleCommitAction,
     ScaleAction,
-    ShrinkForSlotAction,
-    TransferIntent,
     build_plan,
     probe_reserved_gpus,
 )
 from tre_controller.planning.safescale import ProbeWindowInputs, SafeScaleDecision
 from tre_sm.allocator.slots import Binding, Slot
+from relay_view import block_takes, relays
 
 from test_controller_transfer_20261002 import D, R, TOPOLOGY, _e1
 from plan_shim import PlanSM
@@ -72,7 +71,7 @@ def _donor_plan(donor_state, receiver_state, *, backoff=None):
 @pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
 def test_a_high_donor_gives_nothing_without_a_probe(receiver_state):
     plan = _donor_plan(ModelState.HIGH, receiver_state)
-    assert not [a for a in plan.actions if isinstance(a, TransferIntent)]
+    assert not relays(plan.actions)
     downs = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == D and a.delta < 0]
     assert downs and all(a.requires_safescale and a.sleep_path is None for a in downs)
     assert plan.probe_upscale_plans.get(D, {}).get(R) == 1
@@ -81,12 +80,18 @@ def test_a_high_donor_gives_nothing_without_a_probe(receiver_state):
 @pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
 def test_an_idle_donor_is_still_released_at_once(receiver_state):
     plan = _donor_plan(ModelState.IDLE, receiver_state)
-    [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
+    [relay] = relays(plan.actions)
     assert (relay.donor_model, relay.receiver_model, relay.sleep_path) == (D, R, "urgent")
 
 
-@pytest.mark.parametrize("donor_state", [ModelState.HIGH, ModelState.HEALTHY], ids=["high", "middle_zone"])
-@pytest.mark.parametrize("receiver_state", [ModelState.CRITICAL, ModelState.LOW], ids=["rescue", "fairness"])
+# (No fairness + middle-zone case since 2026-10-29: a HEALTHY donor never gives to a
+# LOW receiver - test_tss_only_20261029.)
+@pytest.mark.parametrize(
+    ("receiver_state", "donor_state"),
+    [(ModelState.CRITICAL, ModelState.HIGH), (ModelState.CRITICAL, ModelState.HEALTHY),
+     (ModelState.LOW, ModelState.HIGH)],
+    ids=["rescue-high", "rescue-middle_zone", "fairness-high"],
+)
 def test_a_donor_whose_probe_rolled_back_waits_for_new_evidence(receiver_state, donor_state):
     plan = _donor_plan(donor_state, receiver_state, backoff={D: "same_evidence"})
     assert not [a for a in plan.actions if getattr(a, "model", None) == D or getattr(a, "donor_model", None) == D]
@@ -122,8 +127,10 @@ def _slot_plan(view: ClusterView, *, crit_tp2: bool, active=(), backoff=None, pr
 
 
 def _slot_bindings(*, hidden: bool) -> tuple[Binding, ...]:
-    # high-0 holds node-a/0; its pair mate node-a/1 is free - only low sleeps there.
+    # high-0 holds node-a/0; its pair mate node-a/1 is free - only low sleeps there
+    # (and tp2's binding on the pair).
     return (
+        Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
         Binding("high-0", "high", Slot("node-a", (0,)), awake=True, hidden=hidden),
         Binding("high-2", "high", Slot("node-a", (2,)), awake=True),
         Binding("low-3", "low", Slot("node-a", (3,)), awake=True),
@@ -135,20 +142,19 @@ def _woken(plan) -> set[str]:
     return {pod for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0 for pod in a.pods}
 
 
-def test_the_slot_mate_of_a_same_slot_shrink_is_not_woken_into_in_the_same_plan():
+def test_the_free_gpu_of_a_tp_block_is_not_woken_into_in_the_same_plan():
     view = ClusterView(TOPO_A, _slot_bindings(hidden=False))
     plan = _slot_plan(view, crit_tp2=True)
-    [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
-    assert (shrink.serve_id, shrink.beneficiary) == ("high-0", "tp2")
+    assert [(pod, receiver) for _, receiver, pod in block_takes(plan.actions)] == [("high-0", "tp2")]
     assert "low-s" not in _woken(plan)
     # control: without the TP receiver, LOW does wake into the free GPU
     assert "low-s" in _woken(_slot_plan(view, crit_tp2=False))
 
 
-def test_a_same_slot_shrink_is_not_retried_on_the_evidence_that_rolled_it_back():
+def test_a_block_probe_is_not_retried_on_the_evidence_that_rolled_it_back():
     view = ClusterView(TOPO_A, _slot_bindings(hidden=False))
     plan = _slot_plan(view, crit_tp2=True, backoff={"high": "same_evidence"})
-    assert not [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
+    assert not block_takes(plan.actions)
     assert not [a for a in plan.actions if getattr(a, "model", None) == "high"]
     assert "safescale_rollback_hold:high:same_evidence" in plan.events
 
@@ -317,9 +323,9 @@ def _busy(h: _CriticalHarness) -> _CriticalHarness:
 
 def test_a_critical_model_waives_the_hidden_drain_only():
     at, decision = _busy(_CriticalHarness(critical=("r",))).run_until(HIDE + LONG_W, serve=5)[-1]
-    # The evidence floor (20 samples, two post-hide grids 110-130 s) -> the 131 s poll,
+    # The evidence floor (settle_ms = 10 s after the hide, 20 samples) -> the 121 s poll,
     # although the hidden pod is not drained.
-    assert (at, decision.status) == (131_000, "commit")
+    assert (at, decision.status) == (121_000, "commit")
     early = decision.details["early_commit"]
     assert early["critical_receivers"] == ["r"] and early["hidden_drained"] is False
 

@@ -9,7 +9,7 @@ FALLBACK_TTL_SECONDS = 2 * 60 * 60
 #   controller's per-pod coverage flag counts on this grid (env
 #   TRE_INSTANT_SAMPLE_INTERVAL_MS, gateway and controller).
 # * EVIDENCE_PERIOD_MS - tre:v2:hist docs (token / latency histograms) and the legacy
-#   aibrix:pod_*_metrics_* keys; the controller's phase-aligned window grid, O1 grid and
+#   aibrix:pod_*_metrics_* keys; the controller's phase-aligned window grid and the
 #   SafeScale evidence step (env TRE_EVIDENCE_PERIOD_MS, gateway and controller). A
 #   multiple of the instant period; the metrics window must be a multiple of both.
 #
@@ -29,7 +29,6 @@ LEGACY_GRID_MS = SCRAPE_INTERVAL_MS
 # by the gateway in the MULTI of every round (review round 1, M4/L6).
 GATEWAY_CADENCE_KEY = "tre:v2:gateway:cadence"
 
-DECISION_LATEST_KEY = "tre:v2:decision:latest"
 # S5.1: per-model decision time-series (score = window_end_ms). Backs the UI timelines
 # and post-hoc experiment analysis. Retained ~24h with a TTL backstop.
 DECISION_HIST_RETENTION_MS = 24 * 60 * 60 * 1000
@@ -45,6 +44,10 @@ SM_WRITER_QUEUE_KEY = "tre:v2:sm:writer_queue"
 SM_WRITER_QUEUE_DEADLINES_KEY = "tre:v2:sm:writer_queue_deadlines"
 SM_WRITER_QUEUE_SEQ_KEY = "tre:v2:sm:writer_queue_seq"
 SM_OPERATIONS_KEY = "tre:v2:sm:operations"
+#: Ids of the journal records whose status is ``running`` (a set kept by the
+#: writer-lock Lua scripts on every state change; the supervisor reads only
+#: these, not the whole journal - 10-28: HLEN ~20k, 15 MB per HGETALL).
+SM_RUNNING_OPERATIONS_KEY = "tre:v2:sm:operations:running"
 SM_DESIRED_KEY = "tre:v2:sm:desired"
 SM_DESIRED_VERSION_KEY = "tre:v2:sm:desired_version"
 SM_OBSERVED_KEY = "tre:v2:sm:observed"

@@ -22,6 +22,7 @@ echo "[reset] archiving + clearing Redis decision snapshot"
 kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli --scan --pattern 'tre:v2:decision:*' \
   | while read -r k; do kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli DUMP "$k" >/dev/null 2>&1 || true; done
 kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli --scan --pattern 'tre:v2:decision:*' > "${ARCHIVE_DIR}/decision_keys_${STAMP}.txt" 2>/dev/null || true
+# Legacy cleanup: the controller no longer writes tre:v2:decision:* (removed 2026-10-28); kept for older Redis state.
 kubectl -n tre-v2 exec deploy/tre-v2-redis -- sh -c "redis-cli --scan --pattern 'tre:v2:decision:*' | xargs -r redis-cli DEL" >/dev/null 2>&1 || \
   kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli DEL tre:v2:decision:latest >/dev/null 2>&1 || true
 

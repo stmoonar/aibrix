@@ -6,7 +6,7 @@
 * P3: a hide that did not take effect (not sent in observe, or failed) returns
   ok=False and rolls its probe back instead of leaving it judged as hidden;
 * planner: several receivers' sleeping wakes are assigned jointly (no greedy
-  slot stealing); the same-slot HIGH shrink only looks at awake bindings; a bad
+  slot stealing); a TP block only looks at awake bindings; a bad
   or missing tp_size raises instead of falling back to tp 1;
 * metrics: the model e2e p95 merges the pods' histograms before the
   minimum-samples gate.
@@ -32,9 +32,10 @@ from tre_controller.planning.planner import (
     PlanConfig,
     ScaleAction,
     UnhideAction,
+    BlockDonor,
     _SlotOccupancy,
-    _try_plan_same_slot_high_shrink,
     build_plan,
+    cheapest_block,
 )
 from tre_controller.store.metrics_store import MetricsStore
 from tre_controller.store.state_store import ControllerStateStore
@@ -303,24 +304,23 @@ def test_joint_wakes_do_not_let_one_receiver_steal_the_only_slot_of_another():
     assert not any(e.startswith("critical_sleeping_blocked") for e in plan.events)
 
 
-def test_same_slot_high_shrink_ignores_sleeping_bindings():
+def test_a_tp_block_ignores_sleeping_bindings():
     bindings = (
         Binding("high-0", "high", Slot("n", (0,)), awake=True),
         Binding("other-1", "other", Slot("n", (1,)), awake=False),  # sleeping: not occupancy
         Binding("high-2", "high", Slot("n", (2,)), awake=False),  # sleeping: never a donor
+        Binding("tp2-01", "tp2", Slot("n", (0, 1)), awake=False),
     )
-    shrink = _try_plan_same_slot_high_shrink(
-        classifications=[_cls("high", ModelState.HIGH, ModelRole.DONOR, 2.0, "surplus")],
-        model_contexts={"high": {"routable_pods": 2, "assigned_replicas": 2}},
-        model_replicas={"high": 2},
-        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=4, model_tp_sizes={"tp2": 2, "high": 1}),
-        cluster_view=ClusterView(ONE_NODE, bindings),
-        receiver="tp2",
-        active_probe_models=set(),
-        inflight_models=set(),
-        source_loop="rescue",
+    view = ClusterView(ONE_NODE, bindings)
+    choice = cheapest_block(
+        "tp2",
+        _SlotOccupancy(view),
+        view,
+        {"high": BlockDonor(tier=2, z=2.0, limit=1)},
+        PlanConfig(min_replicas_per_model=0, max_replicas_per_model=4, model_tp_sizes={"tp2": 2, "high": 1}),
     )
-    assert shrink is not None and shrink.serve_id == "high-0"
+    assert choice is not None and choice.sleeps == (("high", "high-0"),)
+    assert choice.binding.serve_id == "tp2-01"
 
 
 def test_bad_or_missing_tp_size_raises_instead_of_falling_back():

@@ -181,12 +181,6 @@ class PlanShim:
 
     async def _wake(self, item: dict) -> dict:
         model = item["model"]
-        if item.get("donors"):
-            donor = item["donors"][0]
-            response = await self._legacy(
-                "transfer", donor["model"], model, int(donor["max"]), sleep_path=donor.get("sleep_path", "urgent")
-            )
-            return self._transfer_item(response, donor["model"])
         hinted_by_power = item.get("hints") and not callable(getattr(self.inner, "scale_model_hinted", None))
         if item.get("pods") or hinted_by_power:
             # Named wakes; a fake without a hinted call wakes the hints by binding power
@@ -223,31 +217,6 @@ class PlanShim:
             status = "refused"
         return {"status": status, "woke": woke, "unfilled": unfilled,
                 "refusals": list(body.get("refusals") or ())}
-
-    def _transfer_item(self, response: dict, donor: str) -> dict:
-        body = response.get("response") if isinstance(response.get("response"), dict) else None
-        if body is None:
-            return {**_failed_item(response), "woke": []}
-        self._plan_id = body.get("transfer_id")
-        woke, failed = [], False
-        for pair in body.get("pairs") or ():
-            if not isinstance(pair, dict):
-                continue
-            if pair.get("status") == "done":
-                woke.append({"serve_id": pair.get("receiver"), "node": pair.get("node"),
-                             "gpu_ids": list(pair.get("gpu_ids") or ()), "source": "donor",
-                             "donor_binding_ids": list(pair.get("donors") or [pair.get("donor")])})
-            elif pair.get("status") == "receiver_wake_failed":
-                failed = True
-        taken = int(body.get("taken") or 0)
-        unfilled = int(body.get("unfilled") or 0)
-        status = "done" if woke and not unfilled and not failed else "partial" if woke else (
-            "failed" if failed else "refused")
-        return {"status": status, "woke": woke, "unfilled": unfilled,
-                "donors_slept": [{"model": donor, "status": "slept"}] * taken,
-                "clamped_by_floor": bool(body.get("clamped_by_floor")),
-                "refusals": list(body.get("refusals") or ()), "skipped": dict(body.get("skipped") or {})}
-
 
 class LegacyFakeQueue(ActionQueue):
     """An ActionQueue whose pre-plan fake client is wrapped in a :class:`PlanShim`
@@ -322,13 +291,6 @@ def done_plan(request: dict, awake: dict[str, int] | None = None, *, plan_id: st
             names = [f"{model}-w{i}" for i in range(awake.get(model, 0), int(item["at_least"]))]
         woke = [{"serve_id": name, "node": "n", "gpu_ids": [i], "wave": 1, "source": "free"}
                 for i, name in enumerate(names)]
-        donors_slept = []
-        if item.get("donors"):
-            donor = item["donors"][0]["model"]
-            for entry in woke:
-                entry.update({"source": "donor", "wave": 2, "donor_binding_ids": [f"{donor}/n/{entry['gpu_ids'][0]}"]})
-                donors_slept.append({"model": donor, "binding_id": f"{donor}/n/{entry['gpu_ids'][0]}",
-                                     "status": "slept"})
         wakes.append({"index": index, "model": model, "status": "done", "woke": woke,
-                      "donors_slept": donors_slept, "unfilled": 0, "refusals": []})
+                      "unfilled": 0, "refusals": []})
     return {"plan_id": plan_id, "status": "done", "sleeps": sleeps, "wakes": wakes}

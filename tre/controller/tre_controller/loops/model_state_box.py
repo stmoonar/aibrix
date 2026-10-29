@@ -1,6 +1,7 @@
 """Latest per-model signal state of the planner ticks (review 3 P2-1..P2-3).
 
-The rescue / fairness ticks publish their classifications here; the ActionQueue
+The decision loop (2026-10-28: one loop, rescue + rebalance sections) publishes its
+classifications here; the ActionQueue
 reads them to revalidate a one-shot SafeScale commit before every (re)try (the
 donor needing capacity again abandons the commit, a receiver that no longer
 needs capacity loses its upscale).
@@ -11,8 +12,8 @@ from __future__ import annotations
 import time
 from typing import Callable, Mapping
 
-#: A receiver the planner would not act on this tick (signal still warming up,
-#: band dwell not yet confirmed): neither "needs" nor "does not need" capacity.
+#: A model whose level is not of the current window (a held context: tokens missing):
+#: neither "needs" nor "does not need" capacity.
 UNCONFIRMED = "unconfirmed"
 
 
@@ -39,16 +40,10 @@ class ModelStateBox:
         contexts = contexts or {}
         for model, item in classifications.items():
             state = getattr(getattr(item, "state", None), "value", None) or str(getattr(item, "state", ""))
-            role = getattr(getattr(item, "role", None), "value", None)
             ctx = contexts.get(model) or {}
-            if role == "receiver" and (
-                not ctx.get("signal_warm", True)
-            ):
-                state = UNCONFIRMED
-            elif ctx.get("signal_hold_reason") is not None:
-                # Not a level of the current window's full evidence (O1 breakpoint,
-                # tokens missing -> held context, a stale pod scrape): the planner takes
-                # no donor from it, but a receiver may still act on it (step-capped).
+            if ctx.get("sample_quality_hold") == "tokens_missing":
+                # A held context (tokens missing): not a level of the current window -
+                # the planner takes no donor from it, a receiver may still act on it.
                 state = UNCONFIRMED
             previous = self._states.get(model)
             if previous is None or previous[1] <= int(ts_ms):

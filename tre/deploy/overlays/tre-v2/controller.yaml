@@ -25,7 +25,7 @@ spec:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: controller
-          image: tre-v2-controller:20261028-e891d29b
+          image: tre-v2-controller:20261029-d9fa1571
           imagePullPolicy: IfNotPresent
           env:
             - name: TRE_REDIS_URL
@@ -70,30 +70,41 @@ spec:
             # on tre-gateway-plugins (the gateway declares them in tre:v2:gateway:cadence; a
             # mismatch marks the snapshots stale). Instant docs (queue gauges): the per-pod
             # coverage grid.
-            # Evidence period (histogram docs): the sampler grid, O1 grid, SafeScale
+            # Evidence period (histogram docs): the sampler grid, the SafeScale
             # evidence step. The metrics window must be a multiple of both.
+            # 2026-10-28: 1 s (was 2 s; code default still 2 s): one snapshot per second,
+            # so the 5 s rescue / 10 s rebalance sections land exactly on the grid, and
+            # the windows match the theta calibration (1 Hz counters, 20 s windows).
+            # Changes together with the gateway's value (else every snapshot is stale).
             - name: TRE_INSTANT_SAMPLE_INTERVAL_MS
               value: "500"
             - name: TRE_EVIDENCE_PERIOD_MS
-              value: "2000"
+              value: "1000"
             # D8 (09-22): phase-aligned sampler. Sleeps to the next evidence boundary +
-            # offset and reads (boundary-30s, boundary]: a full 30 s token span per
+            # offset and reads (boundary-W, boundary]: a full W token span per
             # window, one new snapshot per evidence period. The offset (default
             # min(2 s, evidence period / 2), TRE_METRICS_PHASE_OFFSET_MS) is a floor: the
-            # sampler re-reads until the boundary tick exists and adapts.
+            # sampler re-reads every TRE_METRICS_PHASE_RETRY_MS until the boundary round
+            # exists (or the next boundary is due) and adapts.
             # free_running = the old refresh loop (TRE_METRICS_REFRESH_INTERVAL_SECONDS +
             # TRE_METRICS_WINDOW_MODE).
             - name: TRE_METRICS_REFRESH_MODE
               value: phase_aligned
             # Pinned; must stay below TRE_EVIDENCE_PERIOD_MS (min(2 s, period / 2)).
             - name: TRE_METRICS_PHASE_OFFSET_MS
-              value: "1000"
+              value: "500"
+            # Re-read period while the boundary round is missing (code default 500 ms).
+            # 250 at the 1 s period: offset + retry < period leaves one re-read per
+            # window (500 would give the window up after the first read) and lets the
+            # offset adapt up to period - retry = 750 ms.
+            - name: TRE_METRICS_PHASE_RETRY_MS
+              value: "250"
             # Only used by TRE_METRICS_REFRESH_MODE=free_running.
             - name: TRE_METRICS_REFRESH_INTERVAL_SECONDS
               value: "5"
-            # Fixed timers (2026-10-25): the fast loop every 5 s, the slow loop every 10 s;
-            # each reads the latest snapshot (every 2 s: at most ~2 s old). A re-read of one
-            # window advances neither the EMA nor any time-span rule.
+            # Single decision loop (2026-10-28): woken by each published snapshot, it runs
+            # the rescue section after 5 s and the rebalance section after 10 s of
+            # observation time since their last runs, in one planner call.
             - name: TRE_RESCUE_INTERVAL_SECONDS
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
@@ -139,15 +150,9 @@ spec:
             # (TRE_FLOOR_VIOLATION_COOLDOWN_TICKS was removed on 2026-10-02: the controller
             # bounds donors by the service-manager floor_headroom; a set value is logged once
             # and ignored, never validated - docs/design/20261002-controller-transfer.md.)
-            # Review F4 action cooldown, a FALLBACK since the timer cleanup (2026-10-02,
-            # docs/design/20261002-timer-cleanup.md): it holds a model until a metrics
-            # window starts after its last action only while O1 (registry
-            # scaling.breakpoint_window) does not track the model - O1 off or suspended
-            # by the gateway clock check, no fleet view, stale-held context. With O1
-            # active the routable-count change is a breakpoint and holds the model until
-            # post-change evidence exists. "0" also disables the fallback.
-            - name: TRE_ACTION_COOLDOWN
-              value: "1"
+            # TRE_ACTION_COOLDOWN / TRE_SIGNAL_WARMUP_MS are not set: the F4 window
+            # cooldown and the onset warmup guard were removed with O1 (2026-10-29, design
+            # docs/design/20261029-tss-only.md); a set value is logged once and ignored.
             # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
             - name: SAFE_SCALE_KV_CACHE_MAX
               value: "0.8"
@@ -170,7 +175,7 @@ spec:
             # --- Ablation switches (D4); production defaults ---
             # (The scaling on/off env switch was removed 2026-10-07: actuation follows the
             # run mode tre:v2:controller:mode only.)
-            # SLOW_LOOP: one snapshot-aligned loop runs every decision (no fairness loop).
+            # SLOW_LOOP: the decision loop never runs the rebalance section (LOW gets nothing).
             # SAFESCALE: no probes - every probe shrink is released immediately (urgent).
             - name: TRE_ABLATION_DISABLE_SLOW_LOOP
               value: "false"

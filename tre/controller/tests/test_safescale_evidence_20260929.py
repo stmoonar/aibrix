@@ -629,10 +629,6 @@ def test_clock_only_anchors_fail_closed_with_an_evidence_source() -> None:
     _started(machine)
     assert machine.active_probe(MODEL).hide_anchor.newest_doc_error is True
     assert machine.observe(MODEL, _obs(110_000), now_ms=110_000).reason == "evidence_clock_skew"
-    # Legacy v1 metric keys carry no gateway stamps to anchor on: unverifiable too.
-    store = MetricsStore(DocRedis(), _slo_registry(), instant_sample_interval_ms=10_000, schema="v1",
-                         histogram_lookback_ms=0)
-    assert MetricsEvidenceReader(store, redis_client=DocRedis()).hide_anchor(MODEL).newest_doc_error is True
 
 
 def test_no_doc_of_any_remaining_pod_by_the_ceiling_rolls_back_instead_of_committing() -> None:

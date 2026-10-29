@@ -6,8 +6,9 @@ offset - is rendered into gateway docs at a given evidence period P (instant doc
 0.5 s, histogram docs every P, ``scraped_ms`` 50 ms before the write, the cadence hash
 with ``last_hist_ms``; every gateway stamp on the gateway clock = controller clock +
 ``gateway_offset_ms``) and run through the real controller path: MetricsStore ->
-PhaseAlignedSampler -> the rescue (5 s) / fairness (10 s) planner ticks
-(``loops/replay.py``, one SignalState and PaperStateCache per run) -> SafeScale
+PhaseAlignedSampler -> the single decision loop (``loops/decision_task.py``: on each
+published snapshot, the rescue section after 5 s and the rebalance section after 10 s
+of observation time; one SignalState and PaperStateCache per run) -> SafeScale
 observation ticks (2 s; with ``direct``, the direct evidence path: the real
 DirectEvidenceCollector scraping the sim pods, early commit on). A mock SM applies every
 action at once (relay, wake, sleep, hide, unhide), so the load follows the decisions.
@@ -31,15 +32,16 @@ from dataclasses import dataclass, field, replace
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.metrics_task import PhaseAlignedSampler, SnapshotBox, default_phase_offset_ms
-from tre_controller.loops.replay import TickReplayStep, run_tick_replay
+from tre_controller.loops.action_queue import PlanBatch
+from tre_controller.loops.decision_task import DecisionLoop
+from tre_controller.loops.replay import _active_probe_models
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
-from tre_controller.loops.tick import PaperStateCache
-from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, TransferIntent, UnhideAction
+from tre_controller.loops.tick import run_planner_tick
+from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
 from tre_controller.planning.safescale_evidence import HideAnchor
-from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
-from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
+from tre_controller.signals.trs import SignalState
 from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
 from tre_sm.allocator.slots import Binding, Slot
@@ -49,7 +51,7 @@ WINDOW = 30_000
 T0 = 1_000_000_000_000  # epoch-aligned: every period divides it
 MAX_RUNNING = 16
 #: Tokens per request: d's long answers take ~20 s, so an onset on d completes nothing
-#: for a while (the TSS numerator is 0: the onset saturation rescue decides).
+#: for a while (the TSS numerator is 0 while the queue grows: Z = 0, CRITICAL).
 OUTPUT_TOKENS = {"r": 200.0, "d": 2000.0}
 PROMPT_TOKENS = 500.0
 TTFT_BOUNDS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
@@ -84,8 +86,6 @@ class Scenario:
     gateway_offset_ms: int = 0
     #: SafeScale on the direct evidence path (early commit on).
     direct: bool = False
-    #: O1 (``scaling.breakpoint_window``) on.
-    o1: bool = True
     #: SafeScale's TPOT p95 threshold (config mode).
     tpot_slo_ms: float = 100.0
 
@@ -164,32 +164,36 @@ class _Queue:
     def inflight_models(self) -> set:
         return set()
 
-    def routable_changes(self) -> dict:
-        """When the last call that could change each model's routable count returned
-        (``ActionQueue.routable_changes``): the O1 breakpoint hint."""
-        return dict(self._sim.changes)
-
     def submit(self, actions):
         actions = tuple(actions)
         for action in actions:
             self._sim.apply(action)
         return SimpleNamespace(accepted=len(actions), submitted=len(actions))
 
+    def view_changes(self) -> dict:
+        """model -> (when the mock SM applied its last routable change, direction), as
+        ``ActionQueue.view_changes``: the TSS suffix dates a change of ours there."""
+        return dict(self._sim.changes)
+
 
 @dataclass
 class Run:
     """What one run did: (sim time ms, event) - the planner loops' events prefixed
     ``rescue|`` / ``fairness|``, the SafeScale observation events, the mock SM's applied
-    actions, ``hold:<model>:<O1 hold reason>`` per planner tick, ``stale`` - and the
+    actions, ``stale`` - and the
     probe verdicts in order."""
 
     events: list = field(default_factory=list)
     verdicts: list = field(default_factory=list)
+    #: (controller ms, rescue section ran, rebalance section ran) per planner call.
+    sections: list = field(default_factory=list)
 
 
 class Sim:
-    def __init__(self, scenario: Scenario, period_ms: int) -> None:
+    def __init__(self, scenario: Scenario, period_ms: int, jitter_ms: int = 0) -> None:
         self.scenario, self.period = scenario, int(period_ms)
+        #: +- ms of scrape jitter on every observation stamp (``scraped_ms``).
+        self.jitter = int(jitter_ms)
         self.registry = registry()
         self.redis = FastRedis()
         self.pods = [_Pod(f"{m}-{g}", m, g, awake=scenario.awake[g] == m) for g in range(4) for m in MODELS]
@@ -198,18 +202,12 @@ class Sim:
         self.now = T0
         self.rendered = T0 - WINDOW - 2 * self.period
         self.run = Run()
-        self.changes: dict = {}  # model -> (ms, routable direction) of the last applied action
+        #: model -> (controller ms, "up" / "down") of the last routable change applied.
+        self.changes: dict[str, tuple[int, str]] = {}
         cfg = ControllerConfig.from_env({})
-        self.rescue_ms = int(cfg.rescue_interval_s * 1000)
-        self.fairness_ms = int(cfg.fairness_interval_s * 1000)
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
         self.offset = int(scenario.gateway_offset_ms)
-        breakpoint = BreakpointWindowConfig.from_registry(self.registry)
-        self.signal_state = SignalState(
-            warmup_ms=cfg.signal_warmup_ms,
-            breakpoint=breakpoint if scenario.o1 else replace(breakpoint, enabled=False),
-            saturation=SaturationTracker(SaturationRescueConfig.from_registry(self.registry)),
-        )
+        self.signal_state = SignalState()
         slo = dict(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=float(scenario.tpot_slo_ms))
         self.collector = None
         if scenario.direct:
@@ -233,15 +231,30 @@ class Sim:
             expected_cadence=(INSTANT, self.period), cadence_enforce=True,
             min_sample_ratio=float(self.registry.scaling().sample_min_ratio or 0.0),
             suffix_period_ms=self.period,
-            suffix_breakpoint=lambda m: self.signal_state.breakpoint_ms(m) if self.signal_state.o1_active else None,
             suffix_tail=self.safescale.tail_start_ms,
+            # TSS suffix (2026-10-29): the suffix after each model's last pod-set change.
+            suffix_change=self.signal_state.change_ms,
         )
         self.box = SnapshotBox()
         self.queue = _Queue(self)
-        self.papers = {loop: PaperStateCache(max_stale_ms=cfg.paper_stale_max_ms) for loop in ("rescue", "fairness")}
+        #: (rescue due, rebalance due) of the last planner call (None: no call).
+        self._sections: tuple[bool, bool] | None = None
+
+        def tick(snapshot, **kwargs):
+            self._sections = (bool(kwargs["rescue_due"]), bool(kwargs["fairness_due"]))
+            return run_planner_tick(snapshot, **kwargs)
+
+        self.decisions = DecisionLoop(
+            queue=self.queue, registry=self.registry, cfg=cfg,
+            cluster_view_box=SimpleNamespace(get=self.view),
+            active_probe_models=lambda: set(_active_probe_models(self.safescale)),
+            safescale=self.safescale, signal_state=self.signal_state,
+            producer_ms=self.period, tick=tick,
+        )
+        self._seen_version = 0
 
         async def fetch(start, end):
-            return self.store.read_snapshot(start, end, use_cache=False, start_exclusive=True)
+            return self.store.read_snapshot(start, end, start_exclusive=True)
 
         self.sampler = PhaseAlignedSampler(
             self.store, self.box, window_ms=WINDOW, period_ms=self.period,
@@ -287,7 +300,8 @@ class Sim:
             return
         ts = ts + self.offset  # every gateway stamp is on the gateway clock
         for pod in self.pods:
-            base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod.name, "scraped_ms": ts - 50}
+            jitter = random.Random(f"jitter:{pod.name}:{ts}").randint(-self.jitter, self.jitter) if self.jitter else 0
+            base = {"timestamp": ts, "written_ms": ts + 5, "pod_name": pod.name, "scraped_ms": ts - 50 + jitter}
             running, waiting, kv = pod.gauges
             self.redis.zadd(f"tre:v2:inst:default/{pod.name}", {**base, "model_metrics": {
                 f"{pod.model}/num_requests_running": running, f"{pod.model}/num_requests_waiting": waiting,
@@ -329,34 +343,32 @@ class Sim:
             free[0].awake = True
 
     def apply(self, action) -> None:
+        if isinstance(action, PlanBatch):  # a transfer (TP block, relay pair): its items in order
+            for member in action.members:
+                self.apply(member)
+            return
         t = self.now
-        if isinstance(action, TransferIntent):
-            self.changes[action.donor_model] = (t, -1)
-            self.changes[action.receiver_model] = (t, 1)
-        elif isinstance(action, (ScaleAction, HideAction, UnhideAction)):
-            up = isinstance(action, UnhideAction) or (isinstance(action, ScaleAction) and action.delta > 0)
-            self.changes[action.model] = (t, 1 if up else -1)
-        if isinstance(action, TransferIntent):
-            donors = sorted((p for p in self.pods if p.model == action.donor_model and p.awake and not p.hidden),
-                            key=lambda p: -p.gpu)[: int(action.count)]
-            for pod in donors:
-                pod.awake = False
-                self._wake(action.receiver_model, pod.gpu)
-            self.run.events.append((t, f"relay:{action.donor_model}->{action.receiver_model}:{len(donors)}"))
-        elif isinstance(action, ScaleAction) and action.delta > 0:
-            for _ in range(action.delta):
-                self._wake(action.model)
+        if isinstance(action, ScaleAction) and action.delta > 0:
+            if action.pods:  # a named wake (sm-plans section 10)
+                for name in action.pods:
+                    self._wake(action.model, self._pod(name).gpu)
+            else:
+                for _ in range(action.delta):
+                    self._wake(action.model)
             self.run.events.append((t, f"scale_up:{action.model}:{action.delta}"))
+            self.changes[action.model] = (t, "up")
         elif isinstance(action, ScaleAction):
             pods = [self._pod(n) for n in action.pods] or sorted(
                 (p for p in self.pods if p.model == action.model and p.awake), key=lambda p: -p.gpu)[: -action.delta]
             for pod in pods:
                 pod.awake, pod.hidden = False, False
             self.run.events.append((t, f"scale_down:{action.model}:{len(pods)}"))
+            self.changes[action.model] = (t, "down")
         elif isinstance(action, HideAction):
             for name in action.pods:
                 self._pod(name).hidden = True
             self.run.events.append((t, f"hide:{action.model}"))
+            self.changes[action.model] = (t, "down")
             if self.collector is not None:
                 # The SM confirmed the hide (ActionQueue on_hide_done): anchor + baseline.
                 self.collector.on_hide_done(action.model, tuple(action.pods))
@@ -364,6 +376,7 @@ class Sim:
             for name in set(action.pods) - set(action.keep_hidden):
                 self._pod(name).hidden = False
             self.run.events.append((t, f"unhide:{action.model}"))
+            self.changes[action.model] = (t, "up")
 
     # ---------------------------------------------------------------- the controller
 
@@ -386,20 +399,20 @@ class Sim:
                 if event.startswith(("safescale_formal_commit_gate", "safescale_slo_violation",
                                      "safescale_early_commit")):
                     self.run.verdicts.append(event)
-        for loop, due in (("rescue", self.rescue_ms), ("fairness", self.fairness_ms)):
-            if (t - T0) % due:
-                continue
-            step = TickReplayStep(snapshot=snapshot, rescue_due=loop == "rescue", fairness_due=loop == "fairness",
-                                  cluster_view=self.view())
-            replay = run_tick_replay([step], registry=self.registry, safescale=self.safescale,
-                                     signal_state=self.signal_state, paper_state_cache=self.papers[loop],
-                                     queue=self.queue)
-            for event in replay.events:
-                self.run.events.append((t, f"{loop}|{event}"))
-            for result in replay.results:
-                for model, context in (result.model_contexts or {}).items():
-                    # O1: the reason the model's window decides nothing (None = it decides).
-                    self.run.events.append((t, f"hold:{model}:{context.get('signal_hold_reason')}"))
+        if self.box.version == self._seen_version:
+            return
+        self._seen_version = self.box.version  # a new snapshot was published
+        self._sections = None
+        result = self.decisions.on_snapshot(snapshot)
+        if result is None:
+            return
+        rescue = True
+        if self._sections is not None:  # the planner ran (sections due, a cluster view)
+            rescue, rebalance = self._sections
+            self.run.sections.append((t, rescue, rebalance))
+        loop = "rescue" if rescue else "fairness"
+        for event in result.events:
+            self.run.events.append((t, f"{loop}|{event}"))
 
     async def _advance(self, until: int) -> None:
         while self.now < until:

@@ -6,8 +6,8 @@ Run by run_arm_pilot.sh after the load, next to the signal_log / SafeScale dump:
 * ``decision_hist.jsonl`` - the controller's per-model decision history
   (``tre:v2:decision:hist:<model>``, ZSET scored by window_end_ms, kept ~24 h): one line per
   member from 60 s before the controller restart on, sorted by (score, model). The same model
-  states as the ``trs_calc_result`` lines of controller.log (Z, TSS, queue, O1 window,
-  ``signal_hold_reason``, ``sample_quality_hold``, saturation), kept as a second copy when the
+  states as the ``trs_calc_result`` lines of controller.log (Z, TSS, queue,
+  ``sample_quality_hold``; before 2026-10-29 also the O1 window and saturation fields), kept as a second copy when the
   container log is rotated or truncated. Models: ``MODELS`` (comma list).
 * ``sm_operations.jsonl`` - the SM operations journal (HASH ``tre:v2:sm:operations``: kind,
   actor, status, phases_ms of every wake / sleep / target change), the records started 60 s

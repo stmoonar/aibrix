@@ -16,8 +16,6 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_controller.loops.tick import PaperStateCache, run_planner_tick
 from tre_controller.planning.classify import ModelState, classify_all_models
 from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
-from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
-from tre_controller.signals.trs import SignalState
 from tre_controller.store.metrics_store import MetricsStore
 from tre_sm.allocator.slots import Binding, Slot
 
@@ -28,7 +26,6 @@ def _ctx(z_m: float | None, y_m: float, q: float) -> dict:
         "tss_defined": True, "Y_m": y_m, "y_m": y_m, "Q": q, "Q_ctl": max(q, 1.0),
         "signal_source": "zm", "signal_unavailable_reason": None, "request_rate_rps": 5.0 if y_m else 0.0,
         "routable_pods": 3, "assigned_replicas": 3, "awake_replicas": 3,
-        "signal_warm": True, "signal_full_window": True, "signal_hold_reason": None,
     }
 
 
@@ -81,36 +78,10 @@ def test_held_context_is_never_donor_evidence(fresh):
 
     plan = _plan(held)
     assert not _gives(plan, "d")
-    assert "donor_suppressed_breakpoint_window:d" in plan.events
+    assert "donor_suppressed_samples_incomplete:d" in plan.events
 
 
 
-def test_held_receiver_rescue_is_capped_like_thin_evidence():
-    """I4: the held context does not carry the old window's evidence count, so the rescue
-    of a held CRITICAL receiver takes one capped step (control: the same level from a
-    whole window asks for more)."""
-    fresh = dict(_ctx(0.1, 500.0, 50.0), signal_evidence_requests=50.0)
-    donor = _ctx(1.1, 600.0, 5.0)
-
-    def plan(receiver):
-        contexts = {"r": receiver, "d": donor}
-        return build_plan(
-            model_contexts=contexts,
-            classifications=classify_all_models(contexts),
-            model_replicas={"r": 3, "d": 3},
-            idle_gpus=4,
-            cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8,
-                           partial_window_max_step=1, partial_window_lowevidence_requests=10),
-        )
-
-    def added(result):
-        return sum(a.delta for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.model == "r" and a.delta > 0)
-
-    assert added(plan(dict(fresh))) > 1
-    cache = PaperStateCache(max_stale_ms=30_000)
-    cache.apply("r", dict(fresh), tokens_available=True, window_end_ms=10_000)
-    held, _ = cache.apply("r", _missing_ctx(), tokens_available=False, window_end_ms=20_000)
-    assert added(plan(held)) == 1
 # ------------------------------------------------- E: frozen gateway scrape
 
 
@@ -143,6 +114,29 @@ class _Redis:
 
     def zrangebyscore(self, key, lo, hi):
         return [m for score, m in sorted(self.zsets.get(key, [])) if float(lo) <= score <= float(hi)]
+
+
+class _PipelinedRedis(_Redis):
+    """``_Redis`` with ``pipeline(transaction=False)``: records each round trip's commands."""
+
+    def __init__(self):
+        super().__init__()
+        self.round_trips: list[list[str]] = []
+
+    def pipeline(self, transaction=True):
+        assert transaction is False
+        redis, calls = self, []
+
+        class _Pipe:
+            def __getattr__(self, name):
+                getattr(redis, name)  # only the commands the fake has (the store falls back)
+                return lambda *args, **kwargs: calls.append((name, args, kwargs))
+
+            def execute(self):
+                redis.round_trips.append([name for name, _a, _k in calls])
+                return [getattr(redis, name)(*args, **kwargs) for name, args, kwargs in calls]
+
+        return _Pipe()
 
 
 class _Queue:
@@ -222,7 +216,7 @@ def test_frozen_scrape_is_unknown_not_a_zero_token_window(gateway_writes_scraped
         }}, ts)
     registry = _registry()
     store = MetricsStore(redis, registry, instant_sample_interval_ms=10_000)
-    snapshot = store.read_snapshot(end - 30_000, end, use_cache=False, start_exclusive=True)
+    snapshot = store.read_snapshot(end - 30_000, end, start_exclusive=True)
     view = ClusterView(topology=registry.topology(),
                        bindings=(Binding(serve_id="m-0", model="m", slot=Slot("n", (0,)), awake=True),
                                  Binding(serve_id="m-1", model="m", slot=Slot("n", (1,)), awake=False)))
@@ -255,7 +249,7 @@ def test_a_stale_serving_pod_makes_no_donor(stale):
         _write_pod(redis, "r", pod, gen_per_grid=100, running=20, waiting=10, scraped_ms=fresh)
     registry = _registry("m", "r")
     snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
-        END - 30_000, END, use_cache=False, start_exclusive=True
+        END - 30_000, END, start_exclusive=True
     )
 
     def binding(pod, model, gpu, awake=True):
@@ -279,111 +273,31 @@ def test_a_stale_serving_pod_makes_no_donor(stale):
         assert result.model_contexts["m"]["sample_quality_hold"] == "scrape_stale"
 
 
-def test_o1_suffixes_keep_the_window_pod_set_and_flag_a_pod_without_new_data():
+def test_suffixes_keep_the_window_pod_set_and_flag_a_pod_without_new_data():
     """E (review round 1: one pod set): a pod whose last successful fetch lies inside the
-    window but before the last grid is valid for the whole window. Every O1 suffix keeps
+    window but before the last grid is valid for the whole window. Every suffix keeps
     the window's pod set (queue and tokens from the same pods); the last 10 s, without
     a new observation of the pod, flag it (donor gate) instead of dropping it."""
     redis = _Redis()
     _write_pod(redis, "m", "m-0", gen_per_grid=1_000, running=4, waiting=0, scraped_ms=END - 15_000)
     store = MetricsStore(redis, _registry("m"), instant_sample_interval_ms=10_000, suffix_period_ms=10_000)
-    window = store.read_model_window("m", END - 30_000, END, use_cache=False, start_exclusive=True)
+    window = store.read_model_window("m", END - 30_000, END, start_exclusive=True)
     assert window.generation_tokens is not None
     last_20s, last_10s = window.suffix_windows
     assert set(last_20s.per_pod) == set(last_10s.per_pod) == {"m-0"}
     assert "m-0" in last_10s.sample_incomplete_pods
 
 
-# ---------------------------------------- frozen-scrape rescue (2026-10-04)
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["rescue", "dead_gateway_instance", "scraper_dead", "no_inflight", "unreadable_inflight"],
-)
-def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
-    """No serving pod of m answered /metrics in the whole window, while the gateway
-    scraper works (model o was scraped): vLLM's API-server loop is saturated. With
-    requests in flight on m-0 (live gateway instance) m gets +1 on this first window and
-    is never a donor. No rescue when the in-flight count comes only from a dead gateway
-    instance, when every pod of every model is stale (the scraper is dead), when
-    nothing is in flight, or when the in-flight count is unknown."""
-    redis = _Redis()
-    stale = END - 35_000
-    _write_pod(redis, "m", "m-0", gen_per_grid=0, running=0, waiting=0, scraped_ms=stale)
-    _write_pod(redis, "o", "o-0", gen_per_grid=2_000, running=4, waiting=0,
-               scraped_ms=stale if case == "scraper_dead" else END)
-    live_hb, dead_hb = redis.now_ms - 2_000, redis.now_ms - 120_000
-    redis.instances = {"gw-live": live_hb, "gw-dead": dead_hb}
-    inflight = {"rescue": {"gw-live": 6}, "dead_gateway_instance": {"gw-dead": 6},
-                "scraper_dead": {"gw-live": 6}, "no_inflight": {"gw-live": 0},
-                "unreadable_inflight": {"gw-live": None}}[case]
-    redis.hashes[rediskeys.gw_inflight_key("m-0")] = {
-        # P3-1: an unreadable live field is unknown - it never invents rescue demand.
-        instance: "not-json" if total is None else json.dumps({"total": total, "non_continuable": 0, "ts": 1})
-        for instance, total in inflight.items()
-    }
-    registry = _registry("m", "o")
-    snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
-        END - 30_000, END, use_cache=False, start_exclusive=True
-    )
-
-    def binding(pod, model, gpu, awake=True):
-        return Binding(serve_id=pod, model=model, slot=Slot("n", (gpu,)), awake=awake)
-
-    view = ClusterView(topology=registry.topology(), bindings=(
-        binding("m-0", "m", 0), binding("m-1", "m", 1, awake=False), binding("o-0", "o", 2),
-    ))
-    state = SignalState(saturation=SaturationTracker(SaturationRescueConfig()))
-    result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
-                              cluster_view=view, signal_state=state, paper_state_cache=PaperStateCache())
-    deltas = [a.delta for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.model == "m"]
-    assert all(delta >= 0 for delta in deltas)  # never a donor
-    if case == "rescue":
-        assert sum(deltas) == 1
-        assert result.model_contexts["m"]["saturation_reason"] == "scrape_stale_inflight"
-    else:
-        assert sum(deltas) == 0
-
-
-# ------------------------------------------ IDLE window evidence (2026-10-06 P2-2)
-
-
-@pytest.mark.parametrize("case", ["fresh_drained", "scrape_froze_early", "inflight", "no_live_gateway"])
-def test_an_idle_window_needs_a_last_grid_scrape_and_nothing_in_flight(case):
-    """P2-2: IDLE (whole-surplus release, O1 donor-hold exemption) needs every serving
-    pod scraped in the last grid of the window and zero gateway in-flight on it. A pod
-    whose scrape froze early in the window repeats zero-token docs while traffic
-    arrives; an in-flight request, or no live gateway instance (unknown), is not idle."""
-    redis = _Redis()
-    scraped = END - 25_000 if case == "scrape_froze_early" else END
-    _write_pod(redis, "m", "m-0", gen_per_grid=0, prompt_per_grid=0, running=0, waiting=0, scraped_ms=scraped)
-    if case != "no_live_gateway":
-        redis.instances = {"gw-live": redis.now_ms - 2_000}
-    redis.hashes[rediskeys.gw_inflight_key("m-0")] = {
-        "gw-live": json.dumps({"total": 3 if case in ("scrape_froze_early", "inflight") else 0, "ts": 1})
-    }
-    registry = _registry("m")
-    snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
-        END - 30_000, END, use_cache=False, start_exclusive=True
-    )
-    assert (snapshot.models["m"].prompt_tokens, snapshot.models["m"].generation_tokens) == (0.0, 0.0)
-    view = ClusterView(topology=registry.topology(),
-                       bindings=(Binding(serve_id="m-0", model="m", slot=Slot("n", (0,)), awake=True),))
-    result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
-                              cluster_view=view)
-    assert result.model_contexts["m"]["window_idle"] is (case == "fresh_drained")
-
-
 # ------------------------------- one gateway liveness bound (2026-10-06 P3-2)
 
 
 @pytest.mark.parametrize("heartbeat_age_ms, counted", [(2_000, True), (6_000, False)], ids=["live", "stale"])
-def test_every_inflight_reader_uses_the_registry_instance_staleness(tmp_path, heartbeat_age_ms, counted):
-    """P3-2: the frozen-scrape demand (metrics store) and the early commit
-    (GatewayInflightReader, built as the app builds it) judge a gateway plugin instance
-    live by the same bound - the registry's service_manager.sleep.instance_staleness_s
-    (4 s here): a heartbeat 6 s old is ignored by both, one 2 s old counts in both."""
+def test_the_inflight_reader_uses_the_registry_instance_staleness(tmp_path, heartbeat_age_ms, counted):
+    """P3-2: the early commit (GatewayInflightReader, built as the app builds it) judges
+    a gateway plugin instance live by the registry's
+    service_manager.sleep.instance_staleness_s (4 s here): a heartbeat 6 s old is
+    ignored, one 2 s old counts. (The metrics store's frozen-scrape demand that used the
+    same bound went with the saturation rescue, 2026-10-29.)"""
     from pathlib import Path
 
     from tre_common.gateway_inflight import instance_max_age_ms
@@ -396,13 +310,7 @@ def test_every_inflight_reader_uses_the_registry_instance_staleness(tmp_path, he
     path.write_text(text.replace("\n    instance_staleness_s: 10\n", "\n    instance_staleness_s: 4\n"))
     registry = load_registry(str(path))
     redis = _Redis()
-    _write_pod(redis, "m", "m-0", gen_per_grid=0, running=0, waiting=0, scraped_ms=END - 35_000)  # frozen
     redis.instances = {"gw": redis.now_ms - heartbeat_age_ms}
     redis.hashes[rediskeys.gw_inflight_key("m-0")] = {"gw": json.dumps({"total": 3, "non_continuable": 0, "ts": 1})}
-    window = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_model_window(
-        "m", END - 30_000, END, use_cache=False, start_exclusive=True
-    )
-    assert window.scrape_stale_pods == ("m-0",)
-    assert window.scrape_stale_inflight.get("m-0", 0) == (3 if counted else 0)
     reader = GatewayInflightReader(redis, max_age_ms=instance_max_age_ms(registry))
     assert reader(("m-0",)) == (3.0 if counted else None)

@@ -674,105 +674,40 @@ safescale:
   # Z tail, complete evidence of every remaining pod), the hidden pods have nothing in
   # flight (gateway in-flight count of the live plugin instances and vLLM running +
   # waiting, both known and 0), the newest snapshot window was observed
-  # scaling.min_evidence_ms after the hide confirmation (the O1 warm rule, on
-  # observation time) and at least the donor's p95 e2e passed since the confirmation
+  # scaling.settle_ms after the hide confirmation (on observation time) and at least the donor's p95 e2e passed since the confirmation
   # (2026-10-06: no W / 2 term, no separate early_commit_min_grids key). Rollback
   # checks are unchanged and run first on every tick. false = commit at the deadline
   # only.
   early_commit: true
 
-# Fast-loop scale-up (controller only; read at start, restart-to-apply; every key
-# optional, the values below are the built-in defaults). C1, design
-# docs/design/20261001-c1-deficit-scaleup.md. Controller / SM / UI images before
-# 2026-10-01 ignore this top-level section (the registry loader only reads the
+# Scale-up rules (controller only; read at start, restart-to-apply; every key
+# optional, the values below are the built-in defaults). Controller / SM / UI images
+# before 2026-10-01 ignore this top-level section (the registry loader only reads the
 # sections it knows).
 scaling:
-  # A CRITICAL receiver's rescue asks for its whole deficit at once: target
-  # min(max(n+1, ceil(n * tau_crit / Z)), max(n+1, floor(ratio * n)), the scaling
-  # cap max_awake_replicas, the capacity found), n = its routable replicas, Z its
-  # decision-window signal. 0 = the legacy one step (ceil(0.1 * n)) per window.
-  rescue_max_step_ratio: 2.0
-  # The rescue target may also reach n + this many replicas: cap = max(n + 1,
-  # floor(ratio * n), n + pods) (HPA's default "max(100%, +4 pods)" shape). 0 = off
-  # (the built-in default); 4 = user decision 2026-10-01 (n = 1 can reach the
-  # scaling cap 4 in one decision).
-  rescue_max_step_pods: 4
+  # One step per plan (2026-10-28, design docs/design/20261028-single-loop.md): every
+  # receiver gets max(1, ceil(0.1 * n)) replicas per plan (+1 below 10). TSS only
+  # (2026-10-29, design docs/design/20261029-tss-only.md): Z is always the whole
+  # TRE_METRICS_WINDOW_MS window plus the EMA. Retired keys (an old registry carrying them
+  # loads; the controller logs them once and ignores them): rescue_max_step_ratio,
+  # rescue_max_step_pods, breakpoint_partial_max_step, breakpoint_lowevidence_requests,
+  # saturation_max_step_factor (2026-10-28); rescue_settle_ema_k, breakpoint_window,
+  # onset_warmup_guard, min_evidence_requests, breakpoint_margin_ms,
+  # breakpoint_hold_max_ms, gateway_clock_tolerance_ms, gateway_clock_check_s,
+  # saturation_rescue, saturation_kv_threshold, saturation_confirm_ms (2026-10-29).
   # donor_surplus_release: retired 2026-10-07 (F1-B): a HIGH donor gives capacity
   # only through a SafeScale probe; IDLE donors release their whole surplus to the
   # floor at once (code rule since 2026-10-06, Q3). An old key is ignored (warning).
-  # Fallback only (2026-10-06): while O1 tracks the model, a rescue target this
-  # controller dispatched counts as reflected once the decision window starts
-  # after it completed (the breakpoint restarts the EMA, the evidence gate holds
-  # the receiver). Otherwise (O1 off / suspended / held context, a restored or
-  # probe-covered target) the window must start k * trs.ema_tau_ms after it
-  # completed (the EMA'd Z lags the window). 0 = the window start alone.
-  rescue_settle_ema_k: 2.0
-  # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
-  # ADR-0015): a model decides on the part of its metrics window (TRE_METRICS_WINDOW_MS) after its last
-  # breakpoint (traffic onset, routable replica-count change), the histogram docs after
-  # it only (the evidence period holding the breakpoint excluded), the TSS numerator
-  # scaled to a whole window and the EMA restarted at the breakpoint. Scale-ups act once
-  # the observations after the breakpoint span min_evidence_ms; scale-downs wait for a
-  # whole window after the breakpoint.
-  # Replaces the ADR-0013 onset warmup guard. Controller images before O1 ignore these
-  # keys (C1 images log them as unknown).
-  breakpoint_window: true
-  # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
-  # breakpoint_window: false the guard always applies (= pre-O1 behaviour).
-  onset_warmup_guard: false
-  # Observed span after the breakpoint (ms, gateway scraped_ms) before a scale-up
-  # decision (min_evidence_grids: N is a deprecated alias = N x 10 s).
-  # NOTE (2026-10-28): a suffix is strictly shorter than the window, so with the 20 s
-  # window a value >= 20000 is never reached by a suffix: the model waits for the first
-  # whole window after the breakpoint (about the same 20-22 s as before). Kept as is
-  # pending a user decision (docs/design/20261028-tss-step-counters.md).
+  # SafeScale evidence floor (ms of gateway scraped_ms observations) after a rollback
+  # before a retry (min_evidence_grids: N is a deprecated alias = N x 10 s).
   min_evidence_ms: 20000
-  # Completed requests the post-breakpoint window also needs (0 = off). Added when the
-  # TSS counted tokens at completion (one short request done while long ones run read
-  # Z ~ 5 %); the step-counter numerator (2026-10-28) no longer needs it - kept pending a
-  # user decision.
-  min_evidence_requests: 3
-  # Added to a routable-count change time: the SM writes the routable label before it
-  # answers, the gateway applies it via its pod informer shortly after.
-  breakpoint_margin_ms: 1000
-  # A C1 rescue decided on a partial (post-breakpoint) window with fewer than
-  # breakpoint_lowevidence_requests completed requests adds at most
-  # breakpoint_partial_max_step replicas; with more, the whole deficit at once.
-  # breakpoint_partial_max_step: 0 = no cap.
-  breakpoint_partial_max_step: 1
-  breakpoint_lowevidence_requests: 10
-  # After its windows have been held this long (ms from the first to the newest held
-  # observation) a receiver decides on the whole window again (routable count changing
-  # all the time); donors still wait. 0 = never. (breakpoint_hold_max_windows: N =
-  # deprecated alias, (N - 1) x 10 s; 6 -> 50000.)
-  breakpoint_hold_max_ms: 50000
-  # Same-clock check of gateway doc stamps vs the controller clock (O1 compares them):
-  # beyond the tolerance O1 is suspended (pre-O1 behaviour) until 3 good checks.
-  gateway_clock_tolerance_ms: 2000
-  gateway_clock_check_s: 60
-  # Onset saturation rescue (design docs/design/20261002-saturation-onset-rescue.md):
-  # while a model's TSS cannot decide yet - its window numerator is zero (since 2026-10-28
-  # the step counters: no token processed in the window) or the O1 evidence gate above still
-  # holds it - a model whose engines are full on every metrics window from the first
-  # full observation to the newest one for saturation_confirm_ms (ms, 0 = the first
-  # full window) is a CRITICAL receiver of the fast loop
-  # (saturation_consecutive_ticks: N = deprecated alias, (N - 1) x 10 s). "Full" = vLLM
-  # num_requests_waiting summed over its routable pods > 0, or their mean KV-cache fill
-  # >= saturation_kv_threshold with >= 2 requests running, both from the latest gateway
-  # sample (not the window mean). Not full (one long request running, even one that fills
-  # the KV cache alone) keeps the TSS verdict (no receiver). An O1 hold only counts for
-  # the traffic onset or the rescue's own steps (not after a C1 / donor / SafeScale change
-  # once the TSS was warm).
-  # Target per decision: min(max(n + 1, floor(saturation_max_step_factor * n)),
-  # max_awake_replicas), n = routable replicas (1 -> 2 -> 4, not straight to the cap); the
-  # next step needs the condition again on windows after the routable count rose, and
-  # the pods the last step added must be full themselves (factor in [1, 4]).
-  # Capacity order, donors, SafeScale, O1 and C1 are unchanged; once the TSS is warm the
-  # TSS / Z / C1 rules alone decide. false = off (TSS rules only).
-  saturation_rescue: true
-  saturation_kv_threshold: 0.9
-  saturation_confirm_ms: 10000
-  saturation_max_step_factor: 2
+  # TSS suffix (2026-10-29, design docs/design/20261029-tss-suffix.md): after a change
+  # of a model's pod set (awake and not hidden: a wake, sleep, hide or unhide) its Z
+  # is computed on the samples observed since the change only, and decides once that
+  # suffix spans settle_ms (gateway scraped_ms); until then the model is settling - no
+  # action on it in either direction. Also the observed post-hide span a SafeScale
+  # early commit needs.
+  settle_ms: 10000
   # Instant sample coverage (2026-10-25, docs/design/20261025-instant-sampling.md): a
   # pod's coverage = distinct gateway scraped_ms in the window / (window / instant
   # period). Below sample_min_ratio the pod is flagged: no donor / shrink / release for

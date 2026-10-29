@@ -1,113 +1,22 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, replace
-from typing import Any, Iterable
+import json
+import logging
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Collection, Mapping
 
-from tre_common.metrics_schema import ModelWindowMetrics, observed_of, observed_requests
-from tre_common.persistence import Persistence, span_reaches
+from tre_common.metrics_schema import ModelWindowMetrics, observed_of
+from tre_common.persistence import span_reaches
 from tre_common.registry import TrsParams
 from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window_is_idle
 
-@dataclass(frozen=True)
-class BreakpointWindowConfig:
-    """O1 breakpoint-aware window (registry ``scaling:``, design
-    docs/design/20261001-o1-breakpoint-window.md; round 4: on observation times,
-    docs/design/20261025-instant-sampling.md "Evidence, not ticks").
+LOG = logging.getLogger("tre_controller.signals")
 
-    * ``enabled`` (``scaling.breakpoint_window``): decide on the part of the metrics
-      window after the model's last breakpoint - its traffic onset or the last change of
-      its routable replica count;
-    * ``onset_guard`` (``scaling.onset_warmup_guard``): additionally apply the ADR-0013
-      onset warmup guard (``TRE_SIGNAL_WARMUP_MS``) on top of O1. With ``enabled=False``
-      the guard always applies (pre-O1 behaviour), whatever this flag says;
-    * ``min_evidence_ms`` / ``min_evidence_requests``: post-breakpoint evidence a window
-      needs before the model's signal decides a scale-up - the observed span after the
-      breakpoint (newest observation minus max(breakpoint, the suffix's first
-      observation)) and the completed requests in it;
-    * ``margin_ms`` (``scaling.breakpoint_margin_ms``): added to a routable-count change
-      time (the SM writes the routable label before it answers, the gateway applies it
-      through its pod informer shortly after);
-    * ``hold_max_ms`` (``scaling.breakpoint_hold_max_ms``): a receiver whose windows have
-      been held (not warm) from the first to the newest held observation for this long
-      decides on the whole window (0 = never).
-
-    The evidence period is not here: which docs form the post-breakpoint suffix is the
-    metrics store's business (``MetricsStore(suffix_breakpoint=...)``).
-    """
-
-    enabled: bool = True
-    onset_guard: bool = False
-    min_evidence_ms: int = 20_000
-    min_evidence_requests: int = 3
-    margin_ms: int = 1_000
-    hold_max_ms: int = 50_000
-
-    @classmethod
-    def from_registry(cls, registry: Any) -> "BreakpointWindowConfig":
-        scaling = getattr(registry, "scaling", None)
-        config = scaling() if callable(scaling) else None
-        defaults = cls()
-        return cls(
-            enabled=bool(getattr(config, "breakpoint_window", defaults.enabled)),
-            onset_guard=bool(getattr(config, "onset_warmup_guard", defaults.onset_guard)),
-            min_evidence_ms=max(1, int(getattr(config, "min_evidence_ms", defaults.min_evidence_ms))),
-            min_evidence_requests=max(
-                0, int(getattr(config, "min_evidence_requests", defaults.min_evidence_requests))
-            ),
-            margin_ms=max(0, int(getattr(config, "breakpoint_margin_ms", defaults.margin_ms))),
-            hold_max_ms=max(0, int(getattr(config, "breakpoint_hold_max_ms", defaults.hold_max_ms))),
-        )
-
-
-@dataclass(frozen=True)
-class EffectiveWindow:
-    """The window a model's signal is computed on this tick (O1).
-
-    ``full``: no breakpoint inside the metrics window - the whole window, exactly the
-    pre-O1 input (``numerator_scale`` 1.0). Otherwise the store's suffix after the
-    breakpoint (``metrics`` is that suffix, ``start_ms`` its start). ``warm``: enough
-    post-breakpoint evidence for a scale-up decision (a scale-down always needs
-    ``full``). ``evidence_ms``: the observed span after the breakpoint. ``reason`` says
-    why not warm.
-    """
-
-    metrics: ModelWindowMetrics
-    full: bool
-    warm: bool
-    breakpoint_ms: int | None
-    start_ms: int
-    evidence_ms: int
-    numerator_scale: float = 1.0
-    reason: str | None = None
-
-
-@dataclass(frozen=True)
-class QueueSample:
-    """A model's engine queue from its routable pods' newest gateway instant samples
-    (H3, 2026-10-06): ``q`` = sum of running + lambda_wait * waiting (the TSS queue term
-    on instant values, no qmin), ``waiting`` = sum of ``num_requests_waiting``,
-    ``sample_ms`` = the newest pod observation (round 4: ``scraped_ms``).
-    ``per_pod`` = (pod, q, waiting) of each sampled pod: a rise is measured on the pods
-    of both samples only (review P1-1)."""
-
-    sample_ms: int
-    q: float
-    waiting: float
-    pods: int
-    per_pod: tuple[tuple[str, float, float], ...] = ()
-
-
-#: H3 review P1-1: ``waiting`` must exceed the baseline by max(this, ratio * baseline)
-#: to count as rising (a flat queue jitters by a request or two between samples).
-QUEUE_RISE_MIN_ABS = 1.0
-QUEUE_RISE_MIN_RATIO = 0.1
-
-
-#: H3: queue samples kept per model (one per distinct stamp): those stamped less than
-#: this before the newest (2026-10-25: a span; 80 s = the former 8 samples 10 s apart).
-#: A baseline older than this is gone: the receiver stays held, as before H3.
-QUEUE_SAMPLE_HISTORY_MS = 80_000
+#: Registry ``scaling.settle_ms`` default (design docs/design/20261029-tss-suffix.md).
+DEFAULT_SETTLE_MS = 10_000
+#: A pod with fewer instant samples than this in the suffix makes it unknown (rule 3).
+MIN_SUFFIX_SAMPLES_PER_POD = 2
 
 
 @dataclass
@@ -135,6 +44,10 @@ class TRSInput:
     qmin: float = 1.0
     kv_cache_hit_rate: float = 0.0
     window_ms: float | None = None
+    #: False when the window's zero tokens may be missing data, not a stall: some pod of
+    #: it has a stale scrape or incomplete samples (:func:`zero_tokens_unconfirmed`).
+    #: Then a zero-token window is treated as before 2026-10-29: Z unknown, EMA reset.
+    zero_tokens_confirmed: bool = True
 
     @classmethod
     def from_metrics(cls, metrics: ModelWindowMetrics, params: TrsParams) -> "TRSInput":
@@ -152,7 +65,19 @@ class TRSInput:
             qmin=params.qmin,
             kv_cache_hit_rate=metrics.kv_cache_hit_rate,
             window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+            zero_tokens_confirmed=not zero_tokens_unconfirmed(metrics),
         )
+
+
+def zero_tokens_unconfirmed(metrics: ModelWindowMetrics) -> bool:
+    """The window has zero tokens, but some pod of it has a stale scrape or incomplete
+    samples (frozen counters, a short token span, a pod left out): the zero may be missing
+    data. Only a zero-token window of complete, fresh samples is a stall (TSS = 0, Z = 0)."""
+    if metrics.prompt_tokens is None or metrics.generation_tokens is None:
+        return False
+    if float(metrics.prompt_tokens) + float(metrics.generation_tokens) > 0.0:
+        return False
+    return bool(getattr(metrics, "scrape_stale_pods", ()) or getattr(metrics, "sample_incomplete_pods", ()))
 
 
 @dataclass
@@ -170,6 +95,7 @@ class TRSResult:
     prev_Q_ctl: float | None = None
     #: False when TSS is undefined for this window (idle: running + waiting == 0). TRS /
     #: TRS_raw are then 0.0 and Z_m is None - never a small Z that would read CRITICAL.
+    #: A defined TSS of 0 (zero tokens with a queue: a stalled engine) is Z = 0.
     defined: bool = True
 
 
@@ -249,10 +175,7 @@ class TRSComputer:
         theta_m: float | None = None,
         *,
         window_end_ms: int | None = None,
-        advance_ema: bool = True,
     ) -> TRSResult:
-        """``advance_ema=False`` (O1, a window without enough post-breakpoint evidence)
-        reports the raw TSS as TRS and leaves the EMA untouched."""
         effective_pods = max(1, inp.routable_pods)
         terms = tss_terms(
             prompt_tokens=inp.prompt_tokens_total,
@@ -271,16 +194,20 @@ class TRSComputer:
         y_per_pod = y_total / effective_pods
         q = terms.queue
         q_ctl = terms.queue_ctl
-        # Idle rule (plan 6.4): A + W == 0 -> TSS undefined. Reported as 0.0, which the
-        # EMA passes through without advancing and compute_z_m maps to None.
+        # Idle rule (plan 6.4; the only idle rule since 2026-10-29): A + W == 0 -> TSS
+        # undefined: None to the EMA (idle reset), reported as 0.0, Z None. Zero tokens
+        # with a queue is a defined TSS of 0 -> Z = 0, unless the zero may be missing data
+        # (``zero_tokens_confirmed`` False): then as before - EMA reset, Z None.
+        unconfirmed_zero = terms.defined and terms.numerator <= 0.0 and not inp.zero_tokens_confirmed
+        defined = terms.defined and not unconfirmed_zero
+        idle = window_is_idle(inp.avg_running, inp.avg_waiting) or unconfirmed_zero
+        smoothed = self._update_ema(
+            terms.raw if defined else None, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle
+        )
         trs_raw = terms.raw if terms.raw is not None else 0.0
-        idle = window_is_idle(inp.prompt_tokens_total, inp.generation_tokens_total)
-        if advance_ema:
-            trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle)
-        else:
-            trs = trs_raw
+        trs = smoothed if defined and smoothed is not None else 0.0
         eta = compute_eta_m(trs, effective_pods)
-        z_m = compute_z_m(trs, theta_m)
+        z_m = compute_z_m(trs, theta_m) if defined else None
         saved_prev_y = self._prev_Y
         saved_prev_q_ctl = self._prev_Q_ctl
         self._prev_Y = y_total
@@ -302,11 +229,11 @@ class TRSComputer:
 
     def _update_ema(
         self,
-        raw: float,
+        raw: float | None,
         window_end_ms: int | None = None,
         window_ms: float | None = None,
         idle: bool = False,
-    ) -> float:
+    ) -> float | None:
         if self._raw_passthrough:
             return raw
         if self._ema is not None:
@@ -323,7 +250,7 @@ class TRSComputer:
         # entry sets ema_tau_ms; this path is kept only for the golden parity tests
         # (controller/tests/golden/legacy_trs.py, test_trs_signals.py) and has no idle-gap
         # reset. Byte-identical to pre-S1.3 behaviour when window_end_ms is None (golden).
-        if not _is_finite_positive(raw):
+        if raw is None or not _is_finite_positive(raw):
             return raw
         if (
             window_end_ms is not None
@@ -371,9 +298,11 @@ def compute_eta_m(trs: float, routable_pods: int | float) -> float | None:
 
 
 def compute_z_m(trs: float, theta_m: float | None) -> float | None:
+    """Z = TSS / theta; 0 for a TSS of 0 (a stall). The caller passes only a defined TSS
+    (an undefined one is reported as 0.0 and must not become Z = 0)."""
     if theta_m is None or theta_m <= 0:
         return None
-    if not _is_finite_positive(trs):
+    if trs is None or trs != trs or trs in (float("inf"), float("-inf")) or trs < 0:
         return None
     return trs / theta_m
 
@@ -381,79 +310,106 @@ def compute_z_m(trs: float, theta_m: float | None) -> float | None:
 _compute_z_m = compute_z_m
 
 
-class SignalState:
-    """Per-model registry of stateful ``TRSComputer`` instances shared across the
-    rescue / fairness / safescale loops (S1.3 / ADR-0011).
+@dataclass(frozen=True)
+class SuffixWindow:
+    """The window a model's Z is computed on this tick (TSS suffix, 2026-10-29, design
+    docs/design/20261029-tss-suffix.md).
 
-    The live control path previously constructed a fresh ``TRSComputer`` every
-    tick, so the EMA never persisted (``TRS == TRS_raw`` always). Holding one
-    computer per model here lets the wall-clock time-constant EMA carry across
-    ticks. One shared computer per model means one EMA per model (rescue and
-    fairness share it), per the "one window, one theta, one EMA" contract.
-
-    In-process only: a controller restart starts every EMA from scratch, which is exactly
-    the state an idle reset leaves behind (restart duality): after a restart the next
-    defined sample seeds the EMA, as it would after an idle gap.
-
-    **Idle reset.** One predicate, :func:`tre_common.tss.window_is_idle` (no token in the
-    window), defines an idle window everywhere: every EMA update receives it
-    (``TssEma.update(idle=...)``: clear and pass through), the tick loop derives
-    ``has_traffic`` from it for ``observe_traffic`` (which clears the warmup onset and,
-    idempotently, the model's EMAs), and the offline smoothing computes it from each window
-    row. Independently, ``TssEma``'s idle-gap rule clears an EMA when a sample arrives more
-    than one metrics window after the last advancing sample.
-
-    Also tracks a per-model **traffic-onset** cursor for the F-onset warmup guard
-    (see ``observe_traffic``): at load onset the sliding window is still filling with
-    traffic, so TRS is structurally low (window-fill fraction) and z_m dips falsely
-    CRITICAL. The guard suppresses receiver (CRITICAL/LOW) scale-ups until the window
-    lies fully inside the traffic period (ADR-0014: the saturation bypass was removed, so
-    a genuine flash crowd in the warmup window is delayed at most one window). In-process
-    only, like the EMA: after a restart mid-traffic, one window of receiver-suppression.
+    * No change of the model's pod set inside the metrics window: ``metrics`` is the
+      whole window, ``scale`` 1.0, ``change_ms`` None.
+    * Otherwise the store's suffix that starts first at or after the change
+      (``MetricsStore(suffix_change=...)``): ``metrics`` is that suffix, ``scale`` the
+      whole window's length over the suffix's (its token totals are scaled to a whole
+      window; its queue is the mean of its own samples), ``evidence_ms`` its observed
+      span after the change.
+    * ``settling`` (not None) says why that suffix is not decision-valid yet:
+      ``no_suffix`` (the store has not built one yet, or no snapshot was read after the
+      change yet), ``settle_span`` (less than
+      ``settle_ms`` observed), ``tokens_unknown``, ``samples`` (a serving pod with fewer
+      than two samples in it, or none). Then Z is unknown, never 0.
     """
 
-    def __init__(
-        self,
-        warmup_ms: int = -1,
-        *,
-        breakpoint: BreakpointWindowConfig | None = None,
-        saturation: Any | None = None,
-    ) -> None:
-        self._by_model: dict[str, TRSComputer] = {}
-        #: Onset saturation rescue (``tre_controller.signals.saturation.SaturationTracker``;
-        #: None = off): shared by the rescue / fairness loops like the EMAs, counted once
-        #: per distinct window end. Independent of the idle reset (a numerator-zero window
-        #: is exactly the case it watches).
-        self.saturation = saturation
-        # O1 (None = pre-O1: the onset warmup guard alone, as configured by warmup_ms).
-        self.breakpoint = breakpoint
-        # model -> (routable count, observation time) of the last cluster view seen.
-        self._routable: dict[str, tuple[int, int]] = {}
-        # model -> time of its last routable-count change (O1 breakpoint).
+    metrics: ModelWindowMetrics
+    change_ms: int | None = None
+    scale: float = 1.0
+    settling: str | None = None
+    evidence_ms: int = 0
+
+
+def _samples_per_pod_ok(suffix: ModelWindowMetrics, pod_ids: Collection[str] | None) -> bool:
+    """Every serving pod has at least :data:`MIN_SUFFIX_SAMPLES_PER_POD` instant samples
+    in ``suffix`` (``pod_ids`` None: the pods the suffix holds; an empty suffix fails)."""
+    by_name = {getattr(pod, "pod", key) or key: pod for key, pod in (suffix.per_pod or {}).items()}
+    names = set(pod_ids) if pod_ids is not None else set(by_name)
+    if not names:
+        return False
+    for name in names:
+        pod = by_name.get(name)
+        if pod is None or len(tuple(getattr(pod, "instant_ticks_ms", ()) or ())) < MIN_SUFFIX_SAMPLES_PER_POD:
+            return False
+    return True
+
+
+class SignalState:
+    """Per-model registry of stateful ``TRSComputer`` instances shared across the
+    decision loop and the SafeScale loop (S1.3 / ADR-0011; one decision loop since
+    2026-10-28): one EMA per model (rescue and fairness share it), per the "one window,
+    one theta, one EMA" contract.
+
+    In-process only: a controller restart starts every EMA from scratch, which is exactly
+    the state an idle reset leaves behind (restart duality).
+
+    **Idle reset.** One predicate, :func:`tre_common.tss.window_is_idle` (nothing in flight:
+    running + waiting == 0), defines an idle window everywhere: every EMA update receives it
+    (``TssEma.update(idle=...)``) and the tick clears the model's EMAs on it
+    (:meth:`reset_ema`, also the alternative signals'). Independently, ``TssEma``'s
+    idle-gap rule clears an EMA when a sample arrives more than one metrics window after
+    the last advancing sample.
+
+    **TSS suffix** (2026-10-29, design docs/design/20261029-tss-suffix.md): TSS is the
+    service speed of the model's current pod set (awake and not hidden). After a change
+    of that set (:meth:`note_pod_sets`: the ``done_ms`` of the controller's own SM call
+    that made it, else the first fleet view showing it) Z is computed on the samples
+    observed since the change only (:meth:`suffix_window`); it decides once that suffix
+    spans ``settle_ms``. Until then the model is *settling* (no action on it, one
+    ``settling_start`` / ``settling_end`` event per episode). The model's EMAs restart at
+    the change and seed on the first decision-valid suffix value. No breakpoint holds,
+    no onset guard, no saturation rescue (design docs/design/20261029-tss-only.md).
+
+    Clock (review 2026-10-29 P1-2): ``done_ms`` / the view time are controller clock,
+    the suffix is cut on gateway stamps; the two are never compared. A change is dated on
+    the controller clock only against the controller-clock read time of each published
+    snapshot (:meth:`note_snapshot`): t_c = just after the gateway's newest complete
+    histogram boundary (``gateway_last_hist_ms`` + 1 ms) of the first snapshot read at or
+    after the change; the store cuts the suffix at the first instant sample after it.
+    Cost: the time to that read (at most about one evidence period) plus one instant
+    step. A doc scraped before the change but stamped after that boundary (written
+    between the boundary and the read) can remain - at most the read's lag. Without gateway stamps (offline / synthetic
+    snapshots, a gateway cadence check off) the controller-clock time is used as is.
+    """
+
+    #: Published snapshots remembered for dating changes (one per evidence period).
+    SNAPSHOT_MEMORY = 64
+
+    def __init__(self, settle_ms: int = DEFAULT_SETTLE_MS) -> None:
+        self.settle_ms = max(1, int(settle_ms))
+        # (controller-clock read time, gateway last_hist_ms) of the published snapshots.
+        self._reads: deque[tuple[int, int]] = deque(maxlen=self.SNAPSHOT_MEMORY)
+        # model -> controller-clock time of a change no snapshot read after it yet.
+        self._pending: dict[str, int] = {}
+        # model -> (its pod set, the view time it was last seen at; None = synthetic view).
+        self._pod_sets: dict[str, tuple[frozenset[str], int | None]] = {}
+        # model -> time of its last pod-set change (t_c).
         self._change_ms: dict[str, int] = {}
-        # model -> the breakpoint its EMAs were last restarted at.
-        self._ema_breakpoint: dict[str, int] = {}
-        # model -> whether its last change was seen between two views of this process
-        # (False: dated on the first observation, e.g. after a restart - a guess).
-        self._change_seen: dict[str, bool] = {}
-        # model -> how long its windows have been held (review P2-2; round 4: a span of
-        # observation times).
-        self._hold: dict[str, Persistence] = {}
-        # O1 suspended (same-clock check failed, review P2-3): reason, None = active.
-        self.breakpoint_window_suspended: str | None = None
-        # The D8 band dwell (TRE_DWELL_WINDOWS, off since the v1 alignment A5) was removed
-        # in the timer cleanup (2026-10-02): a band acts on the first window showing it;
-        # O1 already requires post-breakpoint evidence (tre_common.dwell stays for the
-        # offline calibration tools).
-        # warmup_ms: -1 = auto (window fully inside traffic period), 0 = disabled
-        # (pre-fix behaviour, for A/B ablation), >0 = explicit span since onset.
-        self._warmup_ms = warmup_ms
-        self._onset_ms: dict[str, int | None] = {}
+        # model -> the change its EMAs were last restarted at.
+        self._ema_change: dict[str, int] = {}
+        # model -> the change of its open settling episode.
+        self._settling: dict[str, int] = {}
+        self._events: list[str] = []
+        self._by_model: dict[str, TRSComputer] = {}
         # One EMA per (model, alternative signal), same tau/alpha as the TSS EMA
         # (plan §6.9 item 4); see tre_controller.signals.sources._thresholded_signal.
         self._signal_ema: dict[tuple[str, str], TssEma] = {}
-        # H3 (2026-10-06): model -> its recent QueueSamples, oldest first (queue_rise).
-        self._queue_samples: dict[str, list[QueueSample]] = {}
 
     def computer_for(self, model: str, *, ema_alpha: float, ema_tau_ms: float | None) -> TRSComputer:
         computer = self._by_model.get(model)
@@ -510,6 +466,155 @@ class SignalState:
         ema.update(None, window_end_ms, window_ms, idle)
         return ema.value
 
+    # ------------------------------------------------------------ pod-set changes
+
+    def note_snapshot(self, snapshot: Any) -> None:
+        """Remember a published snapshot's controller-clock read time (``read_ms``) and
+        the gateway's newest complete histogram boundary (``gateway_last_hist_ms``), and
+        date the pending changes it was read after. A snapshot without both is ignored."""
+        read = getattr(snapshot, "read_ms", None)
+        last_hist = getattr(snapshot, "gateway_last_hist_ms", None)
+        if read is None or last_hist is None:
+            return
+        entry = (int(read), int(last_hist))
+        if self._reads and entry[0] <= self._reads[-1][0]:
+            return  # the same (or an older) read
+        self._reads.append(entry)
+        for model, change in list(self._pending.items()):
+            if change <= entry[0]:
+                del self._pending[model]
+                self._set_change(model, entry[1] + 1)
+                if self._settling.get(model) == change:
+                    self._settling[model] = self._change_ms[model]  # the same episode
+
+    def _date(self, model: str, controller_ms: int) -> None:
+        """Date ``model``'s change made at ``controller_ms`` (controller clock) in the
+        gateway domain (class docstring): pending until a snapshot is read after it. With
+        no gateway-stamped snapshot seen (offline / synthetic) the time is used as is."""
+        if not self._reads:
+            self._set_change(model, int(controller_ms))
+            return
+        for read, last_hist in self._reads:
+            if read >= int(controller_ms):
+                self._set_change(model, last_hist + 1)
+                return
+        self._pending[model] = int(controller_ms)
+
+    def _set_change(self, model: str, change: int) -> None:
+        if change >= self._change_ms.get(model, change):
+            self._change_ms[model] = change
+
+    def note_pod_sets(
+        self,
+        pod_sets: Mapping[str, Collection[str]],
+        *,
+        view_ms: int | None,
+        done_ms: Mapping[str, int] | None = None,
+        window_ms: int | None = None,
+    ) -> None:
+        """Record each model's pod set (awake, not hidden) of a fleet view produced at
+        ``view_ms`` (its ``state_ms``; None = a synthetic view). A changed set is dated at
+        ``done_ms[model]`` - the controller's own last SM call on the model that changed
+        its pod set (wake / sleep done, hide confirmed, unhide done) - when that returned
+        no earlier than the view that showed the old set and not after this view; else
+        (SM self-heal, recovery, an external change) at ``view_ms``, the first view
+        showing it. Both are controller clock and are dated in the gateway domain
+        (:meth:`_date`). Without either time the change is not dated (no suffix). A
+        model's first view (a start / restart) dates a change only at a ``done_ms`` of
+        ours (the restored last action) at most ``window_ms`` before it. An older view
+        than one seen is ignored."""
+        for model, pods in pod_sets.items():
+            pods = frozenset(pods)
+            previous = self._pod_sets.get(model)
+            if previous is not None and view_ms is not None and previous[1] is not None and view_ms < previous[1]:
+                continue
+            self._pod_sets[model] = (pods, view_ms)
+            hint = (done_ms or {}).get(model)
+            if previous is None:
+                if hint is not None and view_ms is not None and window_ms and 0 <= view_ms - int(hint) < window_ms:
+                    self._date(model, int(hint))
+                continue
+            if previous[0] == pods:
+                continue
+            prior_view = previous[1]
+            if hint is not None and (prior_view is None or int(hint) >= prior_view) and (
+                view_ms is None or int(hint) <= view_ms
+            ):
+                self._date(model, int(hint))
+            elif view_ms is not None:
+                self._date(model, int(view_ms))
+
+    def change_ms(self, model: str) -> int | None:
+        """``model``'s last pod-set change (t_c), None = none seen by this process."""
+        return self._change_ms.get(model)
+
+    def suffix_window(
+        self, model: str, metrics: ModelWindowMetrics, pod_ids: Collection[str] | None = None
+    ) -> SuffixWindow:
+        """The part of ``metrics`` (a serving window) a decision reads (:class:`SuffixWindow`):
+        the whole window unless the model's pod set changed inside it; then the suffix
+        after the change, decision-valid once its observed span after the change reaches
+        ``settle_ms``, its tokens are known and every serving pod (``pod_ids``, else the
+        suffix's pods) has two samples in it. The EMAs restart once per change (the first
+        read that sees it). Settling episodes are logged once at start and end."""
+        start, end = int(metrics.window_start_ms), int(metrics.window_end_ms)
+        if model in self._pending:
+            # A change no snapshot was read after yet (not dated in the gateway domain).
+            change = self._pending[model]
+            return self._settle(model, change, SuffixWindow(metrics, change_ms=None, settling="no_suffix"))
+        change = self._change_ms.get(model)
+        if change is None or change <= start or end <= start:
+            self._end_settling(model, "window_passed")
+            return SuffixWindow(metrics)
+        if self._ema_change.get(model) != change:
+            self._ema_change[model] = change
+            self.reset_ema(model)
+        candidates = [
+            item for item in metrics.suffix_windows
+            if start < int(item.window_start_ms) < end and int(item.window_start_ms) >= change
+        ]
+        if not candidates:
+            return self._settle(model, change, SuffixWindow(metrics, change_ms=change, settling="no_suffix"))
+        suffix = min(candidates, key=lambda item: int(item.window_start_ms))
+        evidence = observed_of(suffix).since(change)
+        window = SuffixWindow(
+            suffix, change_ms=change, scale=float(end - start) / float(end - int(suffix.window_start_ms)),
+            evidence_ms=evidence,
+        )
+        if not span_reaches(evidence, self.settle_ms):
+            reason = "settle_span"
+        elif suffix.prompt_tokens is None or suffix.generation_tokens is None:
+            reason = "tokens_unknown"
+        elif not _samples_per_pod_ok(suffix, pod_ids):
+            reason = "samples"
+        else:
+            self._end_settling(model, f"valid:evidence_ms={evidence}")
+            return window
+        return self._settle(model, change, SuffixWindow(
+            suffix, change_ms=change, scale=window.scale, settling=reason, evidence_ms=evidence,
+        ))
+
+    def _settle(self, model: str, change: int, window: SuffixWindow) -> SuffixWindow:
+        if self._settling.get(model) != change:
+            self._settling[model] = change
+            self._event({"event": "settling_start", "model": model, "change_ms": change, "reason": window.settling})
+        return window
+
+    def _end_settling(self, model: str, how: str) -> None:
+        change = self._settling.pop(model, None)
+        if change is not None:
+            self._event({"event": "settling_end", "model": model, "change_ms": change, "how": how})
+
+    def _event(self, record: dict[str, Any]) -> None:
+        LOG.info(json.dumps(record, sort_keys=True))
+        self._events.append(f"{record['event']}:{record['model']}:{record.get('reason') or record.get('how')}")
+
+    def drain_events(self) -> tuple[str, ...]:
+        """Settling episode events since the last call (one start and one end per
+        episode; the decision record carries them)."""
+        events, self._events = tuple(self._events), []
+        return events
+
     def reset_ema(self, model: str) -> None:
         """Clear every EMA of ``model`` (TSS and alternative signals) - the idle reset."""
         computer = self._by_model.get(model)
@@ -518,269 +623,3 @@ class SignalState:
         for (owner, _source), ema in self._signal_ema.items():
             if owner == model:
                 ema.reset()
-
-    def observe_traffic(
-        self, model: str, *, has_traffic: bool, window_start_ms: int, window_end_ms: int
-    ) -> bool:
-        """Return whether ``model``'s signal is 'warm' (trustworthy on the low side).
-
-        Records the traffic-onset window_end on the first traffic-bearing tick; resets
-        on an idle (no-traffic) tick. Warm iff the current sliding window no longer
-        straddles the onset. Idempotent under the duplicate-window_end re-reads the
-        rescue/fairness/safescale loops do (mirrors the EMA per-window dedup).
-
-        ``has_traffic`` must be ``not tre_common.tss.window_is_idle(...)`` of the window -
-        the predicate every EMA update receives - so the onset and the EMAs restart on the
-        same condition. The idle tick also clears the model's EMAs (:meth:`reset_ema`); that
-        is idempotent with the idle-window reset the EMA updates already applied, and it
-        happens even when the warmup guard is disabled."""
-        if not has_traffic:
-            self.reset_ema(model)
-            self._onset_ms[model] = None
-            return True  # idle -> UNKNOWN, nothing to warm up for
-        onset = self._onset_ms.get(model)
-        if onset is None and (self._warmup_ms != 0 or self._o1_enabled):
-            # O1 needs the onset (a breakpoint) whatever the warmup guard is set to.
-            onset = window_end_ms
-            self._onset_ms[model] = onset
-        if self._warmup_ms == 0:
-            return True  # disabled
-        if self._warmup_ms < 0:
-            # auto: warm once the whole window lies inside the traffic period.
-            return window_start_ms >= onset
-        return (window_end_ms - onset) >= self._warmup_ms
-
-    # ------------------------------------------------------- O1 breakpoint window
-
-    @property
-    def _o1_enabled(self) -> bool:
-        return (
-            self.breakpoint is not None
-            and self.breakpoint.enabled
-            and self.breakpoint_window_suspended is None
-        )
-
-    @property
-    def o1_active(self) -> bool:
-        """O1 breakpoint windows are configured, enabled and not suspended (the gateway
-        clock check passes): a routable-count change then holds the model's decisions
-        until post-change evidence exists (timer cleanup 2026-10-02: the F4 action
-        cooldown only applies while this is False)."""
-        return self._o1_enabled
-
-    def suspend_breakpoint_window(self, reason: str) -> None:
-        """Fall back to whole windows and the onset guard (the gateway clock check)."""
-        self.breakpoint_window_suspended = str(reason)
-
-    def resume_breakpoint_window(self) -> None:
-        self.breakpoint_window_suspended = None
-
-    def note_hold(self, model: str, t_obs_ms: int, held: bool) -> int:
-        """Review P2-2: ``model``'s windows have been held (not warm, post-breakpoint)
-        from the first to this held observation (``t_obs_ms``: the window's newest
-        observation, :class:`tre_common.metrics_schema.Observed`) for ``hold_max_ms``.
-        Returns how long (ms, >= 1) once that is reached, else 0 (also for
-        ``hold_max_ms`` 0 = never). A not-held window resets; a window whose newest
-        observation did not move changes nothing."""
-        limit = int(self.breakpoint.hold_max_ms) if self.breakpoint is not None else 0
-        tracker = self._hold.get(model)
-        if tracker is None or tracker.span_ms != max(0, limit):
-            tracker = self._hold[model] = Persistence(limit)
-        reached = tracker.observe(int(t_obs_ms), bool(held))
-        if limit <= 0 or not reached:
-            return 0
-        return max(1, tracker.held_ms)
-
-    def onset_guard_applies(self) -> bool:
-        """Whether the ADR-0013 onset warmup guard gates receivers: always without O1
-        (``breakpoint`` None or ``scaling.breakpoint_window: false`` - turning O1 off
-        never leaves the model without onset protection, review P2-b), on top of O1 only
-        with ``scaling.onset_warmup_guard``."""
-        return self.breakpoint is None or not self._o1_enabled or self.breakpoint.onset_guard
-
-    def note_routable(
-        self,
-        model: str,
-        routable: int,
-        *,
-        observed_ms: int,
-        done_hints: Iterable[int | None] = (),
-    ) -> int | None:
-        """Track ``model``'s routable replica count (O1 breakpoints).
-
-        ``observed_ms`` is when the count was observed - the fetch time of the SM fleet
-        view it comes from, so the real change happened at or before it. A change is
-        recorded at the latest ``done_hints`` time (the controller's own completed
-        actions on the model: last scale/hide done, rescue target done) inside the
-        interval since the previous observation, else at ``observed_ms``: never before
-        the change, so the grid holding it is always excluded. The first observation
-        (start / restart) takes the latest hint, if any. Returns the recorded change
-        time (None: no change). Idempotent for the re-reads of one view."""
-        routable = int(routable)
-        observed_ms = int(observed_ms)
-        # A hint is ``ms`` (direction unknown) or ``(ms, sign)`` with sign +1 / -1 the
-        # routable direction the SM call could move the count in (review P3: a hint only
-        # dates a change in its own direction; an external change keeps the view time).
-        signed = []
-        for hint in done_hints:
-            if hint is None:
-                continue
-            ms, sign = (hint[0], hint[1]) if isinstance(hint, tuple) else (hint, 0)
-            if ms is not None and int(ms) <= observed_ms:
-                signed.append((int(ms), int(sign)))
-        hints = [ms for ms, _sign in signed]
-        margin = int(self.breakpoint.margin_ms) if self.breakpoint is not None else 0
-        previous = self._routable.get(model)
-        if previous is None:
-            self._routable[model] = (routable, observed_ms)
-            if hints:
-                self._change_ms[model] = max(hints) + margin
-                self._change_seen[model] = False
-                return self._change_ms[model]
-            return None
-        count, last_ms = previous
-        if observed_ms < last_ms:
-            return None  # an older view than one already seen (review P3): ignored
-        if routable == count:
-            if observed_ms > last_ms:
-                self._routable[model] = (count, observed_ms)
-            return None
-        direction = 1 if routable > count else -1
-        explained = [ms for ms, sign in signed if ms > last_ms and sign in (0, direction)]
-        change = (max(explained) if explained else observed_ms) + margin
-        if change >= self._change_ms.get(model, change):
-            self._change_ms[model] = change
-            self._change_seen[model] = True
-        self._routable[model] = (routable, observed_ms)
-        return change
-
-    def settle_breakpoint_ms(self, model: str) -> int | None:
-        """The breakpoint C1 may settle a rescue target on: the onset, or a routable
-        change seen between two views of this process - not one dated on the first
-        observation (a restart: the date is a guess and the SM may still be waking).
-        None while O1 is off or suspended (review P1): the windows are whole windows
-        then, still dominated by the old replica count, so C1 keeps its window-start rule."""
-        if not self._o1_enabled:
-            return None
-        change = self._change_ms.get(model) if self._change_seen.get(model) else None
-        points = [point for point in (self._onset_ms.get(model), change) if point is not None]
-        return max(points) if points else None
-
-    def note_queue_sample(self, model: str, sample: QueueSample | None) -> None:
-        """Record ``model``'s queue sample of a window read (H3). One entry per stamp
-        (the rescue / fairness re-reads of a window replace it); an older stamp than the
-        newest kept is ignored."""
-        if sample is None:
-            return
-        history = self._queue_samples.setdefault(model, [])
-        if history and int(sample.sample_ms) < history[-1].sample_ms:
-            return
-        if history and int(sample.sample_ms) == history[-1].sample_ms:
-            history[-1] = sample
-        else:
-            history.append(sample)
-        newest = history[-1].sample_ms
-        history[:] = [item for item in history if newest - item.sample_ms < QUEUE_SAMPLE_HISTORY_MS]
-
-    def queue_rise(
-        self, model: str, breakpoint_ms: int | None, current: QueueSample | None
-    ) -> dict[str, Any] | None:
-        """H3 "queue rising since the breakpoint": ``current`` - a sample of every
-        included pod taken after ``breakpoint_ms`` (stamp > breakpoint) - shows more
-        waiting requests than the baseline, the newest recorded sample stamped at or
-        before the breakpoint. Review P1-1: compared on the pods present in both samples
-        only (a pod woken at the breakpoint adds running requests, not a rise; a pod gone
-        removes its queue, not a fall), and on ``waiting`` with a margin: rising iff
-        waiting_now > waiting_base + max(1, 0.1 * waiting_base). No baseline (history
-        too short, after a restart), no post-breakpoint sample, no common pod, or not
-        higher -> None. State only: the samples the window reads already carry, no timer."""
-        if current is None or breakpoint_ms is None or int(current.sample_ms) <= int(breakpoint_ms):
-            return None
-        base = None
-        for sample in self._queue_samples.get(model, ()):
-            if sample.sample_ms <= int(breakpoint_ms):
-                base = sample
-        if base is None:
-            return None
-        base_pods = {pod: (q, waiting) for pod, q, waiting in base.per_pod}
-        now_pods = {pod: (q, waiting) for pod, q, waiting in current.per_pod}
-        common = sorted(set(base_pods) & set(now_pods))
-        if not common:
-            return None
-        base_waiting = sum(base_pods[pod][1] for pod in common)
-        waiting = sum(now_pods[pod][1] for pod in common)
-        if waiting <= base_waiting + max(QUEUE_RISE_MIN_ABS, QUEUE_RISE_MIN_RATIO * base_waiting):
-            return None
-        return {
-            "breakpoint_ms": int(breakpoint_ms),
-            "base_ms": base.sample_ms,
-            "base_q": sum(base_pods[pod][0] for pod in common),
-            "base_waiting": base_waiting,
-            "base_pods": base.pods,
-            "sample_ms": int(current.sample_ms),
-            "q": sum(now_pods[pod][0] for pod in common),
-            "waiting": waiting,
-            "pods": current.pods,
-            "common_pods": len(common),
-        }
-
-    def breakpoint_ms(self, model: str) -> int | None:
-        """``max(traffic onset, last routable-count change)`` of ``model`` (O1)."""
-        points = [point for point in (self._onset_ms.get(model), self._change_ms.get(model)) if point is not None]
-        return max(points) if points else None
-
-    def effective_window(self, model: str, metrics: ModelWindowMetrics) -> EffectiveWindow:
-        """The part of ``metrics`` (a model's serving window) after its breakpoint.
-
-        Full window when O1 is off, no breakpoint lies inside the window or the
-        breakpoint sits at/before the window start. Otherwise the store's suffix that
-        starts first at or after the breakpoint (the store aligns it to its docs, the
-        partial period holding the breakpoint excluded); ``warm`` once its observed span
-        after the breakpoint reaches ``min_evidence_ms`` (and ``min_evidence_requests``
-        completed requests). The model's EMAs are restarted once per breakpoint (the
-        first tick that sees it inside the window), so the pre-breakpoint windows never
-        leak into the signal through the EMA."""
-        start = int(metrics.window_start_ms)
-        end = int(metrics.window_end_ms)
-        span = end - start
-        cfg = self.breakpoint
-        point = self.breakpoint_ms(model) if self._o1_enabled else None
-        full = EffectiveWindow(
-            metrics=metrics, full=True, warm=True, breakpoint_ms=point, start_ms=start,
-            evidence_ms=observed_of(metrics).span_ms,
-        )
-        if cfg is None or not self._o1_enabled or point is None or point <= start or span <= 0:
-            return full
-        if self._ema_breakpoint.get(model) != point:
-            self._ema_breakpoint[model] = point
-            self.reset_ema(model)
-        suffixes = [
-            item for item in metrics.suffix_windows if start < int(item.window_start_ms) < end
-            and int(item.window_start_ms) >= int(point)
-        ]
-        suffix = min(suffixes, key=lambda item: int(item.window_start_ms)) if suffixes else None
-        if suffix is None:
-            # No suffix after the breakpoint (it lies in the window's last period, the
-            # store builds none, an unaligned / offline window): wait for a whole clean
-            # window, like the pre-O1 guard.
-            return EffectiveWindow(
-                metrics=metrics, full=False, warm=False, breakpoint_ms=point, start_ms=int(point),
-                evidence_ms=0, reason="no_suffix",
-            )
-        eff_start = int(suffix.window_start_ms)
-        evidence = observed_of(suffix).since(int(point))
-        partial = dict(full=False, breakpoint_ms=point, start_ms=eff_start, evidence_ms=evidence)
-        scale = float(span) / float(end - eff_start)
-        if not span_reaches(evidence, cfg.min_evidence_ms):
-            return EffectiveWindow(
-                metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_span", **partial
-            )
-        if suffix.prompt_tokens is None or suffix.generation_tokens is None:
-            return EffectiveWindow(
-                metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_tokens", **partial
-            )
-        if cfg.min_evidence_requests > 0 and float(observed_requests(suffix) or 0.0) < cfg.min_evidence_requests:
-            return EffectiveWindow(
-                metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_requests", **partial
-            )
-        return EffectiveWindow(metrics=suffix, warm=True, numerator_scale=scale, **partial)

@@ -2,9 +2,9 @@
 
 * a SafeScale commit re-checks the mode before every capacity-changing step: a
   donor already slept is recorded, its receiver is not woken;
-* a relay (TransferIntent, 2026-10-02) is ONE SM call: the mode is checked right
-  before it; once sent, the service-manager completes it (observe entered meanwhile
-  is recorded, nothing is undone);
+* a relay (a named transfer, one plan group since 2026-10-28) is ONE SM call: the mode
+  is checked right before it; once sent, the service-manager completes it (observe
+  entered meanwhile changes nothing, nothing is undone);
 * entering observe rolls every open SafeScale probe back: held one-shot
   actions are dropped, the single action taken is the unhide of the probe
   pods, the probe resolves as a rollback ``observe_entered``;
@@ -19,7 +19,9 @@ from tre_controller.loops.safescale_task import (
     rollback_probes_for_observe,
     run_safescale_observation_tick,
 )
-from tre_controller.planning.planner import HideAction, ScaleAction, TransferIntent
+from tre_common.gpu_placement import GpuBlock
+from tre_controller.loops.action_queue import transfer_plan
+from tre_controller.planning.planner import BlockSupplyAction, HideAction, ScaleAction
 from tre_controller.store.state_store import ControllerStateStore
 
 from test_action_queue_review3 import ScriptedSM, _calls, _commit, _until
@@ -28,28 +30,30 @@ from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind PO
 
 
 def _transfer():
-    return TransferIntent("7b", "8b", 1, "critical_donor_immediate", "rescue")
+    return transfer_plan(BlockSupplyAction(
+        receiver="8b", block=GpuBlock("n", (1,)), receiver_pods=("8b-1",), sleeps=(("7b", "7b-1"),),
+        reason="critical_donor_immediate", source_loop="rescue",
+    ))
 
 
 # ------------------------------------------------------------ mid-transfer flip
 def test_observe_entered_while_the_sm_runs_a_relay_is_recorded_not_undone():
-    """2026-10-02: the relay is one SM call; the SM finishes what it started (donor
-    asleep AND receiver awake) - the controller records it, sends nothing more."""
+    """The relay is one SM plan; the SM finishes what it started (donor asleep AND
+    receiver awake) - the controller sends nothing more."""
     async def scenario():
         mode = {"observe": False}
-        sm = ScriptedSM(gated={"transfer:7b->8b"})
+        sm = ScriptedSM(gated={"7b-1"})
         queue = ActionQueue(sm, is_observe=lambda: mode["observe"])
         queue.submit((_transfer(),))
         drain = asyncio.ensure_future(queue.drain_once())
-        assert await _until(lambda: _calls(sm) == [("7b->8b", "transfer", 1)])
+        assert await _until(lambda: _calls(sm) == [("7b-1", "sleep")])
         mode["observe"] = True  # the console switches while the SM runs the relay
-        sm.gates["transfer:7b->8b"].set()
+        sm.gates["7b-1"].set()
         results = await drain
-        assert _calls(sm) == [("7b->8b", "transfer", 1)]  # nothing else is sent
+        assert _calls(sm) == [("7b-1", "sleep"), ("8b-1", "wake")]  # the plan, nothing more
         donor, receiver = results
-        assert (donor.model, donor.taken) == ("7b", 1)
-        assert (receiver.model, receiver.ok, receiver.done) == ("8b", True, 1)
-        assert queue.stats()["observe_transfer_completed_total"] == 1
+        assert (donor.model, donor.ok) == ("7b", True)
+        assert (receiver.model, receiver.ok) == ("8b", True)
         assert queue.inflight_models() == set()
 
     asyncio.run(scenario())

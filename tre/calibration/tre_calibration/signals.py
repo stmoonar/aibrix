@@ -133,13 +133,13 @@ def tss_series(
                 raise ValueError("EMA scoring needs window_end_ms on every window")
             ema.update(
                 raw_of(earlier), earlier.window_end_ms, earlier.window_ms,
-                window_is_idle(earlier.prompt_tokens_total, earlier.generation_tokens_total),
+                window_is_idle(earlier.avg_running, earlier.avg_waiting),
             )
         if item.window_end_ms is None:
             raise ValueError("EMA scoring needs window_end_ms on every window")
         out.append(ema.update(
             raw_of(item), item.window_end_ms, item.window_ms,
-            window_is_idle(item.prompt_tokens_total, item.generation_tokens_total),
+            window_is_idle(item.avg_running, item.avg_waiting),
         ))
     return out
 

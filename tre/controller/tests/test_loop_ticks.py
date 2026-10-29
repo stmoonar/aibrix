@@ -5,11 +5,12 @@ from dataclasses import replace
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_common.registry import PlacementConfig
-from tre_controller.loops.fairness_task import run_fairness_tick
-from tre_controller.loops.rescue_task import run_rescue_tick
+from section_ticks import run_fairness_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.tick import PaperStateCache
 from tre_controller.config import SafeScaleConfig
-from tre_controller.planning.planner import HideAction, ScaleAction
+from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction
+from tre_sm.allocator.slots import Binding, Slot
 from tre_controller.planning.safescale import SafeScaleStateMachine
 
 
@@ -191,9 +192,9 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     action = queue.submitted[0][0]
     assert isinstance(action, ScaleAction)
     assert action.model == "critical"
-    # C1: the whole deficit at once - n=2, Z far below tau_crit -> target 2n = 4.
-    assert action.delta == 2
-    assert action.rescue is not None and action.rescue.target == 4
+    # One step per plan (2026-10-28): n=2 -> target 3, whatever the Z.
+    assert action.delta == 1
+    assert action.rescue is not None and action.rescue.target == 3
     assert action.source_loop == "rescue"
     assert result.model_contexts["critical"]["z_m"] is not None
     assert result.model_contexts["critical"]["signal_source"] == "zm"
@@ -346,17 +347,25 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
     # (good latency) and the proactive scale-down is the observable proving the signal was
     # applied. The t1 suppress-hot-proactive guard is disabled here so that observable remains;
     # the guard's own behaviour is covered in test_planner.py.
-    # 2026-10-08: with no SafeScale the probe-requiring shrink is released immediately.
+    # 2026-10-08: with no SafeScale the probe-requiring shrink is released immediately;
+    # 2026-10-28: the tick names its pod from the fleet view (sm-plans section 10).
+    registry = _registry()
+    node = registry.topology().nodes[0].name
+    view = ClusterView(registry.topology(), tuple(
+        Binding(f"critical-{gpu}", "critical", Slot(node, (gpu,)), awake=True) for gpu in (0, 1)
+    ))
     result = run_rescue_tick(
         snapshot,
         queue=queue,
-        registry=_registry(),
+        registry=registry,
         signal_source="latency_p95",
         suppress_hot_proactive_probe=False,
+        cluster_view=view,
     )
 
     [action] = result.actions
     assert (action.model, action.reason) == ("critical", "high_proactive_safescale_nosafescale")
+    assert len(action.pods) == 1
 
 
 def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:
@@ -446,18 +455,6 @@ def test_fairness_tick_passes_inflight_models_to_planner() -> None:
     assert queue.submitted == []
 
 
-class StopLoop(Exception):
-    pass
-
-
-async def _stop_sleep(seconds: float) -> None:
-    _stop_sleep.calls.append(seconds)
-    raise StopLoop
-
-
-_stop_sleep.calls = []
-
-
 class FakeDecisionWriter:
     def __init__(self) -> None:
         self.calls: list[tuple[str, MetricsSnapshot, object]] = []
@@ -466,45 +463,12 @@ class FakeDecisionWriter:
         self.calls.append((loop_name, snapshot, result))
 
 
-def test_rescue_task_loop_reads_snapshot_and_sleeps_configured_interval() -> None:
-    import asyncio
-
-    from tre_controller.loops.metrics_task import SnapshotBox
-    from tre_controller.loops.rescue_task import rescue_task
-
-    _stop_sleep.calls = []
-    queue = FakeQueue()
-    snapshot = MetricsSnapshot(
-        ts_ms=1,
-        stale=False,
-        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
-    )
-    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
-
-    try:
-        asyncio.run(
-            rescue_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=_registry(),
-                cfg=cfg,
-                sleep=_stop_sleep,
-            )
-        )
-    except StopLoop:
-        pass
-
-    assert _stop_sleep.calls == [5.0]
-    assert len(queue.submitted) == 1
+_LOOP_CFG = type("Cfg", (), {"rescue_interval_s": 5.0, "fairness_interval_s": 10.0})()
 
 
-def test_rescue_task_loop_records_decision_snapshot_after_tick() -> None:
-    import asyncio
+def test_decision_loop_records_decision_snapshot_after_tick() -> None:
+    from tre_controller.loops.decision_task import DecisionLoop
 
-    from tre_controller.loops.metrics_task import SnapshotBox
-    from tre_controller.loops.rescue_task import rescue_task
-
-    _stop_sleep.calls = []
     queue = FakeQueue()
     writer = FakeDecisionWriter()
     snapshot = MetricsSnapshot(
@@ -512,36 +476,19 @@ def test_rescue_task_loop_records_decision_snapshot_after_tick() -> None:
         stale=False,
         models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
     )
-    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
 
-    try:
-        asyncio.run(
-            rescue_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=_registry(),
-                cfg=cfg,
-                sleep=_stop_sleep,
-                decision_writer=writer,
-            )
-        )
-    except StopLoop:
-        pass
+    result = DecisionLoop(queue=queue, registry=_registry(), cfg=_LOOP_CFG, decision_writer=writer).on_snapshot(
+        snapshot
+    )
 
-    assert len(writer.calls) == 1
-    loop_name, seen_snapshot, result = writer.calls[0]
-    assert loop_name == "rescue"
-    assert seen_snapshot is snapshot
-    assert result.submitted == 1
+    assert result.submitted == 1 and len(queue.submitted) == 1
+    [(loop_name, seen_snapshot, written)] = writer.calls
+    assert (loop_name, seen_snapshot, written) == ("rescue", snapshot, result)
 
 
-def test_fairness_task_loop_records_decision_snapshot_after_tick() -> None:
-    import asyncio
+def test_decision_loop_records_a_stale_snapshot_without_planning() -> None:
+    from tre_controller.loops.decision_task import DecisionLoop
 
-    from tre_controller.loops.fairness_task import fairness_task
-    from tre_controller.loops.metrics_task import SnapshotBox
-
-    _stop_sleep.calls = []
     queue = FakeQueue()
     writer = FakeDecisionWriter()
     snapshot = MetricsSnapshot(
@@ -549,62 +496,18 @@ def test_fairness_task_loop_records_decision_snapshot_after_tick() -> None:
         stale=True,
         models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
     )
-    cfg = type("Cfg", (), {"fairness_interval_s": 10.0})()
 
-    try:
-        asyncio.run(
-            fairness_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=_registry(),
-                cfg=cfg,
-                sleep=_stop_sleep,
-                decision_writer=writer,
-            )
-        )
-    except StopLoop:
-        pass
+    loop = DecisionLoop(queue=queue, registry=_registry(), cfg=_LOOP_CFG, decision_writer=writer)
+    result = loop.on_snapshot(snapshot)
 
-    assert len(writer.calls) == 1
-    loop_name, seen_snapshot, result = writer.calls[0]
-    assert loop_name == "fairness"
-    assert seen_snapshot is snapshot
-    assert result.events == ("snapshot_stale",)
-
-
-def test_fairness_task_loop_skips_missing_snapshot_and_sleeps_configured_interval() -> None:
-    import asyncio
-
-    from tre_controller.loops.fairness_task import fairness_task
-    from tre_controller.loops.metrics_task import SnapshotBox
-
-    _stop_sleep.calls = []
-    queue = FakeQueue()
-    cfg = type("Cfg", (), {"fairness_interval_s": 10.0})()
-
-    try:
-        asyncio.run(
-            fairness_task(
-                SnapshotBox(),
-                queue=queue,
-                registry=_registry(),
-                cfg=cfg,
-                sleep=_stop_sleep,
-            )
-        )
-    except StopLoop:
-        pass
-
-    assert _stop_sleep.calls == [10.0]
+    assert result.events == ("snapshot_stale",) and loop.stale
     assert queue.submitted == []
+    assert [call[2].events for call in writer.calls] == [("snapshot_stale",)]
 
 
-def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
-    import asyncio
-
+def test_decision_loop_uses_latest_cluster_view_from_box() -> None:
     from tre_controller.loops.cluster_view_task import ClusterViewBox
-    from tre_controller.loops.metrics_task import SnapshotBox
-    from tre_controller.loops.rescue_task import rescue_task
+    from tre_controller.loops.decision_task import DecisionLoop
     from tre_controller.planning.planner import ClusterView, DefragAction, ScaleAction
     from tre_sm.allocator.slots import Binding, Migration, Slot
 
@@ -636,22 +539,10 @@ def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
             Binding("serve-2", "m1", Slot("node-a", (2,)), awake=True),
         ),
     )
-    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
-    _stop_sleep.calls = []
 
-    try:
-        asyncio.run(
-            rescue_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=registry,
-                cfg=cfg,
-                sleep=_stop_sleep,
-                cluster_view_box=ClusterViewBox(view),
-            )
-        )
-    except StopLoop:
-        pass
+    DecisionLoop(
+        queue=queue, registry=registry, cfg=_LOOP_CFG, cluster_view_box=ClusterViewBox(view)
+    ).on_snapshot(snapshot)
 
     actions = queue.submitted[0]
     defrag = next(action for action in actions if isinstance(action, DefragAction))
@@ -660,17 +551,12 @@ def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
         Migration("serve-2", Slot("node-a", (2,)), Slot("node-a", (1,))),
     )
     assert scale.reason == "critical_tp_defrag"
-    assert _stop_sleep.calls == [5.0]
 
 
-def test_rescue_task_loop_skips_when_cluster_view_box_is_not_ready() -> None:
-    import asyncio
-
+def test_decision_loop_skips_when_cluster_view_box_is_not_ready() -> None:
     from tre_controller.loops.cluster_view_task import ClusterViewBox
-    from tre_controller.loops.metrics_task import SnapshotBox
-    from tre_controller.loops.rescue_task import rescue_task
+    from tre_controller.loops.decision_task import DecisionLoop
 
-    _stop_sleep.calls = []
     queue = FakeQueue()
     writer = FakeDecisionWriter()
     snapshot = MetricsSnapshot(
@@ -678,68 +564,16 @@ def test_rescue_task_loop_skips_when_cluster_view_box_is_not_ready() -> None:
         stale=False,
         models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
     )
-    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
 
-    try:
-        asyncio.run(
-            rescue_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=_registry(),
-                cfg=cfg,
-                sleep=_stop_sleep,
-                cluster_view_box=ClusterViewBox(),
-                decision_writer=writer,
-            )
-        )
-    except StopLoop:
-        pass
+    DecisionLoop(
+        queue=queue, registry=_registry(), cfg=_LOOP_CFG, cluster_view_box=ClusterViewBox(), decision_writer=writer
+    ).on_snapshot(snapshot)
 
     assert queue.submitted == []
-    assert len(writer.calls) == 1
-    assert writer.calls[0][2].events == ("cluster_view_unavailable",)
-    assert _stop_sleep.calls == [5.0]
+    assert [call[2].events for call in writer.calls] == [("cluster_view_unavailable",)]
 
 
-def test_fairness_task_loop_skips_when_cluster_view_box_is_not_ready() -> None:
-    import asyncio
-
-    from tre_controller.loops.cluster_view_task import ClusterViewBox
-    from tre_controller.loops.fairness_task import fairness_task
-    from tre_controller.loops.metrics_task import SnapshotBox
-
-    _stop_sleep.calls = []
-    queue = FakeQueue()
-    writer = FakeDecisionWriter()
-    snapshot = MetricsSnapshot(
-        ts_ms=1,
-        stale=False,
-        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
-    )
-    cfg = type("Cfg", (), {"fairness_interval_s": 10.0})()
-
-    try:
-        asyncio.run(
-            fairness_task(
-                SnapshotBox(snapshot),
-                queue=queue,
-                registry=_registry(),
-                cfg=cfg,
-                sleep=_stop_sleep,
-                cluster_view_box=ClusterViewBox(),
-                decision_writer=writer,
-            )
-        )
-    except StopLoop:
-        pass
-
-    assert queue.submitted == []
-    assert len(writer.calls) == 1
-    assert writer.calls[0][2].events == ("cluster_view_unavailable",)
-    assert _stop_sleep.calls == [10.0]
-
-
-def _registry_for_same_slot_shrink() -> Registry:
+def _registry_for_tp_block() -> Registry:
     base = _registry()
     template = base.model("critical")
     return Registry(
@@ -769,13 +603,13 @@ def _registry_for_same_slot_shrink() -> Registry:
     )
 
 
-def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None:
+def test_rescue_tick_converts_a_tp_block_with_a_high_donor_to_a_safescale_probe_hide() -> None:
     from tre_controller.planning.planner import ClusterView
     from tre_sm.allocator.slots import Binding, Slot
 
     queue = FakeQueue()
     safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
-    registry = _registry_for_same_slot_shrink()
+    registry = _registry_for_tp_block()
     snapshot = MetricsSnapshot(
         ts_ms=20_000,
         stale=False,
@@ -789,6 +623,7 @@ def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+            Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
         ),
     )
 

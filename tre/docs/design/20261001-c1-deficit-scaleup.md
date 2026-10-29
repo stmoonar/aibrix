@@ -1,5 +1,7 @@
 # C1: deficit-sized rescue scale-up, no scale-up cooldown (2026-10-01)
 
+> **Status 2026-10-29:** the rescue-target timing hold (wait for the window / EMA to reflect a target) is removed; only the ledger that stops one plan double-counting a target the fleet view does not show yet stays. See [20261029-tss-only.md](20261029-tss-only.md).
+
 User decision (2026-10-01): **scale up by the deficit in one step and drop the
 scale-up cooldown; scale-down stays with SafeScale** (scale-up aggressive,
 scale-down cautious). Branch `feat/c1-deficit-scaleup-20261001`; review round

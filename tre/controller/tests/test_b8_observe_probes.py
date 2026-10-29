@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.rescue_task import run_rescue_tick
+from section_ticks import run_rescue_tick
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.planning.planner import HideAction, ScaleAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
@@ -103,15 +103,8 @@ def test_observe_mode_does_not_preempt_a_running_probe():
     assert any(isinstance(a, ScaleAction) and a.delta > 0 for a in result.actions)
 
 
-def test_the_rescue_loop_reads_the_mode_gate_every_tick():
-    from tre_controller.loops.metrics_task import SnapshotBox
-    from tre_controller.loops.rescue_task import rescue_task
-
-    class Stop(Exception):
-        pass
-
-    async def stop(_seconds):
-        raise Stop
+def test_the_decision_loop_reads_the_mode_gate_every_tick():
+    from tre_controller.loops.decision_task import DecisionLoop
 
     queue = FakeQueue()
     safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
@@ -121,20 +114,13 @@ def test_the_rescue_loop_reads_the_mode_gate_every_tick():
         reads.append(1)
         return True
 
-    try:
-        asyncio.run(
-            rescue_task(
-                SnapshotBox(_probe_snapshot()),
-                queue=queue,
-                registry=_registry_with_models("critical", "donor"),
-                cfg=SimpleNamespace(rescue_interval_s=5.0),
-                sleep=stop,
-                safescale=safescale,
-                is_observe=is_observe,
-            )
-        )
-    except Stop:
-        pass
+    DecisionLoop(
+        queue=queue,
+        registry=_registry_with_models("critical", "donor"),
+        cfg=SimpleNamespace(rescue_interval_s=5.0, fairness_interval_s=10.0),
+        safescale=safescale,
+        is_observe=is_observe,
+    ).on_snapshot(_probe_snapshot())
     assert reads == [1]
     assert safescale.busy_models() == set()
     assert not any(isinstance(action, HideAction) for batch in queue.submitted for action in batch)

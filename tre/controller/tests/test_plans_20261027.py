@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue
+from tre_common.gpu_placement import GpuBlock
+from tre_controller.loops.action_queue import ActionQueue, transfer_plan
 from tre_controller.planning.planner import (
     HideAction,
     ReceiverTarget,
     RescuePlan,
     SafeScaleCommitAction,
     ScaleAction,
-    TransferIntent,
+    BlockSupplyAction,
 )
 
 from plan_shim import PlanSM, done_plan
@@ -40,7 +41,7 @@ def test_a_target_already_met_makes_no_sm_call_and_stamps_nothing():
     by_model = {result.model: result for result in results}
     assert by_model["8b"].ok and by_model["8b"].woke_none
     assert by_model["m"].ok and by_model["m"].taken == 0
-    assert queue.view_changes() == {} and queue.routable_changes() == {} and queue.last_actions() == {}
+    assert queue.view_changes() == {} and queue.last_actions() == {}
     assert done == [("7b-0", "commit", "formal_commit_gate_passed")]
 
 
@@ -148,6 +149,14 @@ def test_a_whole_plan_refusal_keeps_every_commit_member_pending():
     assert all(result.ok for result in results) and results[0].attempts == 2
 
 
+
+def _transfer(donor, donor_pod, receiver, receiver_pod, *, rescue=None):
+    """A named relay pair as the tick sends it (sm-plans section 10): one plan group."""
+    return transfer_plan(BlockSupplyAction(
+        receiver=receiver, block=GpuBlock("n", (0,)), receiver_pods=(receiver_pod,),
+        sleeps=((donor, donor_pod),), reason="critical_donor_immediate", source_loop="rescue", rescue=rescue,
+    ))
+
 # ------------------------------------------------------------------ (12) one submit -> one plan
 def test_one_submit_of_different_models_is_one_plan_with_one_item_per_action():
     """§5.2 as narrowed: [+k on R1, D->R2, shrink D2] of one submit = ONE POST with three
@@ -157,28 +166,31 @@ def test_one_submit_of_different_models_is_one_plan_with_one_item_per_action():
     queue = ActionQueue(sm, now_ms=lambda: 5_000)
     submitted = queue.submit((
         ScaleAction("R1", 2, "critical_sleeping_capacity", "rescue", rescue=rescue),
-        TransferIntent("D", "R2", 1, "critical_donor_immediate", "rescue"),
+        _transfer("D", "D-0", "R2", "R2-0"),
         ScaleAction("D2", -1, "idle_proactive_immediate", "rescue", sleep_path="urgent"),
     ))
     assert submitted.accepted == 3 and len(queue.pending_actions()) == 1
     results = asyncio.run(queue.drain_once())
 
+    group = "t:R2:R2-0"
     assert sm.plans == [{
-        "sleeps": [{"model": "D2", "reason": "idle_proactive_immediate", "sleep_path": "urgent", "at_most": 2}],
+        "sleeps": [
+            {"model": "D", "reason": "critical_donor_immediate", "sleep_path": "urgent", "pods": ["D-0"],
+             "group": group},
+            {"model": "D2", "reason": "idle_proactive_immediate", "sleep_path": "urgent", "at_most": 2},
+        ],
         "wakes": [
             {"model": "R1", "reason": "critical_sleeping_capacity", "at_least": 3},
-            {"model": "R2", "reason": "critical_donor_immediate", "at_least": 2,
-             "donors": [{"model": "D", "max": 1, "sleep_path": "urgent"}]},
+            {"model": "R2", "reason": "critical_donor_immediate", "pods": ["R2-0"], "group": group},
         ],
     }]
     assert sm.state_reads == 1
     assert [(r.model, r.action_kind, r.ok) for r in results] == [
-        ("R1", "scale", True), ("D", "transfer", True), ("R2", "transfer", True), ("D2", "scale", True),
+        ("R1", "scale", True), ("D", "scale", True), ("R2", "scale", True), ("D2", "scale", True),
     ]
     record = queue.rescue_targets()["R1"]
     assert (record.gained, record.outstanding, record.done_ms) == (2, 0, 5_000)
     assert {m: d for m, (_, d) in queue.last_actions().items()} == {"R1": "up", "R2": "up", "D": "down", "D2": "down"}
-    assert any(event.startswith("transfer_done:D->R2:count=1:done=1:taken=1") for event in queue.drain_events())
     assert queue.relay_holds() == {} and queue.inflight_models() == set()
 
 
@@ -192,15 +204,19 @@ def test_a_second_action_on_a_used_model_starts_the_next_plan():
     submitted = queue.submit((
         ScaleAction("R1", 1, "critical_sleeping_capacity", "rescue", rescue=rescue),
         ScaleAction("R2", 1, "critical_sleeping_capacity", "rescue"),
-        TransferIntent("D3", "R1", 1, "critical_donor_immediate", "rescue", rescue=rescue),
+        _transfer("D3", "D3-0", "R1", "R1-1", rescue=rescue),
     ))
     assert submitted.accepted == 3 and len(queue.pending_actions()) == 2
     asyncio.run(queue.drain_once())
 
     first, second = sm.plans
     assert [item["model"] for item in first["wakes"]] == ["R1", "R2"] and first["sleeps"] == []
-    assert second == {"sleeps": [], "wakes": [{"model": "R1", "reason": "critical_donor_immediate", "at_least": 2,
-                                               "donors": [{"model": "D3", "max": 1, "sleep_path": "urgent"}]}]}
+    group = "t:R1:R1-1"
+    assert second == {
+        "sleeps": [{"model": "D3", "reason": "critical_donor_immediate", "sleep_path": "urgent", "pods": ["D3-0"],
+                    "group": group}],
+        "wakes": [{"model": "R1", "reason": "critical_donor_immediate", "pods": ["R1-1"], "group": group}],
+    }
     record = queue.rescue_targets()["R1"]
     assert (record.gained, record.outstanding) == (2, 0)
 

@@ -10,7 +10,6 @@ def test_redis_key_builders_match_v2_schema():
     assert rediskeys.hist_key("pod-a") == "tre:v2:hist:pod-a"
     assert rediskeys.inst_key("pod-a") == "tre:v2:inst:pod-a"
     assert rediskeys.pods_key("dsqwen-7b") == "tre:v2:pods:dsqwen-7b"
-    assert rediskeys.DECISION_LATEST_KEY == "tre:v2:decision:latest"
     assert rediskeys.SM_STATE_KEY == "tre:v2:sm:state"
     assert rediskeys.SM_VERSION_KEY == "tre:v2:sm:version"
     assert rediskeys.CONTROLLER_ORPHAN_WATCH_KEY == "tre:v2:controller:orphan_watch"

@@ -1,5 +1,7 @@
 # Onset saturation rescue (2026-10-02)
 
+> **Status 2026-10-29: removed.** The saturation rescue and its `scaling.saturation_*` keys are gone (keys retired). See [20261029-tss-only.md](20261029-tss-only.md).
+
 Branch `feat/saturation-onset-rescue-20261002` (on `fix/tick-safescale-none-20261002`
 @ 61bd5019; review fixes in a follow-up commit). Registry `scaling.saturation_*`. Code:
 `tre_controller/signals/saturation.py` (rule and per-model state), `loops/tick.py`

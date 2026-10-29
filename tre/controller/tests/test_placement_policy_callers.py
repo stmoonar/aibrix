@@ -9,8 +9,8 @@ from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec, PlacementConfig, Registry
 from tre_controller.loops import tick as tick_module
 from tre_controller.loops.tick import _pods_to_probe, run_planner_tick
-from tre_controller.planning.planner import ClusterView, _release_pick, _SlotOccupancy
-from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
+from tre_controller.planning.planner import ClusterView, _SlotOccupancy
+from tre_sm.allocator.slots import Binding, Slot, SlotAllocator, release_order
 
 N1, N2 = "n1", "n2"
 TOPOLOGY = ClusterTopology(
@@ -59,9 +59,10 @@ def test_free_groups_and_find_slot_spread_a_model():
     assert SlotAllocator(TOPOLOGY, bindings).find_slot(1, "A") == Slot(N1, (2,))
 
 
-def test_relay_pairing_is_counted_not_placed():
-    """2026-10-02: which donor pod pairs with which receiver binding is the SM's choice
-    (its ``_release_pick`` / ``_wake_pick``); the planner only counts the pairs."""
+def test_relay_pairing_names_the_shared_release_choice():
+    """2026-10-28 (sm-plans section 10): the planner names the relay pair - the donor pod
+    by the same release order the SM's ``release_pick`` uses, the receiver binding under
+    it - and claims it once."""
     bindings = [
         _b("r-0", "R", N1, (0,), awake=True),
         _b("d-n1", "D", N1, (1,), awake=True),
@@ -71,9 +72,15 @@ def test_relay_pairing_is_counted_not_placed():
     ]
     for placement in (POLICY, None):
         occupancy = _SlotOccupancy(_view(bindings, placement=placement))
-        assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=1) == (1, 1)
-        assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=5) == (1, 1)  # one left
-        assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=5) == (0, 0)  # counted once
+        serving = [b for b in bindings if b.model == "D"]
+        first = release_order(serving, bindings=bindings, topology=TOPOLOGY, policy=placement)[0]
+        estimate = occupancy.pairable("D", "R", max_pairs=5, max_donors=1)
+        [(receiver, donors)] = estimate.named
+        assert donors == (first.serve_id,) and receiver.slot == first.slot
+        again = occupancy.pairable("D", "R", max_pairs=5, max_donors=5)  # one left
+        assert (again.pairs, again.donors) == (1, 1) and again.donor_pods != donors
+        empty = occupancy.pairable("D", "R", max_pairs=5, max_donors=5)  # claimed once
+        assert (empty.pairs, empty.donors) == (0, 0)
 
 
 def test_safescale_probe_pick_releases_from_the_most_loaded_node():
@@ -89,21 +96,6 @@ def test_safescale_probe_pick_releases_from_the_most_loaded_node():
     assert _pods_to_probe(snapshot, "A", 1, cluster_view=_view(bindings)) == ("a-heavy",)
     # Reference best-fit breaks the tie by the highest address instead.
     assert _pods_to_probe(snapshot, "A", 1, cluster_view=_view(bindings, placement=None)) == ("a-light",)
-
-
-def test_same_slot_shrink_tie_break_uses_the_policy_not_serve_id():
-    bindings = [
-        _b("x-1", "X", N2, (2,), awake=True),
-        _b("z-3", "Z", N2, (3,), awake=True),
-        _b("x-2", "X", N1, (0,), awake=True),
-        _b("w-1", "W", N1, (1,), awake=True),
-        _b("y-1", "Y", N1, (2,), awake=True),
-        _b("y-2", "Y", N1, (3,), awake=True),
-    ]
-    tied = [bindings[0], bindings[2]]
-    # Neither release frees a pair; n1 (2 of 2 pairs in use) is the more loaded node.
-    # The old serve_id tie-break would have picked x-1.
-    assert _release_pick(tied, _view(bindings)).serve_id == "x-2"
 
 
 class _Captured(Exception):

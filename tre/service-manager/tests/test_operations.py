@@ -37,6 +37,8 @@ class ScriptRedis:
         self.values = {}
         self.hashes = {}
         self.zsets = {}
+        self.sets = {}
+        self.hgetall_calls = 0
         self.eval_calls = []
         self.now_ms = 1_700_000_000_000
 
@@ -49,9 +51,24 @@ class ScriptRedis:
     def delete(self, key):
         self.values.pop(key, None)
         self.hashes.pop(key, None)
+        self.sets.pop(key, None)
 
     def hgetall(self, key):
+        self.hgetall_calls += 1
         return dict(self.hashes.get(key, {}))
+
+    def hmget(self, key, fields):
+        bucket = self.hashes.get(key, {})
+        return [bucket.get(field) for field in fields]
+
+    def smembers(self, key):
+        return set(self.sets.get(key, set()))
+
+    def sadd(self, key, *values):
+        self.sets.setdefault(key, set()).update(values)
+
+    def srem(self, key, *values):
+        self.sets.get(key, set()).difference_update(values)
 
     def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
@@ -67,7 +84,7 @@ class ScriptRedis:
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:])
         if script == _ACQUIRE_SCRIPT:
-            lock_key, counter_key, operations_key, queue_key, deadlines_key, seq_key = keys
+            lock_key, counter_key, operations_key, queue_key, deadlines_key, seq_key, running_key = keys
             owner, _ttl, operation_id, kind, started_at, request_json, ticket, waiter_ttl = args
             queue = self.zsets.setdefault(queue_key, {})
             deadlines = self.hashes.setdefault(deadlines_key, {})
@@ -106,6 +123,7 @@ class ScriptRedis:
                     "request": json.loads(request_json),
                 }
             )
+            self.sets.setdefault(running_key, set()).add(operation_id)
             return [token, lock_value]
         if script == _LEAVE_QUEUE_SCRIPT:
             self.zsets.get(keys[0], {}).pop(args[0], None)
@@ -114,18 +132,24 @@ class ScriptRedis:
         if script == _RENEW_SCRIPT:
             return int(self.values.get(keys[0]) == args[0])
         if script == _UPDATE_SCRIPT:
-            lock_key, operations_key = keys
-            lock_value, operation_id, record = args
+            lock_key, operations_key, running_key = keys
+            lock_value, operation_id, record, status = args
             if self.values.get(lock_key) != lock_value:
                 return 0
             self.hashes.setdefault(operations_key, {})[operation_id] = record
+            running = self.sets.setdefault(running_key, set())
+            if status == "running":
+                running.add(operation_id)
+            else:
+                running.discard(operation_id)
             return 1
         if script == _FINISH_SCRIPT:
-            lock_key, operations_key = keys
+            lock_key, operations_key, running_key = keys
             lock_value, operation_id, record = args
             if self.values.get(lock_key) != lock_value:
                 return 0
             self.hashes.setdefault(operations_key, {})[operation_id] = record
+            self.sets.setdefault(running_key, set()).discard(operation_id)
             self.values.pop(lock_key, None)
             return 1
         if script == _SAVE_SCRIPT:
@@ -381,6 +405,7 @@ def _real_redis(url):
         rediskeys.SM_WRITER_LOCK_KEY,
         rediskeys.SM_FENCE_COUNTER_KEY,
         rediskeys.SM_OPERATIONS_KEY,
+        rediskeys.SM_RUNNING_OPERATIONS_KEY,
         rediskeys.SM_WRITER_QUEUE_KEY,
         rediskeys.SM_WRITER_QUEUE_DEADLINES_KEY,
         rediskeys.SM_WRITER_QUEUE_SEQ_KEY,
@@ -473,3 +498,38 @@ def test_a_starting_binding_phase_is_visible_to_the_startup_gate(make):
         operation.advance("executing")
         assert gate.active_operation()["phase"] == "executing"
     assert gate.active_operation() is None
+
+
+@pytest.mark.parametrize("make", _redis_backends())
+def test_a_running_operation_older_than_the_newest_1000_records_is_still_stale(make):
+    """10-28: stale_running_operations looked at the newest 1000 journal records
+    only (the supervisor read the whole journal for it, twice per tick), so a
+    record a dead SM left running was never superseded or recovered once 1000
+    newer operations had run. Both a record written before the running index
+    existed and one written with it are found, newest first."""
+    redis, _real = make()
+    legacy = {
+        "operation_id": "legacy-op", "kind": "put_binding_power", "owner": "old-sm",
+        "fencing_token": 1, "status": "running", "phase": "acquired",
+        "started_at": "2026-10-01T00:00:00+00:00",
+    }
+    redis.hset(rediskeys.SM_OPERATIONS_KEY, mapping={"legacy-op": json.dumps(legacy)})
+    coordinator = OperationCoordinator(redis, owner="sm-pod")
+    dead = coordinator.acquire("fleet_repair")
+    redis.delete(rediskeys.SM_WRITER_LOCK_KEY)  # its SM died holding the lock
+    for _ in range(1001):
+        with coordinator.operation("put_binding_power"):
+            pass
+
+    with coordinator.operation("probe") as active:
+        stale = coordinator.stale_running_operations()
+        assert coordinator.active_operation()["operation_id"] == active.operation_id
+    assert [record["operation_id"] for record in stale] == [dead.operation_id, "legacy-op"]
+    assert [r["operation_id"] for r in coordinator.stale_running_operations(kind="fleet_repair")] == [
+        dead.operation_id
+    ]
+    if _real is None:  # the journal is read in full once per process, not per call
+        calls = redis.hgetall_calls
+        coordinator.stale_running_operations()
+        coordinator.active_operation()
+        assert redis.hgetall_calls == calls

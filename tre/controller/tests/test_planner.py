@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_common.registry import ClusterTopology, NodeSpec
-from tre_controller.planning.planner import ClusterView, DefragAction, PlanConfig, ScaleAction, ShrinkForSlotAction, build_plan
+from tre_common.gpu_placement import GpuBlock
+from tre_controller.planning.planner import BlockSupplyAction, ClusterView, DefragAction, PlanConfig, ScaleAction, build_plan
 from tre_sm.allocator.slots import Binding, Migration, Slot
-from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
+from relay_view import expand_relays, relays, pool_view# noqa: F401 - 2026-10-02 relay intents
 
 
 def _classification(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None) -> ModelClassification:
@@ -57,8 +58,8 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     }
     replicas = {"critical": 2, "idle": 3, "high": 2}
 
-    # Legacy one-step rescue (C1 off): the scenario below is the one-replica transfer
-    # plus the HIGH donor's proactive probe. The C1 default is asserted at the end.
+    # One step per plan (L3, 2026-10-28): the one-replica transfer plus the HIGH donor's
+    # proactive probe.
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -66,8 +67,8 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         idle_gpus=0,
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False,
-            rescue_max_step_ratio=0,
         ),
+        cluster_view=pool_view(replicas, receivers=("critical",)),
     )
 
     scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
@@ -76,7 +77,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     assert _deltas(scale_actions) == {"idle": -1, "critical": 1, "high": -1}
     assert plan.delayed_down_models == {"high"}
     assert plan.probe_upscale_plans == {}
-    assert plan.events == []
+    assert plan.events == ["rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1"]
     assert all(action.source_loop == "rescue" for action in plan.actions)
     assert {(a.model, a.reason, a.requires_safescale) for a in scale_actions} == {
         ("idle", "critical_donor_immediate", False),
@@ -98,27 +99,15 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         idle_gpus=0,
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
-            rescue_max_step_ratio=0,
         ),
+        cluster_view=pool_view(replicas, receivers=("critical",)),
     )
     assert _deltas([a for a in expand_relays(guarded.actions) if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
     assert guarded.delayed_down_models == set()
-    assert guarded.events == ["safescale_probe_suppressed_hot:high"]
-
-    # C1 default: n=2, Z=0.5, tau_crit=0.8 -> target ceil(2*0.8/0.5)=4. The idle donor
-    # gives its whole surplus (Q3: 2 above its floor), which covers the need; the high
-    # donor is then probed proactively (one step, SafeScale), not relayed.
-    c1 = build_plan(
-        model_contexts=contexts,
-        classifications=classifications,
-        model_replicas=replicas,
-        idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
-    )
-    c1_actions = [a for a in expand_relays(c1.actions) if isinstance(a, ScaleAction)]
-    assert _deltas(c1_actions) == {"idle": -2, "critical": 2, "high": -1}
-    assert {a.reason for a in c1_actions} == {"critical_donor_immediate", "high_proactive_safescale"}
-    assert c1.events == ["rescue_target:critical:n=2:z=0.5000:desired=4:covered=2:planned=2"]
+    assert guarded.events == [
+        "rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1",
+        "safescale_probe_suppressed_hot:high",
+    ]
 
 
 def test_build_plan_middle_zone_shrinks_healthy_under_safescale_for_a_critical_receiver() -> None:
@@ -152,7 +141,8 @@ def test_build_plan_middle_zone_shrinks_healthy_under_safescale_for_a_critical_r
     assert _deltas(scale_actions) == {"healthy": -1}
     assert plan.delayed_down_models == {"healthy"}
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
-    assert plan.events == []
+    # Review P2-3: the promised replica is the receiver's rescue step.
+    assert plan.events == ["rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1"]
     assert all(action.source_loop == "rescue" for action in plan.actions)
     shrink = next(action for action in scale_actions if action.model == "healthy")
     assert shrink.requires_safescale is True
@@ -189,12 +179,12 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         classifications=classifications,
         model_replicas=replicas,
         idle_gpus=0,
-        # Legacy one-step rescue (C1 off): the scenario is the idle donor drained by
-        # both loops in one tick, one replica each.
+        # One step per plan: the idle donor drained by both sections of one call, one
+        # replica each.
         cfg=PlanConfig(
             min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True,
-            rescue_max_step_ratio=0,
         ),
+        cluster_view=pool_view(replicas, receivers=("critical", "low")),
     )
 
     scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
@@ -208,7 +198,10 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         ("low", 1, "low_fairness_donor_immediate", "fairness", "idle", "low"),
     }
     assert not any(event.startswith("fairness_blocked_unsaturated") for event in plan.events)
-    assert plan.events == ["safescale_probe_suppressed_hot:high"]
+    assert plan.events == [
+        "rescue_target:critical:n=2:z=0.5000:desired=3:covered=2:planned=1",
+        "safescale_probe_suppressed_hot:high",
+    ]
     assert plan.delayed_down_models == set()
 
 
@@ -482,7 +475,7 @@ def test_tp_aware_critical_receiver_records_capacity_blocked_when_no_slot_or_def
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
     assert plan.events == ["capacity_blocked:tp2"]
 
-def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag() -> None:
+def test_tp_aware_critical_receiver_takes_a_high_block_before_a_healthy_one_or_defrag() -> None:
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
@@ -498,6 +491,8 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+            Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
+            Binding("tp2-23", "tp2", Slot("node-a", (2, 3)), awake=False),
         ),
     )
 
@@ -516,13 +511,15 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
 
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
     assert [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)] == []
+    # L4 rev 2: block tier HIGH (0-1) before HEALTHY (2-3); a probe under scope all.
     assert plan.actions == [
-        ShrinkForSlotAction(
-            donor="high",
-            beneficiary="tp2",
-            serve_id="high-0",
-            slot=Slot("node-a", (0,)),
-            reason="critical_same_slot_high_shrink",
+        BlockSupplyAction(
+            receiver="tp2",
+            block=GpuBlock("node-a", (0, 1)),
+            receiver_pods=("tp2-01",),
+            sleeps=(),
+            probe=("high", "high-0"),
+            reason="critical_block_high",
             source_loop="rescue",
         )
     ]
@@ -579,7 +576,7 @@ def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
 
 def test_critical_preemption_of_hot_donor_survives_guard() -> None:
     # Demand-driven preemption: a TP=2 CRITICAL receiver blocked on a fragmented slot with no
-    # idle capacity legitimately shrinks a HIGH donor sharing its two-GPU slot. With the guard
+    # idle capacity legitimately takes its block from a HIGH donor (L4 rev 2). With the guard
     # ON this MUST still fire, tagged with an explicit preemption reason.
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
@@ -596,6 +593,7 @@ def test_critical_preemption_of_hot_donor_survives_guard() -> None:
         bindings=(
             Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
             Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+            Binding("tp2-01", "tp2", Slot("node-a", (0, 1)), awake=False),
         ),
     )
 
@@ -613,17 +611,8 @@ def test_critical_preemption_of_hot_donor_survives_guard() -> None:
         cluster_view=cluster_view,
     )
 
-    assert plan.actions == [
-        ShrinkForSlotAction(
-            donor="high",
-            beneficiary="tp2",
-            serve_id="high-0",
-            slot=Slot("node-a", (0,)),
-            reason="critical_same_slot_high_shrink",
-            source_loop="rescue",
-        )
-    ]
-    assert "safescale_preemption:high->tp2:critical_same_slot_high_shrink" in plan.events
+    assert [(action.receiver, action.probe) for action in plan.actions] == [("tp2", ("high", "high-0"))]
+    assert "block_supply:tp2:node-a:0,1:high:high-0" in plan.events
     assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
 
 
@@ -722,11 +711,13 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
         "hot": {"assigned_replicas": 4, "routable_pods": 4},
     }
     replicas = {"critical": 2, "idle": 3, "hot": 4}
-    # Legacy one-step rescue: the scenario needs the HIGH donor left for its probe.
-    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_max_step_ratio=0)
+    # One step per plan: the scenario needs the HIGH donor left for its probe.
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
 
+    view = pool_view(replicas, receivers=("critical",))
     free = build_plan(
-        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg
+        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg,
+        cluster_view=view,
     )
     held = build_plan(
         model_contexts=contexts,
@@ -735,6 +726,7 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
         idle_gpus=0,
         cfg=cfg,
         probe_backoff_models={"hot"},
+        cluster_view=view,
     )
 
     def reasons(plan):

@@ -26,7 +26,9 @@ def make_tre_arm(root, name="sens-theta-m20"):
     rows.append(req(95, model="m-b", t=60.0, e2e=150.0, ttft=0.2))       # cut by the route timeout
     write_arm(d, layout, rows)
     acts = [(31, [{"model": "m-a", "delta": 1, "reason": "critical_sleeping_capacity"},
-                  {"model": "m-b", "delta": -1, "reason": "critical_donor_immediate"}]),     # donor side: not urgent
+                  {"model": "m-b", "delta": -1, "reason": "critical_donor_immediate"},       # donor side: not urgent
+                  {"model": "m-b", "delta": -1, "reason": "critical_block_idle", "donor": "m-b",
+                   "receiver": "m-a", "group": "t:m-a:a-1"}]),     # a transfer's donor sleep: not urgent
             (50, [{"receiver": "m-b", "donor": "m-a", "reason": "low_fairness_idle_capacity"},
                   {"model": "m-b", "reason": "probe_started", "kind": "hide"}]),
             (60, [{"model": "m-a", "delta": -1, "reason": "high_proactive_safescale"}]),
@@ -58,7 +60,7 @@ def test_v1_row_reuses_tre_eval_metrics_and_classifies_actions(tmp_path):
     assert r["replicas"] == pytest.approx((100 + 30 + 100 + 50) / 100, abs=0.02)
     assert r["gpus"] == pytest.approx((100 + 30 + 100 + 2 * 50) / 100, abs=0.02)
     assert (r["probes"], r["probe_commits"], r["probe_rollbacks"]) == (3, 2, 1)
-    assert (r["act_urgent"], r["act_fairness"], r["act_high_shrink"], r["act_other"]) == (1, 1, 1, 1)
+    assert (r["act_urgent"], r["act_fairness"], r["act_high_shrink"], r["act_other"]) == (1, 1, 1, 2)
     assert r["tpot_v1_p95"] == (None if a["tpot_v1_p95_ms"] is None else pytest.approx(a["tpot_v1_p95_ms"], abs=0.1))
     assert r["verdict"] == "valid"
     assert r["setting"] == "*.trs.theta_m x0.8"

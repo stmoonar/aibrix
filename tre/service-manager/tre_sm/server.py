@@ -14,7 +14,7 @@ from tre_sm.app import create_service_app
 from tre_sm.clock_check import check_clock_skew
 from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.k8s_ops import K8sOps, RequestTimeoutApi
-from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal, log_ignored_drain_settings
+from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
@@ -101,9 +101,6 @@ def create_app() -> FastAPI:
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     sm_config = registry.service_manager()
-    # 2026-10-02: the SM never drains and has no sleep reservation; those
-    # settings parse but are ignored.
-    log_ignored_drain_settings(sm_config.sleep, LOG)
     check_clock_skew(
         redis_client,
         warn_s=sm_config.clock_skew_warn_s,

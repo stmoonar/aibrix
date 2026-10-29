@@ -60,8 +60,7 @@ def run_tick_replay(
     2026-10-08, before it was dropped).
 
     ``signal_state`` / ``paper_state_cache`` (round 4): the controller's stateful
-    signal path - the O1 breakpoint window, the EMAs, the saturation tracker, the
-    missing-token fallback - kept across steps (and across calls, for a closed-loop
+    signal path - the EMAs and the missing-token fallback - kept across steps (and across calls, for a closed-loop
     replay that calls this once per tick); None = stateless, as before. ``queue``: where
     the actions go (default: a :class:`ReplayQueue` that records them).
     ``safescale_scope``: TRE_SAFESCALE_SCOPE, as the live loops pass it."""

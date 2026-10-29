@@ -47,9 +47,7 @@ def merged_hist_p95_ms(pods: list[PodWindowMetrics], rule: P95Rule) -> Optional[
     if min_samples > 0 and count < min_samples:
         return None
     uppers = sorted({upper for buckets, _ in hists for upper, _ in buckets})
-    merged = [
-        (upper, sum(_cumulative_at(buckets, upper) for buckets, _ in hists)) for upper in uppers
-    ]
+    merged = _merged_cumulative([buckets for buckets, _ in hists], uppers)
     p95_s = histogram_percentile(merged, 0.95, mode=mode)
     return None if p95_s is None else p95_s * 1000.0
 
@@ -69,7 +67,7 @@ def pooled_p95_ms(hists, rule: P95Rule) -> Optional[float]:
     if count <= 0 or (min_samples > 0 and count < min_samples):
         return None
     uppers = sorted({upper for buckets, _ in present for upper, _ in buckets})
-    merged = [(upper, sum(_cumulative_at(buckets, upper) for buckets, _ in present)) for upper in uppers]
+    merged = _merged_cumulative([buckets for buckets, _ in present], uppers)
     p95_s = histogram_percentile(merged, 0.95, mode=mode)
     if p95_s is None:
         return None
@@ -81,9 +79,28 @@ def pooled_p95_ms(hists, rule: P95Rule) -> Optional[float]:
     return float(p95_s) * 1000.0
 
 
-def _cumulative_at(buckets: tuple[tuple[float, float], ...], upper: float) -> float:
-    counts = [count for bucket_upper, count in buckets if bucket_upper <= upper]
-    return max(counts) if counts else 0.0
+def _merged_cumulative(bucket_sets: list, uppers: list[float]) -> list[tuple[float, float]]:
+    """``[(upper, sum over the sets of the cumulative count at upper)]`` for the sorted
+    ``uppers``; a set's count at a bound = its maximum count at or below it (0 below
+    every bound). Each set is walked once (formerly a scan of the set per bound)."""
+    columns = [_cumulative_on(buckets, uppers) for buckets in bucket_sets]
+    return [(upper, sum(column[index] for column in columns)) for index, upper in enumerate(uppers)]
+
+
+def _cumulative_on(buckets, uppers: list[float]) -> list[float]:
+    """The cumulative count of ``buckets`` at every bound of the sorted ``uppers``."""
+    ordered = sorted(buckets, key=lambda bucket: bucket[0])
+    out: list[float] = []
+    best = None
+    index = 0
+    for upper in uppers:
+        while index < len(ordered) and ordered[index][0] <= upper:
+            count = ordered[index][1]
+            if best is None or count > best:
+                best = count
+            index += 1
+        out.append(0.0 if best is None else best)
+    return out
 
 
 def aggregate_pods(
@@ -147,19 +164,21 @@ def restrict_to_serving(
     sleeping_pods: Collection[str],
     routable_pods: int,
 ) -> ModelWindowMetrics:
-    """``metrics`` without the docs of pods the fleet state reports asleep.
+    """``metrics`` without the docs of pods the fleet state reports out of the model's
+    pod set.
 
-    * ``sleeping_pods``: pod names (== SM ``serve_id``) of this model's bindings with
-      ``awake=False``. Only positively-known sleepers are dropped; a pod the fleet state
-      does not list (a just-replaced pod whose docs are still in the window) is kept, so
-      real traffic is never discarded on a stale view. Hidden-but-awake pods (a safescale
-      probe) are kept too: they are still draining the requests they hold.
+    * ``sleeping_pods``: pod names (== SM ``serve_id``) of this model's bindings that are
+      asleep or hidden (the controller's serving window, TSS suffix 2026-10-29: a hidden
+      SafeScale probe pod still drains its requests but is no longer routed to, so it is
+      out of TSS). Only positively-known pods are dropped; a pod the fleet state does not
+      list (a just-replaced pod whose docs are still in the window) is kept, so real
+      traffic is never discarded on a stale view.
     * ``routable_pods``: the authoritative serving count (awake and not hidden); it
       replaces both ``routable_pods`` and ``assigned_replicas`` (TSS replica factor 1,
       per-replica alt signals divide by the serving count).
 
     A window with no per-pod breakdown (synthetic / offline) only gets the counts.
-    Its ``suffix_windows`` (O1) are restricted the same way.
+    Its ``suffix_windows`` (the SafeScale tail) are restricted the same way.
     """
     suffixes = tuple(
         restrict_to_serving(suffix, sleeping_pods=sleeping_pods, routable_pods=routable_pods)

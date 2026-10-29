@@ -242,8 +242,7 @@ def gpu_memory_utilization(spec: Any) -> float:
 
 #: Sleep paths (plan 2026-09-27 D1): every caller that puts a binding to sleep names
 #: one (recorded with the outcome; replica-floor rules). The service-manager never
-#: drains on any path (2026-10-02), so ``service_manager.sleep.budgets_s`` keyed by
-#: them is ignored.
+#: drains on any path (2026-10-02).
 SLEEP_PATHS = (
     "safescale_commit",  # SafeScale commit of a hidden probe pod
     "urgent",  # controller *_immediate donor paths (fast loop)
@@ -255,36 +254,22 @@ SLEEP_PATHS = (
     "default",  # any caller that names no path
 )
 
-#: DEPRECATED (2026-10-02): the service-manager never drains - every sleep is
-#: hide -> gateway ack -> one load read -> /sleep, all under its writer lock
-#: (design docs/design/20261002-sm-wholelock.md). ``budgets_s``, ``no_drain_paths``,
-#: ``hard_cap_s`` and ``reservation_ttl_s`` still parse (live registries and the
-#: controller still carry them) but the service-manager ignores them and logs a
-#: deprecation line at start. Former meaning: soft drain budgets (s), ``None`` =
-#: only the hard cap.
-DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
-    # The caller passes the probe window as drain_budget_s; without one, hard cap.
-    "safescale_commit": None,
-    "urgent": 30.0,
-    # No deadline pressure: wait for in-flight requests up to the hard cap. The same
-    # budget applies to TRE and APA scale-downs (both arms drain identically).
-    "scale_down": None,
-    # APA scale-downs (was "scale_down" before 2026-09-29; through /scale_service until
-    # 2026-10-27, now a POST /v2/plans sleep item with this path): with "apa" in
-    # no_drain_paths (default) the budget is unused; without it, the old hard-cap drain.
-    "apa": None,
-    "defrag": 30.0,
-    "repair": 30.0,
-    "startup": 30.0,
-    "default": 30.0,
-}
+#: Retired 2026-10-28 (the service-manager never drains since 2026-10-02 and has no
+#: sleep reservation or separate commit phase; design docs/design/20261002-sm-wholelock.md):
+#: ``service_manager.sleep.budgets_s`` / ``hard_cap_s`` / ``reservation_ttl_s`` and
+#: ``service_manager.commit_lock_wait_s``. The shipped registry still carries them for
+#: rollback images that read them (deploy/tests/test_registry_compat_20261006.py), so a
+#: registry with them loads; they are not read, validated or logged.
+RETIRED_SLEEP_KEYS = frozenset({"budgets_s", "hard_cap_s", "reservation_ttl_s"})
+RETIRED_SERVICE_MANAGER_KEYS = frozenset({"commit_lock_wait_s"})
 
 #: DEPRECATED (2026-10-02): ``service_manager.sleep.no_drain_paths``, the sleep paths
 #: that skipped the drain (hide -> gateway ack -> /sleep ``mode=abort`` at once; the
 #: reissue sidecar continues what it can). Every path is a no-drain path now and the
-#: service-manager ignores the key (still parsed and validated). The default lists
-#: every path, like the live registry, so an older image (a rollback) that still
-#: reads it never drains either.
+#: service-manager ignores the key; it is still parsed and validated because the
+#: baseline scaler checks its abort path against it at start
+#: (tre_baselines.config). The default lists every path, like the live registry, so
+#: an older image (a rollback) that still reads it never drains either.
 DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = SLEEP_PATHS
 
 #: Connect timeout (s) of one Kubernetes API call of the service-manager; the
@@ -314,7 +299,7 @@ K8S_CALLS_WAVE1_RECORD = 2
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
-#: the default of the deprecated (ignored) ``service_manager.sleep.hard_cap_s``.
+#: the drain hard cap of images before 2026-10-02.
 DEFAULT_ROUTE_TIMEOUT_S = 150.0
 
 #: Default ``gateway.upstream_idle_timeout_s``: how long the tre-v2 Envoy keeps an idle
@@ -484,83 +469,23 @@ class ScalingRegistryConfig:
     controller start, restart-to-apply). Older images ignore the whole section
     (the registry loader only reads the sections it knows).
 
-    C1 (2026-10-01, design 20261001-c1-deficit-scaleup): the fast-loop rescue of a
-    CRITICAL receiver asks for its whole deficit at once,
-    ``desired = min(max(n + 1, ceil(n * tau_crit / Z)), max(n + 1, floor(ratio * n)),
-    scaling cap, capacity found)`` with ``n`` its routable replicas, instead of one
-    ``ceil(0.1 * n)`` step per window."""
+    L3 (2026-10-28, design 20261028-single-loop): a receiver gets one step per plan
+    (``max(1, ceil(0.1 * n))``, v1 ``scale_step``). TSS only (2026-10-29, design
+    20261029-tss-only): the O1 breakpoint window, the onset saturation rescue, the C1
+    EMA settle extension and the gateway clock check were removed; their keys are
+    retired (:data:`RETIRED_SCALING_KEYS`)."""
 
-    #: ``ratio`` above: the rescue target is at most ``ratio x n`` (never below n + 1).
-    #: 0 = the legacy one-step rescue (``ceil(0.1 * n)`` per decision window).
-    rescue_max_step_ratio: float = 2.0
-    #: The rescue target may also reach ``n + rescue_max_step_pods`` (HPA's default
-    #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
-    #: floor(ratio * n), n + pods). 0 = the ratio alone.
-    rescue_max_step_pods: int = 0
-    # ``donor_surplus_release`` was retired on 2026-10-07 (F1-B, design
-    # donor-evidence-20261007): no HIGH donor is released without a SafeScale probe any
-    # more. An old registry carrying the key still loads (unknown keys are only warned about).
-    #: A rescue target counts as reflected once the model's decision window starts
-    #: ``k * trs.ema_tau_ms`` after the scale-up completed (the EMA'd Z lags the raw
-    #: window by about its time constant). 0 = the window start alone (F4 rule).
-    rescue_settle_ema_k: float = 2.0
-    #: O1 (2026-10-01, design 20261001-o1-breakpoint-window): decide on the part of the
-    #: metrics window after the model's last breakpoint (traffic onset or routable-count
-    #: change), complete gateway grids only, the TSS numerator normalised to a whole
-    #: window and the EMA restarted at the breakpoint. Replaces the onset warmup guard.
-    breakpoint_window: bool = True
-    #: The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
-    #: ``breakpoint_window: false`` the guard always applies (= pre-O1), whatever this says.
-    onset_warmup_guard: bool = False
-    #: O1: post-breakpoint evidence (ms of observations after the breakpoint) before the
-    #: model's signal decides (scale-ups; scale-downs always need a whole clean window).
+    #: The SafeScale evidence floor (Q4, round 4): the observed span after a rollback
+    #: before a retry (2026-10-29: the early commit after a hide reads ``settle_ms``).
     #: 20 s = the former ``min_evidence_grids: 2`` on the 10 s grid (deprecated alias,
-    #: N x 10 s).
+    #: N x 10 s). (Until 2026-10-29 also O1's post-breakpoint evidence.)
     min_evidence_ms: int = 20_000
-    #: O1: also this many completed requests in the post-breakpoint window (0 = off).
-    #: Tokens count at request completion: with one short request done and long ones
-    #: still running, a 20 s suffix can read Z ~ 5 % (review P2-1).
-    min_evidence_requests: int = 3
-    #: O1: added to a routable-count change time (the gateway applies the SM's routable
-    #: label through its pod informer).
-    breakpoint_margin_ms: int = 1000
-    #: O1 (review P2-1, evidence-gated): a C1 rescue decided on a partial
-    #: (post-breakpoint) window with fewer than ``breakpoint_lowevidence_requests``
-    #: completed requests adds at most ``breakpoint_partial_max_step`` replicas; with at
-    #: least that many it asks for the whole deficit (ratio / step_pods caps apply).
-    #: ``breakpoint_partial_max_step: 0`` = no cap at all.
-    breakpoint_partial_max_step: int = 1
-    breakpoint_lowevidence_requests: int = 10
-    #: O1: after its windows have been held this long (round 4: from the first to the
-    #: newest held observation, ms) a receiver decides on the whole window again (donors
-    #: still need a clean one) - a model whose routable count keeps changing is not
-    #: starved (review P2-2). 0 = never. 50 s = the former
-    #: ``breakpoint_hold_max_windows: 6`` on the 10 s grid (deprecated alias,
-    #: (N - 1) x 10 s: the first held window starts the span).
-    breakpoint_hold_max_ms: int = 50_000
-    #: O1 same-clock check (gateway doc stamps vs the controller clock, review P2-3):
-    #: tolerance and period (s, 0 = off). A violation suspends O1 (pre-O1 behaviour).
-    gateway_clock_tolerance_ms: int = 2000
-    gateway_clock_check_s: int = 60
-    #: Onset saturation rescue (2026-10-02, design 20261002-saturation-onset-rescue):
-    #: while a model's TSS cannot decide yet - its window numerator is zero (no request
-    #: completed) or the O1 evidence gate holds it - a model whose engines are full
-    #: (``num_requests_waiting`` summed over its routable pods > 0, or their mean KV-cache
-    #: fill >= ``saturation_kv_threshold``, latest gateway sample) on every window for
-    #: ``saturation_confirm_ms`` of observation time is a CRITICAL receiver. Its fast-loop target is ``min(max(n + 1, floor(factor * n)),
-    #: max_awake_replicas)``; each further step needs the condition again on windows
-    #: after the routable count changed (the pods the last step added must be full
-    #: themselves); the KV condition alone also needs >= 2 running requests; an O1 hold
-    #: only counts for the traffic onset or the rescue's own steps. Off: the TSS rules
-    #: alone (numerator zero = no decision until requests complete). Factor in [1, 4].
-    saturation_rescue: bool = True
-    saturation_kv_threshold: float = 0.9
-    #: Confirmation span (ms of observation time, round 4): "full" from the first full
-    #: observation to the newest one for this long; 0 = on the first full window. 10 s =
-    #: the former ``saturation_consecutive_ticks: 2`` on the 10 s grid (deprecated alias,
-    #: (N - 1) x 10 s: the first full window starts the span).
-    saturation_confirm_ms: int = 10_000
-    saturation_max_step_factor: float = 2.0
+    #: TSS suffix (2026-10-29, design 20261029-tss-suffix): after a change of a model's
+    #: pod set (awake and not hidden) its Z is computed on the samples observed since the
+    #: change only, and it is decision-valid once that suffix spans this long (ms of
+    #: gateway ``scraped_ms``). Until then the model is "settling": no action on it.
+    #: Also the observed post-hide span a SafeScale early commit needs.
+    settle_ms: int = 10_000
     #: Sampling coverage (2026-10-25, design docs/design/20261025-instant-sampling.md):
     #: a pod's coverage = distinct ``scraped_ms`` in the window / (window / instant
     #: period); below ``sample_min_ratio`` the pod is flagged (no donor / shrink /
@@ -571,13 +496,9 @@ class ScalingRegistryConfig:
 #: 2026-10-25: count-based keys (N metrics windows / ticks / grids of 10 s) replaced by
 #: time spans, so they keep their meaning at any evidence period. Deprecated alias ->
 #: (new key, ms per counted unit, minimum count, counted units before the span starts);
-#: a registry carrying both is refused. Round 4: a persistence count (N windows in a
-#: row) is a span between the first and the last of them, (N - 1) x 10 s; an evidence
-#: count (N complete grids after the breakpoint) is N x 10 s.
+#: a registry carrying both is refused. An evidence count (N complete grids) is N x 10 s.
 SCALING_COUNT_ALIASES: dict[str, tuple[str, int, int, int]] = {
     "min_evidence_grids": ("min_evidence_ms", 10_000, 1, 0),
-    "breakpoint_hold_max_windows": ("breakpoint_hold_max_ms", 10_000, 0, 1),
-    "saturation_consecutive_ticks": ("saturation_confirm_ms", 10_000, 1, 1),
 }
 
 
@@ -590,16 +511,7 @@ def _scaling_span_ms(raw: dict[str, Any], key: str, default: int, minimum: int) 
             raise ValueError(f"scaling.{alias} (deprecated) and scaling.{key} are both set; keep {key} only")
         _, unit_ms, min_count, before = SCALING_COUNT_ALIASES[alias]
         count = _scaling_count(raw, alias, 0, min_count)
-        if before and count == 0:
-            span = 0  # 0 keeps its meaning ("never" / "at once")
-        elif before and count <= before and min_count == 0:
-            # breakpoint_hold_max_windows: 1 was "the first held window falls back": a
-            # span of 0, which now means "never". Refused rather than inverted.
-            raise ValueError(
-                f"scaling.{alias}={count} has no span equivalent; set scaling.{key} instead"
-            )
-        else:
-            span = (count - before) * unit_ms
+        span = (count - before) * unit_ms
         LOG.warning(
             "registry scaling: %s=%d is deprecated (a count of 10 s windows); read as %s=%d ms",
             alias, count, key, span,
@@ -608,17 +520,26 @@ def _scaling_span_ms(raw: dict[str, Any], key: str, default: int, minimum: int) 
     return _scaling_count(raw, key, default, minimum)
 
 
-SCALING_KEYS = frozenset({
+SCALING_KEYS = frozenset({"min_evidence_ms", "settle_ms", "sample_min_ratio"}) | frozenset(SCALING_COUNT_ALIASES)
+
+#: Retired keys. A registry that still carries them (the live ConfigMap until its next
+#: structural replace) loads; they are ignored with one deprecation line.
+#: 2026-10-28 (design 20261028-single-loop, L3: one step per plan): the C1 deficit target
+#: caps, its partial-window / low-evidence step caps and the saturation rescue's doubling
+#: factor. 2026-10-29 (design 20261029-tss-only): the O1 breakpoint window, the onset
+#: warmup guard switch, the gateway clock check, the onset saturation rescue and the C1
+#: EMA settle extension (with their deprecated count aliases).
+RETIRED_SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "rescue_max_step_pods",
+    "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
+    "saturation_max_step_factor",
     "rescue_settle_ema_k",
-    "breakpoint_window", "onset_warmup_guard", "min_evidence_ms", "min_evidence_requests",
-    "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
-    "breakpoint_hold_max_ms",
+    "breakpoint_window", "onset_warmup_guard", "min_evidence_requests",
+    "breakpoint_margin_ms", "breakpoint_hold_max_ms", "breakpoint_hold_max_windows",
     "gateway_clock_tolerance_ms", "gateway_clock_check_s",
     "saturation_rescue", "saturation_kv_threshold", "saturation_confirm_ms",
-    "saturation_max_step_factor",
-    "sample_min_ratio",
-}) | frozenset(SCALING_COUNT_ALIASES)
+    "saturation_consecutive_ticks",
+})
 
 
 def _scaling_number(raw: dict[str, Any], key: str, default: float, *, low: float, high: float | None = None) -> float:
@@ -649,15 +570,6 @@ def _scaling_count(raw: dict[str, Any], key: str, default: int, minimum: int) ->
     return int(float(value))
 
 
-def _scaling_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
-    value = raw.get(key)
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    raise ValueError(f"scaling.{key} must be true or false, got {value!r}")
-
-
 def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
     """Parse the optional ``scaling:`` registry section; raise ValueError on bad values
     (unknown keys are ignored with a warning, like ``safescale:``)."""
@@ -665,73 +577,19 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         return ScalingRegistryConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"scaling must be a mapping, got {raw!r}")
-    unknown = sorted(str(key) for key in set(raw) - SCALING_KEYS)
+    retired = sorted(str(key) for key in set(raw) & RETIRED_SCALING_KEYS)
+    if retired:
+        LOG.warning(
+            "registry scaling: ignoring retired keys %s (designs 20261028-single-loop, "
+            "20261029-tss-only)", retired,
+        )
+    unknown = sorted(str(key) for key in set(raw) - SCALING_KEYS - RETIRED_SCALING_KEYS)
     if unknown:
         LOG.warning("registry scaling: ignoring unknown keys %s (known: %s)", unknown, sorted(SCALING_KEYS))
     defaults = ScalingRegistryConfig()
-    ratio_raw = raw.get("rescue_max_step_ratio")
-    if isinstance(ratio_raw, bool):
-        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}")
-    try:
-        ratio = float(defaults.rescue_max_step_ratio if ratio_raw is None else ratio_raw)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}") from exc
-    if not math.isfinite(ratio) or ratio < 0 or 0 < ratio < 1:
-        raise ValueError(
-            f"scaling.rescue_max_step_ratio must be 0 (legacy step) or at least 1, got {ratio_raw!r}"
-        )
-    pods_raw = raw.get("rescue_max_step_pods")
-    pods = defaults.rescue_max_step_pods if pods_raw is None else pods_raw
-    try:
-        valid_pods = not isinstance(pods, bool) and float(pods) == int(float(pods)) and int(float(pods)) >= 0
-    except (TypeError, ValueError, OverflowError):
-        valid_pods = False
-    if not valid_pods:
-        raise ValueError(f"scaling.rescue_max_step_pods must be a non-negative integer, got {pods_raw!r}")
-    k_raw = raw.get("rescue_settle_ema_k")
-    if isinstance(k_raw, bool):
-        raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}")
-    try:
-        settle_k = float(defaults.rescue_settle_ema_k if k_raw is None else k_raw)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}") from exc
-    if not math.isfinite(settle_k) or settle_k < 0:
-        raise ValueError(f"scaling.rescue_settle_ema_k must be a non-negative number, got {k_raw!r}")
     return ScalingRegistryConfig(
-        rescue_max_step_ratio=ratio,
-        rescue_max_step_pods=int(float(pods)),
-        rescue_settle_ema_k=settle_k,
-        breakpoint_window=_scaling_bool(raw, "breakpoint_window", defaults.breakpoint_window),
-        onset_warmup_guard=_scaling_bool(raw, "onset_warmup_guard", defaults.onset_warmup_guard),
         min_evidence_ms=_scaling_span_ms(raw, "min_evidence_ms", defaults.min_evidence_ms, 1),
-        min_evidence_requests=_scaling_count(
-            raw, "min_evidence_requests", defaults.min_evidence_requests, 0
-        ),
-        breakpoint_margin_ms=_scaling_count(raw, "breakpoint_margin_ms", defaults.breakpoint_margin_ms, 0),
-        breakpoint_partial_max_step=_scaling_count(
-            raw, "breakpoint_partial_max_step", defaults.breakpoint_partial_max_step, 0
-        ),
-        breakpoint_lowevidence_requests=_scaling_count(
-            raw, "breakpoint_lowevidence_requests", defaults.breakpoint_lowevidence_requests, 0
-        ),
-        breakpoint_hold_max_ms=_scaling_span_ms(
-            raw, "breakpoint_hold_max_ms", defaults.breakpoint_hold_max_ms, 0
-        ),
-        gateway_clock_tolerance_ms=_scaling_count(
-            raw, "gateway_clock_tolerance_ms", defaults.gateway_clock_tolerance_ms, 0
-        ),
-        gateway_clock_check_s=_scaling_count(raw, "gateway_clock_check_s", defaults.gateway_clock_check_s, 0),
-        saturation_rescue=_scaling_bool(raw, "saturation_rescue", defaults.saturation_rescue),
-        # A KV threshold of 0 would call every model with a live pod full.
-        saturation_kv_threshold=_scaling_number(
-            raw, "saturation_kv_threshold", defaults.saturation_kv_threshold, low=0.01, high=1.0
-        ),
-        saturation_confirm_ms=_scaling_span_ms(
-            raw, "saturation_confirm_ms", defaults.saturation_confirm_ms, 0
-        ),
-        saturation_max_step_factor=_scaling_number(
-            raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0, high=4.0
-        ),
+        settle_ms=_scaling_count(raw, "settle_ms", defaults.settle_ms, 1),
         sample_min_ratio=_scaling_number(raw, "sample_min_ratio", defaults.sample_min_ratio, low=0.0, high=1.0),
     )
 
@@ -791,8 +649,8 @@ class SafeScaleRegistryConfig:
     #: probe before its deadline once min_commit_samples requests are judged, every
     #: commit gate passes, the hidden pods have nothing in flight (gateway count of the
     #: live plugin instances and vLLM running + waiting), the newest snapshot window was
-    #: observed scaling.min_evidence_ms after the hide confirmation (the O1 warm rule;
-    #: round 4: observation time) and at least the donor's p95 e2e passed since it. The
+    #: observed scaling.min_evidence_ms after the hide confirmation (round 4:
+    #: observation time) and at least the donor's p95 e2e passed since it. The
     #: former ``early_commit_min_grids`` key is gone (an old registry carrying it still
     #: loads: unknown keys are only warned about).
     early_commit: bool = True
@@ -980,45 +838,18 @@ class SleepPolicy:
     #: scheduling and waits for the running queue, an HTTP timeout does not
     #: cancel it, and the waiting queue stays frozen.
     sleep_mode_when_idle: str = "abort"
-    #: DEPRECATED, ignored (2026-10-02: no drain). Parsed for compatibility;
-    #: defaults to gateway.route_timeout_s.
-    hard_cap_s: float = DEFAULT_ROUTE_TIMEOUT_S
-    #: DEPRECATED, ignored (2026-10-02: no sleep reservation - every sleep holds
-    #: the writer lock from the hide to the bookkeeping). Parsed for compatibility.
-    #: 40 (2026-10-06): the registry ships this value for the previous image
-    #: (ba5b558f), which requires it above writer_lock_wait_s + poll_interval_s +
-    #: probe_timeout_s + io_margin_s (37.5 s with the defaults).
-    reservation_ttl_s: float = 40.0
     #: Gateway plugin pods that must ack, besides advancing heartbeats: a plugin
     #: with Redis trouble may still route while its heartbeat stalls, so Ready pods
     #: matching this selector count as live too. None = heartbeats only.
     plugin_namespace: str = "tre-v2"
     plugin_label_selector: str | None = "app=tre-gateway-plugins"
-    budgets_s: dict[str, float | None] = field(
-        default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
-    )
-    #: DEPRECATED, ignored (2026-10-02): see DEFAULT_NO_DRAIN_PATHS.
+    #: DEPRECATED, ignored by the service-manager (2026-10-02): see DEFAULT_NO_DRAIN_PATHS.
     no_drain_paths: tuple[str, ...] = DEFAULT_NO_DRAIN_PATHS
 
     def no_drain(self, path: str) -> bool:
         """DEPRECATED (2026-10-02): what ``no_drain_paths`` configures. The
         service-manager no longer reads it - it never drains on any path."""
         return path in self.no_drain_paths
-
-    def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
-        """DEPRECATED (2026-10-02): the drain budget the old configuration would
-        give. The service-manager no longer reads it - it never drains."""
-        if requested_s is not None:
-            budget = float(requested_s)
-            if not math.isfinite(budget) or budget < 0:
-                raise ValueError(f"drain budget must be a finite number >= 0, got {requested_s!r}")
-        if self.no_drain(path):
-            return 0.0
-        if requested_s is None:
-            key = path if path in self.budgets_s else "default"
-            raw = self.budgets_s.get(key)
-            budget = self.hard_cap_s if raw is None else float(raw)
-        return min(budget, self.hard_cap_s)
 
 
 #: Accepted values of ``service_manager.log_level`` (and TRE_SM_LOG_LEVEL).
@@ -1066,8 +897,6 @@ class ServiceManagerConfig:
     #: hung engine) a caller gets 409 writer_busy and retries on its next tick.
     #: Waiters are served first-come first-served.
     writer_lock_wait_s: float = 30.0
-    #: DEPRECATED, ignored (2026-10-02: a sleep has no separate commit phase).
-    commit_lock_wait_s: float | None = None
     #: ``service_manager.wake.call_timeout_s``: HTTP timeout of one /wake_up call
     #: (single attempt; measured 1.5-3 s). A call without an answer leaves the
     #: wake journaled (the engine may still wake) for the journal recovery.
@@ -1706,10 +1535,8 @@ def parse_service_manager_config(
     raw: dict[str, Any] | None, *, gateway: dict[str, Any] | None = None
 ) -> ServiceManagerConfig:
     """Parse the optional ``service_manager:`` registry section (all keys optional).
-
-    ``sleep.hard_cap_s`` defaults to ``gateway.route_timeout_s`` (the gateway's
-    request timeout: no request can outlive it anyway), else 150 s.
-    """
+    The retired keys (:data:`RETIRED_SLEEP_KEYS`, :data:`RETIRED_SERVICE_MANAGER_KEYS`)
+    are accepted and not read. ``gateway`` is accepted for callers that pass it."""
     raw = raw or {}
     sleep_raw = raw.get("sleep") or {}
     wake_raw = raw.get("wake") or {}
@@ -1734,17 +1561,6 @@ def parse_service_manager_config(
         )
     defaults = SleepPolicy()
     plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
-    hard_cap = sleep_raw.get("hard_cap_s")
-    if hard_cap is None:
-        hard_cap = (gateway or {}).get("route_timeout_s")
-    budgets = dict(DEFAULT_SLEEP_BUDGETS_S)
-    for path, value in (sleep_raw.get("budgets_s") or {}).items():
-        if str(path) not in SLEEP_PATHS:
-            raise ValueError(
-                f"service_manager.sleep.budgets_s: unknown sleep path {path!r} "
-                f"(known: {', '.join(SLEEP_PATHS)})"
-            )
-        budgets[str(path)] = None if value is None else float(value)
     no_drain_raw = sleep_raw.get("no_drain_paths", DEFAULT_NO_DRAIN_PATHS)
     if no_drain_raw is None:
         no_drain_raw = ()
@@ -1785,9 +1601,6 @@ def parse_service_manager_config(
         sleep_mode_when_idle=str(
             sleep_raw.get("sleep_mode_when_idle", defaults.sleep_mode_when_idle)
         ).strip().lower(),
-        hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
-        reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
-        budgets_s=budgets,
         no_drain_paths=no_drain_paths,
         plugin_namespace=str(plugin_pods_raw.get("namespace", defaults.plugin_namespace)),
         plugin_label_selector=plugin_pods_raw.get(
@@ -1811,9 +1624,6 @@ def parse_service_manager_config(
             pressure_raw.get("registry_nodes_only", base.pressure_registry_nodes_only)
         ),
         writer_lock_wait_s=_num(raw, "writer_lock_wait_s", base.writer_lock_wait_s),
-        commit_lock_wait_s=(
-            None if raw.get("commit_lock_wait_s") is None else float(raw["commit_lock_wait_s"])
-        ),
         wake_call_timeout_s=_num(wake_raw, "call_timeout_s", base.wake_call_timeout_s),
         api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
         log_level=(
@@ -1925,19 +1735,12 @@ def _validate_service_manager(
         errors.append("service_manager.wake.call_timeout_s must be positive")
     if not math.isfinite(config.k8s_request_timeout_s) or config.k8s_request_timeout_s <= 0:
         errors.append("service_manager.k8s_request_timeout_s must be positive")
-    for path, value in sleep.budgets_s.items():
-        if path not in SLEEP_PATHS:
-            errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
-        elif value is not None and (not math.isfinite(value) or value < 0):
-            errors.append(f"service_manager.sleep.budgets_s.{path} must be >= 0 or null")
     for path in sleep.no_drain_paths:
         if path not in SLEEP_PATHS:
             errors.append(f"service_manager.sleep.no_drain_paths: unknown sleep path {path}")
     if gateway is not None:
         if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
             errors.append("gateway.route_timeout_s must be positive")
-        # sleep.hard_cap_s is no longer checked against the route timeout: it is
-        # deprecated and ignored (2026-10-02, the service-manager never drains).
     if not (0.0 < config.wake_max_used_fraction <= 1.0):
         errors.append("service_manager.wake.max_used_fraction must be in (0, 1]")
     if config.wake_max_used_mib is not None and config.wake_max_used_mib <= 0:

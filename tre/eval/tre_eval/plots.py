@@ -155,9 +155,6 @@ def arm_timeseries(res: dict, base: str) -> str | None:
                     ok = np.isfinite(kv)
                     ax.plot(t[ok], kv[ok], color=col, lw=1.3, label="mean")
                     ax.plot(t[ok], f["kv_max"][ok], color=col, lw=0.7, alpha=0.6, label="max")
-                elif np.isfinite(f["ctrl_kv"]).any():
-                    ok = np.isfinite(f["ctrl_kv"])
-                    ax.plot(t[ok], f["ctrl_kv"][ok], color=col, lw=1.3, label="controller sample")
                 ax.set_ylim(0, 1.05)
                 if c == 0:
                     _legend(ax, loc="upper left", fontsize=6.5)

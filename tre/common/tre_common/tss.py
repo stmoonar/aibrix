@@ -38,7 +38,8 @@ Changes against the v1/v2 code formula, all deliberate:
 * ``w_d`` is gone (it is 1 by definition; a registry value != 1 is logged and ignored);
 * **idle rule**: ``A + W == 0`` means nothing is in flight, so there is no per-request
   service rate to speak of - TSS and Z are *undefined* (``raw is None``), never a small
-  number that would read as CRITICAL.
+  number that would read as CRITICAL. It is the only idle rule (2026-10-29,
+  :func:`window_is_idle`): zero tokens with a queue (a stuck engine) is TSS = 0, Z = 0.
 
 The EMA is a wall-clock time-constant EMA, ``alpha_k = 1 - exp(-dt_k / tau)``
 (:func:`ema_alpha` / :func:`ema_step`), and is the same function online
@@ -197,15 +198,19 @@ def tss_terms(
     )
 
 
-def window_is_idle(prompt_tokens: Optional[float], generation_tokens: Optional[float]) -> bool:
-    """THE idle-window predicate: the window carried no traffic (no prefill and no decode
-    token). Used by the online idle tick (warmup onset, ``SignalState.observe_traffic``) and
-    by every EMA - online and offline - through ``TssEma.update(idle=...)``. Unknown token
-    totals (``None``) are not idle: nothing is known about the window.
+def window_is_idle(avg_running: Optional[float], avg_waiting: Optional[float]) -> bool:
+    """THE idle-window predicate = the TSS idle rule: nothing was in flight over the
+    window (running + waiting == 0), so TSS and Z are undefined. Used by the online idle
+    reset (``SignalState.reset_ema``) and by every EMA - online and offline - through
+    ``TssEma.update(idle=...)``. Unknown gauges (``None``) are not idle: nothing is known
+    about the window.
+
+    2026-10-29 (design docs/design/20261029-tss-only.md): was "no token in the window". A
+    window with zero tokens and a queue is not idle - TSS = 0, Z = 0 (a stuck engine).
     """
-    if prompt_tokens is None or generation_tokens is None:
+    if avg_running is None or avg_waiting is None:
         return False
-    return not (float(prompt_tokens) + float(generation_tokens) > 0.0)
+    return not (float(avg_running) + float(avg_waiting) > 0.0)
 
 
 def ema_alpha(dt_ms: float, tau_ms: float) -> float:
@@ -229,23 +234,21 @@ class TssEma:
 
     The one wall-clock EMA every signal is smoothed with (plan §6.9 item 4): TSS inside
     ``TRSComputer`` / the offline recompute, and every alternative signal of the ablation
-    through :func:`signal_ema`. ``zero_is_sample`` is the only knob. TSS keeps the legacy
-    rule that a zero raw is passed through without advancing the EMA (a zero TSS is the
-    controller's "undefined" placeholder); for a pressure signal such as queue length a
-    zero is an ordinary, frequent observation and must advance the EMA like any other.
+    through :func:`signal_ema`. A zero raw is an ordinary sample (2026-10-29: for TSS too -
+    an undefined TSS is ``None``, never a 0 placeholder).
 
     Rules of :meth:`update`, in order:
 
-    0. **idle-window reset** - ``idle=True`` (:func:`window_is_idle`: the window carried no
-       traffic) clears ``value`` / ``last_ms`` and passes the raw through without seeding.
+    0. **idle-window reset** - ``idle=True`` (:func:`window_is_idle`: nothing in flight)
+       clears ``value`` / ``last_ms`` and passes the raw through without seeding.
        This is the same condition as the controller's idle tick, so with sliding windows a
        traffic gap shorter than ``window + step`` still resets, online and offline alike.
     1. **idle-gap reset** - if ``window_ms`` is given and ``window_end_ms - last_ms >
        window_ms``, clear ``value`` / ``last_ms``. Checked for *every* sample, including a
-       None / non-finite / (TSS) zero raw that is then passed through. Strictly greater:
+       None / non-finite raw that is then passed through. Strictly greater:
        back-to-back tumbling windows sit exactly one window apart and must not reset;
        one fully idle window in between (or any longer gap) does.
-    2. a None / non-finite / (TSS) zero raw is passed through without advancing
+    2. a None / non-finite raw is passed through without advancing
        ``value`` or ``last_ms``;
     3. the first sample after construction or a reset seeds ``value = raw``;
     4. a repeated or regressed ``window_end_ms`` keeps the current value;
@@ -255,11 +258,10 @@ class TssEma:
     equivalent to an idle-gap reset (restart duality).
     """
 
-    def __init__(self, tau_ms: float, *, zero_is_sample: bool = False) -> None:
+    def __init__(self, tau_ms: float) -> None:
         if tau_ms is None or tau_ms <= 0:
             raise ValueError("tau_ms must be positive")
         self.tau_ms = float(tau_ms)
-        self.zero_is_sample = bool(zero_is_sample)
         self.value: Optional[float] = None
         self.last_ms: Optional[float] = None
 
@@ -285,7 +287,7 @@ class TssEma:
             and float(window_end_ms) - self.last_ms > float(window_ms)
         ):
             self.reset()
-        if raw is None or not math.isfinite(raw) or (raw == 0 and not self.zero_is_sample):
+        if raw is None or not math.isfinite(raw):
             return raw
         if self.value is None or self.last_ms is None:
             self.value, self.last_ms = raw, float(window_end_ms)
@@ -300,8 +302,8 @@ class TssEma:
 
 def signal_ema(tau_ms: float) -> TssEma:
     """The EMA an alternative (ablation) signal is smoothed with: the same class, the same
-    tau and the same alpha as TSS, with a zero counted as a sample."""
-    return TssEma(tau_ms, zero_is_sample=True)
+    tau and the same alpha as TSS."""
+    return TssEma(tau_ms)
 
 
 def smooth_series(
@@ -315,7 +317,7 @@ def smooth_series(
     """EMA a single cell's raw series in data time, exactly as the controller would.
 
     Mirrors ``TRSComputer._update_ema`` in its time-constant mode (:class:`TssEma` rules):
-    an undefined / zero raw is passed through without advancing the EMA or its timestamp;
+    an undefined (None) raw is passed through without advancing the EMA or its timestamp;
     a repeated or regressed ``window_end_ms`` keeps the current EMA; the first defined
     sample seeds it; a gap of more than ``window_ms`` (a scalar or one value per sample)
     since the last advancing sample resets it. ``window_ms=None`` disables the gap rule.

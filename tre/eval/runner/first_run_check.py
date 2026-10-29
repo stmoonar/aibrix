@@ -10,10 +10,12 @@ Sections (text: one screen; JSON: the same, machine readable):
 1. completeness - collector files present / size / lines; logs whose first line starts too late
    after the arm start (container log rotated or truncated);
 2. signal loss - controller ticks per loop, stale snapshots, ``metrics_window_stale`` by reason,
-   ``samples_incomplete`` events, ticks with ``sample_quality_hold`` / ``signal_hold_reason`` /
+   ``samples_incomplete`` events, ticks with ``sample_quality_hold`` /
    ``signal_unavailable_reason`` per model, gateway cadence (declared or not, pod-samples with
    fewer instant / hist docs than declared, write lag, scrape age), sampler error rows, baseline
-   event validity and ``inputs.gaps``;
+   event validity and ``inputs.gaps``; TSS-suffix settling episodes (2026-10-29, events
+   ``settling_start`` / ``settling_end`` per model: Z unknown for ``scaling.settle_ms``
+   after a pod-set change; not signal loss, an info line);
 3. validity - the campaign verdict when present, tick coverage (controller fast loop and
    baseline scaler: ticks during the load / (load duration / tick) >= ``--coverage-min``),
    frozen-tick share of a baseline that reports frozen ticks (``frozen`` true at top level or in
@@ -176,6 +178,7 @@ def controller_scan(p: Path, t0, t1) -> dict:
     stale_ticks, errors = 0, 0
     stale_reasons, events = Counter(), Counter()
     holds = defaultdict(Counter)
+    settling = defaultdict(Counter)  # model -> {settling_start, settling_end} events
     actions = Counter()
     first_err = []
     try:
@@ -213,7 +216,10 @@ def controller_scan(p: Path, t0, t1) -> dict:
             except ValueError:
                 continue
             for e in evs:
-                events[str(e).split(":", 1)[0]] += 1
+                parts = str(e).split(":")
+                events[parts[0]] += 1
+                if parts[0] in ("settling_start", "settling_end") and len(parts) > 1:
+                    settling[parts[1]][parts[0]] += 1
             for a in acts:
                 if isinstance(a, dict):
                     actions[(loop, a.get("kind"), a.get("reason"), "+" if (a.get("delta") or 0) > 0 else
@@ -221,14 +227,13 @@ def controller_scan(p: Path, t0, t1) -> dict:
             for model, st in (states or {}).items():
                 if not isinstance(st, dict):
                     continue
-                for key in ("sample_quality_hold", "signal_hold_reason", "signal_unavailable_reason"):
+                for key in ("sample_quality_hold", "signal_unavailable_reason"):
                     if st.get(key):
                         holds[model][f"{key}={st[key]}"] += 1
-                if st.get("signal_warm") is False:
-                    holds[model]["signal_warm=false"] += 1
     return {"ticks": dict(ticks), "ticks_load": dict(ticks_load), "stale_ticks": stale_ticks,
             "metrics_window_stale": dict(stale_reasons), "error_lines": errors, "first_errors": first_err,
             "events": dict(events.most_common(25)), "holds": {m: dict(c) for m, c in sorted(holds.items())},
+            "settling": {m: dict(c) for m, c in sorted(settling.items())},
             "actions": {" ".join(str(x) for x in k if x): v for k, v in actions.most_common()}}
 
 
@@ -413,8 +418,23 @@ def sm_ops(d: Path, t0_iso_s) -> dict:
 
 
 # ------------------------------------------------------------------ the check
-def check(d: Path, controller_tick_s: float = 5.0, baseline_tick_s: float = 5.0, coverage_min: float = 0.9,
+def expected_rescue_interval_s(rescue_s: float = 5.0, rebalance_s: float = 10.0, snapshot_s: float = 1.0) -> float:
+    """Mean spacing of the controller's rescue decisions (single decision loop, design
+    20261028-single-loop): each period rounds UP to the snapshot grid (5 s with 2 s
+    snapshots: 6 s; with the 1 s snapshots of the overlay since 2026-10-28: 5 s) and every
+    rebalance call (10 s) also runs the rescue section, so per rebalance interval there
+    are ceil(rebalance / rescue) rescue calls. Defaults: the overlay's
+    (TRE_RESCUE_INTERVAL_SECONDS, TRE_FAIRNESS_INTERVAL_SECONDS, TRE_EVIDENCE_PERIOD_MS);
+    a run on another period sets RUN_CHECK_CONTROLLER_TICK_S."""
+    def grid(x: float) -> float:
+        return math.ceil(x / snapshot_s - 1e-9) * snapshot_s
+    rescue, rebalance = grid(rescue_s), grid(rebalance_s)
+    return rebalance / math.ceil(rebalance / rescue - 1e-9)
+
+
+def check(d: Path, controller_tick_s: float | None = None, baseline_tick_s: float = 5.0, coverage_min: float = 0.9,
           frozen_max: float = 0.05) -> dict:
+    controller_tick_s = expected_rescue_interval_s() if controller_tick_s is None else controller_tick_s
     meta = _read_json(d / "arm_meta.json") or {}
     arm = meta.get("arm") or d.name
     baseline = arm in ("chiron", "tokenscale", "preserve") or (d / "baseline").is_dir()
@@ -472,6 +492,9 @@ def check(d: Path, controller_tick_s: float = 5.0, baseline_tick_s: float = 5.0,
             "cadence_inst_short": cad.get("pod_samples_inst_short"), "cadence_hist_short": cad.get("pod_samples_hist_short")}
     if any(loss.values()):
         info.append("signal loss: " + ", ".join(f"{k}={v}" for k, v in loss.items() if v))
+    if ctrl.get("settling"):
+        info.append("settling episodes (start/end): " + ", ".join(
+            f"{m}={c.get('settling_start', 0)}/{c.get('settling_end', 0)}" for m, c in ctrl["settling"].items()))
     camp = _read_json(d / "CAMPAIGN_DONE.json") or _read_json(d / "campaign_manifest.json") or {}
     res["validity"] = {"campaign_verdict": (camp.get("validity") or {}).get("verdict"),
                        "campaign_reasons": (camp.get("validity") or {}).get("invalid", []) + (camp.get("validity") or {}).get("suspect", []),
@@ -587,7 +610,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", help="write the result here (one arm dir only)")
     ap.add_argument("--text", help="also write the text here (one arm dir only)")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--controller-tick-s", type=float, default=float(os.environ.get("RUN_CHECK_CONTROLLER_TICK_S") or 5))
+    ap.add_argument("--controller-tick-s", type=float,
+                    default=float(os.environ.get("RUN_CHECK_CONTROLLER_TICK_S") or expected_rescue_interval_s()))
     ap.add_argument("--baseline-tick-s", type=float, default=float(os.environ.get("RUN_CHECK_BASELINE_TICK_S") or 5))
     ap.add_argument("--coverage-min", type=float, default=float(os.environ.get("RUN_CHECK_COVERAGE_MIN") or 0.9))
     ap.add_argument("--frozen-max", type=float, default=float(os.environ.get("RUN_CHECK_FROZEN_MAX") or 0.05))

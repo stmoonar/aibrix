@@ -54,11 +54,6 @@ class ModelClassification:
     #: exempt from the "Z missing -> incomplete" drop, see plan 6.4 idle rule.
     signal_idle: bool = False
     eta_low: float | None = None
-    #: Onset saturation rescue (design 20261002-saturation-onset-rescue): CRITICAL because
-    #: the engines are full while the TSS cannot decide yet (numerator zero / O1 hold).
-    #: Z_m is then the TSS value for the record only (often None); the planner sizes the
-    #: step by bounded doubling, not by ``ceil(n * tau_crit / Z)``.
-    saturation_rescue: bool = False
 
 
 def classify_model(
@@ -75,7 +70,10 @@ def classify_model(
     idle_rps_eps: float = 0.05,
 ) -> ModelClassification:
     request_rate = _as_nonneg_float(request_rate_rps)
-    if request_rate is not None and request_rate < max(0.0, idle_rps_eps):
+    # Z = 0 is a TSS of 0 with a queue - nothing processed (a stalled engine, 2026-10-29),
+    # not light traffic: the low-request-rate shortcut does not hide it.
+    stalled = Z_m is not None and Z_m <= 0.0
+    if request_rate is not None and request_rate < max(0.0, idle_rps_eps) and not stalled:
         return ModelClassification(
             model_name=model_name,
             state=ModelState.HEALTHY,
@@ -280,7 +278,7 @@ def split_receivers_donors(
 ) -> tuple[list[ModelClassification], list[ModelClassification]]:
     receivers = [item for item in classifications if item.role == ModelRole.RECEIVER]
     donors = [item for item in classifications if item.role == ModelRole.DONOR]
-    receivers.sort(key=_receiver_sort_key)
+    receivers.sort(key=receiver_sort_key)
     donors.sort(
         key=lambda item: donor_mock_cost_key(
             item, disable_eta_gate=disable_eta_gate
@@ -353,7 +351,9 @@ def _natural_text_key(value: str) -> tuple[tuple[int, Any], ...]:
     )
 
 
-def _receiver_sort_key(classification: ModelClassification) -> tuple[int, float]:
+def receiver_sort_key(classification: Any) -> tuple[int, float]:
+    """Receiver order: CRITICAL before LOW, then the most starved first (raw Z
+    ascending; no Z sorts last)."""
     prio = 1 if classification.state == ModelState.CRITICAL else 2
     return (prio, classification.Z_m if classification.Z_m is not None else float("inf"))
 

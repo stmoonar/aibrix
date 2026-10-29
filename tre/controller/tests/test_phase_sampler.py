@@ -386,20 +386,20 @@ def _store_with_ticks(end: int) -> MetricsStore:
             "m/request_prompt_tokens": {"sum": 10.0 * k, "count": k, "buckets": {}},
         }})
     registry = SimpleNamespace(models=lambda: [SimpleNamespace(name="m")])
-    return MetricsStore(redis, registry, instant_sample_interval_ms=P, schema="v2")
+    return MetricsStore(redis, registry, instant_sample_interval_ms=P)
 
 
 def test_store_half_open_read_gives_three_ticks_and_a_30s_token_span() -> None:
     end = BASE + 10 * P
     store = _store_with_ticks(end)
-    half = store.read_model_window("m", end - W, end, use_cache=False, start_exclusive=True)
+    half = store.read_model_window("m", end - W, end, start_exclusive=True)
     assert half.instant_ticks_ms == (end - 20_000, end - 10_000, end)
     assert half.avg_running == pytest.approx(3.0)  # mean of the 3 samples
     assert half.generation_tokens == pytest.approx(300.0)  # hist(end) - hist(end - 30 s)
     assert (half.window_start_ms, half.window_end_ms) == (end - W, end)
     # the closed read on a boundary takes its token baseline one tick early (40 s span) -
     # why the sampler reads (s, e]. (The queue mean is not distorted by the extra tick.)
-    closed = store.read_model_window("m", end - W, end, use_cache=False)
+    closed = store.read_model_window("m", end - W, end)
     assert closed.avg_running == pytest.approx(3.0)
     assert closed.generation_tokens == pytest.approx(400.0)
 
@@ -418,8 +418,8 @@ def test_metrics_task_falls_back_to_free_running_when_window_is_off_grid(caplog)
     calls: list = []
 
     class Store:
-        def read_snapshot(self, start, end, *, use_cache=True):
-            calls.append((start, end, use_cache))
+        def read_snapshot(self, start, end):
+            calls.append((start, end))
             return MetricsSnapshot(ts_ms=end, models={}, stale=False)
 
     async def sleep(_s):
@@ -431,4 +431,4 @@ def test_metrics_task_falls_back_to_free_running_when_window_is_off_grid(caplog)
     with caplog.at_level(logging.ERROR, logger="tre_controller.metrics"), pytest.raises(Stop):
         asyncio.run(metrics_task(Store(), SnapshotBox(), cfg, sleep=sleep))
     assert "FALLING BACK to free_running" in caplog.text
-    assert len(calls) == 1 and calls[0][1] - calls[0][0] == 35_000 and calls[0][2] is False
+    assert len(calls) == 1 and calls[0][1] - calls[0][0] == 35_000

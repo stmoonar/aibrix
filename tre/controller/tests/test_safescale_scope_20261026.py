@@ -10,10 +10,11 @@ from dataclasses import replace
 
 import pytest
 
+from relay_view import fleet_view, transfer_members
+
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller.config import ControllerConfig, SafeScaleConfig
-from tre_controller.loops.rescue_task import run_rescue_tick
-from tre_controller.planning.planner import TransferIntent
+from section_ticks import run_rescue_tick
 from tre_controller.planning.safescale import SafeScaleStateMachine
 
 from test_b8_observe_probes import _probe_snapshot
@@ -39,30 +40,14 @@ def test_only_the_receiverless_high_shrink_runs_as_a_probe():
     donor = _metrics_with_pods("donor", generation=200.0, waiting=0.0, running=1.0, pods=("donor-a", "donor-b"))
     snapshot = replace(snapshot, models={**snapshot.models, "donor": donor})
     queue = FakeQueue()
-    run_rescue_tick(snapshot, queue=queue, registry=_registry_with_models("critical", "donor"),
-                    safescale=machine, safescale_scope=SCOPE)
+    registry = _registry_with_models("critical", "donor")
+    run_rescue_tick(snapshot, queue=queue, registry=registry, safescale=machine, safescale_scope=SCOPE,
+                    cluster_view=fleet_view(registry, "donor", ("donor-a", "donor-b"), "critical"))
     assert machine.active_probe("donor") is None
-    assert queue.submitted == [
-        (TransferIntent("donor", "critical", 1, "critical_high_donor_safescale_nosafescale", "rescue"),)
+    [[transfer]] = queue.submitted
+    assert [(kind, model, path) for kind, model, _, path, _ in transfer_members(transfer)] == [
+        ("sleep", "donor", "urgent"), ("wake", "critical", None)
     ]
-
-
-def test_a_same_slot_preemption_sleeps_its_pod_at_once_and_starts_no_probe():
-    # Review round 6 (L1): the TP same-slot preemption has a beneficiary - immediate.
-    from tre_controller.loops.tick import _apply_safescale
-    from tre_controller.planning.planner import ShrinkForSlotAction
-
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
-    same_slot = ShrinkForSlotAction(
-        donor="high", beneficiary="tp2", serve_id="high-0", slot=None,
-        reason="critical_same_slot_high_shrink", source_loop="rescue",
-    )
-    out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (same_slot,), {},
-                              safescale=machine, safescale_scope=SCOPE)
-    [sleep] = out
-    assert (sleep.model, sleep.delta, sleep.pods, sleep.sleep_path) == ("high", -1, ("high-0",), "urgent")
-    assert sleep.reason == "critical_same_slot_high_shrink_nosafescale"
-    assert machine.active_probe("high") is None
 
 
 @pytest.mark.parametrize(("env", "scope"), [

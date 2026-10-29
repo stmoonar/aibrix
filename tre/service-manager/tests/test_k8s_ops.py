@@ -1,3 +1,5 @@
+import json
+
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, STATE_ANNOTATION, K8sPodSnapshot
@@ -29,7 +31,7 @@ class FakeK8sApi:
         metadata = self.pod_metadata.setdefault(name, {"name": name, "annotations": {}})
         return {"metadata": {**metadata, "annotations": dict(metadata.get("annotations") or {})}}
 
-    def list_namespaced_pod(self, *, namespace, label_selector=None):
+    def list_namespaced_pod(self, *, namespace, label_selector=None, **_kwargs):
         self.last_list = (namespace, label_selector)
         self.list_calls.append((namespace, label_selector))
         if isinstance(self.pods, list) and self.pods and isinstance(self.pods[0], list):
@@ -692,3 +694,102 @@ def test_every_kubernetes_call_gets_a_connect_read_tuple_and_no_retry(monkeypatc
     assert isinstance(timeout, tuple) and len(timeout) == 2
     assert timeout == (K8S_CONNECT_TIMEOUT_S, 5.0)
     assert ops._api._api.api_client.configuration.retries == 0
+
+
+class _RawPodListResponse:
+    """What the kubernetes client returns with ``_preload_content=False``: the
+    undecoded JSON body."""
+
+    def __init__(self, body: bytes):
+        self.data = body
+        self.released = False
+
+    def release_conn(self):
+        self.released = True
+
+
+class _ApiServerPodList:
+    """A Pod LIST with the API server's selector semantics (``k=v`` labels,
+    ``status.phase!=X`` fields) and its JSON (unset fields omitted)."""
+
+    def __init__(self, pods):
+        self.pods = pods
+        self.calls = []
+
+    def list_namespaced_pod(self, *, namespace, label_selector=None, field_selector=None, _preload_content=True):
+        self.calls.append({"field_selector": field_selector, "preload": _preload_content})
+        labels = dict(term.split("=", 1) for term in (label_selector or "").split(",") if term)
+        excluded = {
+            term.split("!=", 1)[1]
+            for term in (field_selector or "").split(",")
+            if term.startswith("status.phase!=")
+        }
+        items = [
+            pod
+            for pod in self.pods
+            if pod["status"]["phase"] not in excluded
+            and all(pod["metadata"]["labels"].get(k) == v for k, v in labels.items())
+        ]
+        body = json.dumps({"kind": "PodList", "items": items}).encode()
+        return _RawPodListResponse(body) if not _preload_content else items
+
+
+def _raw_model_pod(name, phase, *, admitted=False):
+    from tre_sm.ops.k8s_ops import MANAGED_LABEL
+
+    uid = f"uid-{name}"
+    annotations = {GPU_IDS_ANNOTATION: "0"}
+    if admitted:
+        annotations["tre.aibrix.io/startup-admitted-uid"] = uid
+    running = phase == "Running"
+    return {
+        "metadata": {
+            "name": name,
+            "uid": uid,
+            "labels": {MODEL_LABEL: "m1", MANAGED_LABEL: "true", "app": "m1-node-a-gpu-0"},
+            "annotations": annotations,
+        },
+        "spec": {
+            "nodeName": "node-a",
+            "containers": [{"name": "vllm-openai", "env": [{"name": "CUDA_VISIBLE_DEVICES", "value": "0"}]}],
+        },
+        "status": {
+            "phase": phase,
+            **({"podIP": "10.0.0.9"} if running else {"reason": "Evicted"}),
+            "containerStatuses": [
+                {
+                    "name": "vllm-openai",
+                    "ready": running,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-10-28T00:00:00Z"}}
+                    if running
+                    else {"terminated": {"exitCode": 137, "reason": "Error"}},
+                }
+            ],
+        },
+    }
+
+
+def test_eviction_storm_failed_pods_are_filtered_by_the_api_server_and_never_counted():
+    """10-28 OOM: ~4000 evicted (Failed) model Pods were listed and built into
+    kubernetes model objects on every LIST. Every Pod LIST asks the API server
+    for unfinished Pods and reads the raw JSON body; no view counts a Failed
+    Pod (it holds no GPU), and a Deployment whose only Pods are Failed has no
+    Pod left to wait for."""
+    evicted = [_raw_model_pod(f"evicted-{i}", "Failed", admitted=True) for i in range(4000)]
+    api = _ApiServerPodList(evicted + [_raw_model_pod("serve-a", "Running")])
+    ops = K8sOps(api=api, namespace="default")
+
+    assert [pod.name for pod in ops.list_pod_snapshots()] == ["serve-a"]
+    assert [pod.name for pod in ops.list_startup_resident_snapshots()] == ["serve-a"]
+    assert ops.list_live_model_pod_uids() == {"uid-serve-a"}
+    assert ops.list_admitted_startup_pods() == []
+    assert [state["name"] for state in ops.startup_pod_states()] == ["serve-a"]
+
+    only_evicted = K8sOps(api=_ApiServerPodList(evicted), namespace="default")
+    only_evicted.wait_deployment_pods_deleted("m1-node-a-gpu-0", timeout_s=0.01, interval_s=0.01)
+
+    assert api.calls and all(
+        call == {"field_selector": "status.phase!=Failed,status.phase!=Succeeded", "preload": False}
+        for call in api.calls
+    )
