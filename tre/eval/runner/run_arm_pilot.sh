@@ -120,14 +120,15 @@ SCORE_REGISTRY="${SCORE_REGISTRY:-$D/live-registry.yaml}"   # default: the live 
 PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for open SafeScale probes to resolve
 # ---- controller ablation switches (2026-10-08, note 14)
 # (2026-10-26) TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025): which placements SafeScale covers;
-# default "all" = unset (production), e.g. receiverless_shrink. Restored to unset like the switches.
+# default "all" = unset (production), e.g. receiverless_shrink or healthy_and_shrink (2026-10-29).
+# Restored to unset like the switches.
 # (2026-10-28) signal ablation: TRE_SIGNAL_SOURCE (default zm = TSS = unset, restored to unset; the values of
 # campaign.py SIGNAL_SOURCES) and the switch TRE_DISABLE_ETA_GATE (default false).
 CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE"
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_valid() {   # ctl_valid KEY VALUE
   case "$1" in
-    TRE_SAFESCALE_SCOPE) case "$2" in all|receiverless_shrink|off) ;; *) return 1 ;; esac ;;
+    TRE_SAFESCALE_SCOPE) case "$2" in all|receiverless_shrink|off|healthy_and_shrink) ;; *) return 1 ;; esac ;;
     TRE_SIGNAL_SOURCE) case "$2" in zm|queue_len|ttft_mean|kv_usage|latency_p95|decode_tps|prefill_tps) ;; *) return 1 ;; esac ;;
     *) [ "$2" = true ] || [ "$2" = false ] ;;
   esac
@@ -166,7 +167,7 @@ if [ "$SEND_IN_TOKENS" = 1 ]; then
 fi
 for kv in $ARM_CONTROLLER_ENV; do
   case " $CTL_ENV_KEYS " in *" ${kv%%=*} "*) ;; *) echo "ARM_CONTROLLER_ENV: unknown switch '${kv%%=*}' (allowed: $CTL_ENV_KEYS)" >&2; exit 2;; esac
-  ctl_valid "${kv%%=*}" "${kv#*=}" || { echo "ARM_CONTROLLER_ENV: '$kv': bad value (switches true|false, TRE_SAFESCALE_SCOPE all|receiverless_shrink|off, TRE_SIGNAL_SOURCE one of ctl_valid)" >&2; exit 2; }
+  ctl_valid "${kv%%=*}" "${kv#*=}" || { echo "ARM_CONTROLLER_ENV: '$kv': bad value (switches true|false, TRE_SAFESCALE_SCOPE all|receiverless_shrink|off|healthy_and_shrink, TRE_SIGNAL_SOURCE one of ctl_valid)" >&2; exit 2; }
   [ "$ARM" = tre ] || { echo "ARM_CONTROLLER_ENV is for tre arms only (arm=$ARM)" >&2; exit 2; }
 done
 # the switch is the alias of scope "off": both given must agree, else the controller refuses to start

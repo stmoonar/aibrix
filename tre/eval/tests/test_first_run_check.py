@@ -79,3 +79,19 @@ def test_expected_rescue_interval_follows_the_overlay_snapshot_period():
     default_s = inspect.signature(F.expected_rescue_interval_s).parameters["snapshot_s"].default
     assert default_s * 1000 == period_ms
     assert F.expected_rescue_interval_s(snapshot_s=1.0) == 5.0
+
+
+def test_settling_episodes_are_counted_per_model(tmp_path):
+    # TSS suffix (2026-10-29): one settling_start / settling_end per episode in the tick events.
+    def tick(events):
+        message = {"event": "trs_calc_result", "loop": "rescue", "now_ms": 1_000_000,
+                   "events": json.dumps(events), "actions": "[]", "model_states": "{}"}
+        return json.dumps({"message": json.dumps(message)})
+
+    log = tmp_path / "controller.log"
+    log.write_text("\n".join([
+        tick(["settling_start:m7:settle_span", "rescue_target:x"]),
+        tick(["settling_end:m7:valid:evidence_ms=10200", "settling_start:m8:no_suffix"]),
+    ]) + "\n")
+    scan = F.controller_scan(log, None, None)
+    assert scan["settling"] == {"m7": {"settling_start": 1, "settling_end": 1}, "m8": {"settling_start": 1}}

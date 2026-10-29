@@ -73,7 +73,14 @@ CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_S
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
 # 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source);
 # TRE_DISABLE_ETA_GATE is a switch (default false; logged as disable_eta_gate).
-SAFESCALE_SCOPES = ("all", "receiverless_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
+# 2026-10-29 (design 20261029-tss-suffix rule 5): healthy_and_shrink = IDLE donors at once, a HIGH donor
+# relays to a receiver at once, a HEALTHY donor gives only to a CRITICAL receiver through a probe, the
+# receiverless HIGH shrink is a probe. Example arm def:
+#   arm_defs:
+#     tre-hs:
+#       base: tre
+#       controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+SAFESCALE_SCOPES = ("all", "receiverless_shrink", "healthy_and_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
 # = tre_controller.config.SIGNAL_SOURCES (feat/alt-signals-20261028: ttft_mean / kv_usage added, kv_cache removed);
 # an image without a value refuses to start -> the startup-line check fails the arm
 SIGNAL_SOURCES = ("zm", "queue_len", "ttft_mean", "kv_usage", "latency_p95", "decode_tps", "prefill_tps")

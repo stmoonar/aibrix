@@ -13,7 +13,9 @@ Sections (text: one screen; JSON: the same, machine readable):
    ``samples_incomplete`` events, ticks with ``sample_quality_hold`` /
    ``signal_unavailable_reason`` per model, gateway cadence (declared or not, pod-samples with
    fewer instant / hist docs than declared, write lag, scrape age), sampler error rows, baseline
-   event validity and ``inputs.gaps``;
+   event validity and ``inputs.gaps``; TSS-suffix settling episodes (2026-10-29, events
+   ``settling_start`` / ``settling_end`` per model: Z unknown for ``scaling.settle_ms``
+   after a pod-set change; not signal loss, an info line);
 3. validity - the campaign verdict when present, tick coverage (controller fast loop and
    baseline scaler: ticks during the load / (load duration / tick) >= ``--coverage-min``),
    frozen-tick share of a baseline that reports frozen ticks (``frozen`` true at top level or in
@@ -176,6 +178,7 @@ def controller_scan(p: Path, t0, t1) -> dict:
     stale_ticks, errors = 0, 0
     stale_reasons, events = Counter(), Counter()
     holds = defaultdict(Counter)
+    settling = defaultdict(Counter)  # model -> {settling_start, settling_end} events
     actions = Counter()
     first_err = []
     try:
@@ -213,7 +216,10 @@ def controller_scan(p: Path, t0, t1) -> dict:
             except ValueError:
                 continue
             for e in evs:
-                events[str(e).split(":", 1)[0]] += 1
+                parts = str(e).split(":")
+                events[parts[0]] += 1
+                if parts[0] in ("settling_start", "settling_end") and len(parts) > 1:
+                    settling[parts[1]][parts[0]] += 1
             for a in acts:
                 if isinstance(a, dict):
                     actions[(loop, a.get("kind"), a.get("reason"), "+" if (a.get("delta") or 0) > 0 else
@@ -227,6 +233,7 @@ def controller_scan(p: Path, t0, t1) -> dict:
     return {"ticks": dict(ticks), "ticks_load": dict(ticks_load), "stale_ticks": stale_ticks,
             "metrics_window_stale": dict(stale_reasons), "error_lines": errors, "first_errors": first_err,
             "events": dict(events.most_common(25)), "holds": {m: dict(c) for m, c in sorted(holds.items())},
+            "settling": {m: dict(c) for m, c in sorted(settling.items())},
             "actions": {" ".join(str(x) for x in k if x): v for k, v in actions.most_common()}}
 
 
@@ -484,6 +491,9 @@ def check(d: Path, controller_tick_s: float | None = None, baseline_tick_s: floa
             "cadence_inst_short": cad.get("pod_samples_inst_short"), "cadence_hist_short": cad.get("pod_samples_hist_short")}
     if any(loss.values()):
         info.append("signal loss: " + ", ".join(f"{k}={v}" for k, v in loss.items() if v))
+    if ctrl.get("settling"):
+        info.append("settling episodes (start/end): " + ", ".join(
+            f"{m}={c.get('settling_start', 0)}/{c.get('settling_end', 0)}" for m, c in ctrl["settling"].items()))
     camp = _read_json(d / "CAMPAIGN_DONE.json") or _read_json(d / "campaign_manifest.json") or {}
     res["validity"] = {"campaign_verdict": (camp.get("validity") or {}).get("verdict"),
                        "campaign_reasons": (camp.get("validity") or {}).get("invalid", []) + (camp.get("validity") or {}).get("suspect", []),
