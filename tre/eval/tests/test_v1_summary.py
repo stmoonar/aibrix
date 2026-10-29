@@ -23,7 +23,7 @@ def make_tre_arm(root, name="sens-theta-m20"):
     layout = [(float(t), lay([A0, A1] if 30 <= t < 60 else [A0], [B0, B23] if t >= 50 else [B0])) for t in range(-5, 101)]
     rows = [req(i, model="m-a" if i % 2 else "m-b", t=float(i), e2e=5.0 + (i % 10), ttft=0.1 + 0.01 * (i % 7))
             for i in range(95)]
-    rows.append(req(95, model="m-b", t=60.0, e2e=150.0, ttft=0.2))       # cut by the route timeout
+    rows.append({**req(95, model="m-b", t=60.0, e2e=150.0, ttft=0.2), "success_strict": False})       # cut by the route timeout
     write_arm(d, layout, rows)
     acts = [(31, [{"model": "m-a", "delta": 1, "reason": "critical_sleeping_capacity"},
                   {"model": "m-b", "delta": -1, "reason": "critical_donor_immediate"},       # donor side: not urgent

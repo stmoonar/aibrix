@@ -106,7 +106,7 @@ def build(arm: Arm, recs: list[dict], capacity: dict[str, float] | None = None) 
             res[m]["sent_rps"][j] += 1
         if r.get("end_time"):
             j = idx(r["end_time"] - arm.t_load)
-            if 0 <= j < n and r.get("success"):
+            if 0 <= j < n and M.completion_status(r) == "complete":
                 res[m]["completed_rps"][j] += 1
             out = r.get("output_tokens") or 0
             if out and r.get("ttft") is not None:

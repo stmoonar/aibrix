@@ -384,7 +384,7 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 			st.ttftSpan.End()
 			st.ttftSpan = nil
 		}
-		// TRE-PATCH(BL-GW-001): ft on the first frame; the frame is not parsed.
+		// TRE-PATCH(BL-GW-001): ft on the first generated token (role-only frames do not count).
 		s.blOnResponseBody(st, req.GetResponseBody().GetBody())
 		if st.isRespError {
 			body := string(req.Request.(*extProcPb.ProcessingRequest_ResponseBody).ResponseBody.GetBody())

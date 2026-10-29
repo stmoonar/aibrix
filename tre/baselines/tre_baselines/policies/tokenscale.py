@@ -315,7 +315,7 @@ class TokenScalePolicy:
             b_true = _bucket_index(out_len, edges_out)
             b_out, moved = misbucket(b_true, self.misbucket_rate, self.seed, model, ev.draw_key)
             n_mis += moved
-            win.append(_Ev(ev.ts_ms, int(ev.in_tokens), out_len, b_true, b_in, b_out, ev.in_src == "estimate"))
+            win.append(_Ev(ev.ts_ms, int(ev.in_tokens), out_len, b_true, b_in, b_out, ev.in_src not in ("header", "token_ids")))
             n_new += 1
         return n_new, n_missing, n_mis, n_no_id
 
@@ -340,10 +340,13 @@ class TokenScalePolicy:
         grid = self._vel[model]
         lam = [[0.0] * N_OUT for _ in range(N_IN)]
         lam_true = [[0.0] * N_OUT for _ in range(N_IN)]
+        trusted_term = 0.0
         n_est = n_mis_win = 0
         for e in win:
             lam[e.b_in][e.b_out] += e.in_tokens + self.represented_out(model, e.b_in, e.b_out)
             lam_true[e.b_in][e.b_out_true] += e.in_tokens + e.out_len
+            if not e.estimate:
+                trusted_term += (e.in_tokens + self.represented_out(model, e.b_in, e.b_out)) / grid[e.b_in][e.b_out] / self.window_s
             n_est += e.estimate
             n_mis_win += e.b_out != e.b_out_true
         w = self.window_s
@@ -377,7 +380,9 @@ class TokenScalePolicy:
         gaps = evidence_gaps(ms, now_ms, tick_s, events=True, history_s=self.window_s)
         if est_frac > self.max_estimate_frac:
             self._counts[model]["degraded_estimate_frac"] += 1
-            return Decision(ms.awake, "degraded_estimate_frac", inputs)
+            inputs["trusted_term_buckets"] = round(trusted_term, 4)
+            return Decision(max(ms.awake, math.ceil(trusted_term - 1e-9)),
+                            "degraded_estimate_frac", inputs)
         if not win:
             # An empty window alone is unknown, not idle: 0 only on complete evidence with
             # every engine reporting nothing in flight.

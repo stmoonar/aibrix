@@ -280,3 +280,10 @@ def test_events_valid_needs_arrivals_no_drops_and_headers_when_sent() -> None:
     assert doc["events_valid"] is False and "header" in doc["invalid_because"][0]
     assert arm.run_validity(metrics(10, 3), marker, 5.0)["events_valid"] is True   # flag off: estimates expected
     assert arm.run_validity(metrics(10, 0), marker, None)["events_valid"] is False  # drops unknown
+
+def test_mark_replay_preserves_first_arrival_timestamp_and_trace_seed():
+    redis = FakeRedis(now_ms=10000)
+    code, _ = run(["mark-replay", "--trace", "case/seed7/trace.json", "--seed", "7",
+                   "--t0-ms", "4321", "--execute"], FakeRunner(), redis)
+    doc = json.loads(redis.kv[REPLAY_T0_KEY])
+    assert code == 0 and doc["t0_ms"] == 4321 and doc["seed"] == 7

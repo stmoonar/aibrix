@@ -8,10 +8,13 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tre_eval.metrics import completion_status
+
 D = Path(sys.argv[1])
 T_LOAD = int((D / "load_start_epoch").read_text())
 T_END = int((D / "load_end_epoch").read_text())
-S = {"arm": D.name, "load_s": T_END - T_LOAD}
+S = {"arm": D.name, "load_s": T_END - T_LOAD, "scoring_basis": "strict-completion-v1"}
 MODELS = [m for m in os.environ.get("MODELS", "dsqwen-7b,dsllama-8b,dsqwen-14b").split(",") if m]
 
 
@@ -30,23 +33,32 @@ recs = [json.loads(l) for l in open(D / "client/performance_metrics.json") if l.
 cl = {}
 for m in ["ALL"] + MODELS:
     rs = [r for r in recs if m == "ALL" or r["model_name"] == m]
-    ok = [r for r in rs if r["success"]]
+    statuses = collections.Counter(completion_status(r) for r in rs)
+    ok = [r for r in rs if completion_status(r) == "complete"]
+    tpot = [(r["e2e_latency"] - r["ttft"]) / (r["output_tokens"] - 1) for r in ok
+            if r.get("e2e_latency") is not None and r.get("ttft") is not None and (r.get("output_tokens") or 0) > 1]
     cl[m] = {
+        **{k: statuses[k] for k in ("complete", "truncated", "failed", "unknown")},
+        "completion_rate_pct": round(100 * len(ok) / len(rs), 3) if rs else None,
+        "truncation_rate_pct": round(100 * statuses["truncated"] / len(rs), 3) if rs else None,
+        "scoring_basis": "strict-completion-v1",
         "n": len(rs), "ok": len(ok), "err": len(rs) - len(ok),
         "interrupted": sum(bool(r.get("stream_interrupted")) for r in rs),
         "finish": dict(collections.Counter(r.get("finish_reason") for r in rs)),
         "ttft_p95": pct([r["ttft"] for r in ok], 95), "ttft_p99": pct([r["ttft"] for r in ok], 99),
-        "tpot_p95": pct([r["tpot"] for r in ok], 95), "tpot_p99": pct([r["tpot"] for r in ok], 99),
+        "tpot_p95": pct(tpot, 95), "tpot_p99": pct(tpot, 99),
+        "tpot_v1_p95": pct([r.get("tpot") for r in ok], 95), "tpot_v1_p99": pct([r.get("tpot") for r in ok], 99),
         "e2e_p50": pct([r["e2e_latency"] for r in ok], 50),
         "e2e_p95": pct([r["e2e_latency"] for r in ok], 95), "e2e_p99": pct([r["e2e_latency"] for r in ok], 99),
         "short_output": sum(1 for r in ok if (r.get("output_tokens") or 0) < 400 and r.get("finish_reason") != "stop"),
     }
-    # Strict basis (unified client, 2026-09-30; the columns above are the v1 basis): TTFT on
+    # Additional last-attempt timing basis; the main columns above include retry waits
+    # and already require strict completion. Last-attempt TTFT is measured on
     # the first content token, TPOT = (E2E - TTFT)/(n - 1), cut / error-chunk / zero-output
     # streams fail, retry waits excluded. Records written before the unified client have no
     # *_strict fields: every strict column is then None.
     if any("success_strict" in r for r in rs):
-        oks = [r for r in rs if r.get("success_strict")]
+        oks = ok
         cl[m].update({
             "ok_strict": len(oks), "err_strict": len(rs) - len(oks),
             "failures_strict": dict(collections.Counter(r.get("failure_strict") for r in rs
@@ -70,7 +82,7 @@ for m in ["ALL"] + MODELS:
             "ttft_strict_p99", "tpot_strict_p95", "tpot_strict_p99", "e2e_strict_p50", "e2e_strict_p95",
             "e2e_strict_p99", "retried", "tre_continued", "send_lateness_p99_ms", "send_lateness_max_ms")})
 cl["errors"] = dict(collections.Counter((r.get("http_status"), (r.get("error_message") or "")[:80])
-                                       for r in recs if not r["success"]).most_common(8))
+                                       for r in recs if completion_status(r) != "complete").most_common(8))
 cl["errors"] = {str(k): v for k, v in cl["errors"].items()}
 S["client"] = cl
 

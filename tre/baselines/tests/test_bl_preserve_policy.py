@@ -118,7 +118,7 @@ def test_trace_name_and_predictor_set() -> None:
 
 def test_iterations_follow_measured_tpot_and_events_land_at_their_time() -> None:
     p = make()
-    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "r1", "p0", 1000, 1000, 512)]))
+    p.decide(snap(1000, [pod("p0", 1000)], load("r1", "p0", 1000, 1000, 512)))
     m = amap(p)
     assert m.it == 0 and m.at(0) == pytest.approx(0.1) and m.at(511) == pytest.approx(0.1511)
     # itl counters: 64 tokens in 1.0 s -> TPOT 1/64 s -> 64 iterations per second
@@ -126,10 +126,10 @@ def test_iterations_follow_measured_tpot_and_events_land_at_their_time() -> None
                       [ev("arr", "r2", "p0", 2000, 0, 100), ev("ft", "r2", "p0", 2500)]))
     assert d["m"].inputs["tier2"]["p0"]["tpot_src"] == "itl"
     assert m.it == 128
-    assert m.requests[("r2", "p0")].start == 64  # placed at its arr (route) time, not at its ft or the tick
-    assert m.at(0) == pytest.approx((1128 + 64) / 10_000)
-    assert m.at(35) == pytest.approx((1163 + 99) / 10_000)
-    assert m.at(36) == pytest.approx(1164 / 10_000)
+    assert m.requests[("r2", "p0")].start == 96  # placed at ft=2500, not arr=2000
+    assert m.at(0) == pytest.approx((1128 + 32) / 10_000)
+    assert m.at(35) == pytest.approx((1163 + 67) / 10_000)
+    assert m.at(68) == pytest.approx(1196 / 10_000)
 
 
 def test_tpot_falls_back_to_the_slo_and_carries_fractions() -> None:
@@ -157,45 +157,24 @@ def test_early_done_and_reissue_migration() -> None:
     # the sidecar re-sends r to p1 (prompt + generated so far, the remaining max_tokens)
     p.decide(snap(1000, pods, [ev("arr", "r", "p1", 1000, 1050, 50, "continued"),
                                ev("ft", "r", "p1", 1000, reissue="continued")]))
-    assert amap(p, "p0").at(0) == pytest.approx(0.1)
+    assert amap(p, "p0").at(0) == 0.0
     assert amap(p, "p1").at(0) == pytest.approx(0.105) and amap(p, "p1").at(49) == pytest.approx(0.1099)
     p.decide(snap(1000, pods, [ev("done", "r", "p0", 1000)]))  # the original is released
     assert all(u == 0.0 for u in amap(p, "p0").window(200))
     assert amap(p, "p1").at(0) == pytest.approx(0.105)
     p.decide(snap(1000, pods, [ev("done", "r", "p1", 1000, reissue="continued")]))
     assert all(u == 0.0 for u in amap(p, "p1").window(200))
-    assert sum(p.anomalies["m"].values()) == 0
+    assert p.anomalies["m"]["attempt_superseded"] == 1
 
 
-def test_out_of_order_unknown_and_missing_events_do_not_crash() -> None:
+def test_done_before_first_token_does_not_create_a_decode_request():
     p = make()
-    pods = [pod("p0", 5000)]
-    events = [
-        ev("done", "zz", "p0", 5000),                                  # unknown request
-        ev("arr", "q", "p0", 5000, 10, 5), ev("done", "q", "p0", 5000),
-        ev("ft", "q", "p0", 5000),                                     # ft after its done: ignored
-        ev("ft", "w", "p0", 5000, 100, 10),                            # ft without arr: ignored
-        ev("arr", "x", "pZ", 5000, 10, 5),                             # pod not in snapshot (yet)
-        ev("arr", "y", "p0", 5000, 10, None),                          # no max_tokens
-        ev("arr", "u", "p0", 5000, None, 5),                           # no in_tokens
-        ev("arr", "v", None, 5000, 10, 5),                             # arr without pod (not routed)
-        ev("arr", "o", "p0", 4000, 1, 1),                              # older than the pod's clock
-    ]
-    d = p.decide(snap(5000, pods, events))
-    anom = p.anomalies["m"]
-    assert anom["unknown_req"] == 1 and anom["unknown_pod"] == 1
-    assert anom["arr_buffered"] == 1  # pZ: kept until it appears
-    assert anom["missing_max_tokens"] == 1 and anom["missing_in_tokens"] == 1
-    assert anom["out_of_order"] == 1
-    assert d["m"].inputs["anom"]["unknown_req"] == 1
-    m = amap(p)
-    assert set(m.requests) == {("y", "p0"), ("u", "p0"), ("o", "p0")}
-    assert m.requests[("y", "p0")].D == 4096  # max_output_len stands in for max_tokens
-    assert m.at(4095) == pytest.approx((10 + 4095) / 10_000) and m.at(4096) == 0.0
-    # the pod disappears: its map goes, a later done is counted apart
-    p.decide(snap(7000, [], [ev("done", "y", "p0", 6000)], awake=0))
-    assert "p0" not in p._models["m"].pods and p._models["m"].active == {}
-    assert anom["pod_dropped"] == 1 and anom["unknown_req"] == 1 and anom["done_pod_gone"] == 1
+    events = [ev("arr", "q", "p0", 1000, 500, 20), ev("done", "q", "p0", 1100),
+              ev("ft", "q", "p0", 1200), ev("ft", "unknown", "p0", 1200)]
+    d = p.decide(snap(1200, [pod("p0", 1200)], events))["m"]
+    assert d.inputs["tier2"]["p0"]["reqs"] == 0
+    assert d.inputs["tier2"]["p0"]["pending"] == 0
+    assert d.inputs["anom"]["ft_without_arr"] == 1
 
 
 def test_pod_without_kv_capacity_is_skipped_unless_configured() -> None:
@@ -251,58 +230,44 @@ def test_event_after_the_scrape_is_not_out_of_order() -> None:
     assert p.anomalies["m"]["out_of_order"] == 0 and amap(p).it == 53  # 26 + 27 (carry)
 
 
-def test_arr_for_a_pod_not_yet_in_the_snapshot_is_applied_when_it_appears() -> None:
-    """The event stream can run ahead of /v2/state (a pod just woke)."""
+def test_first_tokens_before_the_first_awake_snapshot_are_retained():
     p = make()
     p.decide(snap(1000, [pod("p0", 1000)], load("r", "p1", 1000, 500, 100) + load("s", "p1", 1000, 300, 100)))
-    assert p.anomalies["m"]["arr_buffered"] == 2 and p.anomalies["m"]["unknown_pod"] == 0
-    p.decide(snap(1500, [pod("p0", 1500)], [ev("done", "s", "p1", 1400)]))  # s ends before p1 shows up
+    p.decide(snap(1500, [pod("p0", 1500)], [ev("done", "s", "p1", 1400)]))
     d = p.decide(snap(3000, [pod("p0", 3000), pod("p1", 3000)]))["m"]
-    assert list(amap(p, "p1").requests) == [("r", "p1")] and p._models["m"].active == {("r", "p1"): "p1"}
-    assert d.inputs["anom"]["arr_buffered_applied"] == 1 and p.anomalies["m"]["done_while_buffered"] == 1
-    assert amap(p, "p1").requests[("r", "p1")].start == 0 and amap(p, "p1").it == 26  # walked from 1000 ms
+    assert d.inputs["tier2"]["p1"]["reqs"] == 1
+    assert d.inputs["tier2"]["p1"]["pending"] == 0
+    assert d.inputs["anom"]["ft_buffered_applied"] == 1
 
 
-def test_a_routed_request_counts_before_its_first_token() -> None:
-    """v1 parity (2026-10-26): the map books a request at its route decision (``arr``), so a
-    request queued in vLLM counts before its first token; it leaves on done or abort."""
+def test_waiting_does_not_advance_decode_and_blocks_underload_shrink():
     p = make()
-    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "q", "p0", 1000, 2000, 50),
-                                            ev("arr", "a", "p0", 1000, 1000, 50)]))
-    assert amap(p).at(0) == pytest.approx(0.3)  # no ft yet: both count
-    # an idle scrape right after the route is no done: the request may not have reached the engine
-    p.decide(snap(1500, [pod("p0", 1500, running=0.0)], [ev("ft", "q", "p0", 1400)]))
-    assert set(amap(p).requests) == {("q", "p0"), ("a", "p0")}  # ft changed nothing
-    p.decide(snap(1600, [pod("p0", 1600)], [ev("done", "a", "p0", 1600)]))  # abort (status canceled)
-    assert set(amap(p).requests) == {("q", "p0")}
-    p.decide(snap(1700, [pod("p0", 1700)], [ev("done", "q", "p0", 1700)]))
-    assert amap(p).requests == {} and amap(p).total() == 0.0
+    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "q", "p0", 1000, 2000, 50)]))
+    d = p.decide(snap(5000, [pod("p0", 5000)]))["m"]
+    assert d.inputs["tier2"]["p0"]["reqs"] == 0
+    assert d.inputs["tier2"]["p0"]["U0"] == 0
+    assert d.inputs["down"] == "pending_prefill"
+    d = p.decide(snap(6000, [pod("p0", 6000)], [ev("ft", "q", "p0", 6000)]))["m"]
+    assert d.inputs["tier2"]["p0"]["reqs"] == 1
+    assert d.inputs["tier2"]["p0"]["U0"] == pytest.approx(0.2)
 
 
-def test_a_slept_then_woken_pod_starts_with_an_empty_map() -> None:
-    """Events of a pod's earlier awake period (read late, or routed to it until the gateway's
-    hide receipt and buffered while it slept) never enter its map after it wakes."""
+def test_wake_keeps_new_attempts_and_rejects_old_attempt_events():
     p = make()
-    p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)], load("r1", "p0", 1000, 500, 100)))
-    p.decide(snap(3000, [pod("p1", 3000)], [ev("arr", "r2", "p0", 2500, 500, 100),      # read late
-                                            ev("arr", "r_late", "p0", 3050, 500, 100)],  # gateway lag
-                  awake=1))  # p0 slept
-    assert "p0" not in p._models["m"].pods
-    p.decide(snap(8000, [pod("p1", 8000)], [ev("done", "r1", "p0", 7000)], awake=1))
-    d = p.decide(snap(13000, [pod("p0", 13000), pod("p1", 13000)],
-                      [ev("arr", "r4", "p0", 12500, 200, 100)]))
-    assert set(amap(p).requests) == {("r4", "p0")}  # r_late (routed after the drop tick) is not back
-    anom = p.anomalies["m"]
-    assert anom["buffered_stale"] == 2 and anom["done_pod_gone"] == 1 and anom["unknown_req"] == 0
-    p.decide(snap(15000, [pod("p0", 15000), pod("p1", 15000)], [ev("done", "r_late", "p0", 14000)]))
-    assert anom["done_pod_gone"] == 2 and anom["unknown_req"] == 0
-    assert "arr_buffered_applied" not in d["m"].inputs["anom"]
+    p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)], load("old", "p0", 1000, 500, 100)))
+    p.decide(snap(3000, [pod("p1", 3000)], awake=1))
+    # A wake races the next state snapshot: fresh arr/ft are earlier than that snapshot.
+    p.decide(snap(8000, [pod("p1", 8000)], load("new", "p0", 7500, 200, 100), awake=1))
+    d = p.decide(snap(9000, [pod("p0", 9000), pod("p1", 9000)],
+                      [ev("ft", "old", "p0", 8500), ev("done", "old", "p0", 8800)]))["m"]
+    assert d.inputs["tier2"]["p0"]["reqs"] == 1
+    assert set(amap(p).requests) == {("new", "p0")}
 
 
 def test_a_request_without_done_expires_and_holds_tier2_for_one_window() -> None:
     """v1 parity: a lost done must not keep a request in the map; Tier-2 holds meanwhile."""
     p = make(done_margin_s=10)  # window_s 600
-    p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "r", "p0", 1000, 100, 10)]))
+    p.decide(snap(1000, [pod("p0", 1000)], load("r", "p0", 1000, 100, 10)))
     d = p.decide(snap(12_000, [pod("p0", 12_000)]))["m"]  # 11 s < 10 x 0.2 + 10 = 12 s
     assert len(amap(p).requests) == 1 and "done_lost" not in d.inputs.get("gaps", [])
     d = p.decide(snap(14_000, [pod("p0", 14_000)]))["m"]
@@ -607,7 +572,8 @@ def test_load_errors_are_a_function_of_the_client_id_and_enter_the_map() -> None
     d = p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)],
                       [ev("arr", "x", "p0", 1000, 100, 400), ev("ft", "x", "p0", 1000),
                        ev("arr", "x", "p1", 1000, 100, 400, "retried"), ev("ft", "x", "p1", 1000, reissue="retried")]))
-    assert amap(p, "p0").requests[("x", "p0")].D_pred == amap(p, "p1").requests[("x", "p1")].D_pred
+    assert not amap(p, "p0").requests
+    assert amap(p, "p1").requests[("x", "p1")].D_pred == p.errors.predict("m", "c-x", 400, 100, p.max_model_len)
     assert d["m"].inputs["load_err"]["cum"]["n"] == 1
 
 
@@ -638,3 +604,49 @@ def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:
                        ({"windows": {"m": wins[1:]}}, "seq_len")):
         with pytest.raises(ph.HistoryError, match=match):
             ph.parse({**doc, **bad}, **kw)
+
+def test_late_replay_marker_backfills_arrivals_already_consumed():
+    p, _ = mlstm()
+    p.decide(snap(5000, [pod("p0", 5000)], [ev("arr", "r", "p0", 1000, 1200, 600)]))
+    marker = ReplayInfo(t0_ms=1000, trace_path=REPLAY.trace_path, seed=7)
+    p.decide(snap(8000, [pod("p0", 8000)], replay=marker))
+    d = p.decide(snap(32000, [pod("p0", 32000)], replay=marker))["m"]
+    closed = d.inputs["tier1"]["last_closed"]
+    assert closed["requests"] == 1 and closed["P"] == 1200 and closed["D"] == 600
+
+
+def test_retry_uses_distinct_gateway_attempt_ids_and_late_parent_ft_is_ignored():
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000), pod("p1", 1000)],
+                  [ev("arr", "attempt-a", "p0", 1000, 500, 50, cid="logical")]))
+    d = p.decide(snap(2000, [pod("p0", 2000), pod("p1", 2000)],
+        [ev("arr", "attempt-b", "p1", 1500, 500, 50, "retried", cid="logical"),
+         ev("ft", "attempt-b", "p1", 1800, reissue="retried", cid="logical"),
+         ev("ft", "attempt-a", "p0", 1900, cid="logical"),
+         ev("done", "attempt-a", "p0", 1950, cid="logical")]))["m"]
+    assert d.inputs["tier2"]["p0"]["reqs"] == 0
+    assert d.inputs["tier2"]["p1"]["reqs"] == 1
+
+
+def test_lost_bootstrap_arrivals_keep_refusing_the_same_marker():
+    p, _ = mlstm(req_ttl_s=1)
+    p.decide(snap(5000, [pod("p0", 5000)], [ev("arr", "r1", "p0", 1000, 1200, 600),
+                                          ev("arr", "r2", "p0", 3000, 1200, 600)]))
+    marker = ReplayInfo(t0_ms=1000, trace_path=REPLAY.trace_path, seed=7)
+    for ts in (8000, 9000):
+        with pytest.raises(ValueError, match="arrival history was lost"):
+            p.decide(snap(ts, [pod("p0", ts)], replay=marker))
+
+
+def test_wake_buffer_preserves_decode_progress_when_prefill_finishes_out_of_order():
+    events = [ev("arr", "A", "p0", 1000, 1000, 100),
+              ev("arr", "B", "p0", 1100, 1000, 100),
+              ev("ft", "B", "p0", 1200), ev("ft", "A", "p0", 2200)]
+    visible = make()
+    direct = visible.decide(snap(2300, [pod("p0", 2300, running=2)], events))["m"]
+    waking = make()
+    waking.decide(snap(2300, [], events, awake=1))
+    buffered = waking.decide(snap(2300, [pod("p0", 2300, running=2)]))["m"]
+    # The same arrivals/first tokens must produce the same load when the pod becomes visible.
+    for field in ("U0", "maxU"):
+        assert buffered.inputs["tier2"]["p0"][field] == pytest.approx(direct.inputs["tier2"]["p0"][field])

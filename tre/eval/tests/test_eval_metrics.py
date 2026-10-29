@@ -18,7 +18,7 @@ T0 = 1_000_000.0
 def req(i, model="m-a", t=40.0, ttft=0.1, e2e=5.0, out=400, inp=500, ok=True, cont=None):
     return {"request_id": f"r{i}", "model_name": model, "timestamp": t, "start_time": T0 + t,
             "end_time": T0 + t + e2e, "e2e_latency": e2e, "ttft": ttft, "tpot": None, "input_tokens": inp,
-            "output_tokens": out, "success": ok, "http_status": 200 if ok else 503, "tre_continued": cont}
+            "output_tokens": out, "success": ok, "success_strict": ok, "http_status": 200 if ok else 503, "tre_continued": cont}
 
 
 # ---------------------------------------------------------------- SLO / V_req
@@ -32,7 +32,7 @@ def test_ttft_threshold_is_max_of_floor_and_slowdown():
     ({}, False, "nominal"),
     ({"ttft": 0.6}, True, "v_ttft"),                        # 600 ms > 500 ms
     ({"ttft": 0.1, "e2e": 0.1 + 0.076 * 399}, True, "v_tpot"),  # (e2e - ttft)/(out - 1) = 76 ms > 75
-    ({"e2e": 149.0, "ttft": 0.1}, True, "censored"),         # route-timeout cut, recorded as success
+    ({"e2e": 149.0, "ttft": 0.1}, True, "v_tpot"),         # route-timeout cut, recorded as success
     ({"ok": False, "ttft": None}, True, "fail"),
 ])
 def test_violation_components(kw, viol, what):
@@ -327,3 +327,76 @@ def test_report_joins_request_ids_from_sidecar_and_gateway(arm_dir, tmp_path):
     assert s["interruption"]["added_latency_method"] == "exact_request_id_join"
     ev = list(csv.DictReader(open(os.path.join(a, "events.csv"))))
     assert [e["kind"] for e in ev if e["source"] == "sm_api"] == ["PUT /v2/models/{model}/target"]
+
+def test_strict_completion_controls_latency_denominators_and_all_entrypoints(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    complete = req(0, e2e=150.0, out=10000)
+    complete["finish_reason"] = "length"  # normal budget completion, not a cut
+    cut = {**req(1, e2e=2.0, out=50), "success_strict": False, "stream_interrupted": True}
+    failed = {**req(2, e2e=0.1, out=0, ttft=None, ok=False)}
+    unknown = req(3)
+    unknown.pop("success_strict")
+    rows = [complete, cut, failed, unknown]
+    _, summary = M.score_requests(rows, {"m-a": SLO}, trim_s=0)
+    a = summary["ALL"]
+    assert [a[k] for k in ("complete", "truncated", "failed", "unknown")] == [1, 1, 1, 1]
+    assert a["e2e_p50_ms"] == 150000 and a["V_req_pct"] == 75
+    assert a["completion_rate_pct"] == 25 and a["truncation_rate_pct"] == 25
+    metrics = tmp_path / "performance_metrics.json"
+    metrics.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    registry = tmp_path / "registry.yaml"
+    registry.write_text("models:\n- name: m-a\n  slo: " + json.dumps(SLO) + "\n")
+    scorer = Path(__file__).resolve().parents[1] / "runner" / "score_pilot.py"
+    output = subprocess.check_output([sys.executable, str(scorer), str(metrics), "--registry", str(registry), "--trim-s", "0"], text=True)
+    assert json.loads(output)["models"]["ALL"] == a
+    sys.path.insert(0, str(scorer.parent))
+    from first_run_check import latency
+    quick = latency(rows)["ALL"]
+    assert quick["completion_status"] == {"complete": 1, "truncated": 1, "failed": 1, "unknown": 1}
+    assert quick["e2e_p50"] == 150000 and quick["timeouts_or_cuts"] == 1
+
+    # The runner's main summary and the exported tables must preserve the same completion basis.
+    import csv
+    from tre_eval import report, v1_summary
+    arm_dir = tmp_path / "trace_s1" / "tre"
+    write_arm(str(arm_dir), [(0, lay([A0], [B0])), (100, lay([A0], [B0]))], rows)
+    for name in ("controller.log", "pod_gauges.jsonl", "apa_status.jsonl"):
+        (arm_dir / name).write_text("")
+    for name in ("snap_before.json", "snap_after.json"):
+        (arm_dir / name).write_text(json.dumps({"pods": {}, "sleep": {"stats": {}}}))
+    subprocess.check_output([sys.executable, str(scorer.parent / "analyze.py"), str(arm_dir)], text=True,
+                            env={**os.environ, "MODELS": "m-a"})
+    main_summary = json.loads((arm_dir / "summary.json").read_text())["client"]["ALL"]
+    assert main_summary["ok"] == 1 and main_summary["err"] == 3
+    assert main_summary["complete"] == main_summary["truncated"] == main_summary["failed"] == main_summary["unknown"] == 1
+    assert main_summary["completion_rate_pct"] == main_summary["truncation_rate_pct"] == 25
+    assert main_summary["e2e_p50"] == 150
+    assert main_summary["tpot_p95"] == round((150 - complete["ttft"]) / (complete["output_tokens"] - 1), 3)
+
+    outdir = tmp_path / "completion-report"
+    assert report.main([str(arm_dir), "--out", str(outdir), "--trim-s", "0", "--reps", "20"]) == 0
+    exported = list(csv.DictReader((outdir / "arms" / "tre" / "requests.csv").open()))
+    assert [r["completion"] for r in exported] == ["complete", "truncated", "failed", "unknown"]
+    comparison = next(r for r in csv.DictReader((outdir / "comparison.csv").open()) if r["model"] == "ALL")
+    assert [int(comparison[k]) for k in ("complete", "truncated", "failed", "unknown")] == [1, 1, 1, 1]
+    assert float(comparison["completion_rate_pct"]) == float(comparison["truncation_rate_pct"]) == 25
+    assert "complete requests only" in (outdir / "index.html").read_text()
+
+    v1 = v1_summary.arm_row(str(arm_dir), trim_s=0)
+    files = v1_summary.write([v1], str(tmp_path / "completion-v1"))
+    v1_csv = next(csv.DictReader(open(files["csv"])))
+    assert [int(v1_csv[k]) for k in ("complete", "truncated", "failed", "unknown")] == [1, 1, 1, 1]
+    assert float(v1_csv["completion_rate_pct"]) == float(v1_csv["truncation_rate_pct"]) == 25
+    assert "completion %" in Path(files["md"]).read_text()
+
+def test_role_only_frame_is_not_partial_generated_output():
+    row = {**req(0, out=0, ttft=0.1), "success_strict": False, "ttft_strict_s": None}
+    assert M.completion_status(row) == "failed"
+
+
+def test_partial_output_without_usage_is_truncated():
+    row = {**req(0, out=0, ttft=0.1), "success_strict": False, "ttft_strict_s": None,
+           "first_token_field": "content"}
+    assert M.completion_status(row) == "truncated"

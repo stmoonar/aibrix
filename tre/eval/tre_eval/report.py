@@ -246,7 +246,7 @@ def write_arm(res: dict, out: str, multi_trace: bool) -> dict:
     d = os.path.join(out, "arms", sub)
     os.makedirs(d, exist_ok=True)
     res["subdir"] = os.path.relpath(d, out)
-    fields = ["request_id", "model", "t_send", "t_end", "trimmed", "ok", "ttft_ms", "tpot_ms", "tpot_v1_ms", "e2e_ms",
+    fields = ["request_id", "model", "t_send", "t_end", "trimmed", "ok", "completion", "ttft_ms", "tpot_ms", "tpot_v1_ms", "e2e_ms",
               "in", "out", "max_tokens", "ttft_thr_ms", "v_ttft", "v_tpot", "v_e2e", "censored", "viol", "continued",
               "interrupted", "http_status", "finish_reason", "target_pod", "send_lateness_ms"]
     fields += [k for k in ("gw_arr_t", "gw_ft_t", "gw_done_t", "gw_pod", "sidecar_continuations", "sidecar_gap_ms_sum")
@@ -289,7 +289,8 @@ def write_arm(res: dict, out: str, multi_trace: bool) -> dict:
 
 # ---------------------------------------------------------------- cross arm
 COMP_FIELDS = ["arm", "label", "trace", "model", "n", "fail", "V_req_pct", "V_req_ci_lo", "V_req_ci_hi", "slo_attainment_pct",
-               "V_req_with_e2e_pct", "v_ttft", "v_tpot", "censored_ge_149s", "ttft_p50_ms", "ttft_p95_ms",
+               "V_req_with_e2e_pct", "v_ttft", "v_tpot", "complete", "truncated", "failed", "unknown",
+               "completion_rate_pct", "truncation_rate_pct", "scoring_basis", "censored_ge_149s", "ttft_p50_ms", "ttft_p95_ms",
                "ttft_p95_ci_lo", "ttft_p95_ci_hi", "ttft_p99_ms", "tpot_p50_ms", "tpot_p95_ms", "tpot_p99_ms",
                "e2e_p50_ms", "e2e_p95_ms", "e2e_p99_ms", "ttft_mean_ms", "e2e_mean_ms", "goodput_rps",
                "good_output_tokens_per_s", "gpu_s", "routable_gpu_s", "hidden_gpu_s", "mean_gpus", "gpu_s_per_good_req",
@@ -423,8 +424,11 @@ def write_html(out: str, results: list[dict], comp: list[dict], paired: list[dic
         p.append("<p class=bad>mismatches:</p>" + _table([{"arm": k, **m} for k, v in validation.items() for m in v["mismatches"]]))
     p.append("<h2>Cross-arm comparison</h2><p><a href='comparison.csv'>comparison.csv</a> · <a href='paired.csv'>paired.csv</a> · "
              "<a href='onsets.csv'>onsets.csv</a> · <a href='decision_points.csv'>decision_points.csv</a> · <a href='validation.json'>validation.json</a></p>")
+    p.append("<p>strict-completion-v1: latency percentiles use complete requests only. "
+             "Complete, truncated, failed and unknown counts share the scored-request denominator; "
+             "normal finish_reason=length is complete. Duration alone does not prove truncation.</p>")
     p.append(_table([r for r in comp if r["model"] == M.ALL],
-                    ["arm", "label", "n", "fail", "V_req_pct", "V_req_ci_lo", "V_req_ci_hi", "ttft_p50_ms", "ttft_p95_ms",
+                    ["arm", "label", "n", "fail", "completion_rate_pct", "truncation_rate_pct", "failed", "unknown", "V_req_pct", "V_req_ci_lo", "V_req_ci_hi", "ttft_p50_ms", "ttft_p95_ms",
                      "ttft_p99_ms", "tpot_p95_ms", "e2e_p95_ms", "goodput_rps", "gpu_s", "mean_gpus", "gpu_s_per_good_req",
                      "continued", "lat_decision_s_med", "lat_awake_s_med", "lat_donor_s_med", "valid"]))
     for k in ("cdfs", "bars", "scatter", "onsets", "paired", "replicas"):
@@ -449,7 +453,7 @@ def write_html(out: str, results: list[dict], comp: list[dict], paired: list[dic
         man = r["manifest"]
         p.append("<details><summary>manifest</summary>" + _table([{"key": k, "value": v} for k, v in man.items()]) + "</details>")
         p.append(_table([{"model": m, **{k: (r["summary"].get(m) or {}).get(k) for k in
-                                         ("n", "fail", "V_req_pct", "slo_attainment_pct", "ttft_p50_ms", "ttft_p95_ms", "ttft_p99_ms",
+                                         ("n", "fail", "completion_rate_pct", "truncation_rate_pct", "failed", "unknown", "V_req_pct", "slo_attainment_pct", "ttft_p50_ms", "ttft_p95_ms", "ttft_p99_ms",
                                           "tpot_p95_ms", "e2e_p95_ms", "goodput_rps")},
                           **{k: (r["gpu"].get(m) or {}).get(k) for k in ("gpu_s", "mean_gpus", "gpu_s_per_good_req")}}
                          for m in r["models"] + [M.ALL]]))

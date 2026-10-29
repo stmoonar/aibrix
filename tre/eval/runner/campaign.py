@@ -699,14 +699,14 @@ def _tail(path: str, parts: int) -> tuple:
 
 
 PRE_T0_NAME = "pre_t0.json"                    # the generator's history (synthetic traces)
-PRESERVE_HISTORY_NAME = "preserve_history.json"  # tools/preserve_history real (Real_*)
+PRESERVE_HISTORY_NAME = "preserve_history.json"  # frozen-suite history (synthetic or Real_*)
 
 
 def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, tail: tuple,
                           log: Callable[[str], None]) -> dict:
     """PreServe mLSTM's history before t0 next to the oracle copy (the policy reads
     ``<trace dir>/pre_t0.json``, else ``preserve_history.json``): the generator's ``pre_t0.json``
-    next to the replayed trace, else ``<preserve.history_root>/<trace>/seed<k>/preserve_history.json``.
+    or ``preserve_history.json`` next to the replayed trace, else ``<preserve.history_root>/<trace>/seed<k>/preserve_history.json``.
     A shifted trace, or a slice that does not start at 0, has no matching past: refused for mlstm
     (a slice from 0 keeps the trace's own past; prepare_preserve names the source trace for it)."""
     if len(tail) < 3:
@@ -716,6 +716,8 @@ def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, t
         raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift; "
                             "a slice must start at 0)")
     src = Path(e.src_dir) / PRE_T0_NAME
+    if not src.is_file():
+        src = Path(e.src_dir) / PRESERVE_HISTORY_NAME
     if not src.is_file():
         root = pc.get("history_root")
         parts = (e.trace, f"seed{e.seed}") if e.slice else tail[:-1]

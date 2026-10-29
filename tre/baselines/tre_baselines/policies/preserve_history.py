@@ -20,9 +20,11 @@ oldest first, the last one ``[t0 - W, t0)``):
 
   ``P`` = ``prompt_tokens``, ``D`` = ``output_tokens`` (the sum of ``max_output_tokens``);
   the windows must be contiguous and end at ``t0_s``.
-* ``tre-preserve-history-v1`` (``preserve_history.json``), written for ``Real_*`` by
-  :mod:`tre_baselines.tools.preserve_history` ``real`` from the real Azure windows right before
-  the slice (v1 ``tools/real_history.py`` counts file) times the trace's scale and mean lengths::
+* ``tre-preserve-history-v1`` (``preserve_history.json``), written by
+  :mod:`tre_baselines.tools.preserve_history_frozen` from each model's preceding Azure
+  requests and its frozen transform, or its explicit synthetic past rule. The legacy
+  ``preserve_history real`` tool remains only for reproducing old histories that used
+  test-interval scales and means; do not use it for new frozen suites::
 
     {"format": "tre-preserve-history-v1", "trace", "seed", "window_s",
      "models": {"<model>": [[P, D], ...]}, "source": {...}}
