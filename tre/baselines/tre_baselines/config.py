@@ -43,6 +43,10 @@ Environment:
                             every arm sleeps the same way (hide, gateway ack, ``/sleep
                             mode=abort``, sidecar continuation; no drain). The old
                             ``TRE_BL_SLEEP_PATH`` / ``TRE_BL_DRAIN_BUDGET_S`` are refused.
+                            A policy that drains (PreServe) hides first and sleeps an
+                            empty pod by name on this same path (``tre_baselines.drain``).
+``TRE_BL_DRAIN_MAX_S``      bound of one drain of a hidden pod before it is slept anyway
+                            (default 150 = the gateway route timeout)
 ``TRE_BL_MAX_TICK_FAILURES`` consecutive failed ticks before /healthz is 503 (default 5)
 ``TRE_BL_LOCK_TTL_S``       owner-lock TTL (default 30)
 ``TRE_BL_BACKOFF_MAX_S``    cap of the per-model backoff after a failed scale-down or an
@@ -119,6 +123,8 @@ class Config:
     max_tick_failures: int = 5
     lock_ttl_s: float = 30.0
     backoff_max_s: float = 10.0
+    #: Bound of one drain (``tre_baselines.drain``; only a policy with ``drain_on_shrink``).
+    drain_max_s: float = 150.0
     liveness_stall_s: float = 120.0
     http_port: int = 8080
     seed: int = 0
@@ -265,6 +271,7 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         max_tick_failures=int(env.get("TRE_BL_MAX_TICK_FAILURES", "").strip() or 5),
         lock_ttl_s=float(env.get("TRE_BL_LOCK_TTL_S", "").strip() or 30.0),
         backoff_max_s=float(env.get("TRE_BL_BACKOFF_MAX_S", "").strip() or 10.0),
+        drain_max_s=float(env.get("TRE_BL_DRAIN_MAX_S", "").strip() or 150.0),
         liveness_stall_s=float(env.get("TRE_BL_LIVENESS_STALL_S", "").strip() or 120.0),
         http_port=int(env.get("TRE_BL_HTTP_PORT", "").strip() or 8080),
         seed=int(env.get("TRE_BL_SEED", "").strip() or 0),

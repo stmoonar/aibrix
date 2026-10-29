@@ -30,8 +30,21 @@ local workspace):
 - **One sleep path for every arm.** Scale-downs go to the SM on the abort path
   (`TRE_BL_ABORT_SLEEP_PATH`, default `urgent`, must be one of the registry's
   `service_manager.sleep.no_drain_paths`): hide, gateway ack, `/sleep mode=abort`,
-  sidecar continuation. The shell never drains and never sends `drain_budget_s`;
-  aborts/continuations are a reported cost of each arm.
+  sidecar continuation. The shell never sends `drain_budget_s`; aborts/continuations
+  are a reported cost of each arm.
+- **Drain before sleep: PreServe only** (2026-10-29, paper §4.3.2 "isolating ... allowing
+  their ongoing requests to complete naturally"; policy param `drain`, default true).
+  The shell compares the desired count with the routable replicas (awake minus hidden),
+  hides the least-loaded surplus pods (`PUT /v2/models/{model}/routable`; the SM refuses a
+  hide below the replica floor), sleeps each by name on the same abort path once a scrape
+  at least 1 s after the hide shows `running + waiting == 0`, or after `TRE_BL_DRAIN_MAX_S`
+  (default 150 s = route timeout; counter `drain_timeout`). A scale-up first unhides
+  draining pods (most recently hidden first), then wakes. Decision actions `hide` /
+  `unhide`; line `inputs.drain`; counters `drain_drained` / `drain_timeout` /
+  `drain_unhidden` / `drain_adopted` in `tre_bl_policy_events_total`. On stop the shell
+  unhides the pods it hid; a restarted shell adopts the awake hidden pods at its first
+  owner tick. TokenScale and Chiron keep the abort path (their papers do not drain).
+  Code: `tre_baselines/drain.py`.
 - **Donor before dependent, inside the plan.** The SM starts a wake that needs a GPU a
   sleep of the same plan releases only once that sleep is confirmed; a wake on a free GPU
   starts at once. One plan at a time: a model whose item is in the plan in flight logs

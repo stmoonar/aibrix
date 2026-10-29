@@ -464,7 +464,10 @@ class PodEndpoint:
     ready: bool
 
 
-def endpoints_from_pod_list(doc: Mapping[str, Any], *, port_override: Optional[int] = None) -> list[PodEndpoint]:
+def endpoints_from_pod_list(doc: Mapping[str, Any], *, port_override: Optional[int] = None,
+                            require_routable: bool = True) -> list[PodEndpoint]:
+    """``ready`` = Running, with an IP, not deleting and (``require_routable``) labelled
+    routable; a hidden pod is scraped with ``require_routable=False``."""
     out: list[PodEndpoint] = []
     for item in doc.get("items") or ():
         meta = item.get("metadata") or {}
@@ -480,7 +483,7 @@ def endpoints_from_pod_list(doc: Mapping[str, Any], *, port_override: Optional[i
             status.get("phase") == "Running"
             and bool(status.get("podIP"))
             and not meta.get("deletionTimestamp")
-            and str(labels.get(ROUTABLE_LABEL, "")).lower() == "true"
+            and (not require_routable or str(labels.get(ROUTABLE_LABEL, "")).lower() == "true")
         )
         out.append(PodEndpoint(
             name=str(meta.get("name") or ""), model=labels.get(MODEL_LABEL),
@@ -504,16 +507,24 @@ class K8sPodLister:
         self._token_path = token_path
         self._ctx = ssl.create_default_context(cafile=ca_path) if os.path.exists(ca_path) else None
 
-    def list_routable(self) -> list[PodEndpoint]:
-        query = urllib.parse.urlencode({"labelSelector": f"{ROUTABLE_LABEL}=true"})
+    def _list(self, selector: str) -> Mapping[str, Any]:
+        query = urllib.parse.urlencode({"labelSelector": selector})
         url = f"{self._base}/api/v1/namespaces/{self._namespace}/pods?{query}"
         headers = {"accept": "application/json"}
         if os.path.exists(self._token_path):
             with open(self._token_path, encoding="utf-8") as fh:
                 headers["authorization"] = f"Bearer {fh.read().strip()}"
         with urlopen(Request(url, headers=headers), timeout=self._timeout_s, context=self._ctx) as resp:
-            doc = json.loads(resp.read().decode("utf-8"))
-        return endpoints_from_pod_list(doc, port_override=self._port_override)
+            return json.loads(resp.read().decode("utf-8"))
+
+    def list_routable(self) -> list[PodEndpoint]:
+        return endpoints_from_pod_list(self._list(f"{ROUTABLE_LABEL}=true"), port_override=self._port_override)
+
+    def list_hidden(self) -> list[PodEndpoint]:
+        """Pods not labelled routable (hidden ones among them); read only while the SM shows
+        an awake hidden binding of a managed model."""
+        return endpoints_from_pod_list(self._list(f"{ROUTABLE_LABEL}!=true"), port_override=self._port_override,
+                                       require_routable=False)
 
 
 def http_get_text(url: str, timeout_s: float) -> str:
@@ -532,13 +543,15 @@ class ServingBinding:
     gpu_ids: tuple[int, ...]
 
 
-def serving_bindings(state: Mapping[str, Any], models: Iterable[str]) -> dict[str, list[ServingBinding]]:
-    """Awake, not hidden bindings of ``state`` (``GET /v2/state``) per model, by pod name."""
+def serving_bindings(state: Mapping[str, Any], models: Iterable[str], *,
+                     hidden: bool = False) -> dict[str, list[ServingBinding]]:
+    """Awake bindings of ``state`` (``GET /v2/state``) per model, by pod name: the not hidden
+    ones (serving), or with ``hidden`` the hidden ones."""
     wanted = set(models)
     out: dict[str, list[ServingBinding]] = {m: [] for m in wanted}
     for binding in state.get("bindings") or ():
         model = binding.get("model")
-        if model not in wanted or not binding.get("awake") or binding.get("hidden"):
+        if model not in wanted or not binding.get("awake") or bool(binding.get("hidden")) != hidden:
             continue
         pod = binding.get("serve_id")
         if not pod:
@@ -612,11 +625,14 @@ class LiveSource:
         *,
         fetch_text: Callable[[str, float], str] = http_get_text,
         max_scrape_workers: int = 16,
+        list_hidden: Optional[Callable[[], list[PodEndpoint]]] = None,
     ) -> None:
         self._config = config
         self._redis = redis
         self._get_state = get_state
         self._list_pods = list_pods
+        #: Pod endpoints of hidden pods; None = hidden pods are listed as unscraped.
+        self._list_hidden = list_hidden
         self._fetch = fetch_text
         self._models = sorted(config.models)
         self.events = EventReader(redis, self._models)
@@ -645,7 +661,23 @@ class LiveSource:
         state = self._get_state()
         awake = awake_counts(state, self._models)
         serving = serving_bindings(state, self._models)
+        hidden = serving_bindings(state, self._models, hidden=True)
         endpoints = {ep.name: ep for ep in self._list_pods()}
+        hidden_eps: dict[str, PodEndpoint] = {}
+        if self._list_hidden is not None and any(hidden.values()):
+            try:
+                hidden_eps = {ep.name: ep for ep in self._list_hidden()}
+            except Exception as exc:  # the hidden pods are then unscraped, the tick goes on
+                LOG.warning("listing hidden pods failed: %s", exc)
+        hidden_targets: list[tuple[ServingBinding, PodEndpoint]] = []
+        hidden_unscraped: dict[str, list[str]] = {m: [] for m in self._models}
+        for model in self._models:
+            for binding in hidden[model]:
+                ep = hidden_eps.get(binding.pod)
+                if ep is None or not ep.ready or not ep.ip:
+                    hidden_unscraped[model].append(binding.pod)
+                else:
+                    hidden_targets.append((binding, ep))
 
         targets: list[tuple[ServingBinding, PodEndpoint]] = []
         unscraped: dict[str, list[str]] = {m: [] for m in self._models}
@@ -656,7 +688,8 @@ class LiveSource:
                     unscraped[model].append(binding.pod)
                 else:
                     targets.append((binding, ep))
-        results = list(self._pool.map(lambda t: self._scrape(t, now_ms), targets))
+        results = list(self._pool.map(lambda t: self._scrape(t, now_ms), targets + hidden_targets))
+        results, hidden_results = results[:len(targets)], results[len(targets):]
         failed = sum(len(v) for v in unscraped.values()) + sum(1 for r in results if r is None)
         self.scrape_total += len(targets)
         self.scrape_failures += failed
@@ -677,6 +710,12 @@ class LiveSource:
                 verified.add(binding.pod)  # the cohort in flight at the last gap is gone
             pods[binding.model].append(replace(
                 snap, tracked_inflight=tracked, events_cover=binding.pod in verified))
+        hidden_pods: dict[str, list[PodSnapshot]] = {m: [] for m in self._models}
+        for (binding, _ep), snap in zip(hidden_targets, hidden_results):
+            if snap is None:
+                hidden_unscraped[binding.model].append(binding.pod)
+            else:
+                hidden_pods[binding.model].append(snap)
         for model in self._models:
             self.events.inflight[model].prune(now_ms)
         replay = read_replay_info(self._redis)
@@ -701,6 +740,8 @@ class LiveSource:
                 unscraped=tuple(sorted(unscraped[model])),
                 slo=lim.slo,
                 events_since_ms=self.events.history_since_ms(model),
+                hidden=tuple(sorted(hidden_pods[model], key=lambda p: p.pod)),
+                hidden_unscraped=tuple(sorted(hidden_unscraped[model])),
             )
         return ClusterSnapshot(
             now_ms=now_ms,

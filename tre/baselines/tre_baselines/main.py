@@ -26,8 +26,9 @@ def main() -> None:
     sm = SMClient(config.sm_url, timeout_s=config.sm_timeout_s, state_timeout_s=config.sm_state_timeout_s,
                   actor=f"baseline-{getattr(policy, 'label', config.policy)}")
     pods = K8sPodLister(config.model_namespace, port_override=config.metrics_port)
-    source = LiveSource(config, redis, sm.get_state, pods.list_routable)
-    dispatcher = Dispatcher(sm.post_plan, abort_sleep_path=config.abort_sleep_path)
+    source = LiveSource(config, redis, sm.get_state, pods.list_routable, list_hidden=pods.list_hidden)
+    dispatcher = Dispatcher(sm.post_plan, abort_sleep_path=config.abort_sleep_path,
+                            update_hidden=sm.update_hidden)
     lock = OwnerLock(redis, config.lock_ttl_s)
     shell = BaselineShell(config, source, policy, dispatcher, redis, lock=lock,
                           decision_log=DecisionLog(config.log_dir, config.policy))
@@ -46,8 +47,12 @@ def main() -> None:
     try:
         shell.run()
     finally:
+        dispatcher.close(join_s=10.0)  # the plan in flight first: its pods are then settled
+        try:
+            shell.release_drains(sm.update_hidden)
+        except Exception:  # noqa: BLE001 - shutdown goes on; the next shell adopts them
+            LOG.exception("drain release failed")
         lock.release()
-        dispatcher.close()
         source.close()
         server.shutdown()
 

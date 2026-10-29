@@ -23,6 +23,13 @@ Contract (service manager, ``tre_sm/api/v2.py``, design ``docs/design/20261027-s
   ``writer_busy`` / ``routable_unknown`` and 400 before anything was done (no items).
 * ``GET /v2/state`` -> ``{"version", "models": {m: {"awake", "bound"}}, "bindings":
   [{"serve_id" (= pod name), "model", "node", "gpu_ids", "awake", "hidden"}], ...}``.
+* Drain (a policy with ``drain_on_shrink``, PreServe; :mod:`tre_baselines.drain`): ``PUT
+  /v2/models/{model}/routable`` ``{hidden_pods}`` (the model's whole hidden set) hides pods
+  (no new requests; the SM refuses a hide below the replica floor) or unhides them; a
+  drained pod is slept by name: sleep item ``{model, pods, sleep_path}`` on the same abort
+  path (nothing left to abort). :meth:`SMClient.update_hidden` reads ``/v2/state`` right
+  before the PUT and changes only the named pods (hide = ``add``, unhide = ``remove``),
+  so a stale tick view never re-hides or unhides another pod.
 * :func:`parse_sm_error` reads a structured 409 body (``detail, error, reason, node, gpu_ids,
   scope, binding_id, blocking_binding_id, retry_after_s``), nested under ``detail`` or not,
   and falls back to the raw text. :func:`plan_item_results` turns one plan answer into one
@@ -265,10 +272,30 @@ class SMClient:
     def post_plan(self, body: Mapping[str, Any], timeout_s: Optional[float] = None) -> SMResult:
         """``POST /v2/plans``; never raises. 200 -> ``ok`` with the plan response in ``raw``;
         an HTTP error -> :func:`parse_sm_error` (a 409 ``partial`` keeps its items in ``raw``)."""
+        return self._call("POST", "/v2/plans", dict(body), timeout_s)
+
+    def update_hidden(self, model: str, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = (),
+                      timeout_s: Optional[float] = None) -> SMResult:
+        """Hide ``add`` / unhide ``remove`` (pods of ``model``), keeping every other pod's
+        flag: the model's hidden set is read from a fresh ``/v2/state``, then ``PUT
+        /v2/models/{model}/routable``. Only awake pods are hidden. Never raises."""
+        started = time.monotonic()
+        try:
+            state = self.get_state()
+        except Exception as exc:  # cannot tell the current hidden set: change nothing
+            return SMResult(ok=False, error="state_unreadable", detail=repr(exc)[:2000],
+                            elapsed_s=time.monotonic() - started)
+        bindings = [b for b in state.get("bindings") or () if b.get("model") == model]
+        awake = {str(b.get("serve_id")) for b in bindings if b.get("awake")}
+        current = {str(b.get("serve_id")) for b in bindings if b.get("hidden")}
+        hidden = sorted((current | (set(add) & awake)) - set(remove))
+        return self._call("PUT", f"/v2/models/{model}/routable", {"hidden_pods": hidden}, timeout_s)
+
+    def _call(self, method: str, path: str, body: Optional[dict], timeout_s: Optional[float]) -> SMResult:
         started = time.monotonic()
         timeout = self.timeout_s if timeout_s is None else float(timeout_s)
         try:
-            with self._open("POST", "/v2/plans", dict(body), timeout) as resp:
+            with self._open(method, path, body, timeout) as resp:
                 raw = resp.read()
                 code = resp.status
         except HTTPError as exc:
@@ -294,16 +321,41 @@ class SMClient:
 DEFAULT_ABORT_SLEEP_PATH = "urgent"
 
 
+#: Directions that only change which pods are routable (no plan item).
+ROUTABLE_DIRECTIONS = ("hide", "unhide")
+
+
 def plan_item(model: str, direction: str, target: int, *,
-              abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH) -> dict:
+              abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH, pods: tuple[str, ...] = ()) -> dict:
     """The plan item of one scale action: ``up`` = wake item, grow-only ``at_least``;
     ``down`` = sleep item ``at_most`` on the abort path (hide -> gateway ack -> ``/sleep
-    mode=abort``, no drain)."""
+    mode=abort``, no drain), or with ``pods`` a named sleep item (drained pods). ``hide`` /
+    ``unhide`` have no plan item: the body records the pods (``PUT .../routable``)."""
     if direction == "up":
         return {"model": model, "at_least": int(target)}
     if direction == "down":
+        if pods:
+            return {"model": model, "pods": sorted(pods), "sleep_path": abort_sleep_path}
         return {"model": model, "at_most": int(target), "sleep_path": abort_sleep_path}
+    if direction in ROUTABLE_DIRECTIONS:
+        if not pods:
+            raise ValueError(f"{direction} of {model} names no pods")
+        return {"model": model, direction: sorted(pods)}
     raise ValueError(f"unknown direction {direction!r}")
+
+
+@dataclass(frozen=True)
+class Call:
+    """One model's call of a tick (what :meth:`Dispatcher.dispatch` takes).
+
+    ``pods``: a ``hide`` / ``unhide`` / named ``down`` acts on these; ``unhide_first``:
+    pods to unhide right before an ``up`` (a draining pod comes back before a wake)."""
+
+    direction: str
+    target: int
+    start: Optional[int] = None
+    pods: tuple[str, ...] = ()
+    unhide_first: tuple[str, ...] = ()
 
 
 #: Cap of the fallback wait of :class:`Backoff` (failed scale-downs, calls the SM never
@@ -522,6 +574,8 @@ class _Job:
     start: Optional[int]
     #: Waited behind the plan in flight (answered ``queued``).
     queued: bool = False
+    pods: tuple[str, ...] = ()
+    unhide_first: tuple[str, ...] = ()
 
 
 class Dispatcher:
@@ -533,8 +587,12 @@ class Dispatcher:
 
     def __init__(self, post_plan: Callable[[Mapping[str, Any]], SMResult], *,
                  abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH,
-                 guard: Optional[Callable[[], Optional[str]]] = None) -> None:
+                 guard: Optional[Callable[[], Optional[str]]] = None,
+                 update_hidden: Optional[Callable[..., SMResult]] = None) -> None:
         self._post = post_plan
+        #: ``update_hidden(model, add=..., remove=...)`` (:meth:`SMClient.update_hidden`);
+        #: needed only by a policy that drains.
+        self._update_hidden = update_hidden
         #: Called right before every POST: None = go, a string = drop the plan (why).
         self.guard = guard
         self._abort_sleep_path = abort_sleep_path
@@ -561,8 +619,8 @@ class Dispatcher:
         with self._cond:
             return len(set(self._sending) | set(self._pending))
 
-    def dispatch(self, decisions: Mapping[str, tuple[str, int, Optional[int]]]) -> dict[str, str]:
-        """Hand over one tick's decisions ``{model: (direction, target, start)}``.
+    def dispatch(self, decisions: Mapping[str, Any]) -> dict[str, str]:
+        """Hand over one tick's decisions ``{model: Call | (direction, target, start)}``.
 
         Per model: ``sent`` (no plan in flight: it goes out now, with the tick's other
         decisions, in one plan), ``queued`` (a plan is in flight: it goes in the next one,
@@ -570,8 +628,13 @@ class Dispatcher:
         not taken; the next decision sees the answer). The tick's decisions replace every
         decision still waiting (latest wins): a model waiting from an older tick and absent
         here - its desired count is back at awake, or a gate holds it now - is not sent."""
-        for model, (direction, target, _start) in decisions.items():
-            plan_item(model, direction, target, abort_sleep_path=self._abort_sleep_path)  # validates
+        calls = {m: c if isinstance(c, Call) else Call(c[0], int(c[1]), c[2]) for m, c in decisions.items()}
+        for model, call in calls.items():
+            plan_item(model, call.direction, call.target, abort_sleep_path=self._abort_sleep_path,
+                      pods=call.pods)  # validates
+            if (call.direction in ROUTABLE_DIRECTIONS or call.unhide_first) and self._update_hidden is None:
+                raise ValueError(f"{call.direction} of {model}: the dispatcher has no update_hidden")
+        decisions = calls
         out: dict[str, str] = {}
         with self._cond:
             if self._closed:
@@ -579,14 +642,15 @@ class Dispatcher:
             busy = bool(self._sending)
             pending: dict[str, _Job] = {}
             for model in sorted(decisions):
-                direction, target, start = decisions[model]
+                call = decisions[model]
                 if model in self._sending:
                     out[model] = "inflight"
                     continue
                 self._seq += 1
-                pending[model] = _Job(self._seq, model, direction, int(target),
-                                      None if start is None else int(start), queued=busy)
-                self.submitted.append((self._seq, model, direction, int(target)))
+                pending[model] = _Job(self._seq, model, call.direction, int(call.target),
+                                      None if call.start is None else int(call.start), queued=busy,
+                                      pods=tuple(call.pods), unhide_first=tuple(call.unhide_first))
+                self.submitted.append((self._seq, model, call.direction, int(call.target)))
                 out[model] = "queued" if busy else "sent"
             self._pending = pending
             if pending:
@@ -627,7 +691,7 @@ class Dispatcher:
                 LOG.exception("SM plan failed")
                 done = [Completed(job.model, job.direction, job.target,
                                   plan_item(job.model, job.direction, job.target,
-                                            abort_sleep_path=self._abort_sleep_path),
+                                            abort_sleep_path=self._abort_sleep_path, pods=job.pods),
                                   SMResult(ok=False, error="exception", detail=repr(exc)[:2000]), job.seq,
                                   start=job.start, plan_size=len(jobs), queued=job.queued)
                         for job in jobs.values()]
@@ -639,20 +703,48 @@ class Dispatcher:
                 self._sending = {}
                 self._cond.notify_all()
 
+    def _routable(self, job: _Job) -> Optional[SMResult]:
+        """The routable change of ``job`` before the plan (None = none)."""
+        if job.direction == "hide":
+            add, remove = job.pods, ()
+        elif job.direction == "unhide":
+            add, remove = (), job.pods
+        elif job.unhide_first:
+            add, remove = (), job.unhide_first
+        else:
+            return None
+        try:
+            return self._update_hidden(job.model, add=tuple(add), remove=tuple(remove))
+        except Exception as exc:  # the client should not raise; never lose the answer
+            LOG.exception("routable change of %s raised", job.model)
+            return SMResult(ok=False, error="exception", detail=repr(exc)[:2000])
+
     def _execute(self, jobs: Mapping[str, _Job]) -> list[Completed]:
         plan_id = f"bl-{uuid.uuid4().hex[:12]}"
         models = sorted(jobs)
-        items = {m: plan_item(m, jobs[m].direction, jobs[m].target, abort_sleep_path=self._abort_sleep_path)
+        items = {m: plan_item(m, jobs[m].direction, jobs[m].target, abort_sleep_path=self._abort_sleep_path,
+                              pods=jobs[m].pods)
                  for m in models}
-        body = {
-            "plan_id": plan_id,
-            "sleeps": [items[m] for m in models if jobs[m].direction == "down"],
-            "wakes": [items[m] for m in models if jobs[m].direction == "up"],
-        }
-        # Owner lock and controller mode are checked again right before the POST.
+        # Owner lock and controller mode are checked again right before the first call.
         why = self._check_guard(plan_id)
-        whole = SMResult(ok=False, error=DROPPED, reason=str(why)) if why else self._call(body)
-        answers = plan_item_results(whole, models)
+        answers: dict[str, SMResult] = {}
+        if why:
+            answers = {m: SMResult(ok=False, error=DROPPED, reason=str(why)) for m in models}
+        else:
+            # Routable changes first (an unhide before the wake that may follow it); a model
+            # whose change failed leaves the plan with that answer.
+            for model in models:
+                result = self._routable(jobs[model])
+                if result is not None and (not result.ok or jobs[model].direction in ROUTABLE_DIRECTIONS):
+                    answers[model] = result
+            in_plan = [m for m in models if m not in answers and jobs[m].direction in ("up", "down")]
+            if in_plan:
+                body = {
+                    "plan_id": plan_id,
+                    "sleeps": [items[m] for m in in_plan if jobs[m].direction == "down"],
+                    "wakes": [items[m] for m in in_plan if jobs[m].direction == "up"],
+                }
+                answers.update(plan_item_results(self._call(body), in_plan))
         out: list[Completed] = []
         for model in models:
             job, result = jobs[model], answers[model]

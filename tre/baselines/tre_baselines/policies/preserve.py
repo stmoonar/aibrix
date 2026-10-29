@@ -6,6 +6,13 @@ forecaster, the rest follows TRE v1's faithful PreServe (``tre_code`` dev ``ceb8
 DistilBERT response-length predictor (Tier-2 uses the request's ``max_tokens`` plus the paper's
 Tab. 2 error, "PreServe w/ load errors", :mod:`preserve_load_errors`) and the load-aware router.
 
+Scale-in isolates instances and lets their requests finish (§4.3.2, 2026-10-29; param
+``drain``, default true): the shell hides the surplus pods and sleeps each one once its
+engine is empty (:mod:`tre_baselines.drain`); a scale-up brings a draining pod back before
+it wakes one. The policy counts routable replicas only (``ModelSnapshot.routable_awake``; a
+hidden pod is not in ``pods``). ``drain: false`` = the shared abort path of every other arm
+(hide, ``/sleep mode=abort``, sidecar continuation), as before this date.
+
 Composition (v1 faithful)::
 
     desired = clamp(max(N_T1, N_T2), min_replicas, max_replicas)
@@ -32,7 +39,7 @@ Composition (v1 faithful)::
     (one extra instance per potentially overloaded instance, on the current count);
   - **underload**, at most once per window: when every pod's ``max U[0:l] < T_f``,
     ``N_T2 = max(1, ceil(sum max U / T_f))`` if that is below ``N_T2`` (the load packed onto
-    instances each at ``T_f``; the isolated ones sleep through the shared abort path);
+    instances each at ``T_f``; the isolated ones are drained, see below);
   - **incomplete evidence holds Tier-2 in both directions** (``frozen``): any gap of
     :func:`~tre_baselines.snapshot.evidence_gaps` (event loss, unscraped pod, missing gauges,
     stale scrape) or a pod without a KV capacity. ``frozen`` (every tick, also under
@@ -106,6 +113,7 @@ out_len_is_upper_bound  not load errors        ours: true = ``max_tokens`` is a 
                                                extension); must be false with load errors
 ext_frac                0.2                    paper (virtual extension, with load errors)
 t2_reset_at_window      true                   v1 D54 #2
+drain                   true                   paper §4.3.2 (isolate, let requests finish)
 kv_capacity_tokens      {}                     ours: M per model when the pod lacks cache_config
 kv_agree_tol            0.15                   ours: logged only (``kv_disagree``)
 req_ttl_s               1800                   ours: forget buffered events older than this
@@ -323,6 +331,8 @@ class PreServePolicy:
         self.t_f = float(params.get("t_f", 0.30))
         self.ext_frac = float(params.get("ext_frac", 0.2))
         self.t2_reset_at_window = bool(params.get("t2_reset_at_window", True))
+        #: Read by the shell (``tre_baselines.drain``): shrink by draining, not by aborting.
+        self.drain_on_shrink = bool(params.get("drain", True))
         self.kv_agree_tol = float(params.get("kv_agree_tol", 0.15))
         if not 0.0 < self.kv_agree_tol <= 1.0:
             raise ValueError("preserve: kv_agree_tol must be in (0, 1]")
@@ -664,7 +674,7 @@ class PreServePolicy:
         st = self._models.setdefault(ms.model, _ModelState())
         cum = self.anomalies.setdefault(ms.model, Counter())
         anom: Counter = Counter()
-        awake = int(ms.awake)
+        awake = int(ms.routable_awake)  # a draining (hidden) pod is isolated: not counted
         if ms.model not in self.mu:
             return Decision(desired=awake, reason="no_mu", inputs={"awake": awake, "frozen": False})
         st.ticks += 1

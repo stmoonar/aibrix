@@ -330,7 +330,8 @@ def baseline_scan(rows: list[dict], t0, t1, tick_s: float) -> dict:
             "actions": dict(Counter(str(r.get("action")) for r in rs).most_common(8)),
             # queued_up / queued_down (scaler 2026-10-28) = a decision waiting behind the plan in flight
             "scale_by_reason": dict(Counter(f"{r.get('action')} {r.get('reason')}" for r in rs
-                                            if r.get("action") in ("up", "down", "queued_up", "queued_down"))
+                                            if r.get("action") in ("up", "down", "queued_up", "queued_down",
+                                                                     "hide", "unhide", "queued_hide", "queued_unhide"))
                                     .most_common(10)),
         }
     out["gaps"] = dict(gaps.most_common(10))

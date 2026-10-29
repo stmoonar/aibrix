@@ -19,7 +19,8 @@ TP = {k: int(v) for k, v in (p.split("=", 1) for p in os.environ.get("TP_SIZES",
 
 
 #: Baseline decision actions that scale -> direction (``queued_*``: scaler 2026-10-28).
-_BL_DIRECTION = {"up": "up", "down": "down", "queued_up": "up", "queued_down": "down"}
+_BL_DIRECTION = {"up": "up", "down": "down", "queued_up": "up", "queued_down": "down",
+                "hide": "down", "unhide": "up", "queued_hide": "down", "queued_unhide": "up"}  # drain 2026-10-29
 
 
 def load(p):

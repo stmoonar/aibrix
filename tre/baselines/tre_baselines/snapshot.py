@@ -6,7 +6,8 @@ three sources and hands it to ``Policy.decide``:
 * the service manager's ``GET /v2/state`` (awake count per model, which bindings are
   awake and not hidden, their node and GPUs),
 * each awake, routable pod's own ``/metrics`` (scraped directly, not the gateway's 10 s
-  Redis docs), mapped onto the standardized :data:`COUNTER_KEYS`,
+  Redis docs), mapped onto the standardized :data:`COUNTER_KEYS`; awake hidden pods are
+  scraped too and listed apart (``ModelSnapshot.hidden``),
 * the gateway request-event stream ``tre:v2:bl:req:<model>`` (events new since the
   previous tick) and the replay start marker ``tre:v2:bl:replay_t0``.
 
@@ -152,6 +153,16 @@ class ModelSnapshot:
     #: gap (shell start, a trimmed / recreated stream, a read backlog). None = no event
     #: history (e.g. the source does not read events, or the gap is this tick).
     events_since_ms: Optional[int] = None
+    #: Awake but hidden pods (no new requests; e.g. draining before a sleep), scraped like
+    #: ``pods``; a policy decides on ``pods`` only. Counted in ``awake``.
+    hidden: tuple[PodSnapshot, ...] = ()
+    #: Awake hidden pods whose scrape failed (or no pod endpoint) this tick.
+    hidden_unscraped: tuple[str, ...] = ()
+
+    @property
+    def routable_awake(self) -> int:
+        """Awake replicas that take new requests: ``awake`` minus the hidden ones."""
+        return max(0, int(self.awake) - len(self.hidden) - len(self.hidden_unscraped))
 
 
 @dataclass(frozen=True)

@@ -22,7 +22,10 @@ ALL = "ALL"
 
 #: Baseline decision-log actions that are a decision to scale -> direction (the scaler logs a
 #: decision waiting behind the plan in flight as ``queued_up`` / ``queued_down`` since 2026-10-28).
-BL_DECISION_DIRECTION = {"up": "up", "down": "down", "queued_up": "up", "queued_down": "down"}
+#: ``hide`` / ``unhide``: a draining policy (PreServe, scaler 2026-10-29) shrinks by hiding and
+#: grows by unhiding a draining pod first; its later named ``down`` is the drained pod's sleep.
+BL_DECISION_DIRECTION = {"up": "up", "down": "down", "queued_up": "up", "queued_down": "down",
+                         "hide": "down", "unhide": "up", "queued_hide": "down", "queued_unhide": "up"}
 
 
 # ---------------------------------------------------------------- percentiles (score_pilot's)

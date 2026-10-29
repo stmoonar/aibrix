@@ -20,6 +20,9 @@ spec:
         app.kubernetes.io/name: tre-v2-baseline-scaler
     spec:
       serviceAccountName: tre-v2-baseline-scaler
+      # Shutdown waits up to 10 s for the plan in flight, then unhides the pods a draining
+      # policy (PreServe) still holds hidden (tre_baselines.drain); the default 30 s is tight.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: baseline-scaler
           image: tre-v2-baseline-scaler:20261028-e891d29b

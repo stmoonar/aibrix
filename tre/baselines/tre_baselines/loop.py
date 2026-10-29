@@ -34,6 +34,12 @@
   counter (``tre_bl_actions_total``) and the direction reversals count a queued decision
   as ``up`` / ``down`` only once it was actually sent (its result, ``sm_result.queued`` with
   the ``plan_id``, is collected); one replaced by a later tick is never counted (2026-10-28).
+* Drain (2026-10-29; a policy with ``drain_on_shrink``, PreServe): the shell compares the
+  desired count with the **routable** count (awake minus hidden) and shrinks by hiding the
+  least-loaded pods, sleeping each by name once its engine is empty (bound ``drain_max_s``,
+  ``TRE_BL_DRAIN_MAX_S``, default 150 s = the route timeout); a scale-up unhides draining
+  pods before it wakes (:mod:`tre_baselines.drain`; actions ``hide`` / ``unhide``, line
+  ``inputs.drain``). The pods still hidden by this shell are unhidden when it stops.
 * SM refusals are logged (``sm_result`` on the model's next decision line).
 * A refused scale-up (an SM answer) is not a model-wide pause: the SM's ``retry_after_s``
   means "avoid THOSE GPUs", and the shell cannot steer the SM to other GPUs, so it waits
@@ -92,11 +98,13 @@ from tre_baselines.keys import (
     OWNER_KEY,
     decision_key,
 )
+from tre_baselines.drain import DEFAULT_DRAIN_MAX_S, DrainStep, DrainTracker
 from tre_baselines.policies.base import INCOMPLETE, Decision
 from tre_baselines.sm_client import (
     DEFAULT_BACKOFF_MAX_S,
     DROPPED,
     Backoff,
+    Call,
     Completed,
     Dispatcher,
     RefusalGate,
@@ -107,7 +115,8 @@ from tre_baselines.snapshot import ClusterSnapshot, evidence_gaps
 LOG = logging.getLogger(__name__)
 
 REVERSAL_WINDOW_MS = 60_000
-ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run", "backoff", "wait_refusal", "guard_controller_active")
+ACTIONS = ("none", "up", "down", "hide", "unhide", "inflight_skip", "dry_run", "backoff", "wait_refusal",
+           "guard_controller_active")
 #: Controller modes under which a baseline may actuate (missing key = observe).
 _CONTROLLER_OK = (None, "", "observe")
 
@@ -263,6 +272,10 @@ class BaselineShell:
         self._stop = threading.Event()
         self._stats_lock = threading.Lock()
         dispatcher.guard = self.actuation_guard
+        #: Drain before sleep (PreServe); None = shrink on the abort path directly.
+        self.drains: Optional[DrainTracker] = (
+            DrainTracker(float(getattr(config, "drain_max_s", DEFAULT_DRAIN_MAX_S)))
+            if getattr(policy, "drain_on_shrink", False) else None)
 
     def actuation_guard(self) -> Optional[str]:
         """Checked by the SM worker right before each call: None = the call may go."""
@@ -374,30 +387,47 @@ class BaselineShell:
         needs_events = bool(getattr(self.policy, "needs_events", False))
         history_s = float(getattr(self.policy, "event_history_s", 0.0) or 0.0)
         backstop = bool(getattr(self.policy, "evidence_backstop", True))
+        drains = self.drains
+        if drains is not None:
+            acting = owner and not effective_dry
+            for model, ms in snap.models.items():
+                drains.reconcile(ms, snap.now_ms, inflight=self.dispatcher.inflight(model), adopt=acting)
+            if acting:
+                drains.adopted()
         planned: list[dict] = []
+        steps: dict[str, DrainStep] = {}
         for model, ms in snap.models.items():
             decision = decisions.get(model)
+            # Draining: the policy's count is compared with the routable replicas.
+            base = ms.awake if drains is None else ms.routable_awake
             raw = None if decision is None else int(decision.desired)
-            clamped = ms.awake if raw is None else clamp(raw, ms.min_replicas, ms.max_replicas)
+            clamped = base if raw is None else clamp(raw, ms.min_replicas, ms.max_replicas)
             reason = "no_decision" if decision is None else decision.reason
             inputs = {} if decision is None else dict(decision.inputs)
-            if clamped < ms.awake and backstop:
+            if clamped < base and backstop:
                 gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s, events=needs_events, history_s=history_s)
                 if gaps:  # backstop: never scale down on incomplete evidence
                     inputs.update(gaps=list(gaps), policy_reason=reason, policy_clamped=clamped)
-                    clamped, reason = ms.awake, INCOMPLETE
-            direction = "up" if clamped > ms.awake else "down" if clamped < ms.awake else "none"
+                    clamped, reason = base, INCOMPLETE
+            target = clamped
+            if drains is None:
+                direction = "up" if clamped > ms.awake else "down" if clamped < ms.awake else "none"
+            else:
+                step = drains.step(ms, clamped, snap.now_ms)
+                steps[model] = step
+                direction, target = step.direction, step.target
+                inputs["drain"] = step.info
             planned.append({
                 "model": model, "awake": ms.awake, "raw_desired": raw, "clamped": clamped,
-                "direction": direction, "reason": reason, "inputs": inputs,
+                "direction": direction, "reason": reason, "inputs": inputs, "target": target,
             })
-        order = {"down": 0, "up": 1, "none": 2}
+        order = {"down": 0, "hide": 0, "unhide": 1, "up": 1, "none": 2}
         planned.sort(key=lambda p: (order[p["direction"]], p["model"]))
 
         # Gates first (per model), then ONE hand-over of the tick's would-be calls: the
         # dispatcher sends them as one plan (or queues them behind the plan in flight).
         gated: list[tuple[dict, Optional[str], Optional[float], Optional[str]]] = []
-        calls: dict[str, tuple[str, int, Optional[int]]] = {}
+        calls: dict[str, Call] = {}
         for item in planned:
             model, direction = item["model"], item["direction"]
             ms = snap.models[model]
@@ -418,7 +448,9 @@ class BaselineShell:
                 action = "wait_refusal"  # nothing changed since the refusal: no call
             else:
                 action = None  # a call, if the dispatcher takes it
-                calls[model] = (direction, item["clamped"], ms.awake if direction == "up" else None)
+                step = steps.get(model)
+                calls[model] = Call(direction, item["target"], ms.awake if direction == "up" else None,
+                                    pods=step.pods if step else (), unhide_first=step.unhide_first if step else ())
             gated.append((item, action, wait_s, evidence))
         # Always handed over (also empty): the tick's decisions replace any still waiting.
         taken = self.dispatcher.dispatch(calls)
@@ -431,6 +463,8 @@ class BaselineShell:
                 answer = taken.get(model)
                 if answer in ("sent", "queued"):
                     queued = answer == "queued"
+                    if drains is not None and model in steps:
+                        drains.sent(model, steps[model], snap.now_ms)
                     # Queued: not sent yet (and maybe replaced by a later tick) - no up /
                     # down action, no reversal; counted when its result comes back.
                     action = f"queued_{direction}" if queued else direction
@@ -511,6 +545,8 @@ class BaselineShell:
         )
 
     def _note_dispatch(self, model: str, direction: str, now_ms: int) -> None:
+        # A drain step counts as the shrink / growth it is part of (hide then sleep is one).
+        direction = {"hide": "down", "unhide": "up"}.get(direction, direction)
         with self._stats_lock:
             prev = self._last_dispatch.get(model)
             if prev is not None and prev[0] != direction and now_ms - prev[1] <= REVERSAL_WINDOW_MS:
@@ -579,6 +615,21 @@ class BaselineShell:
     def stop(self) -> None:
         self._stop.set()
 
+    def release_drains(self, update_hidden: Any) -> dict[str, Any]:
+        """Unhide the pods this shell hid (shutdown; ``update_hidden`` =
+        :meth:`~tre_baselines.sm_client.SMClient.update_hidden`). Only while the owner lock
+        is ours: a successor shell adopts them instead."""
+        if self.drains is None or self.config.dry_run:
+            return {}
+        if self.lock is not None and not self.lock.held():
+            return {}
+        out: dict[str, Any] = {}
+        for model, pods in self.drains.release().items():
+            result = update_hidden(model, remove=tuple(pods))
+            out[model] = {"pods": pods, **result.as_dict()}
+            LOG.info("drain release %s %s: %s", model, pods, out[model])
+        return out
+
     # -- health / metrics -------------------------------------------------------------
 
     def alive(self) -> bool:
@@ -595,10 +646,14 @@ class BaselineShell:
         empty_window_busy, ...); empty when the policy has none."""
         fn = getattr(self.policy, "counters", None)
         try:
-            return dict(fn()) if callable(fn) else {}
+            out = {m: dict(c) for m, c in (fn() if callable(fn) else {}).items()}
         except Exception as exc:  # reporting must never break the loop
             LOG.warning("policy counters failed: %s", exc)
-            return {}
+            out = {}
+        if self.drains is not None:  # drain_drained / drain_timeout / drain_unhidden / drain_adopted
+            for model, counts in self.drains.counts.items():
+                out.setdefault(model, {}).update({f"drain_{k}": v for k, v in counts.items()})
+        return out
 
     def health_doc(self) -> dict:
         with self._stats_lock:
