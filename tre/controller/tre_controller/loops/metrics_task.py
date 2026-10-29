@@ -400,7 +400,7 @@ class PhaseAlignedSampler:
         self.last_fresh_end_ms = end
         self.stale_since_ms = None
         assert snapshot is not None
-        published = freeze_snapshot(replace(snapshot, ts_ms=end, stale=False))
+        published = freeze_snapshot(replace(snapshot, ts_ms=end, stale=False, read_ms=int(started)))
         self._box.set(published)
         return SampleOutcome("published", end, attempts, missed, reason, self.offset_ms)
 

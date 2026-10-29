@@ -198,6 +198,9 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(sm)["TRE_SM_LOG_LEVEL"] == "INFO"
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
+    # Review 2026-10-29: the gateway plugins stay pinned to the controller's node. The
+    # TSS suffix does not depend on it (a change is dated by gateway stamps).
+    assert _node_selector(gateway_plugins) == _node_selector(controller)
 
     # P0-4A: per-model params load from a mounted ConfigMap so params_set.py can edit +
     # restart-to-apply. W stays frozen as an explicit env value (not in the CM).

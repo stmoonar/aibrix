@@ -128,11 +128,14 @@ def test_a_model_whose_last_call_the_view_does_not_show_takes_no_new_action():
                            cluster_view=_view(1, fetched_ms=BASE + 1_000, state_ms=BASE + 900),
                            signal_state=SignalState())
     assert not _ups(held.actions) and "view_pending_hold:m:up" in held.events
-    # A newer view shows the call: the model acts again (no window / EMA wait).
+    # A newer view shows the call: no view-pending hold any more; the call changed the
+    # pod set, so the model settles (TSS suffix 2026-10-29; a restarted controller dates
+    # its restored last call inside the window too).
     shown = run_rescue_tick(_snap(_window(BASE + 1_000, [BURST] * 3, routable=2)), queue=queue,
                             registry=_registry(), cluster_view=_view(2, fetched_ms=BASE + 2_100, state_ms=BASE + 2_000),
                             signal_state=SignalState())
-    assert [(a.model, a.delta) for a in _ups(shown.actions)] == [("m", 1)]
+    assert not any(event.startswith("view_pending_hold:") for event in shown.events)
+    assert shown.model_contexts["m"]["settling"] and not _ups(shown.actions)
 
 
 def test_a_model_with_an_action_in_flight_takes_no_new_action():

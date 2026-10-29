@@ -299,6 +299,7 @@ def create_controller_dependencies(
     scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
     # TSS suffix (2026-10-29, design 20261029-tss-suffix): Z on the window since the
     # model's last pod-set change, decision-valid once that spans scaling.settle_ms.
+    # A change is dated in the gateway domain (SignalState.note_snapshot, review P1-2).
     signal_state = SignalState(settle_ms=int(getattr(scaling_config, "settle_ms", 10_000) or 10_000))
     # Round 4: the SafeScale tail span source, bound once the state machine exists.
     tail_start: list = []

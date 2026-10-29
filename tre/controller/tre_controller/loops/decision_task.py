@@ -187,6 +187,9 @@ class DecisionLoop:
             self._write("rescue", snapshot, result)
             return result
         self._recovered(snapshot.ts_ms)
+        if self._signal_state is not None:
+            # TSS suffix: every published snapshot dates the pod-set changes read after.
+            self._signal_state.note_snapshot(snapshot)
         obs_ms = observation_ms(snapshot)
         key = (int(snapshot.ts_ms), obs_ms)
         if key == self._last_obs:

@@ -2390,9 +2390,10 @@ def revalidate_commit_from_signals(
     every (re)try on the models' CURRENT signal state (``get_states``: model ->
     ModelState value of the latest planner tick; missing / stale = unknown):
 
-    * donor pods already asleep in the cluster view (a timed-out first call
-      that succeeded) -> the donor part is done;
-    * else the donor needing capacity (critical / low) -> abandon: unhide;
+    * donor pods and every companion pod already asleep in the cluster view (a
+      timed-out first call that succeeded) -> the donor part is done;
+    * else the donor or a companion model needing capacity (critical / low) ->
+      abandon: unhide;
     * a receiver that clearly no longer needs capacity (healthy / high / idle)
       -> its upscale is dropped. Unknown states keep the plan.
 
@@ -2410,17 +2411,23 @@ def revalidate_commit_from_signals(
     def check(action: SafeScaleCommitAction) -> CommitVerdict:
         states = dict(get_states() or {})
         view = get_view() if get_view is not None else None
+        step = (*action.pods, *(pod for _model, pod in action.companions))
         if not action.donor_done:
-            if view is not None and action.pods:
+            # The donor step is done only when the donor pods AND every companion pod
+            # (TP block, 2026-10-29) are asleep: a retry re-sends a failed companion sleep.
+            if view is not None and step:
                 bindings = {binding.serve_id: binding for binding in getattr(view, "bindings", ())}
-                if all(pod in bindings and not bindings[pod].awake for pod in action.pods):
+                if all(pod in bindings and not bindings[pod].awake for pod in step):
                     action = replace(action, donor_done=True)
         if not action.donor_done:
-            donor_state = states.get(action.donor)
-            if donor_state in NEEDS_CAPACITY_STATES:
-                return CommitVerdict(
-                    action, abandon_reason=f"donor {action.donor} is {donor_state} (needs capacity)"
-                )
+            # The donor or a companion model (the block's IDLE / HIGH half, a joint
+            # partner) needing capacity abandons the whole commit; the probe's rollback
+            # rolls its block partners back (SafeScaleStateMachine._abort_partners).
+            for model in dict.fromkeys((action.donor, *(model for model, _pod in action.companions))):
+                state = states.get(model)
+                if state in NEEDS_CAPACITY_STATES:
+                    role = "donor" if model == action.donor else "companion"
+                    return CommitVerdict(action, abandon_reason=f"{role} {model} is {state} (needs capacity)")
         kept: list[ReceiverTarget] = []
         dropped: list[tuple[str, str]] = []
         for upscale in action.upscales:

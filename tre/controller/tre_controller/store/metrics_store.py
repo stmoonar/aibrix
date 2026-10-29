@@ -354,7 +354,7 @@ class MetricsStore:
         """Gateway boundaries strictly inside an aligned window (suffix starts) - with
         suffix sources only theirs: the SafeScale tail's (round 5: the first boundary at
         or after the probe's post-hide start, gateway doc domain) and the TSS suffix's
-        (the first boundary at or after the model's last pod-set change); () when
+        (the first instant-sample point at or after the model's last pod-set change); () when
         suffixes are off or the window is not on the suffix grid."""
         period = self._suffix_period_ms
         if period <= 0 or window_start_ms % period or window_end_ms % period:
@@ -362,7 +362,11 @@ class MetricsStore:
         if self._suffix_tail is None and self._suffix_change is None:
             return tuple(range(window_start_ms + period, window_end_ms, period))
         starts: set[int] = set()
-        for name, source in (("SafeScale tail", self._suffix_tail), ("TSS suffix", self._suffix_change)):
+        # The SafeScale tail starts on the histogram grid; the TSS suffix at the first
+        # instant sample at or after the change (review 2026-10-29: not rounded up to the
+        # histogram grid - its token baseline is the newest histogram doc before it).
+        for name, source, step in (("SafeScale tail", self._suffix_tail, period),
+                                   ("TSS suffix", self._suffix_change, self._instant_sample_interval_ms)):
             if source is None:
                 continue
             try:
@@ -371,7 +375,7 @@ class MetricsStore:
                 LOG.warning("%s: start of %s unreadable", name, model, exc_info=True)
                 point = None
             if point is not None:
-                starts.add(-(-int(point) // period) * period)  # first grid boundary >= the point
+                starts.add(-(-int(point) // step) * step)  # first grid point >= the point
         return tuple(sorted(start for start in starts if window_start_ms < start < window_end_ms))
 
     def read_latest_instant(

@@ -212,6 +212,10 @@ class MetricsSnapshot:
     #: freshness rule: a window ending at ``E`` is complete once this is >= ``E``.
     #: None = not read (no cadence check, v1 schema, offline).
     gateway_last_hist_ms: int | None = field(default=None, compare=False)
+    #: Controller clock (ms) when the sampler read this snapshot (its last fetch
+    #: attempt); None = not from the sampler. TSS suffix (2026-10-29): a pod-set change
+    #: is dated against it, never against a gateway stamp (``SignalState.note_snapshot``).
+    read_ms: int | None = field(default=None, compare=False)
 
 
 def mean_completed_prompt_tokens(metrics: Any) -> float | None:

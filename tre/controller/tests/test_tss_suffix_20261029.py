@@ -348,3 +348,92 @@ def test_the_immediate_half_of_a_probed_block_sleeps_at_the_commit_not_at_the_st
     kinds = [(c.kind, c.model, c.pods) for c in decision.commands]
     assert kinds[:2] == [("scale_down", "h", ("h-1",)), ("companion_sleep", "i", ("i-0",))]
     assert kinds[2][:2] == ("scale_up", "tp2")
+
+
+# ------------------------------------------------------------------- review 2026-10-29
+def test_a_companion_still_awake_keeps_the_donor_step_pending():
+    # P1-1 (a): the donor slept, the companion's sleep failed: a retry re-sends it.
+    from tre_controller.loops.action_queue import revalidate_commit_from_signals
+    from tre_controller.planning.planner import SafeScaleCommitAction
+
+    commit = SafeScaleCommitAction(donor="s7", pods=("s7-0",), reason="formal_commit_gate_passed",
+                                   companions=(("s8", "s8-1"),))
+
+    def view(s8_awake):
+        return SimpleNamespace(bindings=(SimpleNamespace(serve_id="s7-0", awake=False),
+                                         SimpleNamespace(serve_id="s8-1", awake=s8_awake)))
+
+    assert not revalidate_commit_from_signals(lambda: {}, lambda: view(True))(commit).action.donor_done
+    assert revalidate_commit_from_signals(lambda: {}, lambda: view(False))(commit).action.donor_done
+
+
+@pytest.mark.parametrize("state", ["critical", "low"])
+def test_a_companion_that_needs_capacity_abandons_the_whole_commit(state):
+    # P1-1 (b): the block's IDLE / HIGH half (or a joint partner) turned CRITICAL / LOW.
+    from tre_controller.loops.action_queue import revalidate_commit_from_signals
+    from tre_controller.planning.planner import SafeScaleCommitAction
+
+    commit = SafeScaleCommitAction(donor="h", pods=("h-1",), reason="formal_commit_gate_passed",
+                                   companions=(("i", "i-0"),))
+    verdict = revalidate_commit_from_signals(lambda: {"h": "high", "i": state})(commit)
+    assert verdict.abandon_reason and "companion i" in verdict.abandon_reason
+
+
+@pytest.mark.parametrize("skew_ms", [0, 160_000, -160_000])
+def test_a_skewed_controller_clock_does_not_change_settling(skew_ms):
+    # P1-2: the change is dated against the controller-clock read time of the snapshots
+    # and placed by their gateway stamp; controller and gateway times are never compared.
+    gateway, controller = T0, T0 - skew_ms  # gateway clock = controller clock + skew
+    spec, state = _registry().model("m"), SignalState(settle_ms=10_000)
+
+    def read(after_ms):  # a snapshot read ``after_ms`` after T0: last boundary on the 2 s grid
+        state.note_snapshot(SimpleNamespace(read_ms=controller + after_ms + 300,
+                                            gateway_last_hist_ms=gateway + after_ms // GRID * GRID))
+
+    read(0)
+    state.note_pod_sets({"m": {"m-0"}}, view_ms=controller + 100)
+    state.note_pod_sets({"m": {"m-0", "m-1"}}, view_ms=controller + 1_500, done_ms={"m": controller + 1_000})
+    assert state.change_ms("m") is None  # pending: no snapshot read after the wake yet
+    read(2_000)
+    assert state.change_ms("m") == gateway + 2_001
+    pods = {"m-0": (BURST, None), "m-1": (BURST, gateway + 1_000)}
+    seen = []
+    for at in (8_000, 14_000):
+        window = _window("m", gateway + at, pods, change_ms=state.change_ms("m"))
+        result = compute_model_signal("m", window, spec, signal_source="zm", signal_state=state)
+        seen.append(result.settling)
+    assert seen == ["settle_span", None]
+
+
+def test_a_view_that_does_not_list_a_model_is_no_pod_set_change():
+    # P2: a partial / empty SM view.
+    state, queue = SignalState(settle_ms=10_000), _Queue()
+    _woken(state, queue)
+    m = _window("m", T0 + 5_000, {"m-0": (BURST, None)})
+    o = _window("o", T0 + 5_000, {"o-3": (CALM, None)})
+    only_o = ClusterView(topology=_registry().topology(), state_ms=T0 + 4_000, fetched_ms=T0 + 4_100,
+                         bindings=(Binding(serve_id="o-3", model="o", slot=Slot("node-a", (3,)), awake=True),))
+    run_rescue_tick(_snap(m, o), queue=_Queue(), registry=_registry(), cluster_view=only_o, signal_state=state)
+    assert state.change_ms("m") is None
+
+
+def test_a_joint_partner_that_never_started_is_dropped_without_a_rollback_hold():
+    # P2: block_partner_not_started is not a failed probe.
+    _plans, machine, _view8, leader, member = _joint()
+    assert machine.discard_probe(member.model, reason="block_partner_not_started", now_ms=5_000)
+    assert machine.active_probe(member.model) is None and member.model not in machine.rollback_evidence()
+
+
+def test_a_committing_partner_without_a_live_leader_rolls_back():
+    # P2: a crash between the leader's resolve and its partner's.
+    _plans, machine, _view8, leader, member = _joint()
+    machine._commit(member, reason="formal_commit_gate_passed")
+    machine._commit(machine.active_probe(leader.model), reason="formal_commit_gate_passed")
+    assert machine.active_probe(member.model).block_committing
+    machine._probes.pop(leader.model)  # the leader resolved, then the process stopped
+    from tre_controller.planning.safescale import ProbeObservation
+
+    observation = ProbeObservation(ts_ms=6_000, ttft_p95_ms=None, tpot_p95_ms=None, z_m=None, q_ctl=0.0,
+                                   has_traffic=False)
+    decision = machine.observe(member.model, observation, now_ms=6_000)
+    assert decision.status == "rollback" and [c.kind for c in decision.commands] == ["unhide"]

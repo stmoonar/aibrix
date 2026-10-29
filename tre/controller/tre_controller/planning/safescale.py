@@ -445,6 +445,17 @@ class SafeScaleStateMachine:
             self._persist_probe(probe)
         return True
 
+    def discard_probe(self, model: str, *, reason: str, now_ms: int) -> bool:
+        """A probe whose hide was never submitted (a joint TP block whose partner could
+        not start, review P2): resolved as a rollback without a rollback-evidence hold -
+        nothing was tried, like a preemption. False without a probing probe."""
+        probe = self._probes.get(model)
+        if probe is None or probe.status != "probing":
+            return False
+        self._finish_probe(probe, status="rollback", reason=reason, resolved_ts=float(now_ms) / 1000.0)
+        self._probes.pop(model, None)
+        return True
+
     def rollback_evidence(self) -> dict[str, RollbackEvidence]:
         """Model -> the evidence of its last rolled-back probe (until its next probe
         resolves)."""
@@ -868,8 +879,14 @@ class SafeScaleStateMachine:
         if probe.status != "probing":
             return SafeScaleDecision(status="none", reason="probe_committing")
         if probe.block_committing and probe.abort_reason is None:
-            # Its pods sleep in a block partner's joint commit: resolved with it.
-            return SafeScaleDecision(status="none", reason="block_commit_pending")
+            if self.block_partners(probe):
+                # Its pods sleep in a block partner's joint commit: resolved with it.
+                return SafeScaleDecision(status="none", reason="block_commit_pending")
+            # No live leader (a crash between the leader's resolve and this one, review
+            # P2): roll it back - the unhide is idempotent.
+            probe = replace(probe, abort_reason=BLOCK_PARTNER_ROLLBACK, block_committing=False)
+            self._probes[model] = probe
+            self._persist_probe(probe)
 
         key = _observation_key(observation)
         is_new = all(_observation_key(seen) != key for seen in probe.observations)
@@ -950,15 +967,37 @@ class SafeScaleStateMachine:
                                                poll=direct_poll, critical_receivers=critical_receivers)
                 if early is not None:
                     return early
+                # Rule 6 (review P2): a block probe that passed before but not now waits
+                # for a new pass - its partner does not commit on the old one.
+                updated = self._block_pass_lapsed(updated)
                 if updated is not probe:
                     self._persist_probe(updated)
                 return SafeScaleDecision(status="probing", reason="probe_pending")
-            return self._judge(updated, health, now_ms=now_ms, wall_now_ms=clock)
+            return self._after_judge(model, self._judge(updated, health, now_ms=now_ms, wall_now_ms=clock))
         if now_ms < updated.deadline_ms:
             if updated is not probe:
                 self._persist_probe(updated)
             return SafeScaleDecision(status="probing", reason="probe_pending")
-        return self._judge(updated, health, now_ms=now_ms)
+        return self._after_judge(model, self._judge(updated, health, now_ms=now_ms))
+
+    def _block_pass_lapsed(self, probe: SafeScaleProbe) -> SafeScaleProbe:
+        if not probe.block_passed:
+            return probe
+        lapsed = replace(probe, block_passed=False)
+        self._probes[probe.model] = lapsed
+        return lapsed
+
+    def _after_judge(self, model: str, decision: SafeScaleDecision) -> SafeScaleDecision:
+        """A judgement that neither passed (``block_waiting``) nor resolved the probe
+        (an extension): the probe's earlier block pass lapses (rule 6, review P2)."""
+        probe = self._probes.get(model)
+        if probe is not None and decision is not None and decision.status == "probing" and (
+            decision.reason != "block_waiting"
+        ):
+            lapsed = self._block_pass_lapsed(probe)
+            if lapsed is not probe:
+                self._persist_probe(lapsed)
+        return decision
 
     def _judge(
         self,

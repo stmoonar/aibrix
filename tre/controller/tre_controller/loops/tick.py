@@ -66,6 +66,8 @@ class SafeScaleController(Protocol):
         block_id: str | None = None,
     ) -> SafeScaleDecision: ...
 
+    def discard_probe(self, model: str, *, reason: str, now_ms: int) -> bool: ...
+
 
 # A static set (tests) or a live provider read every tick (app wiring: the models the
 # SafeScaleStateMachine is currently probing), so planner donor paths exclude them.
@@ -492,12 +494,16 @@ def _note_pod_sets(
     view's time and the ``done_ms`` of each model's last routable-changing SM call of
     ours (``ActionQueue.view_changes`` / ``last_actions``, the later one - the same
     sources as the view-pending guard)."""
+    signal_state.note_snapshot(snapshot)
     routable = _routable_pod_ids(cluster_view) or {}
-    models = set(snapshot.models) | {binding.model for binding in cluster_view.bindings}
+    # Only the models the view lists (review P2: a partial / empty SM view is no change).
+    models = {binding.model for binding in cluster_view.bindings}
+    windows = [int(m.window_end_ms) - int(m.window_start_ms) for m in snapshot.models.values()]
     signal_state.note_pod_sets(
         {model: routable.get(model, frozenset()) for model in models},
         view_ms=_view_bound(cluster_view),
         done_ms={model: done for model, (done, _direction) in _last_changes(queue).items()},
+        window_ms=max(windows) if windows else None,
     )
 
 
@@ -729,8 +735,8 @@ def _start_block_probes(
             events.append(f"safescale_probe_skipped:{model}:{decision.reason}")
             for other, other_pod in started:
                 # A joint block runs whole or not at all: the partner never hid (its
-                # hide is not submitted) - roll it back at once.
-                safescale.abort_probe(other, pods=(other_pod,), reason="block_partner_not_started")
+                # hide is not submitted) - dropped at once, no rollback-evidence hold.
+                safescale.discard_probe(other, reason="block_partner_not_started", now_ms=snapshot.ts_ms)
             return ()
         events.append(f"safescale_{decision.reason}:{model}")
         if decision.reason == "probe_started" and getattr(decision, "details", None):
@@ -1233,10 +1239,12 @@ def serving_window(
         counts = _cluster_view_counts(cluster_view).get(metrics.model)
         if counts is None:
             return metrics
+    # One pod-set definition (review P2): the SM's routable set (:func:`_is_routable`).
+    routable_ids = getattr(cluster_view, "routable_ids", None)
     out_of_set = {
         binding.serve_id
         for binding in cluster_view.bindings
-        if binding.model == metrics.model and (not binding.awake or binding.hidden)
+        if binding.model == metrics.model and not _is_routable(binding, routable_ids)
     }
     return restrict_to_serving(metrics, sleeping_pods=out_of_set, routable_pods=counts[0])
 

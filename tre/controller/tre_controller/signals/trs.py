@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Collection, Mapping
 
@@ -322,7 +323,8 @@ class SuffixWindow:
       window; its queue is the mean of its own samples), ``evidence_ms`` its observed
       span after the change.
     * ``settling`` (not None) says why that suffix is not decision-valid yet:
-      ``no_suffix`` (the store has not built one yet), ``settle_span`` (less than
+      ``no_suffix`` (the store has not built one yet, or no snapshot was read after the
+      change yet), ``settle_span`` (less than
       ``settle_ms`` observed), ``tokens_unknown``, ``samples`` (a serving pod with fewer
       than two samples in it, or none). Then Z is unknown, never 0.
     """
@@ -374,14 +376,27 @@ class SignalState:
     the change and seed on the first decision-valid suffix value. No breakpoint holds,
     no onset guard, no saturation rescue (design docs/design/20261029-tss-only.md).
 
-    Clock: ``done_ms`` / the view time are controller clock, the suffix is cut on gateway
-    stamps. The two agree when both run on one node (the overlays pin them); a skew of
-    d ms moves the suffix start by d (the evidence floor still counts on gateway
-    ``scraped_ms`` only).
+    Clock (review 2026-10-29 P1-2): ``done_ms`` / the view time are controller clock,
+    the suffix is cut on gateway stamps; the two are never compared. A change is dated on
+    the controller clock only against the controller-clock read time of each published
+    snapshot (:meth:`note_snapshot`): t_c = just after the gateway's newest complete
+    histogram boundary (``gateway_last_hist_ms`` + 1 ms) of the first snapshot read at or
+    after the change; the store cuts the suffix at the first instant sample after it.
+    Cost: the time to that read (at most about one evidence period) plus one instant
+    step. A doc scraped before the change but stamped after that boundary (written
+    between the boundary and the read) can remain - at most the read's lag. Without gateway stamps (offline / synthetic
+    snapshots, a gateway cadence check off) the controller-clock time is used as is.
     """
+
+    #: Published snapshots remembered for dating changes (one per evidence period).
+    SNAPSHOT_MEMORY = 64
 
     def __init__(self, settle_ms: int = DEFAULT_SETTLE_MS) -> None:
         self.settle_ms = max(1, int(settle_ms))
+        # (controller-clock read time, gateway last_hist_ms) of the published snapshots.
+        self._reads: deque[tuple[int, int]] = deque(maxlen=self.SNAPSHOT_MEMORY)
+        # model -> controller-clock time of a change no snapshot read after it yet.
+        self._pending: dict[str, int] = {}
         # model -> (its pod set, the view time it was last seen at; None = synthetic view).
         self._pod_sets: dict[str, tuple[frozenset[str], int | None]] = {}
         # model -> time of its last pod-set change (t_c).
@@ -453,41 +468,81 @@ class SignalState:
 
     # ------------------------------------------------------------ pod-set changes
 
+    def note_snapshot(self, snapshot: Any) -> None:
+        """Remember a published snapshot's controller-clock read time (``read_ms``) and
+        the gateway's newest complete histogram boundary (``gateway_last_hist_ms``), and
+        date the pending changes it was read after. A snapshot without both is ignored."""
+        read = getattr(snapshot, "read_ms", None)
+        last_hist = getattr(snapshot, "gateway_last_hist_ms", None)
+        if read is None or last_hist is None:
+            return
+        entry = (int(read), int(last_hist))
+        if self._reads and entry[0] <= self._reads[-1][0]:
+            return  # the same (or an older) read
+        self._reads.append(entry)
+        for model, change in list(self._pending.items()):
+            if change <= entry[0]:
+                del self._pending[model]
+                self._set_change(model, entry[1] + 1)
+                if self._settling.get(model) == change:
+                    self._settling[model] = self._change_ms[model]  # the same episode
+
+    def _date(self, model: str, controller_ms: int) -> None:
+        """Date ``model``'s change made at ``controller_ms`` (controller clock) in the
+        gateway domain (class docstring): pending until a snapshot is read after it. With
+        no gateway-stamped snapshot seen (offline / synthetic) the time is used as is."""
+        if not self._reads:
+            self._set_change(model, int(controller_ms))
+            return
+        for read, last_hist in self._reads:
+            if read >= int(controller_ms):
+                self._set_change(model, last_hist + 1)
+                return
+        self._pending[model] = int(controller_ms)
+
+    def _set_change(self, model: str, change: int) -> None:
+        if change >= self._change_ms.get(model, change):
+            self._change_ms[model] = change
+
     def note_pod_sets(
         self,
         pod_sets: Mapping[str, Collection[str]],
         *,
         view_ms: int | None,
         done_ms: Mapping[str, int] | None = None,
+        window_ms: int | None = None,
     ) -> None:
         """Record each model's pod set (awake, not hidden) of a fleet view produced at
         ``view_ms`` (its ``state_ms``; None = a synthetic view). A changed set is dated at
         ``done_ms[model]`` - the controller's own last SM call on the model that changed
         its pod set (wake / sleep done, hide confirmed, unhide done) - when that returned
-        no earlier than the view that showed the old set and not after this view; else (SM
-        self-heal, recovery, an external change) at ``view_ms``, the first view showing
-        it. Without either time the change is not dated (no suffix). The first view of a
-        model (a start / restart) dates nothing. An older view than one seen is ignored."""
+        no earlier than the view that showed the old set and not after this view; else
+        (SM self-heal, recovery, an external change) at ``view_ms``, the first view
+        showing it. Both are controller clock and are dated in the gateway domain
+        (:meth:`_date`). Without either time the change is not dated (no suffix). A
+        model's first view (a start / restart) dates a change only at a ``done_ms`` of
+        ours (the restored last action) at most ``window_ms`` before it. An older view
+        than one seen is ignored."""
         for model, pods in pod_sets.items():
             pods = frozenset(pods)
             previous = self._pod_sets.get(model)
             if previous is not None and view_ms is not None and previous[1] is not None and view_ms < previous[1]:
                 continue
             self._pod_sets[model] = (pods, view_ms)
-            if previous is None or previous[0] == pods:
-                continue
             hint = (done_ms or {}).get(model)
+            if previous is None:
+                if hint is not None and view_ms is not None and window_ms and 0 <= view_ms - int(hint) < window_ms:
+                    self._date(model, int(hint))
+                continue
+            if previous[0] == pods:
+                continue
             prior_view = previous[1]
             if hint is not None and (prior_view is None or int(hint) >= prior_view) and (
                 view_ms is None or int(hint) <= view_ms
             ):
-                change = int(hint)
+                self._date(model, int(hint))
             elif view_ms is not None:
-                change = int(view_ms)
-            else:
-                continue
-            if change >= self._change_ms.get(model, change):
-                self._change_ms[model] = change
+                self._date(model, int(view_ms))
 
     def change_ms(self, model: str) -> int | None:
         """``model``'s last pod-set change (t_c), None = none seen by this process."""
@@ -503,6 +558,10 @@ class SignalState:
         suffix's pods) has two samples in it. The EMAs restart once per change (the first
         read that sees it). Settling episodes are logged once at start and end."""
         start, end = int(metrics.window_start_ms), int(metrics.window_end_ms)
+        if model in self._pending:
+            # A change no snapshot was read after yet (not dated in the gateway domain).
+            change = self._pending[model]
+            return self._settle(model, change, SuffixWindow(metrics, change_ms=None, settling="no_suffix"))
         change = self._change_ms.get(model)
         if change is None or change <= start or end <= start:
             self._end_settling(model, "window_passed")

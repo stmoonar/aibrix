@@ -58,13 +58,12 @@ SCENARIOS = {
     # guarded, observed in the smoke instead (design docs/design/20261029-tss-only.md).
     # 105 s, not 170 s: a third probe sits on the gate's edge and commits or rolls back
     # by period, so a longer run would compare noise, not period invariance.
-    # TSS suffix (2026-10-29): that third probe now STARTS at ~102 s at P = 10 s and
-    # after 105 s at P <= 5 s. The rollback's unhide is a pod-set change; the retry is
-    # judged on the suffix since it, which starts at the first P-grid boundary after the
-    # unhide (8 s later at P = 10 s, < 1 s at P = 1 s). d's e2e (~20 s) is longer than
-    # settle_ms, so the 1 s suffix still holds more of the post-unhide transient and
-    # reads a lower Z (1.46 vs 1.85 at 100 s): only P = 10 s clears the retry margin.
-    # _key_delays compares the first two probe starts of this scenario.
+    # TSS suffix (2026-10-29): that third probe STARTS at ~102 s at P = 10 s and after
+    # 105 s at P <= 5 s (asserted in test_the_third_shrink_probe_starts_only_at_p10).
+    # The rollback's unhide is a pod-set change, dated at the first snapshot read after
+    # it (gateway domain): at P = 10 s that read comes up to 10 s later, so the suffix
+    # skips more of the unhidden pod's warm-up (completion-counted tokens, d's e2e ~20 s
+    # > settle_ms) and reads a higher Z, which clears the retry margin.
     "shrink": ps.Scenario(demand={"r": ((0, 8.0),), "d": ((0, 9.0),)}, awake=("r", "d", "d", "d"),
                           duration_s=105),
     # d HIGH on 2 pods: the probe overloads the last pod and rolls back; the same
@@ -106,9 +105,6 @@ def _key_delays(name: str, run: ps.Run) -> dict[str, list[int]]:
     the delays of the events before it)."""
     starts = _times(run, lambda e: "safescale_probe_started:" in e)
     verdicts = [t for t, e in run.events if e in run.verdicts]
-    if name == "shrink":
-        # The third probe's start is on the retry margin's edge (SCENARIOS["shrink"]).
-        starts = starts[:2]
     delays: dict[str, list[int]] = {
         "probe_start": [t - ps.T0 for t in starts],
         # A verdict and the next probe start can share a tick (the verdict is logged
@@ -138,7 +134,16 @@ def _ground_truth(name: str, run: ps.Run, period: int) -> list[tuple[str, int, i
                                                      "safescale_slo_violation:d")))[0]
         free = next(t for t, e in run.events if t > rolled and e.startswith("rescue|safescale_rollback_hold:d:")
                     and not e.endswith(":no_new_evidence"))
-        out.append(("retry_floor", free - rolled + period, 20_000, period + RESCUE_TICK_MS))
+        # The floor releases d only while d is HIGH (a hold event every rescue tick). TSS
+        # suffix (2026-10-29): after the unhide, d's suffix reads the unhidden pod's
+        # warm-up (the sim counts tokens at completion, d's e2e ~20 s): d is UNKNOWN /
+        # CRITICAL / LOW / HEALTHY for ~25 s at P <= 2 s and HIGH again only after the
+        # floor. Then only the lower bound holds (the floor never frees d early); the
+        # upper one applies when a no_new_evidence hold shows d HIGH during the floor.
+        held = any(rolled < t < free and e.startswith("rescue|safescale_rollback_hold:d:")
+                   and e.endswith(":no_new_evidence") for t, e in run.events)
+        out.append(("retry_floor", free - rolled + period, 20_000,
+                    period + RESCUE_TICK_MS if held else 10**9))
     if name == "direct":
         hides = _times(run, lambda e: e == "hide:r")
         for commit in _times(run, lambda e: e.startswith("safescale_early_commit:r")):
@@ -179,14 +184,31 @@ def test_the_sections_run_on_the_snapshot_grid_whatever_the_jitter(name, period)
     assert gaps and set(gaps) == {step}, (period, sorted(set(gaps)))
 
 
+def _comparable(name: str, delays: dict[str, list[int]]) -> dict[str, list[int]]:
+    """The key delays every period shares: of ``shrink`` the first two probe starts (the
+    third is the known P = 10 s difference, test_the_third_shrink_probe_starts_only_at_p10)."""
+    if name == "shrink":
+        return {**delays, "probe_start": delays["probe_start"][:2]}
+    return delays
+
+
+def test_the_third_shrink_probe_starts_only_at_p10():
+    for period in PERIODS:
+        starts = _key_delays("shrink", _run("shrink", period))["probe_start"]
+        if period == 10_000:
+            assert len(starts) == 3 and starts[2] >= 100_000, starts
+        else:
+            assert len(starts) == 2, (period, starts)
+
+
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_the_same_decisions_at_about_the_same_times_at_every_period(name):
-    reference = _key_delays(name, _run(name, REFERENCE))
+    reference = _comparable(name, _key_delays(name, _run(name, REFERENCE)))
     assert reference["verdict"] or name == "spike", "the scenario must reach a probe verdict"
     for period in PERIODS:
         run = _run(name, period)
         assert _verdicts(run) == _verdicts(_run(name, REFERENCE)), period
-        got = _key_delays(name, run)
+        got = _comparable(name, _key_delays(name, run))
         for key, delays in reference.items():
             assert len(got[key]) == len(delays) and None not in got[key], (period, key, got[key], delays)
             for delay, ref in zip(got[key], delays):
