@@ -170,6 +170,11 @@ class _Queue:
             self._sim.apply(action)
         return SimpleNamespace(accepted=len(actions), submitted=len(actions))
 
+    def view_changes(self) -> dict:
+        """model -> (when the mock SM applied its last routable change, direction), as
+        ``ActionQueue.view_changes``: the TSS suffix dates a change of ours there."""
+        return dict(self._sim.changes)
+
 
 @dataclass
 class Run:
@@ -197,6 +202,8 @@ class Sim:
         self.now = T0
         self.rendered = T0 - WINDOW - 2 * self.period
         self.run = Run()
+        #: model -> (controller ms, "up" / "down") of the last routable change applied.
+        self.changes: dict[str, tuple[int, str]] = {}
         cfg = ControllerConfig.from_env({})
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
         self.offset = int(scenario.gateway_offset_ms)
@@ -225,6 +232,8 @@ class Sim:
             min_sample_ratio=float(self.registry.scaling().sample_min_ratio or 0.0),
             suffix_period_ms=self.period,
             suffix_tail=self.safescale.tail_start_ms,
+            # TSS suffix (2026-10-29): the suffix after each model's last pod-set change.
+            suffix_change=self.signal_state.change_ms,
         )
         self.box = SnapshotBox()
         self.queue = _Queue(self)
@@ -347,16 +356,19 @@ class Sim:
                 for _ in range(action.delta):
                     self._wake(action.model)
             self.run.events.append((t, f"scale_up:{action.model}:{action.delta}"))
+            self.changes[action.model] = (t, "up")
         elif isinstance(action, ScaleAction):
             pods = [self._pod(n) for n in action.pods] or sorted(
                 (p for p in self.pods if p.model == action.model and p.awake), key=lambda p: -p.gpu)[: -action.delta]
             for pod in pods:
                 pod.awake, pod.hidden = False, False
             self.run.events.append((t, f"scale_down:{action.model}:{len(pods)}"))
+            self.changes[action.model] = (t, "down")
         elif isinstance(action, HideAction):
             for name in action.pods:
                 self._pod(name).hidden = True
             self.run.events.append((t, f"hide:{action.model}"))
+            self.changes[action.model] = (t, "down")
             if self.collector is not None:
                 # The SM confirmed the hide (ActionQueue on_hide_done): anchor + baseline.
                 self.collector.on_hide_done(action.model, tuple(action.pods))
@@ -364,6 +376,7 @@ class Sim:
             for name in set(action.pods) - set(action.keep_hidden):
                 self._pod(name).hidden = False
             self.run.events.append((t, f"unhide:{action.model}"))
+            self.changes[action.model] = (t, "up")
 
     # ---------------------------------------------------------------- the controller
 

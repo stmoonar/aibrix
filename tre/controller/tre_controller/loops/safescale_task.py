@@ -15,7 +15,7 @@ from tre_common.metrics_schema import (
     observed_requests,
 )
 from tre_common.registry import Registry
-from tre_common.window_pods import pooled_p95_ms
+from tre_common.window_pods import pooled_p95_ms, restrict_to_serving
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import (
     _cluster_view_counts,
@@ -160,8 +160,10 @@ def run_safescale_observation_tick(
         if metrics is None:
             events.append(f"safescale_observation_missing:{probe.model}")
             continue
-        # Same serving-pod window as the planner tick (sleeping pods' docs and count out).
-        metrics = serving_window(metrics, cluster_view)
+        # Same serving-pod window as the planner tick (sleeping and hidden pods' docs and
+        # count out), and the probe's own hidden pods out even when the view does not show
+        # the hide yet (TSS suffix rule 5: the donor is judged on its remaining pods only).
+        metrics = _remaining_window(serving_window(metrics, cluster_view), tuple(getattr(probe, "pods", ())))
         observation = _observation_from_metrics(
             snapshot.ts_ms,
             metrics,
@@ -187,7 +189,7 @@ def run_safescale_observation_tick(
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms, **extra)
         events.append(f"safescale_{decision.reason}:{probe.model}")
         early = (getattr(decision, "details", None) or {}).get("early_commit")
-        if early:
+        if early and getattr(decision, "status", "") == "commit":
             # Timer cleanup (2026-10-02): committed before the probe's deadline.
             events.append(
                 f"safescale_early_commit:{probe.model}:elapsed_ms={int(early.get('elapsed_ms', 0))}"
@@ -667,6 +669,18 @@ def _gate_failures(safescale: SafeScaleObserver, model: str, decision) -> tuple[
     return tuple(_terminal_details(safescale, model).get("gate_failures") or ())
 
 
+def _remaining_window(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...]) -> ModelWindowMetrics:
+    """``metrics`` without the docs of ``hidden_pods`` (a probe's pods), the serving
+    count lowered by those still in it; unchanged when none is."""
+    hidden = set(hidden_pods)
+    present = sum(1 for key, pod in (metrics.per_pod or {}).items() if key in hidden or pod.pod in hidden)
+    if not present:
+        return metrics
+    return restrict_to_serving(
+        metrics, sleeping_pods=hidden_pods, routable_pods=max(0, int(metrics.routable_pods) - present)
+    )
+
+
 def remaining_pods_kv_cache(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...] = ()) -> float | None:
     """A12: mean KV-cache fill (0..1) over the donor's pods that still serve - the
     window's pods (sleeping ones already dropped by serving_window) minus the probe's
@@ -853,11 +867,16 @@ def _commands_to_actions(
     sleeping bindings on the GPUs the donor pods free (L4, design 20261028-single-loop)."""
     actions: list[Action] = []
     donor = next((command for command in commands if command.kind == "scale_down"), None)
+    # A TP block's companion pods (2026-10-29): they sleep in the same plan, before the
+    # receivers wake, and free the rest of the receiver's block.
+    companions = tuple(
+        (command.model, pod) for command in commands if command.kind == "companion_sleep" for pod in command.pods
+    )
+    freed = (tuple(donor.pods) if donor is not None else ()) + tuple(pod for _model, pod in companions)
     upscales = tuple(
         ReceiverTarget(
             command.model, int(command.delta), None, _scaling_cap(command.model, registry),
-            hints=_receiver_hints(cluster_view, command.model, donor.pods if donor is not None else (),
-                                  int(command.delta)),
+            hints=_receiver_hints(cluster_view, command.model, freed, int(command.delta)),
         )
         for command in commands
         if command.kind == "scale_up" and command.delta > 0
@@ -877,6 +896,7 @@ def _commands_to_actions(
                 drain_budget_s=donor.drain_budget_s,
                 request_id=request_id,
                 decided_ms=decided_ms,
+                companions=companions,
             )
         )
     elif upscales:
@@ -945,6 +965,7 @@ def recovered_actions(probe) -> tuple[Action, ...]:
                 request_id=probe.request_id,
                 # B8: aged from the original decision, not from the re-submission.
                 decided_ms=getattr(probe, "committing_ms", None),
+                companions=tuple(getattr(probe, "companions", ()) or ()),
             ),
         )
     return (

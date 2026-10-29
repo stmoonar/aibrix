@@ -22,7 +22,8 @@ Poisson). Checked:
   (``span - TOL <= delay <= span + P + tick``; a rule that counts windows is 5x
   shorter at 2 s, one that waits for windows 5x longer at 10 s): the stale snapshot
   (20 s hold), the rollback-retry floor (20 s of new evidence), the direct-path early
-  commit (20 s of post-hide observation with the gateway clock 4 s ahead: measured on
+  commit (``scaling.settle_ms`` = 10 s of post-hide observation since 2026-10-29, 20 s
+  before; with the gateway clock 4 s ahead: measured on
   the gateway clock only, the data a snapshot carries is 4 s older on the controller
   clock). (The saturation rescue and the O1 warm rule were removed 2026-10-29, TSS
   only - docs/design/20261029-tss-only.md.)
@@ -50,13 +51,20 @@ SCENARIOS = {
     # nothing for ~20 s while the queue grows, then CRITICAL; a 40 s gateway stall.
     "spike": ps.Scenario(demand={"r": ((0, 8.0),), "d": ((0, 0.0), (60, 40.0))}, awake=("r", "d", "d", "d"),
                          duration_s=300, stalls=((260, 300),)),
-    # d HIGH on 3 pods: the first probe commits (~32 s). The 20 s window still shows the
-    # old count, so d stays HIGH and a second shrink probe starts in the same tick; it
-    # overloads the last pod and is rolled back ~40 s later (~72-78 s). User decision
-    # 2026-10-29: not guarded, observed in the smoke instead (design
-    # docs/design/20261029-tss-only.md). 105 s, not 170 s: a third probe (~112-121 s)
-    # sits on the gate's edge and commits or rolls back by period, so a longer run
-    # would compare noise, not period invariance.
+    # d HIGH on 3 pods: the first probe commits (~32 s). Its commit sleeps a pod that was
+    # already hidden, so d's pod set does not change: Z is the suffix since the hide (2
+    # pods), d stays HIGH and a second shrink probe starts at once; it overloads the last
+    # pod and is rolled back ~40 s later (~72-78 s). User decision 2026-10-29: not
+    # guarded, observed in the smoke instead (design docs/design/20261029-tss-only.md).
+    # 105 s, not 170 s: a third probe sits on the gate's edge and commits or rolls back
+    # by period, so a longer run would compare noise, not period invariance.
+    # TSS suffix (2026-10-29): that third probe now STARTS at ~102 s at P = 10 s and
+    # after 105 s at P <= 5 s. The rollback's unhide is a pod-set change; the retry is
+    # judged on the suffix since it, which starts at the first P-grid boundary after the
+    # unhide (8 s later at P = 10 s, < 1 s at P = 1 s). d's e2e (~20 s) is longer than
+    # settle_ms, so the 1 s suffix still holds more of the post-unhide transient and
+    # reads a lower Z (1.46 vs 1.85 at 100 s): only P = 10 s clears the retry margin.
+    # _key_delays compares the first two probe starts of this scenario.
     "shrink": ps.Scenario(demand={"r": ((0, 8.0),), "d": ((0, 9.0),)}, awake=("r", "d", "d", "d"),
                           duration_s=105),
     # d HIGH on 2 pods: the probe overloads the last pod and rolls back; the same
@@ -98,6 +106,9 @@ def _key_delays(name: str, run: ps.Run) -> dict[str, list[int]]:
     the delays of the events before it)."""
     starts = _times(run, lambda e: "safescale_probe_started:" in e)
     verdicts = [t for t, e in run.events if e in run.verdicts]
+    if name == "shrink":
+        # The third probe's start is on the retry margin's edge (SCENARIOS["shrink"]).
+        starts = starts[:2]
     delays: dict[str, list[int]] = {
         "probe_start": [t - ps.T0 for t in starts],
         # A verdict and the next probe start can share a tick (the verdict is logged
@@ -132,9 +143,10 @@ def _ground_truth(name: str, run: ps.Run, period: int) -> list[tuple[str, int, i
         hides = _times(run, lambda e: e == "hide:r")
         for commit in _times(run, lambda e: e.startswith("safescale_early_commit:r")):
             hide = max(t for t in hides if t <= commit)
-            # 20 s observed on the gateway clock from the first doc boundary after the
-            # hide (<= one period later); a snapshot's data is GATEWAY_AHEAD_MS old.
-            out.append(("early_commit", commit - hide, 20_000 + GATEWAY_AHEAD_MS,
+            # settle_ms (10 s, 2026-10-29; 20 s before) observed on the gateway clock
+            # from the first doc boundary after the hide (<= one period later); a
+            # snapshot's data is GATEWAY_AHEAD_MS old.
+            out.append(("early_commit", commit - hide, 10_000 + GATEWAY_AHEAD_MS,
                         2 * period + SAFESCALE_TICK_MS))
     return out
 

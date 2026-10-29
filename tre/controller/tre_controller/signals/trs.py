@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Collection, Mapping
 
-from tre_common.metrics_schema import ModelWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, observed_of
+from tre_common.persistence import span_reaches
 from tre_common.registry import TrsParams
 from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window_is_idle
+
+LOG = logging.getLogger("tre_controller.signals")
+
+#: Registry ``scaling.settle_ms`` default (design docs/design/20261029-tss-suffix.md).
+DEFAULT_SETTLE_MS = 10_000
+#: A pod with fewer instant samples than this in the suffix makes it unknown (rule 3).
+MIN_SUFFIX_SAMPLES_PER_POD = 2
 
 
 @dataclass
@@ -299,6 +309,45 @@ def compute_z_m(trs: float, theta_m: float | None) -> float | None:
 _compute_z_m = compute_z_m
 
 
+@dataclass(frozen=True)
+class SuffixWindow:
+    """The window a model's Z is computed on this tick (TSS suffix, 2026-10-29, design
+    docs/design/20261029-tss-suffix.md).
+
+    * No change of the model's pod set inside the metrics window: ``metrics`` is the
+      whole window, ``scale`` 1.0, ``change_ms`` None.
+    * Otherwise the store's suffix that starts first at or after the change
+      (``MetricsStore(suffix_change=...)``): ``metrics`` is that suffix, ``scale`` the
+      whole window's length over the suffix's (its token totals are scaled to a whole
+      window; its queue is the mean of its own samples), ``evidence_ms`` its observed
+      span after the change.
+    * ``settling`` (not None) says why that suffix is not decision-valid yet:
+      ``no_suffix`` (the store has not built one yet), ``settle_span`` (less than
+      ``settle_ms`` observed), ``tokens_unknown``, ``samples`` (a serving pod with fewer
+      than two samples in it, or none). Then Z is unknown, never 0.
+    """
+
+    metrics: ModelWindowMetrics
+    change_ms: int | None = None
+    scale: float = 1.0
+    settling: str | None = None
+    evidence_ms: int = 0
+
+
+def _samples_per_pod_ok(suffix: ModelWindowMetrics, pod_ids: Collection[str] | None) -> bool:
+    """Every serving pod has at least :data:`MIN_SUFFIX_SAMPLES_PER_POD` instant samples
+    in ``suffix`` (``pod_ids`` None: the pods the suffix holds; an empty suffix fails)."""
+    by_name = {getattr(pod, "pod", key) or key: pod for key, pod in (suffix.per_pod or {}).items()}
+    names = set(pod_ids) if pod_ids is not None else set(by_name)
+    if not names:
+        return False
+    for name in names:
+        pod = by_name.get(name)
+        if pod is None or len(tuple(getattr(pod, "instant_ticks_ms", ()) or ())) < MIN_SUFFIX_SAMPLES_PER_POD:
+            return False
+    return True
+
+
 class SignalState:
     """Per-model registry of stateful ``TRSComputer`` instances shared across the
     decision loop and the SafeScale loop (S1.3 / ADR-0011; one decision loop since
@@ -315,12 +364,33 @@ class SignalState:
     idle-gap rule clears an EMA when a sample arrives more than one metrics window after
     the last advancing sample.
 
-    TSS only (2026-10-29, design docs/design/20261029-tss-only.md): Z is always computed on
-    the whole sliding window plus this EMA - no breakpoint window, no onset guard, no
-    saturation rescue.
+    **TSS suffix** (2026-10-29, design docs/design/20261029-tss-suffix.md): TSS is the
+    service speed of the model's current pod set (awake and not hidden). After a change
+    of that set (:meth:`note_pod_sets`: the ``done_ms`` of the controller's own SM call
+    that made it, else the first fleet view showing it) Z is computed on the samples
+    observed since the change only (:meth:`suffix_window`); it decides once that suffix
+    spans ``settle_ms``. Until then the model is *settling* (no action on it, one
+    ``settling_start`` / ``settling_end`` event per episode). The model's EMAs restart at
+    the change and seed on the first decision-valid suffix value. No breakpoint holds,
+    no onset guard, no saturation rescue (design docs/design/20261029-tss-only.md).
+
+    Clock: ``done_ms`` / the view time are controller clock, the suffix is cut on gateway
+    stamps. The two agree when both run on one node (the overlays pin them); a skew of
+    d ms moves the suffix start by d (the evidence floor still counts on gateway
+    ``scraped_ms`` only).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, settle_ms: int = DEFAULT_SETTLE_MS) -> None:
+        self.settle_ms = max(1, int(settle_ms))
+        # model -> (its pod set, the view time it was last seen at; None = synthetic view).
+        self._pod_sets: dict[str, tuple[frozenset[str], int | None]] = {}
+        # model -> time of its last pod-set change (t_c).
+        self._change_ms: dict[str, int] = {}
+        # model -> the change its EMAs were last restarted at.
+        self._ema_change: dict[str, int] = {}
+        # model -> the change of its open settling episode.
+        self._settling: dict[str, int] = {}
+        self._events: list[str] = []
         self._by_model: dict[str, TRSComputer] = {}
         # One EMA per (model, alternative signal), same tau/alpha as the TSS EMA
         # (plan §6.9 item 4); see tre_controller.signals.sources._thresholded_signal.
@@ -380,6 +450,111 @@ class SignalState:
             return None
         ema.update(None, window_end_ms, window_ms, idle)
         return ema.value
+
+    # ------------------------------------------------------------ pod-set changes
+
+    def note_pod_sets(
+        self,
+        pod_sets: Mapping[str, Collection[str]],
+        *,
+        view_ms: int | None,
+        done_ms: Mapping[str, int] | None = None,
+    ) -> None:
+        """Record each model's pod set (awake, not hidden) of a fleet view produced at
+        ``view_ms`` (its ``state_ms``; None = a synthetic view). A changed set is dated at
+        ``done_ms[model]`` - the controller's own last SM call on the model that changed
+        its pod set (wake / sleep done, hide confirmed, unhide done) - when that returned
+        no earlier than the view that showed the old set and not after this view; else (SM
+        self-heal, recovery, an external change) at ``view_ms``, the first view showing
+        it. Without either time the change is not dated (no suffix). The first view of a
+        model (a start / restart) dates nothing. An older view than one seen is ignored."""
+        for model, pods in pod_sets.items():
+            pods = frozenset(pods)
+            previous = self._pod_sets.get(model)
+            if previous is not None and view_ms is not None and previous[1] is not None and view_ms < previous[1]:
+                continue
+            self._pod_sets[model] = (pods, view_ms)
+            if previous is None or previous[0] == pods:
+                continue
+            hint = (done_ms or {}).get(model)
+            prior_view = previous[1]
+            if hint is not None and (prior_view is None or int(hint) >= prior_view) and (
+                view_ms is None or int(hint) <= view_ms
+            ):
+                change = int(hint)
+            elif view_ms is not None:
+                change = int(view_ms)
+            else:
+                continue
+            if change >= self._change_ms.get(model, change):
+                self._change_ms[model] = change
+
+    def change_ms(self, model: str) -> int | None:
+        """``model``'s last pod-set change (t_c), None = none seen by this process."""
+        return self._change_ms.get(model)
+
+    def suffix_window(
+        self, model: str, metrics: ModelWindowMetrics, pod_ids: Collection[str] | None = None
+    ) -> SuffixWindow:
+        """The part of ``metrics`` (a serving window) a decision reads (:class:`SuffixWindow`):
+        the whole window unless the model's pod set changed inside it; then the suffix
+        after the change, decision-valid once its observed span after the change reaches
+        ``settle_ms``, its tokens are known and every serving pod (``pod_ids``, else the
+        suffix's pods) has two samples in it. The EMAs restart once per change (the first
+        read that sees it). Settling episodes are logged once at start and end."""
+        start, end = int(metrics.window_start_ms), int(metrics.window_end_ms)
+        change = self._change_ms.get(model)
+        if change is None or change <= start or end <= start:
+            self._end_settling(model, "window_passed")
+            return SuffixWindow(metrics)
+        if self._ema_change.get(model) != change:
+            self._ema_change[model] = change
+            self.reset_ema(model)
+        candidates = [
+            item for item in metrics.suffix_windows
+            if start < int(item.window_start_ms) < end and int(item.window_start_ms) >= change
+        ]
+        if not candidates:
+            return self._settle(model, change, SuffixWindow(metrics, change_ms=change, settling="no_suffix"))
+        suffix = min(candidates, key=lambda item: int(item.window_start_ms))
+        evidence = observed_of(suffix).since(change)
+        window = SuffixWindow(
+            suffix, change_ms=change, scale=float(end - start) / float(end - int(suffix.window_start_ms)),
+            evidence_ms=evidence,
+        )
+        if not span_reaches(evidence, self.settle_ms):
+            reason = "settle_span"
+        elif suffix.prompt_tokens is None or suffix.generation_tokens is None:
+            reason = "tokens_unknown"
+        elif not _samples_per_pod_ok(suffix, pod_ids):
+            reason = "samples"
+        else:
+            self._end_settling(model, f"valid:evidence_ms={evidence}")
+            return window
+        return self._settle(model, change, SuffixWindow(
+            suffix, change_ms=change, scale=window.scale, settling=reason, evidence_ms=evidence,
+        ))
+
+    def _settle(self, model: str, change: int, window: SuffixWindow) -> SuffixWindow:
+        if self._settling.get(model) != change:
+            self._settling[model] = change
+            self._event({"event": "settling_start", "model": model, "change_ms": change, "reason": window.settling})
+        return window
+
+    def _end_settling(self, model: str, how: str) -> None:
+        change = self._settling.pop(model, None)
+        if change is not None:
+            self._event({"event": "settling_end", "model": model, "change_ms": change, "how": how})
+
+    def _event(self, record: dict[str, Any]) -> None:
+        LOG.info(json.dumps(record, sort_keys=True))
+        self._events.append(f"{record['event']}:{record['model']}:{record.get('reason') or record.get('how')}")
+
+    def drain_events(self) -> tuple[str, ...]:
+        """Settling episode events since the last call (one start and one end per
+        episode; the decision record carries them)."""
+        events, self._events = tuple(self._events), []
+        return events
 
     def reset_ema(self, model: str) -> None:
         """Clear every EMA of ``model`` (TSS and alternative signals) - the idle reset."""

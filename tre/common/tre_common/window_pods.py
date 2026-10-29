@@ -164,13 +164,15 @@ def restrict_to_serving(
     sleeping_pods: Collection[str],
     routable_pods: int,
 ) -> ModelWindowMetrics:
-    """``metrics`` without the docs of pods the fleet state reports asleep.
+    """``metrics`` without the docs of pods the fleet state reports out of the model's
+    pod set.
 
-    * ``sleeping_pods``: pod names (== SM ``serve_id``) of this model's bindings with
-      ``awake=False``. Only positively-known sleepers are dropped; a pod the fleet state
-      does not list (a just-replaced pod whose docs are still in the window) is kept, so
-      real traffic is never discarded on a stale view. Hidden-but-awake pods (a safescale
-      probe) are kept too: they are still draining the requests they hold.
+    * ``sleeping_pods``: pod names (== SM ``serve_id``) of this model's bindings that are
+      asleep or hidden (the controller's serving window, TSS suffix 2026-10-29: a hidden
+      SafeScale probe pod still drains its requests but is no longer routed to, so it is
+      out of TSS). Only positively-known pods are dropped; a pod the fleet state does not
+      list (a just-replaced pod whose docs are still in the window) is kept, so real
+      traffic is never discarded on a stale view.
     * ``routable_pods``: the authoritative serving count (awake and not hidden); it
       replaces both ``routable_pods`` and ``assigned_replicas`` (TSS replica factor 1,
       per-replica alt signals divide by the serving count).

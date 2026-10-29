@@ -33,7 +33,7 @@ from tre_controller.store.evidence_grid import EvidenceGrid
 LOG = logging.getLogger("tre_controller.safescale")
 
 ProbeStatus = Literal["none", "probing", "commit", "rollback"]
-CommandKind = Literal["hide", "unhide", "scale_down", "scale_up"]
+CommandKind = Literal["hide", "unhide", "scale_down", "scale_up", "companion_sleep"]
 
 
 class ProbeStore(Protocol):
@@ -198,6 +198,24 @@ class SafeScaleProbe:
     #: capacity rollback keeps them as the evidence a retry must beat. None = unknown.
     start_z_m: float | None = None
     start_routable: int | None = None
+    #: TP block (2026-10-29, design 20261029-tss-suffix rules 5-6): (model, serve id) of
+    #: pods of OTHER models that sleep in this probe's commit plan, before the receiver
+    #: wakes - the block's immediate IDLE / HIGH pods (they keep serving until then, so a
+    #: rollback wastes none) and, at a joint commit, the partner probes' hidden pods.
+    #: Their models are busy (no planner donor) while the probe is unresolved.
+    companions: tuple[tuple[str, str], ...] = ()
+    #: A joint TP block: every probe of the block carries its id. The block commits when
+    #: the last of them passes its gate (``block_passed`` marks the ones waiting); any
+    #: rollback rolls the others back (``abort_reason`` ``block_partner_rollback``).
+    block_id: str | None = None
+    block_passed: bool = False
+    #: A partner whose pods sleep in another block probe's joint commit: no longer judged,
+    #: resolved with that commit (a failed commit rolls it back).
+    block_committing: bool = False
+
+
+#: The abort reason of a joint-block partner rolled back with its block.
+BLOCK_PARTNER_ROLLBACK = "block_partner_rollback"
 
 
 #: Rollback codes that say the model could not spare the probe pods (the retry needs
@@ -325,8 +343,20 @@ class SafeScaleStateMachine:
 
     def busy_models(self) -> set[str]:
         """Models with a probe in any state: their hidden pods are the probe's
-        (never planner donors, no new probe) until it is resolved."""
-        return set(self._probes)
+        (never planner donors, no new probe) until it is resolved. Also the models of a
+        TP block's companion pods (they sleep at the probe's commit)."""
+        busy = set(self._probes)
+        for probe in self._probes.values():
+            busy.update(model for model, _pod in probe.companions)
+        return busy
+
+    def block_partners(self, probe: SafeScaleProbe) -> tuple[SafeScaleProbe, ...]:
+        """The other unresolved probes of ``probe``'s joint TP block (none without one)."""
+        if probe.block_id is None:
+            return ()
+        return tuple(
+            other for other in self._probes.values() if other.block_id == probe.block_id and other.model != probe.model
+        )
 
     def mark_committing(
         self,
@@ -428,7 +458,7 @@ class SafeScaleStateMachine:
         observation ms) of the planner tick's decision window. A model is free again once
 
         * round 4: the observations after the rollback span the evidence floor
-          (``early_commit_min_evidence_ms`` = ``scaling.min_evidence_ms``; else
+          (``rollback_retry_min_evidence_ms`` = ``scaling.min_evidence_ms``; else
           ``no_new_evidence``) - a window that merely ends after the rollback came 5x
           sooner at a 2 s evidence period than at 10 s,
         * and, after a capacity rollback (:data:`CAPACITY_ROLLBACK_CODES`), its routable
@@ -439,7 +469,7 @@ class SafeScaleStateMachine:
         whose starting Z is unknown takes the Z of the first window with enough evidence
         after it."""
         margin = float(getattr(self._config, "rollback_retry_z_margin", 0.25) or 0.0)
-        floor = max(0, int(getattr(self._config, "early_commit_min_evidence_ms", 20_000) or 0))
+        floor = max(0, int(getattr(self._config, "rollback_retry_min_evidence_ms", 20_000) or 0))
         holds: dict[str, str] = {}
         for model, evidence in list(self._rollback_evidence.items()):
             z, routable, observed = signals.get(model, (None, None, None))
@@ -477,7 +507,11 @@ class SafeScaleStateMachine:
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
         window_inputs: ProbeWindowInputs | None = None,
+        companions: tuple[tuple[str, str], ...] = (),
+        block_id: str | None = None,
     ) -> SafeScaleDecision:
+        """Start a probe of ``model`` hiding ``pods``. ``companions`` / ``block_id``: a TP
+        block's immediate pods and joint-block id (:class:`SafeScaleProbe`)."""
         if model in self._probes:
             return SafeScaleDecision(status="probing", reason="probe_already_active")
         if not pods:
@@ -502,6 +536,8 @@ class SafeScaleStateMachine:
             start_wall_ms=self._wall_ms(),
             start_z_m=_optional_float(inputs.z_m),
             start_routable=_optional_int(inputs.routable_pods),
+            companions=tuple((str(m), str(p)) for m, p in companions),
+            block_id=block_id,
         )
         self._probes[model] = probe
         self._persist_probe(probe)
@@ -831,6 +867,9 @@ class SafeScaleStateMachine:
             return SafeScaleDecision(status="none", reason="probe_not_found")
         if probe.status != "probing":
             return SafeScaleDecision(status="none", reason="probe_committing")
+        if probe.block_committing and probe.abort_reason is None:
+            # Its pods sleep in a block partner's joint commit: resolved with it.
+            return SafeScaleDecision(status="none", reason="block_commit_pending")
 
         key = _observation_key(observation)
         is_new = all(_observation_key(seen) != key for seen in probe.observations)
@@ -849,11 +888,12 @@ class SafeScaleStateMachine:
                 rollback_reason={"code": "preempted", "detail": updated.preempt_reason},
             )
         if updated.abort_reason is not None:
+            code = BLOCK_PARTNER_ROLLBACK if updated.abort_reason == BLOCK_PARTNER_ROLLBACK else "hide_failed"
             return self._rollback_now(
                 updated,
                 reason=updated.abort_reason,
                 details={"aborted": updated.abort_reason},
-                rollback_reason={"code": "hide_failed", "detail": updated.abort_reason},
+                rollback_reason={"code": code, "detail": updated.abort_reason},
             )
         wall_now: int | None = None
         if self._direct_live(updated):
@@ -1476,8 +1516,8 @@ class SafeScaleStateMachine:
         hidden pods have nothing in flight - the gateway's in-flight count of the live
         plugin instances and vLLM running + waiting both known and 0 - and (d) one
         evidence floor: the newest snapshot window was observed for
-        ``early_commit_min_evidence_ms`` (= ``scaling.min_evidence_ms``, the O1 warm
-        rule) after the hide (round 5: its newest observation minus the first gateway
+        ``early_commit_min_evidence_ms`` (= ``scaling.settle_ms``, 2026-10-29: the
+        remaining pods' post-hide suffix decides once it spans the settle span) after the hide (round 5: its newest observation minus the first gateway
         doc boundary after the hide, both on the gateway clock; not a count of post-hide
         doc boundaries) AND at least the donor's
         p95 end-to-end latency passed since the hide confirmation (the remaining pods'
@@ -1512,7 +1552,7 @@ class SafeScaleStateMachine:
         # new steady state); the observed post-hide span below is the other half.
         inputs = (probe.window_terms or {}).get("inputs") or {}
         p95_e2e = _optional_float(inputs.get("p95_e2e_ms")) if isinstance(inputs, dict) else None
-        min_evidence_ms = max(1, int(getattr(cfg, "early_commit_min_evidence_ms", 20_000) or 1))
+        min_evidence_ms = max(1, int(getattr(cfg, "early_commit_min_evidence_ms", 10_000) or 1))
         min_elapsed = float(p95_e2e or 0.0)
         if elapsed < min_elapsed:
             return None
@@ -1750,6 +1790,34 @@ class SafeScaleStateMachine:
         return restored
 
     def _commit(self, probe: SafeScaleProbe, *, reason: str) -> SafeScaleDecision:
+        """The commit decision: sleep the hidden probe pods, then the companion pods,
+        then wake the receivers - one SM plan (the queue's :class:`SafeScaleCommitAction`).
+        A joint TP block (rule 6): until every partner passed its gate the probe waits
+        (``block_passed``, status probing, reason ``block_waiting``); the last one to pass
+        commits the whole block - every partner's hidden pods become companions of this
+        commit, the receivers its promises - and the partners are ``block_committing``."""
+        partners = self.block_partners(probe)
+        if partners and any(not other.block_passed or other.status != "probing" for other in partners):
+            waiting = replace(probe, block_passed=True)
+            self._probes[probe.model] = waiting
+            self._persist_probe(waiting)
+            return SafeScaleDecision(status="probing", reason="block_waiting")
+        if partners:
+            companions = list(probe.companions)
+            pending = dict(probe.pending_upscales)
+            for other in partners:
+                companions.extend((other.model, pod) for pod in other.pods)
+                companions.extend(other.companions)
+                for model, delta in other.pending_upscales.items():
+                    pending[model] = pending.get(model, 0) + int(delta)
+                joined = replace(other, block_committing=True)
+                self._probes[other.model] = joined
+                self._persist_probe(joined)
+            probe = replace(
+                probe, companions=tuple(dict.fromkeys(companions)), pending_upscales=pending, block_passed=True,
+            )
+            self._probes[probe.model] = probe
+            self._persist_probe(probe)
         # Review F2/F3: commit sleeps exactly the hidden probe pods (binding-level power).
         # A model-level scale_down(-n) let the SM pick the tail of `awake`, which could
         # sleep a serving pod and leave the hidden one awake as an orphan.
@@ -1769,6 +1837,8 @@ class SafeScaleStateMachine:
                 ),
             )
         ]
+        for model, pod in probe.companions:
+            commands.append(SafeScaleCommand(kind="companion_sleep", model=model, pods=(pod,), delta=-1, reason=reason))
         for model, delta in sorted(probe.pending_upscales.items()):
             commands.append(
                 SafeScaleCommand(kind="scale_up", model=model, delta=delta, reason="safescale_followup_upscale")
@@ -1776,6 +1846,7 @@ class SafeScaleStateMachine:
         return SafeScaleDecision(status="commit", reason=reason, commands=tuple(commands))
 
     def _rollback(self, probe: SafeScaleProbe, *, reason: str) -> SafeScaleDecision:
+        self._abort_partners(probe)
         return SafeScaleDecision(
             status="rollback",
             reason=reason,
@@ -1800,6 +1871,13 @@ class SafeScaleStateMachine:
             resolved_ts=float(now_ms) / 1000.0,
         )
         self._probes.pop(model, None)
+        if status == "commit":
+            # A joint commit done: its partners' pods slept in it.
+            for other in self.block_partners(probe):
+                if other.block_committing:
+                    self.resolve(other.model, status="commit", reason=f"block_commit:{reason}", now_ms=now_ms)
+        else:
+            self._abort_partners(probe)
         # A preemption for the model's own scale-up is not a failed probe: no evidence
         # hold. A commit clears the previous rollback's evidence.
         if status == "rollback" and probe.preempt_reason is None:
@@ -1814,6 +1892,16 @@ class SafeScaleStateMachine:
         elif status == "commit":
             self._rollback_evidence.pop(model, None)
         return True
+
+    def _abort_partners(self, probe: SafeScaleProbe) -> None:
+        """Rule 6: a block probe rolled back (any path) rolls its partners back - the next
+        SafeScale tick unhides them (``abort_reason`` ``block_partner_rollback``)."""
+        for other in self.block_partners(probe):
+            if other.status != "probing" or other.abort_reason is not None:
+                continue
+            aborted = replace(other, abort_reason=BLOCK_PARTNER_ROLLBACK, block_committing=False)
+            self._probes[other.model] = aborted
+            self._persist_probe(aborted)
 
     def _persist_probe(self, probe: SafeScaleProbe, *, terminal_reason: str | None = None) -> None:
         if self._store is None:
@@ -2369,6 +2457,12 @@ def _probe_record(
         record["start_routable"] = probe.start_routable
     if probe.direct is not None:
         record["direct_evidence"] = probe.direct.as_record()
+    if probe.companions:
+        record["companions"] = [list(item) for item in probe.companions]
+    if probe.block_id is not None:
+        record["block_id"] = probe.block_id
+        record["block_passed"] = probe.block_passed
+        record["block_committing"] = probe.block_committing
     if probe.resolution is not None and status == "committing":
         record["resolution"] = probe.resolution
         record["resolution_reason"] = probe.resolution_reason
@@ -2454,6 +2548,13 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         direct=DirectState.from_record(row.get("direct_evidence")),
         start_z_m=_optional_float(row.get("start_z_m")),
         start_routable=_optional_int(row.get("start_routable")),
+        companions=tuple(
+            (str(item[0]), str(item[1])) for item in row.get("companions") or ()
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        ),
+        block_id=str(row["block_id"]) if row.get("block_id") else None,
+        block_passed=bool(row.get("block_passed", False)),
+        block_committing=bool(row.get("block_committing", False)),
         **_committing_fields(row),
     )
 

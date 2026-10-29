@@ -72,6 +72,7 @@ class MetricsStore:
         min_latency_samples: int = 0,
         suffix_period_ms: int = 0,
         suffix_tail: Callable[[str], int | None] | None = None,
+        suffix_change: Callable[[str], int | None] | None = None,
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
@@ -121,6 +122,11 @@ class MetricsStore:
         # or before the window start: the whole window is post-hide, no suffix needed).
         # None = every grid-aligned suffix (offline tools, tests).
         self._suffix_tail = suffix_tail
+        # TSS suffix (2026-10-29, design 20261029-tss-suffix): model -> its last pod-set
+        # change (SignalState.change_ms); the suffix starting at the first boundary at or
+        # after it is built too, when that lies inside the window. A change first seen
+        # after the read gets its suffix with the next snapshot.
+        self._suffix_change = suffix_change
 
     @property
     def redis_client(self) -> Any:
@@ -345,24 +351,28 @@ class MetricsStore:
         return model_metrics
 
     def _suffix_starts(self, model: str, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
-        """Gateway boundaries strictly inside an aligned window (suffix starts) - with a
-        tail source only the SafeScale tail's (round 5: the first boundary at or after the
-        probe's post-hide start, gateway doc domain); () when suffixes are off or the
-        window is not on the suffix grid."""
+        """Gateway boundaries strictly inside an aligned window (suffix starts) - with
+        suffix sources only theirs: the SafeScale tail's (round 5: the first boundary at
+        or after the probe's post-hide start, gateway doc domain) and the TSS suffix's
+        (the first boundary at or after the model's last pod-set change); () when
+        suffixes are off or the window is not on the suffix grid."""
         period = self._suffix_period_ms
         if period <= 0 or window_start_ms % period or window_end_ms % period:
             return ()
-        if self._suffix_tail is None:
+        if self._suffix_tail is None and self._suffix_change is None:
             return tuple(range(window_start_ms + period, window_end_ms, period))
-        try:
-            tail = self._suffix_tail(model)
-        except Exception:  # noqa: BLE001 - no tail suffix: the gate finds no tail evidence
-            LOG.warning("SafeScale tail: post-hide start of %s unreadable", model, exc_info=True)
-            tail = None
-        if tail is None:
-            return ()
-        start = -(-int(tail) // period) * period  # first grid boundary >= the post-hide start
-        return (start,) if window_start_ms < start < window_end_ms else ()
+        starts: set[int] = set()
+        for name, source in (("SafeScale tail", self._suffix_tail), ("TSS suffix", self._suffix_change)):
+            if source is None:
+                continue
+            try:
+                point = source(model)
+            except Exception:  # noqa: BLE001 - no suffix: the reader finds no post-change evidence
+                LOG.warning("%s: start of %s unreadable", name, model, exc_info=True)
+                point = None
+            if point is not None:
+                starts.add(-(-int(point) // period) * period)  # first grid boundary >= the point
+        return tuple(sorted(start for start in starts if window_start_ms < start < window_end_ms))
 
     def read_latest_instant(
         self, model: str, now_ms: int

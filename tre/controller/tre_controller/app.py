@@ -297,8 +297,9 @@ def create_controller_dependencies(
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
     scaling_config = registry.scaling() if callable(getattr(registry, "scaling", None)) else None
-    # TSS only (2026-10-29): Z on the whole sliding window plus the shared EMA.
-    signal_state = SignalState()
+    # TSS suffix (2026-10-29, design 20261029-tss-suffix): Z on the window since the
+    # model's last pod-set change, decision-valid once that spans scaling.settle_ms.
+    signal_state = SignalState(settle_ms=int(getattr(scaling_config, "settle_ms", 10_000) or 10_000))
     # Round 4: the SafeScale tail span source, bound once the state machine exists.
     tail_start: list = []
     store = MetricsStore(
@@ -320,10 +321,12 @@ def create_controller_dependencies(
         percentile_mode=cfg.percentile_mode,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
-        # The SafeScale commit gate's tail (round 5): the post-hide suffix of a probing
-        # model, aligned to the histogram docs - the only suffix window built.
+        # The suffix windows built, aligned to the histogram docs: the SafeScale commit
+        # gate's tail (round 5: the post-hide suffix of a probing model) and the TSS
+        # suffix (2026-10-29: the part of the window after the model's last pod-set change).
         suffix_period_ms=cfg.evidence_period_ms,
         suffix_tail=lambda model: tail_start[0](model) if tail_start else None,
+        suffix_change=signal_state.change_ms,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -406,6 +409,7 @@ def create_controller_dependencies(
         "slo_mode": cfg.safescale.slo_mode,
         "early_commit": cfg.safescale.early_commit,
         "early_commit_min_evidence_ms": cfg.safescale.early_commit_min_evidence_ms,
+        "rollback_retry_min_evidence_ms": cfg.safescale.rollback_retry_min_evidence_ms,
         "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
     }, sort_keys=True))
     # The effective ablation switches (production: both false).

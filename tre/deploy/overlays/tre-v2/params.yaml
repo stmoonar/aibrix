@@ -629,7 +629,7 @@ data:
       # Z tail, complete evidence of every remaining pod), the hidden pods have nothing in
       # flight (gateway in-flight count of the live plugin instances and vLLM running +
       # waiting, both known and 0), the newest snapshot window was observed
-      # scaling.min_evidence_ms after the hide confirmation (on observation time) and at least the donor's p95 e2e passed since the confirmation
+      # scaling.settle_ms after the hide confirmation (on observation time) and at least the donor's p95 e2e passed since the confirmation
       # (2026-10-06: no W / 2 term, no separate early_commit_min_grids key). Rollback
       # checks are unchanged and run first on every tick. false = commit at the deadline
       # only.
@@ -653,10 +653,16 @@ data:
       # donor_surplus_release: retired 2026-10-07 (F1-B): a HIGH donor gives capacity
       # only through a SafeScale probe; IDLE donors release their whole surplus to the
       # floor at once (code rule since 2026-10-06, Q3). An old key is ignored (warning).
-      # SafeScale evidence floor (ms of gateway scraped_ms observations): after a probe's
-      # hide confirmation before an early commit, and after a rollback before a retry
-      # (min_evidence_grids: N is a deprecated alias = N x 10 s).
+      # SafeScale evidence floor (ms of gateway scraped_ms observations) after a rollback
+      # before a retry (min_evidence_grids: N is a deprecated alias = N x 10 s).
       min_evidence_ms: 20000
+      # TSS suffix (2026-10-29, design docs/design/20261029-tss-suffix.md): after a change
+      # of a model's pod set (awake and not hidden: a wake, sleep, hide or unhide) its Z
+      # is computed on the samples observed since the change only, and decides once that
+      # suffix spans settle_ms (gateway scraped_ms); until then the model is settling - no
+      # action on it in either direction. Also the observed post-hide span a SafeScale
+      # early commit needs.
+      settle_ms: 10000
       # Instant sample coverage (2026-10-25, docs/design/20261025-instant-sampling.md): a
       # pod's coverage = distinct gateway scraped_ms in the window / (window / instant
       # period). Below sample_min_ratio the pod is flagged: no donor / shrink / release for

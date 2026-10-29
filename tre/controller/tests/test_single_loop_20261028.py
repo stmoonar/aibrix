@@ -321,25 +321,34 @@ def test_a_block_of_two_pods_of_one_high_donor_is_not_used():
 
 @pytest.mark.parametrize("mate", [None, "i"])
 def test_scope_all_a_block_with_one_high_donor_is_a_probe_for_the_receiver(mate):
-    # 0-1: HIGH h on GPU 1, GPU 0 free or an IDLE pod (sleeps at once); 2-3 at the floor.
+    # 0-1: HIGH h on GPU 1, GPU 0 free or an IDLE pod; 2-3 at the floor.
     plans, _, machine = _tp2(_binding("h-1", "h", (1,), True),
                              *((_binding("i-0", "i", (0,), True),) if mate else ()),
                              *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)),
                              classes={"h": (*HIGH, 1.4)})
 
-    assert machine.active_probe("h").pending_upscales == {"tp2": 1}
+    probe = machine.active_probe("h")
+    assert probe.pending_upscales == {"tp2": 1}
     assert _wakes(plans, "tp2") == []  # the commit wakes it
-    assert _sleeps(plans) == ([("sleep", "i", ["i-0"], None, None)] if mate else [])
+    # 2026-10-29 (tss-suffix rule 6): the IDLE half sleeps at the probe's commit, not
+    # now - a rollback then wastes no IDLE pod and the receiver gets the whole block.
+    assert _sleeps(plans) == []
+    assert probe.companions == ((("i", "i-0"),) if mate else ())
     assert [item[2] for items in plans for item in items if item[0] == "hide"] == [["h-1"]]
 
 
-def test_scope_all_a_block_that_needs_two_probed_donors_is_skipped():
+def test_scope_all_a_block_that_needs_two_probed_donors_starts_both_probes_as_one_block():
+    # 2026-10-29 (tss-suffix rule 6): two probed donors -> two probes, one block id; the
+    # receiver is promised once, on the leader (commit and rollback: test_tss_suffix_20261029).
     plans, events, machine = _tp2(_binding("s7-0", "s7", (0,), True), _binding("s8-1", "s8", (1,), True),
                                   *(_binding(f"x-{gpu}", "x", (gpu,), True) for gpu in (2, 3)),
                                   classes={"s7": (*HIGH, 1.4), "s8": (*HIGH, 1.5)})
 
-    assert machine.active_probe("s7") is None and machine.active_probe("s8") is None
-    assert plans == [] and "capacity_blocked:tp2" in events
+    s7, s8 = machine.active_probe("s7"), machine.active_probe("s8")
+    assert s7 is not None and s8 is not None and s7.block_id == s8.block_id is not None
+    assert sorted([s7.pending_upscales, s8.pending_upscales], key=len) == [{}, {"tp2": 1}]
+    assert _wakes(plans, "tp2") == [] and _sleeps(plans) == []
+    assert sorted(pod for items in plans for item in items if item[0] == "hide" for pod in item[2]) == ["s7-0", "s8-1"]
 
 
 # ------------------------------------------------------------------ 2. receiver order

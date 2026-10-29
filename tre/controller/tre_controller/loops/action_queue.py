@@ -1137,32 +1137,37 @@ class ActionQueue:
         re-sleeps a donor that slept and re-sends only the pending receivers."""
         action: SafeScaleCommitAction = queued.action
         attempts = queued.failures + 1
-        donor: ScaleAction | None = None
+        sleeps: list[ScaleAction] = []
         members: list = []
-        if not action.donor_done and action.pods:
-            donor = action.donor_sleep()
-            members.append(donor)
+        if not action.donor_done and (action.pods or action.companions):
+            # The donor step: its hidden pods and (a TP block, 2026-10-29) the companion
+            # pods of other models; a retry re-sends every named sleep (idempotent).
+            sleeps = [action.donor_sleep()] if action.pods else []
+            sleeps.extend(action.companion_sleeps())
+            members.extend(sleeps)
         members.extend(action.upscales)
         if not members:
             return None, queued
         run = await self._run_plan(tuple(members))
         failure: DispatchResult | None = None
-        offset = 0
-        if donor is not None:
-            offset = 1
-            result = run.results[0]
-            if not result.ok:
-                if result.changed:
-                    self._record_done(action.donor, donor, result)
-                if result.unconfirmed:
-                    action = replace(
-                        action,
-                        unconfirmed_pods=tuple(dict.fromkeys(action.unconfirmed_pods + result.unconfirmed)),
-                    )
-                failure = result
-            else:
-                self._record_done(action.donor, donor, result)
-                results.append(replace(result, attempts=attempts))
+        offset = len(sleeps)
+        if sleeps:
+            done = True
+            for sleep, result in zip(sleeps, run.results[:offset]):
+                if not result.ok:
+                    if result.changed:
+                        self._record_done(sleep.model, sleep, result)
+                    if result.unconfirmed and sleep.model == action.donor:
+                        action = replace(
+                            action,
+                            unconfirmed_pods=tuple(dict.fromkeys(action.unconfirmed_pods + result.unconfirmed)),
+                        )
+                    failure = failure or result
+                    done = False
+                else:
+                    self._record_done(sleep.model, sleep, result)
+                    results.append(replace(result, attempts=attempts))
+            if done:
                 action = replace(action, donor_done=True)
         remaining: list[ReceiverTarget] = []
         for upscale, result in zip(run.members[offset:], run.results[offset:]):

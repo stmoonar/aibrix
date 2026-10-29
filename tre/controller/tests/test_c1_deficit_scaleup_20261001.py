@@ -245,9 +245,9 @@ def test_shipped_registry_scaling_section(caplog):
     assert registry.scaling() == ScalingRegistryConfig()  # built-in defaults
     raw = yaml.safe_load(open(__import__("pathlib").Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml",
                               encoding="utf-8"))
-    # TSS only (2026-10-29): the SafeScale evidence floor and the sample completeness,
-    # at their built-in defaults.
-    assert set(raw["scaling"]) == {"min_evidence_ms", "sample_min_ratio"}
+    # TSS only (2026-10-29): the SafeScale rollback evidence floor, the TSS suffix settle
+    # span and the sample completeness, at their built-in defaults.
+    assert set(raw["scaling"]) == {"min_evidence_ms", "settle_ms", "sample_min_ratio"}
     assert not hasattr(registry.scaling(), "donor_surplus_release")  # retired 2026-10-07 (F1-B)
     # One step per plan (2026-10-28): a live registry that still carries the retired
     # step keys loads, with one deprecation line.

@@ -9,7 +9,13 @@ from typing import Mapping
 
 from tre_common.rediskeys import EVIDENCE_PERIOD_MS, INSTANT_SAMPLE_INTERVAL_MS, LEGACY_GRID_MS
 from tre_common.alt_signals import alt_basis_errors
-from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
+from tre_common.registry import (
+    EXPECTED_SIGNAL_DIRECTIONS,
+    POD_SERVING_PORT,
+    SafeScaleRegistryConfig,
+    ScalingRegistryConfig,
+    load_registry,
+)
 from tre_controller.loops.metrics_task import REFRESH_MODES
 #: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
 #: logged once and otherwise ignored (no validation): an old overlay still starts.
@@ -122,7 +128,7 @@ class SafeScaleConfig:
     donor_min_requests: float = 20.0
     # Timer cleanup (registry safescale.rollback_retry_z_margin): after a capacity
     # rollback (SLO violation, formal commit gate, donor health) the next receiver-less
-    # HIGH probe of the model needs early_commit_min_evidence_ms of observations after the
+    # HIGH probe of the model needs rollback_retry_min_evidence_ms of observations after the
     # rollback (round 4; any window ending after it before) AND either
     # a routable count different from the one the failed probe started from or a Z at
     # least this much above the Z that started it. Other rollbacks (evidence gaps,
@@ -134,11 +140,14 @@ class SafeScaleConfig:
     # instances and vLLM running + waiting) and the evidence floor holds. Rollbacks
     # unchanged.
     early_commit: bool = True
-    # Q4 (2026-10-06), the single evidence floor = registry scaling.min_evidence_ms (no
-    # separate safescale key; its only reader since 2026-10-29): round 4, the observed
-    # span after the hide confirmation (early commit, with at least the donor's p95 e2e since it) and after a
-    # rollback (the retry hold). No W / 2 term, no separate minimum observation time.
-    early_commit_min_evidence_ms: float = 20_000.0
+    # The observed span after the hide confirmation an early commit needs (with at least
+    # the donor's p95 e2e since it) = registry scaling.settle_ms (2026-10-29, design
+    # 20261029-tss-suffix: the remaining pods' post-hide suffix decides once it spans the
+    # settle span, like every model's Z after a pod-set change). No W / 2 term.
+    early_commit_min_evidence_ms: float = 10_000.0
+    # The observed span after a rollback before a retry (the rollback hold) = registry
+    # scaling.min_evidence_ms (Q4, round 4).
+    rollback_retry_min_evidence_ms: float = 20_000.0
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
     # queued behind a long action, or re-submitted after a controller restart - is not run
@@ -189,7 +198,9 @@ class ControllerConfig:
     ablation_disable_safescale: bool
     #: TRE_SAFESCALE_SCOPE (2026-10-26): which placements run as a SafeScale probe -
     #: ``all``, ``receiverless_shrink`` (only the receiver-less HIGH proactive shrink;
-    #: every other probe placement is released at once, as with ``off``) or ``off``.
+    #: every other probe placement is released at once, as with ``off``),
+    #: ``healthy_and_shrink`` (2026-10-29: HEALTHY donors and the receiver-less HIGH
+    #: shrink probe; a HIGH donor for a receiver is released at once) or ``off``.
     #: ``ablation_disable_safescale`` is ``safescale_scope == "off"``.
     safescale_scope: str
     disable_eta_gate: bool
@@ -330,7 +341,7 @@ class ControllerConfig:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below TRE_EVIDENCE_PERIOD_MS")
 
         safescale_registry = _safescale_registry(registry_path)
-        early_evidence_ms = _min_evidence_ms(registry_path)
+        scaling_registry = _scaling_registry(registry_path)
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
             tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
@@ -355,7 +366,8 @@ class ControllerConfig:
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             early_commit=bool(safescale_registry.early_commit),
-            early_commit_min_evidence_ms=float(early_evidence_ms),
+            early_commit_min_evidence_ms=float(scaling_registry.settle_ms),
+            rollback_retry_min_evidence_ms=float(scaling_registry.min_evidence_ms),
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),
@@ -521,14 +533,14 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
     return SafeScaleConfig.min_window_ms
 
 
-def _min_evidence_ms(registry_path: str) -> int:
-    """Registry scaling.min_evidence_ms (20 s without a readable registry): the SafeScale
-    early commit's post-hide evidence span and the rollback retry hold's (Q4)."""
+def _scaling_registry(registry_path: str) -> ScalingRegistryConfig:
+    """Registry ``scaling:`` (the defaults without a readable registry): ``settle_ms`` is
+    the SafeScale early commit's post-hide span, ``min_evidence_ms`` the rollback retry
+    hold's (Q4)."""
     try:
-        scaling = load_registry(registry_path).scaling()
-        return int(getattr(scaling, "min_evidence_ms", 20_000) or 1)
+        return load_registry(registry_path).scaling()
     except Exception:  # noqa: BLE001 - the registry load fails loudly elsewhere
-        return 20_000
+        return ScalingRegistryConfig()
 
 
 def _get_span_ms(
@@ -627,13 +639,19 @@ def _get_str(env: Mapping[str, str], key: str, default: str) -> str:
 SAFESCALE_SCOPE_ALL = "all"
 SAFESCALE_SCOPE_RECEIVERLESS_SHRINK = "receiverless_shrink"
 SAFESCALE_SCOPE_OFF = "off"
-SAFESCALE_SCOPES = (SAFESCALE_SCOPE_ALL, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK, SAFESCALE_SCOPE_OFF)
+#: 2026-10-29 (design 20261029-tss-suffix): probes = HEALTHY donors (only a CRITICAL
+#: receiver takes them) + the receiver-less HIGH shrink; a HIGH donor for a receiver is an
+#: immediate relay; IDLE donors are immediate as in every scope.
+SAFESCALE_SCOPE_HEALTHY_AND_SHRINK = "healthy_and_shrink"
+SAFESCALE_SCOPES = (
+    SAFESCALE_SCOPE_ALL, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK, SAFESCALE_SCOPE_HEALTHY_AND_SHRINK, SAFESCALE_SCOPE_OFF,
+)
 
 
 def _safescale_scope(env: Mapping[str, str]) -> str:
     """TRE_SAFESCALE_SCOPE (default ``all``). TRE_ABLATION_DISABLE_SAFESCALE=true is
     the alias of ``off``; when both are set they must agree (true with ``off``, false
-    with ``all`` / ``receiverless_shrink``), else the controller refuses to start - an
+    with ``all`` / ``receiverless_shrink`` / ``healthy_and_shrink``), else the controller refuses to start - an
     arm must never run a scope it did not ask for."""
     raw = str(env.get("TRE_SAFESCALE_SCOPE") or "").strip().lower()
     if raw and raw not in SAFESCALE_SCOPES:

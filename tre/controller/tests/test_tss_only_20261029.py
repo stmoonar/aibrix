@@ -1,8 +1,8 @@
 """TSS only (2026-10-29, design docs/design/20261029-tss-only.md).
 
-* Z is always the whole sliding window plus the EMA: right after a routable-count change
-  the model decides on the window that still mixes both replica counts, at the next
-  rescue section (no breakpoint hold, no saturation / exempt path, no window-start wait).
+* No breakpoint hold, no saturation / exempt path, no window-start wait. (Superseded on
+  2026-10-29: after a pod-set change Z is the suffix since the change and the model
+  settles for ``scaling.settle_ms`` - design 20261029-tss-suffix, test_tss_suffix_20261029.)
 * The only per-model hold is a correctness guard: an action in flight, or one the fleet
   view does not show yet (view-pending), blocks the model's next action.
 * A LOW receiver takes from IDLE and HIGH donors only - never from a HEALTHY one (TP1
@@ -27,7 +27,6 @@ from tre_common.registry import (
     TrsParams,
 )
 from section_ticks import run_fairness_tick, run_rescue_tick
-from tre_controller.loops.tick import compute_model_signal, serving_window
 from tre_controller.planning.planner import ClusterView, ScaleAction
 from tre_controller.signals.trs import SignalState
 from tre_sm.allocator.slots import Binding, Slot
@@ -115,32 +114,8 @@ def _view(awake: int, *, fetched_ms: int | None, total: int = 4, state_ms: int |
     return ClusterView(topology=_registry().topology(), bindings=bindings, fetched_ms=fetched_ms, state_ms=state_ms)
 
 
-# ------------------------------------------------- (a) the whole window, no hold
-
-
-def test_after_a_routable_change_z_is_the_whole_window_and_the_model_acts_at_once():
-    state, queue, registry = SignalState(), _Queue(), _registry()
-    first = run_rescue_tick(_snap(_window(BASE, [BURST] * 3, routable=1)), queue=queue, registry=registry,
-                            cluster_view=_view(1, fetched_ms=BASE + 500), signal_state=state)
-    assert [(a.model, a.delta) for a in _ups(first.actions)] == [("m", 1)]
-    # The wake completed (BASE + 1 s); the next view shows it (2 routable). The window
-    # still holds the old replica count's grids; a suffix after the change would read
-    # very differently - the decision uses the whole window.
-    queue.last["m"] = (BASE + 1_000, "up")
-    window = _window(BASE + 5_000, [BURST] * 3, routable=2)
-    suffix = _agg(BASE + 5_000 - GRID, BASE + 5_000, [(10.0, 30.0, 20.0, 1.0)], 2)
-    window = replace(window, suffix_windows=(suffix,))
-    view = _view(2, fetched_ms=BASE + 4_000, state_ms=BASE + 3_900)
-    second = run_rescue_tick(_snap(window), queue=queue, registry=registry, cluster_view=view, signal_state=state)
-
-    expected = compute_model_signal(
-        "m", serving_window(window, view), registry.model("m"), signal_source="zm", signal_state=None,
-    ).result.TRS_raw
-    ctx = second.model_contexts["m"]
-    assert ctx["trs_raw"] == expected and ctx["routable_pods"] == 2
-    assert second.classifications["m"].state.value == "critical"
-    assert [(a.model, a.delta) for a in _ups(second.actions)] == [("m", 1)]
-    assert not any(event.startswith("view_pending_hold:") for event in second.events)
+# (a) "the whole window, no hold" was replaced on 2026-10-29 by the TSS suffix: after a
+# pod-set change the model settles for scaling.settle_ms (test_tss_suffix_20261029).
 
 
 # ------------------------------------------------- (d) in flight / view-pending

@@ -323,9 +323,9 @@ def _busy(h: _CriticalHarness) -> _CriticalHarness:
 
 def test_a_critical_model_waives_the_hidden_drain_only():
     at, decision = _busy(_CriticalHarness(critical=("r",))).run_until(HIDE + LONG_W, serve=5)[-1]
-    # The evidence floor (20 samples, two post-hide grids 110-130 s) -> the 131 s poll,
+    # The evidence floor (settle_ms = 10 s after the hide, 20 samples) -> the 121 s poll,
     # although the hidden pod is not drained.
-    assert (at, decision.status) == (131_000, "commit")
+    assert (at, decision.status) == (121_000, "commit")
     early = decision.details["early_commit"]
     assert early["critical_receivers"] == ["r"] and early["hidden_drained"] is False
 

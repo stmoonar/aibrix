@@ -12,9 +12,14 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, obser
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
-from tre_controller.config import SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
-from tre_controller.loops.action_queue import PlanBatch, block_sleeps, receiver_upscales, transfer_plan
-from tre_controller.planning.classify import classify_all_models, model_control_configs_from_registry
+from tre_controller.config import SAFESCALE_SCOPE_HEALTHY_AND_SHRINK, SAFESCALE_SCOPE_RECEIVERLESS_SHRINK
+from tre_controller.loops.action_queue import PlanBatch, receiver_upscales, transfer_plan
+from tre_controller.planning.classify import (
+    ModelRole,
+    ModelState,
+    classify_all_models,
+    model_control_configs_from_registry,
+)
 from tre_controller.planning.planner import (
     BlockSupplyAction,
     IMMEDIATE_DONOR_SLEEP_PATH,
@@ -37,8 +42,8 @@ from tre_controller.planning.safescale import (
     SafeScaleDecision,
     format_window_event,
 )
-from tre_controller.signals.sources import get_signal, per_replica_token_rate
-from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput, zero_tokens_unconfirmed
+from tre_controller.signals.sources import SignalValue, get_signal, per_replica_token_rate
+from tre_controller.signals.trs import SignalState, SuffixWindow, TRSComputer, TRSInput, zero_tokens_unconfirmed
 from tre_sm.allocator.slots import natural_key, release_order
 
 
@@ -57,6 +62,8 @@ class SafeScaleController(Protocol):
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
         window_inputs: ProbeWindowInputs | None = None,
+        companions: tuple[tuple[str, str], ...] = (),
+        block_id: str | None = None,
     ) -> SafeScaleDecision: ...
 
 
@@ -156,7 +163,10 @@ def run_planner_tick(
     """One planner tick. ``safescale_scope`` (TRE_SAFESCALE_SCOPE, 2026-10-26):
     ``receiverless_shrink`` keeps a probe only for the receiver-less HIGH proactive
     shrink (:func:`_receiverless_shrink`); a donor planned for a receiver is a relay and
-    a TP block sleeps its donor pods at once, as with SafeScale off. ``observe_mode`` (controller mode ``observe``, B8): the
+    a TP block sleeps its donor pods at once, as with SafeScale off.
+    ``healthy_and_shrink`` (2026-10-29): probes for HEALTHY donors (CRITICAL receivers
+    only) and the receiver-less HIGH shrink; a HIGH donor for a receiver is a relay
+    (``PlanConfig.relay_high_donors``). ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
@@ -200,6 +210,9 @@ def run_planner_tick(
         _ru_u0, _ru_s0 = prof.rusage_ms()
         _phase_t0 = _tick_t0
 
+    if signal_state is not None and cluster_view is not None:
+        # TSS suffix (2026-10-29): date every pod-set change the fleet view shows.
+        _note_pod_sets(signal_state, snapshot, queue, cluster_view)
     contexts, paper_events = _model_contexts(
         snapshot,
         registry,
@@ -216,6 +229,18 @@ def run_planner_tick(
         model_control_configs=model_control_configs_from_registry(registry, signal_source),
         signal_idle_rps_eps=signal_idle_rps_eps,
     )
+    # TSS suffix (2026-10-29, design 20261029-tss-suffix rule 3): a settling model takes
+    # no action in either direction - no receiver, no donor, no probe. It is reported
+    # UNKNOWN (the commit revalidation then keeps a plan) and left out of the plan; its
+    # episode is logged once at start and end (SignalState), not per plan.
+    settling = {model for model, ctx in contexts.items() if ctx.get("settling")}
+    if settling:
+        classifications = [
+            replace(item, state=ModelState.UNKNOWN, role=ModelRole.UNKNOWN, Z_m=None, signal_idle=False)
+            if item.model_name in settling else item
+            for item in classifications
+        ]
+    settling_events = signal_state.drain_events() if signal_state is not None else ()
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -233,11 +258,12 @@ def run_planner_tick(
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
         release_without_safescale=safescale is None or safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK,
+        relay_high_donors=safescale_scope == SAFESCALE_SCOPE_HEALTHY_AND_SHRINK,
         defrag_enabled=_defrag_enabled(registry),
     )
     plan = build_plan(
         model_contexts=contexts,
-        classifications=classifications,
+        classifications=[item for item in classifications if item.model_name not in settling],
         model_replicas=replicas,
         idle_gpus=_idle_gpus(snapshot, registry, cluster_view),
         cfg=cfg,
@@ -322,7 +348,7 @@ def run_planner_tick(
         submitted=len(actions),
         actions=actions,
         events=(
-            paper_events + reserve_events + tuple(plan.events)
+            paper_events + settling_events + reserve_events + tuple(plan.events)
             + safescale_events + queue_events
         ),
         model_contexts=contexts,
@@ -458,6 +484,37 @@ def _drain_queue_events(queue: PlannerQueue) -> list[str]:
     return list(drain()) if callable(drain) else []
 
 
+def _note_pod_sets(
+    signal_state: SignalState, snapshot: MetricsSnapshot, queue: PlannerQueue, cluster_view: ClusterView
+) -> None:
+    """TSS suffix (2026-10-29): hand the fleet view's pod set of every model (awake and
+    not hidden: :func:`_routable_pod_ids`) to :meth:`SignalState.note_pod_sets`, with the
+    view's time and the ``done_ms`` of each model's last routable-changing SM call of
+    ours (``ActionQueue.view_changes`` / ``last_actions``, the later one - the same
+    sources as the view-pending guard)."""
+    routable = _routable_pod_ids(cluster_view) or {}
+    models = set(snapshot.models) | {binding.model for binding in cluster_view.bindings}
+    signal_state.note_pod_sets(
+        {model: routable.get(model, frozenset()) for model in models},
+        view_ms=_view_bound(cluster_view),
+        done_ms={model: done for model, (done, _direction) in _last_changes(queue).items()},
+    )
+
+
+def _last_changes(queue: PlannerQueue) -> dict[str, tuple[int, str]]:
+    """model -> (done_ms, direction) of its last routable-changing SM call of ours."""
+    latest: dict[str, tuple[int, str]] = {}
+    for source in ("view_changes", "last_actions"):
+        read = getattr(queue, source, None)
+        if not callable(read):
+            continue
+        for model, (done_ms, direction) in read().items():
+            current = latest.get(model)
+            if current is None or int(done_ms) > current[0]:
+                latest[model] = (int(done_ms), str(direction))
+    return latest
+
+
 def _view_pending(queue: PlannerQueue, cluster_view: ClusterView | None) -> dict[str, str]:
     """Correctness guard (timer cleanup 2026-10-02; every model since 2026-10-29): models
     whose last routable-changing SM call returned after the SM state of this tick's fleet
@@ -473,16 +530,7 @@ def _view_pending(queue: PlannerQueue, cluster_view: ClusterView | None) -> dict
     bound = _view_bound(cluster_view)
     if bound is None:
         return {}
-    latest: dict[str, tuple[int, str]] = {}
-    for source in ("view_changes", "last_actions"):
-        read = getattr(queue, source, None)
-        if not callable(read):
-            continue
-        for model, (done_ms, direction) in read().items():
-            current = latest.get(model)
-            if current is None or int(done_ms) > current[0]:
-                latest[model] = (int(done_ms), str(direction))
-    return {model: direction for model, (done_ms, direction) in latest.items() if done_ms > bound}
+    return {model: direction for model, (done_ms, direction) in _last_changes(queue).items() if done_ms > bound}
 
 
 def _apply_safescale(
@@ -615,6 +663,9 @@ def _apply_safescale(
             events.append(f"safescale_probe_skipped:{_safescale_probe_model(action)}:{probe_block_reason}")
             continue
 
+        if isinstance(action, BlockSupplyAction):
+            converted.extend(_start_block_probes(snapshot, action, safescale, contexts, cluster_view, events))
+            continue
         probe_model = _safescale_probe_model(action)
         pods = _safescale_probe_pods(snapshot, action, cluster_view)
         decision = safescale.start_probe(
@@ -630,16 +681,65 @@ def _apply_safescale(
         events.append(f"safescale_{decision.reason}:{probe_model}")
         if decision.reason == "probe_started" and getattr(decision, "details", None):
             events.append(format_window_event(probe_model, decision.details))
-        if isinstance(action, BlockSupplyAction):
-            # L4 rev 2: the block's IDLE pods sleep now (their GPUs stay reserved for
-            # the receiver while the probe runs, ``probe_reserved_gpus``).
-            converted.extend(block_sleeps(action, action.reason))
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
     if covered_targets is not None:
         for model, rescue in rescue_of.items():
             if model not in survived:
                 covered_targets[model] = rescue
     return tuple(converted), tuple(events)
+
+
+def _start_block_probes(
+    snapshot: MetricsSnapshot,
+    action: BlockSupplyAction,
+    safescale: SafeScaleController,
+    contexts: dict[str, dict] | None,
+    cluster_view: ClusterView | None,
+    events: list[str],
+) -> tuple[Action, ...]:
+    """The probe(s) of a TP block (L4 rev 2; 2026-10-29, design 20261029-tss-suffix
+    rules 5-6). The leader probe (``action.probe``) carries the receiver's promise and the
+    block's immediate pods (``companions``: IDLE / HIGH pods that sleep at its commit, not
+    now, so a rollback wastes none of them). A joint block (``joint_probe``: a second
+    probed donor of another model) starts both per-model probes under one block id - the
+    member first; when one cannot start, none runs. Returns their hide actions."""
+    block_id = None
+    if action.joint_probe is not None:
+        block_id = f"block:{action.receiver}:{action.receiver_pods[0] if action.receiver_pods else action.block}" \
+            f"@{int(snapshot.ts_ms)}"
+    starts = []
+    if action.joint_probe is not None:
+        starts.append((action.joint_probe, {}, ()))
+    starts.append((action.probe, {action.receiver: 1}, tuple(action.sleeps)))
+    out: list[Action] = []
+    started: list[tuple[str, str]] = []
+    for (model, pod), pending, companions in starts:
+        kwargs = {"companions": companions} if companions else {}
+        if block_id is not None:
+            kwargs["block_id"] = block_id
+        decision = safescale.start_probe(
+            model=model,
+            pods=(pod,),
+            now_ms=snapshot.ts_ms,
+            pending_upscales=pending,
+            window_inputs=probe_window_inputs(snapshot, model, contexts, cluster_view),
+            **kwargs,
+        )
+        if decision.status == "none":
+            events.append(f"safescale_probe_skipped:{model}:{decision.reason}")
+            for other, other_pod in started:
+                # A joint block runs whole or not at all: the partner never hid (its
+                # hide is not submitted) - roll it back at once.
+                safescale.abort_probe(other, pods=(other_pod,), reason="block_partner_not_started")
+            return ()
+        events.append(f"safescale_{decision.reason}:{model}")
+        if decision.reason == "probe_started" and getattr(decision, "details", None):
+            events.append(format_window_event(model, decision.details))
+        started.append((model, pod))
+        out.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
+    if block_id is not None:
+        events.append(f"safescale_block_probe_started:{action.receiver}:{block_id}")
+    return tuple(out)
 
 
 def _rescue_of(action: Action) -> object | None:
@@ -676,7 +776,8 @@ def _release_without_safescale(actions: tuple[Action, ...]) -> tuple[tuple[Actio
             if action.probe is None:
                 reason = action.reason  # the planner named it (IDLE: no suffix)
             else:
-                action = replace(action, sleeps=(*action.sleeps, action.probe), probe=None)
+                probes = tuple(item for item in (action.probe, action.joint_probe) if item is not None)
+                action = replace(action, sleeps=(*action.sleeps, *probes), probe=None, joint_probe=None)
             out.append(transfer_plan(action, reason))
         else:
             out.append(replace(
@@ -761,8 +862,6 @@ def _safescale_probe_pods(
     action: Action,
     cluster_view: ClusterView | None = None,
 ) -> tuple[str, ...]:
-    if isinstance(action, BlockSupplyAction):
-        return (action.probe[1],) if action.probe is not None else ()
     if isinstance(action, ScaleAction) and action.pods:
         return tuple(action.pods)
     return _pods_to_probe(snapshot, action.model, abs(action.delta), cluster_view=cluster_view)
@@ -772,8 +871,6 @@ def _safescale_pending_upscales(
     action: Action,
     probe_upscale_plans: dict[str, dict[str, int]],
 ) -> dict[str, int]:
-    if isinstance(action, BlockSupplyAction):
-        return {action.receiver: 1}
     return probe_upscale_plans.get(action.model, {})
 
 
@@ -882,11 +979,14 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
 @dataclass(frozen=True)
 class ModelSignal:
     """One model's decision signal of one window (planner tick and SafeScale observation
-    share it, so both read the same Z and advance the shared EMA identically)."""
+    share it, so both read the same Z and advance the shared EMA identically).
+    ``settling``: why the model's post-change suffix is not decision-valid yet (Z is
+    then unknown; :class:`tre_controller.signals.trs.SuffixWindow`), None = it decides."""
 
     result: object
     signal: object
     metrics: ModelWindowMetrics
+    settling: str | None = None
 
 
 def compute_model_signal(
@@ -898,30 +998,51 @@ def compute_model_signal(
     signal_state: SignalState | None,
     routable_pod_ids: frozenset[str] | None = None,
 ) -> ModelSignal:
-    """TSS / Z of ``metrics`` (a serving window): always the whole sliding window plus
-    the model's shared EMA (TSS only, 2026-10-29, design docs/design/20261029-tss-only.md;
-    v1 behaviour). A window that straddles a replica change mixes both regimes - TSS is a
-    ratio of window totals, so that only adds lag. An idle window (nothing in flight), or a
-    zero-token window whose zero may be missing data (:func:`zero_tokens_unconfirmed`),
-    clears the model's EMAs (:meth:`SignalState.reset_ema`)."""
+    """TSS / Z of ``metrics`` (a serving window: awake, not hidden pods) plus the model's
+    shared EMA. TSS suffix (2026-10-29, design docs/design/20261029-tss-suffix.md): after a
+    change of the model's pod set inside the window, Z is computed on the samples since
+    the change only (:meth:`SignalState.suffix_window`; tokens scaled to a whole window,
+    queue = the suffix's own mean); until that suffix spans ``settle_ms`` the model is
+    settling - Z unknown, the EMA untouched (it restarted at the change and seeds on the
+    first decision-valid suffix). An idle window (nothing in flight), or a zero-token
+    window whose zero may be missing data (:func:`zero_tokens_unconfirmed`), clears the
+    model's EMAs (:meth:`SignalState.reset_ema`)."""
+    window = (
+        signal_state.suffix_window(model_name, metrics, routable_pod_ids)
+        if signal_state is not None else SuffixWindow(metrics)
+    )
+    used = window.metrics
+    if window.settling is not None and (used.prompt_tokens is None or used.generation_tokens is None):
+        used, window = metrics, replace(window, metrics=metrics, scale=1.0)
+    inp = TRSInput.from_metrics(used, spec.trs)
+    if window.scale != 1.0:
+        whole = float(metrics.window_end_ms - metrics.window_start_ms)
+        inp = replace(
+            inp,
+            prompt_tokens_total=inp.prompt_tokens_total * window.scale,
+            generation_tokens_total=inp.generation_tokens_total * window.scale,
+            window_ms=whole,
+        )
+    if window.settling is not None:
+        # Settling: the raw values for the record, no EMA step, Z unknown (never 0).
+        result = TRSComputer(ema_tau_ms=0.0).compute(inp, theta_m=spec.trs.theta_m)
+        result = replace(result, TRS=0.0, Z_m=None, eta_m=None)
+        signal = SignalValue(source=signal_source, raw_value=None, z_m=None, unavailable_reason="settling")
+        return ModelSignal(result=result, signal=signal, metrics=used, settling=window.settling)
     if signal_state is not None:
-        if window_is_idle(metrics.avg_running, metrics.avg_waiting) or zero_tokens_unconfirmed(metrics):
+        if window_is_idle(used.avg_running, used.avg_waiting) or zero_tokens_unconfirmed(used):
             signal_state.reset_ema(model_name)
         computer = signal_state.computer_for(
             model_name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
         )
     else:
         computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-    result = computer.compute(
-        TRSInput.from_metrics(metrics, spec.trs),
-        theta_m=spec.trs.theta_m,
-        window_end_ms=metrics.window_end_ms,
-    )
+    result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=used.window_end_ms)
     signal = get_signal(
-        metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
+        used, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state,
         routable_pod_ids=routable_pod_ids,
     )
-    return ModelSignal(result=result, signal=signal, metrics=metrics)
+    return ModelSignal(result=result, signal=signal, metrics=used)
 
 
 def _model_contexts(
@@ -985,6 +1106,8 @@ def _model_contexts(
             )
             result, signal = computed.result, computed.signal
             context = {
+                # TSS suffix (2026-10-29): why the post-change suffix does not decide yet.
+                "settling": computed.settling,
                 "trs": result.TRS,
                 # Pre-EMA TSS, read-only: exposed so a capture can store raw TSS, EMA and Z
                 # of the same tick (the replica factor it includes is not otherwise exposed).
@@ -1065,6 +1188,11 @@ def _model_contexts(
                 model_name, context, tokens_available=tokens_available, window_end_ms=int(metrics.window_end_ms)
             )
             events.extend(model_events)
+        if not tokens_available and signal_state is not None and int(
+            signal_state.change_ms(model_name) or 0
+        ) > int(metrics.window_start_ms):
+            # A pod-set change inside a window without tokens: no held context decides.
+            context = {**context, "settling": "tokens_unknown", "z_m": None, "trs_z_m": None}
         contexts[model_name] = context
     return contexts, tuple(events)
 
@@ -1091,23 +1219,26 @@ def serving_window(
     *,
     counts: tuple[int, int] | None = None,
 ) -> ModelWindowMetrics:
-    """The model's window restricted to its serving pods (``restrict_to_serving``):
-    docs of pods the fleet state reports asleep are dropped and routable/assigned become
-    the awake-and-not-hidden count. Without a fleet view (or a model it does not list) the
-    raw window is returned unchanged. Used by the planner tick and the safescale
-    observation, so both decide on the same window."""
+    """The model's window restricted to its serving pods (``restrict_to_serving``): docs
+    of pods the fleet state reports asleep OR hidden are dropped (TSS suffix 2026-10-29,
+    rule 1: TSS is the service speed of the pod set the gateway routes to - a hidden pod
+    draining a SafeScale probe is out of the numerator and the queue, so the probe judges
+    its donor on the remaining pods) and routable/assigned become the awake-and-not-hidden
+    count. Without a fleet view (or a model it does not list) the raw window is returned
+    unchanged. Used by the planner tick and the safescale observation, so both decide on
+    the same window."""
     if cluster_view is None:
         return metrics
     if counts is None:
         counts = _cluster_view_counts(cluster_view).get(metrics.model)
         if counts is None:
             return metrics
-    sleeping = {
+    out_of_set = {
         binding.serve_id
         for binding in cluster_view.bindings
-        if binding.model == metrics.model and not binding.awake
+        if binding.model == metrics.model and (not binding.awake or binding.hidden)
     }
-    return restrict_to_serving(metrics, sleeping_pods=sleeping, routable_pods=counts[0])
+    return restrict_to_serving(metrics, sleeping_pods=out_of_set, routable_pods=counts[0])
 
 
 def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:

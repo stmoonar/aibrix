@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from test_floor_plan_20260929 import _cls, _topology
 from tre_common.registry import NodeSpec
-from tre_controller.loops.tick import _safescale_pending_upscales
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import (
     ClusterView,
@@ -128,7 +127,8 @@ def test_tick_commits_a_block_probe_with_only_the_receiver_upscale():
         receiver="tp2", block=GpuBlock("node-a", (0, 1)), receiver_pods=("tp2-a01",), sleeps=(),
         probe=("high", "high-0"), reason="critical_block_high", source_loop="rescue",
     )
-    assert _safescale_pending_upscales(shrink, {"high": {"tp2": 1}}) == {"tp2": 1}
+    # The block's own receiver promise is the probe's only upscale (2026-10-29: a block
+    # starts through _start_block_probes, which ignores probe_upscale_plans).
     out, events = _apply_safescale(snapshot, (shrink,), {"high": {"tp2": 1}}, safescale=safescale)
     probe = safescale.active_probe("high")
     assert probe is not None and probe.pending_upscales == {"tp2": 1}

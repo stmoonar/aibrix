@@ -475,11 +475,17 @@ class ScalingRegistryConfig:
     EMA settle extension and the gateway clock check were removed; their keys are
     retired (:data:`RETIRED_SCALING_KEYS`)."""
 
-    #: The SafeScale evidence floor (Q4, round 4): the observed span after a probe's
-    #: hide confirmation before an early commit, and after a rollback before a retry.
+    #: The SafeScale evidence floor (Q4, round 4): the observed span after a rollback
+    #: before a retry (2026-10-29: the early commit after a hide reads ``settle_ms``).
     #: 20 s = the former ``min_evidence_grids: 2`` on the 10 s grid (deprecated alias,
     #: N x 10 s). (Until 2026-10-29 also O1's post-breakpoint evidence.)
     min_evidence_ms: int = 20_000
+    #: TSS suffix (2026-10-29, design 20261029-tss-suffix): after a change of a model's
+    #: pod set (awake and not hidden) its Z is computed on the samples observed since the
+    #: change only, and it is decision-valid once that suffix spans this long (ms of
+    #: gateway ``scraped_ms``). Until then the model is "settling": no action on it.
+    #: Also the observed post-hide span a SafeScale early commit needs.
+    settle_ms: int = 10_000
     #: Sampling coverage (2026-10-25, design docs/design/20261025-instant-sampling.md):
     #: a pod's coverage = distinct ``scraped_ms`` in the window / (window / instant
     #: period); below ``sample_min_ratio`` the pod is flagged (no donor / shrink /
@@ -514,7 +520,7 @@ def _scaling_span_ms(raw: dict[str, Any], key: str, default: int, minimum: int) 
     return _scaling_count(raw, key, default, minimum)
 
 
-SCALING_KEYS = frozenset({"min_evidence_ms", "sample_min_ratio"}) | frozenset(SCALING_COUNT_ALIASES)
+SCALING_KEYS = frozenset({"min_evidence_ms", "settle_ms", "sample_min_ratio"}) | frozenset(SCALING_COUNT_ALIASES)
 
 #: Retired keys. A registry that still carries them (the live ConfigMap until its next
 #: structural replace) loads; they are ignored with one deprecation line.
@@ -583,6 +589,7 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
     defaults = ScalingRegistryConfig()
     return ScalingRegistryConfig(
         min_evidence_ms=_scaling_span_ms(raw, "min_evidence_ms", defaults.min_evidence_ms, 1),
+        settle_ms=_scaling_count(raw, "settle_ms", defaults.settle_ms, 1),
         sample_min_ratio=_scaling_number(raw, "sample_min_ratio", defaults.sample_min_ratio, low=0.0, high=1.0),
     )
 

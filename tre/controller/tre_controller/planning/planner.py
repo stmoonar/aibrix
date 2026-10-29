@@ -73,6 +73,10 @@ class PlanConfig:
     # an immediate relay (reason suffix ``_nosafescale``) through the same gates as an
     # IDLE donor's (relay holds, routable view, C1 tagging), instead of a probe.
     release_without_safescale: bool = False
+    # TRE_SAFESCALE_SCOPE=healthy_and_shrink (2026-10-29, design 20261029-tss-suffix): a
+    # HIGH donor for a receiver is an immediate relay (TP1 relay, TP block part); a
+    # HEALTHY donor still gives through a SafeScale probe (only to a CRITICAL receiver).
+    relay_high_donors: bool = False
     # Registry placement.defrag.enabled: gates the critical_tp_defrag migration plan.
     # Off by default, as in v1 (design 20260928-placement-node-balance).
     defrag_enabled: bool = False
@@ -199,6 +203,9 @@ IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
 #: Reason suffix of a shrink that would have run as a SafeScale probe and is released
 #: immediately because SafeScale is off (TRE_ABLATION_DISABLE_SAFESCALE, 2026-10-08).
 NO_SAFESCALE_REASON_SUFFIX = "_nosafescale"
+#: Reason suffix of a HIGH donor's immediate relay under scope ``healthy_and_shrink``
+#: (2026-10-29, design 20261029-tss-suffix rule 5): released by policy, SafeScale on.
+RELAY_REASON_SUFFIX = "_relay"
 
 
 #: Refusal codes of a NAMED transfer (sm-plans section 10) that follow from the SM's
@@ -317,8 +324,12 @@ class BlockSupplyAction:
     binding, a named wake) - ONE plan group (design 20261027-sm-plans section 10,
     :func:`tre_controller.loops.tick._release_without_safescale`). ``sleeps`` sleep
     at once (IDLE donors, and every donor of a scope that releases without a probe);
-    ``probe`` (scope ``all``: the block's one HIGH / HEALTHY donor pod) is a SafeScale
-    probe whose commit sleeps it and wakes the receiver."""
+    ``probe`` (a HIGH / HEALTHY donor pod whose release is a SafeScale probe) is a
+    SafeScale probe whose commit sleeps it, then the ``sleeps`` pods, and wakes the
+    receiver (2026-10-29: the immediate pods of a probed block sleep at the commit, so a
+    rollback wastes none of them). ``joint_probe``: a second probed donor pod of another
+    model (design 20261029-tss-suffix rule 6): both probes start in one plan under one
+    block id, the block commits when the last one passes, any failure rolls both back."""
 
     receiver: str
     block: GpuBlock
@@ -327,8 +338,10 @@ class BlockSupplyAction:
     sleeps: tuple[tuple[str, str], ...]
     reason: str
     source_loop: SourceLoop
-    #: (donor model, serve id) of the pod a SafeScale probe hides (scope ``all``).
+    #: (donor model, serve id) of the pod a SafeScale probe hides; its commit wakes the receiver.
     probe: tuple[str, str] | None = None
+    #: (donor model, serve id) of a second probed donor pod (a joint block).
+    joint_probe: tuple[str, str] | None = None
     #: C1: the receiver's rescue target (bookkeeping only).
     rescue: RescuePlan | None = field(default=None, compare=False)
     #: The fleet-view inputs a relay pair was planned from (:class:`RelayHold`).
@@ -336,7 +349,7 @@ class BlockSupplyAction:
 
     @property
     def donor_models(self) -> tuple[str, ...]:
-        pods = (*self.sleeps, *((self.probe,) if self.probe else ()))
+        pods = (*self.sleeps, *(item for item in (self.probe, self.joint_probe) if item))
         return tuple(dict.fromkeys(model for model, _ in pods))
 
 
@@ -401,6 +414,11 @@ class SafeScaleCommitAction:
     #: it (held in observe mode, recovered after a restart) becomes the donor unhide.
     #: Metadata, not part of the action's identity (not compared).
     decided_ms: int | None = field(default=None, compare=False)
+    #: TP block (2026-10-29, design 20261029-tss-suffix): (model, serve id) of other
+    #: models' pods that sleep in the same plan as the donor, before the receivers wake
+    #: (the block's immediate pods; at a joint commit the partner probes' hidden pods).
+    #: Part of the donor step: ``donor_done`` once every sleep of it is done.
+    companions: tuple[tuple[str, str], ...] = ()
 
     @property
     def model(self) -> str:
@@ -408,9 +426,22 @@ class SafeScaleCommitAction:
 
     @property
     def touched_models(self) -> tuple[str, ...]:
-        """Models this commit still changes (the donor until it slept)."""
-        models = () if self.donor_done else (self.donor,)
+        """Models this commit still changes (the donor and its companions until they slept)."""
+        models = () if self.donor_done else (self.donor, *(model for model, _pod in self.companions))
         return tuple(dict.fromkeys(models + tuple(item.model for item in self.upscales)))
+
+    def companion_sleeps(self) -> tuple[ScaleAction, ...]:
+        """One named sleep per companion model (its pods of this commit)."""
+        pods: dict[str, list[str]] = {}
+        for model, pod in self.companions:
+            pods.setdefault(model, []).append(pod)
+        return tuple(
+            ScaleAction(
+                model, -len(names), self.reason, self.source_loop, pods=tuple(names),
+                sleep_path="safescale_commit", drain_budget_s=self.drain_budget_s,
+            )
+            for model, names in pods.items()
+        )
 
     def donor_sleep(self) -> ScaleAction:
         return ScaleAction(
@@ -569,6 +600,14 @@ def build_plan(
     critical_probe_donors = high_donors + middle_zone
     low_probe_donors = high_donors
 
+    def relays(state: ModelState) -> bool:
+        # Whether a donor of this band gives a receiver through an immediate relay (no
+        # probe): every non-IDLE donor without SafeScale / under scope
+        # ``receiverless_shrink``; a HIGH one under scope ``healthy_and_shrink``.
+        return cfg.release_without_safescale or (cfg.relay_high_donors and state == ModelState.HIGH)
+
+    relay_suffix = NO_SAFESCALE_REASON_SUFFIX if cfg.release_without_safescale else RELAY_REASON_SUFFIX
+
     def probe_held(donor: ModelClassification) -> bool:
         # One SafeScale probe per donor model (the state machine is keyed by model): a
         # donor this plan already probes gives no other receiver anything - a second
@@ -577,18 +616,14 @@ def build_plan(
             return True
         # One rule for every donor probe (HIGH, middle zone, TP block): a model
         # whose last probe rolled back is probed again only on new evidence.
-        return donor_rollback_held(donor.model_name)
-
-    def donor_rollback_held(model: str) -> bool:
         # Scope of the rollback hold (2026-10-26, Tight_pool hazard (d)): it judged one
         # decision - "a probe that hides a replica of this model is safe on this
-        # evidence" - and blocks only a retry of that decision. With every probe on
-        # (scope ``all``) a donor for a receiver is itself such a probe: held. When a
-        # donor for a receiver is an immediate relay (``release_without_safescale``:
-        # scope ``receiverless_shrink``; scope ``off`` has no holds), it is a different
-        # decision - a LOW / CRITICAL receiver in need - and the hold does not apply.
-        # The receiver-less HIGH probe stays held in every scope (high_models loop).
-        return not cfg.release_without_safescale and rollback_held(model)
+        # evidence" - and blocks only a retry of that decision. A donor for a receiver
+        # whose release is a probe is such a retry: held. When it is an immediate relay
+        # (:func:`relays`; scope ``off`` has no holds) it is a different decision - a
+        # LOW / CRITICAL receiver in need - and the hold does not apply. The receiver-less
+        # HIGH probe stays held in every scope (high_models loop).
+        return not relays(donor.state) and rollback_held(donor.model_name)
 
     def rollback_held(model: str) -> bool:
         if model not in probe_backoff_models:
@@ -605,7 +640,8 @@ def build_plan(
     def note_relay_past_hold(model: str, gained: int) -> None:
         # An immediate relay took a donor whose probe rollback hold would have vetoed it
         # before 2026-10-26 (hazard (d)) - logged so a rerun shows where that happened.
-        if gained > 0 and cfg.release_without_safescale and model in probe_backoff_models:
+        # Called for immediate relays only.
+        if gained > 0 and model in probe_backoff_models:
             _event_once(events, f"safescale_rollback_hold_relay_ok:{model}")
 
     def block_donors(receiver: str, *, critical: bool) -> dict[str, BlockDonor]:
@@ -645,7 +681,7 @@ def build_plan(
                 tier=tier,
                 z=item.Z_m,
                 limit=headroom if idle else 1,
-                probed=not idle and not cfg.release_without_safescale,
+                probed=not idle and not relays(item.state),
             )
         return out
 
@@ -684,9 +720,12 @@ def build_plan(
                     source_loop=source_loop, receiver=model,
                 )
             return True
-        probe = next(((donor, pod) for donor, pod in choice.sleeps if donors[donor].probed), None)
+        # Rule 6 (2026-10-29): up to two probed donor pods (two models) - a joint block.
+        probed = [(donor, pod) for donor, pod in choice.sleeps if donors[donor].probed]
+        probe = probed[0] if probed else None
+        joint = probed[1] if len(probed) > 1 else None
         non_idle = [donor for donor, _ in choice.sleeps if donors[donor].tier > 1]
-        immediate = tuple(item for item in choice.sleeps if item != probe)
+        immediate = tuple(item for item in choice.sleeps if item not in probed)
         actions.append(
             BlockSupplyAction(
                 receiver=model,
@@ -694,20 +733,22 @@ def build_plan(
                 receiver_pods=(choice.binding.serve_id,),
                 sleeps=immediate,
                 probe=probe,
+                joint_probe=joint,
                 # An IDLE-only block is released by policy, not for lack of SafeScale.
                 reason=f"{prefix}_block_{tier}"
-                + (NO_SAFESCALE_REASON_SUFFIX if non_idle and probe is None else ""),
+                + (relay_suffix if non_idle and probe is None else ""),
                 source_loop=source_loop,
                 # The hold key of the transfer group (its first donor, as the tick's
                 # transfer_plan names it): a refused block is held like a relay.
-                basis=relay_basis(cluster_view, (*immediate, *((probe,) if probe else ()))[0][0], model),
+                basis=relay_basis(cluster_view, (*immediate, *probed)[0][0], model),
             )
         )
         for donor, _ in choice.sleeps:
             deltas[donor] = deltas.get(donor, 0) - 1
         for donor in non_idle:
             block_donor_models.add(donor)
-            note_relay_past_hold(donor, 1)
+            if not donors[donor].probed:
+                note_relay_past_hold(donor, 1)
         deltas[model] = deltas.get(model, 0) + 1
         occupancy.count_released(pod for _, pod in choice.sleeps)
         occupancy.claim(choice.binding)
@@ -717,6 +758,8 @@ def build_plan(
             delayed_down_models.add(probe[0])
             pending = probe_upscale_plans.setdefault(probe[0], {})
             pending[model] = pending.get(model, 0) + 1
+        if joint is not None:
+            delayed_down_models.add(joint[0])
         events.append(
             f"block_supply:{model}:{choice.block}:{tier}:" + ",".join(pod for _, pod in choice.sleeps)
         )
@@ -941,7 +984,7 @@ def build_plan(
                         if middle.state == ModelState.HIGH
                         else "critical_middle_zone_safescale"
                     )
-                    if cfg.release_without_safescale:
+                    if relays(middle.state):
                         gained = _plan_relays(
                             actions,
                             deltas,
@@ -950,7 +993,7 @@ def build_plan(
                             receiver=recv.model_name,
                             need=still_needed,
                             donor_limit=min(1, middle_limit),  # one replica per plan
-                            reason=f"{middle_reason}{NO_SAFESCALE_REASON_SUFFIX}",
+                            reason=f"{middle_reason}{relay_suffix}",
                             source_loop="rescue",
                             events=events,
                             view=cluster_view,
@@ -1198,7 +1241,7 @@ def build_plan(
             planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
             middle_limit = min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take)
             middle_reason = "low_fairness_high_donor_safescale"
-            if cfg.release_without_safescale:
+            if relays(middle.state):
                 gained = _plan_relays(
                     actions,
                     deltas,
@@ -1207,7 +1250,7 @@ def build_plan(
                     receiver=recv.model_name,
                     need=needed,
                     donor_limit=min(1, middle_limit),  # one replica per plan
-                    reason=f"{middle_reason}{NO_SAFESCALE_REASON_SUFFIX}",
+                    reason=f"{middle_reason}{relay_suffix}",
                     source_loop="fairness",
                     events=events,
                     view=cluster_view,
@@ -1883,8 +1926,8 @@ def cheapest_block(
     candidate is free (no awake binding, not claimed by this plan, not blocked) or held
     by one awake, not hidden, not released pod of a ``donors`` model whose slot lies in
     the block (a pod spanning the block counts once). A donor gives at most its
-    ``limit`` pods; at most one donor of a block is ``probed`` (one probe per model, no
-    joint commit). Lexicographic choice: worst tier (free < IDLE < HIGH < HEALTHY),
+    ``limit`` pods; up to two donors of a block may be ``probed`` (2026-10-29, a joint
+    block: one probe per model, committed together). Lexicographic choice: worst tier (free < IDLE < HIGH < HEALTHY),
     fewer donor pods, higher donor Z (the lower one first), a wake before a create,
     then the placement score (:func:`tre_common.gpu_placement.choose_placement`)."""
     tp_size = _tp_size(cfg, receiver)
@@ -1921,8 +1964,6 @@ def cheapest_block(
         for pod in pods.values():
             per_model[pod.model] = per_model.get(pod.model, 0) + 1
         if any(count > donors[model].limit for model, count in per_model.items()):
-            continue
-        if sum(1 for model in per_model if donors[model].probed) > 1:
             continue
         tier = max((donors[model].tier for model in per_model), default=0)
         z_values = sorted(_block_z(donors[pod.model].z) for pod in pods.values())
