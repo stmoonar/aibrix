@@ -8,12 +8,13 @@ arm's ``safescale_summary.json`` (probes) and the controller's ``trs_calc_result
 Columns (v1 basis first, v2 basis next to it):
   replicas            mean awake replicas summed over the models over the load window (v1 "GPU")
   GPUs                mean awake GPUs (14b TP2 counts 2; the v2 cost basis)
-  E2E / TTFT (s), TPOT (ms)   p50 / p90 / p95 / p99 over the successful scored requests (first trim_s
+  E2E / TTFT (s), TPOT (ms)   p50 / p90 / p95 / p99 over the strictly complete scored requests (first trim_s
                       seconds dropped, as the report). TPOT = v2 definition (e2e - ttft) / (output_tokens - 1);
                       "TPOT v1" = the client's own TPOT field (score_requests tpot_v1, p50 / p95 / p99)
   reissues            sidecar continuations (tre_reissue events) in the load window (v1 "重发")
-  timeouts            requests cut by the 150 s route timeout (e2e >= 149 s) and their share of the scored
-                      requests (v1 counted "> 115 s", its own route cut: not the same threshold)
+  completion / cuts   complete and truncated shares of all scored requests, plus failed/unknown counts
+  timeouts            truncated requests with e2e >= 149 s: a legacy diagnostic compatible with the
+                      150 s route timeout, not proof of its cause (v1 counted "> 115 s")
   V_req %             the v2 primary metric
   scale up / down     increases / decreases of a model's awake replicas in the layout samples (v1 definition)
   probes              SafeScale probes started / committed / rolled back (safescale_summary.json)
@@ -44,11 +45,13 @@ ACTION_CLASSES = (("urgent", ("critical_",)), ("high_shrink", ("high_proactive",
                   ("low_rescue", ("low_rescue",)), ("idle_shrink", ("idle",)))
 PCTS = (50, 90, 95, 99)
 V1_PCTS = (50, 95, 99)       # score_requests' tpot_v1 percentiles
-NOTES = ("Latency cells: p50 / p90 / p95 / p99 of the successful scored requests (first trim_s seconds dropped). "
+NOTES = ("Latency cells: p50 / p90 / p95 / p99 of the strictly complete scored requests (first trim_s seconds dropped). "
          "TPOT = v2 definition (e2e - ttft) / (output_tokens - 1); TPOT v1 = the client's TPOT field (p50 / p95 / p99). "
          "replicas = mean awake replicas summed over the models (v1 \"GPU\"); GPUs = mean awake GPUs (TP2 = 2). "
-         "timeouts = cut by the 150 s route timeout (e2e >= 149 s), share of scored requests; v1 counted > 115 s "
-         "(its route cut), not the same threshold. urgent = critical_* scale-ups only (v1 rescue gain). "
+         "Completion and truncation rates share the scored-request denominator; failed and unknown are separate. "
+         "timeouts = truncated with e2e >= 149 s (150 s route timeout diagnostic, not proof of cause); v1 counted > 115 s "
+         "(its route cut), not the same threshold. Normal finish_reason=length is complete. "
+         "urgent = critical_* scale-ups only (v1 rescue gain). "
          "[suspect] = campaign verdict suspect. Definitions: tre_eval/v1_summary.py.")
 
 
@@ -91,6 +94,8 @@ def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
     load_s = (gpu.get(M.ALL) or {}).get("load_s")
     row: dict[str, Any] = {"trace": arm.trace_name, "arm": arm.name, "label": arm.label, "setting": _setting(arm.dir),
                            "dir": arm.dir, "verdict": _verdict(arm.dir), "n": a.get("n"), "fail": a.get("fail"), "V_req_pct": a.get("V_req_pct")}
+    for key in ("complete", "truncated", "failed", "unknown", "completion_rate_pct", "truncation_rate_pct", "scoring_basis"):
+        row[key] = a.get(key)
     rep_s = sum((gpu.get(m) or {}).get("replica_s") or 0.0 for m in arm.models)
     row["replicas"] = round(rep_s / load_s, 2) if load_s else None
     row["gpus"] = round((gpu.get(M.ALL) or {}).get("mean_gpus"), 2) if (gpu.get(M.ALL) or {}).get("mean_gpus") is not None else None
@@ -138,6 +143,7 @@ def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
         g = gpu.get(m) or {}
         sec = lambda v: None if v is None else round(v / 1000.0, 2)  # noqa: E731
         row["models"][m] = {"replicas": round(g["replica_s"] / load_s, 2) if load_s and g.get("replica_s") is not None else None,
+                            **{k: s.get(k) for k in ("complete", "truncated", "failed", "unknown", "completion_rate_pct", "truncation_rate_pct")},
                             "e2e_p50": sec(s.get("e2e_p50_ms")), "e2e_p95": sec(s.get("e2e_p95_ms")),
                             "e2e_p99": sec(s.get("e2e_p99_ms")), "ttft_p95": sec(s.get("ttft_p95_ms"))}
     row["warnings"] = list(arm.warnings)
@@ -189,6 +195,12 @@ def markdown(rows: list[dict]) -> str:
             out.append(f"| {_name(r)} | {_f(r['replicas'])} | {_f(r['gpus'])} | {_quad(r, 'e2e')} | {_quad(r, 'ttft')} | "
                        f"{_quad(r, 'tpot')} | {v1} | {_f(r['reissues'])} | {_f(r['timeouts'])} ({_f(r['timeout_pct'])} %) | "
                        f"{_f(r['V_req_pct'])} |")
+        out += ["", "Completion (all scored requests):", "",
+                "| arm | complete | truncated | failed | unknown | completion % | truncation % |",
+                "|---|---|---|---|---|---|---|"]
+        for r in rs:
+            out.append(f"| {_name(r)} | " + " | ".join(_f(r.get(k)) for k in
+                       ("complete", "truncated", "failed", "unknown", "completion_rate_pct", "truncation_rate_pct")) + " |")
         out += ["", "Controller actions:", "",
                 "| arm | scale up / down | probes started / committed / rolled back | HIGH shrink | urgent (CRITICAL) "
                 "| fairness | LOW rescue | IDLE shrink | other |",
@@ -210,7 +222,8 @@ def markdown(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
-CSV_FIELDS = ["trace", "arm", "label", "setting", "verdict", "n", "fail", "V_req_pct", "replicas", "gpus",
+CSV_FIELDS = ["trace", "arm", "label", "setting", "verdict", "n", "fail", "complete", "truncated", "failed", "unknown",
+              "completion_rate_pct", "truncation_rate_pct", "scoring_basis", "V_req_pct", "replicas", "gpus",
               *[f"{m}_p{p}" for m in ("e2e", "ttft", "tpot") for p in PCTS],
               *[f"tpot_v1_p{p}" for p in V1_PCTS], "reissues", "continued_requests",
               "timeouts", "timeout_pct", "scale_up", "scale_down", "probes", "probe_commits", "probe_rollbacks",

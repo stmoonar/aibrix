@@ -636,3 +636,17 @@ def test_lost_bootstrap_arrivals_keep_refusing_the_same_marker():
     for ts in (8000, 9000):
         with pytest.raises(ValueError, match="arrival history was lost"):
             p.decide(snap(ts, [pod("p0", ts)], replay=marker))
+
+
+def test_wake_buffer_preserves_decode_progress_when_prefill_finishes_out_of_order():
+    events = [ev("arr", "A", "p0", 1000, 1000, 100),
+              ev("arr", "B", "p0", 1100, 1000, 100),
+              ev("ft", "B", "p0", 1200), ev("ft", "A", "p0", 2200)]
+    visible = make()
+    direct = visible.decide(snap(2300, [pod("p0", 2300, running=2)], events))["m"]
+    waking = make()
+    waking.decide(snap(2300, [], events, awake=1))
+    buffered = waking.decide(snap(2300, [pod("p0", 2300, running=2)]))["m"]
+    # The same arrivals/first tokens must produce the same load when the pod becomes visible.
+    for field in ("U0", "maxU"):
+        assert buffered.inputs["tier2"]["p0"][field] == pytest.approx(direct.inputs["tier2"]["p0"][field])

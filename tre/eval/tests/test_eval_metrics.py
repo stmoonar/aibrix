@@ -357,6 +357,40 @@ def test_strict_completion_controls_latency_denominators_and_all_entrypoints(tmp
     assert quick["completion_status"] == {"complete": 1, "truncated": 1, "failed": 1, "unknown": 1}
     assert quick["e2e_p50"] == 150000 and quick["timeouts_or_cuts"] == 1
 
+    # The runner's main summary and the exported tables must preserve the same completion basis.
+    import csv
+    from tre_eval import report, v1_summary
+    arm_dir = tmp_path / "trace_s1" / "tre"
+    write_arm(str(arm_dir), [(0, lay([A0], [B0])), (100, lay([A0], [B0]))], rows)
+    for name in ("controller.log", "pod_gauges.jsonl", "apa_status.jsonl"):
+        (arm_dir / name).write_text("")
+    for name in ("snap_before.json", "snap_after.json"):
+        (arm_dir / name).write_text(json.dumps({"pods": {}, "sleep": {"stats": {}}}))
+    subprocess.check_output([sys.executable, str(scorer.parent / "analyze.py"), str(arm_dir)], text=True,
+                            env={**os.environ, "MODELS": "m-a"})
+    main_summary = json.loads((arm_dir / "summary.json").read_text())["client"]["ALL"]
+    assert main_summary["ok"] == 1 and main_summary["err"] == 3
+    assert main_summary["complete"] == main_summary["truncated"] == main_summary["failed"] == main_summary["unknown"] == 1
+    assert main_summary["completion_rate_pct"] == main_summary["truncation_rate_pct"] == 25
+    assert main_summary["e2e_p50"] == 150
+    assert main_summary["tpot_p95"] == round((150 - complete["ttft"]) / (complete["output_tokens"] - 1), 3)
+
+    outdir = tmp_path / "completion-report"
+    assert report.main([str(arm_dir), "--out", str(outdir), "--trim-s", "0", "--reps", "20"]) == 0
+    exported = list(csv.DictReader((outdir / "arms" / "tre" / "requests.csv").open()))
+    assert [r["completion"] for r in exported] == ["complete", "truncated", "failed", "unknown"]
+    comparison = next(r for r in csv.DictReader((outdir / "comparison.csv").open()) if r["model"] == "ALL")
+    assert [int(comparison[k]) for k in ("complete", "truncated", "failed", "unknown")] == [1, 1, 1, 1]
+    assert float(comparison["completion_rate_pct"]) == float(comparison["truncation_rate_pct"]) == 25
+    assert "complete requests only" in (outdir / "index.html").read_text()
+
+    v1 = v1_summary.arm_row(str(arm_dir), trim_s=0)
+    files = v1_summary.write([v1], str(tmp_path / "completion-v1"))
+    v1_csv = next(csv.DictReader(open(files["csv"])))
+    assert [int(v1_csv[k]) for k in ("complete", "truncated", "failed", "unknown")] == [1, 1, 1, 1]
+    assert float(v1_csv["completion_rate_pct"]) == float(v1_csv["truncation_rate_pct"]) == 25
+    assert "completion %" in Path(files["md"]).read_text()
+
 def test_role_only_frame_is_not_partial_generated_output():
     row = {**req(0, out=0, ttft=0.1), "success_strict": False, "ttft_strict_s": None}
     assert M.completion_status(row) == "failed"

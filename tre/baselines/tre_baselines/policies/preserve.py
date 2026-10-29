@@ -566,11 +566,13 @@ class PreServePolicy:
             ps = st.pods.get(pod)
             if ps is None:
                 continue
-            for key, info in sorted(list(st.pending[pod].items()), key=lambda kv: kv[1].ts_ms):
-                if info.ft_ms is not None:
-                    self._add(ms, st, key, info, pod, ps, anom)
-                    st.pending[pod].pop(key)
-                    anom["ft_buffered_applied"] += 1
+            # Prefill can finish in a different order from arrivals. Advance the
+            # decode map in first-token order, exactly as the live event path does.
+            ready = [(key, info) for key, info in st.pending[pod].items() if info.ft_ms is not None]
+            for key, info in sorted(ready, key=lambda item: item[1].ft_ms):
+                self._add(ms, st, key, info, pod, ps, anom)
+                st.pending[pod].pop(key)
+                anom["ft_buffered_applied"] += 1
             if not st.pending[pod]:
                 st.pending.pop(pod)
 
