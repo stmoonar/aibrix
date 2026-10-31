@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Callable, Protocol, Union
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Union
 
 if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
@@ -306,6 +306,7 @@ def run_planner_tick(
         probe_block_reason=probe_block_reason,
         covered_targets=covered_targets,
         safescale_scope=safescale_scope,
+        high_band={item.model_name: item.tau.tau_high for item in classifications},
     )
     # C1 review P2-1: a rescue target fully covered by the pods a probe preemption gives
     # back is still a target the window does not reflect yet.
@@ -551,9 +552,12 @@ def _apply_safescale(
     probe_block_reason: str | None = None,
     covered_targets: dict | None = None,
     safescale_scope: str = "all",
+    high_band: Mapping[str, float] | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
-    preemption gives back cover every planned scale-up part (none is submitted)."""
+    preemption gives back cover every planned scale-up part (none is submitted).
+    ``high_band``: model -> the tau_high it was classified with this tick; a
+    receiver-less shrink's probe commits only at or above it (2026-11-01)."""
     if safescale is None:
         # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE): release immediately, as before
         # 05f489f1 / v1 (2026-10-08).
@@ -680,6 +684,9 @@ def _apply_safescale(
             now_ms=snapshot.ts_ms,
             pending_upscales=_safescale_pending_upscales(action, probe_upscale_plans),
             window_inputs=probe_window_inputs(snapshot, probe_model, contexts, cluster_view),
+            # 2026-11-01: a receiver-less shrink must leave the model HIGH (TP block
+            # probes, joint members included, always serve a receiver: tau_low).
+            commit_z_floor=(high_band or {}).get(probe_model) if _receiverless_shrink(action) else None,
         )
         if decision.status == "none":
             events.append(f"safescale_probe_skipped:{probe_model}:{decision.reason}")

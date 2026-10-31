@@ -2401,7 +2401,8 @@ def revalidate_commit_from_signals(
 
     Two different criteria decide a commit (review 4 P3): the SafeScale commit
     GATE judges the probe window's tail of the donor's SERVING pods (latency
-    SLO, Z_m >= tau_low, KV cache, donor health) with the probe pods hidden;
+    SLO, Z_m >= tau_low - the model's tau_high for a receiver-less shrink - KV
+    cache, donor health) with the probe pods hidden;
     this REVALIDATION judges the planner's latest whole-model ModelState (its
     own window, dwell and warm-up rules). They can disagree right after the
     gate passed - the queue then counts ``commit_abandoned_after_gate_total``

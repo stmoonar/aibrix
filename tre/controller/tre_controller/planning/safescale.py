@@ -198,6 +198,12 @@ class SafeScaleProbe:
     #: capacity rollback keeps them as the evidence a retry must beat. None = unknown.
     start_z_m: float | None = None
     start_routable: int | None = None
+    #: 2026-11-01: the commit gate's Z floor of a receiver-less shrink - the model's own
+    #: tau_high, named by the caller that knows the probe has no receiver (the tick).
+    #: A receiver-less shrink has no beneficiary, it only saves a GPU: if the model
+    #: leaves HIGH after it, latency was traded for a GPU nobody asked for. None =
+    #: ``config.tau_low`` (every probe for a receiver, TP block members included).
+    commit_z_floor: float | None = None
     #: TP block (2026-10-29, design 20261029-tss-suffix rules 5-6): (model, serve id) of
     #: pods of OTHER models that sleep in this probe's commit plan, before the receiver
     #: wakes - the block's immediate IDLE / HIGH pods (they keep serving until then, so a
@@ -244,6 +250,15 @@ class RollbackEvidence:
     #: an unknown Z is taken from the first window after the rollback).
     z_m: float | None
     routable: int | None
+    #: 2026-11-01: the only failed gate was a receiver-less probe's tau_high floor
+    #: (``z_below_tau_high``): the model could not stay HIGH, but a probe for a receiver
+    #: (tau_low floor) would have passed - the hold blocks the receiver-less retry only
+    #: (its reasons carry :data:`RECEIVERLESS_FLOOR_HOLD`).
+    receiverless_floor: bool = False
+
+
+#: Hold-reason prefix of a rollback that failed only the receiver-less tau_high floor.
+RECEIVERLESS_FLOOR_HOLD = "receiverless_floor"
 
 
 @dataclass(frozen=True)
@@ -508,6 +523,9 @@ class SafeScaleStateMachine:
             if float(z) >= float(evidence.z_m) + margin:
                 continue
             holds[model] = "same_evidence"
+        for model, why in holds.items():
+            if self._rollback_evidence[model].receiverless_floor:
+                holds[model] = f"{RECEIVERLESS_FLOOR_HOLD}:{why}"
         return holds
 
     def start_probe(
@@ -520,9 +538,11 @@ class SafeScaleStateMachine:
         window_inputs: ProbeWindowInputs | None = None,
         companions: tuple[tuple[str, str], ...] = (),
         block_id: str | None = None,
+        commit_z_floor: float | None = None,
     ) -> SafeScaleDecision:
         """Start a probe of ``model`` hiding ``pods``. ``companions`` / ``block_id``: a TP
-        block's immediate pods and joint-block id (:class:`SafeScaleProbe`)."""
+        block's immediate pods and joint-block id (:class:`SafeScaleProbe`).
+        ``commit_z_floor``: a receiver-less shrink's commit Z floor (its tau_high)."""
         if model in self._probes:
             return SafeScaleDecision(status="probing", reason="probe_already_active")
         if not pods:
@@ -549,6 +569,7 @@ class SafeScaleStateMachine:
             start_routable=_optional_int(inputs.routable_pods),
             companions=tuple((str(m), str(p)) for m, p in companions),
             block_id=block_id,
+            commit_z_floor=_optional_float(commit_z_floor),
         )
         self._probes[model] = probe
         self._persist_probe(probe)
@@ -1138,7 +1159,8 @@ class SafeScaleStateMachine:
                 )
             tail_low_evidence = True
         failures = () if idle else tail_gate_failures(
-            summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
+            summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max,
+            tau_high=probe.commit_z_floor,
         )
         if early is not None and failures:
             return None
@@ -1921,12 +1943,14 @@ class SafeScaleStateMachine:
         # hold. A commit clears the previous rollback's evidence.
         if status == "rollback" and probe.preempt_reason is None:
             code = _rollback_code(probe, reason)
+            rollback = (probe.terminal_details or {}).get("rollback_reason") or {}
             self._rollback_evidence[model] = RollbackEvidence(
                 rolled_back_ms=int(now_ms),
                 reason=code,
                 capacity=code in CAPACITY_ROLLBACK_CODES,
                 z_m=probe.start_z_m,
                 routable=probe.start_routable,
+                receiverless_floor=isinstance(rollback, dict) and rollback.get("gates") == ["z_below_tau_high"],
             )
         elif status == "commit":
             self._rollback_evidence.pop(model, None)
@@ -2414,17 +2438,16 @@ def tail_pre_hide_stats(
     }
 
 
-def _tail_allows_commit(summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8) -> bool:
-    return not tail_gate_failures(summary, tau_low=tau_low, kv_cache_max=kv_cache_max)
-
-
 def tail_gate_failures(
-    summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8
+    summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8, tau_high: float | None = None
 ) -> tuple[str, ...]:
     """The formal commit gate (v1 _tail_summary_allows_commit), returning which checks
     failed instead of a bool (empty = commit). v1 short-circuits in this order: latency,
     missing Z under traffic, Z < tau_low, KV-cache > 0.8; the same order decides here, and
-    every failing check is listed for the rollback-reason report."""
+    every failing check is listed for the rollback-reason report.
+
+    ``tau_high`` (2026-11-01, receiver-less probes only): the Z floor is
+    ``max(tau_low, tau_high)`` instead of ``tau_low`` - the model must still be HIGH."""
     failures: list[str] = []
     if not summary.latency_ok:
         failures.append("latency")
@@ -2433,7 +2456,9 @@ def tail_gate_failures(
             failures.append("z_missing")
         # v1: no Z and no traffic -> commit, whatever the KV cache says.
         return tuple(failures)
-    if summary.z_min < tau_low:
+    if tau_high is not None and summary.z_min < max(float(tau_low), float(tau_high)):
+        failures.append("z_below_tau_high")
+    elif summary.z_min < tau_low:
         failures.append("z_below_tau_low")
     if summary.gpu_cache_max is not None and summary.gpu_cache_max > kv_cache_max:
         failures.append("kv_cache")
@@ -2494,6 +2519,8 @@ def _probe_record(
         record["start_z_m"] = probe.start_z_m
     if probe.start_routable is not None:
         record["start_routable"] = probe.start_routable
+    if probe.commit_z_floor is not None:
+        record["commit_z_floor"] = probe.commit_z_floor
     if probe.direct is not None:
         record["direct_evidence"] = probe.direct.as_record()
     if probe.companions:
@@ -2586,6 +2613,7 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         window_base_ms=_optional_int(row.get("window_base_ms")),
         direct=DirectState.from_record(row.get("direct_evidence")),
         start_z_m=_optional_float(row.get("start_z_m")),
+        commit_z_floor=_optional_float(row.get("commit_z_floor")),
         start_routable=_optional_int(row.get("start_routable")),
         companions=tuple(
             (str(item[0]), str(item[1])) for item in row.get("companions") or ()

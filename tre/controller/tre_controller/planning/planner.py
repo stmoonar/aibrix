@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology, tp_size_error
+from tre_controller.planning.safescale import RECEIVERLESS_FLOOR_HOLD
 from tre_controller.planning.classify import (
     ModelClassification,
     ModelRole,
@@ -622,11 +623,15 @@ def build_plan(
         # whose release is a probe is such a retry: held. When it is an immediate relay
         # (:func:`relays`; scope ``off`` has no holds) it is a different decision - a
         # LOW / CRITICAL receiver in need - and the hold does not apply. The receiver-less
-        # HIGH probe stays held in every scope (high_models loop).
-        return not relays(donor.state) and rollback_held(donor.model_name)
+        # HIGH probe stays held in every scope (high_models loop). A rollback that failed
+        # only the receiver-less tau_high floor (2026-11-01) judged "the model stays HIGH
+        # without this pod", not this decision: it holds no probe for a receiver.
+        return not relays(donor.state) and rollback_held(donor.model_name, for_receiver=True)
 
-    def rollback_held(model: str) -> bool:
+    def rollback_held(model: str, *, for_receiver: bool = False) -> bool:
         if model not in probe_backoff_models:
+            return False
+        if for_receiver and str(probe_backoff_models[model]).startswith(f"{RECEIVERLESS_FLOOR_HOLD}:"):
             return False
         _event_once(events, f"safescale_rollback_hold:{model}:{probe_backoff_models[model]}")
         return True
