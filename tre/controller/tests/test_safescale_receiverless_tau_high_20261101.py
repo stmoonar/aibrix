@@ -55,3 +55,35 @@ def test_a_receiverless_shrink_commits_only_if_the_model_stays_high(receiver, z,
     assert decision.status == status
     if gates is not None:
         assert decision.details["rollback_reason"]["gates"] == gates
+
+
+@pytest.mark.parametrize(
+    ("tp_sizes", "critical", "status", "gates"),
+    [
+        ({}, ("other",), "commit", None),  # a TP1 model CRITICAL: the freed GPU is needed
+        ({"high": 2, "other": 2}, ("other",), "commit", None),  # a TP2 pod frees a TP2 slot
+        ({}, (), "rollback", ["z_below_tau_high"]),  # nobody CRITICAL
+        ({}, ("high",), "rollback", ["z_below_tau_high"]),  # the probe's own model is no receiver
+        ({"high": 1, "other": 2}, ("other",), "rollback", ["z_below_tau_high"]),  # one GPU, TP2 waits
+    ],
+)
+def test_the_tau_high_floor_is_waived_while_a_model_the_freed_gpus_serve_is_critical(
+    tp_sizes, critical, status, gates
+):
+    # Live run 11-01: a 14b (TP2) receiver-less probe held its 2 GPUs ~21 s and rolled
+    # back on the floor while 7b was CRITICAL and capacity-blocked.
+    machine = SafeScaleStateMachine(config=SafeScaleConfig(), tp_sizes=tp_sizes)
+    snapshot = MetricsSnapshot(ts_ms=1, stale=False, models={
+        "high": _metrics_with_pods("high", generation=400.0, waiting=0.0, running=1.0, pods=("h-a", "h-b")),
+    })
+    run_rescue_tick(snapshot, queue=FakeQueue(), registry=_registry_with_models("high"), safescale=machine)
+    probe = machine.active_probe("high")
+    assert probe is not None and not probe.pending_upscales and len(probe.pods) == 1
+
+    decision = machine.observe("high", _tail(probe, 1.1), now_ms=probe.deadline_ms, critical_receivers=critical)
+    assert decision.status == status
+    if gates is None:
+        assert decision.details["commit_z_floor_waived_for"] == ["other"]
+    else:
+        assert decision.details["rollback_reason"]["gates"] == gates
+        assert "commit_z_floor_waived_for" not in decision.details

@@ -371,6 +371,8 @@ def create_controller_dependencies(
         ),
         # Redis mode: the remaining pods a commit needs evidence of (fresh view only).
         remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
+        # 2026-11-01: which CRITICAL models a receiver-less probe's freed GPUs can serve.
+        tp_sizes={spec.name: spec.tp_size for spec in registry.models()},
     )
     safescale.restore()
     tail_start.append(safescale.tail_start_ms)

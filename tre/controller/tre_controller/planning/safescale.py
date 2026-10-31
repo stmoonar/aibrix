@@ -298,6 +298,7 @@ class SafeScaleStateMachine:
         wall_clock_ms: Callable[[], int] | None = None,
         remaining_pods: Callable[[str, tuple[str, ...]], Collection[str] | None] | None = None,
         grid: EvidenceGrid | None = None,
+        tp_sizes: Mapping[str, int] | None = None,
     ) -> None:
         """``evidence`` (the live controller: ``MetricsEvidenceReader``) switches the
         latency part of the commit gate to the post-hide evidence window (2026-09-29);
@@ -321,8 +322,13 @@ class SafeScaleStateMachine:
 
         ``grid`` (round 4): the gateway's histogram-doc grid, for the Redis evidence
         path only (which docs follow the hide; the controller passes its evidence
-        period; default: the offline 10 s grid). No decision rule here reads it."""
+        period; default: the offline 10 s grid). No decision rule here reads it.
+
+        ``tp_sizes`` (2026-11-01): the registry models' tp_size, for the receiver-less
+        floor waiver (:meth:`_floor_waived_for`). Empty / not wired = every model
+        single-GPU (as the planner's ``PlanConfig.model_tp_sizes``)."""
         self._config = config
+        self._tp_sizes = {str(name): int(size) for name, size in (tp_sizes or {}).items()}
         self._grid = grid or EvidenceGrid()
         self._store = store
         self._evidence = evidence
@@ -893,7 +899,9 @@ class SafeScaleStateMachine:
         (``hide_unconfirmed``).
 
         ``critical_receivers`` (F4, design donor-evidence-20261007): models the latest
-        planner tick classified CRITICAL - an early-commit trigger (:meth:`_try_early_commit`)."""
+        planner tick classified CRITICAL - an early-commit trigger (:meth:`_try_early_commit`);
+        at the gate, one the freed GPUs can serve waives a receiver-less probe's tau_high
+        floor (2026-11-01, :meth:`_floor_waived_for`)."""
         probe = self._probes.get(model)
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
@@ -994,12 +1002,14 @@ class SafeScaleStateMachine:
                 if updated is not probe:
                     self._persist_probe(updated)
                 return SafeScaleDecision(status="probing", reason="probe_pending")
-            return self._after_judge(model, self._judge(updated, health, now_ms=now_ms, wall_now_ms=clock))
+            return self._after_judge(model, self._judge(updated, health, now_ms=now_ms, wall_now_ms=clock,
+                                                        critical_receivers=critical_receivers))
         if now_ms < updated.deadline_ms:
             if updated is not probe:
                 self._persist_probe(updated)
             return SafeScaleDecision(status="probing", reason="probe_pending")
-        return self._after_judge(model, self._judge(updated, health, now_ms=now_ms))
+        return self._after_judge(model, self._judge(updated, health, now_ms=now_ms,
+                                                    critical_receivers=critical_receivers))
 
     def _block_pass_lapsed(self, probe: SafeScaleProbe) -> SafeScaleProbe:
         if not probe.block_passed:
@@ -1028,6 +1038,7 @@ class SafeScaleStateMachine:
         now_ms: int,
         wall_now_ms: int | None = None,
         early: dict[str, Any] | None = None,
+        critical_receivers: Collection[str] = (),
     ) -> SafeScaleDecision | None:
         """The formal commit gate (v1 _tail_summary_allows_commit) at the deadline.
 
@@ -1042,7 +1053,11 @@ class SafeScaleStateMachine:
         ``early`` (timer cleanup 2026-10-02, direct path only): the same gates before
         the deadline, on the evidence covered so far (``early["deadline_ms"]``). Returns
         None - and changes nothing - unless every gate passes (no extension, wait,
-        rollback or gate failure is acted on early: the deadline decides those)."""
+        rollback or gate failure is acted on early: the deadline decides those).
+
+        ``critical_receivers``: models the latest planner tick classified CRITICAL; one
+        the freed GPUs can serve waives a receiver-less probe's tau_high floor
+        (:meth:`_floor_waived_for`)."""
         model = probe.model
         direct_live = self._direct_live(probe)
         if early is not None and not (self._direct_mode and direct_live):
@@ -1158,13 +1173,16 @@ class SafeScaleStateMachine:
                     direct_now_ms=int(wall_now_ms or now_ms) if (self._direct_mode and direct_live) else None,
                 )
             tail_low_evidence = True
+        waived_for = self._floor_waived_for(probe, critical_receivers)
         failures = () if idle else tail_gate_failures(
             summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max,
-            tau_high=probe.commit_z_floor,
+            tau_high=None if waived_for else probe.commit_z_floor,
         )
         if early is not None and failures:
             return None
         audit = {**tail_audit, **latency_audit}
+        if waived_for:
+            audit["commit_z_floor_waived_for"] = waived_for
         if tail_low_evidence:
             audit["tail_low_evidence"] = True
         min_tail = int(getattr(self._config, "min_commit_samples", 20) or 0)
@@ -1231,6 +1249,26 @@ class SafeScaleStateMachine:
             decision = self._rollback(updated, reason="formal_commit_gate_failed")
         # The commit / rollback decision record carries the audit too.
         return replace(decision, details={**decision.details, **audit})
+
+    def _floor_waived_for(self, probe: SafeScaleProbe, critical_receivers: Collection[str]) -> list[str]:
+        """2026-11-01: the CRITICAL models (other than the probe's) that the GPUs this
+        receiver-less probe frees can serve - tp_size <= hidden pods x the probe model's
+        tp_size. The tau_high floor exists only because nobody needs the freed GPU; while
+        one of them does, the probe is judged on the tau_low floor like a probe for a
+        receiver. Empty for a probe for a receiver (no floor to waive). An unknown
+        tp_size (a model missing from a non-empty ``tp_sizes``) waives nothing."""
+        probe_tp = self._tp_size(probe.model)
+        if probe.commit_z_floor is None or not critical_receivers or probe_tp is None:
+            return []
+        freed = len(probe.pods) * probe_tp
+        return sorted(
+            name for name in {str(item) for item in critical_receivers} - {probe.model}
+            if (tp := self._tp_size(name)) is not None and tp <= freed
+        )
+
+    def _tp_size(self, model: str) -> int | None:
+        """The model's tp_size: 1 without ``tp_sizes``, None if a non-empty map lacks it."""
+        return self._tp_sizes.get(model) if self._tp_sizes else 1
 
     def _evidence_outcome(
         self, probe: SafeScaleProbe, summary: "ProbeTailSummary", *, now_ms: int
@@ -1645,7 +1683,7 @@ class SafeScaleStateMachine:
         if urgent:
             drained = {**drained, "critical_receivers": urgent}
         return self._judge(
-            probe, health, now_ms=now_ms, wall_now_ms=wall_now_ms,
+            probe, health, now_ms=now_ms, wall_now_ms=wall_now_ms, critical_receivers=urgent,
             early={
                 "deadline_ms": int(window.coverage_end_ms),
                 "elapsed_ms": elapsed,
