@@ -141,6 +141,7 @@ class _ReferenceStore(MetricsStore):
             ttft_count_complete=self._hist_series_complete(model, H["ttft"], hist_docs, start),
             tpot_avg_ms=ms._seconds_to_ms(self._avg(model, H["tpot"], hist_docs, start)),
             tpot_count=self._count(model, H["tpot"], hist_docs, start),
+            tpot_count_complete=self._hist_series_complete(model, H["tpot"], hist_docs, start),
             e2e_hist=e2e_hist,
             e2e_hist_count=e2e_hist_count,
             hist_first_ts_ms=ttft_ts[0] if ttft_ts else None,
