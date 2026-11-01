@@ -38,6 +38,8 @@ def _spec() -> ModelSpec:
                                       delta_crit=0.2, delta_high=0.25),
             "kv_usage": AltThreshold(theta=0.5, direction="higher_is_healthier",
                                      delta_crit=0.2, delta_high=0.25),
+            "tpot_mean": AltThreshold(theta=50.0, direction="lower_is_healthier",
+                                      delta_crit=0.2, delta_high=0.25),
         },
     )
 
@@ -349,3 +351,23 @@ def test_the_alt_signals_sum_the_routable_pods_only() -> None:
         assert get_signal(gap, _spec(), source, trs_z_m=9.0, routable_pod_ids=frozenset({"a", "b"})).z_m is None
     # ids that disagree with the routable count: fail closed
     assert get_signal(window, _spec(), "queue_len", trs_z_m=9.0, routable_pod_ids=frozenset()).z_m is None
+
+
+def test_tpot_mean_pools_pod_means_by_decoded_token_count_and_fails_closed() -> None:
+    """2026-11-02 tpot_mean: the pods' TPOT (inter-token latency) histogram means pooled by
+    their token counts, z = theta / value; a pod whose TPOT histogram was not read makes it
+    unknown, a window without a decoded token has no sample (nothing held without state)."""
+    import dataclasses
+
+    def pod(name: str, avg: float | None, n: float | None, complete: bool = True) -> PodWindowMetrics:
+        return dataclasses.replace(_pod(name), tpot_avg_ms=avg, tpot_count=n, tpot_count_complete=complete)
+
+    pods = [pod("a", 20.0, 300.0), pod("b", 100.0, 100.0), pod("c", None, 0.0)]
+    sig = get_signal(_pods_window(pods, routable=3), _spec(), "tpot_mean", trs_z_m=9.0)
+    assert sig.raw_value == pytest.approx(40.0)  # (20*300 + 100*100) / 400
+    assert sig.z_m == pytest.approx(50.0 / 40.0)
+    missing = get_signal(_pods_window([pods[0], pod("b", 100.0, 100.0, complete=False)], routable=2),
+                         _spec(), "tpot_mean", trs_z_m=9.0)
+    assert missing.z_m is None and missing.unavailable_reason == "tpot_mean_missing"
+    no_token = get_signal(_pods_window([pod("a", None, 0.0)], routable=1), _spec(), "tpot_mean", trs_z_m=9.0)
+    assert no_token.z_m is None and no_token.unavailable_reason == "tpot_mean_no_sample"

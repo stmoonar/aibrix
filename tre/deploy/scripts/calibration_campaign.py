@@ -1123,8 +1123,8 @@ def fit_plan(
     4. ``ablation`` - the same verdict for the two TSS ablation arms of plan §6.9,
        TSS(lambda=0) and TSS(w_p=1), with the primary label (``--label-lambda-wait``), so
        the paper can show that the weighting, not the signal, does the work;
-    5. ``alt`` - ``fit_alt_thresholds`` for all five ALT_SIGNALS (queue_len, ttft_mean,
-       kv_usage, decode_tps, prefill_tps) on the
+    5. ``alt`` - ``fit_alt_thresholds`` for all six ALT_SIGNALS (queue_len, ttft_mean,
+       tpot_mean, kv_usage, decode_tps, prefill_tps) on the
        same fitting and family CSVs and the same label; it runs the very same
        ``theta_verdict.verdict_report`` per model and writes one verdict JSON per
        model and signal;
@@ -1545,10 +1545,10 @@ def fit_plan(
 
 
 #: The alternative signals this campaign step fits: every one of
-#: tre_calibration.alt_signals.ALT_SIGNALS. The v1 signals ttft_mean / kv_usage read the
+#: tre_calibration.alt_signals.ALT_SIGNALS. The v1 signals ttft_mean / kv_usage (and tpot_mean) read the
 #: standard dataset columns of scripts.alt_signal_columns (written by calibration_dataset),
 #: so their fit is part of the campaign, not a manual step (review 2026-10-28).
-ALT_SIGNALS = ("queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefill_tps")
+ALT_SIGNALS = ("queue_len", "ttft_mean", "tpot_mean", "kv_usage", "decode_tps", "prefill_tps")
 
 
 def _without_idle_fit(label_args: Sequence[str]) -> list[str]:

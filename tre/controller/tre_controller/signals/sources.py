@@ -1,11 +1,12 @@
 """Control signals the classifier can run on: TSS (``zm``) and the ablation arms.
 
 Sources (``TRE_SIGNAL_SOURCE``): ``zm`` (TSS), the v1 ablation signals ``queue_len`` /
-``ttft_mean`` / ``kv_usage`` (definitions in :mod:`tre_common.alt_signals`), the plan
-section 6.9 rates ``decode_tps`` / ``prefill_tps``, and ``latency_p95`` (worst p95/SLO
-ratio; not fitted, not v1's latency signal - not used by the ablation). ``queue_len``,
-``ttft_mean`` and ``kv_usage`` are built from the per-pod window data of the routable pods
-and are unknown unless every routable replica reported (:func:`_serving_pods`).
+``ttft_mean`` / ``kv_usage`` (definitions in :mod:`tre_common.alt_signals`), the mean
+TPOT ``tpot_mean`` (2026-11-02), the plan section 6.9 rates ``decode_tps`` /
+``prefill_tps``, and ``latency_p95`` (worst p95/SLO ratio; not fitted, not v1's latency
+signal - not used by the ablation). ``queue_len``, ``ttft_mean``, ``tpot_mean`` and
+``kv_usage`` are built from the per-pod window data of the routable pods and are unknown
+unless every routable replica reported (:func:`_serving_pods`).
 
 Every alternative signal goes through :func:`_thresholded_signal`: its raw value comes
 from :mod:`tre_common.alt_signals` (the same function the offline fit uses), is smoothed
@@ -28,6 +29,7 @@ from tre_common.alt_signals import (
     normalize_signal_value,
     queue_len_per_replica,
     token_rate_per_replica,
+    tpot_mean_value,
     ttft_mean_value,
 )
 from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
@@ -40,7 +42,7 @@ if TYPE_CHECKING:  # pragma: no cover
 SignalSource = str
 
 __all__ = [
-    "EPS", "Z_MAX", "SignalValue", "get_signal", "model_kv_usage_sum", "model_mean_ttft_ms",
+    "EPS", "Z_MAX", "SignalValue", "get_signal", "model_kv_usage_sum", "model_mean_tpot_ms", "model_mean_ttft_ms",
     "normalize_signal", "per_replica_token_rate",
 ]
 
@@ -120,6 +122,19 @@ def get_signal(
         return _thresholded_signal(
             metrics, spec, source, raw, "ttft_mean_missing", "ttft_mean_threshold_missing", signal_state, gap_ms
         )
+    if source == "tpot_mean":
+        # Same rules as ttft_mean on the TPOT (inter-token latency) histogram: a window
+        # without a decoded token holds the last EMA within its gap rules, else unknown.
+        pods = _serving_pods(metrics, routable_pod_ids)
+        mean_ms = _MISSING if pods is None else model_mean_tpot_ms(pods)
+        if mean_ms is _MISSING:
+            return SignalValue(source, raw_value=None, z_m=None, unavailable_reason="tpot_mean_missing")
+        raw = tpot_mean_value(mean_ms)
+        if raw is None:
+            return _held_signal(metrics, spec, source, "tpot_mean_no_sample", signal_state, gap_ms)
+        return _thresholded_signal(
+            metrics, spec, source, raw, "tpot_mean_missing", "tpot_mean_threshold_missing", signal_state, gap_ms
+        )
     if source == "kv_usage":
         pods = _serving_pods(metrics, routable_pod_ids)
         usage_sum = None if pods is None else model_kv_usage_sum(pods)
@@ -176,15 +191,26 @@ def model_mean_ttft_ms(pods: list[PodWindowMetrics]) -> float | None | object:
     """Model window mean TTFT (ms): the pods' histogram means pooled by their first-token
     counts (sum of sums / sum of counts, v1 D38). None = no first token in the window;
     :data:`_MISSING` = some pod's TTFT histogram was not read."""
+    return _pooled_mean_ms(pods, "ttft")
+
+
+def model_mean_tpot_ms(pods: list[PodWindowMetrics]) -> float | None | object:
+    """Model window mean TPOT (ms): the pods' inter-token-latency histogram means pooled by
+    their decoded-token counts, as :func:`model_mean_ttft_ms`. None = no token decoded in
+    the window; :data:`_MISSING` = some pod's TPOT histogram was not read."""
+    return _pooled_mean_ms(pods, "tpot")
+
+
+def _pooled_mean_ms(pods: list[PodWindowMetrics], name: str) -> float | None | object:
     total_ms = 0.0
     count = 0.0
     for pod in pods:
-        n = pod.ttft_count
-        if not pod.ttft_count_complete or n is None or not math.isfinite(float(n)) or float(n) < 0.0:
+        n = getattr(pod, f"{name}_count")
+        if not getattr(pod, f"{name}_count_complete") or n is None or not math.isfinite(float(n)) or float(n) < 0.0:
             return _MISSING
         if float(n) == 0.0:
             continue
-        avg = pod.ttft_avg_ms
+        avg = getattr(pod, f"{name}_avg_ms")
         if avg is None or not math.isfinite(float(avg)):
             return _MISSING
         total_ms += float(avg) * float(n)

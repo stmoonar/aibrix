@@ -81,9 +81,10 @@ CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_S
 #       base: tre
 #       controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
 SAFESCALE_SCOPES = ("all", "receiverless_shrink", "healthy_and_shrink", "off")   # tre_controller.config.SAFESCALE_SCOPES
-# = tre_controller.config.SIGNAL_SOURCES (feat/alt-signals-20261028: ttft_mean / kv_usage added, kv_cache removed);
+# = tre_controller.config.SIGNAL_SOURCES (feat/alt-signals-20261028: ttft_mean / kv_usage added, kv_cache removed;
+# feat/tpot-signal-20261102: tpot_mean added);
 # an image without a value refuses to start -> the startup-line check fails the arm
-SIGNAL_SOURCES = ("zm", "queue_len", "ttft_mean", "kv_usage", "latency_p95", "decode_tps", "prefill_tps")
+SIGNAL_SOURCES = ("zm", "queue_len", "ttft_mean", "tpot_mean", "kv_usage", "latency_p95", "decode_tps", "prefill_tps")
 CONTROLLER_ENV_CHOICES = {"TRE_SAFESCALE_SCOPE": SAFESCALE_SCOPES, "TRE_SIGNAL_SOURCE": SIGNAL_SOURCES}
 # collectors of docs/eval-metrics-spec §7 that every arm directory should hold (missing -> suspect)
 COLLECTOR_FILES = ("layout.jsonl", "pod_metrics_1s.jsonl", "pod_gauges.jsonl", "gpu_map.jsonl", "gpu_truth.jsonl",

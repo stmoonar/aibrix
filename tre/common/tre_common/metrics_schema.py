@@ -106,6 +106,9 @@ class PodWindowMetrics:
     ttft_count_complete: bool = field(default=True, compare=False)
     tpot_avg_ms: float | None = field(default=None, compare=False)
     tpot_count: float | None = field(default=None, compare=False)
+    #: As ``ttft_count_complete`` for the TPOT (inter-token latency) histogram: False when
+    #: some histogram doc of the read lacks it. Read only by the alt ``tpot_mean`` signal.
+    tpot_count_complete: bool = field(default=True, compare=False)
     #: The window's e2e-latency histogram delta, UNGATED: cumulative buckets
     #: ``((upper_s, count), ...)`` ascending, and its observation count. The model
     #: e2e p95 is computed from the pods' histograms merged BEFORE the

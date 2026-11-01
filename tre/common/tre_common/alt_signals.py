@@ -19,6 +19,12 @@ quantity and its normalisation to ``z`` live here, once:
   vLLM TTFT histogram ``sum / count`` deltas pooled over the pods, i.e. weighted by each
   pod's first-token count), floored at 1 ms (v1 ``LATENCY_FLOOR_MS``). A window without a
   first token has no value;
+* ``tpot_mean`` (2026-11-02, signal ablation TSS vs mean TPOT) is the model's **server-side
+  mean time per output token** of the window in ms: the vLLM inter-token-latency histogram
+  (``vllm:inter_token_latency_seconds``, gateway doc key ``time_per_output_token_seconds``)
+  ``sum / count`` deltas pooled over the pods, i.e. weighted by each pod's decoded-token
+  count, floored at 1 ms like ``ttft_mean``. It is observed per generated token (while the
+  request runs), not per completed request. A window without a decoded token has no value;
 * ``kv_usage`` is the model's **KV-cache headroom** ``max(1 - u, 0.001)``,
   ``u = min(1, sum of the pods' window-mean KV-cache fill / routable_pods)`` (v1
   ``SIGNAL_KV``: vLLM ``kv_cache_usage_perc``, not the prefix-cache hit rate). Higher is
@@ -42,6 +48,7 @@ Z_MAX = 10.0
 #: v1 floors (``tre_code`` ``controller/alt_signals.py`` FLOORS).
 QUEUE_FLOOR_PER_REPLICA = 1.0
 TTFT_FLOOR_MS = 1.0
+TPOT_FLOOR_MS = 1.0
 KV_HEADROOM_FLOOR = 1e-3
 
 #: What each fitted alternative signal's value IS (the formulas in this module). A theta
@@ -53,6 +60,7 @@ KV_HEADROOM_FLOOR = 1e-3
 ALT_SIGNAL_DEFINITIONS = {
     "queue_len": "queue_len:max((running+waiting)/max(1,routable),1):20261028",
     "ttft_mean": "ttft_mean:max(sum_pods(ttft_sum)/sum_pods(ttft_count),1ms):20261028",
+    "tpot_mean": "tpot_mean:max(sum_pods(itl_sum)/sum_pods(itl_count),1ms):20261102",
     "kv_usage": "kv_usage:max(1-min(1,sum_pods(kv_fill)/routable),0.001):20261028",
     "decode_tps": "decode_tps:step_counter_generation_tokens/s/routable:20261028",
     "prefill_tps": "prefill_tps:step_counter_prompt_tokens/s/routable:20261028",
@@ -97,6 +105,16 @@ def ttft_mean_value(mean_ttft_ms: object) -> Optional[float]:
     if mean is None or mean <= 0.0:
         return None
     return max(mean, TTFT_FLOOR_MS)
+
+
+def tpot_mean_value(mean_tpot_ms: object) -> Optional[float]:
+    """The tpot_mean signal from the model's window mean inter-token latency (ms): floored
+    at :data:`TPOT_FLOOR_MS`; None when no token was decoded in the window (missing,
+    non-finite or <= 0), as :func:`ttft_mean_value`."""
+    mean = _finite(mean_tpot_ms)
+    if mean is None or mean <= 0.0:
+        return None
+    return max(mean, TPOT_FLOOR_MS)
 
 
 def kv_headroom(usage_sum: object, pods: object) -> Optional[float]:
@@ -196,6 +214,7 @@ __all__ = (
     "KV_HEADROOM_FLOOR",
     "LOWER_IS_HEALTHIER",
     "QUEUE_FLOOR_PER_REPLICA",
+    "TPOT_FLOOR_MS",
     "TTFT_FLOOR_MS",
     "Z_MAX",
     "alt_basis_errors",
@@ -204,5 +223,6 @@ __all__ = (
     "normalize_signal_value",
     "queue_len_per_replica",
     "token_rate_per_replica",
+    "tpot_mean_value",
     "ttft_mean_value",
 )

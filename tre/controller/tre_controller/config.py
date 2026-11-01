@@ -57,6 +57,7 @@ SIGNAL_SOURCES = {
     "latency_p95",
     "queue_len",
     "ttft_mean",
+    "tpot_mean",
     "kv_usage",
     "decode_tps",
     "prefill_tps",

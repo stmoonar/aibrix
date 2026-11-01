@@ -126,7 +126,7 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.disable_eta_gate is True
 
 
-FITTED_ALT_SOURCES = ["queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefill_tps"]
+FITTED_ALT_SOURCES = ["queue_len", "ttft_mean", "tpot_mean", "kv_usage", "decode_tps", "prefill_tps"]
 
 
 def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
@@ -211,7 +211,7 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
         assert cfg.signal_source == source
 
 
-@pytest.mark.parametrize("source", ["ttft_mean", "kv_usage"])
+@pytest.mark.parametrize("source", ["ttft_mean", "tpot_mean", "kv_usage"])
 def test_v1_alt_source_refuses_to_start_on_the_repo_registry(source: str) -> None:
     """The repo registry carries no fitted theta for the v1 signals."""
     with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires fitted"):

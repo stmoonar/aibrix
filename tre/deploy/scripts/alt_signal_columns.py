@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Window columns of the v1 ablation signals ``ttft_mean`` and ``kv_usage`` from the 1 Hz
+"""Window columns of the ablation signals ``ttft_mean``, ``tpot_mean`` and ``kv_usage`` from the 1 Hz
 per-pod vLLM capture (``cells/<stem>/vllm_metrics_1hz/``, :mod:`scripts.calibration_capture`).
 
 The controller reads both from the gateway docs of every serving pod
@@ -14,6 +14,10 @@ theta / delta on the values the controller will compute:
   ``vllm:time_to_first_token_seconds`` ``_sum`` and ``_count`` deltas between them; the
   model value = sum of the sums / sum of the counts (v1 D38: pooled by first-token count),
   in ms. Count 0 = no first token in the window: the mean is empty (no value), the count 0;
+* ``tpot_server_mean_ms`` / ``tpot_server_count`` (2026-11-02, ``tpot_mean``): the same rule
+  on the inter-token-latency histogram ``vllm:inter_token_latency_seconds``
+  (``time_per_output_token_seconds`` before vLLM 0.11; the gateway doc key is the old
+  name), pooled by decoded-token count. Count 0 = no token decoded: empty mean;
 * ``kv_cache_usage_sum`` / ``kv_cache_pods``: per serving pod, the mean of ALL its
   ``vllm:kv_cache_usage_perc`` samples in ``(start, end]`` (``gpu_cache_usage_perc`` on
   engines before 0.11); the sum over the serving pods and their number. A pod serves when
@@ -31,8 +35,8 @@ pod expected by ``cell_meta.json`` has no file, and per pod: no boundary sample 
 span (``no_sample``), an interior spacing > 10 s (``gap``, the TSS counter rule of
 :mod:`scripts.l3_numerator`), a TTFT count that decreases (``reset``). Per column (as the
 controller reads each signal from its own series): a sample without the TTFT histogram
-(``missing_series``) empties the two TTFT columns, no KV sample of a serving pod in the
-window (``no_kv``) the two KV columns.
+(``missing_series``) empties the two TTFT columns, a sample without the TPOT histogram the
+two TPOT columns, no KV sample of a serving pod in the window (``no_kv``) the two KV columns.
 The counts per status go into the dataset manifest.
 """
 from __future__ import annotations
@@ -47,8 +51,12 @@ from tre_common.vllm_metrics import vllm_candidates
 
 from scripts import l3_numerator as l3
 
-COLUMNS = ["ttft_server_mean_ms", "ttft_server_count", "kv_cache_usage_sum", "kv_cache_pods"]
+TTFT_COLUMNS = ["ttft_server_mean_ms", "ttft_server_count"]
+TPOT_COLUMNS = ["tpot_server_mean_ms", "tpot_server_count"]
+KV_COLUMNS = ["kv_cache_usage_sum", "kv_cache_pods"]
+COLUMNS = TTFT_COLUMNS + KV_COLUMNS + TPOT_COLUMNS
 TTFT_FAMILIES = vllm_candidates("time_to_first_token_seconds")
+TPOT_FAMILIES = vllm_candidates("inter_token_latency_seconds")
 KV_FAMILIES = vllm_candidates("kv_cache_usage_perc")
 SLEEP_FAMILY = "vllm:engine_sleep_state"
 
@@ -65,7 +73,11 @@ def _family(key: str) -> str:
 def _ttft(hists: Mapping[str, Any]) -> tuple[Optional[float], Optional[float]]:
     """``(sum_s, count)`` of the TTFT histogram in one decoded sample, summed over its
     series (engines); ``(None, None)`` when absent."""
-    for family in TTFT_FAMILIES:
+    return _hist_sum_count(hists, TTFT_FAMILIES)
+
+
+def _hist_sum_count(hists: Mapping[str, Any], families: Sequence[str]) -> tuple[Optional[float], Optional[float]]:
+    for family in families:
         series = [v for k, v in hists.items() if _family(k) == family and isinstance(v, Mapping)]
         if series:
             try:
@@ -93,7 +105,8 @@ def _asleep(gauges: Mapping[str, Any]) -> bool:
 
 @dataclass
 class PodAltSamples:
-    """One pod's samples in time order: ``(ts_ms, ttft_sum_s, ttft_count, kv, asleep)``."""
+    """One pod's samples in time order:
+    ``(ts_ms, ttft_sum_s, ttft_count, kv, asleep, tpot_sum_s, tpot_count)``."""
 
     pod: str
     samples: list[tuple[int, Optional[float], Optional[float], Optional[float], bool]]
@@ -106,7 +119,9 @@ class PodAltSamples:
         for s in decode_vllm_metrics(lines):
             gauges = s.get("g") or {}
             ttft_sum, ttft_count = _ttft(s.get("h") or {})
-            samples.append((int(s["ts_ms"]), ttft_sum, ttft_count, _kv(gauges), _asleep(gauges)))
+            tpot_sum, tpot_count = _hist_sum_count(s.get("h") or {}, TPOT_FAMILIES)
+            samples.append((int(s["ts_ms"]), ttft_sum, ttft_count, _kv(gauges), _asleep(gauges),
+                            tpot_sum, tpot_count))
         samples.sort(key=lambda row: row[0])
         return cls(pod=pod, samples=samples)
 
@@ -126,7 +141,16 @@ class PodAltSamples:
 
     def window_ttft(self, start_ms: int, end_ms: int, *, max_gap_ms: int = l3.DEFAULT_MAX_GAP_MS
                     ) -> tuple[str, Optional[float], Optional[float]]:
-        """``(status, sum_s delta, count delta)`` over ``(start_ms, end_ms]``."""
+        """``(status, sum_s delta, count delta)`` of the TTFT histogram over ``(start_ms, end_ms]``."""
+        return self._window_hist(start_ms, end_ms, 1, 2, max_gap_ms=max_gap_ms)
+
+    def window_tpot(self, start_ms: int, end_ms: int, *, max_gap_ms: int = l3.DEFAULT_MAX_GAP_MS
+                    ) -> tuple[str, Optional[float], Optional[float]]:
+        """``(status, sum_s delta, count delta)`` of the TPOT histogram over ``(start_ms, end_ms]``."""
+        return self._window_hist(start_ms, end_ms, 5, 6, max_gap_ms=max_gap_ms)
+
+    def _window_hist(self, start_ms: int, end_ms: int, si: int, ni: int, *, max_gap_ms: int
+                     ) -> tuple[str, Optional[float], Optional[float]]:
         i0, i1 = self._last_at_or_before(start_ms), self._last_at_or_before(end_ms)
         if i0 is None or i1 is None:
             return l3.STATUS_NO_SAMPLE, None, None
@@ -137,11 +161,11 @@ class PodAltSamples:
         span = self.samples[i0:i1 + 1]
         if any(b[0] - a[0] > max(max_gap_ms, l3.INTERIOR_GAP_MAX_MS) for a, b in zip(span, span[1:])):
             return l3.STATUS_GAP, None, None
-        if any(s[1] is None or s[2] is None for s in span):
+        if any(s[si] is None or s[ni] is None for s in span):
             return l3.STATUS_MISSING_SERIES, None, None
-        if any(b[2] < a[2] for a, b in zip(span, span[1:])):
+        if any(b[ni] < a[ni] for a, b in zip(span, span[1:])):
             return l3.STATUS_RESET, None, None
-        return STATUS_OK, max(0.0, span[-1][1] - span[0][1]), span[-1][2] - span[0][2]
+        return STATUS_OK, max(0.0, span[-1][si] - span[0][si]), span[-1][ni] - span[0][ni]
 
     def window_kv(self, start_ms: int, end_ms: int) -> tuple[str, Optional[float], bool]:
         """``(status, mean KV fill of the window's samples, serving)`` over ``(start_ms,
@@ -164,7 +188,8 @@ class AltSignalColumns:
     """Columns of one cell's windows: ``self(start_ms, end_ms)`` -> the :data:`COLUMNS`
     (None = empty). Counts every window asked for by status (``counts``: a window with a
     void column under the first void status of its pods in :data:`VOID_STATUSES` order;
-    ``missing_series`` voids only the TTFT columns, ``no_kv`` only the KV columns)."""
+    ``missing_series`` voids only the columns of the missing histogram (TTFT or TPOT),
+    ``no_kv`` only the KV columns)."""
 
     def __init__(self, pods: Sequence[PodAltSamples], *, missing_pods: Sequence[str] = (),
                  max_gap_ms: int = l3.DEFAULT_MAX_GAP_MS) -> None:
@@ -181,8 +206,9 @@ class AltSignalColumns:
         if not self.pods or self.missing_pods:
             return self._void(l3.STATUS_NO_METRICS)
         ttft_statuses: list[str] = []
+        tpot_statuses: list[str] = []
         kv_statuses: list[str] = []
-        ttft_sum = ttft_count = kv_sum = 0.0
+        ttft_sum = ttft_count = tpot_sum = tpot_count = kv_sum = 0.0
         kv_pods = 0
         for pod in self.pods:
             status, s, n = pod.window_ttft(int(start_ms), int(end_ms), max_gap_ms=self.max_gap_ms)
@@ -190,6 +216,11 @@ class AltSignalColumns:
             if status == STATUS_OK:
                 ttft_sum += s
                 ttft_count += n
+            status, s, n = pod.window_tpot(int(start_ms), int(end_ms), max_gap_ms=self.max_gap_ms)
+            tpot_statuses.append(status)
+            if status == STATUS_OK:
+                tpot_sum += s
+                tpot_count += n
             status, kv, awake = pod.window_kv(int(start_ms), int(end_ms))
             kv_statuses.append(status)
             if status == STATUS_OK and awake:
@@ -198,16 +229,24 @@ class AltSignalColumns:
         # Review L4 (2026-10-28), per column as online: a missing TTFT histogram makes only
         # ttft_mean unknown, a missing KV gauge only kv_usage (the controller reads each
         # signal from its own series); a pod without samples, a gap or a reset voids both.
+        # A TPOT-only void status (its histogram missing) empties only the TPOT columns;
+        # its sample spacing is the TTFT one, so a gap / no sample already voids all.
         statuses = ttft_statuses + kv_statuses
-        void = [s for s in VOID_STATUSES if s in statuses]
-        both = [s for s in void if s not in (l3.STATUS_MISSING_SERIES, STATUS_NO_KV)]
-        if both or (l3.STATUS_MISSING_SERIES in void and (STATUS_NO_KV in void or kv_pods == 0)):
+        void = [s for s in VOID_STATUSES if s in statuses + tpot_statuses]
+        both = [s for s in VOID_STATUSES if s in statuses and s not in (l3.STATUS_MISSING_SERIES, STATUS_NO_KV)]
+        ttft_void = l3.STATUS_MISSING_SERIES in ttft_statuses
+        tpot_void = any(s != STATUS_OK for s in tpot_statuses)
+        if both or (ttft_void and tpot_void and (STATUS_NO_KV in void or kv_pods == 0)):
             return self._void(void[0])
         ttft = {"ttft_server_mean_ms": ttft_sum / ttft_count * 1000.0 if ttft_count > 0 else None,
                 "ttft_server_count": ttft_count}
+        tpot = {"tpot_server_mean_ms": tpot_sum / tpot_count * 1000.0 if tpot_count > 0 else None,
+                "tpot_server_count": tpot_count}
         kv_cols = {"kv_cache_usage_sum": kv_sum, "kv_cache_pods": kv_pods}
-        if l3.STATUS_MISSING_SERIES in void:
+        if ttft_void:
             ttft = {"ttft_server_mean_ms": None, "ttft_server_count": None}
+        if tpot_void:
+            tpot = {"tpot_server_mean_ms": None, "tpot_server_count": None}
         if STATUS_NO_KV in void or kv_pods == 0:
             # No KV sample of a serving pod, or every pod asleep (no serving replica: online
             # no routable pod, every signal unknown - the TTFT columns too).
@@ -215,7 +254,7 @@ class AltSignalColumns:
                 return self._void(STATUS_NO_KV)
             kv_cols = {"kv_cache_usage_sum": None, "kv_cache_pods": None}
         self.counts[void[0] if void else STATUS_OK] += 1
-        return {**ttft, **kv_cols}
+        return {**ttft, **kv_cols, **tpot}
 
     def summary(self) -> dict:
         return {"pods": [p.pod for p in self.pods], "missing_pods": self.missing_pods,
@@ -232,7 +271,7 @@ def columns_for_cell(model_dir: Path, stem: str, *, max_gap_ms: int = l3.DEFAULT
 
 def rule() -> dict:
     """The manifest record of how the columns were made."""
-    return {"columns": list(COLUMNS), "ttft_families": list(TTFT_FAMILIES),
+    return {"columns": list(COLUMNS), "ttft_families": list(TTFT_FAMILIES), "tpot_families": list(TPOT_FAMILIES),
             "kv_families": list(KV_FAMILIES), "max_gap_ms": l3.DEFAULT_MAX_GAP_MS,
             "interior_gap_max_ms": l3.INTERIOR_GAP_MAX_MS,
             "implementation": "scripts.alt_signal_columns.AltSignalColumns"}

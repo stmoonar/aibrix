@@ -474,6 +474,7 @@ class MetricsStore:
             ttft_count_complete=self._hist_series_complete(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
             tpot_avg_ms=_seconds_to_ms(tpot.mean()),
             tpot_count=tpot.count_delta(has_hist),
+            tpot_count_complete=self._hist_series_complete(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms),
             e2e_hist=e2e_hist,
             e2e_hist_count=e2e_hist_count,
             hist_first_ts_ms=ttft.first_ts_ms,
@@ -523,8 +524,9 @@ class MetricsStore:
     ) -> bool:
         """True when every histogram doc of the read (the baseline and the window's docs)
         carries ``metric``. Review L3 (2026-10-28): the alt ttft_mean signal must not read an
-        absent TTFT histogram as "no first token"; the offline columns void such a window
-        (``alt_signal_columns`` ``missing_series``). Only the alt signal reads this."""
+        absent TTFT histogram as "no first token" (nor tpot_mean an absent TPOT histogram as
+        "no decoded token"); the offline columns void such a window (``alt_signal_columns``
+        ``missing_series``). Only the alt signals read this."""
         hist = [doc for doc in docs if isinstance(doc.get("model_histogram_metrics"), dict)]
         if not _has_window_hist_doc(hist, window_start_ms):
             return False

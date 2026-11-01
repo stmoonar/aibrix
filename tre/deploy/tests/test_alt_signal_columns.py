@@ -10,14 +10,17 @@ from scripts import l3_numerator as l3
 
 
 def _pod(name: str, *, ttft_ms: float, rps: float, kv: float | None, asleep: bool = False,
-         reset_at: int | None = None, t1: int = 120_000) -> alt.PodAltSamples:
+         reset_at: int | None = None, t1: int = 120_000, tpot_ms: float | None = 40.0,
+         tps: float = 10.0) -> alt.PodAltSamples:
     """1 Hz samples 1 ms after each second; ``rps`` first tokens per second, each
-    ``ttft_ms`` long; KV fill ``kv`` (None = gauge absent)."""
+    ``ttft_ms`` long; ``tps`` decoded tokens per second, each ``tpot_ms`` apart (None =
+    TPOT histogram absent); KV fill ``kv`` (None = gauge absent)."""
     samples = []
     for t in range(1, t1, 1000):
         base = 0 if reset_at is None or t < reset_at else reset_at
         k = (t - base) // 1000
-        samples.append((t, k * rps * ttft_ms / 1000.0, float(k * rps), kv, asleep))
+        tpot = (None, None) if tpot_ms is None else (k * tps * tpot_ms / 1000.0, float(k * tps))
+        samples.append((t, k * rps * ttft_ms / 1000.0, float(k * rps), kv, asleep, *tpot))
     return alt.PodAltSamples(name, samples)
 
 
@@ -68,7 +71,7 @@ def test_a_missing_series_voids_only_its_own_columns() -> None:
     row = src(40_000, 60_000)
     assert row["kv_cache_usage_sum"] is None and row["kv_cache_pods"] is None
     assert row["ttft_server_mean_ms"] == pytest.approx(100.0)
-    no_hist = alt.PodAltSamples("c", [(t, None, None, 0.5, False) for t, *_ in good.samples])
+    no_hist = alt.PodAltSamples("c", [(s[0], None, None, 0.5, False, *s[5:]) for s in good.samples])
     src = alt.AltSignalColumns([good, no_hist])
     row = src(40_000, 60_000)
     assert row["ttft_server_mean_ms"] is None and row["ttft_server_count"] is None
@@ -80,7 +83,7 @@ def test_a_pod_woken_mid_window_averages_all_its_samples_as_online() -> None:
     """Review L4: the gateway docs carry no sleep state, so the controller averages every
     instant doc of a pod the fleet state reports awake at the tick; offline does the same
     (serving = awake in the last sample of the window), pre-wake samples included."""
-    rows = [(t, 0.0, 0.0, 0.0 if t < 50_000 else 0.6, t < 50_000) for t in range(1, 120_000, 1000)]
+    rows = [(t, 0.0, 0.0, 0.0 if t < 50_000 else 0.6, t < 50_000, 0.0, 0.0) for t in range(1, 120_000, 1000)]
     row = alt.AltSignalColumns([alt.PodAltSamples("b", rows)])(40_000, 60_000)
     assert row["kv_cache_pods"] == 1
     assert row["kv_cache_usage_sum"] == pytest.approx(0.6 * 10 / 20)  # 10 of 20 samples awake
@@ -96,3 +99,21 @@ def test_columns_are_read_by_the_shared_signal_functions() -> None:
     row = alt.AltSignalColumns([_pod("a", ttft_ms=250.0, rps=2.0, kv=0.4)])(40_000, 60_000)
     assert alt_signal_transform("ttft_mean")(row) == pytest.approx(250.0)
     assert alt_signal_transform("kv_usage")(row) == pytest.approx(0.6)
+
+
+def test_tpot_mean_pools_the_pods_by_token_count_and_a_missing_tpot_series_voids_only_it() -> None:
+    """2026-11-02 tpot_mean: the inter-token-latency histogram by the TTFT rules; its own
+    missing series empties only the TPOT columns. The column feeds the shared function."""
+    from tre_calibration.alt_signals import alt_signal_transform
+
+    src = alt.AltSignalColumns([_pod("a", ttft_ms=100.0, rps=1.0, kv=0.2, tpot_ms=20.0, tps=30.0),
+                                _pod("b", ttft_ms=100.0, rps=1.0, kv=0.2, tpot_ms=100.0, tps=10.0)])
+    row = src(40_000, 60_000)
+    assert row["tpot_server_count"] == pytest.approx(800.0)  # (30 + 10) x 20 s
+    assert row["tpot_server_mean_ms"] == pytest.approx(40.0)  # (20*30 + 100*10) / 40
+    assert alt_signal_transform("tpot_mean")(row) == pytest.approx(40.0)
+    src = alt.AltSignalColumns([_pod("a", ttft_ms=100.0, rps=1.0, kv=0.2),
+                                _pod("b", ttft_ms=100.0, rps=1.0, kv=0.2, tpot_ms=None)])
+    row = src(40_000, 60_000)
+    assert row["tpot_server_mean_ms"] is None and row["tpot_server_count"] is None
+    assert row["ttft_server_mean_ms"] == pytest.approx(100.0) and row["kv_cache_pods"] == 2

@@ -33,6 +33,7 @@ EXPECTED_SIGNAL_DIRECTIONS = {
     "decode_tps": "lower_is_healthier",
     "prefill_tps": "lower_is_healthier",
     "ttft_mean": "lower_is_healthier",
+    "tpot_mean": "lower_is_healthier",
     "kv_usage": "higher_is_healthier",
 }
 

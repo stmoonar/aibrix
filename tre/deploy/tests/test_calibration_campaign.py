@@ -831,7 +831,7 @@ def test_the_fit_plan_keeps_the_held_out_shape_out_of_training() -> None:
         assert not any(str(validation["output"]) in entry["command"] for entry in plan[step])
     # one hold-out per verdict: TSS, the two ablation arms and every alt signal
     assert sorted(h["arm"] for h in plan["holdout"]) == sorted(
-        ["tss", "tss_lw0", "tss_wp1", "queue_len", "ttft_mean", "kv_usage", "decode_tps", "prefill_tps"]
+        ["tss", "tss_lw0", "tss_wp1", "queue_len", "ttft_mean", "tpot_mean", "kv_usage", "decode_tps", "prefill_tps"]
     )
     for holdout in plan["holdout"]:
         assert str(validation["output"]) in holdout["command"]

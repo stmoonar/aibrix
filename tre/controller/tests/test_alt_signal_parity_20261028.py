@@ -28,18 +28,23 @@ END = 1_000_000
 WINDOW = 20_000
 WAKE = 951_000  # pod b sleeps until here (zero gauges, flat TTFT counters; its token counters still rise), then serves
 NO_TTFT = 976_000  # pod a's doc here lacks the TTFT histogram (L3)
+NO_TPOT = 990_000  # pod b's doc here lacks the TPOT histogram (tpot_mean, 2026-11-02)
 
 
 def _sample(pod: str, ts: int) -> dict:
-    """Raw state of ``pod`` at ``ts``: cumulative TTFT sum (s) / count, queue, KV fill."""
+    """Raw state of ``pod`` at ``ts``: cumulative TTFT and TPOT (inter-token latency) sum (s)
+    / count, queue, KV fill."""
     s = (ts - T0) / 1000.0
     if pod == "a":
         return {"asleep": False, "ttft_s": 0.12 * 3 * s + 0.0004 * s * s, "ttft_n": 3 * s,
+                "tpot_s": 0.03 * 40 * s + 0.0001 * s * s, "tpot_n": 40 * s,
                 "running": 4 + (ts // P) % 3, "waiting": (ts // P) % 2, "kv": 0.3 + 0.01 * ((ts // P) % 7)}
     if ts < WAKE:
-        return {"asleep": True, "ttft_s": 0.0, "ttft_n": 0.0, "running": 0, "waiting": 0, "kv": 0.0}
+        return {"asleep": True, "ttft_s": 0.0, "ttft_n": 0.0, "tpot_s": 0.0, "tpot_n": 0.0,
+                "running": 0, "waiting": 0, "kv": 0.0}
     w = (ts - WAKE) / 1000.0
-    return {"asleep": False, "ttft_s": 0.4 * w, "ttft_n": 2 * w, "running": 6, "waiting": 2, "kv": 0.55}
+    return {"asleep": False, "ttft_s": 0.4 * w, "ttft_n": 2 * w, "tpot_s": 0.05 * 25 * w, "tpot_n": 25 * w,
+            "running": 6, "waiting": 2, "kv": 0.55}
 
 
 def _online_store() -> MetricsStore:
@@ -53,6 +58,8 @@ def _online_store() -> MetricsStore:
             hists = {f"{MODEL}/request_prompt_tokens": {"sum": 0.0, "count": 0.0, "buckets": {}}}
             if not (pod == "a" and ts == NO_TTFT):
                 hists[f"{MODEL}/time_to_first_token_seconds"] = {"sum": x["ttft_s"], "count": x["ttft_n"], "buckets": {}}
+            if not (pod == "b" and ts == NO_TPOT):
+                hists[f"{MODEL}/time_per_output_token_seconds"] = {"sum": x["tpot_s"], "count": x["tpot_n"], "buckets": {}}
             redis.zadd(f"tre:v2:hist:{key}", {json.dumps({**base, "model_histogram_metrics": hists, "model_counter_metrics": {
                 f"{MODEL}/prompt_tokens_total": 10.0 * ts / 1000, f"{MODEL}/generation_tokens_total": 20.0 * ts / 1000,
             }}): ts})
@@ -72,7 +79,9 @@ def _offline_pods():
         for ts in range(T0, END + 1, P):
             x = _sample(pod, ts)
             missing = pod == "a" and ts == NO_TTFT
-            rows.append((ts, None if missing else x["ttft_s"], None if missing else x["ttft_n"], x["kv"], x["asleep"]))
+            no_tpot = pod == "b" and ts == NO_TPOT
+            rows.append((ts, None if missing else x["ttft_s"], None if missing else x["ttft_n"], x["kv"], x["asleep"],
+                         None if no_tpot else x["tpot_s"], None if no_tpot else x["tpot_n"]))
         pods.append(alt.PodAltSamples(f"default/{pod}", rows))
     return pods
 
@@ -100,19 +109,22 @@ def test_controller_and_fit_compute_the_same_alt_signal_values():
     store = _online_store()
     columns = alt.AltSignalColumns(_offline_pods())
     spec = load_registry(str(REGISTRY_PATH)).model(MODEL)
-    seen = {"wake": 0, "asleep": 0, "missing": 0, "clean": 0}
+    seen = {"wake": 0, "asleep": 0, "missing": 0, "missing_tpot": 0, "clean": 0}
     for end in range(T0 + 40_000, END + 1, P):
         start = end - WINDOW
         serving = ["a"] + (["b"] if not _sample("b", end)["asleep"] else [])
         raw = store.read_model_window(MODEL, start, end, start_exclusive=True)
         window = restrict_to_serving(raw, sleeping_pods=[] if "b" in serving else ["b"], routable_pods=len(serving))
         row = {**columns(start, end), **_offline_queue(serving, start, end)}
-        for source in ("queue_len", "ttft_mean", "kv_usage"):
+        for source in ("queue_len", "ttft_mean", "tpot_mean", "kv_usage"):
             online = get_signal(window, spec, source, trs_z_m=None, routable_pod_ids=frozenset(serving)).raw_value
             offline = alt_signal_transform(source)(row)
             assert (online is None) == (offline is None), (source, start, end, online, offline)
             if online is not None:
                 assert online == pytest.approx(offline, rel=1e-9), (source, start, end)
+        if start <= NO_TPOT <= end:  # only tpot_mean is unknown
+            assert row["tpot_server_mean_ms"] is None and row["kv_cache_pods"] is not None
+            seen["missing_tpot"] += 1
         if start <= NO_TTFT <= end:  # the doc is the baseline or inside the window
             assert row["ttft_server_mean_ms"] is None
             seen["missing"] += 1

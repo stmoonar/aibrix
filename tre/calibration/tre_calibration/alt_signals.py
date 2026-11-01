@@ -2,7 +2,8 @@
 
 The ablation asks whether TSS separates healthy from violating windows better than the
 obvious cheaper signals: v1's queue length, server-side mean TTFT and KV-cache headroom
-(``queue_len`` / ``ttft_mean`` / ``kv_usage``), and the per-replica token rates. That
+(``queue_len`` / ``ttft_mean`` / ``kv_usage``), the server-side mean TPOT (``tpot_mean``,
+2026-11-02) and the per-replica token rates. That
 question is only answerable if every signal was thresholded by the *same* criterion --
 otherwise the comparison measures the criteria. So this module owns nothing but the
 per-signal facts (which column, which orientation) and hands the actual fitting to
@@ -18,7 +19,8 @@ reciprocal transform is written into the registry.
 
 ``ttft_mean`` and ``kv_usage`` are read from window columns the dataset builder derives
 from the 1 Hz per-pod vLLM capture (``scripts.alt_signal_columns``):
-``ttft_server_mean_ms`` (pooled TTFT histogram mean) and ``kv_cache_usage_sum`` /
+``ttft_server_mean_ms`` (pooled TTFT histogram mean), ``tpot_server_mean_ms`` (pooled
+inter-token-latency histogram mean, ``tpot_mean``) and ``kv_cache_usage_sum`` /
 ``kv_cache_pods`` (sum of the awake pods' window-mean KV fill, and their number). An empty
 column is no value (the window is not used), never zero.
 """
@@ -34,6 +36,7 @@ from tre_common.alt_signals import (
     kv_headroom,
     queue_len_per_replica,
     token_rate_per_replica,
+    tpot_mean_value,
     ttft_mean_value,
 )
 from tre_calibration.fit import (
@@ -49,6 +52,7 @@ from tre_calibration.fit import (
 ALT_SIGNALS: Mapping[str, tuple[str | None, str]] = {
     "queue_len": (None, "lower_is_healthier"),
     "ttft_mean": (None, "lower_is_healthier"),
+    "tpot_mean": (None, "lower_is_healthier"),
     "kv_usage": (None, "higher_is_healthier"),
     "decode_tps": (None, "lower_is_healthier"),
     "prefill_tps": (None, "lower_is_healthier"),
@@ -72,6 +76,7 @@ def alt_signal_band_grids() -> dict[str, tuple[float, ...]]:
 
 #: Window columns of the v1 signals (written by ``scripts.alt_signal_columns``).
 TTFT_MEAN_COLUMN = "ttft_server_mean_ms"
+TPOT_MEAN_COLUMN = "tpot_server_mean_ms"
 KV_USAGE_SUM_COLUMN = "kv_cache_usage_sum"
 KV_PODS_COLUMN = "kv_cache_pods"
 
@@ -150,6 +155,12 @@ def alt_signal_transform(signal: str) -> Callable[[Mapping[str, Any]], float | N
             return ttft_mean_value(_row_float(row, TTFT_MEAN_COLUMN))
 
         return ttft
+    if signal == "tpot_mean":
+
+        def tpot(row: Mapping[str, Any]) -> float | None:
+            return tpot_mean_value(_row_float(row, TPOT_MEAN_COLUMN))
+
+        return tpot
     if signal == "kv_usage":
 
         def kv(row: Mapping[str, Any]) -> float | None:
