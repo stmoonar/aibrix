@@ -78,6 +78,17 @@
 #      start is the arm's restart; at arm end the controller stays in run mode observe, which it reads every
 #      tick), and GW_EVENTS_KEEP=1 (campaign) leaves the gateway event stream on at the end of the arm when
 #      GW_PARITY wants it on, so the next arm needs no gateway rollout (2 rollouts / arm before).
+#  16. (2026-11-02, docs runner-overhead-20261102 C2/C4) per-arm fast path; the request period and every
+#      collector are unchanged. (a) ONE controller rollout per arm: the run mode is set first (the arm's
+#      controller starts in it, as before the restart), then `ctl_env_set want`; when it changed a setting,
+#      its rollout IS the arm's restart (controller_restart_epoch, "controller restarted", startup-line
+#      check as before), else restart_controller. (b) CTL_ENV_KEEP=1 (campaign.py): the switches stay set at
+#      the end of the arm - the next arm's ctl_env_set want writes every one of them, campaign.py's last
+#      reset_canonical.sh puts them back, the exit trap still does when the arm dies; default 0 = put back
+#      at the end of the arm as before. (c) The collection after POST_S runs its independent steps in
+#      parallel (each with its old error handling; every step still starts after POST_S and the sampler
+#      stop, collect_start_epoch records when; the gateway log follower is stopped after the last one), and
+#      the offline scoring (analyze / score / run check) runs while the cluster is restored.
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
@@ -136,6 +147,7 @@ ctl_valid() {   # ctl_valid KEY VALUE
   esac
 }
 ARM_CONTROLLER_ENV="${ARM_CONTROLLER_ENV:-}"
+CTL_ENV_KEEP="${CTL_ENV_KEEP:-0}"               # 1 (campaign): switches left set at the end of the arm (note 16b)
 # ---- gateway parity + baseline arms (2026-10-06)
 GW_PARITY="${GW_PARITY:-1}"                      # 1: every arm gets event stream on + x-tre-bl-in-tokens
 GW_EVENTS_KEEP="${GW_EVENTS_KEEP:-0}"            # 1: stream left on at the end (the next arm wants it on too)
@@ -231,11 +243,14 @@ reset_baseline() {
   [ "$want" = "$got" ] || { log "ERROR awake set after restore = [$got], want [$want]"; exit 3; }
   log "reset: awake after restore: $(awake_set)"
 }
+controller_started() {   # the arm's controller is up: the rollout that started it has finished
+  date +%s > "$D/controller_restart_epoch"
+  log "controller restarted: $(kubectl -n "$TRE_NS" get pods -l "$CONTROLLER_SELECTOR" -o name | tr '\n' ' ')${1:+($1)}"
+}
 restart_controller() {
   kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY" >/dev/null
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >/dev/null
-  date +%s > "$D/controller_restart_epoch"
-  log "controller restarted: $(kubectl -n "$TRE_NS" get pods -l "$CONTROLLER_SELECTOR" -o name | tr '\n' ' ')"
+  controller_started
 }
 record_sidecar_nofile() {   # startup line of the (fixed) sidecar; record only, never fails the run
   printf 'pod\tnode\tbefore\tafter\thard\ttarget\n' > "$D/sidecar_nofile.tsv"
@@ -279,6 +294,7 @@ ctl_want() { local kv; for kv in $ARM_CONTROLLER_ENV; do [ "${kv%%=*}" = "$1" ] 
   [ "$1" = TRE_ABLATION_DISABLE_SAFESCALE ] && [ "$(ctl_want TRE_SAFESCALE_SCOPE)" = off ] && { echo true; return 0; }
   ctl_default "$1"; }
 ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the settings that differ; unset == default
+  # (2026-11-02) CTL_ENV_ROLLED=1 when it rolled the controller out (the caller's restart, note 16a)
   local k cur want def args=()
   for k in $CTL_ENV_KEYS; do
     def=$(ctl_default "$k")
@@ -291,6 +307,7 @@ ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the
   [ ${#args[@]} = 0 ] && return 0
   kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "${args[@]}" >> "$D/runner.log" 2>&1 || return 1
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >> "$D/runner.log" 2>&1 || return 1
+  CTL_ENV_ROLLED=1
   log "controller env set: ${args[*]}"
 }
 ctl_env_now() { local k; for k in $CTL_ENV_KEYS; do printf '%s=%s ' "$k" "$(ctl_env_get "$k")"; done; }
@@ -394,14 +411,18 @@ wait_no_open_probes() {
 probe_clocks() { python3 "$TOOLS/clock_probe.py" "$D/clock_offsets.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN clock probe ($1) failed"; }
 record_components() { python3 "$TOOLS/components.py" "$D/components.json" "$1" >> "$D/runner.log" 2>&1 || log "WARN components ($1) failed"; }
 BLT() { python3 "$TOOLS/bl_tools.py" "$@"; }
-BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET; CTL_ENV_TOUCHED=0
-GWLOG_PID=""; LGPID=""; SAMPLER=""
+BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET; CTL_ENV_TOUCHED=0; CTL_ENV_ROLLED=0
+GWLOG_PID=""; LGPID=""; SAMPLER=""; OFFLINE_PID=""
+CJ_PIDS=(); CJ_NAMES=()                          # collection jobs (note 16c)
 on_exit() {   # safety net: never leave a baseline shell actuating or the stream flipped after a crash
   local rc=$?
   if [ -n "$LGPID" ]; then
     kill "$LGPID" 2>/dev/null || true
     wait "$LGPID" 2>/dev/null || true
   fi
+  # (2026-11-02) no collection / scoring job may outlive the arm (the campaign moves a failed arm's directory)
+  if [ ${#CJ_PIDS[@]} -gt 0 ]; then kill "${CJ_PIDS[@]}" 2>/dev/null || true; wait "${CJ_PIDS[@]}" 2>/dev/null || true; fi
+  [ -z "$OFFLINE_PID" ] || wait "$OFFLINE_PID" 2>/dev/null || true
   [ -z "$SAMPLER" ] || touch "$D/STOP"
   [ -z "$GWLOG_PID" ] || kill "$GWLOG_PID" 2>/dev/null || true
   if [ "$BL_ENABLED" = 1 ]; then
@@ -500,9 +521,12 @@ kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_
 python3 "$TOOLS/snap.py" "$D/snap_before.json" "$SM" >> "$D/runner.log" 2>&1
 log "awake at start: $(awake_set)"
 probe_gate
-CTL_ENV_TOUCHED=1; ctl_env_set want
+CTL_ENV_TOUCHED=1
+# (2026-11-02, note 16a) run mode first, as before the restart (the arm's controller starts in it), then
+# ONE rollout: the `set env` rollout when a setting differs (it starts the arm's controller), else a restart
 if [ "$ARM" = tre ]; then log "run mode -> $(mode active active)"; else log "run mode -> $(mode observe active)"; fi
-restart_controller
+CTL_ENV_ROLLED=0; ctl_env_set want
+if [ "$CTL_ENV_ROLLED" = 1 ]; then controller_started "the env rollout above"; else restart_controller; fi
 SW=$(record_ablation_switches)
 if [ "$SW" = match ]; then
   log "ablation switches (controller startup line): $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["logged"])' "$D/ablation_switches.json")"
@@ -580,30 +604,57 @@ if [ "$IS_BL" = 1 ]; then
   log "baseline shell disabled; validity: $(python3 -c 'import json,sys;v=json.load(open(sys.argv[1]));print({k:v.get(k) for k in ("events_valid","invalid_because","gw_bl_dropped_delta")})' "$D/baseline/run_validity.json" 2>&1)"
 fi
 touch "$D/STOP"; wait $SAMPLER || true
-probe_clocks end
-record_components end
-python3 "$TOOLS/snap.py" "$D/snap_after.json" "$SM" >> "$D/runner.log" 2>&1
-kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" --since-time="$START_ISO" > "$D/controller.log" 2>&1 || true
-kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" > "$D/sm.log" 2>&1 || true
+# ---- collection (2026-11-02, note 16c): the steps below write one file each and read none of each
+# other's, so they run as parallel jobs; each keeps its old error handling. snap_after and the Redis
+# dump were fatal under set -e (no `|| true`) and still are: the arm ends with their rc once every
+# other job has finished. Every job starts here, after POST_S and the sampler stop (as before).
+date +%s > "$D/collect_start_epoch"
+CJ_FATAL="snap_after redis_dump"
+cjob() { local n=$1; shift; "$@" & CJ_PIDS+=("$!"); CJ_NAMES+=("$n"); }
+cjob_wait() {   # wait for every job; returns the rc of the first failed fatal job (0: none)
+  local i rc first=0
+  for i in "${!CJ_PIDS[@]}"; do
+    rc=0; wait "${CJ_PIDS[$i]}" || rc=$?
+    [ "$rc" = 0 ] && continue
+    case " $CJ_FATAL " in
+      *" ${CJ_NAMES[$i]} "*) log "ERROR collection step ${CJ_NAMES[$i]} failed rc=$rc"; [ "$first" != 0 ] || first=$rc ;;
+      *) log "WARN collection step ${CJ_NAMES[$i]} rc=$rc" ;;
+    esac
+  done
+  CJ_PIDS=(); CJ_NAMES=()
+  return "$first"
+}
+c_snap_after() { python3 "$TOOLS/snap.py" "$D/snap_after.json" "$SM" >> "$D/runner.log" 2>&1; }
+c_controller_log() { kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" --since-time="$START_ISO" > "$D/controller.log" 2>&1 || true; }
+c_sm_log() { kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" > "$D/sm.log" 2>&1 || true; }
 # G9: the same SM log with kubelet timestamps (uvicorn access lines carry no time of their own)
-kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" --timestamps > "$D/sm.ts.log" 2>&1 || true
-if [ -n "$GWLOG_PID" ] && kill -0 "$GWLOG_PID" 2>/dev/null; then
-  kill "$GWLOG_PID" 2>/dev/null || true; wait "$GWLOG_PID" 2>/dev/null || true
-else   # the follower ended early (pod replaced?): the end-of-arm dump instead, the follower's copy kept
-  log "WARN gateway log follower ended early ($(head -c 200 "$D/gateway-plugins.follow.err" 2>/dev/null)); dumping the log"
-  [ -s "$D/gateway-plugins.log" ] && mv "$D/gateway-plugins.log" "$D/gateway-plugins.follow.log"
-  kubectl -n "$GW_NS" logs "deploy/$GW_DEPLOY" --since-time="$START_ISO" > "$D/gateway-plugins.log" 2>&1 || true
-fi
-GWLOG_PID=""
-mkdir -p "$D/sidecar"
-for P in $(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o name); do
-  kubectl -n "$MODEL_NS" logs "$P" -c "$SIDECAR_CONTAINER" --since-time="$START_ISO" 2>/dev/null > "$D/sidecar/${P#pod/}.log" || true
-done
-grep -l -i "too many open files" "$D"/sidecar/*.log > "$D/EMFILE_PODS" 2>/dev/null || true
-APA_GREP="podautoscal|apa|scale|$(echo "$MODELS" | tr ',' '|')"
-kubectl -n "$AIBRIX_NS" logs "deploy/$APA_CTRL_DEPLOY" --since-time="$START_ISO" 2>/dev/null \
-  | grep -i -E "$APA_GREP" > "$D/aibrix-controller-manager.log" || true
-kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_after.yaml" 2>&1 || true
+c_sm_ts_log() { kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" --timestamps > "$D/sm.ts.log" 2>&1 || true; }
+c_gateway_log() { kubectl -n "$GW_NS" logs "deploy/$GW_DEPLOY" --since-time="$START_ISO" > "$D/gateway-plugins.log" 2>&1 || true; }
+c_sidecars() {   # one log per model pod (pulled in parallel inside this job), then the EMFILE scan of them
+  local P
+  mkdir -p "$D/sidecar"
+  for P in $(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o name); do
+    { kubectl -n "$MODEL_NS" logs "$P" -c "$SIDECAR_CONTAINER" --since-time="$START_ISO" 2>/dev/null > "$D/sidecar/${P#pod/}.log" || true; } &
+  done
+  wait
+  grep -l -i "too many open files" "$D"/sidecar/*.log > "$D/EMFILE_PODS" 2>/dev/null || true
+}
+c_apa_log() {
+  local APA_GREP; APA_GREP="podautoscal|apa|scale|$(echo "$MODELS" | tr ',' '|')"
+  kubectl -n "$AIBRIX_NS" logs "deploy/$APA_CTRL_DEPLOY" --since-time="$START_ISO" 2>/dev/null \
+    | grep -i -E "$APA_GREP" > "$D/aibrix-controller-manager.log" || true
+}
+c_apa_crs() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_after.yaml" 2>&1 || true; }
+c_streams() {
+  if [ "$IS_BL" = 1 ]; then
+    log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models "$MODELS" 2>&1)"
+  elif [ "$WANT_EVENTS" = 1 ] && [ -s "$D/arm_start_redis_ms" ]; then
+    # G4b: the gateway per-request events of TRE / APA arms too (the stream was on)
+    log "gateway events: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/arm_start_redis_ms")" --out-dir "$D/gateway_events" --models "$MODELS" 2>&1)"
+  fi
+}
+c_collect_redis() { log "redis: $(python3 "$TOOLS/collect_redis.py" "$D" "$T_RESTART" "$REDIS_URL" 2>&1 | tail -1)"; }
+c_redis_dump() {   # safescale.json + signal_log.jsonl (fatal, as before), then the SafeScale summary of it
 python3 - "$D" "$T_RESTART" "$REDIS_URL" <<'PY'
 import json, sys, redis
 d, t0 = sys.argv[1], int(sys.argv[2]) * 1000
@@ -636,15 +687,48 @@ with open(f"{d}/signal_log.jsonl", "w") as f:
         f.write(json.dumps({"id": eid, **fields}) + "\n")
 print("probes", len(probes), "of", len(probes_all), "journals", len(journals))
 PY
-if [ "$IS_BL" = 1 ]; then
-  log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models "$MODELS" 2>&1)"
-elif [ "$WANT_EVENTS" = 1 ] && [ -s "$D/arm_start_redis_ms" ]; then
-  # G4b: the gateway per-request events of TRE / APA arms too (the stream was on)
-  log "gateway events: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/arm_start_redis_ms")" --out-dir "$D/gateway_events" --models "$MODELS" 2>&1)"
-fi
-log "redis: $(python3 "$TOOLS/collect_redis.py" "$D" "$T_RESTART" "$REDIS_URL" 2>&1 | tail -1)"
 ( cd "$TRE/deploy" && PYTHONPATH="$TRE/deploy:$TRE/common" python3 -m scripts.analysis.safescale_summary "$D/safescale.json" > "$D/safescale_summary.json" 2>&1 ) || true
+}
+# a gateway log follower that ended early (pod replaced?): the end-of-arm dump instead, the follower's copy kept
+GW_FOLLOWING=0
+if [ -n "$GWLOG_PID" ] && kill -0 "$GWLOG_PID" 2>/dev/null; then
+  GW_FOLLOWING=1
+else
+  log "WARN gateway log follower ended early ($(head -c 200 "$D/gateway-plugins.follow.err" 2>/dev/null)); dumping the log"
+  [ -s "$D/gateway-plugins.log" ] && mv "$D/gateway-plugins.log" "$D/gateway-plugins.follow.log"
+  cjob gateway_log c_gateway_log
+fi
+cjob clock_probe probe_clocks end
+cjob components record_components end
+cjob snap_after c_snap_after
+cjob controller_log c_controller_log
+cjob sm_log c_sm_log
+cjob sm_ts_log c_sm_ts_log
+cjob sidecars c_sidecars
+cjob apa_log c_apa_log
+cjob apa_crs c_apa_crs
+cjob redis_dump c_redis_dump
+cjob streams c_streams
+cjob collect_redis c_collect_redis
+cjob_wait
+# the follower runs until every dump is done (its log covers at least as far as before)
+if [ "$GW_FOLLOWING" = 1 ]; then kill "$GWLOG_PID" 2>/dev/null || true; wait "$GWLOG_PID" 2>/dev/null || true; fi
+GWLOG_PID=""
 log "collected; awake at end: $(awake_set); EMFILE pods: $(wc -l < "$D/EMFILE_PODS")"
+# (2026-11-02, note 16c) the offline scoring reads only the files collected above: it runs while the
+# cluster is restored (waited for before the arm ends; the exit trap waits for it too)
+offline_scoring() {
+  python3 "$TOOLS/analyze.py" "$D" > "$D/analyze.out" 2>&1 || true
+  local SCORE_EXTRA=()
+  if [ "$IS_BL" = 1 ]; then SCORE_EXTRA=(--validity "$D/baseline/run_validity.json" --arm-label "$ARM_LABEL"); fi
+  python3 "$TOOLS/score_pilot.py" "$D/client" --registry "$SCORE_REGISTRY" ${SCORE_EXTRA[@]+"${SCORE_EXTRA[@]}"} --out "$D/score.json" > "$D/score.out" 2>&1 || log "WARN score_pilot failed (see score.out)"
+  [ -f "$D/score.json" ] && log "score: $(python3 -c 'import json,sys;s=json.load(open(sys.argv[1]));a=s["models"]["ALL"];print({k:a.get(k) for k in ("n","fail","V_req_pct","output_tokens_sum","max_tokens_hit_frac")}, "valid=%s" % s.get("valid", "n/a"))' "$D/score.json")"
+  python3 "$TOOLS/first_run_check.py" "$D" --json "$D/run_check.json" --text "$D/run_check.txt" --quiet >> "$D/runner.log" 2>&1 \
+    && log "run check: $(python3 -c 'import json,sys;v=json.load(open(sys.argv[1]))["validity"];print({"suspect": v["suspect"], "tick_coverage": v["tick_coverage"]})' "$D/run_check.json" 2>&1 | head -c 600)" \
+    || log "WARN first_run_check failed (see runner.log)"
+}
+offline_scoring &
+OFFLINE_PID=$!
 # Decision source off BEFORE any restore / wake (same order as reset_canonical.sh): the APA
 # controller polls about every 1 s and scales a replica that restore-ids just woke back down
 # (SM scale_service path=apa), and restore-ids then fails with 409 slot_occupied (exit 3, arm
@@ -653,8 +737,12 @@ log "collected; awake at end: $(awake_set); EMFILE pods: $(wc -l < "$D/EMFILE_PO
 # --no-restart: the controller stays up in run mode observe (read every tick, 1 s cache, its open
 # probes rolled back on observe); the next arm restarts it before its load.
 log "restore: observe/observe -> $(mode observe observe)"
-ctl_env_set false; CTL_ENV_TOUCHED=0
-log "restore: controller switches: $(ctl_env_now)"
+if [ "$CTL_ENV_KEEP" = 1 ]; then   # (2026-11-02, note 16b) CTL_ENV_TOUCHED stays 1: the exit trap still restores
+  log "restore: controller switches kept (CTL_ENV_KEEP=1: the next arm's single rollout writes every one, the campaign's last reset restores them): $(ctl_env_now)"
+else
+  ctl_env_set false; CTL_ENV_TOUCHED=0
+  log "restore: controller switches: $(ctl_env_now)"
+fi
 bash "$TRE/deploy/scripts/toggle_tre_apa.sh" tre --keep-run-mode --no-restart >> "$D/runner.log" 2>&1
 N_APA=$(kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true)
 log "restore: APA CRs live: $N_APA"
@@ -669,12 +757,6 @@ if [ "$IS_BL" = 1 ]; then
   [ "$R" = 0 ] || { kubectl -n "$BL_NS" scale "deploy/$BL_DEPLOY" --replicas=0 >> "$D/runner.log" 2>&1; log "WARN scaler had $R replicas at the end: scaled to 0"; }
   log "restore: $BL_DEPLOY replicas $(kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}')"
 fi
-python3 "$TOOLS/analyze.py" "$D" > "$D/analyze.out" 2>&1 || true
-SCORE_EXTRA=()
-if [ "$IS_BL" = 1 ]; then SCORE_EXTRA=(--validity "$D/baseline/run_validity.json" --arm-label "$ARM_LABEL"); fi
-python3 "$TOOLS/score_pilot.py" "$D/client" --registry "$SCORE_REGISTRY" ${SCORE_EXTRA[@]+"${SCORE_EXTRA[@]}"} --out "$D/score.json" > "$D/score.out" 2>&1 || log "WARN score_pilot failed (see score.out)"
-[ -f "$D/score.json" ] && log "score: $(python3 -c 'import json,sys;s=json.load(open(sys.argv[1]));a=s["models"]["ALL"];print({k:a.get(k) for k in ("n","fail","V_req_pct","output_tokens_sum","max_tokens_hit_frac")}, "valid=%s" % s.get("valid", "n/a"))' "$D/score.json")"
-python3 "$TOOLS/first_run_check.py" "$D" --json "$D/run_check.json" --text "$D/run_check.txt" --quiet >> "$D/runner.log" 2>&1 \
-  && log "run check: $(python3 -c 'import json,sys;v=json.load(open(sys.argv[1]))["validity"];print({"suspect": v["suspect"], "tick_coverage": v["tick_coverage"]})' "$D/run_check.json" 2>&1 | head -c 600)" \
-  || log "WARN first_run_check failed (see runner.log)"
+wait "$OFFLINE_PID" || true; OFFLINE_PID=""
+CTL_ENV_TOUCHED=0   # the arm is complete: CTL_ENV_KEEP=1 leaves the switches to the next arm / the campaign
 log "=== arm=$ARM trace=$NAME done rc=$RC"

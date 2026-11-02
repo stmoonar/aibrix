@@ -8,6 +8,9 @@
 #   (arm_registry.py: annotation tre.dev/arm-registry-restore on the registry ConfigMap; restored through
 #   params_set.py --apply --restart, SM then controller, backups in $ARM_REGISTRY_BACKUP_DIR, which campaign.py
 #   sets to <results_root>/_registry/backups; else $TRE_BACKUP_ROOT/arm-registry).
+#   (2026-11-02) CTL_ENV_KEEP=1 (campaign.py's post-arm reset): the controller switches are not part of the
+#   canonical state and are left as the arm set them - the next arm's run_arm_pilot.sh writes every one of them
+#   in its single controller rollout; campaign.py runs this script without it once after its last arm.
 # Usage: reset_canonical.sh [--check | --force]
 #   --check  report only: exit 0 when canonical, 1 when not (read-only)
 #   (none)   reset only when not canonical
@@ -44,8 +47,10 @@ bl_owner() { kubectl -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw
 CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"   # = run_arm_pilot.sh note 14
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
-# settings off their default (unset = default): "K=v" lines
-ctl_not_false() { local k v d; for k in $CTL_ENV_KEYS; do d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-$d}" = "$d" ] || echo "$k=$v"; done; }
+CTL_ENV_KEEP="${CTL_ENV_KEEP:-0}"
+# settings off their default (unset = default): "K=v" lines; none with CTL_ENV_KEEP=1 (not checked, not reset)
+ctl_off_default() { local k v d; for k in $CTL_ENV_KEYS; do d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-$d}" = "$d" ] || echo "$k=$v"; done; }
+ctl_not_false() { [ "$CTL_ENV_KEEP" = 1 ] || ctl_off_default; }
 # their reset arguments: a switch -> K=false, the scope -> K- (unset)
 ctl_reset_args() { local kv k; for kv in $(ctl_not_false); do k=${kv%%=*}; if [ "$(ctl_default "$k")" = false ]; then echo "$k=false"; else echo "$k-"; fi; done; }
 AREG() { TRE_DIR="$TRE" TRE_NS="$TRE_NS" CONTROLLER_DEPLOY="$CONTROLLER_DEPLOY" SM_DEPLOY="${SM_DEPLOY:-tre-v2-service-manager}" \
@@ -65,6 +70,7 @@ problems() {   # prints one line per deviation from the canonical state
   g=$(AREG check 2>&1) || echo "registry: $(echo "$g" | tail -1)"
 }
 
+[ "$CTL_ENV_KEEP" != 1 ] || log "controller switches kept (CTL_ENV_KEEP=1): $(ctl_off_default | tr '\n' ' ')"
 P=$(problems)
 if [ -z "$P" ] && [ "$MODE" != --force ]; then log "canonical: $(run_mode); awake [$WANT]"; exit 0; fi
 [ -z "$P" ] || log "not canonical: $(echo "$P" | tr '\n' ';')"
