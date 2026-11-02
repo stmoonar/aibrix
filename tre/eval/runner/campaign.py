@@ -13,9 +13,20 @@ every arm in every position, first-order carry-over balanced over a full square)
 Per arm: pre-checks (marker, run mode, canonical awake layout, decision source NONE, gpu-truth
 fresh, disk) -> ``run_arm_pilot.sh`` (all collectors of the
 eval spec) -> validity verdict -> ``campaign_manifest.json`` + done marker -> post-arm reset to
-the canonical state -> report for the arm + cross-arm report of the trace + campaign index
-(plot failures are logged, never stop the campaign). A failed / invalid arm gets one automatic
-retry after a full reset, then a failed marker and the campaign continues.
+the canonical state -> campaign index. Reports (``report.enabled``) are OFF by default since
+2026-11-02 (user decision: no reports while a campaign runs; every input stays in the arm
+directories, so ``report.py`` / the viz scripts make them afterwards); with ``report.enabled: true``
+the arm's report and the trace's cross-arm report follow each arm (plot failures are logged,
+never stop the campaign). A failed / invalid arm gets one automatic retry after a full reset, then
+a failed marker and the campaign continues - except (2026-11-02) an arm whose only invalid reason
+is the client failure rate while every infrastructure check is clean (``validity.cause =
+method``): the method under test caused it, a rerun does not change it; it is marked failed at
+once, its data kept as for every invalid attempt.
+
+Controller switches (2026-11-02): the arms run with ``CTL_ENV_KEEP=1``, so an arm leaves its
+controller switches set and the next arm's single controller rollout writes every one of them
+(the post-arm reset leaves them too); after the last arm this process runs one reset that puts
+them back to production (not after a hard pre-check failure: no cluster write then).
 
 Resume: rerun the same command; arms with a valid done marker are skipped, a directory without
 a marker (interrupted) is moved aside and counts as a failed attempt. ``<results_root>/STOP``
@@ -107,7 +118,9 @@ DEFAULTS: dict = {
     "arm_defs": {},
     "preserve": {"trace_host_root": None, "trace_pod_root": "/etc/tre-baselines-traces", "match_parts": 3,
                  "history_root": None},   # Real_* history files: <history_root>/<trace>/seed<k>/preserve_history.json
-    "report": {"enabled": True, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
+    # 2026-11-02: off by default (no reports while the campaign runs); the campaign files of earlier runs
+    # keep their own `report.enabled: true` (the record of how those runs ran)
+    "report": {"enabled": False, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
                "reps": 1000, "timeout_s": 900, "nice": 10, "extra_args": []},
     # precheck.breakpoint_lookback_s (older campaign files): accepted and ignored - the O1
     # breakpoint window and its clock check were removed (2026-10-29, design 20261029-tss-only).
@@ -936,6 +949,22 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
     return {"verdict": verdict, "invalid": inv, "suspect": sus, "info": info, "metrics": m}
 
 
+# 2026-11-02: the one invalid reason a rerun does not change (r3e APA conv: 21.3 % then 21.1 %)
+_CLIENT_FAILURE_INVALID = re.compile(r"^client failures \d+/\d+ \(")
+
+
+def invalid_cause(verdict: dict) -> Optional[str]:
+    """Cause of an invalid verdict: ``method`` when its only invalid reason is the client failure rate and
+    every infrastructure check is clean (rc 0, no suspect: collectors, run check, SM 5xx, clocks, EMFILE,
+    baseline events) - the method under test failed the requests, a retry runs the same method on the same
+    trace; ``infra`` otherwise (retried). None for a verdict that is not invalid."""
+    if verdict.get("verdict") != "invalid":
+        return None
+    inv = verdict.get("invalid") or []
+    clean = not verdict.get("suspect") and (verdict.get("metrics") or {}).get("rc") == 0
+    return "method" if clean and inv and all(_CLIENT_FAILURE_INVALID.match(x) for x in inv) else "infra"
+
+
 # ------------------------------------------------------------------ per-arm manifest
 def _kv_file(path: Path) -> dict:
     out = {}
@@ -1553,15 +1582,19 @@ class Deps:
     def precheck(self, need_baseline: bool) -> tuple[bool, list]:
         return precheck_until_ready(lambda: self.cluster.checks(self.c, need_baseline), self.reset, self.c, self.rec.line)
 
-    def reset(self, force: bool) -> int:
+    def reset(self, force: bool, keep_ctl_env: bool = False) -> int:
+        """keep_ctl_env (2026-11-02, the post-arm reset): the controller switches the arm set stay (the next
+        arm's run_arm_pilot.sh writes all of them); every other reset puts them back to production."""
         args = ["bash", str(HERE / "reset_canonical.sh")] + (["--force"] if force else [])
         log = Path(self.c["results_root"]) / "logs" / "reset.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a") as f:
-            f.write(f"=== {now_iso()} {' '.join(args)}\n"); f.flush()
+            f.write(f"=== {now_iso()} {' '.join(args)}{' (CTL_ENV_KEEP=1)' if keep_ctl_env else ''}\n"); f.flush()
             rc = subprocess.call(args, stdout=f, stderr=subprocess.STDOUT,
-                                 env={**os.environ, "ARM_REGISTRY_BACKUP_DIR": str(registry_dir(self.c) / "backups")})
-        self.rec.line(f"reset{' --force' if force else ''} rc={rc} (logs/reset.log)")
+                                 env={**os.environ, "ARM_REGISTRY_BACKUP_DIR": str(registry_dir(self.c) / "backups"),
+                                      "CTL_ENV_KEEP": "1" if keep_ctl_env else "0"})
+        self.rec.line(f"reset{' --force' if force else ''}{' (controller switches kept)' if keep_ctl_env else ''} "
+                      f"rc={rc} (logs/reset.log)")
         return rc
 
     def registry_apply(self, item: PlanItem, attempt: int) -> dict:
@@ -1637,6 +1670,8 @@ class Campaign:
         self.completed: list = []
         self.failed: list = []
         self.last_validity: dict = {}
+        self.arms_run = 0                   # arms started by this process (they may leave controller switches set)
+        self.blocked_hard: list = []        # the hard pre-check failures that blocked the last arm
 
     # -- stop
     def stop_requested(self) -> bool:
@@ -1681,6 +1716,9 @@ class Campaign:
         ce = arm_def(self.c, item.arm).controller_env
         # ARM_CONTROLLER_ENV: "K=v ..." the arm wants; unset = every switch false (production)
         env["ARM_CONTROLLER_ENV"] = " ".join(f"{k}={v}" for k, v in sorted(ce.items()))
+        # 2026-11-02: the switches stay set at the end of the arm (run_arm_pilot.sh note 16b); the next arm's
+        # single controller rollout writes all of them, _restore_controller_env after the last arm
+        env["CTL_ENV_KEEP"] = "1"
         env.update(prep.get("env") or {})
         return env
 
@@ -1713,6 +1751,7 @@ class Campaign:
             if not ok:
                 self.rec.line(f"[{item.n}/{len(self.plan)}] BLOCKED {key}: pre-checks failed: "
                               + "; ".join(f"{r['name']}: {r['detail']}" for r in res if not r["ok"]))
+                self.blocked_hard = [r["name"] for r in res if not r["ok"] and r.get("kind") == "hard"]
                 return "blocked"
             try:
                 prep = self.prepare(item, e)
@@ -1745,6 +1784,7 @@ class Campaign:
                         raise
                     except Exception as exc:  # noqa: BLE001  timeouts, OS / parse errors: this item fails, the campaign goes on
                         raise AR.RegistryError(f"{type(exc).__name__}: {exc}") from exc
+                self.arms_run += 1
                 rc = self.deps.run_arm(item, self.arm_env(item, e, prep), att)
             except AR.RegistryError as exc:
                 rc, reg_err = None, str(exc)
@@ -1760,6 +1800,8 @@ class Campaign:
                 verdict = assess_arm(item.arm_dir, rc, e.requests, self.c["validity"], item.base_arm in BASELINE_ARMS)
                 if reg and reg.get("applied"):
                     self._registry_verdict(item, reg, restored, verdict)
+            if verdict["verdict"] == "invalid":
+                verdict["cause"] = invalid_cause(verdict)   # 2026-11-02: method = no retry
             self.last_validity = {"key": key, "attempt": att, **verdict}
             extra = {"preserve": prep.get("record")} if prep.get("record") else {}
             if rules:
@@ -1769,18 +1811,26 @@ class Campaign:
                 write_json_atomic(Path(item.arm_dir) / "campaign_manifest.json", man)
             met = verdict["metrics"]
             self.rec.line(f"[{item.n}/{len(self.plan)}] {'DONE' if verdict['verdict'] != 'invalid' else 'INVALID'} {key} "
-                          f"verdict={verdict['verdict']} rc={rc} V_req={met.get('V_req_pct')}% fail={met.get('fail')} "
+                          f"verdict={verdict['verdict']}{' cause=' + verdict['cause'] if verdict.get('cause') else ''} "
+                          f"rc={rc} V_req={met.get('V_req_pct')}% fail={met.get('fail')} "
                           f"wall={hms(t1 - t0)} reasons={'; '.join(verdict['invalid'] + verdict['suspect'] + verdict.get('info', [])) or '-'}")
             if verdict["verdict"] != "invalid":
                 write_json_atomic(Path(item.arm_dir) / DONE_MARKER, man)
                 self.state["observed_overhead_s"].append(round(t1 - t0 - item.duration_s, 1))
                 self._save_state()
                 self.completed.append({"key": key, "verdict": verdict["verdict"], "wall_s": round(t1 - t0)})
-                self.deps.reset(False)              # post-arm: back to the canonical state
+                self.deps.reset(False, keep_ctl_env=True)   # post-arm: back to the canonical state
                 return "done"
             if Path(item.arm_dir).exists():
                 moved = move_aside(Path(item.arm_dir), f"failed-a{att}")
                 self.rec.line(f"{key}: attempt {att} kept in {moved.name if moved else '?'}")
+            if verdict.get("cause") == "method":
+                # 2026-11-02: the arm ran clean (rc 0, no infrastructure suspect) and the method failed the
+                # requests: no retry (it would rerun the same method on the same trace); the cluster is as
+                # after a done arm
+                self.deps.reset(False, keep_ctl_env=True)
+                self._mark_failed(item, att, "method under test (no retry): " + "; ".join(verdict["invalid"]), cause="method")
+                return "failed"
             if att >= max_att:
                 self.deps.reset(True)               # leave the canonical state for the next arm
                 self._mark_failed(item, att, "; ".join(verdict["invalid"]))
@@ -1810,12 +1860,27 @@ class Campaign:
             verdict["invalid"] += why
         verdict["verdict"] = "invalid" if verdict["invalid"] else ("suspect" if verdict["suspect"] else "valid")
 
-    def _mark_failed(self, item: PlanItem, attempts: int, why: str) -> None:
+    def _mark_failed(self, item: PlanItem, attempts: int, why: str, cause: str = "infra") -> None:
         write_json_atomic(failed_marker_path(item), {"campaign": self.c["name"], "out_name": item.out_name, "arm": item.arm,
-                                                     "attempts": attempts, "reason": why, "at": now_iso(),
+                                                     "attempts": attempts, "reason": why, "cause": cause, "at": now_iso(),
                                                      "validity": self.last_validity if self.last_validity.get("key") == item.key else None})
-        self.failed.append({"key": item.key, "reason": why[:300]})
+        self.failed.append({"key": item.key, "reason": why[:300], "cause": cause})
         self.rec.line(f"[{item.n}/{len(self.plan)}] FAILED {item.key} after {attempts} attempt(s): {why[:300]} (campaign continues)")
+
+    def _restore_controller_env(self, final: str) -> None:
+        """2026-11-02: the arms ran with CTL_ENV_KEEP=1 (an arm leaves its controller switches set, the next arm's
+        single rollout writes all of them), so after the last arm of this process one reset puts them back to
+        production. Not after a hard pre-check failure (marker, another runner, disk ...): no cluster write then."""
+        if not self.arms_run:
+            return
+        if final == "blocked" and self.blocked_hard:
+            self.rec.line(f"controller switches NOT restored: hard pre-check failure ({', '.join(self.blocked_hard)}); "
+                          "reset_canonical.sh restores them")
+            return
+        try:
+            self.deps.reset(False)
+        except Exception as exc:  # noqa: BLE001  the next runner's ctl_env_set / reset_canonical.sh restores them
+            self.rec.line(f"ERROR controller switch restore failed: {type(exc).__name__}: {exc}")
 
     def run(self) -> int:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1856,6 +1921,9 @@ class Campaign:
                 break
             if float(self.c.get("gap_s") or 0) > 0 and not self.stop_requested():
                 self.deps.sleep(float(self.c["gap_s"]))
+        # (a crash of this process skips it, as it skipped every reset before: the controller is in run mode
+        # observe then, and the next arm's rollout or reset_canonical.sh writes the switches)
+        self._restore_controller_env(final)
         if final == "done" and self.stop_requested():
             final = "stopped" if any(item_status(i, self.c["name"]) in ("pending", "interrupted") for i in self.plan) else "done"
         self.publish(final)

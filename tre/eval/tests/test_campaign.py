@@ -87,13 +87,15 @@ def write_campaign(tmp: Path, traces=TRACES, arms=("tre", "apa", "tokenscale"), 
 
 class FakeDeps:
     """Records calls; ``script`` maps an arm key to a list of per-attempt outcomes
-    (``ok`` | ``rc`` | ``emfile``); ``on_run`` is called after each arm (e.g. to touch STOP)."""
+    (``ok`` | ``rc`` | ``emfile`` | ``fail21`` = 22 % client failures | ``fail21_emfile``); ``on_run`` is
+    called after each arm (e.g. to touch STOP). ``resets`` = (force, keep_ctl_env) of every reset."""
 
     def __init__(self, script=None, precheck_ok=True, on_run=None):
         self.script = {k: list(v) for k, v in (script or {}).items()}
         self.precheck_ok = precheck_ok
         self.on_run = on_run
         self.calls: list = []
+        self.resets: list = []
 
     def precheck(self, need_baseline):
         self.calls.append(("precheck",))
@@ -101,12 +103,14 @@ class FakeDeps:
             return True, []
         return False, [{"name": "marker", "ok": False, "detail": "absent", "kind": "hard"}]
 
-    def reset(self, force):
+    def reset(self, force, keep_ctl_env=False):
         self.calls.append(("reset", force))
+        self.resets.append((force, keep_ctl_env))
         return 0
 
     def run_arm(self, item, env, attempt):
         self.calls.append(("run", item.key, attempt, env["ARM_OUT_DIR"], env.get("BL_CM_FILE")))
+        self.last_env = env
         outcome = (self.script.get(item.key) or ["ok"]).pop(0) if self.script.get(item.key) else "ok"
         d = Path(item.arm_dir)
         d.mkdir(parents=True, exist_ok=True)
@@ -114,11 +118,12 @@ class FakeDeps:
         if outcome != "rc":
             (d / "client").mkdir(exist_ok=True)
             (d / "client" / "performance_metrics.json").write_text("[]")
-            (d / "score.json").write_text(json.dumps({"models": {"ALL": {"n": 90, "trimmed": 10, "fail": 0,
+            fail = 20 if outcome.startswith("fail21") else 0
+            (d / "score.json").write_text(json.dumps({"models": {"ALL": {"n": 90, "trimmed": 10, "fail": fail,
                                                                          "V_req_pct": 1.0, "max_tokens_hit_frac": 1.0}}}))
             for f in C.COLLECTOR_FILES:
                 (d / f).write_text("x\n")
-            (d / "EMFILE_PODS").write_text("sidecar/pod-a.log\n" if outcome == "emfile" else "")
+            (d / "EMFILE_PODS").write_text("sidecar/pod-a.log\n" if outcome.endswith("emfile") else "")
             if item.base_arm in C.BASELINE_ARMS:
                 (d / "baseline").mkdir(exist_ok=True)
                 (d / "baseline" / "run_validity.json").write_text(json.dumps({"events_valid": True}))
@@ -278,6 +283,56 @@ def test_blocked_precheck_stops_without_using_an_attempt(tmp_path):
     assert camp.run() == 3 and deps.runs() == []
     assert camp.state["attempts"] == {}
     assert json.loads((camp.root / "status.json").read_text())["state"] == "blocked"
+
+
+def test_method_caused_invalid_is_not_retried_and_infra_invalid_is(tmp_path):
+    """2026-11-02: an arm whose only invalid reason is the client failure rate, every infrastructure check
+    clean, is marked failed at once (cause method, data kept); the same failure rate with an infrastructure
+    problem (EMFILE) is retried as before."""
+    deps = FakeDeps()
+    camp = campaign(tmp_path, deps, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
+    first, second = camp.plan[0].key, camp.plan[1].key
+    deps.script = {first: ["fail21"], second: ["fail21_emfile", "ok"]}
+    assert camp.run() == 0
+    assert deps.runs() == [first, second, second]
+    fm = json.loads(C.failed_marker_path(camp.plan[0]).read_text())
+    assert fm["cause"] == "method" and fm["attempts"] == 1 and fm["validity"]["cause"] == "method"
+    assert list(Path(camp.plan[0].arm_dir).parent.glob(f"{camp.plan[0].arm}.failed-a1*"))      # data kept
+    st = json.loads((camp.root / "status.json").read_text())
+    assert [(f["key"], f["cause"]) for f in st["failed"]] == [(first, "method")]
+    assert C.item_status(camp.plan[1], "camp-test") == "done"
+
+
+def test_reports_off_by_default(tmp_path):
+    """2026-11-02: no report.enabled in the campaign file -> no report while the campaign runs, none in the ETA."""
+    p = write_campaign(tmp_path, traces=["T7_tight_pool"], arms=["tre"])
+    doc = yaml.safe_load(p.read_text())
+    del doc["report"]
+    p.write_text(yaml.safe_dump(doc))
+    c = C.load_campaign(p)
+    assert c["report"]["enabled"] is False
+    assert C.est_arm_s(c, 100) == 100 + c["eta"]["overhead_s"]
+    deps = FakeDeps()
+    assert C.Campaign(c, deps=deps, rec=C.Recorder(c, quiet=True)).run() == 0
+    assert deps.runs() and not [x for x in deps.calls if x[0] == "report"]
+
+
+def test_arms_keep_controller_switches_and_the_last_reset_restores_them(tmp_path):
+    """2026-11-02 (one controller rollout per arm): every arm runs with CTL_ENV_KEEP=1 and the post-arm reset
+    keeps the switches; after the last arm one reset without keep restores them - not after a hard pre-check
+    failure (no cluster write then)."""
+    deps = FakeDeps()
+    camp = campaign(tmp_path, deps, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
+    assert camp.run() == 0
+    assert deps.last_env["CTL_ENV_KEEP"] == "1"
+    assert deps.resets == [(False, True), (False, True), (False, False)]
+    # a hard pre-check failure before the second arm: no restore reset
+    deps2 = FakeDeps()
+    (tmp_path / "b").mkdir()
+    camp2 = campaign(tmp_path / "b", deps2, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
+    deps2.on_run = lambda item: setattr(deps2, "precheck_ok", False)
+    assert camp2.run() == 3
+    assert deps2.resets == [(False, True)]
 
 
 def test_preserve_arm_gets_its_oracle_copy_and_rendered_policy(tmp_path):

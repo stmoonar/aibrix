@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-click E1 campaign: traces in order, each trace's arms back to back (order rotated per trace
-# and recorded), pre-checks + reset + validity + reports after every arm. See campaign.py.
+# and recorded), pre-checks + reset + validity after every arm (reports only with report.enabled: true,
+# off by default since 2026-11-02). See campaign.py.
 #
 #   run_campaign.sh <campaign.yaml> --dry-run [--probe]   plan, ETAs, input checks (no cluster access;
 #                                                         --probe adds the read-only pre-checks)
