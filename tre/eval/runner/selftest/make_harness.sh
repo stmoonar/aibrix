@@ -14,7 +14,10 @@ case "$a" in
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SAFESCALE*) cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SLOW_LOOP*) cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_SAFESCALE_SCOPE*) cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null || true ;;
-  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; esac; done
+  # 2026-11-02: TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE - on the Deployment and (record_ablation_switches) the running pod
+  *"get deploy tre-v2-controller"*TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE*|*"get pods"*TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE*)
+      cat $S/ctl_TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE 2>/dev/null || true ;;
+  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*|TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; esac; done
       # the controller refuses to start when the switch and the scope disagree (tre_controller.config._safescale_scope)
       d=$(cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null); c=$(cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null)
       if [ -n "$d" ] && [ -n "$c" ] && { [ "$d" = true ] && [ "$c" != off ] || [ "$d" != true ] && [ "$c" = off ]; }; then echo "$a" >> $S/inconsistent; fi ;;
