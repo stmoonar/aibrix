@@ -78,17 +78,19 @@
 #      start is the arm's restart; at arm end the controller stays in run mode observe, which it reads every
 #      tick), and GW_EVENTS_KEEP=1 (campaign) leaves the gateway event stream on at the end of the arm when
 #      GW_PARITY wants it on, so the next arm needs no gateway rollout (2 rollouts / arm before).
-#  16. (2026-11-02, docs runner-overhead-20261102 C2/C4) per-arm fast path; the request period and every
-#      collector are unchanged. (a) ONE controller rollout per arm: the run mode is set first (the arm's
+#  16. (2026-11-02, docs runner-overhead-20261102 C2/C4) per-arm fast path; the request period is unchanged
+#      and every collector file is still written. (a) ONE controller rollout per arm: the run mode is set first (the arm's
 #      controller starts in it, as before the restart), then `ctl_env_set want`; when it changed a setting,
 #      its rollout IS the arm's restart (controller_restart_epoch, "controller restarted", startup-line
 #      check as before), else restart_controller. (b) CTL_ENV_KEEP=1 (campaign.py): the switches stay set at
 #      the end of the arm - the next arm's ctl_env_set want writes every one of them, campaign.py's last
 #      reset_canonical.sh puts them back, the exit trap still does when the arm dies; default 0 = put back
 #      at the end of the arm as before. (c) The collection after POST_S runs its independent steps in
-#      parallel (each with its old error handling; every step still starts after POST_S and the sampler
-#      stop, collect_start_epoch records when; the gateway log follower is stopped after the last one), and
-#      the offline scoring (analyze / score / run check) runs while the cluster is restored.
+#      parallel (each with its old error handling). Every step still starts after POST_S and the sampler
+#      stop, but no longer after the steps listed before it, so a dump is taken up to ~15 s nearer the
+#      POST_S end than before (collect_start_epoch records when the collection starts); the gateway log
+#      follower is stopped after the last dump. The offline scoring (analyze / score / run check) runs
+#      while the cluster is restored.
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
