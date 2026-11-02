@@ -19,14 +19,19 @@ directories, so ``report.py`` / the viz scripts make them afterwards); with ``re
 the arm's report and the trace's cross-arm report follow each arm (plot failures are logged,
 never stop the campaign). A failed / invalid arm gets one automatic retry after a full reset, then
 a failed marker and the campaign continues - except (2026-11-02) an arm whose only invalid reason
-is the client failure rate while every infrastructure check is clean (``validity.cause =
-method``): the method under test caused it, a rerun does not change it; it is marked failed at
-once, its data kept as for every invalid attempt.
+is the client failure rate while every infrastructure check is clean and the infrastructure did not
+change during the arm (``validity.cause = method``; see ``invalid_cause``): the method under test
+caused it, a rerun does not change it; it is marked failed at once, its data kept as for every
+invalid attempt. A spec with ``report.enabled: true`` gets a WARN (dry-run and run start).
 
 Controller switches (2026-11-02): the arms run with ``CTL_ENV_KEEP=1``, so an arm leaves its
 controller switches set and the next arm's single controller rollout writes every one of them
 (the post-arm reset leaves them too); after the last arm this process runs one reset that puts
-them back to production (not after a hard pre-check failure: no cluster write then).
+them back to production - also when this process ends on an exception (try/finally), but not after
+a hard pre-check failure (no cluster write then) nor while an arm is still running.
+``status.json`` ``ctl_env_restored``: true = that reset reached the canonical state, false = not
+restored (hard pre-check failure, arm still running, reset failed), null = no arm ran. A SIGKILL of
+this process skips it: run ``reset_canonical.sh`` by hand then (it puts the switches back).
 
 Resume: rerun the same command; arms with a valid done marker are skipped, a directory without
 a marker (interrupted) is moved aside and counts as a failed attempt. ``<results_root>/STOP``
@@ -945,8 +950,64 @@ def assess_arm(arm_dir: str | Path, rc: Optional[int], expected_requests: Option
                           if val.get(k) is not None}
         sus.extend(f"run check: {x}" for x in val.get("suspect") or [])
         info.extend(f"run check: {x}" for x in val.get("info") or [])
+    # 2026-11-02: what changed in the infrastructure during the arm (invalid_cause needs none to blame the method)
+    m["infra_changes"] = infra_changes(d)
     verdict = "invalid" if inv else ("suspect" if sus else "valid")
     return {"verdict": verdict, "invalid": inv, "suspect": sus, "info": info, "metrics": m}
+
+
+_FOLLOWER_ENDED_EARLY = "gateway log follower ended early"     # run_arm_pilot.sh, collection
+
+
+def infra_changes(arm_dir: str | Path) -> list[str]:
+    """2026-11-02: why the infrastructure may have changed during the arm; empty = unchanged. From the
+    components.py ``start`` / ``end`` records (both after the arm's controller restart) and runner.log:
+
+    * a pod of TRE_NS / ENVOY_NS or a model pod appeared or went (the baseline scaler, which the arm itself
+      starts and stops, and a pod already being deleted are left out);
+    * a container of a pod in both records restarted (restartCount, every recorded namespace);
+    * the gateway log follower ended early (its pod was replaced).
+
+    A record that cannot tell (no runner.log / components.json, a phase missing or with listing errors, no
+    ``namespaces`` / ``restart_count``: recorded before 2026-11-02) is a reason too."""
+    d = Path(arm_dir)
+    why = []
+    try:
+        if _FOLLOWER_ENDED_EARLY in (d / "runner.log").read_text(errors="replace"):
+            why.append("gateway log follower ended early")
+    except OSError:
+        why.append("no runner.log")
+    comp = read_json(d / "components.json")
+    st, en = (comp.get("start"), comp.get("end")) if isinstance(comp, dict) else (None, None)
+    if not isinstance(st, dict) or not isinstance(en, dict):
+        return why + ["components.json lacks the start / end record"]
+    if st.get("errors") or en.get("errors"):
+        return why + [f"components.json listing errors: {st.get('errors') or en.get('errors')}"]
+    ns = st.get("namespaces")
+    if not isinstance(ns, dict) or ns != en.get("namespaces"):
+        return why + ["components.json without namespaces (recorded before 2026-11-02)"]
+    watched = {ns.get("TRE_NS"), ns.get("ENVOY_NS")} - {None}
+
+    def pod_set(rec: dict) -> set:
+        return {(r.get("namespace"), r.get("name")) for r in rec.get("pods") or ()
+                if not r.get("deleting") and not r.get("baseline_scaler")
+                and (r.get("model_pod") or r.get("namespace") in watched)}
+    a, b = pod_set(st), pod_set(en)
+    if a != b:
+        why.append(f"pods changed during the arm: gone {sorted(n for _, n in a - b)[:5]}, new {sorted(n for _, n in b - a)[:5]}")
+
+    def restarts(rec: dict) -> dict:
+        return {(r.get("namespace"), r.get("name"), c.get("name")): c.get("restart_count", "missing")
+                for r in rec.get("pods") or () for c in r.get("containers") or ()}
+    r0, r1 = restarts(st), restarts(en)
+    both = sorted(set(r0) & set(r1))
+    unknown = [k for k in both if not isinstance(r0[k], int) or not isinstance(r1[k], int)]
+    if unknown:
+        why.append(f"restartCount not recorded for {len(unknown)} container(s), e.g. {'/'.join(unknown[0][1:])}")
+    moved = [f"{k[1]}/{k[2]} {r0[k]}->{r1[k]}" for k in both if k not in unknown and r1[k] != r0[k]]
+    if moved:
+        why.append(f"container restarts during the arm: {moved[:5]}")
+    return why
 
 
 # 2026-11-02: the one invalid reason a rerun does not change (r3e APA conv: 21.3 % then 21.1 %)
@@ -954,14 +1015,17 @@ _CLIENT_FAILURE_INVALID = re.compile(r"^client failures \d+/\d+ \(")
 
 
 def invalid_cause(verdict: dict) -> Optional[str]:
-    """Cause of an invalid verdict: ``method`` when its only invalid reason is the client failure rate and
-    every infrastructure check is clean (rc 0, no suspect: collectors, run check, SM 5xx, clocks, EMFILE,
-    baseline events) - the method under test failed the requests, a retry runs the same method on the same
-    trace; ``infra`` otherwise (retried). None for a verdict that is not invalid."""
+    """Cause of an invalid verdict: ``method`` when its only invalid reason is the client failure rate, every
+    infrastructure check is clean (rc 0, no suspect: collectors, run check, SM 5xx, clocks, EMFILE, baseline
+    events) and the infrastructure did not change during the arm (``metrics.infra_changes`` empty: same pods,
+    no container restart, gateway log follower ran to the end) - the method under test failed the requests, a
+    retry runs the same method on the same trace; ``infra`` otherwise, also when that cannot be told (retried).
+    None for a verdict that is not invalid."""
     if verdict.get("verdict") != "invalid":
         return None
     inv = verdict.get("invalid") or []
-    clean = not verdict.get("suspect") and (verdict.get("metrics") or {}).get("rc") == 0
+    met = verdict.get("metrics") or {}
+    clean = not verdict.get("suspect") and met.get("rc") == 0 and met.get("infra_changes") == []
     return "method" if clean and inv and all(_CLIENT_FAILURE_INVALID.match(x) for x in inv) else "infra"
 
 
@@ -1672,6 +1736,7 @@ class Campaign:
         self.last_validity: dict = {}
         self.arms_run = 0                   # arms started by this process (they may leave controller switches set)
         self.blocked_hard: list = []        # the hard pre-check failures that blocked the last arm
+        self.ctl_env_restored: Optional[bool] = None   # status.json: the last reset put the switches back (None: no arm ran)
 
     # -- stop
     def stop_requested(self) -> bool:
@@ -1695,6 +1760,7 @@ class Campaign:
                "remaining_s": round(rem) if state == "running" else 0,
                "counts": {k: sum(1 for v in sts.values() if v == k) for k in ("done", "failed", "pending", "interrupted")},
                "completed": self.completed, "failed": self.failed, "last_validity": self.last_validity,
+               "ctl_env_restored": self.ctl_env_restored,
                "plan": [{"n": it.n, "key": it.key, "position": f"{it.position}/{it.k}", "status": sts[it.key]} for it in self.plan]}
         self.rec.status(doc)
         if state == "running" and self.c["marker"].get("extend"):
@@ -1813,7 +1879,9 @@ class Campaign:
             self.rec.line(f"[{item.n}/{len(self.plan)}] {'DONE' if verdict['verdict'] != 'invalid' else 'INVALID'} {key} "
                           f"verdict={verdict['verdict']}{' cause=' + verdict['cause'] if verdict.get('cause') else ''} "
                           f"rc={rc} V_req={met.get('V_req_pct')}% fail={met.get('fail')} "
-                          f"wall={hms(t1 - t0)} reasons={'; '.join(verdict['invalid'] + verdict['suspect'] + verdict.get('info', [])) or '-'}")
+                          f"wall={hms(t1 - t0)} reasons={'; '.join(verdict['invalid'] + verdict['suspect'] + verdict.get('info', [])) or '-'}"
+                          + (f" infra_changes={'; '.join(met.get('infra_changes') or [])}"
+                             if verdict.get("cause") == "infra" and met.get("infra_changes") else ""))
             if verdict["verdict"] != "invalid":
                 write_json_atomic(Path(item.arm_dir) / DONE_MARKER, man)
                 self.state["observed_overhead_s"].append(round(t1 - t0 - item.duration_s, 1))
@@ -1870,16 +1938,29 @@ class Campaign:
     def _restore_controller_env(self, final: str) -> None:
         """2026-11-02: the arms ran with CTL_ENV_KEEP=1 (an arm leaves its controller switches set, the next arm's
         single rollout writes all of them), so after the last arm of this process one reset puts them back to
-        production. Not after a hard pre-check failure (marker, another runner, disk ...): no cluster write then."""
+        production - also when the loop ended on an exception (``final`` crashed). Not after a hard pre-check
+        failure (marker, another runner, disk ...: no cluster write then) and not while an arm is still running.
+        Sets ``ctl_env_restored`` (status.json): True = the reset reached the canonical state, False = not."""
         if not self.arms_run:
             return
         if final == "blocked" and self.blocked_hard:
+            self.ctl_env_restored = False
             self.rec.line(f"controller switches NOT restored: hard pre-check failure ({', '.join(self.blocked_hard)}); "
                           "reset_canonical.sh restores them")
             return
+        child = getattr(self.deps, "child", None)
+        if child is not None and child.poll() is None:
+            self.ctl_env_restored = False
+            self.rec.line(f"controller switches NOT restored: the arm (pid {child.pid}) is still running; "
+                          "reset_canonical.sh after it ends restores them")
+            return
         try:
-            self.deps.reset(False)
+            rc = self.deps.reset(False)
+            self.ctl_env_restored = rc == 0
+            if rc != 0:
+                self.rec.line(f"ERROR controller switch restore: reset rc={rc} (reset_canonical.sh restores them)")
         except Exception as exc:  # noqa: BLE001  the next runner's ctl_env_set / reset_canonical.sh restores them
+            self.ctl_env_restored = False
             self.rec.line(f"ERROR controller switch restore failed: {type(exc).__name__}: {exc}")
 
     def run(self) -> int:
@@ -1900,30 +1981,39 @@ class Campaign:
             return 2
         self.rec.line(f"campaign {self.c['name']} start: {len(self.plan)} arms, file {self.c['campaign_file']} "
                       f"(sha256 {str(self.c['campaign_sha256'])[:12]}), pid {os.getpid()}")
-        final = "done"
-        for item in self.plan:
-            st = item_status(item, self.c["name"])
-            if st == "done":
-                continue
-            if st == "failed":
-                self.rec.line(f"[{item.n}/{len(self.plan)}] skip {item.key}: failed marker (--retry-failed to run it again)")
-                continue
-            if self.stop_requested():
-                final = "stopped"
-                break
-            self.publish("running")
-            out = self.run_item(item)
-            if out == "done" and self.c["report"].get("enabled"):
-                self.deps.report(item, self.trace_done_dirs(item.out_name))
-                self.publish("running")             # the index links the new reports
-            if out in ("stopped", "blocked"):
-                final = out
-                break
-            if float(self.c.get("gap_s") or 0) > 0 and not self.stop_requested():
-                self.deps.sleep(float(self.c["gap_s"]))
-        # (a crash of this process skips it, as it skipped every reset before: the controller is in run mode
-        # observe then, and the next arm's rollout or reset_canonical.sh writes the switches)
-        self._restore_controller_env(final)
+        if self.c["report"].get("enabled"):
+            self.rec.line(f"WARN {REPORT_WARNING}")
+        final, crashed = "done", True
+        try:
+            for item in self.plan:
+                st = item_status(item, self.c["name"])
+                if st == "done":
+                    continue
+                if st == "failed":
+                    self.rec.line(f"[{item.n}/{len(self.plan)}] skip {item.key}: failed marker (--retry-failed to run it again)")
+                    continue
+                if self.stop_requested():
+                    final = "stopped"
+                    break
+                self.publish("running")
+                out = self.run_item(item)
+                if out == "done" and self.c["report"].get("enabled"):
+                    self.deps.report(item, self.trace_done_dirs(item.out_name))
+                    self.publish("running")             # the index links the new reports
+                if out in ("stopped", "blocked"):
+                    final = out
+                    break
+                if float(self.c.get("gap_s") or 0) > 0 and not self.stop_requested():
+                    self.deps.sleep(float(self.c["gap_s"]))
+            crashed = False
+        finally:
+            # 2026-11-02: also on an exception (the switches would stay set); a SIGKILL skips it -> reset_canonical.sh
+            self._restore_controller_env("crashed" if crashed else final)
+            if crashed:
+                self.rec.line(f"campaign {self.c['name']} CRASHED (exception below); controller switches restored: "
+                              f"{self.ctl_env_restored}")
+                with contextlib.suppress(Exception):
+                    self.publish("crashed")
         if final == "done" and self.stop_requested():
             final = "stopped" if any(item_status(i, self.c["name"]) in ("pending", "interrupted") for i in self.plan) else "done"
         self.publish(final)
@@ -1959,11 +2049,16 @@ def print_plan(c: dict, entries: list[TraceEntry], plan: list[PlanItem], start: 
     return total
 
 
+REPORT_WARNING = "reports during runs: AGENTS.md says off (report.enabled: true in the campaign file)"
+
+
 def dry_run(c: dict, probe: bool = False, out=sys.stdout) -> int:
     entries = resolve_traces(c)
     plan = build_plan(c, entries)
     total = print_plan(c, entries, plan, out=out)
     problems, warnings = validate_inputs(c, entries, plan)
+    if c["report"].get("enabled"):
+        warnings.append(REPORT_WARNING)
     w = out.write
     w("\ninputs:\n")
     for e in entries:
@@ -2060,7 +2155,7 @@ def main(argv: Optional[list] = None) -> int:
             if not st:
                 print("no status.json yet"); return 1
             print(json.dumps({k: st.get(k) for k in ("state", "updated_at", "current", "eta_end", "remaining_s", "counts",
-                                                     "last_validity")}, indent=1))
+                                                     "last_validity", "ctl_env_restored")}, indent=1))
             return 0
         if a.dry_run:
             return dry_run(c, probe=a.probe)

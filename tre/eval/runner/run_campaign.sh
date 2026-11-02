@@ -9,11 +9,12 @@
 #   run_campaign.sh <campaign.yaml> [--retry-failed]      resume: done arms are skipped
 #   run_campaign.sh <campaign.yaml> --status              status.json summary
 #   touch <results_root>/STOP                             clean stop after the current arm
+#   (SIGKILL of campaign.py: its final reset is skipped; run reset_canonical.sh by hand - controller switches)
 #
 # Settings: the campaign file's env: block (wins), then runner.env / the caller's environment.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ $# -ge 1 ] || { sed -n 2,13p "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n 2,14p "$0"; exit 2; }
 CAMPAIGN="$1"; shift
 export TRE_REPO="${TRE_REPO:-$(cd "$HERE/../.." && pwd)}"
 EXPORTS=$(python3 "$HERE/campaign.py" env "$CAMPAIGN")

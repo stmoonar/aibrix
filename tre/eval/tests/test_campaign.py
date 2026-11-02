@@ -8,7 +8,9 @@ writes the files a finished arm leaves behind. The invariants tested:
 * resume never reruns an arm with a valid done marker; an interrupted directory is moved aside
   and counts as an attempt;
 * a failed / invalid arm is retried once after a full reset, then marked failed, and the
-  campaign goes on;
+  campaign goes on - except one the method under test failed on an unchanged infrastructure;
+* the controller switches the arms leave set are put back after the last arm, also when this process
+  dies on an exception, never after a hard pre-check failure;
 * STOP stops after the current arm (no retry started), a blocked pre-check stops the campaign
   without consuming an attempt;
 * the exclusive-window marker only ever gets a later end time on line 1; nothing else changes.
@@ -85,10 +87,26 @@ def write_campaign(tmp: Path, traces=TRACES, arms=("tre", "apa", "tokenscale"), 
     return p
 
 
+def write_components(d: Path, restarts: int = 0) -> None:
+    """components.py start / end records of an arm (2026-11-02 fields); ``restarts`` = SM container restarts
+    between them."""
+    ns = {"TRE_NS": "tre-v2", "ENVOY_NS": "envoy", "AIBRIX_NS": "aibrix", "MODEL_NS": "default"}
+
+    def rec(rc):
+        return {"ts": 0, "namespaces": ns, "pods": [
+            {"namespace": "tre-v2", "name": "sm-1", "model_pod": False, "deleting": False, "baseline_scaler": False,
+             "containers": [{"name": "sm", "restart_count": rc}]},
+            {"namespace": "default", "name": "m7-1", "model_pod": True, "deleting": False, "baseline_scaler": False,
+             "containers": [{"name": "vllm", "restart_count": 0}]}]}
+    (d / "components.json").write_text(json.dumps({"start": rec(0), "end": rec(restarts)}))
+    (d / "runner.log").write_text("collected\n")
+
+
 class FakeDeps:
     """Records calls; ``script`` maps an arm key to a list of per-attempt outcomes
-    (``ok`` | ``rc`` | ``emfile`` | ``fail21`` = 22 % client failures | ``fail21_emfile``); ``on_run`` is
-    called after each arm (e.g. to touch STOP). ``resets`` = (force, keep_ctl_env) of every reset."""
+    (``ok`` | ``rc`` | ``emfile`` | ``fail21`` = 22 % client failures | ``fail21_emfile`` | ``fail21_restart`` =
+    the same with a container restart during the arm); ``on_run`` is called after each arm (e.g. to touch STOP).
+    ``resets`` = (force, keep_ctl_env) of every reset."""
 
     def __init__(self, script=None, precheck_ok=True, on_run=None):
         self.script = {k: list(v) for k, v in (script or {}).items()}
@@ -124,6 +142,7 @@ class FakeDeps:
             for f in C.COLLECTOR_FILES:
                 (d / f).write_text("x\n")
             (d / "EMFILE_PODS").write_text("sidecar/pod-a.log\n" if outcome.endswith("emfile") else "")
+            write_components(d, restarts=1 if outcome.endswith("restart") else 0)
             if item.base_arm in C.BASELINE_ARMS:
                 (d / "baseline").mkdir(exist_ok=True)
                 (d / "baseline" / "run_validity.json").write_text(json.dumps({"events_valid": True}))
@@ -287,20 +306,48 @@ def test_blocked_precheck_stops_without_using_an_attempt(tmp_path):
 
 def test_method_caused_invalid_is_not_retried_and_infra_invalid_is(tmp_path):
     """2026-11-02: an arm whose only invalid reason is the client failure rate, every infrastructure check
-    clean, is marked failed at once (cause method, data kept); the same failure rate with an infrastructure
-    problem (EMFILE) is retried as before."""
+    clean and the infrastructure unchanged, is marked failed at once (cause method, data kept); the same
+    failure rate with a container restart during the arm, or with an infrastructure problem (EMFILE), is
+    retried as before."""
     deps = FakeDeps()
-    camp = campaign(tmp_path, deps, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
-    first, second = camp.plan[0].key, camp.plan[1].key
-    deps.script = {first: ["fail21"], second: ["fail21_emfile", "ok"]}
+    camp = campaign(tmp_path, deps, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa", "tokenscale"]})
+    first, second, third = (i.key for i in camp.plan)
+    deps.script = {first: ["fail21"], second: ["fail21_restart", "ok"], third: ["fail21_emfile", "ok"]}
     assert camp.run() == 0
-    assert deps.runs() == [first, second, second]
+    assert deps.runs() == [first, second, second, third, third]
     fm = json.loads(C.failed_marker_path(camp.plan[0]).read_text())
     assert fm["cause"] == "method" and fm["attempts"] == 1 and fm["validity"]["cause"] == "method"
     assert list(Path(camp.plan[0].arm_dir).parent.glob(f"{camp.plan[0].arm}.failed-a1*"))      # data kept
     st = json.loads((camp.root / "status.json").read_text())
     assert [(f["key"], f["cause"]) for f in st["failed"]] == [(first, "method")]
-    assert C.item_status(camp.plan[1], "camp-test") == "done"
+    assert C.item_status(camp.plan[1], "camp-test") == "done" and C.item_status(camp.plan[2], "camp-test") == "done"
+
+
+def test_invalid_cause_is_infra_unless_the_infrastructure_is_known_unchanged(tmp_path):
+    """2026-11-02: a client-failure-only invalid arm is blamed on the method only when the start / end records
+    show the same pods, no container restart and a gateway log follower that ran to the end; a record that
+    cannot tell (before restart_count / namespaces were recorded) counts as infra."""
+    d = tmp_path / "arm"
+    d.mkdir()
+
+    def cause():
+        return C.invalid_cause({"verdict": "invalid", "invalid": ["client failures 22/100 (22.0%) > 20%"], "suspect": [],
+                                "metrics": {"rc": 0, "infra_changes": C.infra_changes(d)}})
+    write_components(d)
+    assert cause() == "method"
+    comp = json.loads((d / "components.json").read_text())
+    comp["end"]["pods"][1]["name"] = "m7-2"                              # a model pod replaced
+    (d / "components.json").write_text(json.dumps(comp))
+    assert cause() == "infra"
+    write_components(d)
+    (d / "runner.log").write_text("WARN gateway log follower ended early (x); dumping the log\n")
+    assert cause() == "infra"
+    write_components(d)
+    comp = json.loads((d / "components.json").read_text())
+    for ph in ("start", "end"):                                          # an older record: cannot tell
+        del comp[ph]["namespaces"]
+    (d / "components.json").write_text(json.dumps(comp))
+    assert cause() == "infra"
 
 
 def test_reports_off_by_default(tmp_path):
@@ -321,18 +368,31 @@ def test_arms_keep_controller_switches_and_the_last_reset_restores_them(tmp_path
     """2026-11-02 (one controller rollout per arm): every arm runs with CTL_ENV_KEEP=1 and the post-arm reset
     keeps the switches; after the last arm one reset without keep restores them - not after a hard pre-check
     failure (no cluster write then)."""
+    def status(camp):
+        return json.loads((camp.root / "status.json").read_text())
     deps = FakeDeps()
     camp = campaign(tmp_path, deps, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
     assert camp.run() == 0
     assert deps.last_env["CTL_ENV_KEEP"] == "1"
     assert deps.resets == [(False, True), (False, True), (False, False)]
-    # a hard pre-check failure before the second arm: no restore reset
+    assert status(camp)["ctl_env_restored"] is True
+    # a hard pre-check failure before the second arm: no restore reset, recorded as not restored
     deps2 = FakeDeps()
     (tmp_path / "b").mkdir()
     camp2 = campaign(tmp_path / "b", deps2, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
     deps2.on_run = lambda item: setattr(deps2, "precheck_ok", False)
     assert camp2.run() == 3
-    assert deps2.resets == [(False, True)]
+    assert deps2.resets == [(False, True)] and status(camp2)["ctl_env_restored"] is False
+    # this process dies on an exception after an arm: the switches are put back all the same
+
+    def boom(item):
+        raise RuntimeError("bug in the loop")
+    deps3 = FakeDeps(on_run=boom)
+    (tmp_path / "c").mkdir()
+    camp3 = campaign(tmp_path / "c", deps3, cfg={"traces": ["T7_tight_pool"], "arms": ["tre", "apa"]})
+    with pytest.raises(RuntimeError):
+        camp3.run()
+    assert deps3.resets[-1] == (False, False) and status(camp3)["ctl_env_restored"] is True
 
 
 def test_preserve_arm_gets_its_oracle_copy_and_rendered_policy(tmp_path):
@@ -561,6 +621,7 @@ def test_dry_run_prints_plan_and_flags_missing_inputs(tmp_path, monkeypatch):
     assert C.dry_run(c, out=out) == 0
     txt = out.getvalue()
     assert "total: 9 arms over 3 trace entries" in txt and "T7_tight_pool_s1" in txt
+    assert C.REPORT_WARNING in txt                                     # report.enabled: true -> WARN, not an error
     assert not (tmp_path / "results").exists()                         # nothing written
     monkeypatch.undo()
     (tmp_path / "traces" / "Simul_spike" / "seed1" / "traces_tre.effective.json").unlink()
@@ -722,7 +783,8 @@ def test_sensitivity_arm_registry_restored_after_success_failure_and_abort(tmp_p
         if abort:
             with pytest.raises(KeyboardInterrupt):
                 camp.run()
-            assert deps.seq(k) == ["reg_apply", "run", "reg_restore"]
+            # the registry first; then (2026-11-02) the controller switches are put back (try/finally)
+            assert deps.seq(k) == ["reg_apply", "run", "reg_restore", "reset"] and deps.resets == [(False, False)]
         else:
             camp.run()
             s = deps.seq(k)

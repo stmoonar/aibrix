@@ -10,6 +10,11 @@ several nodes, e.g. a DaemonSet, is listed per node as ``<component>@<node>``) a
 in this one keeps its node. ``baseline_scaler`` {pod, node, phase}: the baseline scaler's pod
 when one was running in a recorded phase (the runner records a ``bl_enabled`` phase right after
 the shell starts; the scaler is at 0 replicas at ``start`` and ``end``). Read-only.
+
+2026-11-02 (fields added, none removed): per container ``restart_count`` (its status restartCount),
+per pod ``deleting`` (deletionTimestamp set) and ``baseline_scaler`` (the scaler's pod), per phase
+``namespaces`` {TRE_NS, ENVOY_NS, AIBRIX_NS, MODEL_NS}: campaign.py compares the start and end records
+(both taken after the arm's controller restart) before it blames an invalid arm on the method.
 """
 from __future__ import annotations
 
@@ -33,8 +38,10 @@ def pods(ns: str, selector: str | None = None) -> list[dict]:
         rows.append({
             "namespace": ns, "name": p["metadata"]["name"], "component": component_of(p["metadata"]["name"]),
             "node": p["spec"].get("nodeName"), "phase": p.get("status", {}).get("phase"),
+            "deleting": bool(p["metadata"].get("deletionTimestamp")),
             "containers": [{"name": c["name"], "image": c.get("image"),
-                            "image_id": (status.get(c["name"]) or {}).get("imageID")}
+                            "image_id": (status.get(c["name"]) or {}).get("imageID"),
+                            "restart_count": (status.get(c["name"]) or {}).get("restartCount")}
                            for c in p["spec"].get("containers", [])],
         })
     return rows
@@ -42,22 +49,26 @@ def pods(ns: str, selector: str | None = None) -> list[dict]:
 
 def main(path: str, phase: str) -> int:
     e = os.environ.get
-    groups = [(e("TRE_NS", "tre-v2"), None), (e("ENVOY_NS", "envoy-gateway-system"), None),
-              (e("AIBRIX_NS", "aibrix-system"), None),
-              (e("MODEL_NS", "default"), e("MODEL_SELECTOR", "tre.aibrix.io/managed=true"))]
+    namespaces = {"TRE_NS": e("TRE_NS", "tre-v2"), "ENVOY_NS": e("ENVOY_NS", "envoy-gateway-system"),
+                  "AIBRIX_NS": e("AIBRIX_NS", "aibrix-system"), "MODEL_NS": e("MODEL_NS", "default")}
+    groups = [(namespaces["TRE_NS"], None), (namespaces["ENVOY_NS"], None), (namespaces["AIBRIX_NS"], None),
+              (namespaces["MODEL_NS"], e("MODEL_SELECTOR", "tre.aibrix.io/managed=true"))]
     if e("BL_NS") and e("BL_NS") not in {ns for ns, _ in groups}:
         groups.append((e("BL_NS"), None))
+    scaler = os.environ.get("BL_DEPLOY", "tre-v2-baseline-scaler")
     rows, errors = [], {}
     for ns, sel in groups:
         try:
-            rows += [dict(r, model_pod=sel is not None) for r in pods(ns, sel)]
+            rows += [dict(r, model_pod=sel is not None,
+                          baseline_scaler=r["namespace"] == e("BL_NS", "tre-v2") and r["component"] == component_of(scaler))
+                     for r in pods(ns, sel)]
         except Exception as exc:  # noqa: BLE001
             errors[ns] = str(exc)[:200]
     try:
         doc = json.load(open(path))
     except (OSError, ValueError):
         doc = {}
-    doc[phase] = {"ts": time.time(), "pods": rows, **({"errors": errors} if errors else {})}
+    doc[phase] = {"ts": time.time(), "pods": rows, "namespaces": namespaces, **({"errors": errors} if errors else {})}
     nodes_of: dict = {}
     images: dict = {}
     for r in rows:
@@ -79,10 +90,8 @@ def main(path: str, phase: str) -> int:
     comp = {**{k: v for k, v in prev.items() if k.split("@", 1)[0] not in nodes_of}, **comp}
     doc["component_nodes"] = comp
     # the baseline scaler's pod + node (its log / decision timestamps are that node's clock)
-    scaler = os.environ.get("BL_DEPLOY", "tre-v2-baseline-scaler")
     for r in rows:
-        if r["namespace"] == e("BL_NS", "tre-v2") and r["component"] == component_of(scaler) \
-                and r["phase"] in ("Running", "Pending"):
+        if r["baseline_scaler"] and r["phase"] in ("Running", "Pending"):
             doc["baseline_scaler"] = {"pod": r["name"], "node": r["node"], "phase": phase, "pod_phase": r["phase"]}
     merged = doc.get("image_ids_by_node") or {}
     for node, imgs in images.items():
