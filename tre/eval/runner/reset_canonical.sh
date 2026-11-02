@@ -48,8 +48,15 @@ CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
 CTL_ENV_KEEP="${CTL_ENV_KEEP:-0}"
-# settings off their default (unset = default): "K=v" lines; none with CTL_ENV_KEEP=1 (not checked, not reset)
-ctl_off_default() { local k v d; for k in $CTL_ENV_KEYS; do d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); [ "${v:-$d}" = "$d" ] || echo "$k=$v"; done; }
+# settings off their default (unset = default; a switch read as the controller reads it, lib_env.sh ctl_bool:
+# the overlay's "0" is false): "K=v" lines; none with CTL_ENV_KEEP=1 (not checked, not reset)
+ctl_off_default() {
+  local k v d
+  for k in $CTL_ENV_KEYS; do
+    d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]')
+    if [ "$d" = false ]; then [ "$(ctl_bool "$v")" = false ] || echo "$k=$v"; else [ "${v:-$d}" = "$d" ] || echo "$k=$v"; fi
+  done
+}
 ctl_not_false() { [ "$CTL_ENV_KEEP" = 1 ] || ctl_off_default; }
 # their reset arguments: a switch -> K=false, the scope -> K- (unset)
 ctl_reset_args() { local kv k; for kv in $(ctl_not_false); do k=${kv%%=*}; if [ "$(ctl_default "$k")" = false ]; then echo "$k=false"; else echo "$k-"; fi; done; }

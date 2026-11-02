@@ -299,9 +299,15 @@ ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the
   local k cur want def args=()
   for k in $CTL_ENV_KEYS; do
     def=$(ctl_default "$k")
-    cur=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]'); cur=${cur:-$def}
+    cur=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]')
     if [ "$1" = want ]; then want=$(ctl_want "$k"); else want=$def; fi
-    [ "$cur" = "$want" ] && continue
+    # (2026-11-02) a switch compares as the controller reads it (lib_env.sh ctl_bool): the overlay's "0" is
+    # false, so it needs no rollout; the value written is still $want
+    if [ "$def" = false ]; then
+      [ "$(ctl_bool "$cur")" = "$(ctl_bool "$(echo "$want" | tr '[:upper:]' '[:lower:]')")" ] && continue
+    else
+      [ "${cur:-$def}" = "$want" ] && continue
+    fi
     # a switch goes back to an explicit "false" (as before); the scope back to unset (= all)
     if [ "$want" = "$def" ] && [ "$def" != false ]; then args+=("$k-"); else args+=("$k=$want"); fi
   done

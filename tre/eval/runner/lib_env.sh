@@ -21,6 +21,10 @@ need_env() {   # need_env VAR ... : refuse when a required setting is empty
     [ -n "${!v:-}" ] || { echo "[runner] $v is not set (runner.env / environment)" >&2; exit 2; }
   done
 }
+# (2026-11-02) a controller switch value (lower case, "" = unset) as tre_controller.config._get_bool reads it:
+# 1/true/yes/y/on -> true, 0/false/no/n/off/unset -> false; any other value unchanged (so it stays visible
+# and differs from both). run_arm_pilot.sh / reset_canonical.sh compare default-false switches through it.
+ctl_bool() { case "$1" in 1|true|yes|y|on) echo true ;; ""|0|false|no|n|off) echo false ;; *) echo "$1" ;; esac; }
 # runner provenance (recorded per arm): this directory's git sha + dirty state
 runner_sha() {
   echo "dir=$RUNNER_DIR"

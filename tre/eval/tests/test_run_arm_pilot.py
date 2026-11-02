@@ -6,6 +6,8 @@ kubectl, curl, redis-py, loadgen; no cluster). Invariants (2026-11-02, docs runn
 * CTL_ENV_KEEP=1 (campaign): an arm leaves its switches set and the next arm's rollout writes every one of
   them; reset_canonical.sh leaves them with CTL_ENV_KEEP=1 and puts them back without it; without
   CTL_ENV_KEEP an arm puts them back at its end, as before;
+* a switch compares as the controller reads it (_get_bool): the overlay's "0" is false - no rollout, no
+  deviation; a value the controller does not know is reported;
 * every collector file is still written, and an arm that dies in its collection puts its switches back
   (CTL_ENV_KEEP=1 too).
 """
@@ -130,3 +132,17 @@ def test_an_arm_that_dies_in_its_collection_puts_its_switches_back_in_campaign_m
     # snap_after is fatal (as before); the exit trap puts the switch back although CTL_ENV_KEEP=1
     assert rc == 5 and switch(h) == "false" and "TRAP rc=5" in log
 
+
+def test_a_switch_compares_as_the_controller_reads_it(harness):
+    h = harness
+    sup = "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"
+    (h / "state" / f"ctl_{sup}").write_text("0")          # the overlay's value: false for the controller
+    rc, d, ro = run_arm(h, "tre", 1)
+    assert rc == 0, (d / "runner.log").read_text()[-1500:]
+    # no `set env` at the start or the end: the arm's single rollout is its restart
+    assert len(ro) == 1 and " rollout restart " in ro[0], ro
+    assert switch(h, sup) == "0" and startup_line_matched(d)
+    assert SWITCH_DEVIATION not in reset_check(h)
+    # a value the controller does not know is still reported
+    (h / "state" / f"ctl_{sup}").write_text("maybe")
+    assert f"{sup}=maybe" in reset_check(h)
