@@ -1,13 +1,13 @@
 """run_arm_pilot.sh / reset_canonical.sh on the offline harness (runner/selftest/make_harness.sh: fake
-kubectl, curl, redis-py, loadgen; no cluster). Invariants (2026-11-02, docs runner-overhead-20261102 C2/C4):
+kubectl, curl, redis-py, loadgen; no cluster). Invariants (2026-11-02, docs runner-overhead-20261102 C2):
 
 * one controller rollout per arm: the arm's controller is started by the ``set env`` rollout when a switch
   differs, else by a restart; the startup-line check passes either way;
 * CTL_ENV_KEEP=1 (campaign): an arm leaves its switches set and the next arm's rollout writes every one of
   them; reset_canonical.sh leaves them with CTL_ENV_KEEP=1 and puts them back without it; without
   CTL_ENV_KEEP an arm puts them back at its end, as before;
-* the parallel collection still writes every collector file, and a fatal collection step (snap_after)
-  still fails the arm - after the other steps wrote theirs.
+* every collector file is still written, and an arm that dies in its collection puts its switches back
+  (CTL_ENV_KEEP=1 too).
 """
 from __future__ import annotations
 
@@ -121,13 +121,12 @@ def test_standalone_arm_puts_its_switches_back_and_collects_every_file(harness):
     assert not missing, missing
 
 
-def test_fatal_collection_step_still_fails_the_arm_after_the_others_finished(harness):
+def test_an_arm_that_dies_in_its_collection_puts_its_switches_back_in_campaign_mode(harness):
     h = harness
     (h / "tools" / "snap.py").write_text(
         "import json, sys\nif sys.argv[1].endswith('snap_after.json'):\n    sys.exit(5)\njson.dump({}, open(sys.argv[1], 'w'))\n")
     rc, d, _ = run_arm(h, "tre", 1, ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SLOW_LOOP=true", CTL_ENV_KEEP="1")
     log = (d / "runner.log").read_text()
-    assert rc == 5 and "ERROR collection step snap_after failed rc=5" in log
-    assert all((d / f).exists() for f in ("controller.log", "sm.ts.log", "signal_log.jsonl", "decision_hist.jsonl"))
-    # the exit trap still puts the switch back when the arm dies (CTL_ENV_KEEP=1 too)
-    assert switch(h) == "false" and "TRAP rc=5" in log
+    # snap_after is fatal (as before); the exit trap puts the switch back although CTL_ENV_KEEP=1
+    assert rc == 5 and switch(h) == "false" and "TRAP rc=5" in log
+

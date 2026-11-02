@@ -85,12 +85,11 @@
 #      check as before), else restart_controller. (b) CTL_ENV_KEEP=1 (campaign.py): the switches stay set at
 #      the end of the arm - the next arm's ctl_env_set want writes every one of them, campaign.py's last
 #      reset_canonical.sh puts them back, the exit trap still does when the arm dies; default 0 = put back
-#      at the end of the arm as before. (c) The collection after POST_S runs its independent steps in
-#      parallel (each with its old error handling). Every step still starts after POST_S and the sampler
-#      stop, but no longer after the steps listed before it, so a dump is taken up to ~15 s nearer the
-#      POST_S end than before (collect_start_epoch records when the collection starts); the gateway log
-#      follower is stopped after the last dump. The offline scoring (analyze / score / run check) runs
-#      while the cluster is restored.
+#      at the end of the arm as before. (c) The collection after POST_S is serial as before (same order,
+#      same error handling: every dump is taken when it was before; collect_start_epoch records when the
+#      collection starts). Two changes: the gateway log follower is stopped after the last dump (was:
+#      after sm.ts.log; its log only covers longer), and the offline scoring (analyze / score / run
+#      check), which reads only the collected files, runs while the cluster is restored.
 # CHANGES CLUSTER STATE (run mode, APA CRs/anchors, controller restarts, SM power, load,
 # gateway plugin env (+ rollout), baseline-scaler env + replicas).
 # Usage: run_arm_pilot.sh <tre|apa|chiron|tokenscale|preserve> <TRACE_NAME>   (nohup it; progress in <dir>/runner.log)
@@ -415,15 +414,13 @@ record_components() { python3 "$TOOLS/components.py" "$D/components.json" "$1" >
 BLT() { python3 "$TOOLS/bl_tools.py" "$@"; }
 BL_ENABLED=0; EVENTS_CHANGED=0; EV_BEFORE=UNSET; CTL_ENV_TOUCHED=0; CTL_ENV_ROLLED=0
 GWLOG_PID=""; LGPID=""; SAMPLER=""; OFFLINE_PID=""
-CJ_PIDS=(); CJ_NAMES=()                          # collection jobs (note 16c)
 on_exit() {   # safety net: never leave a baseline shell actuating or the stream flipped after a crash
   local rc=$?
   if [ -n "$LGPID" ]; then
     kill "$LGPID" 2>/dev/null || true
     wait "$LGPID" 2>/dev/null || true
   fi
-  # (2026-11-02) no collection / scoring job may outlive the arm (the campaign moves a failed arm's directory)
-  if [ ${#CJ_PIDS[@]} -gt 0 ]; then kill "${CJ_PIDS[@]}" 2>/dev/null || true; wait "${CJ_PIDS[@]}" 2>/dev/null || true; fi
+  # (2026-11-02) the offline scoring may not outlive the arm (the campaign moves a failed arm's directory)
   [ -z "$OFFLINE_PID" ] || wait "$OFFLINE_PID" 2>/dev/null || true
   [ -z "$SAMPLER" ] || touch "$D/STOP"
   [ -z "$GWLOG_PID" ] || kill "$GWLOG_PID" 2>/dev/null || true
@@ -606,57 +603,36 @@ if [ "$IS_BL" = 1 ]; then
   log "baseline shell disabled; validity: $(python3 -c 'import json,sys;v=json.load(open(sys.argv[1]));print({k:v.get(k) for k in ("events_valid","invalid_because","gw_bl_dropped_delta")})' "$D/baseline/run_validity.json" 2>&1)"
 fi
 touch "$D/STOP"; wait $SAMPLER || true
-# ---- collection (2026-11-02, note 16c): the steps below write one file each and read none of each
-# other's, so they run as parallel jobs; each keeps its old error handling. snap_after and the Redis
-# dump were fatal under set -e (no `|| true`) and still are: the arm ends with their rc once every
-# other job has finished. Every job starts here, after POST_S and the sampler stop (as before).
+# (2026-11-02, note 16c) the collection below is serial, in the order and with the error handling of
+# before (every dump is taken when it was before); collect_start_epoch records when it starts
 date +%s > "$D/collect_start_epoch"
-CJ_FATAL="snap_after redis_dump"
-cjob() { local n=$1; shift; "$@" & CJ_PIDS+=("$!"); CJ_NAMES+=("$n"); }
-cjob_wait() {   # wait for every job; returns the rc of the first failed fatal job (0: none)
-  local i rc first=0
-  for i in "${!CJ_PIDS[@]}"; do
-    rc=0; wait "${CJ_PIDS[$i]}" || rc=$?
-    [ "$rc" = 0 ] && continue
-    case " $CJ_FATAL " in
-      *" ${CJ_NAMES[$i]} "*) log "ERROR collection step ${CJ_NAMES[$i]} failed rc=$rc"; [ "$first" != 0 ] || first=$rc ;;
-      *) log "WARN collection step ${CJ_NAMES[$i]} rc=$rc" ;;
-    esac
-  done
-  CJ_PIDS=(); CJ_NAMES=()
-  return "$first"
-}
-c_snap_after() { python3 "$TOOLS/snap.py" "$D/snap_after.json" "$SM" >> "$D/runner.log" 2>&1; }
-c_controller_log() { kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" --since-time="$START_ISO" > "$D/controller.log" 2>&1 || true; }
-c_sm_log() { kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" > "$D/sm.log" 2>&1 || true; }
+probe_clocks end
+record_components end
+python3 "$TOOLS/snap.py" "$D/snap_after.json" "$SM" >> "$D/runner.log" 2>&1
+kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" --since-time="$START_ISO" > "$D/controller.log" 2>&1 || true
+kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" > "$D/sm.log" 2>&1 || true
 # G9: the same SM log with kubelet timestamps (uvicorn access lines carry no time of their own)
-c_sm_ts_log() { kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" --timestamps > "$D/sm.ts.log" 2>&1 || true; }
-c_gateway_log() { kubectl -n "$GW_NS" logs "deploy/$GW_DEPLOY" --since-time="$START_ISO" > "$D/gateway-plugins.log" 2>&1 || true; }
-c_sidecars() {   # one log per model pod (pulled in parallel inside this job), then the EMFILE scan of them
-  local P
-  mkdir -p "$D/sidecar"
-  for P in $(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o name); do
-    { kubectl -n "$MODEL_NS" logs "$P" -c "$SIDECAR_CONTAINER" --since-time="$START_ISO" 2>/dev/null > "$D/sidecar/${P#pod/}.log" || true; } &
-  done
-  wait
-  grep -l -i "too many open files" "$D"/sidecar/*.log > "$D/EMFILE_PODS" 2>/dev/null || true
-}
-c_apa_log() {
-  local APA_GREP; APA_GREP="podautoscal|apa|scale|$(echo "$MODELS" | tr ',' '|')"
-  kubectl -n "$AIBRIX_NS" logs "deploy/$APA_CTRL_DEPLOY" --since-time="$START_ISO" 2>/dev/null \
-    | grep -i -E "$APA_GREP" > "$D/aibrix-controller-manager.log" || true
-}
-c_apa_crs() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_after.yaml" 2>&1 || true; }
-c_streams() {
-  if [ "$IS_BL" = 1 ]; then
-    log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models "$MODELS" 2>&1)"
-  elif [ "$WANT_EVENTS" = 1 ] && [ -s "$D/arm_start_redis_ms" ]; then
-    # G4b: the gateway per-request events of TRE / APA arms too (the stream was on)
-    log "gateway events: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/arm_start_redis_ms")" --out-dir "$D/gateway_events" --models "$MODELS" 2>&1)"
-  fi
-}
-c_collect_redis() { log "redis: $(python3 "$TOOLS/collect_redis.py" "$D" "$T_RESTART" "$REDIS_URL" 2>&1 | tail -1)"; }
-c_redis_dump() {   # safescale.json + signal_log.jsonl (fatal, as before), then the SafeScale summary of it
+kubectl -n "$TRE_NS" logs "deploy/$SM_DEPLOY" --since-time="$START_ISO" --timestamps > "$D/sm.ts.log" 2>&1 || true
+# a gateway log follower still running is stopped after the last dump below (2026-11-02, note 16c: its
+# log then covers at least as far as before); one that ended early (pod replaced?): the end-of-arm dump
+# instead, here as before, the follower's copy kept
+GW_FOLLOWING=0
+if [ -n "$GWLOG_PID" ] && kill -0 "$GWLOG_PID" 2>/dev/null; then
+  GW_FOLLOWING=1
+else
+  log "WARN gateway log follower ended early ($(head -c 200 "$D/gateway-plugins.follow.err" 2>/dev/null)); dumping the log"
+  [ -s "$D/gateway-plugins.log" ] && mv "$D/gateway-plugins.log" "$D/gateway-plugins.follow.log"
+  kubectl -n "$GW_NS" logs "deploy/$GW_DEPLOY" --since-time="$START_ISO" > "$D/gateway-plugins.log" 2>&1 || true
+fi
+mkdir -p "$D/sidecar"
+for P in $(kubectl -n "$MODEL_NS" get pods -l "$MODEL_SELECTOR" -o name); do
+  kubectl -n "$MODEL_NS" logs "$P" -c "$SIDECAR_CONTAINER" --since-time="$START_ISO" 2>/dev/null > "$D/sidecar/${P#pod/}.log" || true
+done
+grep -l -i "too many open files" "$D"/sidecar/*.log > "$D/EMFILE_PODS" 2>/dev/null || true
+APA_GREP="podautoscal|apa|scale|$(echo "$MODELS" | tr ',' '|')"
+kubectl -n "$AIBRIX_NS" logs "deploy/$APA_CTRL_DEPLOY" --since-time="$START_ISO" 2>/dev/null \
+  | grep -i -E "$APA_GREP" > "$D/aibrix-controller-manager.log" || true
+kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o yaml > "$D/apa_crs_after.yaml" 2>&1 || true
 python3 - "$D" "$T_RESTART" "$REDIS_URL" <<'PY'
 import json, sys, redis
 d, t0 = sys.argv[1], int(sys.argv[2]) * 1000
@@ -689,31 +665,14 @@ with open(f"{d}/signal_log.jsonl", "w") as f:
         f.write(json.dumps({"id": eid, **fields}) + "\n")
 print("probes", len(probes), "of", len(probes_all), "journals", len(journals))
 PY
-( cd "$TRE/deploy" && PYTHONPATH="$TRE/deploy:$TRE/common" python3 -m scripts.analysis.safescale_summary "$D/safescale.json" > "$D/safescale_summary.json" 2>&1 ) || true
-}
-# a gateway log follower that ended early (pod replaced?): the end-of-arm dump instead, the follower's copy kept
-GW_FOLLOWING=0
-if [ -n "$GWLOG_PID" ] && kill -0 "$GWLOG_PID" 2>/dev/null; then
-  GW_FOLLOWING=1
-else
-  log "WARN gateway log follower ended early ($(head -c 200 "$D/gateway-plugins.follow.err" 2>/dev/null)); dumping the log"
-  [ -s "$D/gateway-plugins.log" ] && mv "$D/gateway-plugins.log" "$D/gateway-plugins.follow.log"
-  cjob gateway_log c_gateway_log
+if [ "$IS_BL" = 1 ]; then
+  log "bl streams: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/bl_enabled_redis_ms")" --out-dir "$D/baseline" --models "$MODELS" 2>&1)"
+elif [ "$WANT_EVENTS" = 1 ] && [ -s "$D/arm_start_redis_ms" ]; then
+  # G4b: the gateway per-request events of TRE / APA arms too (the stream was on)
+  log "gateway events: $(BLT dump-streams --redis "$REDIS_HOST" --since-ms "$(cat "$D/arm_start_redis_ms")" --out-dir "$D/gateway_events" --models "$MODELS" 2>&1)"
 fi
-cjob clock_probe probe_clocks end
-cjob components record_components end
-cjob snap_after c_snap_after
-cjob controller_log c_controller_log
-cjob sm_log c_sm_log
-cjob sm_ts_log c_sm_ts_log
-cjob sidecars c_sidecars
-cjob apa_log c_apa_log
-cjob apa_crs c_apa_crs
-cjob redis_dump c_redis_dump
-cjob streams c_streams
-cjob collect_redis c_collect_redis
-cjob_wait
-# the follower runs until every dump is done (its log covers at least as far as before)
+log "redis: $(python3 "$TOOLS/collect_redis.py" "$D" "$T_RESTART" "$REDIS_URL" 2>&1 | tail -1)"
+( cd "$TRE/deploy" && PYTHONPATH="$TRE/deploy:$TRE/common" python3 -m scripts.analysis.safescale_summary "$D/safescale.json" > "$D/safescale_summary.json" 2>&1 ) || true
 if [ "$GW_FOLLOWING" = 1 ]; then kill "$GWLOG_PID" 2>/dev/null || true; wait "$GWLOG_PID" 2>/dev/null || true; fi
 GWLOG_PID=""
 log "collected; awake at end: $(awake_set); EMFILE pods: $(wc -l < "$D/EMFILE_PODS")"
