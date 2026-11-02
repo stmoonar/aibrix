@@ -1215,7 +1215,11 @@ def publish_tau_arg(text: str) -> Optional[float]:
 
 
 def verdict(model: str, label, p: Mapping[str, Any], tau: float, w_p: float, lam: float,
-            n_res: int = 1000, fam_res: int = 200, theta_source: str = "family") -> dict:
+            n_res: int = 1000, fam_res: int = 200) -> dict:
+    """The verdict at (tau, w_p, lambda). D5: the merged theta is the published one in every
+    stage (the family rule is a diagnostic), with the bands fitted at it. The D-rules, not
+    the verdict CLI's publish rule, decide what is frozen, so a degenerate band is reported
+    (``published.bands``), not refused, as before."""
     from scripts import theta_verdict as tv
 
     spec = spec_for(tau, w_p, lam)
@@ -1223,7 +1227,7 @@ def verdict(model: str, label, p: Mapping[str, Any], tau: float, w_p: float, lam
         return tv.verdict_report(model=model, fitting_csv=p["fitting"], families=p["families"], spec=spec,
                                  label=label, trim_ramp_windows=TRIM_RAMP_WINDOWS, n_resamples=n_res,
                                  family_resamples=fam_res, seed=SEED, max_ci_fraction=D13_MAX_CI_FRACTION,
-                                 theta_source=theta_source)
+                                 theta_source="merged", allow_degenerate_band=True)
     except tv.VerdictError as exc:
         return {"error": str(exc)}
 
@@ -1467,8 +1471,8 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     win = dict(DEFAULT_WINDOWING if win is None else win)
     tau, wp, lam = wp_doc["tau_s"], wp_doc["w_p_used"], wp_doc["lambda_star"]
     # D5: the merged theta is published whatever the family verdict says (diagnostic only),
-    # with the bands fitted at it (theta_source "merged")
-    v = verdict(model, label, p, tau, wp, lam, *FINAL_RESAMPLES, theta_source="merged")
+    # with the bands fitted at it (verdict(): theta_source "merged")
+    v = verdict(model, label, p, tau, wp, lam, *FINAL_RESAMPLES)
     out_dir.mkdir(parents=True, exist_ok=True)
     if "error" in v:
         (out_dir / "verdict_final.json").write_text(json.dumps(v, indent=1, default=str))

@@ -27,8 +27,11 @@ Two subcommands, run in this order by the campaign's fit plan:
     stays in the report). delta_crit / delta_high are always fitted at the published theta
     - refitted with the same labels, grids and selection when it is not the merged one
     (the bands at the merged theta stay under ``merged``) - because tau is a multiple of
-    theta. A band ``tau_high`` the signal can never exceed (``z`` is bounded, e.g. KV
-    headroom <= 1 gives ``z <= 1 / theta``) is refused (:class:`VerdictError`).
+    theta. The verdict is refused (``published.refused_reason``; the report is still
+    written, the command exits non-zero) when its HIGH band can never fire (``z`` is
+    bounded, e.g. KV headroom <= 1 gives ``z <= 1 / theta``:
+    ``tre_common.alt_signals.alt_tau_high_unreachable``) or when a band is degenerate
+    (delta 0: tau_crit or tau_high on tau_low) unless ``--allow-degenerate-band``.
 
     It also records the ranking quality of the signal (AUROC in its prior direction, flag
     ``inert`` below 0.6) and the balanced accuracy of the fit in BOTH directions. It writes
@@ -44,6 +47,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,12 +60,12 @@ from tre_calibration.alt_signals import (
     alt_signal_direction,
     alt_signal_names,
     alt_signal_transform,
-    alt_signal_z_max,
 )
 from tre_calibration.bootstrap import bootstrap_theta, bootstrap_theta_and_delta_crit
 from tre_calibration.dataset import CalibrationWindow, TssRecompute, load_windows_from_csv
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
+    CLAMP_TOLERANCE,
     DEFAULT_FIT_METHOD,
     ThetaFitConfig,
     fit_method as named_fit_method,
@@ -69,6 +73,7 @@ from tre_calibration.fit import (
     signal_z,
     threshold_balanced_accuracy,
 )
+from tre_common.alt_signals import alt_signal_z_max, alt_tau_high_unreachable
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_calibration.profile import theta_fit_block
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
@@ -84,7 +89,7 @@ _OPPOSITE = {"higher_is_healthier": "lower_is_healthier", "lower_is_healthier": 
 
 
 class VerdictError(RuntimeError):
-    """The merged fit did not publish a threshold, or its band cannot fire."""
+    """The merged fit did not publish a threshold (or a refused verdict was scored)."""
 
 
 #: Where the published theta comes from (``--theta-source``): ``family`` = the family rule
@@ -145,7 +150,7 @@ class SignalSpec:
 
     def z_max(self, theta: float) -> float | None:
         """The largest ``z`` a window can reach at ``theta``
-        (``tre_calibration.alt_signals.alt_signal_z_max``); None for TSS (unbounded)."""
+        (``tre_common.alt_signals.alt_signal_z_max``); None for TSS (unbounded)."""
         return None if self.signal == "tss" else alt_signal_z_max(self.signal, theta)
 
     def band_kwargs(self) -> dict[str, Any]:
@@ -351,12 +356,29 @@ def dwell_acceptance(
 
 
 def _band_side_record(side) -> dict[str, Any]:
-    """How one side of the published bands was fitted (when refitted at a family theta)."""
+    """How one side of the published bands was fitted (clamped: on a grid edge, either one)."""
     return {
         "method": side.method, "delta": side.delta, "balanced_accuracy": side.balanced_accuracy,
         "clamped": side.clamped, "clamp_reason": side.clamp_reason, "used_fallback": side.used_fallback,
         **_selection_record(side),
     }
+
+
+def refusal_reasons(spec: SignalSpec, theta: float, bands, *, allow_degenerate_band: bool = False) -> list[str]:
+    """Why bands fitted at ``theta`` must not be published (empty: publishable): a HIGH band
+    the signal can never exceed, or - unless ``allow_degenerate_band`` - a side whose tau
+    sits on tau_low (delta 0: no LOW band under tau_low, or no HEALTHY band above it)."""
+    reasons: list[str] = []
+    if spec.signal != "tss":
+        unreachable = alt_tau_high_unreachable(spec.signal, theta, bands.high.delta)
+        if unreachable:
+            reasons.append(unreachable)
+    if not allow_degenerate_band:
+        for name, side in (("delta_crit", bands.crit), ("delta_high", bands.high)):
+            if side.delta <= CLAMP_TOLERANCE:
+                reasons.append(f"degenerate band: {name} = {side.delta:g} puts its tau on tau_low "
+                               f"(clamp {side.clamp_reason}); pass --allow-degenerate-band to publish it")
+    return reasons
 
 
 def _selection_record(side) -> dict[str, Any]:
@@ -382,13 +404,15 @@ def verdict_report(
     seed: int = 20260922,
     max_ci_fraction: float | None = None,
     theta_source: str = DEFAULT_THETA_SOURCE,
+    allow_degenerate_band: bool = False,
 ) -> dict[str, Any]:
     """The verdict for ``spec``'s signal on one model - the one fit path of every arm.
 
     ``max_ci_fraction`` is the D13 CI gate of the stop rule (default
     ``adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION``, 20 % since 2026-09-24).
     ``theta_source`` (:data:`THETA_SOURCES`) picks the published theta; the published
-    bands are always fitted at it."""
+    bands are always fitted at it. A refused verdict (:func:`refusal_reasons`) is returned
+    with ``published.refused_reason`` set - its numbers are diagnostics, not a threshold."""
     from scripts.calibration_campaign import family_theta_verdict
 
     if theta_source not in THETA_SOURCES:
@@ -461,13 +485,7 @@ def verdict_report(
         fit_delta_margins(windows, theta=published_theta, direction=direction, **spec.band_kwargs())
         if refit else delta
     )
-    z_max = spec.z_max(published_theta)
-    if z_max is not None and 1.0 + bands.high.delta >= z_max:
-        raise VerdictError(
-            f"{model}/{spec.signal}: tau_high {1.0 + bands.high.delta:.4g} at theta {published_theta:.4g} "
-            f"({source}, --theta-source {theta_source}) "
-            f"can never fire: z <= {z_max:.4g} for this signal, HIGH needs z > tau_high; not published"
-        )
+    refused = refusal_reasons(spec, published_theta, bands, allow_degenerate_band=allow_degenerate_band)
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model,
@@ -548,9 +566,15 @@ def verdict_report(
             # published theta is not the merged one (merged.delta_* = bands at the merged theta)
             "bands_fitted_at_theta": bands.theta,
             "bands_refit": refit,
-            **({"bands": {"delta_crit": _band_side_record(bands.crit),
-                          "delta_high": _band_side_record(bands.high)}} if refit else {}),
-            "z_max": z_max,
+            "bands": {
+                "delta_crit": _band_side_record(bands.crit),
+                "delta_high": _band_side_record(bands.high),
+                "ci": ("none of its own: refitted at the published theta; merged.delta_crit.bootstrap "
+                       "is the CI of the merged fit's band" if refit else "merged.delta_crit.bootstrap"),
+            },
+            "z_max": spec.z_max(published_theta),
+            "allow_degenerate_band": allow_degenerate_band,
+            "refused_reason": "; ".join(refused) or None,
             "stop_rule_satisfied": stop.satisfied,
         },
     }
@@ -577,7 +601,7 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
             model=args.model, fitting_csv=args.fitting_csv, families=families, spec=spec,
             label=label, trim_ramp_windows=args.trim_ramp_windows,
             n_resamples=args.n_resamples, family_resamples=args.family_resamples, seed=args.seed,
-            theta_source=args.theta_source,
+            theta_source=args.theta_source, allow_degenerate_band=args.allow_degenerate_band,
         )
     except VerdictError as exc:
         raise SystemExit(str(exc)) from exc
@@ -588,7 +612,11 @@ def holdout_report(
     dwell_windows: int = DEFAULT_HOLDOUT_DWELL_WINDOWS, window_ms: float = 30_000.0,
 ) -> dict[str, Any]:
     """The hold-out report of ``verdict`` on ``validation_csv``; ``window_ms`` is the window
-    length the dwell counter dates a window's end by (window start + ``window_ms``)."""
+    length the dwell counter dates a window's end by (window start + ``window_ms``). A
+    refused verdict published nothing to score (:class:`VerdictError`)."""
+    refused = (verdict.get("published") or {}).get("refused_reason")
+    if refused:
+        raise VerdictError(f"{verdict.get('model')}/{verdict.get('signal')}: the verdict was refused ({refused})")
     label = LabelDefinition.from_dict(verdict["label_def"])
     if "signal_spec" in verdict:
         spec = SignalSpec.from_dict(verdict["signal_spec"])
@@ -653,7 +681,10 @@ def holdout_report(
 
 def cmd_holdout(args: argparse.Namespace) -> dict[str, Any]:
     verdict = json.loads(Path(args.verdict).read_text(encoding="utf-8"))
-    return holdout_report(verdict, args.validation_csv, dwell_windows=args.dwell_windows)
+    try:
+        return holdout_report(verdict, args.validation_csv, dwell_windows=args.dwell_windows)
+    except VerdictError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -683,6 +714,8 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
         help="published theta: the family rule's (family) or the merged fit's (merged); the "
              "published bands are fitted at it either way",
     )
+    v.add_argument("--allow-degenerate-band", action="store_true",
+                   help="publish a band whose delta is 0 (tau_crit or tau_high on tau_low)")
     v.add_argument("--output", required=True)
     h = sub.add_parser("holdout")
     h.add_argument("--verdict", required=True)
@@ -707,6 +740,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"({p['source']}), delta_crit={p['delta_crit']:.3f}, delta_high={p['delta_high']:.3f}, "
             f"auroc={report['merged']['ranking']['auroc']:.3f}, stop_rule={p['stop_rule_satisfied']}"
         )
+        if p["refused_reason"]:
+            print(f"REFUSED [{report['model']}/{report['signal']}]: {p['refused_reason']} "
+                  f"(diagnostics written to {out})", file=sys.stderr)
+            return 1
     else:
         print(f"[{report['model']}/{report['signal']}] hold-out BA={report['at_published_theta']['balanced_accuracy']:.3f}")
     return 0

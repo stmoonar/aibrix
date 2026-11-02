@@ -164,6 +164,44 @@ def normalize_signal_value(
     return min(Z_MAX, normalized)
 
 
+#: The healthiest value each signal can take by its formula above: KV headroom ``<= 1``,
+#: queue length ``>= 1`` request per replica, mean TTFT / TPOT ``>= 1 ms``, token rates
+#: ``>= 0``. A tau-EMA is a convex combination of such values, so it keeps the bound.
+ALT_SIGNAL_HEALTHIEST_VALUE = {
+    "queue_len": QUEUE_FLOOR_PER_REPLICA,
+    "ttft_mean": TTFT_FLOOR_MS,
+    "tpot_mean": TPOT_FLOOR_MS,
+    "kv_usage": 1.0,
+    "decode_tps": 0.0,
+    "prefill_tps": 0.0,
+}
+
+
+def alt_signal_z_max(signal: str, theta: float) -> float:
+    """The largest ``z`` a window of ``signal`` can reach at ``theta``: the z
+    (:func:`normalize_signal_value`, capped at :data:`Z_MAX`) of its healthiest value -
+    e.g. ``1 / theta`` for kv_usage, ``min(theta, Z_MAX)`` for queue_len."""
+    from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS
+
+    z = normalize_signal_value(ALT_SIGNAL_HEALTHIEST_VALUE[signal], theta, EXPECTED_SIGNAL_DIRECTIONS[signal])
+    if z is None:
+        raise ValueError(f"{signal}: theta must be finite and positive, got {theta!r}")
+    return z
+
+
+def alt_tau_high_unreachable(signal: str, theta: float, delta_high: float) -> Optional[str]:
+    """Why the band ``tau_high = 1 + delta_high`` of ``signal`` at ``theta`` can never fire,
+    or None when it can. HIGH is ``z > tau_high`` and ``z <= alt_signal_z_max``, so a
+    ``tau_high >= z_max`` is unreachable. The one check of the fit (``theta_verdict``) and
+    of a registry edit (``registry_params``); never applied when the controller loads."""
+    z_max = alt_signal_z_max(signal, theta)
+    tau_high = 1.0 + float(delta_high)
+    if tau_high >= z_max:
+        return (f"{signal}: tau_high {tau_high:.4g} at theta {float(theta):.4g} can never fire "
+                f"(z <= {z_max:.4g}, HIGH needs z > tau_high)")
+    return None
+
+
 def alt_ema_tau_ms(ema_tau_ms: object) -> float:
     """The tau (ms) an alternative signal is smoothed with, from the registry's
     ``trs.ema_tau_ms`` (the TSS tau): unset (None) = :data:`tre_common.tss.DEFAULT_EMA_TAU_MS`;

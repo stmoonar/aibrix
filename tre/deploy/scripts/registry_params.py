@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import yaml
 
-from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS, Z_MAX
+from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS, Z_MAX, alt_tau_high_unreachable
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 from tre_common.tss import NUMERATOR_COMPLETION_HISTOGRAMS, NUMERATOR_STEP_COUNTERS
 
@@ -140,7 +140,8 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
         out[name] = {
             "editable": editable,
             "locked": locked,
-            "constraints": ["tau_crit <= tau_low < tau_high", "qmin <= qsat", "min_replicas <= max_replicas", "min_replicas <= max_awake_replicas <= max_replicas", "w_p and w_d not both 0"],
+            "constraints": ["tau_crit <= tau_low < tau_high", "qmin <= qsat", "min_replicas <= max_replicas", "min_replicas <= max_awake_replicas <= max_replicas", "w_p and w_d not both 0",
+                            "alt_thresholds: 1 + delta_high below the signal's largest z at theta"],
         }
     return out
 
@@ -189,6 +190,7 @@ def apply_and_validate(
 
     for model_name in edits:
         _cross_field(models[model_name], model_name, errors)
+        _alt_band_reachable(models[model_name], edits[model_name].get("alt_thresholds") or {}, model_name, errors)
     if errors:
         raise ParamValidationError(errors)
 
@@ -348,6 +350,24 @@ def _cross_field(model: dict, name: str, errors: list) -> None:
         add("max_awake_replicas", "max_awake_replicas must be within [min_replicas, max_replicas]")
     if trs.get("w_p") == 0 and trs.get("w_d") == 0:
         add("trs.w_p", "w_p and w_d must not both be 0")
+
+
+def _alt_band_reachable(model: dict, edited: dict, name: str, errors: list) -> None:
+    """Publish-time check (never at controller start): an edited alt threshold whose HIGH
+    band ``1 + delta_high`` the signal can never exceed (``tre_common.alt_signals``). Only
+    signals whose theta or delta_high this edit sets, so an old value does not block an
+    unrelated edit."""
+    for signal, raw in edited.items():
+        if not isinstance(raw, dict) or not ({"theta", "delta_high"} & set(raw)):
+            continue
+        threshold = (model.get("alt_thresholds") or {}).get(signal) or {}
+        theta, delta_high = threshold.get("theta"), threshold.get("delta_high")
+        if theta is None or delta_high is None:
+            continue
+        reason = alt_tau_high_unreachable(signal, theta, delta_high)
+        if reason:
+            errors.append({"model": name, "field": f"alt_thresholds.{signal}.delta_high",
+                           "error": "constraint", "detail": reason})
 
 
 def render(data: dict) -> str:

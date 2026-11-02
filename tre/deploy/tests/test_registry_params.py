@@ -182,6 +182,26 @@ def test_alt_threshold_bands_are_editable_and_bounded() -> None:
     assert exc_info.value.errors[0]["error"] == "out_of_bounds"
 
 
+def test_an_alt_band_that_can_never_fire_is_rejected_at_publish_only() -> None:
+    """kv headroom <= 1, so at theta 0.5 z <= 2: tau_high = 1 + delta_high must stay below 2.
+    The check is the edit's (params_set), not the loader's: the controller still starts on
+    such a registry (a rollback ConfigMap replace must not crashloop it)."""
+    from tre_common.registry import _parse_registry
+
+    def kv(delta_high: float) -> dict:
+        return {"m1": {"alt_thresholds": {"kv_usage": {
+            "theta": 0.5, "direction": "higher_is_healthier", "delta_crit": 0.2, "delta_high": delta_high}}}}
+
+    assert yaml.safe_load(apply_and_validate(_REGISTRY, kv(0.99)))["models"][0]["alt_thresholds"]["kv_usage"]
+    with pytest.raises(ParamValidationError) as exc_info:
+        apply_and_validate(_REGISTRY, kv(1.0))  # tau_high == z_max
+    [error] = exc_info.value.errors
+    assert (error["field"], error["error"]) == ("alt_thresholds.kv_usage.delta_high", "constraint")
+    unreachable = yaml.safe_load(_REGISTRY)
+    unreachable["models"][0]["alt_thresholds"]["kv_usage"] = kv(1.68)["m1"]["alt_thresholds"]["kv_usage"]
+    assert not [e for e in _parse_registry(unreachable).validate() if "kv_usage" in e]
+
+
 def test_alt_threshold_basis_stamp_is_settable_and_checked() -> None:
     """The fit's basis stamp goes out with theta through params_set (the controller
     refuses an alt arm without it); only the definition this code computes is accepted."""

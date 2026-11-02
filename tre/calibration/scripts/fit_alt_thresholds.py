@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -54,7 +55,12 @@ from tre_calibration.fit import (
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 
-from scripts.theta_verdict import DEFAULT_THETA_SOURCE, THETA_SOURCES, build_signal_spec, verdict_report
+from scripts.theta_verdict import THETA_SOURCES, build_signal_spec, verdict_report
+
+#: Published theta of the alternative signals: the merged fit's, with its own bands (user
+#: 2026-11-02; what the cluster runs). ``family`` (the family rule's theta, bands refitted
+#: at it) stays available; on queue_len it pushed delta to the grid's lower edge.
+DEFAULT_ALT_THETA_SOURCE = "merged"
 
 #: Queue weight of the delta_high surplus label when the caller names none: the primary
 #: TSS lambda_wait, so the alternative arms share the label of the TSS fit.
@@ -119,9 +125,12 @@ def fit_model(
     n_resamples: int = 200,
     family_resamples: int = 100,
     seed: int = 20260922,
-    theta_source: str = DEFAULT_THETA_SOURCE,
+    theta_source: str = DEFAULT_ALT_THETA_SOURCE,
+    allow_degenerate_band: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """One model's alt threshold through :func:`scripts.theta_verdict.verdict_report`."""
+    """One model's alt threshold through :func:`scripts.theta_verdict.verdict_report`. A
+    refused verdict (``published.refused_reason``) yields no ``alt_thresholds`` entry,
+    only ``refused_reason`` and the diagnostics."""
     spec = build_signal_spec(signal, ema_tau_ms=ema_tau_ms, label_lambda_wait=label_lambda_wait)
     config = ThetaFitConfig(
         criterion=criterion,
@@ -139,7 +148,7 @@ def fit_model(
         model=model_name, fitting_csv=input_path, families=dict(families or {}), spec=spec,
         label=label_def, trim_ramp_windows=trim_ramp_windows, config=config,
         n_resamples=n_resamples, family_resamples=family_resamples, seed=seed,
-        theta_source=theta_source,
+        theta_source=theta_source, allow_degenerate_band=allow_degenerate_band,
     )
     windows = spec.load(input_path, label_def, trim_ramp_windows)
     published = verdict["published"]
@@ -156,7 +165,7 @@ def fit_model(
         "cells_at_theta": on_theta,
         "window_count": len(windows),
         "cell_count": len({window.scenario_id for window in windows}),
-        "alt_thresholds": {
+        **({"refused_reason": published["refused_reason"]} if published["refused_reason"] else {"alt_thresholds": {
             signal: {
                 "theta": theta,
                 "direction": spec.direction,
@@ -168,11 +177,12 @@ def fit_model(
                 "basis": {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": int(csv_window_ms(input_path)),
                           "ema_tau_ms": float(ema_tau_ms) if ema_tau_ms is not None and ema_tau_ms > 0 else 0.0},
             }
-        },
-        # A band on its grid's top edge has its optimum outside the searched range.
+        }}),
+        # The published side's own clamp (either grid edge): on the upper edge its optimum
+        # is outside the searched range, on the lower one the band is empty. None = inside.
         "band_at_grid_edge": {
-            "delta_crit": float(published["delta_crit"]) >= ALT_DELTA_CRIT_GRID[-1],
-            "delta_high": float(published["delta_high"]) >= ALT_DELTA_HIGH_GRID[-1],
+            side: (published["bands"][side]["clamp_reason"] if published["bands"][side]["clamped"] else None)
+            for side in ("delta_crit", "delta_high")
         },
         "theta_criterion": criterion,
         "fit": merged["fit"],
@@ -262,6 +272,13 @@ def write_threshold_svg(
     ET.ElementTree(svg).write(output, encoding="utf-8", xml_declaration=True)
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` in one step, so no reader sees a half-written file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _git_sha() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -317,10 +334,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--family-resamples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260922)
     parser.add_argument(
-        "--theta-source", choices=THETA_SOURCES, default=DEFAULT_THETA_SOURCE,
-        help="published theta: the family rule's (family) or the merged fit's (merged); "
-             "delta_crit / delta_high are fitted at it either way",
+        "--theta-source", choices=THETA_SOURCES, default=DEFAULT_ALT_THETA_SOURCE,
+        help="published theta: the merged fit's (merged, default) or the family rule's "
+             "(family); delta_crit / delta_high are fitted at it either way",
     )
+    parser.add_argument("--allow-degenerate-band", action="store_true",
+                        help="publish a band whose delta is 0 (tau_crit or tau_high on tau_low)")
     parser.add_argument(
         "--verdict-dir",
         help="write each model's verdict JSON here as <model>_verdict_<signal>.json "
@@ -372,21 +391,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             family_resamples=args.family_resamples,
             seed=args.seed,
             theta_source=args.theta_source,
+            allow_degenerate_band=args.allow_degenerate_band,
         )
-        if args.verdict_dir:
-            vdir = Path(args.verdict_dir)
-            vdir.mkdir(parents=True, exist_ok=True)
-            (vdir / f"{model}_verdict_{args.signal}.json").write_text(
-                json.dumps(models[model]["verdict"], indent=2, sort_keys=True, default=str) + "\n",
-                encoding="utf-8",
-            )
+    # Written only once every model is fitted (a crash leaves no mix of new and stale
+    # files); a refused model's verdict is written too - it carries refused_reason.
+    if args.verdict_dir:
+        vdir = Path(args.verdict_dir)
+        vdir.mkdir(parents=True, exist_ok=True)
+        for model, payload in models.items():
+            _write_atomic(vdir / f"{model}_verdict_{args.signal}.json",
+                          json.dumps(payload["verdict"], indent=2, sort_keys=True, default=str) + "\n")
+    refused = {model: payload["refused_reason"] for model, payload in models.items() if "refused_reason" in payload}
 
     # Two models on the same threshold is not an error: token-rate signals sit on a
     # lattice under ignore_eos (e.g. 1446.4 = 339 x 128 / 30), so coinciding thresholds
     # happen. Warn and record which windows/cells carry the shared value (plan 6.9).
     by_theta: dict[float, list[str]] = {}
     for model, payload in models.items():
-        by_theta.setdefault(payload["alt_thresholds"][args.signal]["theta"], []).append(model)
+        if model not in refused:
+            by_theta.setdefault(payload["alt_thresholds"][args.signal]["theta"], []).append(model)
     warnings: list[dict[str, Any]] = []
     for theta, same in sorted(by_theta.items()):
         if len(same) < 2:
@@ -411,9 +434,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "trim_ramp_windows": args.trim_ramp_windows,
         "label_def": _report_label_def(label_defs),
         "warnings": warnings,
+        "refused": refused,
         "fit_config": {
             "pipeline": "scripts.theta_verdict.verdict_report",
             "theta_source": args.theta_source,
+            "allow_degenerate_band": args.allow_degenerate_band,
             "delta_grids": {"delta_crit": [ALT_DELTA_CRIT_GRID[0], ALT_DELTA_CRIT_GRID[-1], 0.01],
                             "delta_high": [ALT_DELTA_HIGH_GRID[0], ALT_DELTA_HIGH_GRID[-1], 0.01]},
             "label_lambda_wait": args.label_lambda_wait,
@@ -438,7 +463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(yaml.safe_dump(json.loads(json.dumps(report, default=str)), sort_keys=False), encoding="utf-8")
+    _write_atomic(output, yaml.safe_dump(json.loads(json.dumps(report, default=str)), sort_keys=False))
 
     if args.curve_dir:
         curve_dir = Path(args.curve_dir)
@@ -457,16 +482,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_threshold_svg(
             args.plot_output,
             curves,
-            {
-                model: payload["alt_thresholds"][args.signal]["theta"]
-                for model, payload in models.items()
-            },
+            {model: payload["verdict"]["published"]["theta_m"] for model, payload in models.items()},
             signal=args.signal,
             direction=alt_signal_direction(args.signal),
             criterion=args.theta_criterion,
         )
 
     for model, payload in models.items():
+        if model in refused:
+            print(f"{model}: REFUSED - {refused[model]}", file=sys.stderr)
+            continue
         threshold = payload["alt_thresholds"][args.signal]
         print(
             f"{model}: theta={threshold['theta']:.6f} delta_crit={threshold['delta_crit']:.3f} "
@@ -475,7 +500,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"inert={payload['ranking']['inert']} windows={payload['window_count']} "
             f"edge={payload['band_at_grid_edge']}"
         )
-    return 0
+    # Every output is written (the refused models' diagnostics included); the run fails.
+    return 1 if refused else 0
 
 
 if __name__ == "__main__":

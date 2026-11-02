@@ -32,9 +32,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
 from tre_common.alt_signals import (
-    QUEUE_FLOOR_PER_REPLICA,
-    TPOT_FLOOR_MS,
-    TTFT_FLOOR_MS,
     Z_MAX,
     kv_headroom,
     queue_len_per_replica,
@@ -45,7 +42,6 @@ from tre_common.alt_signals import (
 from tre_calibration.fit import (
     BalancedAccuracyThetaFit,
     ReliabilityThetaFit,
-    signal_z,
     threshold_balanced_accuracy,
 )
 
@@ -76,28 +72,6 @@ ALT_DELTA_HIGH_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in rang
 def alt_signal_band_grids() -> dict[str, tuple[float, ...]]:
     """``fit_delta_margins`` grid keywords of the alternative signals."""
     return {"delta_crit_grid": ALT_DELTA_CRIT_GRID, "delta_high_grid": ALT_DELTA_HIGH_GRID}
-
-
-#: The healthiest value each alternative signal can take, by its formula in
-#: :mod:`tre_common.alt_signals`: KV headroom ``<= 1``, queue length ``>= 1`` request per
-#: replica, mean TTFT / TPOT ``>= 1 ms``, token rates ``>= 0``. The tau-EMA is a convex
-#: combination of such values, so the smoothed signal keeps the bound.
-ALT_SIGNAL_HEALTHIEST_VALUE: Mapping[str, float] = {
-    "queue_len": QUEUE_FLOOR_PER_REPLICA,
-    "ttft_mean": TTFT_FLOOR_MS,
-    "tpot_mean": TPOT_FLOOR_MS,
-    "kv_usage": 1.0,
-    "decode_tps": 0.0,
-    "prefill_tps": 0.0,
-}
-
-
-def alt_signal_z_max(signal: str, theta: float) -> float:
-    """The largest ``z`` a window of ``signal`` can reach at ``theta``: the z of its
-    healthiest value, capped at ``Z_MAX`` as the controller caps it
-    (``tre_common.alt_signals.normalize_signal_value``). HIGH is ``z > tau_high``, so a
-    ``tau_high >= alt_signal_z_max`` never fires (kv_usage: ``z <= 1 / theta``)."""
-    return min(Z_MAX, signal_z(ALT_SIGNAL_HEALTHIEST_VALUE[signal], theta, alt_signal_direction(signal)))
 
 
 #: Window columns of the v1 signals (written by ``scripts.alt_signal_columns``).

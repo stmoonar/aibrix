@@ -316,6 +316,7 @@ def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
         label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal,
         trim_ramp_windows=0,
+        allow_degenerate_band=True,  # clean boundary: delta_crit 0 (these tests are about theta)
     )
 
     assert payload["label_def"]["e2e"] == "excluded"
@@ -354,6 +355,7 @@ def test_every_alternative_signal_moves_when_the_criterion_is_switched(
         label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal,
         trim_ramp_windows=0,
+        allow_degenerate_band=True,  # clean boundary: delta_crit 0 (these tests are about theta)
         criterion="reliability",
         **_RELIABILITY_KNOBS,
     )
@@ -370,6 +372,28 @@ def test_the_driver_and_the_registry_agree_on_every_signals_orientation() -> Non
         assert alt_signal_direction(signal) == EXPECTED_SIGNAL_DIRECTIONS[signal]
         assert ALT_SIGNALS[signal][1] == EXPECTED_SIGNAL_DIRECTIONS[signal]
     assert alt_signal_direction("kv_usage") == "higher_is_healthier"  # headroom
+
+
+def test_every_signal_has_a_healthiest_value() -> None:
+    from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS, ALT_SIGNAL_HEALTHIEST_VALUE
+
+    assert set(ALT_SIGNAL_HEALTHIEST_VALUE) == set(ALT_SIGNALS) == set(ALT_SIGNAL_DEFINITIONS)
+
+
+@pytest.mark.parametrize("signal, theta, z_max", [
+    ("kv_usage", 0.5, 2.0),      # headroom <= 1: z <= 1 / theta
+    ("queue_len", 3.0, 3.0),     # >= 1 request per replica: z <= theta
+    ("queue_len", 50.0, 10.0),   # ... capped at Z_MAX
+    ("ttft_mean", 5.0, 5.0),     # >= 1 ms
+    ("decode_tps", 1000.0, 10.0),  # >= 0: only the cap bounds it
+])
+def test_z_max_is_the_z_of_the_healthiest_value(signal: str, theta: float, z_max: float) -> None:
+    from tre_common.alt_signals import alt_signal_z_max, alt_tau_high_unreachable
+
+    assert alt_signal_z_max(signal, theta) == pytest.approx(z_max)
+    # HIGH is z > tau_high: tau_high == z_max already never fires
+    assert alt_tau_high_unreachable(signal, theta, z_max - 1.0) is not None
+    assert alt_tau_high_unreachable(signal, theta, z_max - 1.01) is None
 
 
 def _write_v1_signal_csv(path: Path) -> Path:
@@ -400,6 +424,7 @@ def test_v1_signals_go_through_the_same_fit_in_their_own_direction(signal: str, 
         _MODEL, _write_v1_signal_csv(tmp_path / "windows.csv"),
         label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal, trim_ramp_windows=0,
+        allow_degenerate_band=True,  # clean boundary: delta_crit 0 (these tests are about theta)
     )
     threshold = payload["alt_thresholds"][signal]
     assert threshold["direction"] == EXPECTED_SIGNAL_DIRECTIONS[signal]
@@ -438,7 +463,7 @@ def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tm
         "--model-input", f"a={csv_path}", "--model-input", f"b={csv_path}",
         "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
         "--trim-ramp-windows", "0", "--output", str(output), "--n-resamples", "20",
-        "--family-resamples", "10",
+        "--family-resamples", "10", "--allow-degenerate-band",  # clean boundary: delta_crit 0
     ]) == 0
     report = yaml.safe_load(output.read_text(encoding="utf-8"))
     [warning] = report["warnings"]

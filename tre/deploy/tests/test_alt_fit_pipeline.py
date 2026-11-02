@@ -10,8 +10,8 @@
   JSONs that theta_verdict holdout scores;
 * the published bands are fitted at the published theta (2026-11-02: the family rule
   used to swap theta under bands fitted at the merged one), ``--theta-source merged``
-  publishes the merged theta with its bands, and a HIGH band the signal can never reach
-  is refused.
+  publishes the merged theta with its bands, and a refused model (degenerate band) is
+  reported without stopping the others.
 """
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ import yaml
 from scripts import calibration_campaign as campaign
 from scripts import r3_grid, theta_verdict
 from tre_calibration.dataset import CalibrationWindow
-from tre_calibration.alt_signals import KV_PODS_COLUMN, KV_USAGE_SUM_COLUMN
 from tre_calibration.fit import (
     ThetaFitConfig,
     fit_delta_margins,
@@ -41,15 +40,12 @@ MODEL = "dsqwen-7b"
 TRE_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _csv(path: Path, seed: int, queue_scale: float = 1.0, kv: bool = False) -> Path:
-    """Load scan where the queue grows with load and latency violates above load ~1.
-
-    ``queue_scale`` scales the queue (a family whose queue_len theta differs); ``kv`` adds
-    the KV columns: idle KV (headroom 1) up to load 0.95, headroom 0.3 above it."""
+def _csv(path: Path, seed: int, queue_scale: float = 1.0) -> Path:
+    """Load scan where the queue grows with load and latency violates above load ~1;
+    ``queue_scale`` scales the queue (a family whose queue_len theta differs)."""
     rng = random.Random(seed)
     with path.open("w", newline="") as fh:
-        writer = csv.DictWriter(
-            fh, fieldnames=[*r3_grid.CSV_COLUMNS, *((KV_USAGE_SUM_COLUMN, KV_PODS_COLUMN) if kv else ())])
+        writer = csv.DictWriter(fh, fieldnames=r3_grid.CSV_COLUMNS)
         writer.writeheader()
         for cell in range(16):
             load = 0.5 + 0.07 * cell
@@ -69,7 +65,6 @@ def _csv(path: Path, seed: int, queue_scale: float = 1.0, kv: bool = False) -> P
                     "queue_control": running, "p95_ttft_client_ms": 400.0 * ratio,
                     "p95_tpot_client_ms": 30.0, "p95_e2e_client_ms": 1.0, "trs": "",
                     "model_errors": 0, "proxy_transient_errors": 0, "client_timeouts": 0,
-                    **({KV_USAGE_SUM_COLUMN: 0.0 if load <= 0.95 else 0.7, KV_PODS_COLUMN: 1} if kv else {}),
                 })
                 start += 5_000
     return path
@@ -159,12 +154,17 @@ def test_delta_margins_use_the_controller_z_of_the_signal() -> None:
     assert fit.high.method == "ba_grid" and fit.high.tau > 1.0
 
 
-def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None:
+def _load_fit_alt_thresholds():
     path = TRE_ROOT / "calibration" / "scripts" / "fit_alt_thresholds.py"
     spec = importlib.util.spec_from_file_location("tre_fit_alt_thresholds_pipeline", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    return module
+
+
+def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None:
+    module = _load_fit_alt_thresholds()
     fit = _csv(tmp_path / "fit.csv", 1)
     fam = _csv(tmp_path / "fam.csv", 2)
     out = tmp_path / "alt.yaml"
@@ -172,6 +172,7 @@ def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None
         "--model-input", f"{MODEL}={fit}", "--family", f"{MODEL}:prefill_heavy={fam}",
         "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "decode_tps",
         "--n-resamples", "10", "--family-resamples", "5", "--verdict-dir", str(tmp_path),
+        "--allow-degenerate-band",  # this fixture's decode_tps band has delta_crit 0
         "--output", str(out),
     ]) == 0
     report = yaml.safe_load(out.read_text())
@@ -208,7 +209,8 @@ def _bands_at(spec: theta_verdict.SignalSpec, windows: list, theta: float) -> tu
 def test_the_published_bands_are_fitted_at_the_published_theta(tmp_path: Path) -> None:
     # regression 2026-11-02: tau = theta * (1 -/+ delta), so bands fitted at the merged theta
     # under a family theta moved every absolute line (queue_len CRIT q > 119 became q > 11).
-    v, spec, windows = _swapping_verdict(tmp_path)
+    # (Here the refit band is degenerate - delta_crit 0 - hence the flag.)
+    v, spec, windows = _swapping_verdict(tmp_path, "--theta-source", "family", "--allow-degenerate-band")
     pub = v["published"]
     assert v["family_verdict"]["publish"] == "min_family" and pub["source"] == "min_family"
     assert pub["theta_m"] != v["merged"]["theta"]
@@ -228,14 +230,33 @@ def test_theta_source_merged_publishes_the_merged_theta_with_its_bands(tmp_path:
     assert (pub["delta_crit"], pub["delta_high"]) == (merged["delta_crit"]["delta"], merged["delta_high"]["delta"])
 
 
-def test_a_high_band_the_signal_cannot_reach_is_refused(tmp_path: Path) -> None:
-    # KV headroom <= 1: healthy windows sit at headroom 1, so theta = 1 and z <= 1 / theta = 1
-    # - no tau_high = 1 + delta_high can ever be exceeded.
-    fit = _csv(tmp_path / "kv.csv", 1, kv=True)
-    with pytest.raises(SystemExit, match="can never fire"):
-        theta_verdict.main([
-            "verdict", "--model", MODEL, "--fitting-csv", str(fit), "--signal", "kv_usage",
-            "--label-lambda-wait", "3", "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500",
-            "--tpot-p95-ms", "75", "--n-resamples", "20", "--family-resamples", "10",
-            "--output", str(tmp_path / "kv.json"),
+def test_a_refused_model_is_reported_and_does_not_stop_the_others(tmp_path: Path) -> None:
+    # Model b's family theta (3x queue) moves theta; the band refitted there has delta 0
+    # (tau on tau_low), so b is refused - its diagnostics are written, a's threshold is
+    # published, and the run exits non-zero. --allow-degenerate-band publishes b.
+    driver = _load_fit_alt_thresholds()
+    fit = _csv(tmp_path / "fit.csv", 1)
+    fam = _csv(tmp_path / "fam.csv", 2, queue_scale=3.0)
+
+    def run(out: Path, *extra: str) -> int:
+        return driver.main([
+            "--model-input", f"a={fit}", "--model-input", f"b={fit}", "--family", f"b:prefill_heavy={fam}",
+            "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
+            "--theta-source", "family", "--n-resamples", "20", "--family-resamples", "10",
+            "--verdict-dir", str(out), "--output", str(out / "alt.yaml"), *extra,
         ])
+
+    assert run(tmp_path / "strict") == 1
+    report = yaml.safe_load((tmp_path / "strict" / "alt.yaml").read_text())
+    assert set(report["refused"]) == {"b"} and "degenerate band" in report["refused"]["b"]
+    assert "alt_thresholds" not in report["models"]["b"] and "queue_len" in report["models"]["a"]["alt_thresholds"]
+    assert report["models"]["b"]["band_at_grid_edge"]["delta_crit"] == "delta_at_grid_lower_edge"
+    verdict_b = tmp_path / "strict" / "b_verdict_queue_len.json"
+    assert json.loads(verdict_b.read_text())["published"]["refused_reason"] == report["refused"]["b"]
+    with pytest.raises(SystemExit, match="refused"):  # a refused verdict has nothing to hold out
+        theta_verdict.main(["holdout", "--verdict", str(verdict_b), "--validation-csv", str(fit),
+                            "--output", str(tmp_path / "hold.json")])
+
+    assert run(tmp_path / "allowed", "--allow-degenerate-band") == 0
+    allowed = yaml.safe_load((tmp_path / "allowed" / "alt.yaml").read_text())
+    assert allowed["refused"] == {} and allowed["models"]["b"]["alt_thresholds"]["queue_len"]["delta_crit"] == 0.0
