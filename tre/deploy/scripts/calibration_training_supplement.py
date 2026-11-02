@@ -76,8 +76,9 @@ sentinels, no checks (every cell is kept whatever its verdict: the void rule sti
 a void cell once and stops the run on a second void); the drain gate waits up to
 :data:`P1_DRAIN_LIMIT_S`; a cell at >= :data:`SUPP_OVERLOAD_FACTOR` x its unit is void only
 past :data:`stream_cut.RUNTIME_MODEL_ERROR_LIMIT` model errors (0.10: the route's 150 s
-cut counts as a model error), every other at the run's ``--max-model-error-rate``; those
-overload cells run last in their plan (:func:`build_cells`):
+cut counts as a model error), every other at the run's ``--max-model-error-rate``. A plan
+runs its cells in three tiers: below :data:`SUPP_NEAR_KNEE_FACTOR`, up to the overload
+factor, then the overload cells (:func:`build_cells`):
 
 * ``supp-a-20261103`` (A, training): the seven training shapes x {0.3, 0.4, 0.5, 0.6} x
   rho*_run2, 240 s - 28 cells. Low load, so that tau_high's n = 3 rule interpolates.
@@ -246,6 +247,9 @@ SUPP_SECONDS = 240.0
 SUPP_LONG_SECONDS = 300.0
 #: Cells at or above this factor are void only past the stream-cut limit (0.10).
 SUPP_OVERLOAD_FACTOR = 1.15
+#: Cells from this factor up to the overload factor run after the lower ones and before the
+#: overload cells (:func:`build_cells`).
+SUPP_NEAR_KNEE_FACTOR = 0.95
 #: Clear of every earlier collection's serials (supplement 50_001+, legacy 60_001+, P1
 #: 62_001+, M 70_000 / 70_500, M2 74_000+, T14 80_500 / 81_000).
 SUPP_SERIAL_BASE = {PLAN_SUPP_A: 90_000, PLAN_SUPP_B: 91_000, PLAN_SUPP_E: 92_000}
@@ -460,12 +464,14 @@ def build_cells(model: str, factory: design.CellFactory, resolved: Mapping,
                     note=f"part {group.part}: {factor:g} x {group.unit}"))
     if not tplan.sentinels:
         rng = random.Random(design.derived_seed(design_seed, model, "training-supplement-order"))
-        # the overload cells (>= the plan's overload factor) last: a run ends on a second
-        # void, and a void there (C^'s error, route-timeout cuts) then costs only the tail
         cut = tplan.overload_factor
-        late = [c for c in holds if cut is not None and c.rho_factor >= cut]
-        early = [c for c in holds if cut is None or c.rho_factor < cut]
-        return interleave(early, rng) + interleave(late, rng), []
+        if cut is None:
+            return interleave(holds, rng), []
+        # three tiers in turn, each interleaved: a run ends when a voided cell voids again on
+        # its retry, and C^'s error and route cuts make the near-knee long-output cells risky
+        tier = [2 if c.rho_factor >= cut else int(c.rho_factor >= SUPP_NEAR_KNEE_FACTOR) for c in holds]
+        return [c for k in (0, 1, 2)
+                for c in interleave([h for h, t in zip(holds, tier) if t == k], rng)], []
     sentinel_rho = round(SENTINEL_FACTOR * units[(SENTINEL_SHAPE, UNIT_SENTINEL)]["rho"], 6)
     sentinels = [
         factory.new(SENTINEL_SHAPE, design.ROLE_SENTINEL, SENTINEL_SECONDS,
