@@ -22,16 +22,17 @@ Two subcommands, run in this order by the campaign's fit plan:
       when every family theta sits inside its CI, otherwise the conservative family theta -
       the largest for TSS, the smallest for a lower_is_healthier signal).
 
-    ``--theta-source`` picks the published theta: ``family`` (default) is the family
-    rule's, ``merged`` the merged fit's whatever the family rule says (the family verdict
-    stays in the report). delta_crit / delta_high are always fitted at the published theta
+    ``--theta-source`` picks the published theta: ``merged`` (default) is the merged fit's
+    whatever the family rule says (the family verdict stays in the report), ``family``
+    (opt-in) the family rule's. delta_crit / delta_high are always fitted at the published theta
     - refitted with the same labels, grids and selection when it is not the merged one
     (the bands at the merged theta stay under ``merged``) - because tau is a multiple of
-    theta. The verdict is refused (``published.refused_reason``; the report is still
-    written, the command exits non-zero) when its HIGH band can never fire (``z`` is
-    bounded, e.g. KV headroom <= 1 gives ``z <= 1 / theta``:
-    ``tre_common.alt_signals.alt_tau_high_unreachable``) or when a band is degenerate
-    (delta 0: tau_crit or tau_high on tau_low) unless ``--allow-degenerate-band``.
+    theta. The verdict is refused (``published.refused_reason``, its numbers moved under
+    ``published.diagnostic``; the report is still written, the command exits non-zero)
+    when its HIGH band can never fire (``z`` is bounded, e.g. KV headroom <= 1 gives
+    ``z <= 1 / theta``: ``tre_common.alt_signals.alt_tau_high_unreachable``) or, unless
+    ``--allow-degenerate-band``, when delta_high is 0 (tau_high on tau_low). delta_crit 0
+    is published with a ``published.warnings`` entry.
 
     It also records the ranking quality of the signal (AUROC in its prior direction, flag
     ``inert`` below 0.6) and the balanced accuracy of the fit in BOTH directions. It writes
@@ -92,10 +93,14 @@ class VerdictError(RuntimeError):
     """The merged fit did not publish a threshold (or a refused verdict was scored)."""
 
 
-#: Where the published theta comes from (``--theta-source``): ``family`` = the family rule
-#: (``calibration_campaign.family_theta_verdict``), ``merged`` = the merged fit.
+#: Where the published theta comes from (``--theta-source``): ``merged`` = the merged fit
+#: (default; dline D5, and what the cluster runs for the alt signals, user 2026-11-02),
+#: ``family`` = the family rule (``calibration_campaign.family_theta_verdict``), opt-in.
 THETA_SOURCES = ("family", "merged")
-DEFAULT_THETA_SOURCE = "family"
+DEFAULT_THETA_SOURCE = "merged"
+
+#: The published fields a refused verdict keeps only under ``published.diagnostic``.
+_PUBLISHED_NUMBERS = ("theta_m", "tau_crit", "delta_crit", "tau_high", "delta_high")
 
 
 @dataclass(frozen=True)
@@ -366,19 +371,24 @@ def _band_side_record(side) -> dict[str, Any]:
 
 def refusal_reasons(spec: SignalSpec, theta: float, bands, *, allow_degenerate_band: bool = False) -> list[str]:
     """Why bands fitted at ``theta`` must not be published (empty: publishable): a HIGH band
-    the signal can never exceed, or - unless ``allow_degenerate_band`` - a side whose tau
-    sits on tau_low (delta 0: no LOW band under tau_low, or no HEALTHY band above it)."""
+    the signal can never exceed, or - unless ``allow_degenerate_band`` - delta_high 0
+    (tau_high on tau_low: no HEALTHY band, so a model flips between donor and receiver)."""
     reasons: list[str] = []
     if spec.signal != "tss":
         unreachable = alt_tau_high_unreachable(spec.signal, theta, bands.high.delta)
         if unreachable:
             reasons.append(unreachable)
-    if not allow_degenerate_band:
-        for name, side in (("delta_crit", bands.crit), ("delta_high", bands.high)):
-            if side.delta <= CLAMP_TOLERANCE:
-                reasons.append(f"degenerate band: {name} = {side.delta:g} puts its tau on tau_low "
-                               f"(clamp {side.clamp_reason}); pass --allow-degenerate-band to publish it")
+    if not allow_degenerate_band and bands.high.delta <= CLAMP_TOLERANCE:
+        reasons.append(f"degenerate HIGH band: delta_high = {bands.high.delta:g} puts tau_high on tau_low "
+                       f"(clamp {bands.high.clamp_reason}); pass --allow-degenerate-band to publish it")
     return reasons
+
+
+def band_warnings(bands) -> list[str]:
+    """Published, but disclosed: delta_crit 0 (tau_crit on tau_low, no LOW band)."""
+    if bands.crit.delta <= CLAMP_TOLERANCE:
+        return [f"delta_crit = {bands.crit.delta:g} puts tau_crit on tau_low (no LOW band: z < 1 is CRITICAL)"]
+    return []
 
 
 def _selection_record(side) -> dict[str, Any]:
@@ -574,10 +584,14 @@ def verdict_report(
             },
             "z_max": spec.z_max(published_theta),
             "allow_degenerate_band": allow_degenerate_band,
+            "warnings": band_warnings(bands),
             "refused_reason": "; ".join(refused) or None,
             "stop_rule_satisfied": stop.satisfied,
         },
     }
+    if refused:  # no threshold to read by mistake: the numbers are diagnostics only
+        pub = report["published"]
+        pub["diagnostic"] = {key: pub.pop(key) for key in _PUBLISHED_NUMBERS}
     if spec.tss is not None:
         report["tss"] = {**spec.tss.as_dict(), "units": TSS_UNITS}
     return report
@@ -711,11 +725,11 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     v.add_argument("--seed", type=int, default=20260922)
     v.add_argument(
         "--theta-source", choices=THETA_SOURCES, default=DEFAULT_THETA_SOURCE,
-        help="published theta: the family rule's (family) or the merged fit's (merged); the "
-             "published bands are fitted at it either way",
+        help="published theta: the merged fit's (merged, default) or the family rule's "
+             "(family); the published bands are fitted at it either way",
     )
     v.add_argument("--allow-degenerate-band", action="store_true",
-                   help="publish a band whose delta is 0 (tau_crit or tau_high on tau_low)")
+                   help="publish a HIGH band with delta_high 0 (tau_high on tau_low)")
     v.add_argument("--output", required=True)
     h = sub.add_parser("holdout")
     h.add_argument("--verdict", required=True)
@@ -734,10 +748,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     out.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     if args.command == "verdict":
         p = report["published"]
+        n = p.get("diagnostic") or p
         print(
             f"[{report['model']}/{report['signal']}] theta={report['merged']['theta']:.4g} "
-            f"CI={report['merged']['bootstrap']['theta_ci95']} -> publish {p['theta_m']:.4g} "
-            f"({p['source']}), delta_crit={p['delta_crit']:.3f}, delta_high={p['delta_high']:.3f}, "
+            f"CI={report['merged']['bootstrap']['theta_ci95']} -> publish {n['theta_m']:.4g} "
+            f"({p['source']}), delta_crit={n['delta_crit']:.3f}, delta_high={n['delta_high']:.3f}, "
             f"auroc={report['merged']['ranking']['auroc']:.3f}, stop_rule={p['stop_rule_satisfied']}"
         )
         if p["refused_reason"]:

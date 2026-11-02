@@ -247,6 +247,7 @@ def alt_basis_errors(models, signal: str, *, window_ms: float) -> list[str]:
 
 __all__ = (
     "ALT_SIGNAL_DEFINITIONS",
+    "ALT_SIGNAL_HEALTHIEST_VALUE",
     "EPS",
     "HIGHER_IS_HEALTHIER",
     "KV_HEADROOM_FLOOR",
@@ -257,6 +258,8 @@ __all__ = (
     "Z_MAX",
     "alt_basis_errors",
     "alt_ema_tau_ms",
+    "alt_signal_z_max",
+    "alt_tau_high_unreachable",
     "kv_headroom",
     "normalize_signal_value",
     "queue_len_per_replica",

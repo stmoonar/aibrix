@@ -316,7 +316,6 @@ def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
         label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal,
         trim_ramp_windows=0,
-        allow_degenerate_band=True,  # clean boundary: delta_crit 0 (these tests are about theta)
     )
 
     assert payload["label_def"]["e2e"] == "excluded"
@@ -355,7 +354,6 @@ def test_every_alternative_signal_moves_when_the_criterion_is_switched(
         label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal,
         trim_ramp_windows=0,
-        allow_degenerate_band=True,  # clean boundary: delta_crit 0 (these tests are about theta)
         criterion="reliability",
         **_RELIABILITY_KNOBS,
     )
@@ -424,7 +422,6 @@ def test_v1_signals_go_through_the_same_fit_in_their_own_direction(signal: str, 
         _MODEL, _write_v1_signal_csv(tmp_path / "windows.csv"),
         label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal, trim_ramp_windows=0,
-        allow_degenerate_band=True,  # clean boundary: delta_crit 0 (these tests are about theta)
     )
     threshold = payload["alt_thresholds"][signal]
     assert threshold["direction"] == EXPECTED_SIGNAL_DIRECTIONS[signal]
@@ -463,7 +460,7 @@ def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tm
         "--model-input", f"a={csv_path}", "--model-input", f"b={csv_path}",
         "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
         "--trim-ramp-windows", "0", "--output", str(output), "--n-resamples", "20",
-        "--family-resamples", "10", "--allow-degenerate-band",  # clean boundary: delta_crit 0
+        "--family-resamples", "10",
     ]) == 0
     report = yaml.safe_load(output.read_text(encoding="utf-8"))
     [warning] = report["warnings"]

@@ -9,9 +9,9 @@
 * fit_alt_thresholds writes registry-shaped entries from verdict_report and verdict
   JSONs that theta_verdict holdout scores;
 * the published bands are fitted at the published theta (2026-11-02: the family rule
-  used to swap theta under bands fitted at the merged one), ``--theta-source merged``
-  publishes the merged theta with its bands, and a refused model (degenerate band) is
-  reported without stopping the others.
+  used to swap theta under bands fitted at the merged one), the default (merged) publishes
+  the merged theta with its bands, an unreachable or degenerate HIGH band is refused, and
+  a refused model is reported without stopping the others.
 """
 from __future__ import annotations
 
@@ -172,7 +172,6 @@ def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None
         "--model-input", f"{MODEL}={fit}", "--family", f"{MODEL}:prefill_heavy={fam}",
         "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "decode_tps",
         "--n-resamples", "10", "--family-resamples", "5", "--verdict-dir", str(tmp_path),
-        "--allow-degenerate-band",  # this fixture's decode_tps band has delta_crit 0
         "--output", str(out),
     ]) == 0
     report = yaml.safe_load(out.read_text())
@@ -184,18 +183,20 @@ def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None
     assert "prefill_heavy" in verdict["families"]
 
 
-def _swapping_verdict(tmp_path: Path, *extra: str) -> tuple[dict, theta_verdict.SignalSpec, list]:
-    """queue_len verdict whose only family has 3x the queue: its theta falls outside the
-    merged CI, so the family rule moves the published theta off the merged one."""
+def _swapping_verdict(
+    tmp_path: Path, *extra: str, scale: float = 3.0, rc: int = 0,
+) -> tuple[dict, theta_verdict.SignalSpec, list]:
+    """queue_len verdict whose only family has ``scale`` x the queue: its theta falls outside
+    the merged CI, so the family rule (when asked for) moves the published theta."""
     fit = _csv(tmp_path / "fit.csv", 1)
-    fam = _csv(tmp_path / "fam.csv", 2, queue_scale=3.0)
+    fam = _csv(tmp_path / "fam.csv", 2, queue_scale=scale)
     out = tmp_path / "verdict_swap.json"
     assert theta_verdict.main([
         "verdict", "--model", MODEL, "--fitting-csv", str(fit), "--family", f"prefill_heavy={fam}",
         "--signal", "queue_len", "--label-lambda-wait", "3", "--ttft-slo-mode", "fixed",
         "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--n-resamples", "20", "--family-resamples", "10",
         "--output", str(out), *extra,
-    ]) == 0
+    ]) == rc
     v = json.loads(out.read_text())
     spec = theta_verdict.SignalSpec.from_dict(v["signal_spec"])
     return v, spec, spec.load(fit, LabelDefinition.from_dict(v["label_def"]), v["trim_ramp_windows"])
@@ -209,8 +210,7 @@ def _bands_at(spec: theta_verdict.SignalSpec, windows: list, theta: float) -> tu
 def test_the_published_bands_are_fitted_at_the_published_theta(tmp_path: Path) -> None:
     # regression 2026-11-02: tau = theta * (1 -/+ delta), so bands fitted at the merged theta
     # under a family theta moved every absolute line (queue_len CRIT q > 119 became q > 11).
-    # (Here the refit band is degenerate - delta_crit 0 - hence the flag.)
-    v, spec, windows = _swapping_verdict(tmp_path, "--theta-source", "family", "--allow-degenerate-band")
+    v, spec, windows = _swapping_verdict(tmp_path, "--theta-source", "family")
     pub = v["published"]
     assert v["family_verdict"]["publish"] == "min_family" and pub["source"] == "min_family"
     assert pub["theta_m"] != v["merged"]["theta"]
@@ -220,23 +220,37 @@ def test_the_published_bands_are_fitted_at_the_published_theta(tmp_path: Path) -
     # the bands at the merged theta stay in the report for reference
     merged = (v["merged"]["delta_crit"]["delta"], v["merged"]["delta_high"]["delta"])
     assert merged == _bands_at(spec, windows, v["merged"]["theta"])
+    # delta_crit 0 here: published, with a warning (only a degenerate HIGH band is refused)
+    assert pub["delta_crit"] == 0.0 and pub["refused_reason"] is None
+    assert any("delta_crit" in w for w in pub["warnings"])
 
 
 def test_theta_source_merged_publishes_the_merged_theta_with_its_bands(tmp_path: Path) -> None:
-    v, _spec, _windows = _swapping_verdict(tmp_path, "--theta-source", "merged")
+    v, _spec, _windows = _swapping_verdict(tmp_path)  # merged is the default
     pub, merged = v["published"], v["merged"]
     assert v["family_verdict"]["publish"] == "min_family"  # the family rule still reported
     assert (pub["theta_m"], pub["source"], pub["theta_source"]) == (merged["theta"], "merged", "merged")
     assert (pub["delta_crit"], pub["delta_high"]) == (merged["delta_crit"]["delta"], merged["delta_high"]["delta"])
 
 
+def test_a_high_band_the_signal_cannot_reach_is_refused(tmp_path: Path) -> None:
+    # family theta 9 (0.3x queue): queue >= 1 per replica, so z = 9 / q <= 9, while the band
+    # refitted there is tau_high 10. Refused through the verdict; no threshold field is left
+    # where a script ignoring the exit code would read it.
+    v, _spec, _windows = _swapping_verdict(tmp_path, "--theta-source", "family", scale=0.3, rc=1)
+    pub = v["published"]
+    assert "can never fire" in pub["refused_reason"]
+    assert pub["diagnostic"]["tau_high"] >= pub["z_max"] == pytest.approx(pub["diagnostic"]["theta_m"])
+    assert not {"theta_m", "tau_crit", "delta_crit", "tau_high", "delta_high"} & set(pub)
+
+
 def test_a_refused_model_is_reported_and_does_not_stop_the_others(tmp_path: Path) -> None:
-    # Model b's family theta (3x queue) moves theta; the band refitted there has delta 0
-    # (tau on tau_low), so b is refused - its diagnostics are written, a's threshold is
-    # published, and the run exits non-zero. --allow-degenerate-band publishes b.
+    # Model b's family theta (0.45x queue) moves theta; the HIGH band refitted there has
+    # delta_high 0 (tau_high on tau_low), so b is refused - its diagnostics are written, a's
+    # threshold is published, and the run exits non-zero. --allow-degenerate-band publishes b.
     driver = _load_fit_alt_thresholds()
     fit = _csv(tmp_path / "fit.csv", 1)
-    fam = _csv(tmp_path / "fam.csv", 2, queue_scale=3.0)
+    fam = _csv(tmp_path / "fam.csv", 2, queue_scale=0.45)
 
     def run(out: Path, *extra: str) -> int:
         return driver.main([
@@ -248,9 +262,9 @@ def test_a_refused_model_is_reported_and_does_not_stop_the_others(tmp_path: Path
 
     assert run(tmp_path / "strict") == 1
     report = yaml.safe_load((tmp_path / "strict" / "alt.yaml").read_text())
-    assert set(report["refused"]) == {"b"} and "degenerate band" in report["refused"]["b"]
+    assert set(report["refused"]) == {"b"} and "degenerate HIGH band" in report["refused"]["b"]
     assert "alt_thresholds" not in report["models"]["b"] and "queue_len" in report["models"]["a"]["alt_thresholds"]
-    assert report["models"]["b"]["band_at_grid_edge"]["delta_crit"] == "delta_at_grid_lower_edge"
+    assert report["models"]["b"]["band_at_grid_edge"]["delta_high"] == "delta_at_grid_lower_edge"
     verdict_b = tmp_path / "strict" / "b_verdict_queue_len.json"
     assert json.loads(verdict_b.read_text())["published"]["refused_reason"] == report["refused"]["b"]
     with pytest.raises(SystemExit, match="refused"):  # a refused verdict has nothing to hold out
@@ -259,4 +273,4 @@ def test_a_refused_model_is_reported_and_does_not_stop_the_others(tmp_path: Path
 
     assert run(tmp_path / "allowed", "--allow-degenerate-band") == 0
     allowed = yaml.safe_load((tmp_path / "allowed" / "alt.yaml").read_text())
-    assert allowed["refused"] == {} and allowed["models"]["b"]["alt_thresholds"]["queue_len"]["delta_crit"] == 0.0
+    assert allowed["refused"] == {} and allowed["models"]["b"]["alt_thresholds"]["queue_len"]["delta_high"] == 0.0

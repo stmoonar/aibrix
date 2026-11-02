@@ -55,12 +55,13 @@ from tre_calibration.fit import (
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 
-from scripts.theta_verdict import THETA_SOURCES, build_signal_spec, verdict_report
-
-#: Published theta of the alternative signals: the merged fit's, with its own bands (user
-#: 2026-11-02; what the cluster runs). ``family`` (the family rule's theta, bands refitted
-#: at it) stays available; on queue_len it pushed delta to the grid's lower edge.
-DEFAULT_ALT_THETA_SOURCE = "merged"
+from scripts.theta_verdict import (
+    DEFAULT_THETA_SOURCE,
+    THETA_SOURCES,
+    VerdictError,
+    build_signal_spec,
+    verdict_report,
+)
 
 #: Queue weight of the delta_high surplus label when the caller names none: the primary
 #: TSS lambda_wait, so the alternative arms share the label of the TSS fit.
@@ -125,12 +126,12 @@ def fit_model(
     n_resamples: int = 200,
     family_resamples: int = 100,
     seed: int = 20260922,
-    theta_source: str = DEFAULT_ALT_THETA_SOURCE,
+    theta_source: str = DEFAULT_THETA_SOURCE,
     allow_degenerate_band: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """One model's alt threshold through :func:`scripts.theta_verdict.verdict_report`. A
-    refused verdict (``published.refused_reason``) yields no ``alt_thresholds`` entry,
-    only ``refused_reason`` and the diagnostics."""
+    refused verdict (``published.refused_reason``; a merged fit that published no theta is
+    one too) yields no ``alt_thresholds`` entry, only ``refused_reason`` and the diagnostics."""
     spec = build_signal_spec(signal, ema_tau_ms=ema_tau_ms, label_lambda_wait=label_lambda_wait)
     config = ThetaFitConfig(
         criterion=criterion,
@@ -144,20 +145,30 @@ def fit_model(
         max_single_scenario_ratio=max_single_scenario_ratio,
         candidate_grid=spec.candidate_grid,
     )
-    verdict = verdict_report(
-        model=model_name, fitting_csv=input_path, families=dict(families or {}), spec=spec,
-        label=label_def, trim_ramp_windows=trim_ramp_windows, config=config,
-        n_resamples=n_resamples, family_resamples=family_resamples, seed=seed,
-        theta_source=theta_source, allow_degenerate_band=allow_degenerate_band,
-    )
+    try:
+        verdict = verdict_report(
+            model=model_name, fitting_csv=input_path, families=dict(families or {}), spec=spec,
+            label=label_def, trim_ramp_windows=trim_ramp_windows, config=config,
+            n_resamples=n_resamples, family_resamples=family_resamples, seed=seed,
+            theta_source=theta_source, allow_degenerate_band=allow_degenerate_band,
+        )
+    except VerdictError as exc:  # the merged fit published no theta: refused like any other
+        verdict = {
+            "generated_at": datetime.now(timezone.utc).isoformat(), "model": model_name, "signal": signal,
+            "direction": spec.direction, "signal_spec": spec.as_dict(), "label_def": label_def.as_dict(),
+            "trim_ramp_windows": trim_ramp_windows,
+            "published": {"signal": signal, "direction": spec.direction, "theta_source": theta_source,
+                          "refused_reason": str(exc)},
+        }
     windows = spec.load(input_path, label_def, trim_ramp_windows)
     published = verdict["published"]
-    theta = float(published["theta_m"])
+    theta = (published.get("diagnostic") or published).get("theta_m")
     # Windows sitting exactly on the threshold: with ignore_eos every request has the
     # same token count, so rate signals live on a lattice and two models can land on the
     # same lattice point. Recorded so a coincidence can be told apart from a bug.
     on_theta = sorted({window.scenario_id for window in windows if window.signal == theta})
-    merged = verdict["merged"]
+    merged = verdict.get("merged") or {}
+    bands = published.get("bands") or {}
     payload = {
         "input_csv": str(input_path),
         "label_def": label_def.as_dict(),
@@ -181,13 +192,13 @@ def fit_model(
         # The published side's own clamp (either grid edge): on the upper edge its optimum
         # is outside the searched range, on the lower one the band is empty. None = inside.
         "band_at_grid_edge": {
-            side: (published["bands"][side]["clamp_reason"] if published["bands"][side]["clamped"] else None)
-            for side in ("delta_crit", "delta_high")
+            side: (bands[side]["clamp_reason"] if bands[side]["clamped"] else None)
+            for side in ("delta_crit", "delta_high") if side in bands
         },
         "theta_criterion": criterion,
-        "fit": merged["fit"],
-        "ranking": merged["ranking"],
-        "opposite_direction_diagnostic": merged["opposite_direction"],
+        "fit": merged.get("fit"),
+        "ranking": merged.get("ranking"),
+        "opposite_direction_diagnostic": merged.get("opposite_direction"),
         "verdict": verdict,
     }
     return payload, threshold_curve(windows, direction=spec.direction)
@@ -274,7 +285,7 @@ def write_threshold_svg(
 
 def _write_atomic(path: Path, text: str) -> None:
     """Replace ``path`` in one step, so no reader sees a half-written file."""
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
@@ -334,12 +345,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--family-resamples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260922)
     parser.add_argument(
-        "--theta-source", choices=THETA_SOURCES, default=DEFAULT_ALT_THETA_SOURCE,
+        "--theta-source", choices=THETA_SOURCES, default=DEFAULT_THETA_SOURCE,
         help="published theta: the merged fit's (merged, default) or the family rule's "
              "(family); delta_crit / delta_high are fitted at it either way",
     )
     parser.add_argument("--allow-degenerate-band", action="store_true",
-                        help="publish a band whose delta is 0 (tau_crit or tau_high on tau_low)")
+                        help="publish a HIGH band with delta_high 0 (tau_high on tau_low)")
     parser.add_argument(
         "--verdict-dir",
         help="write each model's verdict JSON here as <model>_verdict_<signal>.json "
@@ -393,8 +404,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             theta_source=args.theta_source,
             allow_degenerate_band=args.allow_degenerate_band,
         )
-    # Written only once every model is fitted (a crash leaves no mix of new and stale
-    # files); a refused model's verdict is written too - it carries refused_reason.
+    # Every model gets a fresh verdict (a refused one carries refused_reason), written after
+    # all fits; each file is replaced atomically - per file only, not as a set.
     if args.verdict_dir:
         vdir = Path(args.verdict_dir)
         vdir.mkdir(parents=True, exist_ok=True)
@@ -456,9 +467,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     report["models"] = {
         model: {k: v for k, v in payload.items() if k != "verdict"}
-        | {"published": payload["verdict"]["published"], "stop_rule": payload["verdict"]["stop_rule"],
-           "family_verdict": payload["verdict"]["family_verdict"],
-           "bootstrap": payload["verdict"]["merged"]["bootstrap"]}
+        | {"published": payload["verdict"]["published"], "stop_rule": payload["verdict"].get("stop_rule"),
+           "family_verdict": payload["verdict"].get("family_verdict"),
+           "bootstrap": (payload["verdict"].get("merged") or {}).get("bootstrap")}
         for model, payload in models.items()
     }
     output = Path(args.output)
@@ -478,11 +489,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 writer.writeheader()
                 writer.writerows(rows)
 
-    if args.plot_output:
+    selected = {model: (payload["verdict"]["published"].get("diagnostic") or payload["verdict"]["published"]).get("theta_m")
+                for model, payload in models.items()}
+    selected = {model: theta for model, theta in selected.items() if theta is not None}
+    if args.plot_output and selected:
         write_threshold_svg(
             args.plot_output,
-            curves,
-            {model: payload["verdict"]["published"]["theta_m"] for model, payload in models.items()},
+            {model: curves[model] for model in selected},
+            selected,
             signal=args.signal,
             direction=alt_signal_direction(args.signal),
             criterion=args.theta_criterion,

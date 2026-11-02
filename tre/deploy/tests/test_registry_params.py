@@ -202,6 +202,23 @@ def test_an_alt_band_that_can_never_fire_is_rejected_at_publish_only() -> None:
     assert not [e for e in _parse_registry(unreachable).validate() if "kv_usage" in e]
 
 
+def test_a_theta_edit_is_checked_against_the_existing_band_and_old_bands_block_nothing_else() -> None:
+    """kv 8b of 11-02: theta 0.4601 / delta_high 0.68 is reachable (z <= 2.17); moving only
+    theta to 0.7571 makes the same band unreachable (z <= 1.32). An unrelated edit on a
+    registry that already holds such a band still goes through."""
+    def with_kv(theta: float) -> str:
+        data = yaml.safe_load(_REGISTRY)
+        data["models"][0]["alt_thresholds"]["kv_usage"] = {
+            "theta": theta, "direction": "higher_is_healthier", "delta_crit": 0.59, "delta_high": 0.68}
+        return yaml.safe_dump(data)
+
+    with pytest.raises(ParamValidationError) as exc_info:
+        apply_and_validate(with_kv(0.4601), {"m1": {"alt_thresholds": {"kv_usage": {"theta": 0.7571}}}})
+    assert exc_info.value.errors[0]["field"] == "alt_thresholds.kv_usage.delta_high"
+    edited = yaml.safe_load(apply_and_validate(with_kv(0.7571), {"m1": {"trs": {"w_p": 0.05}}}))
+    assert edited["models"][0]["trs"]["w_p"] == 0.05
+
+
 def test_alt_threshold_basis_stamp_is_settable_and_checked() -> None:
     """The fit's basis stamp goes out with theta through params_set (the controller
     refuses an alt arm without it); only the definition this code computes is accepted."""
