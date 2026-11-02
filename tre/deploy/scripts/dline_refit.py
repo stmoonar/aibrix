@@ -1215,14 +1215,15 @@ def publish_tau_arg(text: str) -> Optional[float]:
 
 
 def verdict(model: str, label, p: Mapping[str, Any], tau: float, w_p: float, lam: float,
-            n_res: int = 1000, fam_res: int = 200) -> dict:
+            n_res: int = 1000, fam_res: int = 200, theta_source: str = "family") -> dict:
     from scripts import theta_verdict as tv
 
     spec = spec_for(tau, w_p, lam)
     try:
         return tv.verdict_report(model=model, fitting_csv=p["fitting"], families=p["families"], spec=spec,
                                  label=label, trim_ramp_windows=TRIM_RAMP_WINDOWS, n_resamples=n_res,
-                                 family_resamples=fam_res, seed=SEED, max_ci_fraction=D13_MAX_CI_FRACTION)
+                                 family_resamples=fam_res, seed=SEED, max_ci_fraction=D13_MAX_CI_FRACTION,
+                                 theta_source=theta_source)
     except tv.VerdictError as exc:
         return {"error": str(exc)}
 
@@ -1237,11 +1238,11 @@ def summarize(v: Mapping[str, Any]) -> dict:
     half_frac = m["bootstrap"]["ci_half_width_fraction"]
     gap = abs(tP - tD) / theta if tP and tD else None
     return {
-        "theta_merged": theta, "theta_published": v["published"]["theta_m"], "source": v["published"]["source"],
+        "theta_merged": theta, "theta_published": v["published"]["theta_m"], "source": v["family_verdict"]["publish"],
         "train_ba": m["fit"].get("balanced_accuracy"), "ci_half_frac": half_frac,
         "publish_rate": m["bootstrap"]["publish_rate"], "theta_P": tP, "theta_D": tD,
         "family_ratio_P_over_D": (tP / tD) if tP and tD else None, "family_gap_frac": gap,
-        "family_merged": v["published"]["source"] == "merged",
+        "family_merged": v["family_verdict"]["publish"] == "merged",
         "delta_crit": v["published"]["delta_crit"], "delta_high": v["published"]["delta_high"],
         "tau_crit": v["published"]["tau_crit"],
         "delta_crit_ci": [m["delta_crit"]["bootstrap"].get(k) for k in ("delta_p2_5", "delta_p97_5")],
@@ -1465,14 +1466,14 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
 
     win = dict(DEFAULT_WINDOWING if win is None else win)
     tau, wp, lam = wp_doc["tau_s"], wp_doc["w_p_used"], wp_doc["lambda_star"]
-    v = verdict(model, label, p, tau, wp, lam, *FINAL_RESAMPLES)
+    # D5: the merged theta is published whatever the family verdict says (diagnostic only),
+    # with the bands fitted at it (theta_source "merged")
+    v = verdict(model, label, p, tau, wp, lam, *FINAL_RESAMPLES, theta_source="merged")
     out_dir.mkdir(parents=True, exist_ok=True)
     if "error" in v:
         (out_dir / "verdict_final.json").write_text(json.dumps(v, indent=1, default=str))
         return {"model": model, "error": v["error"]}
-    # D5: the merged theta is published whatever the family verdict says (diagnostic only)
-    v["published"]["family_rule_theta"] = v["published"]["theta_m"]
-    v["published"]["theta_m"] = v["merged"]["theta"]
+    v["published"]["family_rule_theta"] = v["family_verdict"]["theta"]
     v["published"]["d5_merged_published"] = True
     # the theta uncertainty band (disclosed; theta stays the fit's argmax), on the training windows
     spec_f = spec_for(tau, wp, lam)

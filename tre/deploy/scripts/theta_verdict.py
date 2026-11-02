@@ -22,6 +22,14 @@ Two subcommands, run in this order by the campaign's fit plan:
       when every family theta sits inside its CI, otherwise the conservative family theta -
       the largest for TSS, the smallest for a lower_is_healthier signal).
 
+    ``--theta-source`` picks the published theta: ``family`` (default) is the family
+    rule's, ``merged`` the merged fit's whatever the family rule says (the family verdict
+    stays in the report). delta_crit / delta_high are always fitted at the published theta
+    - refitted with the same labels, grids and selection when it is not the merged one
+    (the bands at the merged theta stay under ``merged``) - because tau is a multiple of
+    theta. A band ``tau_high`` the signal can never exceed (``z`` is bounded, e.g. KV
+    headroom <= 1 gives ``z <= 1 / theta``) is refused (:class:`VerdictError`).
+
     It also records the ranking quality of the signal (AUROC in its prior direction, flag
     ``inert`` below 0.6) and the balanced accuracy of the fit in BOTH directions. It writes
     the numbers that would be published and why. It never touches a registry.
@@ -48,6 +56,7 @@ from tre_calibration.alt_signals import (
     alt_signal_direction,
     alt_signal_names,
     alt_signal_transform,
+    alt_signal_z_max,
 )
 from tre_calibration.bootstrap import bootstrap_theta, bootstrap_theta_and_delta_crit
 from tre_calibration.dataset import CalibrationWindow, TssRecompute, load_windows_from_csv
@@ -75,7 +84,13 @@ _OPPOSITE = {"higher_is_healthier": "lower_is_healthier", "lower_is_healthier": 
 
 
 class VerdictError(RuntimeError):
-    """The merged fit did not publish a threshold."""
+    """The merged fit did not publish a threshold, or its band cannot fire."""
+
+
+#: Where the published theta comes from (``--theta-source``): ``family`` = the family rule
+#: (``calibration_campaign.family_theta_verdict``), ``merged`` = the merged fit.
+THETA_SOURCES = ("family", "merged")
+DEFAULT_THETA_SOURCE = "family"
 
 
 @dataclass(frozen=True)
@@ -127,6 +142,11 @@ class SignalSpec:
         if self.signal == "tss":
             return named_fit_method(self.fit_method).theta_config(self.direction)
         return ThetaFitConfig(direction=self.direction, candidate_grid=self.candidate_grid)
+
+    def z_max(self, theta: float) -> float | None:
+        """The largest ``z`` a window can reach at ``theta``
+        (``tre_calibration.alt_signals.alt_signal_z_max``); None for TSS (unbounded)."""
+        return None if self.signal == "tss" else alt_signal_z_max(self.signal, theta)
 
     def band_kwargs(self) -> dict[str, Any]:
         """``fit_delta_margins`` keywords: the fit method's selection (none for argmax) and,
@@ -330,6 +350,15 @@ def dwell_acceptance(
     }
 
 
+def _band_side_record(side) -> dict[str, Any]:
+    """How one side of the published bands was fitted (when refitted at a family theta)."""
+    return {
+        "method": side.method, "delta": side.delta, "balanced_accuracy": side.balanced_accuracy,
+        "clamped": side.clamped, "clamp_reason": side.clamp_reason, "used_fallback": side.used_fallback,
+        **_selection_record(side),
+    }
+
+
 def _selection_record(side) -> dict[str, Any]:
     """A band side's plateau record (only when not the argmax, so default reports keep
     their key set)."""
@@ -352,13 +381,18 @@ def verdict_report(
     family_resamples: int = 200,
     seed: int = 20260922,
     max_ci_fraction: float | None = None,
+    theta_source: str = DEFAULT_THETA_SOURCE,
 ) -> dict[str, Any]:
     """The verdict for ``spec``'s signal on one model - the one fit path of every arm.
 
     ``max_ci_fraction`` is the D13 CI gate of the stop rule (default
-    ``adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION``, 20 % since 2026-09-24)."""
+    ``adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION``, 20 % since 2026-09-24).
+    ``theta_source`` (:data:`THETA_SOURCES`) picks the published theta; the published
+    bands are always fitted at it."""
     from scripts.calibration_campaign import family_theta_verdict
 
+    if theta_source not in THETA_SOURCES:
+        raise ValueError(f"theta_source must be one of {THETA_SOURCES}, got {theta_source!r}")
     config = config or spec.default_config()
     if config.direction != spec.direction:
         raise ValueError(f"config direction {config.direction} != signal direction {spec.direction}")
@@ -418,7 +452,22 @@ def verdict_report(
         max_ci_fraction=(boundary.MAX_CI_HALF_WIDTH_FRACTION if max_ci_fraction is None
                          else float(max_ci_fraction)),
     )
-    published_theta = float(fam["theta"])
+    source = "merged" if theta_source == "merged" else fam["publish"]
+    published_theta = theta if theta_source == "merged" else float(fam["theta"])
+    # tau = theta * (1 -/+ delta): bands fitted at another theta mean other absolute lines,
+    # so a theta the family rule moved gets its own bands (same labels, grids, selection).
+    refit = published_theta != theta
+    bands = (
+        fit_delta_margins(windows, theta=published_theta, direction=direction, **spec.band_kwargs())
+        if refit else delta
+    )
+    z_max = spec.z_max(published_theta)
+    if z_max is not None and 1.0 + bands.high.delta >= z_max:
+        raise VerdictError(
+            f"{model}/{spec.signal}: tau_high {1.0 + bands.high.delta:.4g} at theta {published_theta:.4g} "
+            f"({source}, --theta-source {theta_source}) "
+            f"can never fire: z <= {z_max:.4g} for this signal, HIGH needs z > tau_high; not published"
+        )
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model,
@@ -489,11 +538,19 @@ def verdict_report(
             "signal": spec.signal,
             "direction": direction,
             "theta_m": published_theta,
-            "tau_crit": 1.0 - delta.crit.delta,
-            "delta_crit": delta.crit.delta,
-            "tau_high": 1.0 + delta.high.delta,
-            "delta_high": delta.high.delta,
-            "source": fam["publish"],
+            "tau_crit": 1.0 - bands.crit.delta,
+            "delta_crit": bands.crit.delta,
+            "tau_high": 1.0 + bands.high.delta,
+            "delta_high": bands.high.delta,
+            "source": source,
+            "theta_source": theta_source,
+            # the theta delta_crit / delta_high were fitted at (always theta_m); refit: the
+            # published theta is not the merged one (merged.delta_* = bands at the merged theta)
+            "bands_fitted_at_theta": bands.theta,
+            "bands_refit": refit,
+            **({"bands": {"delta_crit": _band_side_record(bands.crit),
+                          "delta_high": _band_side_record(bands.high)}} if refit else {}),
+            "z_max": z_max,
             "stop_rule_satisfied": stop.satisfied,
         },
     }
@@ -520,6 +577,7 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
             model=args.model, fitting_csv=args.fitting_csv, families=families, spec=spec,
             label=label, trim_ramp_windows=args.trim_ramp_windows,
             n_resamples=args.n_resamples, family_resamples=args.family_resamples, seed=args.seed,
+            theta_source=args.theta_source,
         )
     except VerdictError as exc:
         raise SystemExit(str(exc)) from exc
@@ -620,6 +678,11 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     v.add_argument("--n-resamples", type=int, default=1000)
     v.add_argument("--family-resamples", type=int, default=200)
     v.add_argument("--seed", type=int, default=20260922)
+    v.add_argument(
+        "--theta-source", choices=THETA_SOURCES, default=DEFAULT_THETA_SOURCE,
+        help="published theta: the family rule's (family) or the merged fit's (merged); the "
+             "published bands are fitted at it either way",
+    )
     v.add_argument("--output", required=True)
     h = sub.add_parser("holdout")
     h.add_argument("--verdict", required=True)

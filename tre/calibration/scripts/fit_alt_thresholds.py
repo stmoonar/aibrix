@@ -54,7 +54,7 @@ from tre_calibration.fit import (
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 
-from scripts.theta_verdict import build_signal_spec, verdict_report
+from scripts.theta_verdict import DEFAULT_THETA_SOURCE, THETA_SOURCES, build_signal_spec, verdict_report
 
 #: Queue weight of the delta_high surplus label when the caller names none: the primary
 #: TSS lambda_wait, so the alternative arms share the label of the TSS fit.
@@ -119,6 +119,7 @@ def fit_model(
     n_resamples: int = 200,
     family_resamples: int = 100,
     seed: int = 20260922,
+    theta_source: str = DEFAULT_THETA_SOURCE,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """One model's alt threshold through :func:`scripts.theta_verdict.verdict_report`."""
     spec = build_signal_spec(signal, ema_tau_ms=ema_tau_ms, label_lambda_wait=label_lambda_wait)
@@ -138,6 +139,7 @@ def fit_model(
         model=model_name, fitting_csv=input_path, families=dict(families or {}), spec=spec,
         label=label_def, trim_ramp_windows=trim_ramp_windows, config=config,
         n_resamples=n_resamples, family_resamples=family_resamples, seed=seed,
+        theta_source=theta_source,
     )
     windows = spec.load(input_path, label_def, trim_ramp_windows)
     published = verdict["published"]
@@ -315,6 +317,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--family-resamples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260922)
     parser.add_argument(
+        "--theta-source", choices=THETA_SOURCES, default=DEFAULT_THETA_SOURCE,
+        help="published theta: the family rule's (family) or the merged fit's (merged); "
+             "delta_crit / delta_high are fitted at it either way",
+    )
+    parser.add_argument(
         "--verdict-dir",
         help="write each model's verdict JSON here as <model>_verdict_<signal>.json "
              "(input of theta_verdict holdout)",
@@ -364,6 +371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             n_resamples=args.n_resamples,
             family_resamples=args.family_resamples,
             seed=args.seed,
+            theta_source=args.theta_source,
         )
         if args.verdict_dir:
             vdir = Path(args.verdict_dir)
@@ -405,6 +413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "warnings": warnings,
         "fit_config": {
             "pipeline": "scripts.theta_verdict.verdict_report",
+            "theta_source": args.theta_source,
             "delta_grids": {"delta_crit": [ALT_DELTA_CRIT_GRID[0], ALT_DELTA_CRIT_GRID[-1], 0.01],
                             "delta_high": [ALT_DELTA_HIGH_GRID[0], ALT_DELTA_HIGH_GRID[-1], 0.01]},
             "label_lambda_wait": args.label_lambda_wait,

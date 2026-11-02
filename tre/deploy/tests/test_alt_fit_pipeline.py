@@ -7,7 +7,11 @@
   lower_is_healthier signal);
 * queue_len searches distinct values; delta margins are fitted on the controller's z;
 * fit_alt_thresholds writes registry-shaped entries from verdict_report and verdict
-  JSONs that theta_verdict holdout scores.
+  JSONs that theta_verdict holdout scores;
+* the published bands are fitted at the published theta (2026-11-02: the family rule
+  used to swap theta under bands fitted at the merged one), ``--theta-source merged``
+  publishes the merged theta with its bands, and a HIGH band the signal can never reach
+  is refused.
 """
 from __future__ import annotations
 
@@ -24,30 +28,36 @@ import yaml
 from scripts import calibration_campaign as campaign
 from scripts import r3_grid, theta_verdict
 from tre_calibration.dataset import CalibrationWindow
+from tre_calibration.alt_signals import KV_PODS_COLUMN, KV_USAGE_SUM_COLUMN
 from tre_calibration.fit import (
     ThetaFitConfig,
     fit_delta_margins,
     fit_theta_by_balanced_accuracy,
     signal_z,
 )
+from tre_common.slo_labels import LabelDefinition
 
 MODEL = "dsqwen-7b"
 TRE_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _csv(path: Path, seed: int) -> Path:
-    """Load scan where the queue grows with load and latency violates above load ~1."""
+def _csv(path: Path, seed: int, queue_scale: float = 1.0, kv: bool = False) -> Path:
+    """Load scan where the queue grows with load and latency violates above load ~1.
+
+    ``queue_scale`` scales the queue (a family whose queue_len theta differs); ``kv`` adds
+    the KV columns: idle KV (headroom 1) up to load 0.95, headroom 0.3 above it."""
     rng = random.Random(seed)
     with path.open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=r3_grid.CSV_COLUMNS)
+        writer = csv.DictWriter(
+            fh, fieldnames=[*r3_grid.CSV_COLUMNS, *((KV_USAGE_SUM_COLUMN, KV_PODS_COLUMN) if kv else ())])
         writer.writeheader()
         for cell in range(16):
             load = 0.5 + 0.07 * cell
             shape = ("i2048_o96", "i256_o448")[cell % 2]
             start = 0
             for _k in range(14):
-                running = round(20.0 * load * rng.uniform(0.9, 1.1))
-                waiting = max(0.0, round(30.0 * (load - 0.95))) if load > 0.95 else 0.0
+                running = round(20.0 * queue_scale * load * rng.uniform(0.9, 1.1))
+                waiting = max(0.0, round(30.0 * queue_scale * (load - 0.95))) if load > 0.95 else 0.0
                 gen = 30_000.0 * min(load, 1.0) * rng.uniform(0.95, 1.05)
                 ratio = load * rng.uniform(0.85, 1.15)
                 writer.writerow({
@@ -59,6 +69,7 @@ def _csv(path: Path, seed: int) -> Path:
                     "queue_control": running, "p95_ttft_client_ms": 400.0 * ratio,
                     "p95_tpot_client_ms": 30.0, "p95_e2e_client_ms": 1.0, "trs": "",
                     "model_errors": 0, "proxy_transient_errors": 0, "client_timeouts": 0,
+                    **({KV_USAGE_SUM_COLUMN: 0.0 if load <= 0.95 else 0.7, KV_PODS_COLUMN: 1} if kv else {}),
                 })
                 start += 5_000
     return path
@@ -170,3 +181,61 @@ def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None
     verdict = json.loads((tmp_path / f"{MODEL}_verdict_decode_tps.json").read_text())
     assert verdict["published"]["theta_m"] == entry["theta"]
     assert "prefill_heavy" in verdict["families"]
+
+
+def _swapping_verdict(tmp_path: Path, *extra: str) -> tuple[dict, theta_verdict.SignalSpec, list]:
+    """queue_len verdict whose only family has 3x the queue: its theta falls outside the
+    merged CI, so the family rule moves the published theta off the merged one."""
+    fit = _csv(tmp_path / "fit.csv", 1)
+    fam = _csv(tmp_path / "fam.csv", 2, queue_scale=3.0)
+    out = tmp_path / "verdict_swap.json"
+    assert theta_verdict.main([
+        "verdict", "--model", MODEL, "--fitting-csv", str(fit), "--family", f"prefill_heavy={fam}",
+        "--signal", "queue_len", "--label-lambda-wait", "3", "--ttft-slo-mode", "fixed",
+        "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--n-resamples", "20", "--family-resamples", "10",
+        "--output", str(out), *extra,
+    ]) == 0
+    v = json.loads(out.read_text())
+    spec = theta_verdict.SignalSpec.from_dict(v["signal_spec"])
+    return v, spec, spec.load(fit, LabelDefinition.from_dict(v["label_def"]), v["trim_ramp_windows"])
+
+
+def _bands_at(spec: theta_verdict.SignalSpec, windows: list, theta: float) -> tuple[float, float]:
+    fit = fit_delta_margins(windows, theta=theta, direction=spec.direction, **spec.band_kwargs())
+    return fit.crit.delta, fit.high.delta
+
+
+def test_the_published_bands_are_fitted_at_the_published_theta(tmp_path: Path) -> None:
+    # regression 2026-11-02: tau = theta * (1 -/+ delta), so bands fitted at the merged theta
+    # under a family theta moved every absolute line (queue_len CRIT q > 119 became q > 11).
+    v, spec, windows = _swapping_verdict(tmp_path)
+    pub = v["published"]
+    assert v["family_verdict"]["publish"] == "min_family" and pub["source"] == "min_family"
+    assert pub["theta_m"] != v["merged"]["theta"]
+    assert (pub["delta_crit"], pub["delta_high"]) == _bands_at(spec, windows, pub["theta_m"])
+    assert pub["tau_crit"] == pytest.approx(1 - pub["delta_crit"])
+    assert pub["tau_high"] == pytest.approx(1 + pub["delta_high"])
+    # the bands at the merged theta stay in the report for reference
+    merged = (v["merged"]["delta_crit"]["delta"], v["merged"]["delta_high"]["delta"])
+    assert merged == _bands_at(spec, windows, v["merged"]["theta"])
+
+
+def test_theta_source_merged_publishes_the_merged_theta_with_its_bands(tmp_path: Path) -> None:
+    v, _spec, _windows = _swapping_verdict(tmp_path, "--theta-source", "merged")
+    pub, merged = v["published"], v["merged"]
+    assert v["family_verdict"]["publish"] == "min_family"  # the family rule still reported
+    assert (pub["theta_m"], pub["source"], pub["theta_source"]) == (merged["theta"], "merged", "merged")
+    assert (pub["delta_crit"], pub["delta_high"]) == (merged["delta_crit"]["delta"], merged["delta_high"]["delta"])
+
+
+def test_a_high_band_the_signal_cannot_reach_is_refused(tmp_path: Path) -> None:
+    # KV headroom <= 1: healthy windows sit at headroom 1, so theta = 1 and z <= 1 / theta = 1
+    # - no tau_high = 1 + delta_high can ever be exceeded.
+    fit = _csv(tmp_path / "kv.csv", 1, kv=True)
+    with pytest.raises(SystemExit, match="can never fire"):
+        theta_verdict.main([
+            "verdict", "--model", MODEL, "--fitting-csv", str(fit), "--signal", "kv_usage",
+            "--label-lambda-wait", "3", "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500",
+            "--tpot-p95-ms", "75", "--n-resamples", "20", "--family-resamples", "10",
+            "--output", str(tmp_path / "kv.json"),
+        ])
