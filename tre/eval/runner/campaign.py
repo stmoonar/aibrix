@@ -68,11 +68,13 @@ TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
 CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE",
-                       "TRE_SIGNAL_SOURCE", "TRE_DISABLE_ETA_GATE")
+                       "TRE_SIGNAL_SOURCE", "TRE_DISABLE_ETA_GATE", "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE")
 # 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
 # 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source);
 # TRE_DISABLE_ETA_GATE is a switch (default false; logged as disable_eta_gate).
+# 2026-11-02: TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE is a switch (default false): true = no receiverless HIGH shrink probe
+# (plan event safescale_probe_suppressed_hot). The startup line does not log it; the runner reads the pod env.
 # 2026-10-29 (design 20261029-tss-suffix rule 5): healthy_and_shrink = IDLE donors at once, a HIGH donor
 # relays to a receiver at once, a HEALTHY donor gives only to a CRITICAL receiver through a probe, the
 # receiverless HIGH shrink is a probe. Example arm def:

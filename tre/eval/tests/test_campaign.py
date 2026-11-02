@@ -559,6 +559,7 @@ def test_ablation_arm_passes_its_controller_switch_and_other_arms_pass_none(tmp_
      "contradicts"),
     ({"base": "tre", "controller_env": {"TRE_SIGNAL_SOURCE": "tss"}}, "must be one of"),
     ({"base": "tre", "controller_env": {"TRE_DISABLE_ETA_GATE": "off"}}, "true or false"),
+    ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "yes"}}, "true or false"),
 ])
 def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, bad, match):
     c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra={"arm_defs": {"x": bad}}))
@@ -583,6 +584,13 @@ def test_controller_env_keys_are_one_list_in_campaign_and_both_shell_scripts():
     except Exception:  # noqa: BLE001  controller deps not importable here
         pytest.skip("tre_controller not importable")
     assert set(CTL) == set(C.SIGNAL_SOURCES)
+
+
+def test_suppress_hot_proactive_switch_is_accepted_as_a_bool(tmp_path):
+    extra = {"arm_defs": {"x": {"base": "tre", "controller_env": {"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": True}}}}
+    c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra=extra))
+    plan = C.build_plan(c)
+    assert C.arm_def(c, plan[0].arm).controller_env == {"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "true"}
 
 
 def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):

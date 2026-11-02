@@ -41,7 +41,7 @@ mode_set() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; lo
 n_apa() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true; }
 bl_replicas() { kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0; }
 bl_owner() { kubectl -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
-CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE"   # = run_arm_pilot.sh note 14
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"   # = run_arm_pilot.sh note 14
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
 # settings off their default (unset = default): "K=v" lines
