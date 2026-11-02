@@ -285,13 +285,19 @@ class ControllerConfig:
                 "TRE_ABLATION_DISABLE_SLOW_LOOP is the remaining loop ablation (no rebalance section)"
             )
         # 2026-11-02 (user decision): eta and its gate were removed; every arm, alt-signal arms
-        # included, orders donors IDLE first, then Z descending. "true" asked for the removed
-        # name order, so it fails closed; "false" (old TSS-arm specs, a runner reset) is the
-        # only behaviour left and is ignored.
-        if str(values.get("TRE_DISABLE_ETA_GATE", "")).strip().lower() in _TRUE_VALUES:
+        # included, orders donors IDLE first, then Z descending. Parsed like any switch
+        # (_get_bool: an unknown value is an error). "true" asked for the removed name order,
+        # so it fails closed; "false" (old TSS-arm specs, a runner reset) is the only behaviour
+        # left: one warning, the value is ignored.
+        if _get_bool(values, "TRE_DISABLE_ETA_GATE", False):
             raise ValueError(
                 "TRE_DISABLE_ETA_GATE was removed (2026-11-02): donors are ordered IDLE first, then Z "
                 "descending on every arm, alt-signal arms included; remove it from the Deployment"
+            )
+        if "TRE_DISABLE_ETA_GATE" in values:
+            LOG.warning(
+                "TRE_DISABLE_ETA_GATE=%r is ignored (removed 2026-11-02): donors are ordered IDLE first, "
+                "then Z descending on every arm; remove it from the Deployment", values.get("TRE_DISABLE_ETA_GATE")
             )
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"

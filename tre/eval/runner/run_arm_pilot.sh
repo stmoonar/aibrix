@@ -144,6 +144,9 @@ PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for o
 # (2026-11-02) TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (default false): not in the controller startup line, so
 # record_ablation_switches checks it on the running controller pod's container env.
 CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"
+# (2026-11-02) keys removed from the controller (= campaign.py REMOVED_CONTROLLER_ENV_KEYS): ctl_env_set unsets them
+# when still on the Deployment (a stale "true" would crash-loop the controller, a stale "false" would linger)
+CTL_REMOVED_KEYS="TRE_DISABLE_ETA_GATE"
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_valid() {   # ctl_valid KEY VALUE
   case "$1" in
@@ -299,6 +302,7 @@ ctl_want() { local kv; for kv in $ARM_CONTROLLER_ENV; do [ "${kv%%=*}" = "$1" ] 
   # scope "off" alone implies the switch true (its alias): a live "false" left as is would disagree and crash-loop
   [ "$1" = TRE_ABLATION_DISABLE_SAFESCALE ] && [ "$(ctl_want TRE_SAFESCALE_SCOPE)" = off ] && { echo true; return 0; }
   ctl_default "$1"; }
+ctl_env_has() { [ -n "$(kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].name}")" ]; }
 ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the settings that differ; unset == default
   # (2026-11-02) CTL_ENV_ROLLED=1 when it rolled the controller out (the caller's restart, note 16a)
   local k cur want def args=()
@@ -316,6 +320,7 @@ ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the
     # a switch goes back to an explicit "false" (as before); the scope back to unset (= all)
     if [ "$want" = "$def" ] && [ "$def" != false ]; then args+=("$k-"); else args+=("$k=$want"); fi
   done
+  for k in $CTL_REMOVED_KEYS; do if ctl_env_has "$k"; then args+=("$k-"); fi; done
   [ ${#args[@]} = 0 ] && return 0
   kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "${args[@]}" >> "$D/runner.log" 2>&1 || return 1
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >> "$D/runner.log" 2>&1 || return 1
@@ -379,11 +384,18 @@ scope_logged = None if rec is None else rec.get("safescale_scope")
 ok = ok and (scope_logged == eff_scope if scope_logged is not None else eff_scope in ("all", "off") and want_scope == "all")
 want["safescale_scope"] = eff_scope
 # signal ablation (2026-10-28): a line without signal_source (controller image before it) matches only the default zm
-# (2026-11-02: disable_eta_gate is no longer checked - TRE_DISABLE_ETA_GATE removed)
 for key, wv, default in (("signal_source", want_sig, "zm"),):
     want[key] = wv
     got = None if rec is None else rec.get(key)
     ok = ok and (got == wv if got is not None else wv == default)
+# (2026-11-02) a line that still logs disable_eta_gate comes from a controller image built before the eta removal:
+# its donor order is the eta / waste tier (or the name order), not IDLE then Z -> mismatch whatever the values
+old_image = rec is not None and "disable_eta_gate" in rec
+problem = ("the controller startup line logs disable_eta_gate: image built before the eta removal (2026-11-02), "
+           "donor order is not IDLE then Z; deploy the current controller image") if old_image else None
+ok = ok and not old_image
+if problem:
+    print(f"ablation switches: {problem}", file=sys.stderr)
 # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (2026-11-02): never in the startup line -> the pod env decides
 # (source "pod_env"; unset = false; "?" = the read failed -> mismatch). A line that logs it is trusted ("startup_line").
 # Parsed like the controller's _get_bool (tre_controller/config.py _TRUE_VALUES / _FALSE_VALUES); any other value -> mismatch.
@@ -401,7 +413,8 @@ effective = None if rec is None else {"disable_safescale": rec.get("disable_safe
                                       "disable_slow_loop": rec.get("disable_slow_loop"),
                                       "safescale_scope": scope_logged if scope_logged is not None else "all (not logged)",
                                       "signal_source": rec.get("signal_source", "zm (not logged)")}
-json.dump({"logged": rec, "wanted": want, "effective": effective, "match": ok, "deployment_env": env_now.strip(),
+json.dump({"logged": rec, "wanted": want, "effective": effective, "match": ok, "problem": problem,
+           "deployment_env": env_now.strip(),
            "suppress_hot_proactive": {"source": sup_src, "value": sup_got, "pod_env_raw": pod_sup},
            "raw": line[:500] or None}, open(out, "w"), indent=1)
 print("match" if ok else ("missing" if rec is None else "mismatch"))

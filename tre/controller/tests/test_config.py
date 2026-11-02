@@ -158,18 +158,23 @@ def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
 
 
 @pytest.mark.parametrize("source", ["zm", "queue_len"])
-def test_the_removed_eta_gate_switch_fails_closed_on_true_and_is_ignored_on_false(tmp_path, source: str) -> None:
+def test_the_removed_eta_gate_switch_fails_closed_on_true_and_is_ignored_on_false(tmp_path, source: str, caplog) -> None:
     """2026-11-02: eta and TRE_DISABLE_ETA_GATE were removed. "true" asked for the removed name
-    order and refuses to start; "false" (old TSS-arm specs, a runner reset) starts. An alt
-    signal starts without the switch (above)."""
+    order and refuses to start; "false" (old TSS-arm specs, a runner reset) starts with one
+    warning; anything else is refused like any boolean switch. An alt signal starts without
+    the switch (above)."""
     env = {"TRE_SIGNAL_SOURCE": source}
     if source != "zm":
         env["TRE_REGISTRY_PATH"] = str(_registry_with_alt(tmp_path, source))
     for value in ("true", "1"):
         with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE was removed"):
             ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": value})
-    for value in ("false", ""):
-        assert ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": value}).signal_source == source
+    with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE must be a boolean value"):
+        ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "maybe"})
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "false"}).signal_source == source
+    assert [r for r in caplog.records if "TRE_DISABLE_ETA_GATE" in r.getMessage() and "ignored" in r.getMessage()]
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)

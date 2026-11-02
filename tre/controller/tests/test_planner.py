@@ -662,36 +662,55 @@ def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
     assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
 
 
-def test_the_higher_z_donor_gives_first_whatever_its_replica_count() -> None:
-    """2026-11-02 (eta removed): donors are taken IDLE first, then by Z descending on every
-    arm. The lower-Z HIGH donor with more replicas (the old eta = TSS / pods "waste" tier
-    put it first) is not picked before the higher-Z one."""
-    classifications = [
-        _classification("receiver", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _classification("many-warm", ModelState.HIGH, ModelRole.DONOR, 1.5),
-        _classification("few-hot", ModelState.HIGH, ModelRole.DONOR, 2.0),
-    ]
-    contexts = {
-        "receiver": {"assigned_replicas": 1, "routable_pods": 1},
-        "many-warm": {"assigned_replicas": 4, "routable_pods": 4},
-        "few-hot": {"assigned_replicas": 2, "routable_pods": 2},
-    }
+def test_the_higher_z_high_donor_gives_first_whatever_the_replica_counts() -> None:
+    """2026-11-02 (eta removed): on the real signal path (window -> TSS / Z -> classify ->
+    plan) donors go IDLE first, then by Z descending. Before, eta = TSS / routable pods put
+    the lower-Z donor with more pods first ("warm": TSS 1400 on 5 pods, eta 280 < 300, the
+    "waste" tier). The pick is the higher-Z donor and does not move when the pod counts move."""
+    from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+    from tre_common.registry import ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+    from section_ticks import run_rescue_tick
+    from test_band_dwell import _Queue
 
-    plan = build_plan(
-        model_contexts=contexts,
-        classifications=classifications,
-        model_replicas={"receiver": 1, "many-warm": 4, "few-hot": 2},
-        idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+    topology = ClusterTopology(
+        nodes=tuple(NodeSpec(name=n, gpus=4, two_gpu_slots=((0, 1), (2, 3))) for n in ("node-a", "node-b"))
     )
+    trs = TrsParams(w_p=0.02, w_d=1.0, lambda_wait=3.0, qmin=1.0, ema_alpha=0.0, theta_m=1000.0,
+                    tau_crit=0.8, tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=3)
+    slo = SloSpec(ttft_p95_ms=500.0, tpot_p95_ms=75.0, e2e_p95_ms=12000.0)
+    registry = Registry(topology, [
+        ModelSpec(name=m, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=8, vllm_image="image",
+                  slo=slo, trs=trs)
+        for m in ("receiver", "hot", "warm")
+    ])
+    slots = [Slot(node, (gpu,)) for node in ("node-a", "node-b") for gpu in range(4)]
+    # TSS = generation tokens / running (no waiting, no prompt tokens), Z = TSS / 1000.
+    load = {"receiver": 500.0, "hot": 2000.0, "warm": 1400.0}   # Z 0.5 CRITICAL, 2.0 / 1.4 HIGH
 
-    donor_shrinks = [
-        action
-        for action in expand_relays(plan.actions)
-        if isinstance(action, ScaleAction) and action.delta < 0
-    ]
-    assert donor_shrinks
-    assert donor_shrinks[0].model == "few-hot"
+    def first_donor(hot_pods: int, warm_pods: int) -> str:
+        owners = ["receiver"] + ["hot"] * hot_pods + ["warm"] * warm_pods
+        bindings = [Binding(f"{m}-{i}", m, slot, awake=True) for i, (m, slot) in enumerate(zip(owners, slots))]
+        bindings += [Binding(f"receiver-z{i}", "receiver", slot, awake=False) for i, slot in enumerate(slots[1:])]
+        snapshot = MetricsSnapshot(ts_ms=60_000, stale=False, models={
+            m: ModelWindowMetrics(
+                model=m, window_start_ms=40_000, window_end_ms=60_000, prompt_tokens=0.0,
+                generation_tokens=per_q, avg_waiting=0.0, avg_running=1.0, avg_swapping=0.0,
+                kv_cache_hit_rate=0.0, ttft_p95_ms=100.0, tpot_p95_ms=10.0, e2e_p95_ms=1000.0,
+                routable_pods=0, assigned_replicas=0, per_pod={},
+            )
+            for m, per_q in load.items()
+        })
+        result = run_rescue_tick(snapshot, queue=_Queue(), registry=registry,
+                                 cluster_view=ClusterView(topology=topology, bindings=tuple(bindings)),
+                                 suppress_hot_proactive_probe=True)
+        assert {m: result.classifications[m].state for m in load} == {
+            "receiver": ModelState.CRITICAL, "hot": ModelState.HIGH, "warm": ModelState.HIGH}
+        given = [a.model for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.delta < 0]
+        assert given, result.actions
+        return given[0]
+
+    assert first_donor(hot_pods=2, warm_pods=5) == "hot"
+    assert first_donor(hot_pods=5, warm_pods=2) == "hot"
 
 
 def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:

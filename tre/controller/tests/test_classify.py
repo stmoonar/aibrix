@@ -15,7 +15,6 @@ from tre_controller.planning.classify import (
     TauThresholds,
     classify_all_models,
     classify_model,
-    donor_sort_key,
 )
 
 
@@ -145,23 +144,3 @@ def test_zero_load_still_uses_idle_reclamation_tier() -> None:
     classification = classify_all_models(contexts, signal_idle_rps_eps=0.05)[0]
     assert classification.state.value == "idle"
     assert classification.role.value == "donor"
-
-
-def test_donor_order_is_idle_first_then_z_descending_and_ignores_replica_count() -> None:
-    """2026-11-02 (user decision, eta removed): one donor order on every arm - IDLE first,
-    then Z descending (no Z last), ties by natural model name. The replica count plays no
-    part: a lower-Z HIGH donor with more replicas (the old eta = TSS / pods "waste" tier)
-    does not go before a higher-Z one."""
-    contexts = {
-        "few-hot": {"Y_m": 1.0, "Q": 1.0, "z_m": 2.0, "trs": 2000.0, "theta_m": 1000.0, "routable_pods": 1},
-        "many-warm": {"Y_m": 1.0, "Q": 1.0, "z_m": 1.4, "trs": 980.0, "theta_m": 700.0, "routable_pods": 4},
-        "model-10": {"Y_m": 1.0, "Q": 1.0, "z_m": 1.6, "trs": 1600.0, "theta_m": 1000.0, "routable_pods": 2},
-        "model-2": {"Y_m": 1.0, "Q": 1.0, "z_m": 1.6, "trs": 1600.0, "theta_m": 1000.0, "routable_pods": 3},
-        "idle": {"Y_m": 0.0, "Q": 0.0, "z_m": None, "trs": 0.0, "theta_m": 1000.0, "routable_pods": 4},
-    }
-    donors = [item for item in classify_all_models(contexts) if item.role.value == "donor"]
-
-    ordered = [item.model_name for item in sorted(donors, key=donor_sort_key)]
-
-    assert ordered == ["idle", "few-hot", "model-2", "model-10", "many-warm"]
-

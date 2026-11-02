@@ -692,6 +692,9 @@ def test_controller_env_keys_are_one_list_in_campaign_and_both_shell_scripts():
         txt = (RUNNER / f).read_text()
         keys = re.search(r'(?m)^CTL_ENV_KEYS="([^"]+)"', txt).group(1).split()
         assert tuple(keys) == C.CONTROLLER_ENV_KEYS, f
+        # 2026-11-02: the removed keys are unset from the Deployment by both scripts
+        removed = re.search(r'(?m)^CTL_REMOVED_KEYS="([^"]+)"', txt).group(1).split()
+        assert tuple(removed) == C.REMOVED_CONTROLLER_ENV_KEYS, f
         assert "TRE_SIGNAL_SOURCE) echo zm ;;" in txt and "TRE_SAFESCALE_SCOPE) echo all ;;" in txt, f
     sh = re.search(r"TRE_SIGNAL_SOURCE\) case \"\$2\" in ([a-z0-9_|]+)\)", (RUNNER / "run_arm_pilot.sh").read_text())
     assert set(sh.group(1).split("|")) == set(C.SIGNAL_SOURCES)
