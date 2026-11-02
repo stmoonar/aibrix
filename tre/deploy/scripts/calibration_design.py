@@ -750,6 +750,11 @@ class DesignCell:
     #: load, whatever ``rho`` / ``profile`` say; the acceptance set's steps / bursts / ramp
     #: cells use it.
     rho_profile: Optional[list] = None
+    #: The cell's own model-error void limit when it is not the run's
+    #: ``--max-model-error-rate``: an overload cell's route-timeout cuts count as model
+    #: errors (``scripts.stream_cut``), which is why the 7b P1 re-run, M2 and T14 ran at its
+    #: 0.10. None = the run's.
+    max_model_error_rate: Optional[float] = None
 
     @property
     def primitive(self) -> str:
@@ -789,7 +794,8 @@ class CellFactory:
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
         if (shape not in gen.ALL_SHAPES and shape not in gen.ACCEPTANCE_SHAPES
-                and shape not in gen.T14_SHAPES):
+                and shape not in gen.T14_SHAPES and shape not in gen.SUPPLEMENT_GRID_SHAPES
+                and shape not in gen.VALIDATION_SHAPES):
             raise ValueError(f"unknown shape {shape!r}")
         if role == ROLE_BOUNDARY:
             if fields.get("stage") not in (STAGE_COARSE, STAGE_BISECT):

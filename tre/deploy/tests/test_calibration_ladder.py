@@ -754,8 +754,9 @@ def test_design_cells_are_driven_with_their_own_seed_key_prompts_and_valve(tmp_p
     factory = design.CellFactory(MODEL, 5)
     probe = factory.new("S2", design.ROLE_BOUNDARY, 150.0, rho=1.2, stage="bisect")
     rung = factory.new("S2", design.ROLE_LADDER, 150.0, rho_factor=1.0)
+    overload = factory.new("S2", design.ROLE_LADDER, 150.0, rho_factor=1.3, max_model_error_rate=0.1)
     args = _args(tmp_path)
-    for cell in (probe, rung):
+    for cell in (probe, rung, overload):
         grid = campaign.Cell(MODEL, cell.shape, cell.primitive, cell.cell_id, "s.json", 150.0, 0.0)
         command = ladder.design_cell_command(grid, cell, args, Path("s.json"),
                                              Path("o.csv"), Path("/p") / cell.stem(1))
@@ -765,6 +766,9 @@ def test_design_cells_are_driven_with_their_own_seed_key_prompts_and_valve(tmp_p
         assert command[command.index("--cell-id") + 1] == cell.cell_id
         assert command[command.index("--shed-policy") + 1] == openloop.SHED_POLICY_VOID
         assert ("--max-backlog" in command) == (cell.role == design.ROLE_BOUNDARY)
+        # a cell's own void limit (an overload cell's route-timeout cuts) replaces the run's
+        assert command[command.index("--max-model-error-rate") + 1] == str(
+            cell.max_model_error_rate or args.max_model_error_rate)
     parsed = r3_grid.parse_args(["--model", MODEL, "--gateway-url", "http://g/v1/chat/completions", "--output", "o.csv",
                                  "--schedule", "s.json", "--prompt-key", "k",
                                  "--max-backlog", "7"])

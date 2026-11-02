@@ -2055,8 +2055,9 @@ PREFLIGHT_MID_TOKENS = 512
 
 def all_calibration_shapes() -> tuple[str, ...]:
     """Every shape a calibration entry point can drive (training, M, acceptance, T14,
-    static grid): the default span of the preflight lengths."""
-    return (*gen.ALL_SHAPES, *gen.ACCEPTANCE_SHAPES, *gen.T14_SHAPES, *gen.STATIC_GRID_SHAPES)
+    static grid, the 2026-11-03 supplement's): the default span of the preflight lengths."""
+    return (*gen.ALL_SHAPES, *gen.ACCEPTANCE_SHAPES, *gen.T14_SHAPES, *gen.STATIC_GRID_SHAPES,
+            *gen.SUPPLEMENT_GRID_SHAPES, *gen.VALIDATION_SHAPES)
 
 
 def preflight_input_lengths(shapes: Optional[Sequence[str]] = None) -> list[int]:
@@ -2638,6 +2639,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "whatever this is set to. The guard verdict is recorded per "
                          "cell either way")
     ap.add_argument("--stop-on-failure", action="store_true")
+    ap.add_argument("--stop-file", type=Path, action="append", default=[],
+                    help="ladder-design runs (scripts.calibration_ladder): checked before every "
+                         "scheduled cell; when one of these files exists the run ends 'stopped' "
+                         "(exit 4) before that cell - the cells before it are complete and in "
+                         "the dataset. Repeatable")
+    ap.add_argument("--cell-log", type=Path, default=None,
+                    help="ladder-design runs: also append one JSON line per driven attempt "
+                         "(identity, load, verdict, void reasons) to this file - a chain's "
+                         "progress record; cells.jsonl stays the record")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--redis-url", default=None)
     ap.add_argument("--reissue-check", default=capture.DEFAULT_REISSUE_POLICY, choices=list(capture.REISSUE_POLICIES),
@@ -2703,11 +2713,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "constant-load training cells on the D6' boundaries of one model "
                          "(--models MODEL), placed from --base-run and --boundary-supplement-run")
     ap.add_argument("--training-plan", default=None,
-                    choices=["legacy-20260923", "p1-deep-overload"],
+                    choices=["legacy-20260923", "p1-deep-overload", "supp-a-20261103",
+                             "supp-b-20261103", "supp-e-20261103"],
                     help="--training-supplement: the cell plan (scripts.calibration_training_"
                          "supplement.TRAINING_PLANS). legacy-20260923 (default): the 2026-09-23 "
                          "③a/③b/③d cells (needs --boundary-supplement-run). p1-deep-overload: "
-                         "S2/S3/T8/S4/S5 x {1.5, 2.0, 3.0} x rho*_run2, 150 s holds")
+                         "S2/S3/T8/S4/S5 x {1.5, 2.0, 3.0} x rho*_run2, 150 s holds. "
+                         "supp-{a,b,e}-20261103: the 2026-11-03 supplement's blocks - A low load "
+                         "x rho*_run2, B new shapes and E the sealed validation mixtures x the "
+                         "capacity prior C^ (E needs --sealed-plan for a real run)")
+    ap.add_argument("--sealed-plan", type=Path, default=None,
+                    help="--training-supplement, a sealed plan (supp-e-20261103): the plan.json "
+                         "of its dry run, sealed before the collection with a <file>.sha256 "
+                         "sidecar; the run refuses unless its cells are exactly the sealed ones")
     ap.add_argument("--acceptance-set", action="store_true",
                     help="step ④ of plan §6.11 (scripts.calibration_acceptance): the acceptance "
                          "set M of one model - D6' probes of its new shapes, its ten cells, then "
@@ -2861,8 +2879,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                  "--boundary-supplement-run / --boundary-table / --retained-dataset belong to "
                  "--training-supplement / --acceptance-set (and to calibration_t14 "
                  "capacity-prior)")
-    if args.training_plan and not args.training_supplement:
-        ap.error("--training-plan belongs to --training-supplement")
+    if (args.training_plan or args.sealed_plan) and not args.training_supplement:
+        ap.error("--training-plan / --sealed-plan belong to --training-supplement")
     if args.forbidden_root and not args.t14_set:
         ap.error("--forbidden-root belongs to --t14-set")
     if not args.t14_set and (args.capacity_prior_file or args.refit_params_file

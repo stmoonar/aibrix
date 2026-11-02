@@ -217,7 +217,7 @@ ACCEPTANCE_SHAPES: dict[str, tuple[tuple[float, "int | TokenRange", "int | Token
 def is_held_out(shape_name: str) -> bool:
     """True for shapes that exist to validate a fit and must never enter one."""
     return (shape_name == MIXTURE_NAME or shape_name in ACCEPTANCE_SHAPES
-            or shape_name in T14_SHAPES)
+            or shape_name in T14_SHAPES or shape_name in VALIDATION_SHAPES)
 
 
 def is_mixture(shape_name: str) -> bool:
@@ -291,6 +291,37 @@ assert all(static_grid_shape_name(i, o) == name
 _T14_COLLISIONS = set(T14_SHAPES) & (set(ACCEPTANCE_SHAPES) | set(STATIC_GRID_SHAPES) | set(SHAPES)
                                      | set(SAMPLED_SHAPES) | {MIXTURE_NAME})
 assert not _T14_COLLISIONS, f"T14 shape names collide with existing shapes: {_T14_COLLISIONS}"
+
+#: The 2026-11-03 supplement (local workspace ``docs/calib-supplement-design-20261103.md``,
+#: driven by ``scripts.calibration_training_supplement`` plans ``supp-*-20261103``).
+#:
+#: Block B: four new fixed-length TRAINING shapes, a 2 x 2 of input {384, 1024} x output
+#: {64, 640} at the corners of what the seven shapes leave empty (their outputs span
+#: 96-448, the experiments' traces 67-700). Static-grid naming; never held out, in no
+#: family, and not in :data:`TRAINING_SHAPES` (the committed schedule set and the default
+#: campaign do not change) - like the static grid's, their cells train by their split.
+SUPPLEMENT_GRID_INPUTS: tuple[int, ...] = (384, 1024)
+SUPPLEMENT_GRID_OUTPUTS: tuple[int, ...] = (64, 640)
+SUPPLEMENT_GRID_SHAPES: dict[str, tuple[int, int]] = {
+    static_grid_shape_name(i, o): (i, o)
+    for i in SUPPLEMENT_GRID_INPUTS
+    for o in SUPPLEMENT_GRID_OUTPUTS
+}
+
+#: Block E: the supplement's sealed validation set - two mixtures of (request share, input,
+#: output) streams, a short-output and a long-output one, under names no earlier set used.
+#: Held out (:func:`is_held_out`) like ``M``, :data:`ACCEPTANCE_SHAPES` and T14, and like
+#: them in neither :data:`TRAINING_SHAPES` nor :data:`ALL_SHAPES`.
+VALIDATION_SHAPES: dict[str, tuple[tuple[float, int, int], ...]] = {
+    "ES": ((0.5, 320, 64), (0.3, 640, 96), (0.2, 960, 192)),
+    "EL": ((0.5, 512, 400), (0.3, 768, 640), (0.2, 1024, 800)),
+}
+_SUPPLEMENT_COLLISIONS = (set(SUPPLEMENT_GRID_SHAPES) | set(VALIDATION_SHAPES)) & (
+    set(T14_SHAPES) | set(ACCEPTANCE_SHAPES) | set(STATIC_GRID_SHAPES) | set(SHAPES)
+    | set(SAMPLED_SHAPES) | {MIXTURE_NAME})
+assert not _SUPPLEMENT_COLLISIONS, (
+    f"2026-11-03 supplement shape names collide with existing shapes: {_SUPPLEMENT_COLLISIONS}")
+assert not set(SUPPLEMENT_GRID_SHAPES) & set(VALIDATION_SHAPES)
 
 #: Family of a static-grid shape, from its prompt/output ratio i/o. The thresholds are
 #: the ones the committed families already satisfy (prefill_heavy S3 21.3, T8 14.3;
@@ -493,6 +524,11 @@ def shape_components(
         return ACCEPTANCE_SHAPES[shape_name]
     if shape_name in T14_SHAPES:
         return T14_SHAPES[shape_name]
+    if shape_name in VALIDATION_SHAPES:
+        return VALIDATION_SHAPES[shape_name]
+    if shape_name in SUPPLEMENT_GRID_SHAPES:
+        i, o = SUPPLEMENT_GRID_SHAPES[shape_name]
+        return ((1.0, i, o),)
     if shape_name in SAMPLED_SHAPES:
         i, o = SAMPLED_SHAPES[shape_name]
         return ((1.0, i, o),)

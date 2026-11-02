@@ -6,13 +6,17 @@
 #
 #   run_stage3.sh <model> [--dry-run] [-- <extra campaign args>]
 #
+# The 2026-11-03 supplement's plans supp-a/b/e-20261103 run from run_chain_supp.sh.
+#
 # Exit codes: 0 = every cell driven and the plan's checks passed; 3 = finished but a check
-# failed (design_result.json says which); 1 = stopped. Then refit offline and freeze.
+# failed (design_result.json says which); 4 = a --stop-file ended it before a cell; 1 =
+# stopped. Then refit offline and freeze.
 #
 # Environment:
 #   OUT_ROOT, TRE_CALIBRATION_GATEWAY_URL, TRE_EXCLUSIVE_WINDOW_FILE   as run_primitives.sh
 #   BASE_RUN        round 2's root (read only)
-#   TRAINING_PLAN   p1-deep-overload | legacy-20260923
+#   TRAINING_PLAN   p1-deep-overload | legacy-20260923 | supp-a-20261103 | supp-b-20261103 |
+#                   supp-e-20261103
 #   SUPP_RUN        the boundary supplement's root: required by legacy-20260923, optional
 #                   for p1 (when given, its load path is checked and recorded)
 #   DESIGN_SEED     (optional)
