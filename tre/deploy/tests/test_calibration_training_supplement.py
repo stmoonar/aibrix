@@ -442,6 +442,10 @@ def test_the_supplement_is_66_cells_per_model_and_only_e_is_held_out(tmp_path, m
         factory = design.CellFactory(model, SUPP_SEED, serial_base=tplan.serial_base)
         seq, sentinels = ts.build_cells(model, factory, resolved, SUPP_SEED, tplan)
         assert len(seq) == n and sentinels == []
+        # the overload cells run last: B's 1.15 / 1.3 x, E's 1.2 x (A has none)
+        late = [c.rho_factor >= ts.SUPP_OVERLOAD_FACTOR for c in seq]
+        assert late == sorted(late) and sum(late) == {ts.PLAN_SUPP_A: 0, ts.PLAN_SUPP_B: 8,
+                                                      ts.PLAN_SUPP_E: 2}[name]
         assert sorted((c.shape, c.rho_factor) for c in seq) == sorted(
             (s, f) for s in shapes for f in factors)
         held_out = name == ts.PLAN_SUPP_E

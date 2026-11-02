@@ -17,8 +17,9 @@
 #      $CALIB_ROOT/<block>/<model> with --stop-file $CALIB_ROOT/STOP --stop-file
 #      $CALIB_ROOT/STOP.<model> --cell-log $CHAIN_LOG_DIR/cells.<model>.jsonl (one line per
 #      driven attempt) --instant-sample-ms $CHAIN_INSTANT_SAMPLE_MS (E: --sealed-plan too).
-#      Exit 0 -> the next block; 4 -> a STOP file ended it; anything else stops this model's
-#      chain (the others go on).
+#      Exit 0 -> the next block; 4 -> a STOP file ended it and this model's chain; anything
+#      else (e.g. a cell void twice ends the run) -> block_failed, the next block goes on and
+#      the chain exits 1. A changed pod (step 3) stops this model's chain (the others go on).
 #   4. wait for every model's chain.
 #
 # Stop gracefully: touch $CALIB_ROOT/STOP (every model) or $CALIB_ROOT/STOP.<model>. The cell
@@ -173,12 +174,13 @@ seal_e() {  # seal_e <model>
   status "$m" E_seal sealed 0 "$plan sha256 $(cut -d' ' -f1 "$plan.sha256")"
 }
 
-chain_model() {  # chain_model <model>: the blocks in turn; returns 0, 4 (STOP) or the failure
-  local m="$1" b now log rc extra
+chain_model() {  # chain_model <model>: the blocks in turn; returns 0, 4 (STOP, none failed) or 1
+  local m="$1" b now log rc extra failed=""
   status "$m" chain start null "blocks=$CHAIN_BLOCKS base_run=$(base_run "$m") pod=${POD0[$m]}"
   for b in $CHAIN_BLOCKS; do
     if [[ -e "$CALIB_ROOT/STOP" || -e "$CALIB_ROOT/STOP.$m" ]]; then
       status "$m" "$b" stopped 4 "a STOP file exists: block $b and the rest are not driven"
+      [[ -z "$failed" ]] || return 1
       return 4
     fi
     now="$(routable "$m")" || now="(kubectl get failed)"
@@ -198,10 +200,17 @@ chain_model() {  # chain_model <model>: the blocks in turn; returns 0, 4 (STOP) 
     status "$m" "$b" end "$rc" "log=$log"
     case "$rc" in
       0) ;;
-      4) status "$m" "$b" stopped 4 "a STOP file ended block $b before its next cell"; return 4 ;;
-      *) status "$m" "$b" chain_stopped "$rc" "block $b exited $rc (see $log)"; return "$rc" ;;
+      4) status "$m" "$b" stopped 4 "a STOP file ended block $b before its next cell"
+         [[ -z "$failed" ]] || return 1
+         return 4 ;;
+      *) status "$m" "$b" block_failed "$rc" "block $b exited $rc (see $log); the next block goes on"
+         failed="${failed:+$failed }$b" ;;
     esac
   done
+  if [[ -n "$failed" ]]; then
+    status "$m" chain done 1 "block(s) $failed failed (block_failed lines); the other blocks ran"
+    return 1
+  fi
   status "$m" chain done 0 "every block exited 0"
 }
 

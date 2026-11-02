@@ -1092,15 +1092,17 @@ def _check_once(redis_client: Any, model: str, cfg: ClockDomainConfig,
     c_now = redis_time_ms(redis_client)
     c_lag = None if c_stamp is None or c_now is None else c_now - c_stamp
     lo_c, hi_c = cfg.controller_lag_bounds
-    # phase-aligned: window ends are gateway rounds, one round apart (free_running stamps
-    # its own clock: off the grid when sliding, one window apart when tumbling)
-    on_grid = (len(ends) == 2 and ends[0] % cfg.period_ms == 0 and ends[0] - ends[1] == cfg.period_ms)
+    # phase-aligned: window ends are gateway rounds, one decision apart: at most one
+    # controller tick (the single loop since 2026-10-29: 5 s on the 1 s grid). free_running
+    # stamps its own clock: off the grid when sliding, one window (> a tick) apart when tumbling
+    on_grid = (len(ends) == 2 and ends[0] % cfg.period_ms == 0 and ends[1] % cfg.period_ms == 0
+               and ends[0] - ends[1] <= cfg.controller_tick_ms)
     c_ok = c_lag is not None and on_grid and lo_c <= c_lag <= hi_c
     if c_lag is None:
         reasons.append("controller: no decision history for the model or no redis TIME")
     elif not on_grid:
-        reasons.append(f"controller: newest window ends {ends} are not consecutive {cfg.period_ms} ms gateway "
-                       "rounds (not phase-aligned: it stamps its own clock)")
+        reasons.append(f"controller: newest window ends {ends} are not {cfg.period_ms} ms gateway rounds at most "
+                       f"one tick ({cfg.controller_tick_ms} ms) apart (not phase-aligned: it stamps its own clock)")
     elif not c_ok:
         reasons.append(f"controller: newest window_end_ms is {c_lag} ms behind redis TIME, outside "
                        f"[{lo_c}, {hi_c}]")

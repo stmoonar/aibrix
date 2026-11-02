@@ -702,6 +702,35 @@ def test_a_free_running_controller_is_not(ends) -> None:
     assert not v["controller"]["ok"] and "gateway rounds" in v["reasons"][0]
 
 
+class Cluster1s(Cluster):
+    """The gateway since 2026-10-29 (instant 0.5 s / evidence 1 s); the decision history
+    is written by the test."""
+
+    P = 1_000
+
+    def __init__(self, **kw) -> None:
+        super().__init__(gw_phase=100, controller=False, **kw)
+        self.r.hashes[GATEWAY_CADENCE_KEY] = {"instant_ms": 500, "evidence_ms": 1_000}
+
+
+@pytest.mark.parametrize("ends, ok", [
+    ((RS - 8_000, RS - 3_000), True),     # the single loop: one window per 5 s, on the 1 s grid
+    ((RS - 7_300, RS - 2_300), False),    # off the grid: free_running, sliding
+    ((RS - 23_000, RS - 3_000), False),   # one 20 s window apart: free_running, tumbling
+])
+def test_the_single_decision_loop_on_a_1s_gateway(ends, ok) -> None:
+    c = Cluster1s()
+    c.advance(RS)
+    for b in ends:
+        c.r.zadd(decision_hist_key("m7"), {_tick(b): b})
+    cfg = cc.ClockDomainConfig(window_ms=30_000, period_ms=cc.gateway_round_ms(c.r))
+    assert cfg.period_ms == 1_000 and cfg.controller_lag_bounds == (-2_000, 13_500)
+    v = cc.check_clock_domains(c.r, "m7", cfg, sleep=c.sleep)
+    assert v["gateway"]["ok"] and v["controller"]["ok"] is ok and v["ok"] is ok, v
+    assert v["attempts"] == (1 if ok else cfg.attempts)
+    assert ok or "gateway rounds" in v["reasons"][0]
+
+
 def test_a_gateway_ticker_later_than_the_controller_retries_is_refused() -> None:
     # documented limit: past ~9.5 s the phase-aligned controller never sees its windows fresh
     c = Cluster(gw_phase=9_900)
