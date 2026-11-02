@@ -173,7 +173,7 @@ def test_a_donor_without_sm_floor_headroom_is_not_planned() -> None:
     """The planner bounds a donor by the SM ``floor_headroom`` (its floor check's count)."""
     plan = build_plan(
         model_contexts={"warm": {"assigned_replicas": 2, "routable_pods": 2, "floor": 2, "floor_headroom": 0}},
-        classifications=[_cls("warm", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")],
+        classifications=[_cls("warm", ModelState.IDLE, ModelRole.DONOR, 10.0)],
         model_replicas={"warm": 2},
         idle_gpus=0,
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
@@ -256,17 +256,15 @@ def test_probe_record_keeps_w_max_and_clamped() -> None:
 
 
 # ------------------------------------------- fix C relaxed: floor via deltas only
-def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None):
+def _cls(model: str, state: ModelState, role: ModelRole, z: float | None):
     return ModelClassification(
         model_name=model,
         state=state,
         role=role,
         Z_m=z,
-        eta_m=None,
         trs=0.0,
         theta_m=1.0,
         tau=TauThresholds.from_control(),
-        donor_tier=tier,
     )
 
 
@@ -310,7 +308,7 @@ def _two_receiver_plan(high_replicas: int):
         classifications=[
             _cls("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
             _cls("crit1", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-            _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+            _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
         ],
         model_replicas={"tp2": 0, "crit1": 2, "high": high_replicas},
         idle_gpus=0,
@@ -369,7 +367,7 @@ def test_one_block_per_high_donor_model_per_plan() -> None:
         classifications=[
             _cls("tpa", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
             _cls("tpb", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-            _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+            _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
         ],
         model_replicas={"tpa": 0, "tpb": 0, "high": 3},
         idle_gpus=0,

@@ -8,17 +8,15 @@ from tre_sm.allocator.slots import Binding, Migration, Slot
 from relay_view import expand_relays, relays, pool_view# noqa: F401 - 2026-10-02 relay intents
 
 
-def _classification(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None) -> ModelClassification:
+def _classification(model: str, state: ModelState, role: ModelRole, z: float | None) -> ModelClassification:
     return ModelClassification(
         model_name=model,
         state=state,
         role=role,
         Z_m=z,
-        eta_m=None,
         trs=0.0,
         theta_m=1.0,
         tau=TauThresholds.from_control(),
-        donor_tier=tier,
     )
 
 
@@ -48,8 +46,8 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     """
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
-        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6),
     ]
     contexts = {
         "critical": {"assigned_replicas": 2, "routable_pods": 2},
@@ -163,8 +161,8 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
-        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6),
     ]
     contexts = {
         "critical": {"assigned_replicas": 2, "routable_pods": 2},
@@ -213,7 +211,7 @@ def test_build_plan_low_fairness_receiver_needs_no_saturation() -> None:
     # would diverge -- that divergence is the whole point of ADR-0014.)
     classifications = [
         _classification("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6),
     ]
     contexts = {
         "low": {"assigned_replicas": 2, "routable_pods": 2},  # NOTE: no is_saturated
@@ -287,7 +285,7 @@ def test_build_plan_can_keep_legacy_drop_all_for_incomplete_paper_state() -> Non
 
 
 def test_idle_proactive_honors_per_model_min_replicas() -> None:
-    classifications = [_classification("warm", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
+    classifications = [_classification("warm", ModelState.IDLE, ModelRole.DONOR, 10.0)]
     contexts = {"warm": {"assigned_replicas": 4, "routable_pods": 1}}
 
     plan = build_plan(
@@ -307,7 +305,7 @@ def test_idle_proactive_honors_per_model_min_replicas() -> None:
 
 
 def test_idle_proactive_keeps_one_routable_endpoint_for_bound_zero_min_model() -> None:
-    classifications = [_classification("warm", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
+    classifications = [_classification("warm", ModelState.IDLE, ModelRole.DONOR, 10.0)]
     contexts = {"warm": {"assigned_replicas": 2, "routable_pods": 1}}
 
     plan = build_plan(
@@ -478,7 +476,7 @@ def test_tp_aware_critical_receiver_records_capacity_blocked_when_no_slot_or_def
 def test_tp_aware_critical_receiver_takes_a_high_block_before_a_healthy_one_or_defrag() -> None:
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
         _classification("other", ModelState.HEALTHY, ModelRole.NEUTRAL, 1.1),
     ]
     contexts = {
@@ -535,7 +533,7 @@ def test_tp_aware_critical_receiver_takes_a_high_block_before_a_healthy_one_or_d
 
 def test_high_proactive_probe_suppressed_for_hot_model_when_guard_enabled() -> None:
     # A lone HIGH (hot, z_m far above tau_high) model with no receiver needing capacity.
-    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6)]
     contexts = {"hot": {"assigned_replicas": 4, "routable_pods": 4}}
 
     plan = build_plan(
@@ -555,7 +553,7 @@ def test_high_proactive_probe_suppressed_for_hot_model_when_guard_enabled() -> N
 
 def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
     # Default path (A2 = v1 paper_high_proactive_shrink): the proactive release fires.
-    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6)]
     contexts = {"hot": {"assigned_replicas": 4, "routable_pods": 4}}
 
     plan = build_plan(
@@ -580,7 +578,7 @@ def test_critical_preemption_of_hot_donor_survives_guard() -> None:
     # ON this MUST still fire, tagged with an explicit preemption reason.
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
         _classification("other", ModelState.HEALTHY, ModelRole.NEUTRAL, 1.1),
     ]
     contexts = {
@@ -646,7 +644,7 @@ def test_middle_zone_safescale_donor_not_suppressed_by_hot_guard() -> None:
 def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
     # Genuine idle over-provisioning is reclaimed by idle_proactive_immediate (no SafeScale
     # probe). The hot guard (when ON) must not touch it.
-    classifications = [_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
+    classifications = [_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0)]
     contexts = {"idle": {"assigned_replicas": 4, "routable_pods": 4, "Y_m": 0.0, "Q": 0.0}}
 
     plan = build_plan(
@@ -664,28 +662,27 @@ def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
     assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
 
 
-def test_disable_eta_gate_uses_signal_independent_natural_donor_order() -> None:
+def test_the_higher_z_donor_gives_first_whatever_its_replica_count() -> None:
+    """2026-11-02 (eta removed): donors are taken IDLE first, then by Z descending on every
+    arm. The lower-Z HIGH donor with more replicas (the old eta = TSS / pods "waste" tier
+    put it first) is not picked before the higher-Z one."""
     classifications = [
         _classification("receiver", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _classification("model-10", ModelState.HIGH, ModelRole.DONOR, 2.0, "surplus"),
-        _classification("model-2", ModelState.HIGH, ModelRole.DONOR, 1.5, "surplus"),
+        _classification("many-warm", ModelState.HIGH, ModelRole.DONOR, 1.5),
+        _classification("few-hot", ModelState.HIGH, ModelRole.DONOR, 2.0),
     ]
     contexts = {
         "receiver": {"assigned_replicas": 1, "routable_pods": 1},
-        "model-10": {"assigned_replicas": 2, "routable_pods": 2},
-        "model-2": {"assigned_replicas": 2, "routable_pods": 2},
+        "many-warm": {"assigned_replicas": 4, "routable_pods": 4},
+        "few-hot": {"assigned_replicas": 2, "routable_pods": 2},
     }
 
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
-        model_replicas={"receiver": 1, "model-10": 2, "model-2": 2},
+        model_replicas={"receiver": 1, "many-warm": 4, "few-hot": 2},
         idle_gpus=0,
-        cfg=PlanConfig(
-            min_replicas_per_model=1,
-            max_replicas_per_model=4,
-            disable_eta_gate=True,
-        ),
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
     )
 
     donor_shrinks = [
@@ -694,7 +691,7 @@ def test_disable_eta_gate_uses_signal_independent_natural_donor_order() -> None:
         if isinstance(action, ScaleAction) and action.delta < 0
     ]
     assert donor_shrinks
-    assert donor_shrinks[0].model == "model-2"
+    assert donor_shrinks[0].model == "few-hot"
 
 
 def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
@@ -702,8 +699,8 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
     # the backoff expires; demand-driven releases (v1 has no cooldown for them) are not held.
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
-        _classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0),
+        _classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6),
     ]
     contexts = {
         "critical": {"assigned_replicas": 2, "routable_pods": 2},
@@ -780,7 +777,7 @@ def test_receiver_cap_counts_hidden_probe_pods_like_v1_assigned() -> None:
 def test_rollback_backoff_event_only_for_models_that_would_be_probed() -> None:
     # Review P3: a HIGH model at its serving floor is never probed, so it must not log a
     # backoff event every tick while its backoff runs.
-    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6)]
     cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
 
     def events(pods: int):

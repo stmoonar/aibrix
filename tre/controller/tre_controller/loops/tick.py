@@ -154,7 +154,6 @@ def run_planner_tick(
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
     suppress_hot_proactive_probe: bool = False,
-    disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
     observe_mode: bool = False,
@@ -258,7 +257,6 @@ def run_planner_tick(
         max_replicas_by_model={spec.name: spec.scale_max_replicas for spec in registry.models()},
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
-        disable_eta_gate=disable_eta_gate,
         release_without_safescale=safescale is None or safescale_scope == SAFESCALE_SCOPE_RECEIVERLESS_SHRINK,
         relay_high_donors=safescale_scope == SAFESCALE_SCOPE_HEALTHY_AND_SHRINK,
         defrag_enabled=_defrag_enabled(registry),
@@ -1039,7 +1037,7 @@ def compute_model_signal(
     if window.settling is not None:
         # Settling: the raw values for the record, no EMA step, Z unknown (never 0).
         result = TRSComputer(ema_tau_ms=0.0).compute(inp, theta_m=spec.trs.theta_m)
-        result = replace(result, TRS=0.0, Z_m=None, eta_m=None)
+        result = replace(result, TRS=0.0, Z_m=None)
         signal = SignalValue(source=signal_source, raw_value=None, z_m=None, unavailable_reason="settling")
         return ModelSignal(result=result, signal=signal, metrics=used, settling=window.settling)
     if signal_state is not None:
@@ -1132,7 +1130,6 @@ def _model_contexts(
                 "signal_theta": _signal_theta(spec, signal.source),
                 "trs_z_m": result.Z_m,
                 "tss_defined": result.defined,
-                "eta_m": result.eta_m,
                 "theta_m": spec.trs.theta_m,
                 "Q": result.Q,
                 "Q_ctl": result.Q_ctl,
@@ -1157,7 +1154,6 @@ def _model_contexts(
                 "signal_unavailable_reason": "tokens_missing",
                 "signal_theta": _signal_theta(spec, signal_source),
                 "trs_z_m": None,
-                "eta_m": None,
                 "theta_m": spec.trs.theta_m,
                 # Same queue term as tre_common.tss (A + w_q*W, swapping excluded).
                 "Q": metrics.avg_running + spec.trs.lambda_wait * metrics.avg_waiting,

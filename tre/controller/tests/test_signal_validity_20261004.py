@@ -22,7 +22,7 @@ from tre_sm.allocator.slots import Binding, Slot
 
 def _ctx(z_m: float | None, y_m: float, q: float) -> dict:
     return {
-        "trs": 100.0 * (z_m or 0.0), "z_m": z_m, "trs_z_m": z_m, "theta_m": 100.0, "eta_m": 500.0,
+        "trs": 100.0 * (z_m or 0.0), "z_m": z_m, "trs_z_m": z_m, "theta_m": 100.0,
         "tss_defined": True, "Y_m": y_m, "y_m": y_m, "Q": q, "Q_ctl": max(q, 1.0),
         "signal_source": "zm", "signal_unavailable_reason": None, "request_rate_rps": 5.0 if y_m else 0.0,
         "routable_pods": 3, "assigned_replicas": 3, "awake_replicas": 3,

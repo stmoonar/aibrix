@@ -41,7 +41,6 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.incomplete_policy == "drop_model"
     assert config.ablation_disable_slow_loop is False
     assert config.ablation_disable_safescale is False
-    assert config.disable_eta_gate is False
     # v1/paper alignment A2: the receiver-less HIGH proactive SafeScale shrink is live.
     assert config.safescale_suppress_hot_proactive is False
     # Timer cleanup (2026-10-02): the band dwell, the fixed rollback backoff and the
@@ -102,7 +101,6 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_INCOMPLETE_POLICY": "drop_all",
             "TRE_ABLATION_DISABLE_SLOW_LOOP": "1",
             "TRE_ABLATION_DISABLE_SAFESCALE": "yes",
-            "TRE_DISABLE_ETA_GATE": "true",
         }
     )
 
@@ -123,7 +121,6 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.incomplete_policy == "drop_all"
     assert config.ablation_disable_slow_loop is True
     assert config.ablation_disable_safescale is True
-    assert config.disable_eta_gate is True
 
 
 FITTED_ALT_SOURCES = ["queue_len", "ttft_mean", "tpot_mean", "kv_usage", "decode_tps", "prefill_tps"]
@@ -150,29 +147,29 @@ def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
 
 @pytest.mark.parametrize("source", ["zm", "latency_p95"])
 def test_config_accepts_unfitted_signal_sources(source: str) -> None:
-    env = {"TRE_SIGNAL_SOURCE": source}
-    if source != "zm":
-        env["TRE_DISABLE_ETA_GATE"] = "true"
-    assert ControllerConfig.from_env(env).signal_source == source
+    assert ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source}).signal_source == source
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
 def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
     path = _registry_with_alt(tmp_path, source)
-    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
-                                     "TRE_DISABLE_ETA_GATE": "true"})
-    assert cfg.signal_source == source and cfg.disable_eta_gate is True
+    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
+    assert cfg.signal_source == source
 
 
-@pytest.mark.parametrize("source", [*FITTED_ALT_SOURCES, "latency_p95"])
-def test_alt_source_refuses_to_start_with_the_eta_gate_on(tmp_path, source: str) -> None:
-    """Plan section 8: only the signal changes on an alt arm - the eta gate is off there."""
-    path = _registry_with_alt(tmp_path, source) if source in FITTED_ALT_SOURCES else None
-    env = {"TRE_SIGNAL_SOURCE": source, **({"TRE_REGISTRY_PATH": str(path)} if path else {})}
-    with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires TRE_DISABLE_ETA_GATE=true"):
-        ControllerConfig.from_env(env)
-    with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE"):
-        ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "false"})
+@pytest.mark.parametrize("source", ["zm", "queue_len"])
+def test_the_removed_eta_gate_switch_fails_closed_on_true_and_is_ignored_on_false(tmp_path, source: str) -> None:
+    """2026-11-02: eta and TRE_DISABLE_ETA_GATE were removed. "true" asked for the removed name
+    order and refuses to start; "false" (old TSS-arm specs, a runner reset) starts. An alt
+    signal starts without the switch (above)."""
+    env = {"TRE_SIGNAL_SOURCE": source}
+    if source != "zm":
+        env["TRE_REGISTRY_PATH"] = str(_registry_with_alt(tmp_path, source))
+    for value in ("true", "1"):
+        with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE was removed"):
+            ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": value})
+    for value in ("false", ""):
+        assert ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": value}).signal_source == source
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
@@ -207,7 +204,7 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
     # the same stamp is accepted when the controller window matches it
     if basis is not None and basis["window_ms"] == 30_000:
         cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
-                                         "TRE_METRICS_WINDOW_MS": "30000", "TRE_DISABLE_ETA_GATE": "true"})
+                                         "TRE_METRICS_WINDOW_MS": "30000"})
         assert cfg.signal_source == source
 
 

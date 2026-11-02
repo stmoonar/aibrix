@@ -7,7 +7,6 @@ import pytest
 from golden.legacy_trs import (
     LegacyTRSComputer,
     LegacyTRSInput,
-    legacy_compute_eta_m,
     legacy_compute_z_m,
 )
 from tre_common.metrics_schema import ModelWindowMetrics
@@ -15,7 +14,6 @@ from tre_common.registry import TrsParams
 from tre_controller.signals.trs import (
     TRSComputer,
     TRSInput,
-    compute_eta_m,
     compute_z_m,
 )
 
@@ -36,7 +34,7 @@ def _assert_trs_result_equal(actual, expected) -> None:
     assert actual.Q_ctl == pytest.approx(expected.Q_ctl)
     assert actual.TRS_raw == pytest.approx(expected.TRS_raw)
     assert actual.TRS == pytest.approx(expected.TRS)
-    _assert_float_or_none_equal(actual.eta_m, expected.eta_m)
+    # 2026-11-02: eta_m removed from TRSResult (the legacy reference still computes it).
     _assert_float_or_none_equal(actual.Z_m, expected.Z_m)
     assert actual.ema_alpha == pytest.approx(expected.ema_alpha)
     _assert_float_or_none_equal(actual.prev_Y, expected.prev_Y)
@@ -162,11 +160,6 @@ def test_trs_input_can_be_built_from_model_metrics_and_registry_params() -> None
     assert inp.lambda_wait == 3.0
     assert inp.qmin == 2.0
     assert inp.kv_cache_hit_rate == 0.25
-
-
-@pytest.mark.parametrize("trs,routable", [(0.0, 3), (float("inf"), 2), (float("nan"), 1)])
-def test_eta_helper_matches_legacy_unavailable_values(trs: float, routable: int) -> None:
-    assert compute_eta_m(trs, routable) == legacy_compute_eta_m(trs, routable)
 
 
 @pytest.mark.parametrize("theta", [None, 0.0, -1.0])

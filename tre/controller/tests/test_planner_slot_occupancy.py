@@ -36,17 +36,15 @@ TOPOLOGY = ClusterTopology(
 )
 
 
-def _cls(model: str, state: ModelState, role: ModelRole, z: float, tier: str | None = None) -> ModelClassification:
+def _cls(model: str, state: ModelState, role: ModelRole, z: float) -> ModelClassification:
     return ModelClassification(
         model_name=model,
         state=state,
         role=role,
         Z_m=z,
-        eta_m=None,
         trs=0.0,
         theta_m=1.0,
         tau=TauThresholds.from_control(),
-        donor_tier=tier,
     )
 
 
@@ -80,8 +78,7 @@ def _plan(bindings: tuple[Binding, ...], donor_state: ModelState, *, idle_gpus: 
         },
         classifications=[
             _cls("dsllama-8b", ModelState.CRITICAL, ModelRole.RECEIVER, 0.4),
-            _cls("dsqwen-7b", donor_state, donor_role, donor_z,
-                 "idle" if donor_state == ModelState.IDLE else "surplus"),
+            _cls("dsqwen-7b", donor_state, donor_role, donor_z),
         ],
         model_replicas={"dsqwen-7b": 8, "dsllama-8b": 8},
         idle_gpus=idle_gpus,
@@ -178,7 +175,7 @@ def test_low_fairness_sleeping_path_is_slot_aware() -> None:
         },
         classifications=[
             _cls("dsllama-8b", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-            _cls("dsqwen-7b", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
+            _cls("dsqwen-7b", ModelState.IDLE, ModelRole.DONOR, 10.0),
         ],
         model_replicas={"dsqwen-7b": 8, "dsllama-8b": 8},
         idle_gpus=0,

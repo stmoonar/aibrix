@@ -56,8 +56,8 @@
 #  14. (2026-10-08) controller ablation switches (TRE_ABLATION_DISABLE_SAFESCALE / _SLOW_LOOP):
 #      ARM_CONTROLLER_ENV="K=true|false ..." (campaign arm_defs.<id>.controller_env, tre arms only;
 #      2026-10-26: also TRE_SAFESCALE_SCOPE=<scope>, default all = unset, restored to unset;
-#      2026-10-28: also TRE_SIGNAL_SOURCE=<signal> (default zm = unset, restored to unset) and the switch
-#      TRE_DISABLE_ETA_GATE; the startup line logs them as signal_source / disable_eta_gate;
+#      2026-10-28: also TRE_SIGNAL_SOURCE=<signal> (default zm = unset, restored to unset), logged by the
+#      startup line as signal_source (2026-11-02: the switch TRE_DISABLE_ETA_GATE was removed with eta);
 #      unset = every switch false = production). Before the controller restart of EVERY arm (all arm
 #      types): (a) hygiene gate - no unresolved SafeScale probe record in Redis (status other than
 #      "resolved", or unparsable; resolved records stay an hour until gc_resolved_probes), polled up
@@ -140,10 +140,10 @@ PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for o
 # default "all" = unset (production), e.g. receiverless_shrink or healthy_and_shrink (2026-10-29).
 # Restored to unset like the switches.
 # (2026-10-28) signal ablation: TRE_SIGNAL_SOURCE (default zm = TSS = unset, restored to unset; the values of
-# campaign.py SIGNAL_SOURCES) and the switch TRE_DISABLE_ETA_GATE (default false).
+# campaign.py SIGNAL_SOURCES). (2026-11-02) TRE_DISABLE_ETA_GATE removed (no eta; one donor order on every arm).
 # (2026-11-02) TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (default false): not in the controller startup line, so
 # record_ablation_switches checks it on the running controller pod's container env.
-CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_valid() {   # ctl_valid KEY VALUE
   case "$1" in
@@ -348,9 +348,9 @@ record_ablation_switches() {   # prints match | mismatch | missing; writes ablat
   done
   # not in the startup line: the env of the running controller pod (read-only); unset = false
   pod_sup=$(kubectl -n "$TRE_NS" get pods -l "$CONTROLLER_SELECTOR" --field-selector=status.phase=Running -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE")].value}' 2>/dev/null || echo "?")
-  python3 - "$D/ablation_switches.json" "$line" "$(ctl_want TRE_ABLATION_DISABLE_SAFESCALE)" "$(ctl_want TRE_ABLATION_DISABLE_SLOW_LOOP)" "$(ctl_env_now)" "$(ctl_want TRE_SAFESCALE_SCOPE)" "$(ctl_want TRE_SIGNAL_SOURCE)" "$(ctl_want TRE_DISABLE_ETA_GATE)" "$(ctl_want TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE)" "${pod_sup:-}" <<'PY'
+  python3 - "$D/ablation_switches.json" "$line" "$(ctl_want TRE_ABLATION_DISABLE_SAFESCALE)" "$(ctl_want TRE_ABLATION_DISABLE_SLOW_LOOP)" "$(ctl_env_now)" "$(ctl_want TRE_SAFESCALE_SCOPE)" "$(ctl_want TRE_SIGNAL_SOURCE)" "$(ctl_want TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE)" "${pod_sup:-}" <<'PY'
 import json, sys
-out, line, want_ss, want_sl, env_now, want_scope, want_sig, want_eta, want_sup, pod_sup = sys.argv[1:11]
+out, line, want_ss, want_sl, env_now, want_scope, want_sig, want_sup, pod_sup = sys.argv[1:10]
 def event_of(obj):
     if isinstance(obj, dict) and obj.get("event") == "ablation_switches":
         return obj
@@ -378,9 +378,9 @@ ok = rec is not None and all(rec.get(k) == v for k, v in want.items())
 scope_logged = None if rec is None else rec.get("safescale_scope")
 ok = ok and (scope_logged == eff_scope if scope_logged is not None else eff_scope in ("all", "off") and want_scope == "all")
 want["safescale_scope"] = eff_scope
-# signal ablation (2026-10-28): a line without signal_source / disable_eta_gate (controller image before them)
-# matches only the defaults zm / false
-for key, wv, default in (("signal_source", want_sig, "zm"), ("disable_eta_gate", want_eta == "true", False)):
+# signal ablation (2026-10-28): a line without signal_source (controller image before it) matches only the default zm
+# (2026-11-02: disable_eta_gate is no longer checked - TRE_DISABLE_ETA_GATE removed)
+for key, wv, default in (("signal_source", want_sig, "zm"),):
     want[key] = wv
     got = None if rec is None else rec.get(key)
     ok = ok and (got == wv if got is not None else wv == default)
@@ -400,8 +400,7 @@ ok = ok and sup_got is not None and sup_got == (want_sup == "true")
 effective = None if rec is None else {"disable_safescale": rec.get("disable_safescale"),
                                       "disable_slow_loop": rec.get("disable_slow_loop"),
                                       "safescale_scope": scope_logged if scope_logged is not None else "all (not logged)",
-                                      "signal_source": rec.get("signal_source", "zm (not logged)"),
-                                      "disable_eta_gate": rec.get("disable_eta_gate", "false (not logged)")}
+                                      "signal_source": rec.get("signal_source", "zm (not logged)")}
 json.dump({"logged": rec, "wanted": want, "effective": effective, "match": ok, "deployment_env": env_now.strip(),
            "suppress_hot_proactive": {"source": sup_src, "value": sup_got, "pod_env_raw": pod_sup},
            "raw": line[:500] or None}, open(out, "w"), indent=1)

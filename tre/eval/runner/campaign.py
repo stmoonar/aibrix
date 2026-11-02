@@ -84,11 +84,14 @@ TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
 CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE",
-                       "TRE_SIGNAL_SOURCE", "TRE_DISABLE_ETA_GATE", "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE")
+                       "TRE_SIGNAL_SOURCE", "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE")
+# 2026-11-02: TRE_DISABLE_ETA_GATE was removed from the controller (eta gone; every arm orders donors IDLE first,
+# then Z descending). An old spec's "false" (the only behaviour left) is dropped; "true" (the removed name order)
+# fails the spec check - the controller would refuse to start.
+REMOVED_CONTROLLER_ENV_KEYS = ("TRE_DISABLE_ETA_GATE",)
 # 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
-# 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source);
-# TRE_DISABLE_ETA_GATE is a switch (default false; logged as disable_eta_gate).
+# 2026-10-28 (signal ablation): TRE_SIGNAL_SOURCE likewise (default zm = TSS = unset; logged as signal_source).
 # 2026-11-02: TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE is a switch (default false): true = no receiverless HIGH shrink probe
 # (plan event safescale_probe_suppressed_hot). The startup line does not log it; the runner reads the pod env.
 # 2026-10-29 (design 20261029-tss-suffix rule 5): healthy_and_shrink = IDLE donors at once, a HIGH donor
@@ -302,6 +305,11 @@ def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
         raise CampaignError(f"arm_defs.{arm_id}.controller_env is only supported for base tre (the controller actuates)")
     if not isinstance(raw, dict):
         raise CampaignError(f"arm_defs.{arm_id}.controller_env must be a mapping")
+    for k in REMOVED_CONTROLLER_ENV_KEYS:
+        if k in raw and str(raw[k]).strip().lower() != "false":
+            raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k}={raw[k]}: removed 2026-11-02 (no eta; donors IDLE "
+                                f"first, then Z descending on every arm); only false is accepted, and dropped")
+    raw = {k: v for k, v in raw.items() if k not in REMOVED_CONTROLLER_ENV_KEYS}
     bad = sorted(set(raw) - set(CONTROLLER_ENV_KEYS))
     if bad:
         raise CampaignError(f"arm_defs.{arm_id}.controller_env: unknown keys {bad} (allowed {list(CONTROLLER_ENV_KEYS)})")

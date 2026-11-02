@@ -40,7 +40,7 @@ def _plan(view, queue=None):
         },
         classifications=[
             _cls(R, ModelState.CRITICAL, ModelRole.RECEIVER, 0.4),
-            _cls(D, ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
+            _cls(D, ModelState.IDLE, ModelRole.DONOR, 10.0),
         ],
         model_replicas={D: 8, R: 8},
         idle_gpus=0,

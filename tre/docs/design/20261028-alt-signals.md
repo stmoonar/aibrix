@@ -3,9 +3,9 @@
 Status: implemented on `feat/alt-signals-20261028` (not deployed). Scope: the alternative
 signals of the signal ablation (v1 10-23, D30-D40; plan `docs/v2-ablation-sensitivity-gap-20261028.md`
 in the local workspace). Only the signal changes on an alt arm; the runner sets
-`TRE_SIGNAL_SOURCE` and `TRE_DISABLE_ETA_GATE` (eta gate and waste ranking off on alt arms, D31).
-The controller refuses to start with `TRE_SIGNAL_SOURCE` != `zm` and
-`TRE_DISABLE_ETA_GATE=false` (plan section 8; review M3).
+`TRE_SIGNAL_SOURCE`. 2026-11-02: eta, its gate / waste ranking and `TRE_DISABLE_ETA_GATE` were
+removed (user decision); every arm orders donors IDLE first, then its own Z descending, and the
+controller refuses to start with `TRE_DISABLE_ETA_GATE=true` (before: alt arms required it, D31).
 
 O1 (the breakpoint window: hold after a routable-count change, full window afterwards)
 applies on every arm, alt arms included (same hold, same rules). The alt EMA keeps the

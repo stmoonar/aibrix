@@ -336,7 +336,7 @@ def test_model_state_box_marks_held_contexts_unconfirmed_and_expires() -> None:
 
     def cls(model, state, role):
         return ModelClassification(
-            model_name=model, state=state, role=role, Z_m=1.0, eta_m=None, trs=0.0,
+            model_name=model, state=state, role=role, Z_m=1.0, trs=0.0,
             theta_m=1.0, tau=TauThresholds.from_control(),
         )
 
@@ -460,7 +460,7 @@ def test_rescue_for_a_receiver_cancels_its_pending_upscale_only() -> None:
 def test_planner_plans_a_critical_receiver_whose_commit_is_preemptible() -> None:
     def cls(model, state, role):
         return ModelClassification(
-            model_name=model, state=state, role=role, Z_m=0.3, eta_m=None, trs=0.0,
+            model_name=model, state=state, role=role, Z_m=0.3, trs=0.0,
             theta_m=1.0, tau=TauThresholds.from_control(),
         )
 

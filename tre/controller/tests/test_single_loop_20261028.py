@@ -65,8 +65,8 @@ HEALTHY = ModelState.HEALTHY, ModelRole.NEUTRAL
 
 def _cls(model: str, state: ModelState, role: ModelRole, z: float | None) -> ModelClassification:
     return ModelClassification(
-        model_name=model, state=state, role=role, Z_m=z, eta_m=None, trs=0.0, theta_m=1.0,
-        tau=TauThresholds.from_control(), donor_tier="idle" if state == ModelState.IDLE else None,
+        model_name=model, state=state, role=role, Z_m=z, trs=0.0, theta_m=1.0,
+        tau=TauThresholds.from_control(),
     )
 
 

@@ -53,7 +53,6 @@ def _result():
             "decode_tps": 4.0,
             "prefill_tps": 2.0,
             "routable_pods": 1,
-            "eta_m": 5.0,
         }
         for model in ("m1", "m2")
     }

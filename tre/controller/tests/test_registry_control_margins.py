@@ -126,7 +126,7 @@ def test_control_configs_are_margins_around_tau_low() -> None:
 
 
 def test_models_without_a_registry_entry_keep_the_documented_defaults() -> None:
-    contexts = {"unregistered": {"trs": 10.0, "z_m": 0.9, "theta_m": 100.0, "eta_m": 500.0}}
+    contexts = {"unregistered": {"trs": 10.0, "z_m": 0.9, "theta_m": 100.0}}
 
     classification = classify_all_models(
         contexts,

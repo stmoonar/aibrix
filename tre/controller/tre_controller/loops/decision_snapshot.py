@@ -209,7 +209,6 @@ def _model_states(
             "trs_raw": context.get("trs_raw"),
             "q_ctl": context.get("Q_ctl"),
             "y_m": context.get("Y_m"),
-            "eta_m": context.get("eta_m"),
             "theta_m": context.get("theta_m"),
             "routable_pods": context.get("routable_pods"),
             "assigned_replicas": context.get("assigned_replicas"),

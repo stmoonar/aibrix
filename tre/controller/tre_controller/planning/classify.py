@@ -43,17 +43,15 @@ class ModelClassification:
     state: ModelState
     role: ModelRole
     Z_m: float | None
-    eta_m: float | None
     trs: float
     theta_m: float | None
     tau: TauThresholds
-    donor_tier: str | None = None
-    eta_crit: float | None = None
+    # 2026-11-02: eta_m, eta_crit / eta_low and donor_tier (idle / waste / surplus) removed;
+    # the donor order is donor_sort_key (IDLE first by state).
     #: TSS undefined because nothing was in flight (running + waiting == 0) while tokens
     #: still completed. Classified HEALTHY/NEUTRAL (surplus side, never a receiver) and
     #: exempt from the "Z missing -> incomplete" drop, see plan 6.4 idle rule.
     signal_idle: bool = False
-    eta_low: float | None = None
 
 
 def classify_model(
@@ -61,11 +59,8 @@ def classify_model(
     model_name: str,
     trs: float,
     Z_m: float | None,
-    eta_m: float | None,
     theta_m: float | None,
     tau: TauThresholds,
-    eta_crit: float | None = None,
-    eta_low: float | None = None,
     request_rate_rps: float | None = None,
     idle_rps_eps: float = 0.05,
 ) -> ModelClassification:
@@ -79,12 +74,9 @@ def classify_model(
             state=ModelState.HEALTHY,
             role=ModelRole.NEUTRAL,
             Z_m=Z_m,
-            eta_m=eta_m,
             trs=trs,
             theta_m=theta_m,
             tau=tau,
-            eta_crit=eta_crit,
-            eta_low=eta_low,
         )
 
     if Z_m is None:
@@ -93,12 +85,9 @@ def classify_model(
             state=ModelState.UNKNOWN,
             role=ModelRole.UNKNOWN,
             Z_m=Z_m,
-            eta_m=eta_m,
             trs=trs,
             theta_m=theta_m,
             tau=tau,
-            eta_crit=eta_crit,
-            eta_low=eta_low,
         )
 
     if Z_m < tau.tau_crit:
@@ -114,22 +103,14 @@ def classify_model(
         state = ModelState.HIGH
         role = ModelRole.DONOR
 
-    donor_tier: str | None = None
-    if role == ModelRole.DONOR:
-        donor_tier = "waste" if eta_low is not None and eta_m is not None and eta_m < eta_low else "surplus"
-
     return ModelClassification(
         model_name=model_name,
         state=state,
         role=role,
         Z_m=Z_m,
-        eta_m=eta_m,
         trs=trs,
         theta_m=theta_m,
         tau=tau,
-        donor_tier=donor_tier,
-        eta_crit=eta_crit,
-        eta_low=eta_low,
     )
 
 
@@ -188,8 +169,6 @@ def classify_all_models(
 
         d_crit = _float_or(control.get("delta_crit"), delta_crit)
         d_high = _float_or(control.get("delta_high"), delta_high)
-        eta_crit = _float_or(control.get("receiver_thrashing_eff"), 200.0)
-        eta_low = _float_or(control.get("donor_waste_eff"), 300.0)
         tau = TauThresholds.from_control(d_crit, d_high)
 
         if _ctx_is_signal_idle(ctx):
@@ -203,12 +182,9 @@ def classify_all_models(
                     state=ModelState.HEALTHY,
                     role=ModelRole.NEUTRAL,
                     Z_m=None,
-                    eta_m=ctx.get("eta_m"),
                     trs=ctx.get("trs", 0.0),
                     theta_m=ctx.get("theta_m"),
                     tau=tau,
-                    eta_crit=eta_crit,
-                    eta_low=eta_low,
                     signal_idle=True,
                 )
             )
@@ -221,13 +197,9 @@ def classify_all_models(
                     state=ModelState.IDLE,
                     role=ModelRole.DONOR,
                     Z_m=ctx.get("z_m"),
-                    eta_m=ctx.get("eta_m"),
                     trs=ctx.get("trs", 0.0),
                     theta_m=ctx.get("theta_m"),
                     tau=tau,
-                    donor_tier="idle",
-                    eta_crit=eta_crit,
-                    eta_low=eta_low,
                 )
             )
             continue
@@ -237,109 +209,14 @@ def classify_all_models(
                 model_name=model_name,
                 trs=ctx.get("trs", 0.0),
                 Z_m=ctx.get("z_m"),
-                eta_m=ctx.get("eta_m"),
                 theta_m=ctx.get("theta_m"),
                 tau=tau,
-                eta_crit=eta_crit,
-                eta_low=eta_low,
                 request_rate_rps=ctx.get("request_rate_rps"),
                 idle_rps_eps=signal_idle_rps_eps,
             )
         )
 
     return results
-
-
-def filter_donors_by_eta(
-    donors: list[ModelClassification],
-    *,
-    disabled: bool = False,
-) -> tuple[list[ModelClassification], list[ModelClassification]]:
-    if disabled:
-        return list(donors), []
-    eligible: list[ModelClassification] = []
-    filtered_out: list[ModelClassification] = []
-    for donor in donors:
-        if donor.state == ModelState.IDLE:
-            eligible.append(donor)
-            continue
-        if donor.eta_m is not None and donor.eta_crit is not None and donor.eta_m < donor.eta_crit:
-            filtered_out.append(donor)
-        else:
-            eligible.append(donor)
-    return eligible, filtered_out
-
-
-def split_receivers_donors(
-    classifications: list[ModelClassification],
-    *,
-    apply_eta_gate: bool = True,
-    disable_eta_gate: bool = False,
-) -> tuple[list[ModelClassification], list[ModelClassification]]:
-    receivers = [item for item in classifications if item.role == ModelRole.RECEIVER]
-    donors = [item for item in classifications if item.role == ModelRole.DONOR]
-    receivers.sort(key=receiver_sort_key)
-    donors.sort(
-        key=lambda item: donor_mock_cost_key(
-            item, disable_eta_gate=disable_eta_gate
-        )
-    )
-    if apply_eta_gate:
-        donors, _filtered = filter_donors_by_eta(
-            donors, disabled=disable_eta_gate
-        )
-    return receivers, donors
-
-
-def build_comparison_log(
-    *,
-    model_name: str,
-    legacy_type: str,
-    paper_cls: ModelClassification,
-) -> dict[str, Any]:
-    eta_gate_pass: bool | None = None
-    if paper_cls.role == ModelRole.DONOR and paper_cls.eta_m is not None and paper_cls.eta_crit is not None:
-        eta_gate_pass = paper_cls.eta_m >= paper_cls.eta_crit
-    return {
-        "event": "state_comparison",
-        "model": model_name,
-        "legacy_type": legacy_type,
-        "legacy_role": (
-            "receiver"
-            if legacy_type in ("THRASHING", "CONGESTED")
-            else ("donor" if legacy_type in ("WASTE", "SURPLUS") else "neutral")
-        ),
-        "paper_state": paper_cls.state.value,
-        "paper_role": paper_cls.role.value,
-        "Z_m": paper_cls.Z_m,
-        "eta_m": paper_cls.eta_m,
-        "eta_crit": paper_cls.eta_crit,
-        "eta_gate_pass": eta_gate_pass,
-        "donor_tier": paper_cls.donor_tier,
-        "theta_m": paper_cls.theta_m,
-        "trs": paper_cls.trs,
-    }
-
-
-def donor_mock_cost_key(
-    classification: Any,
-    *,
-    disable_eta_gate: bool = False,
-) -> Any:
-    if disable_eta_gate:
-        return _natural_text_key(str(getattr(classification, "model_name", "")))
-    donor_tier = getattr(classification, "donor_tier", None)
-    if donor_tier == "idle":
-        donor_prio = -1
-    elif donor_tier == "waste":
-        donor_prio = 0
-    else:
-        donor_prio = 1
-
-    z_m = _float_or(getattr(classification, "Z_m", None), 0.0)
-    eta_m_raw = _float_or(getattr(classification, "eta_m", None), None)
-    eta_m = eta_m_raw if eta_m_raw is not None else float("inf")
-    return (donor_prio, -z_m, eta_m)
 
 
 def _natural_text_key(value: str) -> tuple[tuple[int, Any], ...]:
@@ -356,6 +233,23 @@ def receiver_sort_key(classification: Any) -> tuple[int, float]:
     ascending; no Z sorts last)."""
     prio = 1 if classification.state == ModelState.CRITICAL else 2
     return (prio, classification.Z_m if classification.Z_m is not None else float("inf"))
+
+
+def donor_sort_key(classification: Any) -> tuple[int, float, tuple[tuple[int, Any], ...]]:
+    """Donor order, the same on every arm: IDLE first, then Z descending (no Z last),
+    ties by natural model name.
+
+    2026-11-02 (user decision): eta (TSS / routable pods) and its "waste" tier are gone.
+    TSS is already a fleet ratio, so eta fell as 1/n at equal per-replica load and its
+    v1 thresholds (200 / 300) were never calibrated; the order no longer depends on the
+    replica count. An alt-signal arm sorts by its own Z (TRE_DISABLE_ETA_GATE removed)."""
+    prio = 0 if classification.state == ModelState.IDLE else 1
+    z_m = _float_or(classification.Z_m, None)
+    return (
+        prio,
+        -z_m if z_m is not None else float("inf"),
+        _natural_text_key(str(classification.model_name)),
+    )
 
 
 def _ctx_is_signal_idle(ctx: dict[str, Any] | None) -> bool:

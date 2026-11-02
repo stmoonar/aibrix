@@ -22,17 +22,15 @@ from tre_sm.allocator.slots import Binding, Slot
 from relay_view import block_takes, expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 
-def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None):
+def _cls(model: str, state: ModelState, role: ModelRole, z: float | None):
     return ModelClassification(
         model_name=model,
         state=state,
         role=role,
         Z_m=z,
-        eta_m=None,
         trs=0.0,
         theta_m=1.0,
         tau=TauThresholds.from_control(),
-        donor_tier=tier,
     )
 
 
@@ -53,7 +51,7 @@ def test_two_tp2_critical_receivers_take_a_two_replica_donor_once():
     classifications = [
         _cls("tpa", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _cls("tpb", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
     ]
     contexts = {
         "tpa": {"assigned_replicas": 0, "routable_pods": 0},
@@ -96,7 +94,7 @@ def test_tp_block_then_tp1_critical_donor_loop_skips_the_claimed_donor():
     classifications = [
         _cls("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _cls("crit1", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
     ]
     contexts = {
         "tp2": {"assigned_replicas": 0, "routable_pods": 0},
@@ -152,7 +150,7 @@ def test_tp_block_counts_takes_planned_by_an_earlier_receiver():
     classifications = [
         _cls("crit1", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _cls("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
     ]
     contexts = {
         "tp2": {"assigned_replicas": 0, "routable_pods": 0},

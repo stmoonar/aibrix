@@ -120,7 +120,7 @@ def test_planner_z_is_the_same_with_or_without_sleeping_pods() -> None:
     a = run_rescue_tick(with_sleepers, queue=_Queue(), registry=registry, cluster_view=_view([AWAKE], ASLEEP))
     b = run_rescue_tick(alone, queue=_Queue(), registry=registry, cluster_view=_view([AWAKE], []))
     ca, cb = a.model_contexts["m"], b.model_contexts["m"]
-    for key in ("z_m", "trs", "Q", "Y_m", "y_m", "eta_m", "routable_pods", "decode_tps", "prefill_tps"):
+    for key in ("z_m", "trs", "Q", "Y_m", "y_m", "routable_pods", "decode_tps", "prefill_tps"):
         assert ca[key] == cb[key], key
     assert ca["routable_pods"] == 1
 
