@@ -207,6 +207,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
     assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "20000"  # W (2026-10-28: 20 s, step counters)
     assert controller["spec"]["strategy"] == {"type": "Recreate"}  # no dual-controller actuation
+    # 2026-11-02: PID 1 ignores SIGTERM (no handler): the grace period is only how long the old pod keeps running
+    assert controller["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 5
     mounts = controller["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
     assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in mounts
     volumes = controller["spec"]["template"]["spec"]["volumes"]

@@ -21,6 +21,10 @@ spec:
         app.kubernetes.io/name: tre-v2-controller
     spec:
       serviceAccountName: tre-v2-controller
+      # 2026-11-02: the controller runs as PID 1 (python) without a SIGTERM handler, so SIGTERM is ignored
+      # and every stop waited the full default 30 s for the SIGKILL (each rollout ~33 s); 5 s ends the same
+      # way (SIGKILL), only sooner. Recreate: the old pod keeps running (and may actuate) until then.
+      terminationGracePeriodSeconds: 5
       nodeSelector:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
