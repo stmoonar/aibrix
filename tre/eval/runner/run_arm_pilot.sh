@@ -357,7 +357,15 @@ for key, wv, default in (("signal_source", want_sig, "zm"), ("disable_eta_gate",
     ok = ok and (got == wv if got is not None else wv == default)
 # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (2026-11-02): never in the startup line -> the pod env decides
 # (source "pod_env"; unset = false; "?" = the read failed -> mismatch). A line that logs it is trusted ("startup_line").
-sup_src, sup_got = ("startup_line", rec.get("suppress_hot_proactive")) if rec is not None and "suppress_hot_proactive" in rec else ("pod_env", None if pod_sup == "?" else (pod_sup.strip().lower() or "false") == "true")
+# Parsed like the controller's _get_bool (tre_controller/config.py _TRUE_VALUES / _FALSE_VALUES); any other value -> mismatch.
+def pod_bool(raw):
+    v = raw.strip().lower()
+    if v == "?":
+        return None
+    if v in ("", "0", "false", "no", "n", "off"):
+        return False
+    return True if v in ("1", "true", "yes", "y", "on") else None
+sup_src, sup_got = ("startup_line", rec.get("suppress_hot_proactive")) if rec is not None and "suppress_hot_proactive" in rec else ("pod_env", pod_bool(pod_sup))
 want["suppress_hot_proactive"] = want_sup == "true"
 ok = ok and sup_got is not None and sup_got == (want_sup == "true")
 effective = None if rec is None else {"disable_safescale": rec.get("disable_safescale"),
