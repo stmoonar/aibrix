@@ -91,7 +91,7 @@ EOF
 T=$H/tre; mkdir -p $T/deploy/scripts/release $T/deploy/scripts/analysis $T/baselines/tre_baselines/tools $T/common
 cat > $T/deploy/scripts/set_run_mode.sh <<'EOF'
 #!/usr/bin/env bash
-S=__H__/state; if [ "$1" = status ]; then cat $S/mode 2>/dev/null || echo "observe active"; else echo "$1 $2" > $S/mode; fi
+S=__H__/state; if [ "$1" = status ]; then cat $S/mode 2>/dev/null || echo "observe active"; else echo "$1 $2" > $S/mode; echo "set_run_mode $1 $2" >> $S/calls.log; fi
 EOF
 cat > $T/deploy/scripts/toggle_tre_apa.sh <<'EOF'
 #!/usr/bin/env bash

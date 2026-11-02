@@ -82,7 +82,12 @@
 #      and every collector file is still written. (a) ONE controller rollout per arm: the run mode is set first (the arm's
 #      controller starts in it, as before the restart), then `ctl_env_set want`; when it changed a setting,
 #      its rollout IS the arm's restart (controller_restart_epoch, "controller restarted", startup-line
-#      check as before), else restart_controller. (b) CTL_ENV_KEEP=1 (campaign.py): the switches stay set at
+#      check as before), else restart_controller. Side effect of that order: the controller pod still up
+#      (the previous arm's, with the previous arm's switches under CTL_ENV_KEEP=1) runs in the new run mode
+#      (active for a TRE arm) for ~2 s plus its termination grace (overlay: 5 s) until the rollout stops it.
+#      The cluster is idle then (canonical awake set, one replica per model, no load), so it has nothing to
+#      act on, and it is before T_RESTART (controller_restart_epoch), i.e. outside every measured window.
+#      (b) CTL_ENV_KEEP=1 (campaign.py): the switches stay set at
 #      the end of the arm - the next arm's ctl_env_set want writes every one of them, campaign.py's last
 #      reset_canonical.sh puts them back, the exit trap still does when the arm dies; default 0 = put back
 #      at the end of the arm as before. (c) The collection after POST_S is serial as before (same order,
