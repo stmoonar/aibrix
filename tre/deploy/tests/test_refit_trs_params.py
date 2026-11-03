@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 
+import pytest
+
 from scripts import refit_trs_params
 
 
@@ -281,3 +283,15 @@ def test_load_windows_and_inputs_trims_aligned_ramp_rows(tmp_path) -> None:
     assert [window.window_start_ms for window in windows] == [2000.0, 2000.0]
     assert len(inputs) == len(windows) == 2
     assert [item.prompt_tokens_total for item in inputs] == [200.0, 400.0]
+
+
+def test_the_fit_clis_refuse_a_negative_ema_tau(capsys) -> None:
+    """tau <= 0 means raw, so a negative value would be accepted silently as 'no smoothing': it is refused at the command line."""
+    from scripts import theta_verdict
+
+    for parse, head in ((refit_trs_params._parse_args, []), (theta_verdict._parse, ["verdict"])):
+        for bad in ("-1", "nan"):
+            with pytest.raises(SystemExit) as stop:
+                parse([*head, f"--ema-tau-ms={bad}"])
+            assert stop.value.code == 2
+    assert "must be >= 0" in capsys.readouterr().err

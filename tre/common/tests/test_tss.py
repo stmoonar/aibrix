@@ -99,3 +99,24 @@ def test_smooth_series_seeds_passes_undefined_through_and_decays() -> None:
 def test_theta_rate_equivalent_divides_by_the_window_seconds() -> None:
     assert tss.convert_window_total_theta(1718.2369972339602, 30_000) == 1718.2369972339602 / 30.0
     assert tss.convert_window_total_theta(739.0, 20_000) == 739.0 / 20.0
+
+
+def test_the_fit_tools_default_tau_is_the_tau_every_registry_model_is_smoothed_with() -> None:
+    """FIT_EMA_TAU_MS is a literal; the controller smooths with alt_ema_tau_ms(trs.ema_tau_ms) per model. A fit run with the default
+    must stamp a basis the controller accepts, so the two must agree for every model of the repo registry."""
+    from tre_common.alt_signals import alt_ema_tau_ms
+    from tre_common.registry import load_registry
+
+    models = load_registry().models()
+    assert models
+    for m in models:
+        assert alt_ema_tau_ms(m.trs.ema_tau_ms) == tss.FIT_EMA_TAU_MS, m.name
+
+
+def test_a_tau_argument_is_zero_or_positive() -> None:
+    import argparse
+
+    assert tss.nonneg_tau_ms_arg("0") == 0.0 and tss.nonneg_tau_ms_arg("20000") == 20_000.0
+    for bad in ("-1", "-0.5", "nan", "x", ""):
+        with pytest.raises(argparse.ArgumentTypeError):
+            tss.nonneg_tau_ms_arg(bad)

@@ -63,7 +63,7 @@ from tre_calibration.dataset import (
     trim_scenario_ramp_windows,
 )
 from tre_common.slo_labels import LabelDefinition, LabelSpec, add_label_arguments, label_def_from_args
-from tre_common.tss import FIT_EMA_TAU_MS
+from tre_common.tss import FIT_EMA_TAU_MS, nonneg_tau_ms_arg
 from tre_calibration.signals import (
     ParameterCandidateScore,
     SignalInputs,
@@ -407,7 +407,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument(
         "--ema-tau-ms",
-        type=float,
+        type=nonneg_tau_ms_arg,
         default=FIT_EMA_TAU_MS,
         help="EMA time constant candidates are smoothed with (default 0 = raw, as the deployed registry names it; > 0 = time-constant EMA)",
     )

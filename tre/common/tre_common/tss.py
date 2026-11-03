@@ -79,6 +79,20 @@ DEFAULT_EMA_TAU_MS = 20_000.0
 #: smooths like the controller does, and an alt-signal basis it stamps (``basis.ema_tau_ms``) is the one the controller accepts.
 FIT_EMA_TAU_MS = 0.0
 
+
+def nonneg_tau_ms_arg(text: str) -> float:
+    """argparse ``type`` of a ``--ema-tau-ms``: 0 = no smoothing, > 0 = the time constant. A negative value would be read as "no
+    smoothing" too (tau <= 0 means raw), so it is refused instead of silently accepted."""
+    import argparse  # noqa: PLC0415
+
+    try:
+        tau = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not tau >= 0.0:  # also NaN
+        raise argparse.ArgumentTypeError(f"must be >= 0 (0 = no smoothing), got {text}")
+    return tau
+
 #: Numerator sources a theta can be fitted on (registry ``trs.numerator``).
 NUMERATOR_STEP_COUNTERS = "step_counters"
 NUMERATOR_COMPLETION_HISTOGRAMS = "completion_histograms"
@@ -352,6 +366,7 @@ def convert_window_total_theta(theta_total: float, window_ms: float) -> float:
 __all__: Iterable[str] = (
     "DEFAULT_EMA_TAU_MS",
     "FIT_EMA_TAU_MS",
+    "nonneg_tau_ms_arg",
     "NUMERATOR_COMPLETION_HISTOGRAMS",
     "NUMERATOR_STEP_COUNTERS",
     "TSS_NUMERATOR",

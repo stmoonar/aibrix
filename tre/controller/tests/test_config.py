@@ -215,14 +215,12 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
 def test_alt_thresholds_of_the_repo_registry_are_fitted_on_the_default_window(source: str) -> None:
     """Since 2026-11-03 the repo registry carries the live fitted alt thresholds (basis: 10 s window, EMA off): they fit the
     default window of the controller and no other."""
-    from tre_controller.config import _validate_signal_thresholds
-
-    registry = str(Path(__file__).parents[2] / "deploy" / "registry.yaml")
-    window = ControllerConfig.from_env({}).metrics_window_ms
-    assert window == 10_000
-    _validate_signal_thresholds(registry, source, window_ms=window)  # accepted
+    env = {"TRE_SIGNAL_SOURCE": source, "TRE_DISABLE_ETA_GATE": "true",   # a non-zm source requires the gate off (from_env)
+           "TRE_REGISTRY_PATH": str(Path(__file__).parents[2] / "deploy" / "registry.yaml")}
+    assert ControllerConfig.from_env({}).metrics_window_ms == 10_000
+    assert ControllerConfig.from_env(env).signal_source == source              # accepted at the default window
     with pytest.raises(ValueError, match="basis does not match"):
-        _validate_signal_thresholds(registry, source, window_ms=20_000)
+        ControllerConfig.from_env({**env, "TRE_METRICS_WINDOW_MS": "20000"})
 
 
 def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:

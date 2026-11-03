@@ -3,11 +3,24 @@
 `controller_env.py` writes the env of the live controller Deployment to a file (`snapshot`), shows what a file would change (`diff`), and
 applies it with one `kubectl patch` = one Recreate rollout (`apply --backup-dir`, which also writes the rollback script). The patch
 carries the resourceVersion of the Deployment it was planned on, so a concurrent edit fails the apply instead of being overwritten.
-`apply` refuses while an exclusive-window marker exists (`TRE_EXCLUSIVE_WINDOW_FILE`, default `$CAMPAIGN_DATA_ROOT/TRE_EXCLUSIVE_WINDOW`),
-while a campaign runner or driver shell is active, and when the EFFECTIVE `TRE_METRICS_WINDOW_MS` disagrees with `trs.theta_window_ms`
-of the registry (the controller would not start). Effective = the value in the file; a file without the key unsets it, and the
-controller then falls back to the default of its code (read from this checkout; name the key in the file when the image may be older).
-Tested with a fake kubectl in `tre/eval/tests/test_repro_assets_20261103.py`.
+`apply` is refused (exit 2, nothing written) when
+- the exclusive-window marker cannot be located (neither `TRE_EXCLUSIVE_WINDOW_FILE` nor `CAMPAIGN_DATA_ROOT` is set: a window cannot be
+  ruled out; plain shells on the servers have neither), or the marker exists. Only the session that owns the window may apply inside it:
+  `--window-owner X` must equal the `owner=` field of the marker line;
+- a campaign runner or driver shell is active on this host (`ps`; `run_campaign*.sh`, `run_all*.sh`, `run_arm_pilot.sh`, `campaign.py run`,
+  scripts under `drivers/`, also `bash ./x.sh` started inside `drivers/`; a `bash -c` wrapper that names them also matches: refusing is
+  the safe direction);
+- the file does not name `TRE_METRICS_WINDOW_MS` while the live Deployment sets it. Applying would unset it, and the controller image
+  falls back to ITS code default, which can differ from this checkout's (image 420c69ef: 20000; this checkout: 10000) and refuses a registry
+  that stamps another window; being `Recreate`, the cluster would have no controller. Name the key in the file. Only when neither the file nor
+  the live Deployment names it is this checkout's code default used (with a note that an older image may differ);
+- the effective `TRE_METRICS_WINDOW_MS` disagrees with `trs.theta_window_ms` of the registry (live ConfigMap, or `--registry-file`).
+
+If the API server refuses the patch (a concurrent edit changed the resourceVersion), nothing was applied: `rollback.sh` is renamed to
+`rollback.sh.not-applied` (it would overwrite the concurrent edit) and the tool prints "not applied". If the patch went through but the
+rollout is not confirmed, `rollback.sh` stays. The rollback script passes its arguments on (`rollback.sh --window-owner X`).
+Tested with a fake kubectl in `tre/eval/tests/test_repro_assets_20261103.py`. The server-side rejection of a stale resourceVersion is
+not tested (the fake models it).
 
 | file | runs (`runs.tsv`) | controller image |
 |---|---|---|

@@ -323,6 +323,8 @@ def test_a_campaign_builds_its_dataset_and_the_last_one_builds_the_merge(tmp_pat
     assert (second / "dataset" / "windows.csv").exists()
     _, windows = _read(root / "dataset" / "windows.csv")
     assert {w["model"] for w in windows} == {"dsqwen-7b", "dsllama-8b"}
+    # every dataset of the run records the windowing it was cut with, and they agree
+    assert dataset.recorded_windowing(root) == (dataset.DEFAULT_WINDOW_MS, dataset.DEFAULT_STEP_MS)
 
 
 def _set_prompt(campaign_dir: Path, prompt) -> None:
@@ -436,3 +438,36 @@ def test_a_cell_off_its_prompt_length_refuses_the_dataset_unless_allowed(tmp_pat
     # ... and the trainset stage never trains on it
     off = dline_refit.prompt_token_mismatched_cells(dline_refit.DatasetSource("run", out, False))
     assert {cell for cell, _attempt in off} == {"i256_o128_c95"}
+
+
+def test_a_rebuild_can_take_the_windowing_the_run_recorded_instead_of_the_module_default(tmp_path, capsys):
+    root = tmp_path / "run"
+    _campaign(root, "dsqwen-7b")
+    with pytest.raises(SystemExit):                                   # nothing built yet: nothing recorded
+        dataset.recorded_windowing(root)
+    dataset.build_dataset(root, overrides={"window_ms": 20_000})
+    assert dataset.recorded_windowing(root) == (20_000, 10_000) != (dataset.DEFAULT_WINDOW_MS, dataset.DEFAULT_STEP_MS)
+    assert dataset.main([str(root), "--recorded-windowing"]) == 0
+    assert capsys.readouterr().out.split() == ["20000", "10000"]
+
+
+def test_datasets_cut_with_different_windows_have_no_one_recorded_windowing(tmp_path):
+    root = tmp_path / "run"
+    first = _campaign(root, "dsqwen-7b")
+    second = _campaign(root, "dsllama-8b")
+    dataset.build_dataset(first, overrides={"window_ms": 20_000})
+    dataset.build_dataset(second)
+    with pytest.raises(SystemExit):
+        dataset.recorded_windowing(root)
+
+
+def test_the_merge_of_a_run_refuses_campaigns_cut_with_another_window(tmp_path):
+    """A resumed run can hold a campaign built under an older default: the merge must not re-cut it silently."""
+    root = tmp_path / "run"
+    first = _campaign(root, "dsqwen-7b")
+    second = _campaign(root, "dsllama-8b")
+    dataset.build_dataset(first, overrides={"window_ms": 20_000})
+    (first / "campaign_status.json").write_text(json.dumps({"status": "complete", "exit_code": 0}))
+    with pytest.raises(SystemExit):
+        campaign.finalize_run(second, status="complete", exit_code=0)
+    assert not (root / "dataset").exists()

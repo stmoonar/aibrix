@@ -225,6 +225,23 @@ def _read_json(path: Path) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
+def recorded_windowing(run_dir: Path) -> tuple[int, int]:
+    """(window_ms, step_ms) that the standard datasets already built for ``run_dir`` recorded (``windowing`` of the manifest of
+    every ``<campaign>/dataset`` and of ``<run_dir>/dataset``). A rebuild passes them explicitly instead of the module default, so
+    a change of DEFAULT_WINDOW_MS never silently re-cuts an old run. SystemExit when there is none or when they differ."""
+    run_dir = Path(run_dir)
+    found: dict[tuple[int, int], list[str]] = {}
+    for d in dict.fromkeys([run_dir, *campaign_dirs(run_dir)]):
+        w = _read_json(d / DATASET_DIR / MANIFEST).get("windowing") or {}
+        if w.get("window_ms") and w.get("step_ms"):
+            found.setdefault((int(w["window_ms"]), int(w["step_ms"])), []).append(d.name)
+    if not found:
+        raise SystemExit(f"{run_dir}: no standard dataset with a recorded windowing; pass --window-ms and --step-ms")
+    if len(found) > 1:
+        raise SystemExit(f"{run_dir}: its datasets were cut with different windowings {found}; pass --window-ms and --step-ms")
+    return next(iter(found))
+
+
 def _cell_capture(raw_dir: Path) -> tuple[Optional[Path], Optional[str]]:
     """(the per-request capture, its cell id) inside one attempt directory."""
     for path in sorted(raw_dir.iterdir()):
@@ -1438,8 +1455,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--registry", default=None,
                     help="registry whose trs parameters fill the signal columns (default: "
                          "the one the run recorded, else the repository's)")
-    ap.add_argument("--window-ms", type=int, default=None)
-    ap.add_argument("--step-ms", type=int, default=None)
+    ap.add_argument("--window-ms", type=int, default=None, help=f"default {DEFAULT_WINDOW_MS}")
+    ap.add_argument("--step-ms", type=int, default=None, help=f"default {DEFAULT_STEP_MS}")
+    ap.add_argument("--recorded-windowing", action="store_true",
+                    help="print 'WINDOW_MS STEP_MS' as the datasets already under RUN_DIR recorded them and exit (for a rebuild "
+                         "that must cut the same windows: pass them back with --window-ms / --step-ms)")
     ap.add_argument("--ttft-slo-ms", type=float, default=None)
     ap.add_argument("--tpot-slo-ms", type=float, default=None)
     ap.add_argument("--min-latency-samples", type=int, default=None)
@@ -1468,6 +1488,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="build even when a cell's served requests were off their prompt length "
                          "(recorded; dline_refit trainset still refuses those cells)")
     args = ap.parse_args(argv)
+    if args.recorded_windowing:
+        print(*recorded_windowing(args.run_dir))
+        return 0
     out = build_dataset(args.run_dir, out_dir=args.out_dir,
                         allow_prompt_token_mismatch=args.allow_prompt_token_mismatch, overrides={
         "registry": args.registry, "label_registry": args.label_registry,

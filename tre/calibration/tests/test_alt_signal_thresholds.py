@@ -477,3 +477,9 @@ def test_alt_band_grids_span_what_the_classifier_can_use() -> None:
 
     assert ALT_DELTA_CRIT_GRID[0] == 0.0 and ALT_DELTA_CRIT_GRID[-1] == pytest.approx(0.99)
     assert ALT_DELTA_HIGH_GRID[0] == 0.0 and ALT_DELTA_HIGH_GRID[-1] == pytest.approx(Z_MAX - 1.0)
+
+
+def test_the_driver_refuses_a_negative_ema_tau(capsys) -> None:
+    with pytest.raises(SystemExit) as stop:
+        _load_driver().main(["--ema-tau-ms=-1"])
+    assert stop.value.code == 2 and "must be >= 0" in capsys.readouterr().err

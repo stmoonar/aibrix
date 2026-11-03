@@ -77,7 +77,7 @@ from tre_calibration.fit import (
 from tre_common.alt_signals import alt_signal_z_max, alt_tau_high_unreachable
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_calibration.profile import theta_fit_block
-from tre_common.tss import FIT_EMA_TAU_MS, TSS_UNITS
+from tre_common.tss import FIT_EMA_TAU_MS, TSS_UNITS, nonneg_tau_ms_arg
 
 from scripts import adaptive_boundary as boundary
 
@@ -717,7 +717,7 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
              "the primary TSS value for every ablation arm so all arms share one label",
     )
     v.add_argument("--qmin", type=float, default=1.0)
-    v.add_argument("--ema-tau-ms", type=float, default=FIT_EMA_TAU_MS)
+    v.add_argument("--ema-tau-ms", type=nonneg_tau_ms_arg, default=FIT_EMA_TAU_MS)
     add_label_arguments(v)
     v.add_argument("--trim-ramp-windows", type=int, default=1)
     v.add_argument("--n-resamples", type=int, default=1000)

@@ -10,7 +10,8 @@ Invariants, not implementation:
 * the new files hold no site path;
 * the trace-set configs of the repo match the checksums of TRACE_FILES.sha256 / traces.tsv and the loadgen configs of main;
 * controller_env.py makes the live env equal a file in one `kubectl patch` (with the resourceVersion it planned on), never while a runner,
-  a driver or an exclusive window is active and never with an effective window the registry does not stamp.
+  a driver or an exclusive window is active (an unlocatable marker counts as active), never with an effective window the registry does
+  not stamp (a file that drops a window key the live Deployment sets counts as such), and a refused patch leaves no usable rollback.sh.
   Historical records are compared with their own records (runs.tsv, env files), not with today's overlay.
 """
 from __future__ import annotations
@@ -215,6 +216,7 @@ class FakeCluster:
         self.env = dict(env)
         self.rv = 100
         self.race = False  # a concurrent edit lands right after the Deployment was read
+        self.rollout_fails = False
         self.calls: list[list[str]] = []
         models = [{"name": m, "trs": {"theta_window_ms": registry_window, "numerator": "step_counters"}} for m in ("m1", "m2")]
         self.registry = yaml.safe_dump({"models": models})
@@ -247,6 +249,8 @@ class FakeCluster:
             self.rv += 1
             return ""
         if args[:2] == ["rollout", "status"]:
+            if self.rollout_fails:
+                raise CE.EnvError("kubectl rollout status: timed out waiting for the rollout to finish")
             return ""
         raise AssertionError(args)
 
@@ -255,11 +259,11 @@ class FakeCluster:
 
 
 @pytest.fixture
-def cluster(monkeypatch):
+def cluster(monkeypatch, tmp_path):
     fc = FakeCluster(CE.parse_env_file((CE_DIR / "controller-env-20261031-w10.env").read_text()))
     monkeypatch.setattr(CE, "kubectl", fc)
     monkeypatch.setattr(CE, "runner_active", lambda: [])
-    monkeypatch.delenv("TRE_EXCLUSIVE_WINDOW_FILE", raising=False)
+    monkeypatch.setenv("TRE_EXCLUSIVE_WINDOW_FILE", str(tmp_path / "no-window" / "TRE_EXCLUSIVE_WINDOW"))   # configured, no window
     monkeypatch.delenv("CAMPAIGN_DATA_ROOT", raising=False)
     return fc
 
@@ -300,22 +304,29 @@ def test_apply_is_refused_when_the_registry_stamps_another_window(cluster, tmp_p
     assert cluster.env["TRE_METRICS_WINDOW_MS"] == "20000"
 
 
-def test_a_file_without_the_window_key_is_judged_by_the_default_the_controller_falls_back_to(cluster, tmp_path, monkeypatch):
-    """Applying such a file UNSETS the variable; the controller then uses its code default, which must match the registry."""
+def test_a_file_that_drops_the_window_key_the_live_deployment_sets_is_refused(cluster, tmp_path, capsys):
+    """Applying such a file UNSETS the variable; the live image may fall back to another code default than this checkout's
+    (20000 vs 10000), and the controller then refuses the registry: with Recreate, no controller."""
+    want = {k: v for k, v in cluster.env.items() if k != "TRE_METRICS_WINDOW_MS"}
+    path = _want(tmp_path, want)
+    before = dict(cluster.env)
+    assert CE.main(["diff", path]) == 2
+    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 2
+    assert "REFUSED" in capsys.readouterr().out and not cluster.writes() and cluster.env == before and not (tmp_path / "bk").exists()
+
+
+def test_the_code_default_of_this_checkout_is_used_only_if_neither_file_nor_live_names_the_window(cluster, tmp_path, monkeypatch):
     from tre_controller.config import ControllerConfig
 
     assert CE.controller_default_window() == str(ControllerConfig.from_env({}).metrics_window_ms)   # read from the code
-    want = {k: v for k, v in cluster.env.items() if k != "TRE_METRICS_WINDOW_MS"}
-    path = _want(tmp_path, want)
+    del cluster.env["TRE_METRICS_WINDOW_MS"]                                                          # live does not name it either
+    path = _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2"))
     monkeypatch.setattr(CE, "controller_default_window", lambda: "30000")                 # registry stamps 10000
-    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 2
-    assert not cluster.writes() and "TRE_METRICS_WINDOW_MS" in cluster.env
+    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 2 and not cluster.writes()
     monkeypatch.setattr(CE, "controller_default_window", lambda: "10000")
     assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 0
-    assert "TRE_METRICS_WINDOW_MS" not in cluster.env
-    cluster.env["TRE_METRICS_WINDOW_MS"] = "10000"
     monkeypatch.setattr(CE, "controller_default_window", lambda: (_ for _ in ()).throw(RuntimeError("no code")))
-    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk3")]) == 2          # unreadable default: refused
+    assert CE.main(["apply", _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="3")), "--backup-dir", str(tmp_path / "bk3")]) == 2
 
 
 def test_apply_is_refused_while_a_runner_or_a_driver_is_active(cluster, tmp_path, monkeypatch):
@@ -326,22 +337,40 @@ def test_apply_is_refused_while_a_runner_or_a_driver_is_active(cluster, tmp_path
     assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 0 and cluster.env["TRE_ACTION_COOLDOWN"] == "2"
 
 
-def test_the_active_patterns_match_runners_and_drivers_but_not_this_tool():
-    hit = ["python3 /x/tre/eval/runner/campaign.py run spec.yaml", "bash /x/tre/eval/runner/run_arm_pilot.sh a b",
-           "bash /x/tre/eval/runner/drivers/icse-r3c-20261101/run_r3c_full_D.sh", "bash /x/run_all3.sh",
-           "bash tre/eval/runner/run_campaign.sh spec.yaml"]
-    miss = ["python3 tre/eval/controller_env/controller_env.py apply x.env --backup-dir /tmp/b", "bash -c ls", "python3 -m pytest"]
+def test_runners_and_drivers_are_recognised_by_launcher_and_directory_but_not_this_tool():
+    hit = ["python3 /x/tre/eval/runner/campaign.py run spec.yaml", "/usr/bin/python3 tre/eval/runner/campaign.py run s.yaml",
+           "bash /x/tre/eval/runner/run_arm_pilot.sh a b",
+           "bash /x/tre/eval/runner/drivers/icse-r3c-20261101/run_r3c_full_D.sh",
+           "/bin/bash /x/run_campaign-bl-w10-apa-ts-20261103.sh", "sh ./run_campaign-x.sh", "/usr/bin/env bash /x/run_all3.sh",
+           "bash tre/eval/runner/run_campaign.sh spec.yaml", "bash -e /x/run_campaign.sh spec.yaml"]
+    miss = ["python3 tre/eval/controller_env/controller_env.py apply x.env --backup-dir /tmp/b", "bash -c ls", "python3 -m pytest",
+            "vim tre/eval/runner/run_campaign.sh", "bash ./run_x.sh", "bash /x/other/setup.sh"]
     for line in hit:
-        assert any(re.search(p, line) for p in CE._ACTIVE_PATTERNS), line
+        assert CE._active(line), line
     for line in miss:
-        assert not any(re.search(p, line) for p in CE._ACTIVE_PATTERNS), line
+        assert not CE._active(line), line
+    # a driver started from inside drivers/ shows no directory in its command line
+    inside = lambda: "/repo/tre/eval/runner/drivers/bl-w10-20261103"
+    assert CE._active("bash ./run_x.sh", inside) and CE._active("sh run_x.sh --flag", inside)
+    assert not CE._active("bash ./run_x.sh", lambda: "/repo/tre/eval/runner") and not CE._active("python3 x.py", inside)
+
+
+def test_runner_active_lists_matching_processes_but_not_itself_or_its_parent(monkeypatch):
+    import os
+
+    procs = [(str(os.getpid()), "bash /x/drivers/a/b.sh"), (str(os.getppid()), "bash /x/drivers/a/b.sh"),
+             ("4242", "python3 /x/campaign.py run s.yaml"), ("4243", "bash ./run_y.sh"), ("4244", "bash ./run_z.sh"), ("4245", "sleep 1")]
+    monkeypatch.setattr(CE, "_processes", lambda: procs)
+    monkeypatch.setattr(CE, "_cwd", lambda pid: "/r/drivers/w" if pid == "4243" else "/r")
+    assert CE.runner_active() == ["4242", "4243"]
 
 
 def test_apply_is_refused_while_an_exclusive_window_marker_exists(cluster, tmp_path, monkeypatch):
     path = _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2"))
     marker = tmp_path / "root" / "TRE_EXCLUSIVE_WINDOW"
     marker.parent.mkdir()
-    marker.write_text("validation 2026-11-03T16:18:02+08:00 2026-11-03T21:18:02+08:00 owner=x\n")
+    marker.write_text("validation 2026-11-03T16:18:02+08:00 2026-11-03T21:18:02+08:00 round=r1 owner=x\n")
+    monkeypatch.delenv("TRE_EXCLUSIVE_WINDOW_FILE")
     monkeypatch.setenv("CAMPAIGN_DATA_ROOT", str(marker.parent))                           # default location
     assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 2 and not cluster.writes()
     monkeypatch.delenv("CAMPAIGN_DATA_ROOT")
@@ -351,11 +380,48 @@ def test_apply_is_refused_while_an_exclusive_window_marker_exists(cluster, tmp_p
     assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 0
 
 
-def test_apply_fails_instead_of_overwriting_a_concurrent_edit_of_the_deployment(cluster, tmp_path):
+def test_apply_is_refused_when_the_marker_location_is_not_configured(cluster, tmp_path, monkeypatch):
+    """Plain shells have neither variable set: a window cannot be ruled out, so the tool does not guess."""
+    path = _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2"))
+    monkeypatch.delenv("TRE_EXCLUSIVE_WINDOW_FILE")
+    monkeypatch.delenv("CAMPAIGN_DATA_ROOT", raising=False)
+    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 2 and not cluster.writes()
+    monkeypatch.setenv("TRE_EXCLUSIVE_WINDOW_FILE", "")                                    # empty is not configured either
+    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk")]) == 2 and not cluster.writes()
+
+
+def test_only_the_owner_of_the_window_may_apply_inside_it(cluster, tmp_path, monkeypatch):
+    path = _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2"))
+    marker = tmp_path / "marker"
+    marker.write_text("validation 2026-11-03T16:18:02+08:00 2026-11-03T21:18:02+08:00 round=r1 owner=run-7\n")
+    monkeypatch.setenv("TRE_EXCLUSIVE_WINDOW_FILE", str(marker))
+    for owner in ("run-8", "run", "r1", ""):
+        assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk"), "--window-owner", owner]) == 2, owner
+    assert not cluster.writes()
+    assert CE.main(["apply", path, "--backup-dir", str(tmp_path / "bk"), "--window-owner", "run-7"]) == 0
+    assert cluster.env["TRE_ACTION_COOLDOWN"] == "2"
+    marker.write_text("validation 2026-11-03T16:18:02+08:00 2026-11-03T21:18:02+08:00\n")      # a marker without owner=
+    assert CE.main(["apply", _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="3")), "--backup-dir", str(tmp_path / "bk2"),
+                    "--window-owner", "run-7"]) == 2
+
+
+def test_a_refused_patch_leaves_no_usable_rollback_script(cluster, tmp_path, capsys):
+    """A concurrent edit makes the API server refuse the patch (resourceVersion): nothing changed, and a rollback.sh written
+    before the patch would overwrite that edit with the old state."""
     cluster.race = True                                                                    # the Deployment changes after it was read
     before = dict(cluster.env)
-    assert CE.main(["apply", _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2")), "--backup-dir", str(tmp_path / "bk")]) == 2
-    assert cluster.env == before
+    bk = tmp_path / "bk"
+    assert CE.main(["apply", _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2")), "--backup-dir", str(bk)]) == 2
+    assert cluster.env == before and "not applied" in capsys.readouterr().out
+    assert not (bk / "rollback.sh").exists() and (bk / "rollback.sh.not-applied").is_file()
+
+
+def test_an_applied_patch_whose_rollout_is_not_confirmed_keeps_its_rollback_script(cluster, tmp_path, capsys):
+    cluster.rollout_fails = True
+    bk = tmp_path / "bk"
+    assert CE.main(["apply", _want(tmp_path, dict(cluster.env, TRE_ACTION_COOLDOWN="2")), "--backup-dir", str(bk)]) == 2
+    assert cluster.env["TRE_ACTION_COOLDOWN"] == "2" and (bk / "rollback.sh").is_file()    # the patch went through
+    assert "rollback" in capsys.readouterr().out and '"$@"' in (bk / "rollback.sh").read_text()
 
 
 def test_env_file_parser_rejects_what_is_not_the_whole_state():

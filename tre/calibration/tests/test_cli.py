@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 
+import pytest
+
 from tre_calibration.cli import main
 from tre_calibration.fit import (
     THETA_METHOD_BALANCED_ACCURACY,
@@ -108,3 +110,9 @@ def _row(scenario_id: str, family: str, trs: float, p95_ttft_client_ms: float, p
         "prompt_tokens_total": "100",
         "generation_tokens_total": "50",
     }
+
+
+def test_a_negative_ema_tau_is_refused(capsys) -> None:
+    with pytest.raises(SystemExit) as stop:
+        main(["--input", "w.csv", "--output", "p.json", "--model-name", "m", "--ema-tau-ms=-1"])
+    assert stop.value.code == 2 and "must be >= 0" in capsys.readouterr().err

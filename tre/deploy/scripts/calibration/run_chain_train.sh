@@ -6,7 +6,7 @@
 #   D1 run1 (run_primitives.sh)
 #   -> barrier: every model in CHAIN_MODELS has finished D1 with exit 0
 #   -> D2 priors (once, by whichever chain takes the D2 lock first): standard dataset of
-#      RUN1_ROOT (if missing), calibration_priors -> PRIORS_DIR, SHA256SUMS, and an
+#      RUN1_ROOT (if missing; cut with the windowing the run1 datasets recorded), calibration_priors -> PRIORS_DIR, SHA256SUMS, and an
 #      addendum text file. No git commit here: the preregistration addendum is committed
 #      by a person (the chain does not wait for it).
 #   -> D3 run2 (run_ladder.sh)
@@ -183,7 +183,12 @@ d2_compute() {
   if [[ ! -s "$RUN1_ROOT/dataset/windows.csv" ]]; then
     if [[ "$DRY" == 1 ]]; then echo "FATAL: $RUN1_ROOT/dataset/windows.csv missing" >&2; exit 1; fi
     echo "building the merged standard dataset of $RUN1_ROOT"
-    python3 -m scripts.calibration_dataset "$RUN1_ROOT"
+    # Cut the windows the per-model datasets of D1 recorded (manifest.json -> windowing), passed explicitly: a change of the
+    # builder's default must never re-cut round 1 (the priors are computed on these windows). No recorded windowing = stop.
+    D2_WINDOWING="$(python3 -m scripts.calibration_dataset "$RUN1_ROOT" --recorded-windowing)"
+    read -r D2_WINDOW_MS D2_STEP_MS <<< "$D2_WINDOWING"
+    echo "windowing recorded by the run1 datasets: window_ms=$D2_WINDOW_MS step_ms=$D2_STEP_MS"
+    python3 -m scripts.calibration_dataset "$RUN1_ROOT" --window-ms "$D2_WINDOW_MS" --step-ms "$D2_STEP_MS"
   fi
   mkdir -p "$D2_OUT"
   python3 -m scripts.analysis.calibration_priors "$RUN1_ROOT" --out-dir "$D2_OUT"
