@@ -80,33 +80,72 @@ metadata:
     app.kubernetes.io/name: tre-v2-baseline-scaler
 data:
   preserve.yaml: |
-    # FROZEN (tools/freeze_params preserve). Sources: mu sha256 04b0b23b6847487447395dd2b5be7d816527ce45ffd99807b4f78aee181d3ba5
-    # NOTE: mu: velocity_ladder mu (aibrix e171131e), scheme B, P share pooled [p5, p95] = [0.2922, 0.8392] (v1 D58: [min, max], the same mu here); no mu cell is the re-measured 14b b22
-    # NOTE: calibration 2026-10-26; provenance <data root>/bl-calib-20261026/SOURCES.md
+    # FROZEN (tools/freeze_params preserve). Sources: mu sha256 54a4bb757bdc49ba6ce2f1c302538d3aa9cde1df52ae29eb6fe25e8ca64636cf (preserve_mu alg1, tool 43edd63ebbeb0e5744f827ecb13b9a28510ae208, config sha256 e6ea9eceacd349bc6c14970a1845be6d4276f8d4e2e5f37a6cd48e6d190dbe9c; provenance in result.json), weights manifest sha256 6cf0202f86e1f2f3e089c4e49f2d19e02fb2e4b0a0255ceaa7f1fd496b9f3e46
+    # NOTE: mu: calib_preserve_mu_20261104/repro-43edd63e/alg1-env-c/mu.yaml (final, envelope c, NL_SLO 62.38 / 64.97 / 43.34 ms; chain baselines/docs/preserve-mu-calibration.md); TTFT+TPOT sensitivity mu = alg1-d379c2f0-env-c-ttfttpot/mu.yaml (set per arm)
     calibration: frozen
     # The trace: replaced per run by the campaign runner (its oracle copy in the trace volume); the
     # history before t0 is next to it, named by the window (preserve_history.history_names): at 10 s
-    # preserve_history_w10.json (tools/preserve_history_azure); at 30 s pre_t0.json, else preserve_history.json.
+    # preserve_history_w10.json (tools/preserve_history_azure), with history_variant V
+    # preserve_history_w10_<V>.json; at 30 s pre_t0.json, else preserve_history.json.
     trace_path: /etc/tre-baselines-traces/case/seed1/traces_tre.effective.json
     trace_seed: 0
     trace_schedule: poisson
     trace_match_parts: 2
     window_s: 10             # = TRE metrics window (2026-11-03; 30 s before, v1 D18; paper 600 s)
     lead_s: 0
-    tier1: mlstm             # paper forecaster; v1 paper_past protocol at W = 10 s (train before the Real_* slices)
+    tier1: mlstm             # paper forecaster (Tier-1 mLSTM)
     tier1_horizon: paper_two_step   # paper Alg. 2: two steps at the start of T_i -> N_{i+1} (2026-11-04)
     tier1_d_source: done_tokens     # paper: observed D = done out_tokens, known at completion (2026-11-04)
     seq_len: 25
-    predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)
-      code: {path: weights/preserve-mlstm-20261103-paper-w10/code-paper-w10.npz, sha256: f8b74a2b91cd570e3b9b565ae8ac0fb5d47a7e9366699bf138d40f91509340c2}
-      conv: {path: weights/preserve-mlstm-20261103-paper-w10/conv-paper-w10.npz, sha256: f21dad6b84f43ff1fc354b35590f0f62ff69e1ab9b7f3f7c66559ca9bc93636b}
-      pooled: {path: weights/preserve-mlstm-20261103-paper-w10/pooled-paper-w10.npz, sha256: e69c2dc188b46e8fa0368e47ea42962697578613745e6c1621dcbb3728f1d7ad}
-    predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled
-    mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,
-                             # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu
-      dsqwen-7b: {"p": 6775.7, "d": 5137.7, "t": 9547.0}
-      dsllama-8b: {"p": 3196.9, "d": 4458.1, "t": 7655.0}
-      dsqwen-14b: {"p": 6164.9, "d": 4013.3, "t": 7533.4}
+    predictor_normalization: minmax   # paper Alg. 1 line 3 (min / max of each file's training series)
+    history_variant: train-tail-20261104   # history before t0 = the end of the trace's training series (weights' REPORT.md)
+    predictors:              # under tre/baselines: weights/preserve-mlstm-20261104-trace-w10 (manifest.json); one file per model
+      v2:                     # V2: trained on the 7 traces concatenated (any trace)
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v2/concat.dsqwen-7b.npz, sha256: b057f4b5ab9ec94bae881186c13f159ed810e13d7bbc65f680fdc01d5ce69612}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v2/concat.dsllama-8b.npz, sha256: 3f0b2db93e7b3a8123562c9644fd53c0668e728cfa6316263891515dff705e59}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v2/concat.dsqwen-14b.npz, sha256: cfa8e88f6e3a89ffdeee3b7a55bd3e42a77dd3774f648a5101beafea60bc2f76}
+      v1-Alternating_hot_model_periodic_A:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Alternating_hot_model_periodic_A.dsqwen-7b.npz, sha256: ea31034af6183361b47c3c6c3f467b4573404b0d3ae26b8b4dc565a02719efc0}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Alternating_hot_model_periodic_A.dsllama-8b.npz, sha256: 7cf8613ca338faaf77bc59a135a318a9d9335df4a3b580982a400a15e1a397de}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Alternating_hot_model_periodic_A.dsqwen-14b.npz, sha256: 4f935df2e8533acea7643ed829548e667dce0aa67ab9b14d211c1661318d3f1c}
+      v1-Simultaneous_spike_ramp_twice_tps1o2:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Simultaneous_spike_ramp_twice_tps1o2.dsqwen-7b.npz, sha256: b3330f2f7f15badb0dffe6b2fa41fd7058e7bdbe6e18b92e25882fd403194092}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Simultaneous_spike_ramp_twice_tps1o2.dsllama-8b.npz, sha256: 33545127a51a926f0c6cb0c67cbd80ea1e502dbf3cdeecb36155749a6c4217f3}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Simultaneous_spike_ramp_twice_tps1o2.dsqwen-14b.npz, sha256: 18c79a416cd977a7d24a309b41d8770406261a2c5531a28fc256cd0d9258a520}
+      v1-Prefill_mixed_corner_decode_mix:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Prefill_mixed_corner_decode_mix.dsqwen-7b.npz, sha256: 6895df8ec224687ac6ec73fea0535b08e37cadaf6627d1afad4f6b28a4dbb491}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Prefill_mixed_corner_decode_mix.dsllama-8b.npz, sha256: e9d3ad347ddfcf6cb8b6547cf5ddf56690aef38a47bfb21af856a7eba3d4369b}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Prefill_mixed_corner_decode_mix.dsqwen-14b.npz, sha256: f4bb765e123915576a7f557bbbdf9826f405bd54392d8661926ea72b82d1aa1d}
+      v1-Decode_heavy_burst:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Decode_heavy_burst.dsqwen-7b.npz, sha256: 47b42951f20808b0f7ec7dae5b209e47accebf8b2a8e939479ca3e4b56b7b951}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Decode_heavy_burst.dsllama-8b.npz, sha256: 20af262f0e6a6440308c0761a1fb5f4b238b0422f9fbb5b0365580a999979a35}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Decode_heavy_burst.dsqwen-14b.npz, sha256: 5cba19ed0fcf9ce28064e33e65010792af7468f198b659d9ea34376ad6c1cc35}
+      v1-Sinusoidal_demand:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Sinusoidal_demand.dsqwen-7b.npz, sha256: 1eb7c6b636820cf4229ce612b59118e424d9bc2bca6d015933558d5ffd15b148}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Sinusoidal_demand.dsllama-8b.npz, sha256: 850fe9164111b6d0f444ce75b23a94f55c5313aecb2984d6ca3c51adffd2fa84}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Sinusoidal_demand.dsqwen-14b.npz, sha256: 8e6385ca1bfa38bce81b77dd527b4169f7204d71114f5533f15792eb9d3c5b37}
+      v1-Real_conv_2023_slice_a_tok70:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Real_conv_2023_slice_a_tok70.dsqwen-7b.npz, sha256: 5c9cdbbaceee37faa2b25e0d8e613be0dc10f54ce15e253fcda4d5136d9cc832}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Real_conv_2023_slice_a_tok70.dsllama-8b.npz, sha256: 396ab0d9e14f37c9f275bfcd12929c899005a890a59ed013db1fbd9e803e0f1d}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Real_conv_2023_slice_a_tok70.dsqwen-14b.npz, sha256: e49bebbd25cb9741c4d79e880a64e26a8319b6f3f8ca09c4d8be4eb22822bf95}
+      v1-Real_code_2024_slice_a_tok70:   # V1: trained on this trace's own past
+        models:
+          dsqwen-7b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Real_code_2024_slice_a_tok70.dsqwen-7b.npz, sha256: 21e14528ac1f920134b4a7f12c66a52070e1f4707d029c830acdd05ae915cf50}
+          dsllama-8b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Real_code_2024_slice_a_tok70.dsllama-8b.npz, sha256: a3e0716aded448e8f1f09790a0caf2244845176723029006bb99ecf35e02aa9c}
+          dsqwen-14b: {path: weights/preserve-mlstm-20261104-trace-w10/v1/Real_code_2024_slice_a_tok70.dsqwen-14b.npz, sha256: e29df732db1a0b08a246c10283c97dec4dbeff54bee6e410fa70cc2defe0ed23}
+    predictor_rules: [["Alternating_hot_model_periodic_A", "v2"], ["Simultaneous_spike_ramp_twice_tps1o2", "v2"], ["Prefill_mixed_corner_decode_mix", "v2"], ["Decode_heavy_burst", "v2"], ["Sinusoidal_demand", "v2"], ["Real_conv_2023_slice_a_tok70", "v2"], ["Real_code_2024_slice_a_tok70", "v2"]]   # V2 for every trace (default); a V1 arm overrides the rules (freeze_params.predictor_rules)
+    mu:                      # tok/s per replica, PreServe Alg. 1 (tools/preserve_mu alg1): 10 s windows of the
+                             # TSS / theta training set, clean = every request within NL_SLO, max over clean windows
+      dsqwen-7b: {"p": 10137.6, "d": 7424.0, "t": 12672.0}
+      dsllama-8b: {"p": 8140.8, "d": 5056.0, "t": 10176.0}
+      dsqwen-14b: {"p": 6374.4, "d": 4480.0, "t": 7968.0}
     load_error_mode: paper_tab2_relative   # paper RQ2 'w/ load errors': Tab. 2 as a relative error (2026-11-04)
     underload_pending_gate: false   # paper §4.3.2 scale-in rule only (2026-11-04)
     load_error_seed: 0       # the same draws in every arm and replay seed (as TokenScale seed: 0)

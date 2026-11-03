@@ -114,11 +114,21 @@ def test_policy_configmaps_hold_frozen_parameters() -> None:
         if policy == "preserve":
             # Tier-1 reads the trace at start from the per-environment trace volume; the shipped
             # weights load (sha256 checked); the history comes with the trace (injected here)
+            # (2026-11-04: the rules name a set per trace; every trace's set loads, the default rules (V2) and
+            # the V1 rules a V1 arm sets)
+            from tre_baselines.tools import freeze_params as fp
+
             assert params["trace_path"].startswith("/etc/tre-baselines-traces/")
-            oracle = SimpleNamespace(window_s=float(params["window_s"]), max_tokens_max={}, path=params["trace_path"],
-                                     n_windows=24)
             hist = {m: [[1.0, 1.0]] * int(params["seq_len"]) for m in models}
-            PreServePolicy(cfg, oracle=oracle, history=hist)
+            rules = params.get("predictor_rules") or []
+            runs = [(t, rules) for t, _s in rules] + [(t, fp.predictor_rules("v1")) for t, _s in rules]
+            for trace, rl in runs or [(None, rules)]:
+                path = params["trace_path"] if trace is None else f"/etc/tre-baselines-traces/{trace}/seed1/t.json"
+                c = Config(sm_url="x", redis_url="y", policy=policy, models=models,
+                           policy_params={**params, "trace_path": path, "trace_match_parts": 3, "predictor_rules": rl})
+                oracle = SimpleNamespace(window_s=float(params["window_s"]), max_tokens_max={}, path=path, n_windows=24)
+                pol = PreServePolicy(c, oracle=oracle, history=hist)
+                assert trace is None or pol.predictor_set == dict(rl)[trace]
         else:
             build_policy(policy, cfg)
 
