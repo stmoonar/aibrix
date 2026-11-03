@@ -627,7 +627,7 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
               "predictors": {k: {"path": f"{W30}/{k}-paper.npz", "sha256": v} for k, v in sha.items()}}
     p = build_policy("preserve", cfg(params))
     assert p.predictor_set == "code" and p.history_info["trace"] == "Real_code"
-    est = p._predictors["prompt"].predict([r[0] for r in p._history["m"]])
+    est = p._predictors["m"]["prompt"].predict([r[0] for r in p._history["m"]])
     assert np.isfinite(est) and 0 < est < 1e6
     # golden values: v1 tre_preserve.predictor (dev ceb88b4) on these weights, numpy 1.26.4
     from tre_baselines.policies import preserve_predictor as pp

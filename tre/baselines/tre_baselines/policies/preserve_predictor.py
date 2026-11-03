@@ -29,6 +29,14 @@ declares it: scalar key ``window_s`` (written by ``preserve_train/export.py``). 
 three files of ``weights/preserve-mlstm-20261024-paper`` predate the key; their window (30 s, their
 REPORT.md) is known by sha256 (:data:`LEGACY_WINDOW_S`). Any other file without the key is refused,
 and the policy refuses weights of another window than ``params.window_s``.
+
+Normalization ``minmax`` (2026-11-04, the paper's Alg. 1 line 3, ``preserve_train/trace_train.py``):
+``x' = (x - min) / (max - min)`` with the ``min`` / ``max`` of the predictor's training series, stored per kind
+in the file (scalar keys ``<kind>.norm_min``, ``<kind>.norm_max``); the prediction is
+``max(0, out * (max - min) + min)``. A file declares its normalization (key ``normalization``) and the policy
+refuses one that differs from ``params.predictor_normalization`` (default ``per_sequence_mean``). Optional
+scalar keys ``model`` / ``trace`` / ``variant`` name what a per-model file was trained on (the policy refuses a
+per-model file mapped to another model).
 """
 
 from __future__ import annotations
@@ -41,6 +49,8 @@ import numpy as np
 FORMAT_VERSION = 1
 KINDS = ("prompt", "response")
 PER_SEQUENCE_MEAN = "per_sequence_mean"
+MINMAX = "minmax"
+NORMALIZATIONS = (PER_SEQUENCE_MEAN, MINMAX)
 #: sha256 -> training window (s) of exported files without a ``window_s`` key (v1 paper_past, 10-24).
 LEGACY_WINDOW_S = {
     "3e70e4642829427ac5a528bfd6ff77e8e29335960adbab76832a6d5168251fb4": 30.0,  # code-paper.npz
@@ -57,9 +67,20 @@ class Predictor:
     """One trained mLSTM (prompt tokens or response tokens) for one model set."""
 
     def __init__(self, weights: Dict[str, np.ndarray], seq_len: int, hidden: int, eps: float,
-                 normalization: str, kind: str, window_s: Optional[float] = None):
-        if normalization != PER_SEQUENCE_MEAN:
-            raise ValueError(f"unsupported normalization {normalization!r} (only {PER_SEQUENCE_MEAN!r} ships)")
+                 normalization: str, kind: str, window_s: Optional[float] = None,
+                 norm_min: Optional[float] = None, norm_max: Optional[float] = None,
+                 model: Optional[str] = None):
+        if normalization not in NORMALIZATIONS:
+            raise ValueError(f"unsupported normalization {normalization!r} (one of {NORMALIZATIONS})")
+        if normalization == MINMAX:
+            if norm_min is None or norm_max is None or not (np.isfinite(norm_min) and np.isfinite(norm_max)) \
+                    or not norm_max > norm_min:
+                raise ValueError(f"{kind}: minmax needs finite norm_min < norm_max, got {norm_min}, {norm_max}")
+            self.norm_min, self.norm_max = float(norm_min), float(norm_max)
+        else:
+            self.norm_min = self.norm_max = None
+        #: the service the file was trained for (per-model files), else None
+        self.model = None if model is None else str(model)
         self.seq_len = int(seq_len)
         self.hidden = int(hidden)
         self.eps = float(eps)
@@ -98,6 +119,9 @@ class Predictor:
         x = hist[-self.seq_len:]
         if not np.all(np.isfinite(x)):
             raise ValueError("history contains non-finite values")
+        if self.normalization == MINMAX:
+            span = self.norm_max - self.norm_min
+            return max(0.0, self.forward((x - self.norm_min) / span) * span + self.norm_min)
         scale = max(float(x.mean()), self.eps)
         return max(0.0, self.forward(x / scale)) * scale
 
@@ -114,9 +138,12 @@ def load_predictor(path: str, kind: str) -> Predictor:
         weights = {k[len(prefix):]: z[k] for k in z.files if k.startswith(prefix)}
         if not weights:
             raise ValueError(f"{path}: no {kind!r} model in file")
+        weights = {k: v for k, v in weights.items() if k not in ("norm_min", "norm_max")}
         window_s = float(z["window_s"]) if "window_s" in z.files else None
+        opt = {k: float(z[f"{prefix}{k}"]) for k in ("norm_min", "norm_max") if f"{prefix}{k}" in z.files}
         return Predictor(weights, seq_len=int(z["seq_len"]), hidden=int(z["hidden"]), eps=float(z["eps"]),
-                         normalization=str(z["normalization"]), kind=kind, window_s=window_s)
+                         normalization=str(z["normalization"]), kind=kind, window_s=window_s,
+                         model=str(z["model"]) if "model" in z.files else None, **opt)
 
 
 def sha256_of(path: str) -> str:
