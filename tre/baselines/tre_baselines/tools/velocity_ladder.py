@@ -32,16 +32,32 @@ Port of the TRE v1 tool (``tre_code`` dev ``python/tre_tokenscale/tools/profile_
   - the v2 knee (highest bounded step) is kept for comparison only; D52 (disclosure only): about
     ``--stream-frac`` of the requests stream, giving p95 TTFT / TPOT and the best step meeting the
     TokenScale paper SLO.
-  - every request is logged (``raw/<model>_<cell>_<rate>.jsonl``: send, done, ok, prompt and
-    completion tokens), so ``mu`` can re-judge the same steps.
+  - every request is logged (``raw/<model>_<cell>_<rate>.jsonl``: send, first (streamed only),
+    done, end, ok, prompt and completion tokens), so ``mu`` can re-judge the same steps.
 
 * ``isolated``: one request at a time per model (pod idle before each), the mix shape and the
   nine cell centres, ``--runs`` each: the isolated normalized latency NL = e2e / output tokens,
   the base of PreServe's SLO (3 x isolated NL of the mix shape, paper section 5.1; v1 D58).
 
 * ``mu`` (offline): PreServe Alg. 1 lines 8-11 from the ladder: a step passes when it is
-  effective and **every** request sent in its window completed with NL <= SLO; mu_p / mu_d / mu_t
-  = per term the highest engine rate over passing steps. Variant B (v1 D58, used) keeps only the
+  effective and **no** request sent in its window violated the SLO; mu_p / mu_d / mu_t = per term
+  the highest engine rate over passing steps. The SLO (``--slo-rule``):
+
+  - ``unified`` (user decision 2026-11-04, the rule for new calibrations): the one per-request SLO
+    of ``tools/slo_judge.py`` (format-independent; this tool adapts its raw records with
+    ``slo_judge.from_ladder_record``) - a request violates when it failed or hit the route timeout, when
+    its TTFT > ``max(floor, k * (c_m + b_m * L))`` (``tre_common.slo_labels.request_ttft_slo_ms``,
+    c / b / k / floor from the ``--registry`` ``slo`` block, L = its prompt tokens) or its TPOT =
+    (done - first) / (completion tokens - 1) > ``tpot_p95_ms`` (75 ms; one output token: TTFT
+    only). Needs a first-token time for every served request (a ladder run with
+    ``--stream-frac 1.0``); a non-streamed request in a judged window makes ``mu`` refuse, it is
+    never skipped. The output records the registry path + sha256 and the resolved c / b / k /
+    floor / TPOT per model, per step the violations by cause and TTFT / TPOT p95 and max, per
+    variant-B cell whether the passing rates are bracketed below and above;
+  - ``nl`` (default, reproduces the 10-26 result): PreServe's paper SLO, NL = e2e / output
+    tokens <= ``--slo-factor`` (3) x the isolated NL of the mix shape (needs ``--isolated-dir``).
+
+  Variant B (v1 D58, used) keeps only the
   cells whose P share in / (in + out) lies in the campaign traces' window share range
   (``p_share.pooled`` of the buckets report, **[p5, p95]** by default, ``--p-share-range
   minmax`` for v1's [min, max]); variant A (all cells) is reported. Deviation from v1 (coordinator
@@ -546,9 +562,35 @@ def judge_step(step: Step, records: Sequence[Dict[str, Any]], slo_s: float, rule
             "effective": effective, "passes": bool(n) and effective and within == n}
 
 
+def judge_step_unified(step: Step, records: Sequence[Dict[str, Any]], slo: Any, rules: Rules) -> Dict[str, Any]:
+    """PreServe Alg. 1 line 8 under the unified SLO (``slo_judge``): the step passes when it is
+    effective and no request sent inside its measured window violated the SLO (failed / TTFT /
+    TPOT). Raises ``slo_judge.UnjudgeableWindow`` when a served request there was not streamed."""
+    from tre_baselines.tools import slo_judge
+
+    lo, hi = step.window_lo, step.window_hi
+    if lo is None or hi is None:
+        w = {"n": 0, "meets_slo": False}
+    else:
+        reqs = [slo_judge.from_ladder_record(r, step.model, default_prompt_tokens=step.in_tokens) for r in records]
+        # the step window counts requests sent in [lo, hi] (fill_step); the judge's is half-open
+        w = slo_judge.judge_window(reqs, lo, math.nextafter(hi, math.inf), slo, route_timeout_s=rules.route_timeout_s)
+        w.pop("lo", None)
+        w.pop("hi", None)
+    why = ineffective_why(step, rules)
+    return {"model": step.model, "cell": step.cell, "in_tokens": step.in_tokens, "out_tokens": step.out_tokens,
+            "p_share": round(step.in_tokens / (step.in_tokens + step.out_tokens), 4),
+            "rate_rps": round(step.rate_rps, 3), "ttft_slo_ms_cell": round(float(slo.ttft_slo_ms(step.in_tokens)), 1),
+            **{k: v for k, v in w.items() if k != "meets_slo"},
+            "prefill_tok_s": step.prefill_tok_s, "decode_tok_s": step.decode_tok_s, "total_tok_s": step.tok_s,
+            "effective": why is None, "ineffective": why, "passes": why is None and bool(w["meets_slo"])}
+
+
 def mu_from(judged: Sequence[Dict[str, Any]], keep: Callable[[Dict[str, Any]], bool]) -> Dict[str, Any]:
     """Alg. 1 lines 9-11: per term the highest engine rate over passing steps (each term may come
-    from a different step); ``bracketed`` = a faster step of the same cell failed."""
+    from a different step); ``bracketed_below`` = it comes from a passing step (always, when there is
+    a value), ``bracketed_above`` (= ``bracketed``, the old name) = a faster step of the same cell
+    failed, so the term is not just the top of the ladder."""
     res: Dict[str, Any] = {}
     for key, col in (("p", "prefill_tok_s"), ("d", "decode_tok_s"), ("t", "total_tok_s")):
         ok = [s for s in judged if keep(s) and s["passes"] and s[col] is not None]
@@ -557,9 +599,27 @@ def mu_from(judged: Sequence[Dict[str, Any]], keep: Callable[[Dict[str, Any]], b
             continue
         best = max(ok, key=lambda s: s[col])
         above = [s for s in judged if s["cell"] == best["cell"] and s["rate_rps"] > best["rate_rps"]]
+        failed_above = any(not s["passes"] for s in above)
         res[key] = {"value": round(best[col], 1), "cell": best["cell"], "rate_rps": best["rate_rps"],
-                    "p_share": best["p_share"], "bracketed": any(not s["passes"] for s in above)}
+                    "p_share": best["p_share"], "bracketed": failed_above,
+                    "bracketed_below": True, "bracketed_above": failed_above}
     return res
+
+
+def cell_brackets(judged: Sequence[Dict[str, Any]], keep: Callable[[Dict[str, Any]], bool]) -> Dict[str, Any]:
+    """Per kept cell: the fastest passing and the slowest failing step rate; bracketed when a
+    passing step lies below a failing one (the SLO boundary is inside the ladder)."""
+    out: Dict[str, Any] = {}
+    for cell in sorted({s["cell"] for s in judged if keep(s)}):
+        st = [s for s in judged if s["cell"] == cell]
+        ok = [s["rate_rps"] for s in st if s["passes"]]
+        bad = [s["rate_rps"] for s in st if not s["passes"]]
+        top_ok = max(ok, default=None)
+        out[cell] = {"pass_rps_max": top_ok, "fail_rps_min": min(bad, default=None),
+                     "bracketed_below": top_ok is not None,
+                     "bracketed_above": top_ok is not None and any(r > top_ok for r in bad),
+                     "rates": sorted(s["rate_rps"] for s in st)}
+    return out
 
 
 # ------------------------------------------------------------------ cluster access (read only)
@@ -883,6 +943,11 @@ def fill_step(st: Step, records: List[Dict[str, Any]], samples: List[Dict[str, A
     st.mean_completion_tokens = round(sum(cts) / len(cts), 1) if cts else None
 
 
+def raw_log_path(raw_dir: Path, model: str, cell: str, rate_rps: float) -> Path:
+    """The per-request log of one ladder step (written by ``ladder``, read by ``mu``)."""
+    return Path(raw_dir) / f"{model}_{cell}_{rate_rps:.3f}.jsonl"
+
+
 def make_measure(model: str, fleet: Dict[str, Any], namespace: str, *, port: int, step_s: float, measure_s: float,
                  max_num_seqs: int, lifetimes: float, seed: int, drain_cap_s: float, raw_dir: Path,
                  prompt_processes: int = 4, stream_frac: float = DEFAULT_STREAM_FRAC, kubectl: str = "kubectl",
@@ -990,7 +1055,7 @@ def make_measure(model: str, fleet: Dict[str, Any], namespace: str, *, port: int
         lo = hi - measure_s
         st.samples_bad = sum(1 for d in read_samples(sample_path, ok=False) if d["t"] is None or lo <= d["t"] <= hi)
         fill_step(st, records, samples, t0, lo, hi, sent)
-        with open(raw_dir / f"{model}_{cell}_{rate_rps:.3f}.jsonl", "w", encoding="utf-8") as fh:
+        with open(raw_log_path(raw_dir, model, cell, rate_rps), "w", encoding="utf-8") as fh:
             for r in sorted(records, key=lambda r: r["k"]):
                 fh.write(json.dumps(r) + "\n")
         deadline = time.time() + drain_cap_s
@@ -1389,12 +1454,17 @@ def isolated_main(argv: List[str]) -> int:
 
 
 def mu_main(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser(prog="velocity_ladder mu", description="PreServe mu by normalized latency (D58)")
+    ap = argparse.ArgumentParser(prog="velocity_ladder mu", description="PreServe mu (Alg. 1) from the ladder steps")
     ap.add_argument("--ladder-dir", required=True, help="out-dir of the ladder run (step logs + raw/)")
-    ap.add_argument("--isolated-dir", required=True, help="out-dir of the isolated run")
+    ap.add_argument("--slo-rule", choices=["nl", "unified"], default="nl",
+                    help="nl: paper NL <= slo-factor x isolated NL of the mix (D58, the 10-26 result); unified: "
+                         "per request TTFT <= max(floor, k (c + b L)) and TPOT <= tpot_p95_ms of --registry "
+                         "(user 2026-11-04; every request must have streamed)")
+    ap.add_argument("--isolated-dir", default=None, help="out-dir of the isolated run (--slo-rule nl)")
+    ap.add_argument("--registry", default=None, help="registry YAML with the models' slo blocks (--slo-rule unified)")
     ap.add_argument("--report", required=True, help="buckets report (p_share range)")
     ap.add_argument("--models", default="dsqwen-7b,dsllama-8b,dsqwen-14b")
-    ap.add_argument("--slo-factor", type=float, default=3.0, help="SLO = this x isolated NL of the mix shape")
+    ap.add_argument("--slo-factor", type=float, default=3.0, help="nl: SLO = this x isolated NL of the mix shape")
     ap.add_argument("--min-completed", type=int, default=150)
     ap.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES)
     ap.add_argument("--route-timeout-s", type=float, default=DEFAULT_ROUTE_TIMEOUT_S)
@@ -1413,40 +1483,81 @@ def mu_main(argv: List[str]) -> int:
     if lo is None or hi is None:
         print(f"error: the report has no p_share.pooled {klo} / {khi}", file=sys.stderr)
         return 2
-    ladder, iso = Path(a.ladder_dir), Path(a.isolated_dir)
+    unified = a.slo_rule == "unified"
+    if unified and not a.registry:
+        print("error: --slo-rule unified needs --registry", file=sys.stderr)
+        return 2
+    if not unified and not a.isolated_dir:
+        print("error: --slo-rule nl needs --isolated-dir", file=sys.stderr)
+        return 2
+    ladder = Path(a.ladder_dir)
     summary: Dict[str, Any] = {"p_share_range": [lo, hi], "p_share_range_rule": f"pooled [{klo}, {khi}]",
-                               "slo_factor": a.slo_factor, "models": {}}
+                               "slo_rule": a.slo_rule, "models": {}}
+    if not unified:
+        summary["slo_factor"] = a.slo_factor
     if a.p_share_range == "p5p95":
         summary["p_share_deviation"] = (
             f"v1 D58 used [min, max] = [{pooled.get('min')}, {pooled.get('max')}]; here [p5, p95]: v1's range was "
             "narrow because v1's traces were, on this set a few extreme windows would let shapes far from the "
             "load pick mu")
+    registry = None
+    if unified:
+        from tre_baselines.tools import slo_judge
+        from tre_common.registry import load_registry
+        try:
+            registry = load_registry(a.registry)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"error: registry {a.registry}: {exc!r}", file=sys.stderr)
+            return 2
+    in_b = lambda s: lo <= s["p_share"] <= hi  # noqa: E731
     all_rows: List[Dict[str, Any]] = []
     mu_b: Dict[str, Any] = {}
     for m in models:
-        recs = [json.loads(x) for x in (iso / f"{m}.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
-        nl, bad = isolated_nl(recs)
-        if "mix" not in nl:
-            print(f"error: {m}: no clean isolated mix-shape run", file=sys.stderr)
-            return 2
-        slo_s = a.slo_factor * nl["mix"]["mean"]
+        entry: Dict[str, Any] = {}
+        if unified:
+            try:
+                slo = slo_judge.unified_slo(m, registry)
+            except (KeyError, SystemExit, ValueError) as exc:
+                print(f"error: {m}: no unified SLO in {a.registry}: {exc}", file=sys.stderr)
+                return 2
+            entry["slo"] = slo_judge.slo_record(slo, registry.model(m).slo.ttft_slo_mode)
+        else:
+            iso = Path(a.isolated_dir)
+            recs = [json.loads(x) for x in (iso / f"{m}.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+            nl, bad = isolated_nl(recs)
+            if "mix" not in nl:
+                print(f"error: {m}: no clean isolated mix-shape run", file=sys.stderr)
+                return 2
+            slo_s = a.slo_factor * nl["mix"]["mean"]
+            entry.update(isolated_nl_ms={k: {"mean": round(1000 * v["mean"], 3), "sd": round(1000 * v["sd"], 3),
+                                             "n": v["n"]} for k, v in nl.items()},
+                         isolated_bad_records=bad, slo_ms=round(1000 * slo_s, 3))
         steps = steps_from_log(ladder / f"profile-{m}.log.jsonl").get(m, [])
         judged = []
         for s in steps:
-            raw = ladder / "raw" / f"{m}_{s.cell}_{s.rate_rps:.3f}.jsonl"
+            raw = raw_log_path(ladder / "raw", m, s.cell, s.rate_rps)
             rr = [json.loads(x) for x in raw.read_text(encoding="utf-8").splitlines() if x.strip()]
-            judged.append(judge_step(s, rr, slo_s, rules))
+            if not unified:
+                judged.append(judge_step(s, rr, slo_s, rules))
+                continue
+            try:
+                judged.append(judge_step_unified(s, rr, slo, rules))
+            except slo_judge.UnjudgeableWindow as exc:
+                print(f"error: {m} {s.cell} {s.rate_rps:.3f} req/s ({raw}): {exc}; the unified SLO needs every "
+                      "request streamed (ladder --stream-frac 1.0)", file=sys.stderr)
+                return 2
         all_rows += judged
-        mu_a = mu_from(judged, lambda s: True)
-        mb = mu_from(judged, lambda s: lo <= s["p_share"] <= hi)
-        summary["models"][m] = {"isolated_nl_ms": {k: {"mean": round(1000 * v["mean"], 3), "sd": round(1000 * v["sd"], 3),
-                                                       "n": v["n"]} for k, v in nl.items()},
-                                "isolated_bad_records": bad, "slo_ms": round(1000 * slo_s, 3),
-                                "mu": {"A": mu_a, "B": mb}}
+        entry["mu"] = {"A": mu_from(judged, lambda s: True), "B": mu_from(judged, in_b)}
+        if unified:
+            entry["cells_B"] = cell_brackets(judged, in_b)
+        summary["models"][m] = entry
+        mb = entry["mu"]["B"]
         if all(mb.get(k) for k in ("p", "d", "t")):
             mu_b[m] = {k: mb[k]["value"] for k in ("p", "d", "t")}
     summary["mu_B"] = mu_b
     summary["sources"] = {"report_sha256": _sha256(a.report)}
+    if unified:
+        summary["sources"].update(registry=str(Path(a.registry).resolve()), registry_sha256=_sha256(a.registry))
     Path(a.out).write_text(yaml.safe_dump(summary, sort_keys=False, default_flow_style=None), encoding="utf-8")
     if all_rows:
         with Path(a.out).with_suffix(".steps.csv").open("w", newline="", encoding="utf-8") as fh:

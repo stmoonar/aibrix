@@ -28,6 +28,32 @@ def test_ttft_threshold_is_max_of_floor_and_slowdown():
     assert M.ttft_threshold_ms({**SLO, "ttft_slo_mode": "fixed"}, 2000) == 500.0
 
 
+def test_ttft_threshold_is_the_one_shared_definition():
+    # the 7b registry values: unchanged by the delegation to tre_common (2026-11-04)
+    from tre_common.slo_labels import label_def_for_model, request_ttft_slo_ms
+    slo7 = {**SLO, "ttft_idle_c_ms": 41.1, "ttft_idle_b_ms_per_token": 0.0694}
+    assert M.ttft_threshold_ms(slo7, 256) == 500.0                       # 5 * 58.9 = 294.3 < floor
+    assert M.ttft_threshold_ms(slo7, 2048) == pytest.approx(916.156)     # 5 * (41.1 + 142.13)
+    label = label_def_for_model("m", mode="slowdown", c=41.1, b=0.0694, k=5.0, floor=500.0)
+    for L in (0, 256, 1000, 2048, 8000):
+        assert M.ttft_threshold_ms(slo7, L) == label.ttft_slo_ms(L) == request_ttft_slo_ms(
+            L, c_ms=41.1, b_ms_per_token=0.0694)
+
+
+def test_metrics_import_with_only_tre_eval_on_the_path():
+    # report.py / runner/score_pilot.py put only tre/eval on sys.path
+    import subprocess
+    import sys
+    eval_dir = os.path.dirname(os.path.dirname(os.path.abspath(M.__file__)))
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    p = subprocess.run([sys.executable, "-c", "from tre_eval import metrics as M; "
+                        "print(M.ttft_threshold_ms({'ttft_slo_mode': 'slowdown', 'ttft_idle_c_ms': 41.1, "
+                        "'ttft_idle_b_ms_per_token': 0.0694}, 2048))"],
+                       cwd=eval_dir, env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    assert float(p.stdout) == pytest.approx(916.156)
+
+
 @pytest.mark.parametrize("kw,viol,what", [
     ({}, False, "nominal"),
     ({"ttft": 0.6}, True, "v_ttft"),                        # 600 ms > 500 ms

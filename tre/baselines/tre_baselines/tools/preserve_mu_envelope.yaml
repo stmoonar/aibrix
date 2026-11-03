@@ -1,0 +1,23 @@
+# Input of `python3 -m tre_baselines.tools.preserve_eval_envelope --config <this file> --data-root <root> --out <dir>`:
+# the shape envelope of the PreServe mu calibration (user 2026-11-04). preserve_mu alg1 keeps a dataset window
+# only if its arrived requests' shape lies inside the envelope file named by `default` (alg1 config
+# `envelope_default`; a / b only as sensitivity rows, alg1 --envelope-variant).
+#   a = P share [min, max]   b = P share [p5, p95]   c = mean input and mean output length each [min, max]
+# of the evaluation traces' 10 s arrival windows, per model.
+window_s: 10
+default: c                  # -> envelope_c.yaml, name lengths-minmax
+
+# The evaluation trace set: the 7 traces of eval/runner/campaigns/campaign-bl-w10-preserve-20261103.yaml (seed 1),
+# dirs relative to --data-root, sha256 of <set>/<trace>/<trace_file> (the tool refuses another file).
+trace_file: seed1/traces_tre.effective.json
+# A request without max_output_tokens gets the max_tokens of its model in the trace's loadgen config (relative to
+# the tre/ tree; = the campaign spec's loadgen_config_root), the value the replayer sends.
+loadgen_config_root: loadgen_v1/configs/traces_v14
+traces:
+  - {set: traces-icse-r3c-20261101,   trace: Alternating_hot_model_periodic_A,     sha256: 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf}
+  - {set: traces-icse-r3c-20261101,   trace: Simultaneous_spike_ramp_twice_tps1o2, sha256: 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93}
+  - {set: traces-icse-r3c-20261101,   trace: Prefill_mixed_corner_decode_mix,      sha256: 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e}
+  - {set: traces-icse-ktrace-20261031, trace: Decode_heavy_burst,                  sha256: f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929}
+  - {set: traces-icse-ktrace-20261031, trace: Sinusoidal_demand,                   sha256: 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab}
+  - {set: traces-icse-r3e-20261101,   trace: Real_conv_2023_slice_a_tok70,         sha256: 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5}
+  - {set: traces-icse-r3e-20261101,   trace: Real_code_2024_slice_a_tok70,         sha256: 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c}

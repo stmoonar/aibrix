@@ -207,6 +207,24 @@ class LabelInputError(ValueError):
     """The window row lacks a column the label definition needs."""
 
 
+def request_ttft_slo_ms(
+    prompt_tokens: float,
+    *,
+    c_ms: float,
+    b_ms_per_token: float,
+    k: float = DEFAULT_TTFT_SLOWDOWN_K,
+    floor_ms: float = DEFAULT_TTFT_FLOOR_MS,
+) -> float:
+    """The one per-request slowdown TTFT threshold: ``max(floor, k * (c + b * L))``.
+
+    ``c`` / ``b`` = the model's idle TTFT fit (registry ``slo.ttft_idle_c_ms`` /
+    ``ttft_idle_b_ms_per_token``), ``L`` = the request's prompt tokens. Every consumer
+    (:meth:`LabelDefinition.ttft_slo_ms`, ``tre_eval.metrics.ttft_threshold_ms``, the
+    baseline calibration tools) computes the threshold here."""
+    idle = float(c_ms) + float(b_ms_per_token) * float(prompt_tokens)
+    return max(float(floor_ms), float(k) * idle)
+
+
 # -------------------------------------------------------------------- row accessors
 
 
@@ -457,8 +475,10 @@ class LabelDefinition:
             return float(self.ttft_p95_ms)
         if prompt_tokens is None:
             raise ValueError("slowdown TTFT SLO needs the prompt length")
-        idle = float(self.ttft_idle_c_ms) + float(self.ttft_idle_b_ms_per_token) * float(prompt_tokens)
-        return max(float(self.ttft_floor_ms), float(self.ttft_slowdown_k) * idle)
+        return request_ttft_slo_ms(
+            prompt_tokens, c_ms=self.ttft_idle_c_ms, b_ms_per_token=self.ttft_idle_b_ms_per_token,
+            k=self.ttft_slowdown_k, floor_ms=self.ttft_floor_ms,
+        )
 
     def latency_slo_ms(self) -> dict[str, float]:
         """Fixed-mode thresholds keyed by SLO name (the fixed arm; legacy callers)."""
