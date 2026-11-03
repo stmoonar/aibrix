@@ -265,7 +265,7 @@ def cmd_finish(a) -> int:
            "trainer_manifest_sha256": sha256_file(train_dir / "manifest.json"), "trainer_code": man["code"],
            "trainer_env": man["env"], "trainer_argv": man["argv"], "window_s": a.window_s, "files": files,
            "held_out_mape_mlstm": {str(a.window_s): man["held_out_mape"]},
-           "held_out_mape_naive_last_window": naive}
+           "held_out_mape_naive_last_window": naive, "run_notes": list(a.note)}
     if ref_man is not None:
         doc["held_out_mape_mlstm"][str(ref_man["window_s"])] = ref_man["held_out_mape"]
         doc["reference_dir"] = str(a.ref_train_dir)
@@ -290,8 +290,10 @@ def _report(doc: dict, man: dict) -> str:
          "and dataset files are the trainer's defaults / the same arguments.", "",
          f"Each file below is the trainer's file plus one scalar key `window_s` = {W} "
          "(the policy refuses to start when it differs from `params.window_s`); predictions are bit-identical "
-         "to the trainer's file.", "",
-         "| set | file | sha256 | trainer file sha256 |", "|---|---|---|---|"]
+         "to the trainer's file.", ""]
+    if doc.get("run_notes"):
+        L += ["Run differences (not protocol):", ""] + [f"- {n}" for n in doc["run_notes"]] + [""]
+    L += ["| set | file | sha256 | trainer file sha256 |", "|---|---|---|---|"]
     for s, r in doc["files"].items():
         L.append(f"| {s} | `{r['file']}` | `{r['sha256']}` | `{r['trainer_file_sha256']}` |")
     L += ["", "## Held-out MAPE (%): mLSTM (shipped per_sequence_mean) vs naive last window", "",
@@ -329,6 +331,7 @@ def main(argv=None) -> int:
     f.add_argument("--v1-python", required=True, help="tre_code/python of the trainer's checkout")
     f.add_argument("--window-s", type=int, required=True)
     f.add_argument("--out", required=True, help="weights directory (tre/baselines/weights/<name>)")
+    f.add_argument("--note", action="append", default=[], help="a run difference for REPORT.md (repeatable)")
     a = ap.parse_args(argv)
     return cmd_windows(a) if a.cmd == "windows" else cmd_finish(a)
 
