@@ -78,7 +78,7 @@ spec:
             # evidence step. The metrics window must be a multiple of both.
             # 2026-10-28: 1 s (was 2 s; code default still 2 s): one snapshot per second,
             # so the 5 s rescue / 10 s rebalance sections land exactly on the grid, and
-            # the windows match the theta calibration (1 Hz counters, 20 s windows).
+            # the windows match the theta calibration (1 Hz counters; 10 s windows since 2026-11-03).
             # Changes together with the gateway's value (else every snapshot is stale).
             - name: TRE_INSTANT_SAMPLE_INTERVAL_MS
               value: "500"
@@ -130,8 +130,14 @@ spec:
             # noise, so a shorter window stays usable). Every model's registry
             # trs.theta_window_ms must equal this - the controller refuses to start
             # otherwise (thetas are window token totals).
+            # 2026-11-03 (user decision): 10 s. The live Deployment has run with 10 s since the
+            # 2026-10-31 w10refit publication (every TRE and baseline run of the 10-31 .. 11-03
+            # campaigns); the overlay now says so. The bootstrap registry (deploy/registry.yaml,
+            # overlays/tre-v2/params.yaml) still stamps theta_window_ms 20000 with 20 s thetas:
+            # publish a registry with theta_window_ms 10000 (see tre/eval/registries/) before
+            # this controller starts, or it refuses to start.
             - name: TRE_METRICS_WINDOW_MS
-              value: "20000"
+              value: "10000"
             # SafeScale latency thresholds come from the registry (safescale.slo_mode,
             # 2026-09-29): SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS are
             # optional overrides and deliberately NOT set here. (Older images default

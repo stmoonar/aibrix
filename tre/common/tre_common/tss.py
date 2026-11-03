@@ -15,8 +15,8 @@ Plan 2026-09-21 §6.4 (unified definition)::
   ``request_*_tokens`` histogram sums, i.e. the tokens of the requests that COMPLETED in
   the window (:data:`NUMERATOR_COMPLETION_HISTOGRAMS`; offline only, to reproduce old
   freezes);
-* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (20 s since 2026-10-28, 30 s
-  before), so the numerator is a **window token total**, the convention main and v1
+* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (10 s since 2026-10-31 live and 2026-11-03 in the overlay;
+  20 s from 2026-10-28, 30 s before), so the numerator is a **window token total**, the convention main and v1
   always used - theta is therefore tied to the window length and to the numerator
   source: the registry stamps both per model (``trs.numerator``, ``trs.theta_window_ms``)
   and the controller refuses to start on a mismatch (:func:`theta_basis_errors`);
