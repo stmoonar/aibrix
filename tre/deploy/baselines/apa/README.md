@@ -105,7 +105,7 @@ v1 APA configuration, `/root/aibrix-main/config_tre/autoscaler_hot/<model>_APA.y
 | `autoscaling.aibrix.ai/scale-up-tolerance` | `0.1` | `autoscaling.aibrix.ai/up-fluctuation-tolerance` (`0.2`, never applied: v1 effective = its default 0.1) | scale up when usage > target x 1.1 |
 | `autoscaling.aibrix.ai/scale-down-tolerance` | `0.2` | `autoscaling.aibrix.ai/down-fluctuation-tolerance` (`0.8`, never applied: v1 effective = its default 0.2) | scale down when usage < target x 0.8; v2's own default would be 0.1 |
 | `autoscaling.aibrix.ai/scale-down-cooldown-window` | `0s` | none (v1 APA has no cooldown) | v2 default is 300 s |
-| `apa.autoscaling.aibrix.ai/window` | `10s` | `apa.autoscaling.aibrix.ai/window` (`20s`) | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s. 10 s since 2026-11-03 (every baseline decides on TRE's 10 s metrics window, as TokenScale / PreServe `window_s`); 20 s before, as v1 |
+| `apa.autoscaling.aibrix.ai/window` | `10s` | `apa.autoscaling.aibrix.ai/window` (`20s`) | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s. 10 s since 2026-11-03 (TRE metrics window, `TRE_METRICS_WINDOW_MS` 10000; TokenScale `window_s` is 10 s too; PreServe stays at 30 s, its predictors are trained for 30 s); 20 s before, as v1 |
 
 Not set, so the controller defaults apply, equal to v1: `autoscaling.aibrix.ai/max-scale-up-rate` 2,
 `max-scale-down-rate` 2 (v1 files: `apa.autoscaling.aibrix.ai/max-scale-{up,down}-rate: '2.0'`),

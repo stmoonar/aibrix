@@ -1,0 +1,123 @@
+# 2026-11-03 baselines with a 10 s decision window: APA and TokenScale on the 7 ICSE-suite traces (user decision 2026-11-03), seed 1,
+# 14 arms, NO TRE arm and NO PreServe arm.
+# WHAT CHANGED against the baselines of the first sample and of campaign-bl-rep2-r3e-20261103 (both: APA window 20 s, TokenScale 30 s):
+#   - APA: apa.autoscaling.aibrix.ai/window 20s -> 10s in the three PodAutoscaler CRs (tre/deploy/baselines/apa/*.yaml);
+#   - TokenScale: window_s 30 -> 10 in tre/deploy/baselines/tre/policy-configmaps.yaml (the baseline-scaler image reads it from the
+#     ConfigMap; tre/baselines is unchanged since the live image 20261029-8b60253f, checked file by file).
+#   Both follow TRE's metrics window (TRE_METRICS_WINDOW_MS 10000). Everything else of the two baselines is as in the earlier samples.
+#   PreServe is not run: its predictor weights are trained for a 30 s window and no 10 s weights are in the live image.
+# The runner applies the ConfigMap file and the APA CRs of ITS checkout (env BL_CM_FILE below; deploy/scripts/toggle_tre_apa.sh), so this
+# campaign must run from a checkout that holds the 10 s files, i.e. main after the merge of feat/apa-window10-20261103.
+# Same trace files as the earlier samples (the r3e variant of campaign-bl-rep2-20261103: Real_code / Real_conv r3e); sha256 below and in
+# tre/eval/runner/drivers/bl-w10-apa-ts-20261103/campaign-bl-w10-apa-ts-20261103.traces.sha256 (paths relative to ${CAMPAIGN_DATA_ROOT}).
+# The baselines read no TRE parameter: the registry is pinned to the live one (registry_expect, a hard pre-check of every arm). It
+# differs from the one of campaign-bl-rep2-r3e-20261103 (0ab5352747bdd70e) only in 14 models[*].trs.* values (theta_m, tau_crit, tau_high,
+# lambda_wait, w_p; published 2026-11-03 13:49 for the TRE rerun): per-model min_replicas, max_awake_replicas, slo.ttft/tpot_p95_ms and
+# every other key are identical.
+# Runner / client / images: main (the driver's MAIN_SHA); SM 20261029-d9fa1571, gateway 20261029-8b60253f-nozmq2, baseline-scaler
+# 20261029-8b60253f; the controller (20261102-420c69ef) stays in observe mode and is not a method of any arm here.
+#
+# Traces (first sample: the run each trace file was generated for), the files replayed now (traces_tre.effective.json):
+#   Alternating_hot_model_periodic_A   r3c k1.65   traces-icse-r3c-20261101   sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+#   Simultaneous_spike_ramp_twice_tps1o2 r3c k1.325 traces-icse-r3c-20261101   sha256 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93
+#   Prefill_mixed_corner_decode_mix    r3c k1.7    traces-icse-r3c-20261101   sha256 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e
+#   Decode_heavy_burst                 ktrace x1.2 traces-icse-ktrace-20261031 sha256 f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929
+#   Sinusoidal_demand                  ktrace x1.3 traces-icse-ktrace-20261031 sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+#   Real_conv_2023_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5
+#   Real_code_2024_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c
+#
+# RUN ORDER (user 2026-11-03): trace-major. The runner nests traces (outer, file order) over arms (inner): both arms of trace 1, then both
+# arms of trace 2, ... so the baselines can be compared with the earlier results after every trace. Inside a trace the order is the
+# williams row of the trace index, as in campaign-bl-rep2-r3e-20261103 (2 arms: trace 1 apa, tokenscale; trace 2 tokenscale, apa; ...).
+# arms: [apa, tokenscale], so the FIRST run is APA x Alternating: the first APA arm of the fastpath runner, check it at once with
+# first_run_check.py.
+# ETA: ~911 s per baseline arm (campaign-bl-rep2-r3e-20261103: 14 arms in 3 h 32 min, 720 s trace + ~190 s overhead) -> 14 arms ~3.5 h
+# (+ first pre-check / reset 2-10 min; + about 17 min per retried arm).
+#
+# Parameters (environment): CAMPAIGN_DATA_ROOT = the directory with the results roots, the trace sets and the exclusive-window marker
+# (required); TRE_REPO = the tre/ tree of the checkout (default: this checkout). Site-specific and NOT parameterised (YAML keys are
+# not expanded): the node name under precheck.disk_min_free_gb.nodes.
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-bl-w10-apa-ts-20261103.yaml --dry-run
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/drivers/bl-w10-apa-ts-20261103/run_campaign-bl-w10-apa-ts-20261103.sh --check   (read-only guards)
+#   python3 tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/apa      # after run 1, then every 50 min
+name: campaign-bl-w10-apa-ts-20261103
+round: campaign-bl-w10-apa-ts-20261103
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-w10-apa-ts-20261103-run
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [apa, tokenscale]   # first run = APA (user 2026-11-03: APA first)
+order: williams
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 190, report_s: 150}
+
+registry_expect:
+  registry_id: f75155148eba1e61     # live registry since 2026-11-03 13:49 (TRE rerun parameters); see the header
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+report:
+  enabled: false                    # project rule 2026-11-02: no reports while a campaign runs (viz.sh afterwards)
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: apa
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; per-trace dir = <trace set>/<trace>/seed1 (traces_tre.effective.json, manifest.json)
+traces:
+  - trace: Alternating_hot_model_periodic_A
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+    # Alternating r3c k1.65
+  - trace: Simultaneous_spike_ramp_twice_tps1o2
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+    # Simultaneous r3c k1.325
+  - trace: Prefill_mixed_corner_decode_mix
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+    # Prefill_mixed r3c k1.7
+  - trace: Decode_heavy_burst
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+    # Decode_heavy ktrace x1.2
+  - trace: Sinusoidal_demand
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+    # Sinusoidal ktrace x1.3
+  - trace: Real_conv_2023_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+    # Real_conv r3e
+  - trace: Real_code_2024_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+    # Real_code r3e

@@ -21,7 +21,7 @@ metadata:
     autoscaling.aibrix.ai/scale-up-tolerance: '0.1'
     autoscaling.aibrix.ai/scale-down-tolerance: '0.2'
     autoscaling.aibrix.ai/scale-down-cooldown-window: 0s
-    # 10 s since 2026-11-03 (every baseline decides on TRE's 10 s metrics window); 20 s before (v1)
+    # 10 s since 2026-11-03 (TRE metrics window, TRE_METRICS_WINDOW_MS 10000; TokenScale window_s is 10 s too); 20 s before (v1)
     apa.autoscaling.aibrix.ai/window: 10s
 spec:
   scalingStrategy: APA
