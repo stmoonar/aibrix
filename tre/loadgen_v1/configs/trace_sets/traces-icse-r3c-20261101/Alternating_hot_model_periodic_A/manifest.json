@@ -1,0 +1,56 @@
+{
+  "trace": "Alternating_hot_model_periodic_A",
+  "seed": 1,
+  "duration_s": 720.0,
+  "design": {
+    "requests": 23319,
+    "sha256": "574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf",
+    "source": "generated (gen_r3c.py)"
+  },
+  "out_cap": {
+    "max_output_tokens": 400,
+    "null_max_output_tokens": 0,
+    "note": "null = the loadgen config's max_tokens"
+  },
+  "loadgen_config": "aibrix/tre/loadgen_v1/configs/traces_v14/Alternating_hot_model_periodic_A/config.yaml",
+  "preserve_history": {
+    "file": "preserve_history.json",
+    "sha256": "58aaac45aebf03f20864239963ce246ec8a103810d69bd9ffbd4d8589d177120",
+    "method": "azure-segment-v1-20261031"
+  },
+  "rate_scale": {
+    "k": 1.65,
+    "base_suite": "ICSE v1 trace design, r3c edits (r3c.json in the design dir)",
+    "random_seed": 7606,
+    "icse_config_random_seed": 7606,
+    "method": "synthetic: carry-round(k x rps(t)) of the r3c trace.json timeline",
+    "max_output_tokens": "config max_tokens for every request (06-07 effective rule)",
+    "r3c_marker_sha256": "7f702cb23d3e4233e59f67b6e1b111dfa33757b8e971ec471bf26cf46dded48a",
+    "gen_dir": "_gen/Alternating_hot_model_periodic_A/seed1",
+    "gen_config_sha256": "1f2c4afa42b66df88f1b9150f0e119105a9b89676bd1dc79459bb0c80d5772b8",
+    "synthetic": {
+      "dsllama-8b": {
+        "requests": 8732
+      },
+      "dsqwen-14b": {
+        "requests": 4862
+      },
+      "dsqwen-7b": {
+        "requests": 9725
+      }
+    }
+  },
+  "generator": {
+    "script": "docs/scripts/trace_suite_r3c_20261101/gen_r3c.py",
+    "sha256": "860b52c6305ebccf3ccf4312a2a382a1b2683ef846236ba3eab67e00e43051b0",
+    "v1": {
+      "repo": "/root/aibrix-main/CustomTraceGenerator",
+      "git_sha": "aeb2cf42ba6c0c81680a918c3f7a98695498bafc",
+      "dirty_src": "",
+      "trace_generator.py_sha256": "459a8977a92650f393ed07b7e303ad498cfba89f2cc07d304bad8b9a4495795d",
+      "data_generator.py_sha256": "be2d06a61ba58ae44fc13ca9b52788640d9afbeb8d1e4ae55347f7d723af95d2",
+      "real_trace_adapter.py_sha256": "6052126cd424a7779c45d81973f509513d6e7b6c9d294ee08bd0e9dd8b2d3bec",
+      "config_manager.py_sha256": "d9612f3864fd30d0335af1ea521e858cbaf6ed9b26f1584df9a9bb6fb78a8910"
+    }
+  }
+}

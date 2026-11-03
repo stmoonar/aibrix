@@ -1,0 +1,97 @@
+# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
+# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
+# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
+# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
+# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+# 2026-11-02 ICSE r3e FULL 720 s runs (Real_code / Real_conv r3e, 4 arms). User 11-02: skip the 400 s half-run screen
+# (8b peak is placed after 400 s; offline audit: best fixed layout over the knee 34 % code / 43 % conv of the full run).
+# Traces: traces-icse-r3e-20261101 (SOURCES.md, audit.md; preserve_history.json next to each trace).
+# Registry: tune F f3ac339a6e5de9be, not switched by any driver; controller window 10 s (check before launch).
+# Runner / client / images: main 4ab51261. TRE arm env as tune F (scope healthy_and_shrink).
+#
+#   tre/eval/runner/run_campaign.sh <this file> --dry-run
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/<arm>      # after run 1
+name: campaign-icse-r3e-full-20261101
+round: campaign-icse-r3e-full-20261101
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-r3e-full-20261101-run
+trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [tre, tokenscale, preserve, apa]
+order: williams
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 280, report_s: 150}
+
+registry_expect:
+  registry_id: f3ac339a6e5de9be     # tune F (live since 11-01 14:14); another registry: make it live, change here AND re-run the dry-run
+  present:
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+    - "*.trs.ema_tau_ms"
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    # TRE_METRICS_WINDOW_MS=10000 is a field of the live controller Deployment (tune A..F), NOT set here: controller_env
+    # keys are reset to false at arm end. The driver must check it (as run_r3c_half_F.sh: WINDOW_EXPECT=10000).
+    controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  preserve:
+    base: preserve
+    label: PreServe                 # faithful (mLSTM, load errors), drain on
+    policy: {tier1: mlstm}          # history: preserve_history.json next to the trace (real Azure segments, causal)
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; the Real_* entries carry the PreServe arm
+traces:
+  - trace: Real_code_2024_slice_a_tok70
+  - trace: Real_conv_2023_slice_a_tok70

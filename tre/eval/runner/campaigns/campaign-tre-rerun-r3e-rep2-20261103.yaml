@@ -1,0 +1,186 @@
+# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
+# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
+# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
+# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
+# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+# 2026-11-03 TRE rerun with the recalibrated TSS parameters, r3e variant: the TRE arm alone on the 7 traces of the
+# baselines rep 2 (campaign-bl-rep2-r3e-20261103: same trace files, r3e Real_code / Real_conv), seed 1.
+# REP: 2 of 2 (made by make_rep2.sh from campaign-tre-rerun-r3e-20261103.yaml: edit rep 1, then rerun make_rep2.sh)
+# PARAMETERS (user 11-03 13:35): candidate Frecf_all = tune F recipe (completion attribution, r* 5 %, 10 s window) on old
+# + A + B training cells, but lambda / w_p from the SLO-budget formula (lambda = 0.15 L_out, w_p = 6.67 / L_in, request-weighted
+# training means; docs/train-set-slo-review-20261102.md sec 10) instead of tune F 20 / 0.01. EXPLORATORY: not the
+# pre-registered primary (which failed its one-time E / M validation) and not validated on a sealed set. Fit:
+# calib_supp_20261103/fit/adhoc/frecipe-20261103/f_all/Frecf_all/{fit.json sha256 a58ba1fc8c3e49fc..., candidate.json}.
+#   7b theta 382.4 tau_crit .65 tau_high 1.47 lambda 32.91 w_p .009472 | 8b 291.0 .64 1.60 31.44 .009446 |
+#   14b 409.7 .49 1.27 32.93 .009425. Published with params_set.py from fix/lambda-bound-20261103 @31139fec (bound 20 -> 100).
+# REP 1 only for now (user: run TRE on the representative traces first).
+# PURPOSE: the TRE arm under the TSS parameters of the supplementary calibration (calib_supp_20261103, prereg sec 5:
+# a tau change > 0.03 -> atomic publish of theta / tau (/ lambda / w_p) and a rerun of the TRE arm on every trace), on the
+# SAME trace files as the first sample and both baseline samples: TRE (new parameters) x 2 reps vs APA / TokenScale /
+# PreServe x 2 reps. The baselines are NOT rerun (they read no TRE parameter; campaign-bl-rep2-20261103/registry_guard.py).
+# Runner / client: main d17bccea (pushed). Images: SM 20261029-d9fa1571, gateway 20261029-8b60253f-nozmq2 (as the first
+# sample); controller = the driver's CTL_IMAGE (default the live 20261102-420c69ef; the eta-removal image only if the user
+# approves it); baseline-scaler unused (0 replicas). Controller window TRE_METRICS_WINDOW_MS=10000 (Deployment field, as
+# the first sample; NOT a controller_env key: the driver checks it).
+# Registry: published with params_set.py --apply --restart before the launch; its content id goes into
+# registry_expect.registry_id (the quoted placeholder below: the runner refuses to start while it is there). The
+# driver checks that the live registry differs from the reference 0ab5352747bdd70e (registry-live-*.yaml next to this
+# file, = tune F + the 11-02 alt_thresholds) ONLY in models[*].trs.{theta_m, tau_crit, tau_high, lambda_wait, w_p}.
+#
+# FIRST SAMPLE of the TRE arm (tune F, registry f3ac339a6e5de9be) per trace, and the trace file replayed now
+# (traces_tre.effective.json; sha256 = the TRE arm manifests of the first sample = campaign-bl-rep2-r3e-20261103):
+#   Alternating_hot_model_periodic_A   r3c k1.65      traces-icse-r3c-20261101       campaign-icse-r3c-full-F-20261101-run     994.6 s
+#       trace sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+#   Simultaneous_spike_ramp_twice_tps1 r3c k1.325     traces-icse-r3c-20261101       campaign-icse-r3c-full-F-20261101-run     987.9 s
+#       trace sha256 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93
+#   Prefill_mixed_corner_decode_mix    r3c k1.7       traces-icse-r3c-20261101       campaign-icse-r3c-full-F-20261101-run    1012.5 s
+#       trace sha256 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e
+#   Decode_heavy_burst                 ktrace x1.2    traces-icse-ktrace-20261031    campaign-icse-ktrace-full-F-20261101-run  984.6 s
+#       trace sha256 f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929
+#   Sinusoidal_demand                  ktrace x1.3    traces-icse-ktrace-20261031    campaign-icse-ktrace-full-F-20261101-run  994.7 s
+#       trace sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+#   Real_conv_2023_slice_a_tok70       r3e            traces-icse-r3e-20261101       campaign-icse-r3e-full-20261101-run       997.4 s
+#       trace sha256 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5
+#   Real_code_2024_slice_a_tok70       r3e            traces-icse-r3e-20261101       campaign-icse-r3e-full-20261101-run       999.5 s
+#       trace sha256 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c
+#   per-arm manifest facts of the first-sample TRE arms (all attempt 1, valid; controller 20261101-c8279678, runner 4ab51261,
+#   live-registry.yaml sha256 d2d23949fcc2..): source_tre_runs.tsv next to this file.
+#
+# SOURCES of arm_defs.tre: the first-sample TRE arms ran in the TRE-only specs campaign-icse-r3c-full-F-20261101 and
+# campaign-icse-ktrace-full-F-20261101 (campaign-icse-r3c-20261101/) and in the 4-arm campaign-icse-r3e-full-20261101, NOT
+# in the baseline sources of the rep-2 template (campaign-icse-r3c-full-D-20261101 = tune D TRE arm; campaign-icse-ktrace-20261031
+# = win10 registry 5028a1209a5fe38d TRE arm). All five specs have the SAME arm_defs.tre {base: tre, label: TRE, controller_env:
+# {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}} (= controller_env and ablation_switches
+# match=true in all 7 first-sample manifests) and the same env / precheck / validity / marker / max_attempts / gap_s / seed /
+# order; they differ only in registry_expect.registry_id (D ee3712855753d0e8, win10 5028a1209a5fe38d, F f3ac339a6e5de9be in
+# the three TRE sources), trace_root / traces, arms and header. So no per-trace TRE setting is needed (the runner has per-trace
+# dir / arms / seed / slice / config / preserve_policy, but no per-trace controller_env or registry_expect).
+#
+# DIFFERENCES to the TRE sources (campaign-icse-r3c-full-F-20261101, campaign-icse-ktrace-full-F-20261101,
+# campaign-icse-r3e-full-20261101):
+#   - registry: the recalibrated TSS parameters (registry_expect.registry_id = PLACEHOLDER) instead of tune F f3ac339a6e5de9be.
+#     The base registry 0ab5352747bdd70e also differs from f3ac.. in models[*].alt_thresholds (11-02 15:45: 10 s basis,
+#     refit queue_len / kv_usage / ttft_mean, new tpot_mean), which only the alternative-signal arms read (TSS = signal zm);
+#   - controller image 20261101-c8279678 -> CTL_IMAGE (20261102-420c69ef adds the tpot_mean source for ablation arms, TSS
+#     path unchanged; the eta-removal image changes the HIGH-donor order = a method change, to be stated with the results);
+#   - runner / client main 4ab51261 -> d17bccea (fastpath C1-C4 + C7: 1 controller rollout per arm, grace 5 s, collection in
+#     parallel; nothing changes while requests are sent, docs/runner-overhead-20261102.md);
+#   - name / round / results_root new; ONE spec for traces of three trace sets: per-trace `dir:` instead of one trace_root
+#     (as campaign-bl-rep2-r3e-20261103; trace files and loadgen configs = those of the first sample, sha256 above);
+#   - arms = [tre] (r3e-full had 4 arms), trace order = the rep-2 template's (r3c, ktrace, r3e; one campaign, not three);
+#   - report.enabled false (project rule 11-02);
+#   - eta.overhead_s 280 -> 190 (planning / marker length only, see ETA).
+#   Everything else (env, arm_defs.tre, arm_defs.preserve + preserve block (unused: no PreServe arm, kept as in the TRE-only
+#   sources), precheck, validity, marker, max_attempts 2, gap_s 0, seed 1, order williams) is copied.
+#
+# ETA: first-sample TRE arms wall 995.9 s on average (min 984.6, max 1012.5, n=7 valid) = load phase ~764 s + ~232 s runner;
+#   runner fastpath (smoke 11-02: TRE arm runner overhead 236 -> 142 s) -> ~906 s; reports off, ~6 s between arms
+#   -> ~912 s per arm -> 7 arms ~1.8 h per rep (+ first pre-check / reset 2-10 min; +~16 min per retried arm); 2 reps ~3.6 h.
+#
+#   bash tre/eval/runner/run_campaign.sh {this file} --dry-run          (no cluster access; output in dryrun*.txt)
+#   bash ${CAMPAIGN_DATA_ROOT}/campaign-tre-rerun-draft-20261103/run_campaign-tre-rerun-20261103.sh --check   (read-only guards)
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/tre      # after arm 1, then every 50 min
+name: campaign-tre-rerun-r3e-rep2-20261103
+round: campaign-tre-rerun-r3e-rep2-20261103
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-tre-rerun-r3e-rep2-20261103-run
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [tre]
+order: williams
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 190, report_s: 150}
+
+registry_expect:
+  # >>> PLACEHOLDER: after params_set.py --apply --restart, put the live registry id here (16 hex digits, KEEP THE
+  #     QUOTES: an all-digit id would parse as an int): python3 .../tre/eval/runner/arm_registry.py id   (CHECKLIST.md B)
+  registry_id: "f75155148eba1e61"
+  present:
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+    - "*.trs.ema_tau_ms"
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    # TRE_METRICS_WINDOW_MS=10000 is a field of the live controller Deployment (tune A..F), NOT set here: controller_env
+    # keys are reset at the end of the campaign. The driver checks it (WINDOW_EXPECT=10000).
+    controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  preserve:
+    base: preserve
+    label: PreServe                 # unused (no PreServe arm); kept as in the TRE-only sources
+    policy: {tier1: mlstm}
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: false                    # project rule 2026-11-02: no reports while a campaign runs (viz.sh afterwards)
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; per-trace dir = <trace set>/<trace>/seed1 (traces_tre.effective.json, manifest.json)
+traces:
+  - trace: Alternating_hot_model_periodic_A
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+    # Alternating r3c k1.65; sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+  - trace: Simultaneous_spike_ramp_twice_tps1o2
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+    # Simultaneous r3c k1.325; sha256 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93
+  - trace: Prefill_mixed_corner_decode_mix
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+    # Prefill_mixed r3c k1.7; sha256 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e
+  - trace: Decode_heavy_burst
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+    # Decode_heavy ktrace x1.2; sha256 f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929
+  - trace: Sinusoidal_demand
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+    # Sinusoidal ktrace x1.3; sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+  - trace: Real_conv_2023_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+    # Real_conv r3e; sha256 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5
+  - trace: Real_code_2024_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+    # Real_code r3e; sha256 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c

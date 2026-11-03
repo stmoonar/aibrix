@@ -1,0 +1,120 @@
+# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
+# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
+# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
+# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
+# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+# 2026-10-31 ICSE suite with a PER-TRACE rate factor k (user 10-31; traces-icse-ktrace-20261031, built by
+# docs/scripts/icse_suite_20261030/scale_icse_suite.py --k-map --history azure, see its SOURCES.md / audit.md).
+# Only the arrival rate is scaled (shape, lengths, mix, caps, seeds' rule unchanged); k per trace:
+#   Alternating 2.1, Decode_heavy 1.2, Simultaneous 1.4, Prefill_mixed 1.15, Sinusoidal 1.3, Real_conv 1.0, Real_code 1.6
+# (largest k on a 0.05 grid with corrected integer demand Gi' <= 7 in every 30 s window; capacity kappa per ICSE family
+# from the 10-30 calibration, analysis-icse-ktrace-20261031/choose_k.json).
+# ONE TRACE AT A TIME WITH ALL ITS ARMS (TRE + TokenScale + PreServe + APA); arm order inside a trace = Williams row of
+# the trace index. Trace order: Alternating first (main target), then Decode_heavy, Simultaneous, Prefill_mixed,
+# Sinusoidal, Real_conv, Real_code. Driven by campaign-icse-ktrace-20261031/run_all3.sh.
+#
+# DEVIATION (as campaign-contend-r3-all-20261030.yaml): ALL arms, the 3 baselines included, run under the win10 registry
+# (registry id 5028a1209a5fe38d: theta x0.5, trs.theta_window_ms 10000, trs.ema_tau_ms 0; controller env
+# TRE_METRICS_WINDOW_MS=10000), not the standard W 20 s registry (af9aef4701804743) of campaign-icse-bl.
+# Reason: no per-arm window switching (each switch = registry replace + SM and controller restart).
+# Baseline arms run with the controller in observe mode: their actuation (APA CR, tre-v2-baseline-scaler) reads no
+# trs.* key and no TSS window; only the logged controller signals (signal_log.jsonl Z_m etc.) of baseline arms use
+# the 10 s window. The runner neither sets nor resets TRE_METRICS_WINDOW_MS (reset_canonical.sh only touches the
+# ablation switches); run_all3.sh applies win10 before and rolls it back after.
+#
+# TRE arm: identical to campaign-contend-r3-all-20261030.yaml (healthy_and_shrink, release 20261029 d9fa1571).
+# Baselines: identical to campaign-icse-bl-20261030 (TokenScale frozen policy-configmaps; PreServe mLSTM + drain).
+# PreServe history: preserve_history.json next to each trace (no pre_t0.json in the set) = REAL Azure 2024 segments
+# (one 750 s segment per model, no overlap with any Real_* slice / pre-slice history / other suite's interval;
+# v9 tok70 length transform; P and D levelled to the trace's planned mean, never read from the evaluated trace;
+# check_history_causal.py). Loadgen configs: the ICSE ones (traces_v14; k changes no config field).
+# Runner / client / images: main 9f2856a1.
+#
+#   tre/eval/runner/run_campaign.sh ${CAMPAIGN_DATA_ROOT}/campaign-icse-ktrace-20261031/campaign-icse-ktrace-20261031.yaml --dry-run
+#   python3 tre/eval/runner/first_run_check.py <results_root>/<trace>_s1/<arm>      # after run 1, then every 50 min
+name: campaign-icse-ktrace-20261031
+round: campaign-icse-ktrace-20261031
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-ktrace-20261031-run
+trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [tre, tokenscale, preserve, apa]
+order: williams
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 280, report_s: 150}
+
+registry_expect:
+  registry_id: 5028a1209a5fe38d     # win10 registry (apply_win10.sh) for ALL arms; canonical W20 registry is af9aef4701804743
+  present:
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+    - "*.trs.ema_tau_ms"
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  preserve:
+    base: preserve
+    label: PreServe                 # faithful (mLSTM, load errors), drain on
+    policy: {tier1: mlstm}          # history: preserve_history.json next to the trace (real Azure segments)
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+traces:
+  - trace: Alternating_hot_model_periodic_A
+  - trace: Decode_heavy_burst
+  - trace: Simultaneous_spike_ramp_twice_tps1o2
+  - trace: Prefill_mixed_corner_decode_mix
+  - trace: Sinusoidal_demand
+  - trace: Real_conv_2023_slice_a_tok70
+  - trace: Real_code_2024_slice_a_tok70

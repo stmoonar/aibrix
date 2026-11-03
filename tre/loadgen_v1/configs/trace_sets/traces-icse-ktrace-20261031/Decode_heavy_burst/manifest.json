@@ -1,0 +1,62 @@
+{
+  "trace": "Decode_heavy_burst",
+  "seed": 1,
+  "duration_s": 720.0,
+  "design": {
+    "requests": 26091,
+    "sha256": "f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929",
+    "source": "generated (scale_icse_suite.py)"
+  },
+  "out_cap": {
+    "max_output_tokens": 300,
+    "null_max_output_tokens": 0,
+    "note": "ICSE v1 trace rule, scaled; null = the config's max_tokens"
+  },
+  "loadgen_config": "aibrix/tre/loadgen_v1/configs/traces_v14/Decode_heavy_burst/config.yaml",
+  "preserve_history": {
+    "file": "preserve_history.json",
+    "sha256": "e9ac0955144d5dc42fc0b14dc427d710d2bae1545788ea396c23ad690c232ef8",
+    "method": "azure-segment-v1-20261031"
+  },
+  "rate_scale": {
+    "k": 1.2,
+    "base_suite": "traces-icse-20261030 (seed1 = ICSE v1 files)",
+    "random_seed": 6105,
+    "icse_config_random_seed": 6105,
+    "method": "synthetic: k x ICSE per-second count per model, carry-rounded",
+    "max_output_tokens": "config max_tokens for every request (06-07 effective rule)",
+    "gen_dir": "_gen/Decode_heavy_burst/seed1",
+    "gen_config_sha256": "667e1b492ca7ede32dadbb6ddbade20561bb0dbd3535f8fa34a79b212a90c9b0",
+    "synthetic": {
+      "dsllama-8b": {
+        "icse_requests": 7728,
+        "scaled_requests": 9274,
+        "ratio": 1.20005
+      },
+      "dsqwen-14b": {
+        "icse_requests": 6286,
+        "scaled_requests": 7543,
+        "ratio": 1.19997
+      },
+      "dsqwen-7b": {
+        "icse_requests": 7728,
+        "scaled_requests": 9274,
+        "ratio": 1.20005
+      }
+    }
+  },
+  "generator": {
+    "script": "docs/scripts/icse_suite_20261030/scale_icse_suite.py",
+    "sha256": "cb5dbbcf329facf728161e38455f9bc2389b02c0b5a22859ba0d28470fa50cbc",
+    "build_icse_suite_sha256": "c592e1f90b2e079a4e3bfe41c5872819b38cc83c97dacb2c4f38699bc9bad4fc",
+    "v1": {
+      "repo": "/root/aibrix-main/CustomTraceGenerator",
+      "git_sha": "aeb2cf42ba6c0c81680a918c3f7a98695498bafc",
+      "dirty_src": "",
+      "trace_generator.py_sha256": "459a8977a92650f393ed07b7e303ad498cfba89f2cc07d304bad8b9a4495795d",
+      "data_generator.py_sha256": "be2d06a61ba58ae44fc13ca9b52788640d9afbeb8d1e4ae55347f7d723af95d2",
+      "real_trace_adapter.py_sha256": "6052126cd424a7779c45d81973f509513d6e7b6c9d294ee08bd0e9dd8b2d3bec",
+      "config_manager.py_sha256": "d9612f3864fd30d0335af1ea521e858cbaf6ed9b26f1584df9a9bb6fb78a8910"
+    }
+  }
+}

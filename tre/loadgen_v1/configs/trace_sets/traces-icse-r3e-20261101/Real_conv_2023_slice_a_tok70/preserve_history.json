@@ -1,0 +1,438 @@
+{
+  "format": "tre-preserve-history-v1",
+  "trace": "Real_conv_2023_slice_a_tok70",
+  "seed": 1,
+  "window_s": 30.0,
+  "models": {
+    "dsllama-8b": [
+      [
+        236831.8,
+        82547.98
+      ],
+      [
+        237579.15,
+        81590.35
+      ],
+      [
+        253903.61,
+        88626.84
+      ],
+      [
+        245340.91,
+        83894.44
+      ],
+      [
+        237134.51,
+        82404.51
+      ],
+      [
+        224867.34,
+        78817.32
+      ],
+      [
+        230455.06,
+        79410.45
+      ],
+      [
+        210460.86,
+        72303.5
+      ],
+      [
+        233699.51,
+        80873.52
+      ],
+      [
+        225890.1,
+        78635.83
+      ],
+      [
+        228713.24,
+        79592.45
+      ],
+      [
+        243182.74,
+        83511.69
+      ],
+      [
+        241638.43,
+        81028.14
+      ],
+      [
+        238356.76,
+        81874.24
+      ],
+      [
+        224018.76,
+        76806.24
+      ],
+      [
+        247975.97,
+        84291.39
+      ],
+      [
+        231476.83,
+        80213.97
+      ],
+      [
+        243174.8,
+        85322.02
+      ],
+      [
+        248064.3,
+        86169.13
+      ],
+      [
+        240174.01,
+        82389.81
+      ],
+      [
+        227225.0,
+        77466.8
+      ],
+      [
+        237185.63,
+        82468.89
+      ],
+      [
+        217460.89,
+        76196.89
+      ],
+      [
+        229048.7,
+        76322.61
+      ],
+      [
+        227090.02,
+        76868.09
+      ]
+    ],
+    "dsqwen-7b": [
+      [
+        295384.84,
+        96085.07
+      ],
+      [
+        276701.13,
+        89573.55
+      ],
+      [
+        294566.55,
+        97320.7
+      ],
+      [
+        263781.93,
+        85738.45
+      ],
+      [
+        296864.75,
+        93919.23
+      ],
+      [
+        284245.18,
+        91872.28
+      ],
+      [
+        299670.96,
+        98873.39
+      ],
+      [
+        287668.91,
+        93035.64
+      ],
+      [
+        321347.95,
+        103330.97
+      ],
+      [
+        296683.75,
+        98782.46
+      ],
+      [
+        310424.28,
+        103773.93
+      ],
+      [
+        280719.55,
+        90258.98
+      ],
+      [
+        223158.09,
+        72384.37
+      ],
+      [
+        297441.2,
+        95502.23
+      ],
+      [
+        237563.29,
+        78769.99
+      ],
+      [
+        275925.43,
+        91056.3
+      ],
+      [
+        288817.25,
+        92695.26
+      ],
+      [
+        277592.42,
+        94411.15
+      ],
+      [
+        244491.35,
+        81299.52
+      ],
+      [
+        273929.9,
+        87053.34
+      ],
+      [
+        191999.31,
+        68372.08
+      ],
+      [
+        254338.17,
+        82465.21
+      ],
+      [
+        323588.36,
+        103372.93
+      ],
+      [
+        335474.81,
+        110206.18
+      ],
+      [
+        305348.77,
+        95441.61
+      ]
+    ],
+    "dsqwen-14b": [
+      [
+        181743.18,
+        67395.61
+      ],
+      [
+        191322.43,
+        71293.89
+      ],
+      [
+        186227.28,
+        66700.37
+      ],
+      [
+        235088.33,
+        83798.61
+      ],
+      [
+        210188.2,
+        76954.38
+      ],
+      [
+        220960.01,
+        78424.14
+      ],
+      [
+        238482.91,
+        88394.27
+      ],
+      [
+        266981.75,
+        99439.94
+      ],
+      [
+        209340.21,
+        77665.69
+      ],
+      [
+        204378.29,
+        74286.97
+      ],
+      [
+        225245.24,
+        83687.2
+      ],
+      [
+        204702.53,
+        74039.51
+      ],
+      [
+        198234.32,
+        70767.91
+      ],
+      [
+        202945.51,
+        76013.83
+      ],
+      [
+        207918.58,
+        81401.15
+      ],
+      [
+        188074.21,
+        72789.36
+      ],
+      [
+        274334.04,
+        99256.76
+      ],
+      [
+        246412.13,
+        90214.33
+      ],
+      [
+        211714.84,
+        77107.57
+      ],
+      [
+        236386.57,
+        84434.93
+      ],
+      [
+        213127.28,
+        72335.15
+      ],
+      [
+        255658.61,
+        92748.91
+      ],
+      [
+        206475.95,
+        76818.34
+      ],
+      [
+        227813.49,
+        81956.06
+      ],
+      [
+        262707.68,
+        94942.83
+      ]
+    ]
+  },
+  "source": {
+    "method": "azure-segment-v1-20261031",
+    "rate_scale_k": 1.0,
+    "history_range_s": [
+      -750.0,
+      0
+    ],
+    "generator": "docs/scripts/trace_suite_r3e_20261101/preserve_history_azure.py",
+    "generator_sha256": "ab053d6746e27214ae8fecaad534dd27d6822d33e7e0c42f1d028f5eb89231a6",
+    "rule": "real Azure 2024 segment per model (no overlap with any Real_* slice / pre-slice history / other suite interval), v9 tok70 length transform, P and D scaled to the trace's planned mean per 30 s window (schedule x planned lengths, not the effective file)",
+    "per_model": {
+      "dsllama-8b": {
+        "source_file": "2024/AzureLLMInferenceTrace_conv_1week.csv",
+        "source_sha256": "a0cc9b969a9bbf0fd811802cbf4323edd3a209ace791e3799ad4f9207f213941",
+        "family": "conv",
+        "segment_start_utc": "2024-05-13T23:53:30+00:00",
+        "segment_end_utc_exclusive": "2024-05-14T00:06:00+00:00",
+        "segment_rule_attempt": 0,
+        "raw_requests": 34245,
+        "raw_rps_mean": 45.66,
+        "raw_count_cv_30s": 0.041,
+        "raw_in_range": [
+          6,
+          7997
+        ],
+        "raw_out_range": [
+          1,
+          1200
+        ],
+        "length_transform": "v9 min-max to (250, 700) / (80, 500) (conv targets), cap 697 / 500",
+        "mapped_mean_in": 344.89,
+        "mapped_mean_out": 116.33,
+        "target_P_per_window": 234437.96,
+        "target_D_per_window": 80785.08,
+        "scale_P": 0.496245,
+        "scale_D": 0.506952,
+        "plan": {
+          "requests": 16716,
+          "P_per_window": 234437.958,
+          "D_per_window": 80785.083,
+          "mean_in": 336.594,
+          "mean_out": 115.987,
+          "max_in": 697,
+          "max_out": 500,
+          "design_list_sha256": "ec50c9d0c838bfc5d79aba9b2097eda3e3b5181c2bbd057663ed8f2979dbdafe",
+          "rule": "r3e design per-second list (r3e_select.py), lengths as planned"
+        }
+      },
+      "dsqwen-7b": {
+        "source_file": "2024/AzureLLMInferenceTrace_code_1week.csv",
+        "source_sha256": "71de5c55cbc35f8f1ed0b6b7806b4cd1e9764b0058469725a6aac98023a1448f",
+        "family": "code",
+        "segment_start_utc": "2024-05-11T16:47:30+00:00",
+        "segment_end_utc_exclusive": "2024-05-11T17:00:00+00:00",
+        "segment_rule_attempt": 0,
+        "raw_requests": 11902,
+        "raw_rps_mean": 15.869,
+        "raw_count_cv_30s": 0.1073,
+        "raw_in_range": [
+          3,
+          7687
+        ],
+        "raw_out_range": [
+          1,
+          1500
+        ],
+        "length_transform": "v9 min-max to (260, 710) / (78, 395) (code targets), cap 710 / 495",
+        "mapped_mean_in": 388.77,
+        "mapped_mean_out": 82.73,
+        "target_P_per_window": 281509.12,
+        "target_D_per_window": 91823.79,
+        "scale_P": 1.520979,
+        "scale_D": 2.33137,
+        "plan": {
+          "requests": 19592,
+          "P_per_window": 281509.125,
+          "D_per_window": 91823.792,
+          "mean_in": 344.846,
+          "mean_out": 112.483,
+          "max_in": 710,
+          "max_out": 495,
+          "design_list_sha256": "cd4c41e9604a2baec2f8d2e0a05d8d407d84dd298a34b970af67bb15415bf38e",
+          "rule": "r3e design per-second list (r3e_select.py), lengths as planned"
+        }
+      },
+      "dsqwen-14b": {
+        "source_file": "2024/AzureLLMInferenceTrace_code_1week.csv",
+        "source_sha256": "71de5c55cbc35f8f1ed0b6b7806b4cd1e9764b0058469725a6aac98023a1448f",
+        "family": "code",
+        "segment_start_utc": "2024-05-13T12:58:30+00:00",
+        "segment_end_utc_exclusive": "2024-05-13T13:11:00+00:00",
+        "segment_rule_attempt": 0,
+        "raw_requests": 21537,
+        "raw_rps_mean": 28.716,
+        "raw_count_cv_30s": 0.1138,
+        "raw_in_range": [
+          1,
+          7692
+        ],
+        "raw_out_range": [
+          1,
+          3172
+        ],
+        "length_transform": "v9 min-max to (245, 695) / (85, 410) (code targets), cap 694 / 510",
+        "mapped_mean_in": 389.55,
+        "mapped_mean_out": 87.24,
+        "target_P_per_window": 220258.54,
+        "target_D_per_window": 80514.71,
+        "scale_P": 0.656338,
+        "scale_D": 1.071251,
+        "plan": {
+          "requests": 15873,
+          "P_per_window": 220258.542,
+          "D_per_window": 80514.708,
+          "mean_in": 333.031,
+          "mean_out": 121.738,
+          "max_in": 694,
+          "max_out": 510,
+          "design_list_sha256": "cf8e0a285a8403b4cdff7c911d44d6020d644703904851cf260e36eb35cfaef5",
+          "rule": "r3e design per-second list (r3e_select.py), lengths as planned"
+        }
+      }
+    }
+  }
+}
