@@ -119,6 +119,17 @@ def test_out_of_bounds_rejected() -> None:
     assert ei.value.errors[0]["error"] == "out_of_bounds"
 
 
+def test_lambda_wait_bound_admits_a_calibrated_value_and_refuses_a_typo() -> None:
+    # lambda = 0.15 x mean output length (recalibration of 2026-11-03) is ~32 for the three models; the
+    # publish bound used to be 20 and refused it. Up to 100 (mean outputs of ~670 tokens) goes out.
+    for value in (32, 100):
+        m = yaml.safe_load(apply_and_validate(_REGISTRY, {"m1": {"trs": {"lambda_wait": value}}}))["models"][0]
+        assert m["trs"]["lambda_wait"] == value
+    with pytest.raises(ParamValidationError) as ei:
+        apply_and_validate(_REGISTRY, {"m1": {"trs": {"lambda_wait": 101}}})
+    assert [(e["field"], e["error"]) for e in ei.value.errors] == [("trs.lambda_wait", "out_of_bounds")]
+
+
 def test_non_finite_threshold_rejected() -> None:
     with pytest.raises(ParamValidationError) as exc_info:
         apply_and_validate(

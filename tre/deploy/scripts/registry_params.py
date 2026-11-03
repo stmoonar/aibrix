@@ -31,7 +31,9 @@ _TRS_BOUNDS: dict[str, tuple] = {
     "tau_high": (0, 8, "float", True, False),
     "w_p": (0, 10, "float", False, False),
     "w_d": (0, 10, "float", False, False),
-    "lambda_wait": (0, 20, "float", False, False),
+    # 2026-11-03: 20 -> 100. 20 was the console's round bound (07-06, lambda was ~2), never derived; lambda =
+    # 0.15 x mean output length is ~32, and 100 covers means up to ~670 tokens. Publish time only (the loader has none).
+    "lambda_wait": (0, 100, "float", False, False),
     "qmin": (0, 16, "float", False, False),
     "qsat": (0, 64, "float", True, False),
     "ema_alpha": (0, 1, "float", True, True),
