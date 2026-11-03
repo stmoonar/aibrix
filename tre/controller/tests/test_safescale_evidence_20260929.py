@@ -817,7 +817,7 @@ def test_the_app_wires_the_evidence_reader_thresholds_and_hide_callback() -> Non
     from test_controller_app import REGISTRY_PATH as APP_REGISTRY
     from tre_controller.app import create_controller_dependencies
 
-    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(APP_REGISTRY)})
+    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(APP_REGISTRY)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert isinstance(deps.safescale._evidence, MetricsEvidenceReader)
     assert isinstance(deps.safescale._thresholds, RegistryThresholds)

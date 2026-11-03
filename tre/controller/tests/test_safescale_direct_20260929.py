@@ -722,7 +722,7 @@ def test_the_app_wires_the_collector_and_redis_mode_leaves_it_out(tmp_path) -> N
     from test_controller_app import REGISTRY_PATH as APP_REGISTRY
     from tre_controller.app import create_controller_dependencies
 
-    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(APP_REGISTRY)})
+    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(APP_REGISTRY)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert isinstance(deps.direct_evidence, DirectEvidenceCollector)
     assert deps.queue._on_hide_done == deps.direct_evidence.on_hide_done
@@ -730,7 +730,7 @@ def test_the_app_wires_the_collector_and_redis_mode_leaves_it_out(tmp_path) -> N
     raw["safescale"]["evidence_source"] = "redis"
     path = tmp_path / "registry.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)})
+    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(path)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert deps.direct_evidence is None and not deps.safescale.direct_mode()
 

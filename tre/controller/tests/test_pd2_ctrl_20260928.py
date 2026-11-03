@@ -179,7 +179,7 @@ def test_the_app_wires_one_maintenance_watch_into_every_loop():
     from tre_controller.app import create_controller_dependencies
     from tre_controller.config import ControllerConfig
 
-    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(APP_REGISTRY)})
+    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(APP_REGISTRY)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert isinstance(deps.maintenance_watch, MaintenanceWatch)
     assert deps.queue._on_hide_failed is not None

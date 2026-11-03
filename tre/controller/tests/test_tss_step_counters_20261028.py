@@ -132,10 +132,13 @@ def test_flat_counters_while_asleep_are_no_reset():
     assert w.generation_tokens == pytest.approx(100.0 * 8.0)
 
 
-def test_the_window_is_20s_from_config_and_thetas_must_be_stamped_for_it(tmp_path):
+def test_thetas_must_be_stamped_for_the_window_of_the_controller(tmp_path):
+    # the code default is 20 s (2026-10-28); the deployed controller sets TRE_METRICS_WINDOW_MS=10000 (overlay, 2026-11-03)
+    # and the bootstrap registry is stamped for that (deploy/tests/test_kustomize_overlays.py checks it against the overlay)
     assert ControllerConfig.from_env({}).metrics_window_ms == 20_000
     registry = load_registry(str(REGISTRY_PATH))
-    assert theta_basis_errors(registry.models(), window_ms=20_000) == []
+    assert theta_basis_errors(registry.models(), window_ms=10_000) == []
+    assert len(theta_basis_errors(registry.models(), window_ms=20_000)) == len(registry.models())
     assert len(theta_basis_errors(registry.models(), window_ms=30_000)) == len(registry.models())
     # an unstamped (pre-2026-10-28) registry: the controller refuses to start
     raw = yaml.safe_load(REGISTRY_PATH.read_text(encoding="utf-8"))
@@ -145,7 +148,7 @@ def test_the_window_is_20s_from_config_and_thetas_must_be_stamped_for_it(tmp_pat
     path = tmp_path / "registry.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     old = load_registry(str(path))
-    assert all("trs.numerator=None" in line for line in theta_basis_errors(old.models(), window_ms=20_000))
+    assert all("trs.numerator=None" in line for line in theta_basis_errors(old.models(), window_ms=10_000))
     from tre_controller.app import create_controller_dependencies
     from test_controller_app import EmptyRedis
 

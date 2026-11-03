@@ -226,13 +226,13 @@ def test_resolve_inherited_reads_registry_defaults() -> None:
     triple, source = refit_trs_params.resolve_inherited(
         "dsqwen-7b", w_p=None, lambda_wait=None, qmin=None
     )
-    # next-round calibration values (registry.yaml, accepted 2026-10-05).
-    assert triple == (0.02, 2.375, 1.0)
+    # the live values (registry.yaml since 2026-11-03: Frecf_all, lambda / w_p from the SLO formula).
+    assert triple == (0.009472, 32.91, 1.0)
     assert source == "registry"
     triple14, _ = refit_trs_params.resolve_inherited(
         "dsqwen-14b", w_p=None, lambda_wait=None, qmin=None
     )
-    assert triple14 == (0.0025, 2.25, 1.0)
+    assert triple14 == (0.009425, 32.93, 1.0)
 
 
 def test_cli_writes_report_from_csv(tmp_path) -> None:

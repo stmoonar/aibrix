@@ -133,9 +133,9 @@ spec:
             # 2026-11-03 (user decision): 10 s. The live Deployment has run with 10 s since the
             # 2026-10-31 w10refit publication (every TRE and baseline run of the 10-31 .. 11-03
             # campaigns); the overlay now says so. The bootstrap registry (deploy/registry.yaml,
-            # overlays/tre-v2/params.yaml) still stamps theta_window_ms 20000 with 20 s thetas:
-            # publish a registry with theta_window_ms 10000 (see tre/eval/registries/) before
-            # this controller starts, or it refuses to start.
+            # overlays/tre-v2/params.yaml) stamps theta_window_ms 10000 with the live 10 s thetas
+            # (deploy/tests/test_kustomize_overlays.py keeps the two equal). A registry with another
+            # theta_window_ms makes this controller refuse to start.
             - name: TRE_METRICS_WINDOW_MS
               value: "10000"
             # SafeScale latency thresholds come from the registry (safescale.slo_mode,

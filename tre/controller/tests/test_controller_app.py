@@ -155,6 +155,7 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     cfg = ControllerConfig.from_env(
         {
             "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_METRICS_WINDOW_MS": "10000",  # the bootstrap registry is stamped 10 s (overlay value)
             "TRE_REDIS_URL": "redis://example:6379/0",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
@@ -188,7 +189,7 @@ def test_create_controller_dependencies_wires_the_gateway_stats_source() -> None
     from tre_controller.gateway_health import EnvoyStatsSource
 
     cfg = ControllerConfig.from_env(
-        {"TRE_REGISTRY_PATH": str(REGISTRY_PATH), "TRE_GATEWAY_STATS_URL": "http://envoy:19001/stats/prometheus"}
+        {"TRE_REGISTRY_PATH": str(REGISTRY_PATH), "TRE_METRICS_WINDOW_MS": "10000", "TRE_GATEWAY_STATS_URL": "http://envoy:19001/stats/prometheus"}
     )
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
 
@@ -205,6 +206,7 @@ def test_create_controller_dependencies_can_split_metrics_redis_from_state_redis
     cfg = ControllerConfig.from_env(
         {
             "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_METRICS_WINDOW_MS": "10000",  # the bootstrap registry is stamped 10 s (overlay value)
             "TRE_REDIS_URL": "redis://state:6379/0",
             "TRE_METRICS_REDIS_URL": "redis://metrics:6379/0",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
@@ -231,6 +233,7 @@ def test_create_controller_dependencies_restores_safescale_probe_state() -> None
     cfg = ControllerConfig.from_env(
         {
             "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_METRICS_WINDOW_MS": "10000",  # the bootstrap registry is stamped 10 s (overlay value)
             "TRE_REDIS_URL": "redis://example:6379/0",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
         }
@@ -286,6 +289,7 @@ def test_main_builds_config_from_env_and_runs_controller() -> None:
         main(
             env={
                 "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_METRICS_WINDOW_MS": "10000",  # the bootstrap registry is stamped 10 s (overlay value)
                 "TRE_REDIS_URL": "redis://example:6379/0",
                 "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
             },

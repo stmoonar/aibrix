@@ -229,6 +229,18 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert yaml.safe_load(params["data"]["registry.yaml"]) == _load_yaml(DEPLOY_ROOT / "registry.yaml")
 
 
+def test_a_fresh_install_starts_the_controller_on_the_bootstrap_registry() -> None:
+    """The controller refuses to start unless every model's thetas are stamped for the window and numerator it computes
+    (tre_common.tss.theta_basis_errors; Recreate: no controller is left). The bootstrap registry (registry.yaml and its
+    params.yaml copy) must stamp the overlay's TRE_METRICS_WINDOW_MS (10 s since 2026-11-03)."""
+    from tre_common.tss import theta_basis_errors
+
+    window = int(_env(_load_yaml(DEPLOY_ROOT / "overlays" / "tre-v2" / "controller.yaml"))["TRE_METRICS_WINDOW_MS"])
+    registry = load_registry(str(DEPLOY_ROOT / "registry.yaml"))
+    assert theta_basis_errors(registry.models(), window_ms=window) == []
+    assert theta_basis_errors(registry.models(), window_ms=window * 2) != []
+
+
 def test_ablation_overlays_patch_only_controller_env() -> None:
     expected = {
         "ablation-no-slowloop": ("TRE_ABLATION_DISABLE_SLOW_LOOP", "true"),

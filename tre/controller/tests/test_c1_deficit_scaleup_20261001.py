@@ -556,7 +556,7 @@ def test_metrics_redis_client_has_its_own_longer_timeout(monkeypatch):
     from tre_controller import app
     from tre_controller.config import ControllerConfig
 
-    cfg = ControllerConfig.from_env({})
+    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000"})  # the app starts on the bootstrap registry: its 10 s window
     assert cfg.redis_metrics_socket_timeout_s == 10.0 and cfg.redis_socket_timeout_s == 2.0
     custom = ControllerConfig.from_env({"TRE_REDIS_METRICS_SOCKET_TIMEOUT_SECONDS": "30"})
     assert custom.redis_metrics_socket_timeout_s == 30.0
