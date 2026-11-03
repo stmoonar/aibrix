@@ -760,7 +760,7 @@ def preserve_history_source(pc: dict, e: TraceEntry, tail: tuple, names: tuple) 
     root = pc.get("history_root")
     if src is None and root:
         parts = (e.trace, f"seed{e.seed}") if e.slice else tail[:-1]
-        tset = Path(e.src_dir).parent.parent.name if not e.slice else None
+        tset = Path(e.src_dir).parent.parent.name   # src_dir = the generated trace, also for a slice
         cands = ([Path(root) / tset / Path(*parts) / names[-1]] if tset else []) + [Path(root) / Path(*parts) / names[-1]]
         src = next((p for p in cands if p.is_file()), None)
     return src
