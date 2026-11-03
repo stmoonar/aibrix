@@ -141,20 +141,20 @@ e_plan() { echo "$SEAL_DIR/calibration_stage3_dryrun/$1/plan.json"; }
 # step <model> <block> <log> <run_stage3.sh flags...>: run_stage3.sh of the block's plan into
 # $WORK/<block>, in a subshell, output appended to <log> (never truncated); returns its exit
 # code. CALIB_DRYRUN_ROOT (a dry run's out-dir root) comes from the caller.
+# Call it as `step ... || rc=$?`: a bare call under `set -e` ends the caller on a non-zero
+# return before it can record the block's end (2026-11-03: an earlier version turned
+# `set -e` back on before returning, so a failed block left no end / block_failed line).
 step() {
-  local m="$1" b="$2" log="$3" rc
+  local m="$1" b="$2" log="$3" rc=0
   shift 3
   echo "===== $(date -Iseconds) $m $b ($(plan_of "$b")): run_stage3.sh $m $* =====" >> "$log"
-  set +e
   ( OUT_ROOT="$WORK/$b" BASE_RUN="$(base_run "$m")" SUPP_RUN="" TRAINING_PLAN="$(plan_of "$b")" \
-      bash "$CAL/run_stage3.sh" "$m" "$@" ) >> "$log" 2>&1 < /dev/null
-  rc=$?
-  set -e
+      bash "$CAL/run_stage3.sh" "$m" "$@" ) >> "$log" 2>&1 < /dev/null || rc=$?
   return "$rc"
 }
 
 seal_e() {  # seal_e <model>
-  local m="$1" plan log rc
+  local m="$1" plan log rc=0
   plan="$(e_plan "$m")"
   if [[ "$DRY" != 1 && -f "$plan.sha256" ]]; then
     ( cd "$(dirname "$plan")" && sha256sum --status -c plan.json.sha256 ) \
@@ -164,11 +164,8 @@ seal_e() {  # seal_e <model>
   fi
   log="$LOGS/E_seal.$m.log"
   status "$m" E_seal start null "log=$log"
-  set +e
   CALIB_DRYRUN_ROOT="$SEAL_DIR" step "$m" E "$log" --dry-run -- \
-    --instant-sample-ms "$CHAIN_INSTANT_SAMPLE_MS"
-  rc=$?
-  set -e
+    --instant-sample-ms "$CHAIN_INSTANT_SAMPLE_MS" || rc=$?
   [[ "$rc" == 0 && -s "$plan" ]] || fail E_seal "the dry run of E for $m exited $rc (see $log)"
   ( cd "$(dirname "$plan")" && sha256sum plan.json > plan.json.sha256 && chmod a-w plan.json plan.json.sha256 )
   status "$m" E_seal sealed 0 "$plan sha256 $(cut -d' ' -f1 "$plan.sha256")"
@@ -193,10 +190,8 @@ chain_model() {  # chain_model <model>: the blocks in turn; returns 0, 4 (STOP, 
     [[ "$b" != E ]] || extra+=(--sealed-plan "$(e_plan "$m")")
     log="$LOGS/$b.$m.log"
     status "$m" "$b" start null "log=$log out=$WORK/$b/$([[ "$DRY" == 1 ]] && echo calibration_stage3_dryrun/)$m plan=$(plan_of "$b")"
-    set +e
-    CALIB_DRYRUN_ROOT="$WORK/$b" step "$m" "$b" "$log" ${DRY_FLAG[@]+"${DRY_FLAG[@]}"} -- "${extra[@]}"
-    rc=$?
-    set -e
+    rc=0
+    CALIB_DRYRUN_ROOT="$WORK/$b" step "$m" "$b" "$log" ${DRY_FLAG[@]+"${DRY_FLAG[@]}"} -- "${extra[@]}" || rc=$?
     status "$m" "$b" end "$rc" "log=$log"
     case "$rc" in
       0) ;;

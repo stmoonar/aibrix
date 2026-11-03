@@ -4,6 +4,7 @@ cluster, no Redis). Tests the external contract only: which states start and whi
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -96,6 +97,39 @@ def test_real_run_needs_the_exclusive_window_marker(cluster):
     r = preflight(tmp / "out")
     assert r.returncode != 0 and "exclusive-window" in r.stderr
     assert preflight(tmp / "out", dry=1).returncode == 0
+
+
+def test_supplement_chain_records_a_failed_block_and_runs_the_next(tmp_path):
+    """run_chain_supp.sh: a block that exits non-zero gets its `end` and `block_failed`
+    status lines, the next block still runs, and the chain exits 1 (2026-11-03: `step`
+    turned `set -e` back on before returning, so the model's chain died at the failed
+    block without a status line). Fakes: run_stage3.sh (block A fails) and kubectl."""
+    if shutil.which("bash") is None or shutil.which("flock") is None or shutil.which("git") is None:
+        pytest.skip("bash / flock / git not available")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # CALIB_REPO: a clean repo
+    cal = tmp_path / "cal"
+    cal.mkdir()
+    for name in ("run_chain_supp.sh", "lib.sh"):
+        shutil.copy(CALIB / name, cal / name)
+    (cal / "run_stage3.sh").write_text(
+        '#!/usr/bin/env bash\n[ "$TRAINING_PLAN" = supp-a-20261103 ] && exit 1\nexit 0\n', encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    kubectl = bin_dir / "kubectl"
+    kubectl.write_text("#!/usr/bin/env bash\necho 'dsqwen-7b-pod-0 vllm-openai=0,'\n", encoding="utf-8")
+    kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+    logs = tmp_path / "logs"
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+           "CHAIN_LOG_DIR": str(logs), "CALIB_ROOT": str(tmp_path / "root"), "BASE_RUN": str(tmp_path / "base"),
+           "CHAIN_BLOCKS": "A B", "CHAIN_LOCK_DIR": str(tmp_path / "lock"), "CALIB_REPO": str(tmp_path)}
+    r = subprocess.run(["bash", str(cal / "run_chain_supp.sh"), "--dry-run", "dsqwen-7b"], env=env, text=True,
+                       capture_output=True)
+    status = (logs / "dryrun" / "logs" / "CHAIN_STATUS.jsonl").read_text(encoding="utf-8").splitlines()
+    events = [(d["step"], d["event"], d["rc"]) for d in map(json.loads, status) if d["model"] == "dsqwen-7b"]
+    assert ("A", "end", 1) in events and ("A", "block_failed", 1) in events, (events, r.stderr)
+    assert ("B", "end", 0) in events
+    assert ("chain", "done", 1) in events
+    assert r.returncode == 1
 
 
 @pytest.mark.parametrize("script", sorted(p.name for p in CALIB.glob("run_*.sh")))
