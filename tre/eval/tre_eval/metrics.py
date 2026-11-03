@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import math
 import statistics
+import sys
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import numpy as np
 
 from .load import Arm, parse_binding
+
+try:
+    from tre_common.slo_labels import request_ttft_slo_ms
+except ImportError:  # the entry points (report.py, runner/score_pilot.py) put only tre/eval on the path
+    sys.path.append(str(Path(__file__).resolve().parents[2] / "common"))
+    from tre_common.slo_labels import request_ttft_slo_ms
 
 E2E_CENSOR_MS = 149000.0  # diagnostic threshold only; strict completion determines truncation
 ALL = "ALL"
@@ -43,10 +51,12 @@ def pct(xs: Iterable[float | None], p: float) -> float | None:
 
 # ---------------------------------------------------------------- SLO thresholds
 def ttft_threshold_ms(slo: dict, input_tokens: float) -> float:
-    """TTFT SLO of one request: ``max(floor, k * (c + b * L))`` in slowdown mode, else ttft_p95_ms."""
+    """TTFT SLO of one request: ``max(floor, k * (c + b * L))`` in slowdown mode (the one
+    definition, ``tre_common.slo_labels.request_ttft_slo_ms``), else ttft_p95_ms."""
     if slo.get("ttft_slo_mode") == "slowdown":
-        return max(slo.get("ttft_floor_ms", 500.0),
-                   slo.get("ttft_slowdown_k", 5.0) * (slo["ttft_idle_c_ms"] + slo["ttft_idle_b_ms_per_token"] * input_tokens))
+        return request_ttft_slo_ms(input_tokens, c_ms=slo["ttft_idle_c_ms"],
+                                   b_ms_per_token=slo["ttft_idle_b_ms_per_token"],
+                                   k=slo.get("ttft_slowdown_k", 5.0), floor_ms=slo.get("ttft_floor_ms", 500.0))
     return slo["ttft_p95_ms"]
 
 
