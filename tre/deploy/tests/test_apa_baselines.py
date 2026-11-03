@@ -85,3 +85,15 @@ def test_toggle_script_enforces_stop_old_before_start_new() -> None:
     # the APA arm applies them, the TRE arm removes them.
     assert "APA_ANCHORS" in script
     assert "apply_apa_anchors" in script and "delete_apa_anchors" in script
+
+
+def test_apa_and_tokenscale_decide_on_one_window() -> None:
+    # user 2026-11-03: APA and TokenScale use TRE's 10 s metrics window (TRE_METRICS_WINDOW_MS 10000). A change to one of
+    # them alone makes the two arms incomparable. PreServe is not part of this: its predictors are trained for one window.
+    docs = yaml.safe_load_all((DEPLOY_ROOT / "baselines" / "tre" / "policy-configmaps.yaml").read_text(encoding="utf-8"))
+    cms = {d["metadata"]["name"]: d["data"] for d in docs if d and d.get("kind") == "ConfigMap"}
+    windows = {f"apa/{m}": _load(APA_DIR / f"{m}-apa.yaml")["metadata"]["annotations"]["apa.autoscaling.aibrix.ai/window"]
+               for m in MODELS}
+    ts = yaml.safe_load(cms["tre-v2-baseline-tokenscale"]["tokenscale.yaml"])
+    windows["tokenscale"] = f"{float(ts['window_s']):g}s"
+    assert set(windows.values()) == {"10s"}, windows

@@ -105,7 +105,7 @@ v1 APA configuration, `/root/aibrix-main/config_tre/autoscaler_hot/<model>_APA.y
 | `autoscaling.aibrix.ai/scale-up-tolerance` | `0.1` | `autoscaling.aibrix.ai/up-fluctuation-tolerance` (`0.2`, never applied: v1 effective = its default 0.1) | scale up when usage > target x 1.1 |
 | `autoscaling.aibrix.ai/scale-down-tolerance` | `0.2` | `autoscaling.aibrix.ai/down-fluctuation-tolerance` (`0.8`, never applied: v1 effective = its default 0.2) | scale down when usage < target x 0.8; v2's own default would be 0.1 |
 | `autoscaling.aibrix.ai/scale-down-cooldown-window` | `0s` | none (v1 APA has no cooldown) | v2 default is 300 s |
-| `apa.autoscaling.aibrix.ai/window` | `20s` | `apa.autoscaling.aibrix.ai/window` (`20s`) | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s |
+| `apa.autoscaling.aibrix.ai/window` | `10s` | `apa.autoscaling.aibrix.ai/window` (`20s`) | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s. 10 s since 2026-11-03 (TRE metrics window, `TRE_METRICS_WINDOW_MS` 10000; TokenScale `window_s` is 10 s too; PreServe stays at 30 s, its predictors are trained for 30 s); 20 s before, as v1 |
 
 Not set, so the controller defaults apply, equal to v1: `autoscaling.aibrix.ai/max-scale-up-rate` 2,
 `max-scale-down-rate` 2 (v1 files: `apa.autoscaling.aibrix.ai/max-scale-{up,down}-rate: '2.0'`),
@@ -119,12 +119,14 @@ v1 files' `autoscaling.aibrix.ai/{up,down}-fluctuation-tolerance` keys were not 
 v1 run used its defaults, up 0.1 / down 0.2. The CRs here are aligned with v1's EFFECTIVE values: the v1 files' 0.2 / 0.8 never took effect because their keys lack the `apa.` prefix the v1 controller reads (`/root/aibrix-main/pkg/controller/podautoscaler/scaler/apa.go:39-41`) (owner decision
 2026-10-01). The v2 keys are written explicitly (the v2 default down tolerance is 0.1).
 The window keeps one sample per second bucket (a later sample in the same second overwrites)
-and averages the buckets of the last 20 s with equal weight. The sample count is not fixed:
+and averages the buckets of the last window (10 s) with equal weight. The sample count is not fixed:
 besides the 10 s resync (`DefaultResyncInterval`), the controller watches PodAutoscaler
 objects without an event filter, so its own status write-back and every scaling step trigger
 an immediate re-evaluation that adds a sample. Under load this chains decisions: one canary
 went 1 -> 2 -> 3 -> 4 within 5.5 s (`max-scale-up-rate` caps each step, not the chain;
 scale-up cooldown is 0 s). This is the stock controller behaviour and is kept as the baseline.
+With the 10 s window equal to the 10 s resync, a window holds one periodic sample plus the
+event-triggered ones (at 20 s: two), so each decision averages fewer samples.
 Each evaluation logs the values in force, and the window itself:
 `kubectl -n aibrix-system logs deploy/aibrix-controller-manager | grep -E "Effective autoscaling config|Metrics window aggregation"`
 (`stableWindow`, `stableWindowSpan` = time from the oldest to the newest sample, at most the window).
