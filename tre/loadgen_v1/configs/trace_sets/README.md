@@ -25,6 +25,9 @@ checksums that pin the data:
 | Real_conv_2023_slice_a_tok70 | traces-icse-r3e-20261101 | 52181 | 431c96e7ff7b |
 | Real_code_2024_slice_a_tok70 | traces-icse-r3e-20261101 | 46005 | 457df889b8bd |
 
-Not included: the `SOURCES.md` / `audit.md` prose of the three sets (design rules and audits; they cite workspace scripts), the
-other traces of those sets, and the older sets the first-batch specs name (traces-icse-20261030, the ktrace set's own
+`<set>/SOURCES.md` and `<set>/audit.md` (traces-icse-r3c-20261101, traces-icse-ktrace-20261031, traces-icse-r3e-20261101): verbatim copies of
+the sets' design rules, sources and audits (sha256 in `tre/eval/runner/drivers/originals.tsv`). They cite workspace scripts and record the
+cluster paths of the run host.
+
+Not included: the other traces of those sets, and the older sets the first-batch specs name (traces-icse-20261030, the ktrace set's own
 Alternating / Prefill_mixed / Simultaneous / Real_* that the 10-31 batch ran).

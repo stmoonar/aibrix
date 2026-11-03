@@ -107,13 +107,27 @@ def test_every_repo_copy_is_the_file_recorded_in_originals_tsv():
     for r in rows:
         f = TRE.parent / r["repo_path"]
         assert sha(f.read_bytes()) == r["repo_sha256"], r["repo_path"]
-        if r["relation"] == "identical":
+        if r["relation"] in ("identical", "record"):
             assert r["original_sha256"] == r["repo_sha256"], r["repo_path"]
         if r["relation"] == "spec-param":
             text = "".join(l for l in f.read_text().splitlines(True) if not l.startswith("# [repo]"))
             assert sha(text.replace("${CAMPAIGN_DATA_ROOT}", root).encode()) == r["original_sha256"], \
                 f"{r['repo_path']}: the original is not recoverable from the repo copy"
-    assert {r["relation"] for r in rows} <= {"identical", "spec-param", "script-param", "doc-param", "data-relative-paths", "regenerated"}
+    assert {r["relation"] for r in rows} <= {"identical", "spec-param", "script-param", "doc-param", "data-relative-paths", "regenerated", "record"}
+
+
+def test_state_records_and_trace_set_docs_are_listed_verbatim():
+    root, rows = originals()
+    listed = {r["repo_path"]: r for r in rows}
+    records = sorted(DRV_DIR.glob("*/state-records/*/*"))
+    assert len(records) >= 15
+    for f in records:
+        r = listed[str(f.relative_to(TRE.parent))]
+        assert r["relation"] == "record" and r["original_sha256"] == sha(f.read_bytes())
+    assert not [r for r in rows if r["relation"] == "record" and not (TRE.parent / r["repo_path"]).is_file()]
+    for name in ("SOURCES.md", "audit.md"):
+        for ts in ("traces-icse-r3c-20261101", "traces-icse-ktrace-20261031", "traces-icse-r3e-20261101"):
+            assert listed[f"tre/loadgen_v1/configs/trace_sets/{ts}/{name}"]["relation"] == "identical"
 
 
 def test_the_new_code_holds_no_site_path():

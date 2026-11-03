@@ -15,8 +15,11 @@ count), first 16 hex digits. `index.tsv` lists file sha256, source arm and the r
 | `f75155148eba1e61` | "Frecf_all": recalibrated TSS parameters, lambda from the SLO-budget formula (spec header of campaign-tre-rerun-r3e-20261103) = the live ConfigMap on 2026-11-03 (resourceVersion 237290695) | campaign-tre-rerun-r3e-20261103 (TRE) | 10000 / 0 | 382.4, 0.65, 1.47, 32.91, 0.009472 |
 
 All five stamp `trs.numerator: step_counters` and `trs.theta_window_ms: 10000`, so each needs `TRE_METRICS_WINDOW_MS=10000` on the
-controller (the controller refuses to start otherwise). The overlay says 10000 since 2026-11-03; the bootstrap registry
-(`deploy/registry.yaml`, `deploy/overlays/tre-v2/params.yaml`) still stamps 20000 and is NOT one of these.
+controller (the controller refuses to start otherwise). The overlay says 10000 since 2026-11-03. The bootstrap registry
+(`deploy/registry.yaml` and its copy `deploy/overlays/tre-v2/params.yaml`) carries the per-model `trs` and `alt_thresholds` values of
+`f75155148eba1e61` since 2026-11-03 (a fresh install starts the controller; `deploy/tests/test_kustomize_overlays.py` checks the stamp
+against the overlay) but is NOT identical to it: `scaling` keys and `safescale.slo_mode` differ (bootstrap: TSS-only `scaling`, `labels`;
+the live ConfigMap still holds the retired `scaling` keys and `fixed`).
 
 Putting a snapshot live: check `arm_registry.py id` against the file name first. Tunables (`trs.*`, `slo.*`, `alt_thresholds.*`,
 replica bounds) go through `deploy/scripts/release/params_set.py --set ...` (bounds-checked, `--apply --restart --backup-dir`, SM

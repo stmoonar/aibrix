@@ -1,0 +1,52 @@
+--- live
++++ edited
+@@ -90,10 +90,10 @@
+     lambda_wait: 2.125
+     qmin: 1.0
+     ema_alpha: 0.632121
+-    theta_m: 302.843454
+-    tau_crit: 0.52
++    theta_m: 652.7
++    tau_crit: 0.56
+     tau_low: 1.0
+-    tau_high: 1.645
++    tau_high: 1.27
+     qsat: 4.0
+     epsat: 0.05
+     hsat: 3
+@@ -170,10 +170,10 @@
+     lambda_wait: 2.0
+     qmin: 1.0
+     ema_alpha: 0.632121
+-    theta_m: 230.309626
+-    tau_crit: 0.66
++    theta_m: 650.9
++    tau_crit: 0.39
+     tau_low: 1.0
+-    tau_high: 1.825
++    tau_high: 1.59
+     qsat: 4.0
+     epsat: 0.05
+     hsat: 3
+@@ -250,10 +250,10 @@
+     lambda_wait: 2.0
+     qmin: 1.0
+     ema_alpha: 0.632121
+-    theta_m: 233.564481
++    theta_m: 591.6
+     tau_crit: 0.6
+     tau_low: 1.0
+-    tau_high: 2.0
++    tau_high: 1.67
+     qsat: 4.0
+     epsat: 0.05
+     hsat: 3
+@@ -354,7 +354,7 @@
+   node_pressure:
+     registry_nodes_only: true
+ safescale:
+-  slo_mode: labels
++  slo_mode: fixed
+   window_ceiling_s: 60
+   min_commit_samples: 20
+   evidence_clock_tolerance_s: 20
