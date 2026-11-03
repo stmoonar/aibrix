@@ -1,0 +1,7 @@
+# Offline mLSTM training only (the baseline-scaler image does not install these).
+# Versions of the runs that produced the shipped weights (host 75, python 3.10.12, CPU; the wheel there was
+# torch 2.13.0+cu130 with CUDA unused): weights/preserve-mlstm-20261024-paper and -20261103-paper-w10.
+torch==2.13.0
+numpy==2.2.6
+# pandas is needed only when a window cache is missing and data.window_csv is used instead of
+# `pipeline.py windows` (no pandas); the v1 30 s caches were written with pandas (version not recorded).

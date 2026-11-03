@@ -17,14 +17,15 @@ Normalization ``per_sequence_mean`` (our deliberate deviation from upstream's gl
 decision D15): inputs are divided by ``s = max(mean(history[-seq_len:]), eps)``, the model
 predicts the next window as a ratio, and the prediction is ``max(0, ratio) * s``.
 
-File layout (written by ``tre_preserve.train.export.export_npz``): scalar keys ``seq_len``,
-``hidden``, ``eps``, ``normalization``, ``format_version``, ``kinds``; per model kind
+File layout (written by ``preserve_train.export.export_npz``, the copy of the v1
+``tre_preserve.train`` exporter): scalar keys ``seq_len``, ``hidden``, ``eps``, ``normalization``,
+``format_version``, ``kinds``; per model kind
 (``prompt`` / ``response``) the tensors ``<kind>.W_ih.weight`` (4H x 1), ``<kind>.W_ih.bias``,
 ``<kind>.W_hh.weight`` (4H x H), ``<kind>.W_hh.bias``, ``<kind>.fc.weight`` (1 x H),
 ``<kind>.fc.bias`` (+ unused ``<kind>.W_m.*`` / ``<kind>.U_m.*``).
 
 Window (2026-11-03): a model predicts the next window of the length it was trained on, so a file
-declares it: scalar key ``window_s`` (written by ``tools/preserve_mlstm_retrain.py finish``). The
+declares it: scalar key ``window_s`` (written by ``preserve_train/export.py``). The
 three files of ``weights/preserve-mlstm-20261024-paper`` predate the key; their window (30 s, their
 REPORT.md) is known by sha256 (:data:`LEGACY_WINDOW_S`). Any other file without the key is refused,
 and the policy refuses weights of another window than ``params.window_s``.

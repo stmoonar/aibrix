@@ -518,7 +518,8 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
     from tre_baselines.policies import preserve_history as ph
     from tre_baselines.tools import freeze_params as fp
 
-    sha = fp.weights_sha256()
+    W30 = "weights/preserve-mlstm-20261024-paper"   # the 10-24 (30 s) weights: past runs must still load them
+    sha = {k: fp.sha256_file(Path(fp.TRE_ROOT) / "baselines" / W30 / f"{k}-paper.npz") for k in fp.WEIGHT_SETS}
     trace = tmp_path / "Real_code" / "seed1" / "trace.json"
     trace.parent.mkdir(parents=True)
     trace.write_text('[{"timestamp": 1.0, "model_name": "m", "prompt_length": 100, "max_output_tokens": 50}]')
@@ -526,7 +527,7 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
             "models": {"m": [[30000.0 + 100 * i, 15000.0] for i in range(25)]}}
     (trace.parent / ph.DEFAULT_NAME).write_text(__import__("json").dumps(hist))
     params = {"mu": {"m": dict(MU)}, "trace_path": str(trace), "load_error_mode": "none", "window_s": 30,
-              "predictors": {k: {"path": f"{fp.WEIGHTS}/{k}-paper.npz", "sha256": v} for k, v in sha.items()}}
+              "predictors": {k: {"path": f"{W30}/{k}-paper.npz", "sha256": v} for k, v in sha.items()}}
     p = build_policy("preserve", cfg(params))
     assert p.predictor_set == "code" and p.history_info["trace"] == "Real_code"
     est = p._predictors["prompt"].predict([r[0] for r in p._history["m"]])
@@ -539,10 +540,10 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
     gold = {"code": (32385.288988438784, 16027.245117373537), "conv": (32027.71266924556, 15797.959411714452),
             "pooled": (32344.189325879677, 15803.711096508441)}
     for name, (gp, gd) in gold.items():
-        prs = pp.load_predictors(str(Path(fp.TRE_ROOT) / "baselines" / fp.WEIGHTS / f"{name}-paper.npz"), sha[name])
+        prs = pp.load_predictors(str(Path(fp.TRE_ROOT) / "baselines" / W30 / f"{name}-paper.npz"), sha[name])
         assert prs["prompt"].predict(hp) == pytest.approx(gp, rel=1e-6)
         assert prs["response"].predict(hd) == pytest.approx(gd, rel=1e-6)
-    bad = {**params, "predictors": {**params["predictors"], "code": {"path": f"{fp.WEIGHTS}/code-paper.npz",
+    bad = {**params, "predictors": {**params["predictors"], "code": {"path": f"{W30}/code-paper.npz",
                                                                      "sha256": "0" * 64}}}
     with pytest.raises(ValueError, match="sha256"):
         build_policy("preserve", cfg(bad))
@@ -552,6 +553,22 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
     (trace.parent / ph.DEFAULT_NAME).unlink()
     with pytest.raises(ValueError, match="history"):
         build_policy("preserve", cfg(params))
+
+
+def test_the_frozen_configmap_weights_declare_its_window() -> None:
+    """The shipped PreServe ConfigMap's predictors were trained on its window_s (2026-11-03): a release
+    that changes one without the other fails here, not at the shell's start."""
+    pytest.importorskip("numpy")
+    yaml = pytest.importorskip("yaml")
+    from tre_baselines.policies import preserve_predictor as pp
+    from tre_baselines.tools import freeze_params as fp
+
+    docs = [d for d in yaml.safe_load_all(fp.DEFAULT_CM.read_text()) if d]
+    cm = [d for d in docs if d["metadata"]["name"] == "tre-v2-baseline-preserve"][0]
+    params = yaml.safe_load(cm["data"]["preserve.yaml"])
+    for name, spec in params["predictors"].items():
+        prs = pp.load_predictors(str(Path(fp.TRE_ROOT) / "baselines" / spec["path"]), spec["sha256"])
+        assert {p.window_s for p in prs.values()} == {float(params["window_s"])}, name
 
 
 # ------------------------------------------------------------ load errors
