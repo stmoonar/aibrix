@@ -2,6 +2,7 @@
 mLSTM Tier-1, load errors."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -36,7 +37,7 @@ def cfg(params: dict, models=("m",), seed: int = 0) -> Config:
 def make(**params) -> PreServePolicy:
     """The feed / Tier-2 tests: oracle Tier-1 on 600 s windows, no load errors."""
     p = {"mu": {"m": dict(MU)}, "max_output_len": 4096, "tier1": "oracle", "load_error_mode": "none",
-         "window_s": 600.0}
+         "window_s": 600.0, "tier1_horizon": "one_step_now"}
     p.update(params)
     return PreServePolicy(cfg(p), oracle=ORACLE)
 
@@ -51,9 +52,9 @@ def pod(name: str, t: int, itl=(0.0, 0.0), M: Optional[int] = 10_000, *, running
 
 
 def ev(kind: str, req: str, p: Optional[str], ts: int, inn=None, mx=None, reissue="none",
-       cid: Optional[str] = "auto") -> RequestEvent:
+       cid: Optional[str] = "auto", out: Optional[int] = None) -> RequestEvent:
     return RequestEvent(kind=kind, model="m", pod=p, req_id=req, ts_ms=ts, in_tokens=inn,
-                        in_src="header", max_tokens=mx, out_tokens=None, status=None, reissue=reissue,
+                        in_src="header", max_tokens=mx, out_tokens=out, status=None, reissue=reissue,
                         client_id=f"c-{req}" if cid == "auto" else cid)
 
 
@@ -243,8 +244,8 @@ def test_first_tokens_before_the_first_awake_snapshot_are_retained():
     assert d.inputs["anom"]["ft_buffered_applied"] == 1
 
 
-def test_waiting_does_not_advance_decode_and_blocks_underload_shrink():
-    p = make()
+def test_waiting_does_not_advance_decode_and_blocks_underload_shrink_only_with_the_old_gate():
+    p = make(underload_pending_gate=True)
     p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "q", "p0", 1000, 2000, 50)]))
     d = p.decide(snap(5000, [pod("p0", 5000)]))["m"]
     assert d.inputs["tier2"]["p0"]["reqs"] == 0
@@ -253,6 +254,12 @@ def test_waiting_does_not_advance_decode_and_blocks_underload_shrink():
     d = p.decide(snap(6000, [pod("p0", 6000)], [ev("ft", "q", "p0", 6000)]))["m"]
     assert d.inputs["tier2"]["p0"]["reqs"] == 1
     assert d.inputs["tier2"]["p0"]["U0"] == pytest.approx(0.2)
+    # the paper's rule (default): a queued / prefilling request is not in the map and does not block it
+    pods = [pod("p0", 1000), pod("p1", 1000)]
+    d = make().decide(snap(1000, pods, [ev("arr", "q", "p0", 1000, 2000, 50)]))["m"]
+    assert d.reason == "tier2_underload" and d.desired == 1
+    d = make(underload_pending_gate=True).decide(snap(1000, pods, [ev("arr", "q", "p0", 1000, 2000, 50)]))["m"]
+    assert d.inputs["down"] == "pending_prefill" and d.desired == 2
 
 
 def test_wake_keeps_new_attempts_and_rejects_old_attempt_events():
@@ -387,7 +394,8 @@ def test_desired_is_max_of_the_two_tiers_and_a_window_start_resets_tier2() -> No
     pods = [pod("p0", 1000, M=1000)]
     d = p.decide(snap(1000, pods, replay=REPLAY))["m"]
     assert d.reason == "tier1_window" and (d.desired, d.inputs["n_t1"], d.inputs["n_t2"]) == (2, 2, 1)
-    assert d.inputs["tier1"] == {"window": 0, "mode": "oracle", "P_hat": 120000.0, "D_hat": 60000.0, "W": 600.0, "N": 2}
+    assert d.inputs["tier1"] == {"window": 0, "target": 0, "mode": "oracle", "horizon": "one_step_now",
+                                 "P_hat": 120000.0, "D_hat": 60000.0, "W": 600.0, "N": 2}
     d = p.decide(snap(3000, pods, replay=REPLAY))["m"]  # same window, empty map: Tier-2 cannot isolate below N_T1
     assert d.desired == 2
     # an overload adds on max(N_T1, N_T2)
@@ -427,7 +435,8 @@ def test_tier1_after_the_trace_keeps_its_last_value_before_t0_none() -> None:
 def test_oracle_noisy_is_seeded_and_deterministic() -> None:
     def run(seed: int):
         p = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "max_output_len": 4096, "tier1": "oracle_noisy",
-                                "load_error_mode": "none", "window_s": 600.0}, seed=seed), oracle=ORACLE)
+                                "load_error_mode": "none", "window_s": 600.0, "tier1_horizon": "one_step_now"},
+                               seed=seed), oracle=ORACLE)
         return p.decide(snap(1000, [pod("p0", 1000)], replay=REPLAY))["m"].inputs["tier1"]
 
     a = run(4)
@@ -475,7 +484,9 @@ class _Mean:
 
 def mlstm(history=None, **params):
     preds = {"prompt": _Mean(), "response": _Mean()}
-    p = {"mu": {"m": dict(MU)}, "tier1": "mlstm", "seq_len": 3, "load_error_mode": "none", "window_s": 30.0}
+    # the timing / D source of runs before 2026-11-04 unless a test asks for the paper's
+    p = {"mu": {"m": dict(MU)}, "tier1": "mlstm", "seq_len": 3, "load_error_mode": "none", "window_s": 30.0,
+         "tier1_horizon": "one_step_now", "tier1_d_source": "arrival_max_tokens"}
     p.update(params)
     oracle = to.build_oracle([to.TraceRequest(1.0, "m", 1, 1), to.TraceRequest(89.0, "m", 1, 1)],
                              path=ORACLE.path, fmt=to.FORMAT_REQUESTS, window_s=30.0, duration_s=89.0)
@@ -512,6 +523,86 @@ def test_mlstm_flags_a_window_observed_through_an_event_gap_and_restarts_per_rep
     second = ReplayInfo(t0_ms=5_000_000, trace_path=REPLAY.trace_path)
     d = p.decide(snap(5_000_100, [pod("p0", 5_000_100)], replay=second))["m"]
     assert d.inputs["tier1"]["window"] == 0 and preds["prompt"].calls[-1] == [3000.0] * 3  # fresh history
+
+
+def _paper(history):
+    """The paper's Tier-1 (the defaults: paper_two_step, done_tokens) on the stand-in forecaster."""
+    return mlstm(history=history, tier1_horizon="paper_two_step", tier1_d_source="done_tokens")
+
+
+def test_paper_two_step_targets_the_next_window_from_observed_windows_only() -> None:
+    """Alg. 2: at the start of T_i, P_hat_i from the observed history, then P_hat_{i+1} from that history
+    plus P_hat_i (a copy); N_{i+1} is the target from then on. The history holds observations only."""
+    default = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "tier1": "oracle", "load_error_mode": "none",
+                                  "window_s": 600.0}), oracle=ORACLE)
+    assert (default.t1_horizon, default.d_source) == ("paper_two_step", "done_tokens")
+    mean = lambda h: sum(h[-3:]) / 3  # noqa: E731 - the stand-in forecaster
+    p, preds = _paper([[0.0, 0.0], [0.0, 0.0], [9000.0, 0.0]])
+    pods = [pod("p0", 1000)]
+    d = p.decide(snap(1000, pods, replay=REPLAY))["m"]
+    assert preds["prompt"].calls == [[0.0, 0.0, 9000.0], [0.0, 9000.0, 3000.0]]
+    i1 = d.inputs["tier1"]
+    assert (i1["window"], i1["target"], i1["P_hat_cur"], i1["P_hat"]) == (0, 1, 3000.0, 4000.0)
+    assert d.inputs["n_t1"] == 2  # ceil(4000 / (100 x 30)); the one-step N_0 would be 1
+    p.decide(snap(8000, pods, [ev("arr", "a", "p0", 5000, 1200, 600)], replay=REPLAY))
+    d = p.decide(snap(30_500, pods, replay=REPLAY))["m"]
+    obs = [0.0, 9000.0, 1200.0]  # observed P of window 0 = 1200, not the forecast 3000
+    t1m = p._models["m"].mlstm[1]
+    assert t1m.hist_p == obs
+    want = mean(obs[1:] + [mean(obs)])
+    assert d.inputs["tier1"]["P_hat"] == round(want, 1) and d.inputs["tier1"]["target"] == 2
+    assert d.inputs["n_t1"] == t1.required_replicas(want, 0.0, t1.Mu(**MU), 30.0)
+
+
+def test_an_in_flight_requests_d_is_not_visible_before_its_done() -> None:
+    """done_tokens: D of a window = out_tokens of its requests' done events before the forecast instant."""
+    p, preds = _paper([[3000.0, 0.0]] * 3)
+    pods = [pod("p0", 1000)]
+    p.decide(snap(1000, pods, replay=REPLAY))
+    evs = [*load("a", "p0", 5000, 1200, 600), *load("b", "p0", 6000, 1800, 300),
+           ev("done", "a", "p0", 20_000, out=500)]
+    p.decide(snap(21_000, pods, evs, replay=REPLAY))
+    # b completes at 31 s, after the window-1 boundary (30 s), and is read in the same tick
+    d = p.decide(snap(32_000, pods, [ev("done", "b", "p0", 31_000, out=280)], replay=REPLAY))["m"]
+    assert preds["response"].calls[-2] == [0.0, 0.0, 500.0]  # b in flight at 30 s; max_tokens never counted
+    assert d.inputs["tier1"]["d_unknown"] == 1
+    # the forecast at the next boundary (60 s) sees it (the policy's last window targets after the trace)
+    _, info = p._models["m"].mlstm[1].decide(2)
+    assert preds["response"].calls[-2] == [0.0, 780.0, 0.0] and info["d_unknown"] == 0
+
+
+def test_done_or_predicted_counts_an_in_flight_request_by_its_d_hat_until_done() -> None:
+    """Sensitivity mode: at the boundary an in-flight request of a concluded window contributes its
+    Tier-2 D_hat (with the load error); at the next boundary, after its done, its actual tokens."""
+    p, preds = mlstm(history=[[3000.0, 0.0]] * 3, tier1_horizon="paper_two_step",
+                     tier1_d_source="done_or_predicted", load_error_mode="paper_tab2_relative",
+                     out_len_is_upper_bound=False)
+    pods = [pod("p0", 1000)]
+    p.decide(snap(1000, pods, replay=REPLAY))
+    evs = [*load("a", "p0", 5000, 1200, 600), *load("b", "p0", 6000, 1800, 300),
+           ev("done", "a", "p0", 20_000, out=500)]
+    p.decide(snap(21_000, pods, evs, replay=REPLAY))
+    d = p.decide(snap(32_000, pods, [ev("done", "b", "p0", 31_000, out=280)], replay=REPLAY))["m"]
+    d_hat_b = p._predicted_len("m", "c-b", 300, 1800)
+    assert d_hat_b != 300  # the load error, not the max_tokens oracle
+    assert preds["response"].calls[-2] == [0.0, 0.0, 500.0 + d_hat_b]
+    assert d.inputs["tier1"]["d_split"] == [[0, 500.0, float(d_hat_b)]]
+    _, info = p._models["m"].mlstm[1].decide(2)
+    assert preds["response"].calls[-2] == [0.0, 780.0, 0.0]
+    assert (info["d_predicted"], info["d_split"]) == (0.0, [])
+
+
+def test_paper_two_step_oracle_and_the_last_window() -> None:
+    p = make(tier1_horizon="paper_two_step")
+    pods = [pod("p0", 1000)]
+    targets = []
+    for t in (1000, 600_000, 1_200_000, 1_800_000):
+        d = p.decide(snap(t, pods, replay=REPLAY))["m"]
+        targets.append((d.inputs["tier1"].get("target"), d.inputs["n_t1"]))
+    # window 0 -> N_1 = 1; window 1 -> N_2 = 2 (partial, 300 s); window 2: T_3 is after the trace, kept
+    assert targets == [(1, 1), (2, 2), (3, 2), (None, 2)]
+    with pytest.raises(ValueError, match="lead_s"):
+        make(tier1_horizon="paper_two_step", lead_s=5)
 
 
 def test_mlstm_refuses_a_short_history() -> None:
@@ -601,6 +692,29 @@ def test_load_errors_are_a_function_of_the_client_id_and_enter_the_map() -> None
     assert not amap(p, "p0").requests
     assert amap(p, "p1").requests[("x", "p1")].D_pred == p.errors.predict("m", "c-x", 400, 100, p.max_model_len)
     assert d["m"].inputs["load_err"]["cum"]["n"] == 1
+
+
+def test_default_load_errors_are_relative_to_the_length_and_keyed_by_the_client_id() -> None:
+    """paper_tab2_relative (default): err = sign * |r| * D, |r| of the Tab. 2 fit, one draw per
+    (seed, model, client id), the sign symmetric."""
+    from tre_baselines.policies import preserve_load_errors as le
+
+    p = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "tier1": "oracle", "window_s": 600.0,
+                            "out_len_is_upper_bound": False}), oracle=ORACLE)
+    assert isinstance(p.errors, le.Tab2RelativeErrors)
+    e = p.errors
+    rs = [e.rel_error("m", f"c{i}") for i in range(20_000)]
+    assert rs[:50] == [le.Tab2RelativeErrors(0).rel_error("m", f"c{i}") for i in range(50)]
+    assert 0.48 < sum(r > 0 for r in rs) / len(rs) < 0.52
+    mx = le.REL_MIXTURE
+    half_s2 = mx["sigma"] ** 2 / 2
+    mean_abs = (1 - mx["w"]) * math.exp(mx["mu1"] + half_s2) + mx["w"] * math.exp(mx["mu2"] + half_s2)
+    assert sum(abs(r) for r in rs) / len(rs) == pytest.approx(mean_abs, rel=0.03)
+    # relative: the same request is off by ten times more tokens at ten times the length
+    for k in ("c1", "c2", "c3"):
+        r = e.rel_error("m", k)
+        assert e.predict("m", k, 1000, 10, 131072) == max(1, 1000 + round(r * 1000))
+        assert e.predict("m", k, 100, 10, 131072) == max(1, 100 + round(r * 100))
 
 
 def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:

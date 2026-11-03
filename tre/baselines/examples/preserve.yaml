@@ -14,8 +14,12 @@ trace_schedule: poisson
 trace_match_parts: 2
 window_s: 10              # 2026-11-03 (= TRE metrics window; 30 s before, v1 D18; paper 600 s);
                           # the predictors and the history must declare the same window
-lead_s: 0
+lead_s: 0                 # one_step_now + oracle modes only; paper_two_step already looks one window ahead
 tier1: mlstm              # paper; sensitivity: oracle_noisy | oracle | last_window
+tier1_horizon: paper_two_step   # paper Alg. 2: at the start of T_i, two steps -> N_{i+1}, the target from
+                          # then on; one_step_now = runs before 2026-11-04 (T_i itself, v1 D18)
+tier1_d_source: done_tokens     # paper: observed D = done out_tokens by arrival window, known at done;
+                          # arrival_max_tokens = runs before 2026-11-04
 seq_len: 25
 predictors:               # relative paths are under tre/baselines; sha256 is checked at start
   code: {path: weights/preserve-mlstm-20261103-paper-w10/code-paper-w10.npz, sha256: <sha256>}
@@ -30,7 +34,9 @@ mu:
   dsqwen-14b: {p: 0.0, d: 0.0, t: 0.0}
 
 # --- Tier-2 (in-window, per pod, paper §4.3.1 / §4.3.2) ---
-load_error_mode: paper_tab2   # paper RQ2 "PreServe w/ load errors"; none = max_tokens exact
+load_error_mode: paper_tab2_relative   # paper RQ2 "w/ load errors": Tab. 2 fitted as a relative error on
+                          # ShareGPT; paper_tab2 = absolute tokens (runs before 2026-11-04); none = exact
+underload_pending_gate: false   # paper §4.3.2; true = runs before 2026-11-04
 max_model_len: 131072
 # max_output_len: 4096    # default: the trace's largest max_tokens per model, else 4096
 map_factor: 1.2
