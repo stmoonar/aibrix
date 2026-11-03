@@ -11,6 +11,7 @@
 #   CAMPAIGN_WORK_DIR   log / STOP file / runner stdout          (default $CAMPAIGN_DATA_ROOT/campaign-bl-w10-apa-ts-20261103)
 #   TRE_REPO            the tre/ tree of the checkout the runner, client, ConfigMap and APA CRs come from (default: this checkout)
 #   MAIN_SHA            optional: pin the runner commit (8 hex digits); without it the pushed HEAD of this checkout is accepted
+#   ALLOW_UNPUSHED      optional, 1 = accept HEAD != origin/main (explicit user decision; logged as WARN)
 #   TEST_MARKER         only to test the guards with a fake marker file
 #
 #   bash run_campaign-bl-w10-apa-ts-20261103.sh --check
@@ -94,7 +95,13 @@ pgrep -af '[c]alibration_campaign|[t]re_models\.sh' >/dev/null && bad "a calibra
 [ -e "$ROOT/STOP" ] && bad "$ROOT/STOP present (remove it to start)"
 # 0b. runner = pushed main, clean tree
 [ "$(git -C $T/.. status --porcelain | wc -l)" = 0 ] || bad "checkout dirty"
-[ "$(git -C $T/.. rev-parse HEAD)" = "$(git -C $T/.. rev-parse origin/main)" ] || bad "HEAD != origin/main (merge and push first; the runner must be pushed main)"
+if [ "$(git -C $T/.. rev-parse HEAD)" != "$(git -C $T/.. rev-parse origin/main)" ]; then
+  if [ "${ALLOW_UNPUSHED:-0}" = 1 ]; then
+    log "WARN HEAD != origin/main: running an unpushed main by explicit ALLOW_UNPUSHED=1 (user decision; deviates from AGENTS.md rule 6 until pushed, a fast-forward push keeps the sha)"
+  else
+    bad "HEAD != origin/main (merge and push first; the runner must be pushed main; ALLOW_UNPUSHED=1 overrides by explicit decision)"
+  fi
+fi
 HEAD8=$(git -C $T/.. rev-parse --short=8 HEAD)
 if [ -n "$MAIN_SHA" ]; then
   [ "$HEAD8" = "$(echo "$MAIN_SHA" | cut -c1-8)" ] || bad "HEAD $HEAD8 != MAIN_SHA $MAIN_SHA"
