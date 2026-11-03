@@ -12,14 +12,15 @@ trace_path: /etc/tre-baselines-traces/case/seed1/traces_tre.effective.json
 trace_seed: 0             # = the replay's --seed (segment traces are re-scheduled from it)
 trace_schedule: poisson
 trace_match_parts: 2
-window_s: 30              # v1 D18 (paper 600 s; the traces are 12 min)
+window_s: 10              # 2026-11-03 (= TRE metrics window; 30 s before, v1 D18; paper 600 s);
+                          # the predictors and the history must declare the same window
 lead_s: 0
 tier1: mlstm              # paper; sensitivity: oracle_noisy | oracle | last_window
 seq_len: 25
 predictors:               # relative paths are under tre/baselines; sha256 is checked at start
-  code: {path: weights/preserve-mlstm-20261024-paper/code-paper.npz, sha256: <sha256>}
-  conv: {path: weights/preserve-mlstm-20261024-paper/conv-paper.npz, sha256: <sha256>}
-  pooled: {path: weights/preserve-mlstm-20261024-paper/pooled-paper.npz, sha256: <sha256>}
+  code: {path: weights/preserve-mlstm-20261103-paper-w10/code-paper-w10.npz, sha256: <sha256>}
+  conv: {path: weights/preserve-mlstm-20261103-paper-w10/conv-paper-w10.npz, sha256: <sha256>}
+  pooled: {path: weights/preserve-mlstm-20261103-paper-w10/pooled-paper-w10.npz, sha256: <sha256>}
 predictor_rules: [[Real_code, code], [Real_conv, conv]]   # by trace name prefix; else pooled
 # Per-replica serving capability, tok/s (tools/velocity_ladder mu, variant B). Required for
 # every managed model.

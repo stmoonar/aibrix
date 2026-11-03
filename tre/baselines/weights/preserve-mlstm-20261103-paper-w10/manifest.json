@@ -1,0 +1,271 @@
+{
+ "created_utc": "2026-11-03T07:50:40+00:00",
+ "pipeline": {
+  "path": "tre/baselines/preserve_train/pipeline.py",
+  "sha": "1c661670f2d27d0e8566a3374b47439e72c18bf2",
+  "dirty": false
+ },
+ "trainer_dir": "/data/nfs_shared_data/xxy/bl-mlstm-w10-20261103-repo",
+ "trainer_manifest_sha256": "51628a75922ce0ac08722d6b536c449b30f71ba4fc7d253d9fb35a47276c9095",
+ "trainer_code": {
+  "sha": "1c661670f2d27d0e8566a3374b47439e72c18bf2",
+  "dirty_tre_preserve_train": false
+ },
+ "trainer_env": {
+  "python": "3.10.12",
+  "torch": "2.13.0+cu130",
+  "numpy": "2.2.6",
+  "host_cpu_count": 64
+ },
+ "trainer_argv": [
+  "/data/nfs_shared_data/xxy/aibrix-wt/bl-window10-20261103/tre/baselines/preserve_train/pipeline.py",
+  "train",
+  "--train-dir",
+  "/data/nfs_shared_data/xxy/bl-mlstm-w10-20261103-repo",
+  "--window-s",
+  "10",
+  "--azure-root",
+  "/data/nfs_shared_data/xxy/datasets/azure-llm-inference",
+  "--file-suffix=-paper-w10",
+  "--jobs",
+  "12",
+  "--threads",
+  "1"
+ ],
+ "window_s": 10,
+ "files": {
+  "code": {
+   "file": "code-paper-w10.npz",
+   "sha256": "f8b74a2b91cd570e3b9b565ae8ac0fb5d47a7e9366699bf138d40f91509340c2",
+   "streams": [
+    "code"
+   ]
+  },
+  "conv": {
+   "file": "conv-paper-w10.npz",
+   "sha256": "f21dad6b84f43ff1fc354b35590f0f62ff69e1ab9b7f3f7c66559ca9bc93636b",
+   "streams": [
+    "conv"
+   ]
+  },
+  "pooled": {
+   "file": "pooled-paper-w10.npz",
+   "sha256": "e69c2dc188b46e8fa0368e47ea42962697578613745e6c1621dcbb3728f1d7ad",
+   "streams": [
+    "code",
+    "conv"
+   ]
+  }
+ },
+ "held_out_mape_mlstm": {
+  "10": {
+   "code": {
+    "per_sequence_mean": {
+     "code": {
+      "prompt": 17.36,
+      "response": 28.69,
+      "total": 17.26,
+      "targets": 51635
+     }
+    },
+    "global_minmax": {
+     "code": {
+      "prompt": 23.08,
+      "response": 36.74,
+      "total": 22.96,
+      "targets": 51635
+     }
+    }
+   },
+   "conv": {
+    "per_sequence_mean": {
+     "conv": {
+      "prompt": 7.35,
+      "response": 9.15,
+      "total": 7.33,
+      "targets": 47855
+     }
+    },
+    "global_minmax": {
+     "conv": {
+      "prompt": 7.41,
+      "response": 9.07,
+      "total": 7.39,
+      "targets": 47855
+     }
+    }
+   },
+   "pooled": {
+    "per_sequence_mean": {
+     "code": {
+      "prompt": 12.76,
+      "response": 22.14,
+      "total": 12.71,
+      "targets": 30240
+     },
+     "conv": {
+      "prompt": 7.63,
+      "response": 9.34,
+      "total": 7.61,
+      "targets": 30240
+     }
+    },
+    "global_minmax": {
+     "code": {
+      "prompt": 12.76,
+      "response": 20.53,
+      "total": 12.7,
+      "targets": 30240
+     },
+     "conv": {
+      "prompt": 7.62,
+      "response": 9.31,
+      "total": 7.59,
+      "targets": 30240
+     }
+    }
+   }
+  },
+  "30": {
+   "code": {
+    "per_sequence_mean": {
+     "code": {
+      "prompt": 12.94,
+      "response": 19.2,
+      "total": 12.88,
+      "targets": 17195
+     }
+    },
+    "global_minmax": {
+     "code": {
+      "prompt": 13.63,
+      "response": 21.82,
+      "total": 13.58,
+      "targets": 17195
+     }
+    }
+   },
+   "conv": {
+    "per_sequence_mean": {
+     "conv": {
+      "prompt": 6.46,
+      "response": 7.05,
+      "total": 6.44,
+      "targets": 15935
+     }
+    },
+    "global_minmax": {
+     "conv": {
+      "prompt": 6.65,
+      "response": 7.11,
+      "total": 6.62,
+      "targets": 15935
+     }
+    }
+   },
+   "pooled": {
+    "per_sequence_mean": {
+     "code": {
+      "prompt": 10.37,
+      "response": 15.37,
+      "total": 10.33,
+      "targets": 10080
+     },
+     "conv": {
+      "prompt": 6.8,
+      "response": 7.42,
+      "total": 6.78,
+      "targets": 10080
+     }
+    },
+    "global_minmax": {
+     "code": {
+      "prompt": 10.52,
+      "response": 14.92,
+      "total": 10.47,
+      "targets": 10080
+     },
+     "conv": {
+      "prompt": 6.8,
+      "response": 7.38,
+      "total": 6.79,
+      "targets": 10080
+     }
+    }
+   }
+  }
+ },
+ "held_out_mape_naive_last_window": {
+  "10": {
+   "code": {
+    "code": {
+     "prompt": 19.41,
+     "response": 34.15,
+     "total": 19.3,
+     "targets": 51635
+    }
+   },
+   "conv": {
+    "conv": {
+     "prompt": 8.29,
+     "response": 10.68,
+     "total": 8.26,
+     "targets": 47855
+    }
+   },
+   "pooled": {
+    "code": {
+     "prompt": 14.8,
+     "response": 27.02,
+     "total": 14.72,
+     "targets": 30240
+    },
+    "conv": {
+     "prompt": 8.63,
+     "response": 11.02,
+     "total": 8.6,
+     "targets": 30240
+    }
+   }
+  },
+  "30": {
+   "code": {
+    "code": {
+     "prompt": 15.16,
+     "response": 23.11,
+     "total": 15.09,
+     "targets": 17195
+    }
+   },
+   "conv": {
+    "conv": {
+     "prompt": 7.68,
+     "response": 8.54,
+     "total": 7.66,
+     "targets": 15935
+    }
+   },
+   "pooled": {
+    "code": {
+     "prompt": 12.14,
+     "response": 18.74,
+     "total": 12.1,
+     "targets": 10080
+    },
+    "conv": {
+     "prompt": 7.98,
+     "response": 8.9,
+     "total": 7.96,
+     "targets": 10080
+    }
+   }
+  }
+ },
+ "reference_dir": "/data/nfs_shared_data/xxy/tre_v1/preserve-mlstm-20261024-paper",
+ "run_notes": [
+  "trained by the repo copy preserve_train (aibrix 1c661670) with the settings of the tre_code 80571402 run of the same day (/data/nfs_shared_data/xxy/bl-mlstm-w10-20261103): every array of the three files is identical to that run (window_s aside, which the tre_code export lacks); window caches and held-out MAPE identical too (/data/nfs_shared_data/xxy/bl-mlstm-w10-20261103-repo/compare_vs_tre_code.json, compare_caches_mape_vs_tre_code.json)",
+  "--jobs 12 (10-24 run: --jobs 2): parallel training processes only; each job trains with 1 torch thread as before; the trainer main process (held-out forward passes) used min(8, jobs x threads) = 8 threads (was 2)",
+  "window caches windows_{code,conv}_10s.npz: pipeline.py windows (no pandas on host 75); it first reproduced both v1 30 s caches of preserve-mlstm-20261024-paper exactly (windows_check_10s.json in the training dir)",
+  "host 75 (as the 10-24 run), CPU, nice 10, taskset 48-63, 2026-11-03 15:38-15:53 (75 clock, about 160 s ahead of 76); git safe.directory via GIT_CONFIG_GLOBAL only"
+ ]
+}

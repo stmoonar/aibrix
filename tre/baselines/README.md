@@ -61,8 +61,10 @@ tre_baselines/   snapshot.py (policy contract)  sources.py  loop.py  sm_client.p
                  policies/{chiron,tokenscale,preserve,static}.py   trace_oracle.py
                  policies/preserve_{tier1,anticipator,predictor,load_errors,history}.py
                  tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  velocity_ladder.py  freeze_params.py
-                          preserve_history.py  tokenscale_profile.py  preserve_mu.py (old procedure)
-weights/         preserve-mlstm-20261024-paper/{code,conv,pooled}-paper.npz (v1 paper_past, REPORT.md)
+                          preserve_history{,_azure,_frozen}.py  tokenscale_profile.py  preserve_mu.py (old procedure)
+preserve_train/  offline trainer of weights/ (copy of the v1 trainer, needs torch; not imported by tre_baselines)
+weights/         preserve-mlstm-20261103-paper-w10/{code,conv,pooled}-paper-w10.npz (v1 paper_past at 10 s,
+                 REPORT.md, the ConfigMap's); preserve-mlstm-20261024-paper/ (30 s, runs before 2026-11-03)
 requirements-baselines.txt   numpy==1.26.4 (mLSTM forward pass; the image sets *_NUM_THREADS=1)
 examples/        one parameter file per policy (chiron.yaml, tokenscale.yaml, preserve.yaml)
 tests/           unit tests + test_bl_e2e_real_redis.py (fake environment, real Redis)
@@ -166,7 +168,7 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
 - TokenScale: no V_P (v1 D51); lambda' per cell = true input + the cell's represented output after the
   simulated 15 % misbucketing, drawn from `hash(seed, model, client request id)` (`x-tre-request-id`, carried by
   the gateway's bl events as `client_id`; a sidecar reissue keeps it, so a reissue lands in the same cell).
-- PreServe: `window_s` 30 (v1 D18); mu = variant B of `velocity_ladder mu`: cells whose P share lies in the
+- PreServe: `window_s` 10 (2026-11-03; 30 before, v1 D18); mu = variant B of `velocity_ladder mu`: cells whose P share lies in the
   traces' pooled 30 s window share **[p5, p95]** (deviation from v1's [min, max], recorded in the output:
   v1's range was narrow because its traces were; `--p-share-range minmax` restores it). Tier-1 needs the
   history before t0 next to the trace (below). The old knee / closed-loop procedure (`tokenscale_profile`,
@@ -184,7 +186,13 @@ windows refuses the policy):
   --trace <trace dir>/traces_tre.effective.json --out <dir>/preserve_history.json` (the Azure windows right
   before the slice x the trace's rate / the slice's rate x the trace's mean lengths);
 - `preserve_history check --trace T [--history H]` loads it as the policy does and prints the last history
-  window next to the trace's first one.
+  window next to the trace's first one;
+- ICSE trace sets (`traces-icse-ktrace-20261031`, `traces-icse-r3c-20261101`, `traces-icse-r3e-20261101`):
+  `python3 -m tre_baselines.tools.preserve_history_azure --profile {icse|r3c|r3e} --suite <set>
+  --k-map <set>/_checks/k_map.json --v1-gen <CustomTraceGenerator | <set>.design> --v9 <traces_v9>
+  --azure-root <azure-root> --trace T --window-s W` (real Azure segments; rule in the module docstring). W must
+  be the policy's `window_s`: 30 writes `preserve_history.json`, another W `preserve_history_w<W>.json`, the
+  file the runner copies when the PreServe ConfigMap says `window_s: W`. `--verify` compares with existing files.
 
 The campaign runner copies the history file next to its copy of the trace, keeping `<trace>/seed<k>/`.
 

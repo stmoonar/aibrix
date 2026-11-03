@@ -91,14 +91,14 @@ data:
     trace_seed: 0
     trace_schedule: poisson
     trace_match_parts: 2
-    window_s: 30             # v1 D18 (paper 600 s; the traces are 12 min)
+    window_s: 10             # = TRE metrics window (2026-11-03; 30 s before, v1 D18; paper 600 s)
     lead_s: 0
-    tier1: mlstm             # paper forecaster; v1 paper_past weights (train before the Real_* slices)
+    tier1: mlstm             # paper forecaster; v1 paper_past protocol at W = 10 s (train before the Real_* slices)
     seq_len: 25
     predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)
-      code: {path: weights/preserve-mlstm-20261024-paper/code-paper.npz, sha256: 3e70e4642829427ac5a528bfd6ff77e8e29335960adbab76832a6d5168251fb4}
-      conv: {path: weights/preserve-mlstm-20261024-paper/conv-paper.npz, sha256: 64448df062646bbb0cbe0ce8936330509172046c4bd2ee568b595b4ad4dc4478}
-      pooled: {path: weights/preserve-mlstm-20261024-paper/pooled-paper.npz, sha256: 0dfd5649600b2c86208528e3f0de5b19ac3266fc27af77c2189d6851134c1585}
+      code: {path: weights/preserve-mlstm-20261103-paper-w10/code-paper-w10.npz, sha256: f8b74a2b91cd570e3b9b565ae8ac0fb5d47a7e9366699bf138d40f91509340c2}
+      conv: {path: weights/preserve-mlstm-20261103-paper-w10/conv-paper-w10.npz, sha256: f21dad6b84f43ff1fc354b35590f0f62ff69e1ab9b7f3f7c66559ca9bc93636b}
+      pooled: {path: weights/preserve-mlstm-20261103-paper-w10/pooled-paper-w10.npz, sha256: e69c2dc188b46e8fa0368e47ea42962697578613745e6c1621dcbb3728f1d7ad}
     predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled
     mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,
                              # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu

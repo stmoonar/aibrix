@@ -33,8 +33,10 @@ import yaml
 TRE_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CM = TRE_ROOT / "deploy" / "baselines" / "tre" / "policy-configmaps.yaml"
 MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
-#: PreServe mLSTM weights shipped in the image (relative to tre/baselines), v1 paper_past (2026-10-24)
-WEIGHTS = "weights/preserve-mlstm-20261024-paper"
+#: PreServe mLSTM weights shipped in the image (relative to tre/baselines): v1 paper_past protocol
+#: retrained at W = 10 s (2026-11-03; the 30 s weights of 2026-10-24 stay in weights/ for past runs)
+WEIGHTS = "weights/preserve-mlstm-20261103-paper-w10"
+WEIGHTS_SUFFIX = "-paper-w10"
 WEIGHT_SETS = ("code", "conv", "pooled")
 
 
@@ -93,13 +95,13 @@ def render_preserve(mu: Optional[Mapping[str, Any]], sources: Mapping[str, str],
          "trace_seed: 0",
          "trace_schedule: poisson",
          "trace_match_parts: 2",
-         "window_s: 30             # v1 D18 (paper 600 s; the traces are 12 min)",
+         "window_s: 10             # = TRE metrics window (2026-11-03; 30 s before, v1 D18; paper 600 s)",
          "lead_s: 0",
-         "tier1: mlstm             # paper forecaster; v1 paper_past weights (train before the Real_* slices)",
+         "tier1: mlstm             # paper forecaster; v1 paper_past protocol at W = 10 s (train before the Real_* slices)",
          "seq_len: 25",
          "predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)"]
     for name in WEIGHT_SETS:
-        L.append(f"  {name}: {{path: {WEIGHTS}/{name}-paper.npz, sha256: {weights[name]}}}")
+        L.append(f"  {name}: {{path: {WEIGHTS}/{name}{WEIGHTS_SUFFIX}.npz, sha256: {weights[name]}}}")
     L += ["predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled",
           "mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,",
           "                         # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu"]
@@ -140,7 +142,7 @@ def with_notes(block: str, notes) -> str:
 
 def weights_sha256() -> dict[str, str]:
     root = TRE_ROOT / "baselines" / WEIGHTS
-    return {n: sha256_file(root / f"{n}-paper.npz") for n in WEIGHT_SETS}
+    return {n: sha256_file(root / f"{n}{WEIGHTS_SUFFIX}.npz") for n in WEIGHT_SETS}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
