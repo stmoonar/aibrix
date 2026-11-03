@@ -67,6 +67,9 @@ DESIGN_RESULT = "design_result.json"
 #: pod discovery, prompt materialisation); the first round measured ~6 s.
 DRIVER_OVERHEAD_S = 6.0
 DEFAULT_DESIGN_SEED = 20260923
+#: Exit code of a run ended by ``--stop-file`` before a cell: nothing failed, the cells
+#: before it are complete (and in the dataset), the rest were never driven.
+EXIT_STOP_FILE = 4
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -242,6 +245,8 @@ def design_cell_command(grid_cell, cell: design.DesignCell, args, schedule_path:
     probe, the backlog valve."""
     command = campaign.cell_command(grid_cell, args, schedule_path, output)
     command[command.index("--prompt-dir") + 1] = str(prompt_dir)
+    if cell.max_model_error_rate is not None:
+        command[command.index("--max-model-error-rate") + 1] = str(cell.max_model_error_rate)
     command += ["--schedule-seed", str(cell.arrival_seed), "--prompt-key", cell.prompt_key]
     if cell.role == design.ROLE_BOUNDARY:
         command += ["--max-backlog", str(design.PROBE_MAX_BACKLOG)]
@@ -366,6 +371,7 @@ class LadderRun:
         with (self.out_dir / LEDGER).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, sort_keys=True) + "\n")
         self.records.append(record)
+        self.log_attempt(record)
         if contaminated:
             self.contaminated.append({"cell_id": cell.cell_id, "attempt": attempt,
                                       "role": cell.role, "shape": cell.shape,
@@ -376,9 +382,35 @@ class LadderRun:
             raise CampaignStopped(f"cell {cell.cell_id} driver exited {returncode}", returncode)
         return rows, guard, record
 
+    def log_attempt(self, record: dict) -> None:
+        """``--cell-log``: one line per driven attempt, appended next to the ledger line - a
+        chain's progress record across its runs (``cells.jsonl`` stays the record)."""
+        path = getattr(self.args, "cell_log", None)
+        if not path:
+            return
+        keys = ("model", "shape", "role", "cell_id", "attempt", "rho_factor", "rho",
+                "offered_rps", "duration_s", "max_model_error_rate", "driven_at_utc",
+                "start_ms", "end_ms", "returncode", "sent", "completed", "verdict",
+                "labeled_windows", "violating_windows", "void_reasons", "possibly_contaminated")
+        line = {"logged_at_utc": campaign.utc_iso(), "run": str(self.out_dir),
+                "training_plan": getattr(self.args, "training_plan", None),
+                **{k: record.get(k) for k in keys}}
+        with Path(path).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, sort_keys=True) + "\n")
+
+    def stop_requested(self) -> Optional[Path]:
+        """The first ``--stop-file`` that exists, if any."""
+        return next((Path(p) for p in getattr(self.args, "stop_file", None) or ()
+                     if Path(p).exists()), None)
+
     def drive_cell(self, cell: design.DesignCell) -> tuple[list, dict, dict]:
         """A scheduled cell: re-run once in place if void, stop the run on a second void
-        (the campaign's one rule, ``adaptive_boundary.next_void_attempt``)."""
+        (the campaign's one rule, ``adaptive_boundary.next_void_attempt``). A ``--stop-file``
+        that exists ends the run here, before the cell (exit :data:`EXIT_STOP_FILE`)."""
+        stop = self.stop_requested()
+        if stop is not None:
+            raise CampaignStopped(f"stop file {stop} exists: {cell.cell_id} and every cell "
+                                  "after it are not driven", EXIT_STOP_FILE)
         attempt = 1
         while True:
             rows, guard, record = self.drive_attempt(cell, attempt)

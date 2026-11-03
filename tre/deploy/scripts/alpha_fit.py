@@ -151,7 +151,7 @@ def shape_table() -> dict[tuple[int, int], str]:
     out = {(int(i), int(o)): name for name, (i, o) in gen.SHAPES.items()}
     for name, (i, o) in gen.SAMPLED_SHAPES.items():
         out[(gen._length_nominal(i), gen._length_nominal(o))] = name
-    for name, (i, o) in gen.STATIC_GRID_SHAPES.items():
+    for name, (i, o) in {**gen.STATIC_GRID_SHAPES, **gen.SUPPLEMENT_GRID_SHAPES}.items():
         out[(int(i), int(o))] = name
     return out
 

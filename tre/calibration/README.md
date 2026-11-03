@@ -11,6 +11,7 @@ ranking metrics). The campaign that produces its input lives in `tre/deploy/scri
 | standard dataset | `calibration_dataset.py` |
 | fit / freeze / accept | `dline_refit.py` (+ `alpha_fit.py`, `theta_verdict.py`) |
 | ranking disclosure (AUROC, Kendall tau-b) | see `tre/docs/design/20260930-ranking-metrics.md` |
+| refit theta / tau_crit / tau_high / lambda / w_p (fixed SLO, local logistic; the 2026-11-03 supplement and the published `Frecf_all` parameters) | `tre/calibration/scripts/fit_tss/` (its README: configuration, reproduction, provenance) |
 
 ## Request endpoint: chat, fitted to the templated length
 

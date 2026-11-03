@@ -1,7 +1,7 @@
 """Step ③ of plan 2026-09-21 §6.11 - the training supplement
 (``scripts.calibration_training_supplement``).
 
-What these pin: the cells per model (③a S3 ladder on the supplement's D6' rho*, 14b also
+What these pin (the 2026-11-03 plans A / B / E at the end): the cells per model (③a S3 ladder on the supplement's D6' rho*, 14b also
 at 0.75 x; ③b 14b's twelve T8 cells on 1.006 x rho*_run2; the 7b T8 top-up; three S2
 sentinels at 0.72 x rho*_run2 first / middle / last); every cell is a 300 s hold (240 s
 sentinel) with a run-unique id above the supplement's, its own seeds, a ledger line the
@@ -28,9 +28,12 @@ from scripts import calibration_ladder as ladder
 from scripts import calibration_supplement as supplement
 from scripts import calibration_training_supplement as ts
 from scripts import dline_refit as dl
+from scripts import gen_calibration_schedules as gen
+from scripts import stream_cut
 
-ANCHORS = {"S2": 1.4, "S3": 1.5, "T8": 0.9, "S4": 1.9, "S5": 1.4}  # rho*_run2 (x C_s)
-CAPACITY = {"S2": 7.5, "S3": 2.0, "T8": 6.0, "S4": 6.4, "S5": 5.5}  # C_s (rps)
+# rho*_run2 (x C_s) and C_s (rps); S1 / T9 only feed the 2026-11-03 supplement's plans
+ANCHORS = {"S2": 1.4, "S3": 1.5, "T8": 0.9, "S4": 1.9, "S5": 1.4, "S1": 1.8, "T9": 1.25}
+CAPACITY = {"S2": 7.5, "S3": 2.0, "T8": 6.0, "S4": 6.4, "S5": 5.5, "S1": 16.6, "T9": 6.2}
 SUPP_S3 = 2.1                                     # rho*_D6'(S3) (x C_s)
 LENGTH = {"S2": 768, "S3": 2048, "T8": 1600, "S4": 256, "S5": 768}
 
@@ -381,3 +384,144 @@ def test_the_cli_plans_p1_without_a_supplement_and_keeps_the_flag_with_it(tmp_pa
     with pytest.raises(SystemExit):
         campaign.main(["--training-plan", "p1-deep-overload", "--models", model,
                        "--out-dir", str(tmp_path / "o"), "--dry-run"])
+
+
+# ------------------------------------------------- the 2026-11-03 supplement (A / B / E)
+
+SUPP_SEED = 20261103
+_IDLE = {"running": 0, "waiting": 0, "pods_scraped": 1, "scrape_errors": 0}
+
+
+def _supp_args(tmp_path, name, base, **over):
+    return _args(tmp_path, "dsqwen-7b", training_plan=name, base_run=base,
+                 boundary_supplement_run=None, **{"design_seed": SUPP_SEED, **over})
+
+
+def _supp_drive(driven, after=None):
+    """Every cell healthy; ``after(n)`` runs once the n-th cell is driven."""
+    t = [1_790_000_000_000]
+
+    def drive(cell, attempt, schedule_path, output, prompt_dir):
+        driven.append((cell, json.loads(Path(schedule_path).read_text())))
+        start = t[0]
+        t[0] += int(cell.duration_s * 1000) + 60_000
+        if after is not None:
+            after(len(driven))
+        return (_windows(start, cell.duration_s, ttft=100.0, length=512),
+                {"start_ms": start, "end_ms": start + int(cell.duration_s * 1000),
+                 "void_reasons": [], "sent": 10, "completed": 10}, 0)
+
+    return drive
+
+
+def _run_plan(args, after=None):
+    clock, driven = _Clock(), []
+    code = ts.run_training_supplement(
+        args, drive=_supp_drive(driven, after), sample_factory=lambda _m: lambda: dict(_IDLE),
+        sleep=clock.sleep, clock=clock, check_controller=False)
+    return code, driven
+
+
+def _training_set(record) -> str:
+    row = {k: record[k] for k in ("model", "cell_id", "attempt", "shape", "primitive", "role",
+                                  "split", "stage")}
+    return dl.assign_set(row, sealed_to_h2=False, sentinels=True)
+
+
+@pytest.mark.parametrize("model", ["dsqwen-7b", "dsllama-8b", "dsqwen-14b"])
+def test_the_supplement_is_66_cells_per_model_and_only_e_is_held_out(tmp_path, model) -> None:
+    base = _base_run(tmp_path / "base", model)
+    ids = set()
+    for name, n, shapes, factors in (
+            (ts.PLAN_SUPP_A, 28, gen.TRAINING_SHAPES, ts.SUPP_A_FACTORS),
+            (ts.PLAN_SUPP_B, 32, tuple(gen.SUPPLEMENT_GRID_SHAPES),
+             ts.SUPP_B_FACTORS + ts.SUPP_B_KNEE_FACTORS),
+            (ts.PLAN_SUPP_E, 6, tuple(gen.VALIDATION_SHAPES), ts.SUPP_E_FACTORS)):
+        tplan = ts.TRAINING_PLANS[name]
+        resolved = ts.resolve_units(model, base, None, tplan)
+        factory = design.CellFactory(model, SUPP_SEED, serial_base=tplan.serial_base)
+        seq, sentinels = ts.build_cells(model, factory, resolved, SUPP_SEED, tplan)
+        assert len(seq) == n and sentinels == []
+        # three tiers in turn: B 0.4-0.85 / 0.95-1.05 / 1.15-1.3 x, E 0.8 / 1.0 / 1.2 x (A: one)
+        tier = [(c.rho_factor >= ts.SUPP_NEAR_KNEE_FACTOR) + (c.rho_factor >= ts.SUPP_OVERLOAD_FACTOR)
+                for c in seq]
+        assert tier == sorted(tier) and [tier.count(k) for k in (0, 1, 2)] == {
+            ts.PLAN_SUPP_A: [28, 0, 0], ts.PLAN_SUPP_B: [16, 8, 8], ts.PLAN_SUPP_E: [2, 2, 2]}[name]
+        assert sorted((c.shape, c.rho_factor) for c in seq) == sorted(
+            (s, f) for s in shapes for f in factors)
+        held_out = name == ts.PLAN_SUPP_E
+        for c in seq:
+            assert c.split == (design.SPLIT_HOLDOUT if held_out else design.SPLIT_TRAIN)
+            assert gen.is_held_out(c.shape) == held_out
+            assert c.max_model_error_rate == (
+                stream_cut.RUNTIME_MODEL_ERROR_LIMIT if c.rho_factor >= ts.SUPP_OVERLOAD_FACTOR else None)
+            long = name == ts.PLAN_SUPP_E or c.rho_factor in ts.SUPP_B_KNEE_FACTORS
+            assert c.duration_s == (ts.SUPP_LONG_SECONDS if long else ts.SUPP_SECONDS)
+            if name == ts.PLAN_SUPP_A:     # rho*_run2 units
+                assert c.rho == pytest.approx(c.rho_factor * ANCHORS[c.shape])
+            else:                          # C^ units: rho is the factor
+                assert c.rho == pytest.approx(c.rho_factor)
+        ids |= {c.cell_id for c in seq}
+        assert all(c.serial > 81_000 for c in seq)      # above every earlier collection's
+    assert len(ids) == 66
+    # C^: one fit 1/r = i/P + o/D; a mixture combines its streams by request share
+    prior = resolved["prior"]
+    cost = lambda i, o: i / prior["prefill_tokens_per_s"] + o / prior["decode_tokens_per_s"]  # noqa: E731
+    for shape, streams in gen.VALIDATION_SHAPES.items():
+        assert resolved["capacity"][shape] == pytest.approx(
+            1.0 / sum(w * cost(i, o) for w, i, o in streams), rel=1e-5)
+
+
+def test_b_trains_and_e_is_sealed_never_trained(tmp_path) -> None:
+    base = _base_run(tmp_path / "base", "dsqwen-7b")
+    code, driven = _run_plan(_supp_args(tmp_path / "b", ts.PLAN_SUPP_B, base))
+    assert code == 0 and len(driven) == 32
+    assert {_training_set(r) for r in _ledger(tmp_path / "b")} == {dl.SET_TRAINING}
+
+    # E: the dry run's plan, sealed with a sidecar before the collection
+    dry = _supp_args(tmp_path / "seal", ts.PLAN_SUPP_E, base, dry_run=True)
+    assert ts.run_training_supplement(dry, check_controller=False) == 0
+    sealed = tmp_path / "seal" / "out" / "plan.json"
+    with pytest.raises(ValueError, match="needs --sealed-plan"):
+        _run_plan(_supp_args(tmp_path / "e0", ts.PLAN_SUPP_E, base))
+    with pytest.raises(ValueError, match="sidecar"):
+        _run_plan(_supp_args(tmp_path / "e1", ts.PLAN_SUPP_E, base, sealed_plan=sealed))
+    Path(f"{sealed}.sha256").write_text(f"{design._sha256(sealed)}  plan.json\n")
+    # other cells (here: another design seed) than the sealed ones are refused
+    with pytest.raises(ValueError, match="differ from the sealed plan"):
+        _run_plan(_supp_args(tmp_path / "e2", ts.PLAN_SUPP_E, base,
+                                              sealed_plan=sealed, design_seed=1))
+    code, driven = _run_plan(_supp_args(tmp_path / "e", ts.PLAN_SUPP_E, base,
+                                                        sealed_plan=sealed))
+    assert code == 0 and len(driven) == 6
+    records = _ledger(tmp_path / "e")
+    assert {_training_set(r) for r in records} == {dl.SET_M}
+    # a mixture cell offers factor x C^_mix, split over its streams by request share
+    cell, body = driven[0]
+    (segments,) = body.values()
+    c_mix = records[0]["capacity_rps"]
+    assert [s["rps"] for s in segments] == pytest.approx(
+        [w * cell.rho_factor * c_mix for w, _i, _o in gen.VALIDATION_SHAPES[cell.shape]], rel=1e-3)
+    out = tmp_path / "e" / "out"
+    manifest = json.loads((out / ts.E_MANIFEST).read_text())
+    assert manifest["sealed_plan"]["sha256"] == design._sha256(sealed)
+    assert {c["split"] for c in manifest["cells"]} == {design.SPLIT_HOLDOUT} and len(manifest["cells"]) == 6
+    for name in (ts.E_MANIFEST, ts.E_SHA256SUMS):
+        assert not (out / name).stat().st_mode & 0o222          # read-only
+    listed = (out / ts.E_SHA256SUMS).read_text()
+    assert str((out / ladder.LEDGER).resolve()) in listed and "/dataset/" not in listed
+
+
+def test_a_stop_file_ends_the_run_before_the_next_cell(tmp_path) -> None:
+    base = _base_run(tmp_path / "base", "dsqwen-7b")
+    stop, log = tmp_path / "STOP.dsqwen-7b", tmp_path / "logs" / "cells.dsqwen-7b.jsonl"
+    log.parent.mkdir()
+    args = _supp_args(tmp_path, ts.PLAN_SUPP_A, base, stop_file=[tmp_path / "STOP", stop],
+                      cell_log=log)
+    code, driven = _run_plan(args, after=lambda n: n == 2 and stop.write_text(""))
+    assert code == ladder.EXIT_STOP_FILE and len(driven) == 2
+    lines = [json.loads(x) for x in log.read_text().splitlines()]
+    assert [x["cell_id"] for x in lines] == [r["cell_id"] for r in _ledger(tmp_path)]
+    assert all(x["training_plan"] == ts.PLAN_SUPP_A and x["verdict"] for x in lines)
+    status = json.loads((tmp_path / "out" / campaign.CAMPAIGN_STATUS_FILE).read_text())
+    assert status["exit_code"] == ladder.EXIT_STOP_FILE

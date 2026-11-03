@@ -1697,7 +1697,11 @@ def namespace_request_ids(events: Sequence, request_key: Optional[str]) -> list:
 
 @dataclass
 class _Sidecar:
-    """1 Hz instant sampler thread."""
+    """Instant sampler thread, one sample every ``interval_s`` (1 Hz by default).
+
+    Fixed rate: sample n is due at start + n x interval, so the spacing is the interval and
+    not the interval plus the scrape (a 1 Hz capture of the 2026-10-03 round drifted to a
+    median 1052 ms, mean 1130 ms). A scrape that overruns its slot skips the slots it missed."""
 
     sampler: Callable[[int], dict]
     interval_s: float
@@ -1711,6 +1715,7 @@ class _Sidecar:
         self._thread.start()
 
     def _loop(self) -> None:
+        start, slot = time.monotonic(), 0
         while not self._stop.is_set():
             ts = self.now_ms()
             try:
@@ -1722,7 +1727,9 @@ class _Sidecar:
                 # None stays None (kv_cache_usage when no pod reported it)
                 row.update({k: (None if v is None else float(v)) for k, v in snap.items()})
                 self.samples.append(row)
-            self._stop.wait(self.interval_s)
+            elapsed = time.monotonic() - start
+            slot = max(slot + 1, math.floor(elapsed / self.interval_s) + 1)
+            self._stop.wait(max(0.0, start + slot * self.interval_s - time.monotonic()))
 
     def stop(self) -> list:
         self._stop.set()

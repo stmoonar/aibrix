@@ -33,6 +33,7 @@ def test_shape_and_steady_cell_from_scenario_id() -> None:
     assert af.shape_of("i1600_o112_c1120", table) == "T8"
     assert af.shape_of("i812_o241_c95", table) == "T9"      # sampled shape, nominal lengths
     assert af.shape_of("i400_o320_c2100", table) == "G400x320"
+    assert af.shape_of("i1024_o640_c1191002", table) == "G1024x640"   # 2026-11-03 supplement B
     assert af.shape_of("i256_o128_c60#3", table) == "S1"    # bootstrap copy
     assert af.shape_of("i9_o9_c95", table) == "i9_o9"       # unknown: its own shape
     assert af.is_steady_cell("i256_o128_c1177") and af.is_steady_cell("i400_o160_c2085")

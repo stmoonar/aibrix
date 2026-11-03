@@ -51,7 +51,8 @@
 #   REPROBE_GRID_<model, '-' -> '_'>   e.g. REPROBE_GRID_dsqwen_7b=1.3,1.45,1.6,1.8:
 #                     overrides the D4 grid rule for that model
 #   CHAIN_DIR         markers, b50 tables, per-model state (default $CALIB_ROOT/chain)
-#   CHAIN_LOG_DIR     step logs (default $CALIB_ROOT/logs)
+#   CHAIN_LOG_DIR     (required, no default) step logs: a restart that fell back to the
+#                     default overwrote an earlier attempt's D3 log on 2026-10-03
 #   CHAIN_STATUS      JSONL of every step start/end (default $CALIB_ROOT/CHAIN_STATUS.jsonl)
 #   CHAIN_LOCK_DIR    HOST-LOCAL directory for the flock files (default /run/lock; flock on
 #                     NFS is not reliable, so every chain must run on the same host)
@@ -74,6 +75,7 @@ esac
 
 [[ -n "${CALIB_ROOT:-}" ]] || { echo "FATAL: set CALIB_ROOT" >&2; exit 2; }
 [[ -n "${DESIGN_SEED:-}" ]] || { echo "FATAL: set DESIGN_SEED" >&2; exit 2; }
+[[ -n "${CHAIN_LOG_DIR:-}" ]] || { echo "FATAL: set CHAIN_LOG_DIR (no default: a restart must not write over an earlier attempt's logs)" >&2; exit 2; }
 export DESIGN_SEED
 : "${CHAIN_MODELS:=dsqwen-7b dsllama-8b dsqwen-14b}"
 : "${RUN1_ROOT:=$CALIB_ROOT/run1}"
@@ -83,7 +85,6 @@ export DESIGN_SEED
 : "${P1_ROOT:=$CALIB_ROOT/p1}"
 : "${TRAINING_PLAN:=p1-deep-overload}"
 : "${CHAIN_DIR:=$CALIB_ROOT/chain}"
-: "${CHAIN_LOG_DIR:=$CALIB_ROOT/logs}"
 : "${CHAIN_LOCK_DIR:=/run/lock}"
 : "${CHAIN_POLL_S:=60}"
 : "${CHAIN_BARRIER_TIMEOUT_S:=86400}"

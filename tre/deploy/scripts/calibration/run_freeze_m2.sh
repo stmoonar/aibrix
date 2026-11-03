@@ -80,7 +80,8 @@ case "$WINDOW_MS$STEP_MS" in *[!0-9]*) echo "WINDOW_MS / STEP_MS must be integer
 if [ -e "$OUT_DIR" ] && [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
   echo "OUT_DIR $OUT_DIR is not empty: a freeze run never reuses an output directory" >&2; exit 2
 fi
-DIRTY="$(git -C "$TRE" status --porcelain --untracked-files=no)"
+# a failing git (not a repo, "dubious ownership") must not end the script silently under set -e
+DIRTY="$(git -C "$TRE" status --porcelain --untracked-files=no 2>&1)" || DIRTY="git status failed: $DIRTY"
 if [ -n "$DIRTY" ] && [ "$MODE" = final ]; then
   echo "MODE=final refuses a dirty worktree (the freeze records the commit):" >&2; echo "$DIRTY" >&2; exit 2
 fi
@@ -101,7 +102,7 @@ export PYTHONPATH="../common:.:../controller:../service-manager:../calibration:.
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 PY=(nice -n "$NICE" python3)
 {
-  echo "mode=$MODE"; git -C "$TRE" rev-parse HEAD; echo "dirty:"; echo "$DIRTY"
+  echo "mode=$MODE"; git -C "$TRE" rev-parse HEAD || echo "git rev-parse failed"; echo "dirty:"; echo "$DIRTY"
   echo "calib_root=$CALIB_ROOT"; echo "queue_estimator=$QUEUE_ESTIMATOR fit_method=$FIT_METHOD"
   echo "numerator=$NUMERATOR window_ms=$WINDOW_MS step_ms=$STEP_MS"
   echo "lambda_method=$LAMBDA_METHOD publish_tau_s=$PUBLISH_TAU_S attribution=$ATTRIBUTION"

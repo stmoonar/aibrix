@@ -1,0 +1,8 @@
+# The fit_tss tools (README.md). Versions of the 2026-11-03 fits (python 3.10.12); the published
+# TSS parameters were reproduced bit for bit with exactly these. numpy 2.x was not tried.
+numpy==1.26.4
+pandas==2.2.3
+python-dateutil==2.9.0.post0
+pytz==2022.1
+six==1.16.0
+tzdata==2025.2

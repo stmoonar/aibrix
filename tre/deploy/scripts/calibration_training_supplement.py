@@ -67,12 +67,44 @@ one 150 s hold each (15 cells), plus the same three S2 sentinels. They are train
 * the plan reports each cell's in-flight estimate (engine running limit + the excess
   arrivals of one client timeout) against the lower of the client's connection limit and
   Envoy's shed ceiling: past either the cell would be void (dispatch delay / shed).
+
+The 2026-11-03 supplement (local workspace ``docs/calib-supplement-design-20261103.md``,
+blocks A / B / E; preregistration ``prereg-calib-supplement-20261103.md``) is three plans,
+run in this order per model, the three models in parallel
+(``calibration/run_chain_supp.sh``). Every cell is one hold, first 60 s warm-up; no
+sentinels, no checks (every cell is kept whatever its verdict: the void rule still re-runs
+a void cell once and stops the run on a second void); the drain gate waits up to
+:data:`P1_DRAIN_LIMIT_S`; a cell at >= :data:`SUPP_OVERLOAD_FACTOR` x its unit is void only
+past :data:`stream_cut.RUNTIME_MODEL_ERROR_LIMIT` model errors (0.10: the route's 150 s
+cut counts as a model error), every other at the run's ``--max-model-error-rate``. A plan
+runs its cells in three tiers: below :data:`SUPP_NEAR_KNEE_FACTOR`, up to the overload
+factor, then the overload cells (:func:`build_cells`):
+
+* ``supp-a-20261103`` (A, training): the seven training shapes x {0.3, 0.4, 0.5, 0.6} x
+  rho*_run2, 240 s - 28 cells. Low load, so that tau_high's n = 3 rule interpolates.
+* ``supp-b-20261103`` (B, training): G384x64 / G1024x64 / G384x640 / G1024x640
+  (``gen.SUPPLEMENT_GRID_SHAPES``: shapes no training cell used, split train) x {0.4, 0.55,
+  0.7, 0.85, 0.95, 1.05, 1.15, 1.3} x C^, 240 s, 300 s at 0.85-1.15 - 32 cells.
+* ``supp-e-20261103`` (E, held out): the mixtures ES / EL (``gen.VALIDATION_SHAPES``, split
+  holdout, role acceptance) x {0.8, 1.0, 1.2} x C^, 300 s - 6 cells. Sealed: a real run
+  needs ``--sealed-plan``, the ``plan.json`` of its dry run with a ``<file>.sha256`` sidecar
+  written before the collection, and refuses unless its cells, order, capacities and label
+  are the sealed ones (:data:`SEALED_PLAN_KEYS`); right after its last cell it writes
+  :data:`E_SHA256SUMS` and :data:`E_MANIFEST` (read-only), then the dataset. A run that
+  stops is never sealed: re-run E into a new out-dir.
+
+C^ (B, E) is the capacity-model prior :func:`capacity_prior`, no boundary probe: ``1/r = i/P
++ o/D`` through the seven training shapes' measured boundaries rho*_run2 x C_s; a mixture's
+streams combine by request share. A cell's capacity is C^ and its rho the factor, so it
+offers ``factor x C^`` rps (``capacity_source`` :data:`SUPP_CAPACITY_SOURCE`).
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import random
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,7 +118,9 @@ from scripts import calibration_campaign as campaign
 from scripts import calibration_design as design
 from scripts import calibration_ladder as ladder
 from scripts import calibration_supplement as supplement
+from scripts import gen_calibration_schedules as gen
 from scripts import openloop
+from scripts import stream_cut
 
 MODE = "training_supplement"
 #: Serials of this collection start here: the second round used a few hundred per model
@@ -100,6 +134,8 @@ UNIT_S3_D6PRIME = "rho*_D6'(S3): the boundary supplement's measured anchor"
 UNIT_RUN2 = "rho*_run2: the second round's anchor (fixed-label stage 0)"
 UNIT_T8_D6PRIME = "rho*_D6'(T8) = D6PRIME_T8_B50 x rho*_run2(T8)"
 UNIT_SENTINEL = "rho*_run2(S2): the second round's stage-0 anchor of the sentinel shape"
+UNIT_PRIOR = ("C^: the capacity prior 1/r = i/P + o/D through the seven training shapes' "
+              "rho*_run2 x C_s (capacity_prior)")
 
 #: D6' b50 of T8 in units of rho*_run2(T8): the run-2 T8 ladder relabelled under D6'
 #: (calibration_rev2_20260923/analysis_step0/step0_2_t8.txt, "D6' ladder b50").
@@ -158,9 +194,27 @@ class TrainingPlan:
     serial_base: int
     drain_limit_s: float
     why: str
+    #: The three S2 drift sentinels (first / middle / last of the run).
+    sentinels: bool = True
+    #: The hold cells' role: ``ladder`` trains (D16); a held-out set's cells are
+    #: ``acceptance`` (their split is holdout because their shape is held out).
+    role: str = design.ROLE_LADDER
+    capacity_source: str = "rho_priors"
+    #: Cells at or above this factor get the stream-cut limit as their own void limit
+    #: (:meth:`max_model_error_rate`); None = every cell at the run's.
+    overload_factor: Optional[float] = None
+    #: A sealed held-out set: a real run needs ``--sealed-plan`` and is sealed at its end.
+    sealed: bool = False
 
     def needs_supplement(self, model: str) -> bool:
         return any(g.unit == UNIT_S3_D6PRIME for g in self.groups[model])
+
+    def max_model_error_rate(self, factor: float) -> Optional[float]:
+        """A cell's own model-error void limit, None = the run's ``--max-model-error-rate``.
+        An overload cell's route-timeout cuts are model errors (``scripts.stream_cut``)."""
+        if self.overload_factor is None or factor < self.overload_factor:
+            return None
+        return stream_cut.RUNTIME_MODEL_ERROR_LIMIT
 
 
 PLAN_LEGACY = "legacy-20260923"
@@ -181,6 +235,46 @@ P1_PLAN: dict[str, tuple[Group, ...]] = {
     for model in PLAN
 }
 
+PLAN_SUPP_A = "supp-a-20261103"
+PLAN_SUPP_B = "supp-b-20261103"
+PLAN_SUPP_E = "supp-e-20261103"
+SUPP_A_FACTORS = (0.3, 0.4, 0.5, 0.6)
+#: B's ladder; the four around the knee hold 300 s, the others 240 s.
+SUPP_B_FACTORS = (0.4, 0.55, 0.7, 1.3)
+SUPP_B_KNEE_FACTORS = (0.85, 0.95, 1.05, 1.15)
+SUPP_E_FACTORS = (0.8, 1.0, 1.2)
+SUPP_SECONDS = 240.0
+SUPP_LONG_SECONDS = 300.0
+#: Cells at or above this factor are void only past the stream-cut limit (0.10).
+SUPP_OVERLOAD_FACTOR = 1.15
+#: Cells from this factor up to the overload factor run after the lower ones and before the
+#: overload cells (:func:`build_cells`).
+SUPP_NEAR_KNEE_FACTOR = 0.95
+#: Clear of every earlier collection's serials (supplement 50_001+, legacy 60_001+, P1
+#: 62_001+, M 70_000 / 70_500, M2 74_000+, T14 80_500 / 81_000).
+SUPP_SERIAL_BASE = {PLAN_SUPP_A: 90_000, PLAN_SUPP_B: 91_000, PLAN_SUPP_E: 92_000}
+SUPP_CAPACITY_SOURCE = "supp_capacity_prior"
+_SUPP_A_WHY = "A: low load, so that tau_high's n = 3 rule interpolates (needs ~0.3-0.7 rho*)"
+_SUPP_B_WHY = "B: input {384, 1024} x output {64, 640}, does theta carry to short / long outputs"
+_SUPP_E_WHY = "E: sealed held-out mixtures, accepts theta on loads no fit has seen"
+SUPP_A_PLAN: dict[str, tuple[Group, ...]] = {
+    model: tuple(Group("a", shape, UNIT_RUN2, SUPP_A_FACTORS, 1, SUPP_SECONDS, _SUPP_A_WHY)
+                 for shape in gen.TRAINING_SHAPES)
+    for model in PLAN
+}
+SUPP_B_PLAN: dict[str, tuple[Group, ...]] = {
+    model: tuple(g for shape in gen.SUPPLEMENT_GRID_SHAPES for g in (
+        Group("b", shape, UNIT_PRIOR, SUPP_B_FACTORS, 1, SUPP_SECONDS, _SUPP_B_WHY),
+        Group("b", shape, UNIT_PRIOR, SUPP_B_KNEE_FACTORS, 1, SUPP_LONG_SECONDS, _SUPP_B_WHY)))
+    for model in PLAN
+}
+SUPP_E_PLAN: dict[str, tuple[Group, ...]] = {
+    model: tuple(Group("e", shape, UNIT_PRIOR, SUPP_E_FACTORS, 1, SUPP_LONG_SECONDS, _SUPP_E_WHY)
+                 for shape in gen.VALIDATION_SHAPES)
+    for model in PLAN
+}
+_SUPP = dict(sentinels=False, overload_factor=SUPP_OVERLOAD_FACTOR)
+
 TRAINING_PLANS: dict[str, TrainingPlan] = {
     PLAN_LEGACY: TrainingPlan(
         PLAN_LEGACY, PLAN, BOTH_SIDES_PARTS, (), SERIAL_BASE, design.DRAIN_LIMIT_S,
@@ -190,6 +284,19 @@ TRAINING_PLANS: dict[str, TrainingPlan] = {
         PLAN_P1, P1_PLAN, (), ("p1",), P1_SERIAL_BASE, P1_DRAIN_LIMIT_S,
         "2026-10-03 re-calibration on vLLM 0.30, shape supplement P1: S2/S3/T8/S4/S5 x "
         "{1.5, 2.0, 3.0} x rho*_run2, 150 s holds, training (D16), plus ③d sentinels"),
+    PLAN_SUPP_A: TrainingPlan(
+        PLAN_SUPP_A, SUPP_A_PLAN, (), (), SUPP_SERIAL_BASE[PLAN_SUPP_A], P1_DRAIN_LIMIT_S,
+        "2026-11-03 supplement A: S1-S5/T8/T9 x {0.3, 0.4, 0.5, 0.6} x rho*_run2, 240 s, "
+        "training", **_SUPP),
+    PLAN_SUPP_B: TrainingPlan(
+        PLAN_SUPP_B, SUPP_B_PLAN, (), (), SUPP_SERIAL_BASE[PLAN_SUPP_B], P1_DRAIN_LIMIT_S,
+        "2026-11-03 supplement B: G384x64/G1024x64/G384x640/G1024x640 x {0.4 .. 1.3} x C^, "
+        "240 s (300 s at 0.85-1.15), training", capacity_source=SUPP_CAPACITY_SOURCE, **_SUPP),
+    PLAN_SUPP_E: TrainingPlan(
+        PLAN_SUPP_E, SUPP_E_PLAN, (), (), SUPP_SERIAL_BASE[PLAN_SUPP_E], P1_DRAIN_LIMIT_S,
+        "2026-11-03 supplement E: mixtures ES/EL x {0.8, 1.0, 1.2} x C^_mix, 300 s, sealed "
+        "held-out validation (never trains)", role=design.ROLE_ACCEPTANCE,
+        capacity_source=SUPP_CAPACITY_SOURCE, sealed=True, **_SUPP),
 }
 DEFAULT_TRAINING_PLAN = PLAN_LEGACY
 
@@ -229,15 +336,70 @@ def supplement_sha256(path: Path) -> str:
     return design._sha256(Path(path))
 
 
+#: The points of the capacity prior: every training shape at its measured boundary.
+PRIOR_SHAPES = gen.TRAINING_SHAPES
+
+
+def _mean_streams(shape: str) -> list[tuple[float, float, float]]:
+    return [(w, gen._length_mean(i), gen._length_mean(o)) for w, i, o in gen.shape_components(shape)]
+
+
+def capacity_prior(model: str, bases: Mapping[str, supplement.BaseAnchor],
+                   shapes: Sequence[str]) -> dict:
+    """C^ (rps) of each of ``shapes``: ``1/r = i/P + o/D`` (``gen.fit_capacity_model``, least
+    squares through the origin) through the :data:`PRIOR_SHAPES`' boundary rates rho*_run2
+    x C_s at their mean lengths; a mixture's streams combine by request share
+    (``CapacityModel.mixture_rps``). rho*_run2 is a measured boundary, so a factor of 1 is
+    about the knee, as with M's and T14's priors. Leave-one-shape-out errors say how far
+    the fit carries."""
+    points = []
+    for shape in PRIOR_SHAPES:
+        (_w, i, o), = _mean_streams(shape)
+        points.append((i, o, bases[shape].anchor_rps))
+    fit = gen.fit_capacity_model(model, points)
+    loo = []
+    for k, (i, o, rate) in enumerate(points):
+        rest = gen.fit_capacity_model(model, points[:k] + points[k + 1:])
+        loo.append({"shape": PRIOR_SHAPES[k], "rate_rps": round(rate, 4),
+                    "loo_rps": round(rest.rps(i, o), 4), "loo_error": round(rest.rps(i, o) / rate - 1.0, 4)})
+    return {
+        "form": f"1/r = i/P + o/D, least squares through the origin over {list(PRIOR_SHAPES)} at "
+                "rho*_run2 x C_s; a mixture's streams combined by request share",
+        "prefill_tokens_per_s": round(fit.prefill_tps, 3),
+        "decode_tokens_per_s": round(fit.decode_tps, 3),
+        "rms_relative_error": round(fit.rms_rel_error, 4),
+        "points": [{"shape": s, "input_mean": round(i, 3), "output_mean": round(o, 3),
+                    "rate_rps": round(r, 6)} for s, (i, o, r) in zip(PRIOR_SHAPES, points)],
+        "leave_one_out": loo,
+        "predicted_rps": {s: round(fit.mixture_rps(_mean_streams(s)), 6) for s in shapes},
+    }
+
+
 def resolve_units(model: str, base_root: Path, supp_root: Optional[Path],
                   plan: Optional[TrainingPlan] = None) -> dict:
-    """Per (shape, unit) the rho (of the shape's run-2 C_s) a factor of 1 means, with
-    where it came from; plus each shape's C_s."""
-    groups = (plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]).groups[model]
-    shapes = sorted({g.shape for g in groups} | {SENTINEL_SHAPE})
-    bases = {s: supplement.load_base_anchor(base_root, model, s) for s in shapes}
+    """Per (shape, unit) the rho (of the shape's run-2 C_s, or of C^ for a prior unit) a
+    factor of 1 means, with where it came from; plus each shape's capacity."""
+    tplan = plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]
+    groups = tplan.groups[model]
+    prior_shapes = sorted({g.shape for g in groups if g.unit == UNIT_PRIOR})
+    shapes = {g.shape for g in groups if g.unit != UNIT_PRIOR}
+    shapes |= {SENTINEL_SHAPE} if tplan.sentinels else set()
+    shapes |= set(PRIOR_SHAPES) if prior_shapes else set()
+    bases = {s: supplement.load_base_anchor(base_root, model, s) for s in sorted(shapes)}
+    capacity = {s: b.capacity_rps for s, b in bases.items()}
+    base_docs = {s: b.as_dict() for s, b in bases.items()}
+    prior = capacity_prior(model, bases, prior_shapes) if prior_shapes else None
     units: dict[tuple[str, str], dict] = {}
     for group in groups:
+        if group.unit == UNIT_PRIOR:
+            c_hat = prior["predicted_rps"][group.shape]
+            capacity[group.shape] = c_hat
+            # anchor 1 = C^: what the in-flight estimate counts the excess arrivals from
+            base_docs[group.shape] = {"model": model, "shape": group.shape, "anchor_rho": 1.0,
+                                      "capacity_rps": c_hat, "anchor_rule": UNIT_PRIOR}
+            units[(group.shape, group.unit)] = {"rho": 1.0, "source": {"capacity_rps": c_hat,
+                                                                       "rule": UNIT_PRIOR}}
+            continue
         base = bases[group.shape]
         if group.unit == UNIT_S3_D6PRIME:
             if supp_root is None:
@@ -253,10 +415,11 @@ def resolve_units(model: str, base_root: Path, supp_root: Optional[Path],
                 "source": {"d6prime_b50_of_rho_star_run2": b50, "base": base.as_dict()}}
         else:  # pragma: no cover - PLAN only uses the units above
             raise ValueError(f"unknown unit {group.unit!r}")
-    sentinel = bases[SENTINEL_SHAPE]
-    units[(SENTINEL_SHAPE, UNIT_SENTINEL)] = {"rho": sentinel.anchor_rho, "source": sentinel.as_dict()}
-    return {"units": units, "capacity": {s: b.capacity_rps for s, b in bases.items()},
-            "bases": {s: b.as_dict() for s, b in bases.items()}}
+    if tplan.sentinels:
+        sentinel = bases[SENTINEL_SHAPE]
+        units[(SENTINEL_SHAPE, UNIT_SENTINEL)] = {"rho": sentinel.anchor_rho,
+                                                  "source": sentinel.as_dict()}
+    return {"units": units, "capacity": capacity, "bases": base_docs, "prior": prior}
 
 
 # -------------------------------------------------------------------------- the plan
@@ -287,16 +450,28 @@ def build_cells(model: str, factory: design.CellFactory, resolved: Mapping,
                 design_seed: int, plan: Optional[TrainingPlan] = None,
                 ) -> tuple[list[design.DesignCell], list[design.DesignCell]]:
     """(the run's cell sequence, the sentinels). Ids and seeds are fixed here."""
+    tplan = plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]
     units = resolved["units"]
     holds = []
-    for group in (plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]).groups[model]:
+    for group in tplan.groups[model]:
         unit_rho = units[(group.shape, group.unit)]["rho"]
         for factor in group.factors:
             for rep in range(1, group.replicates + 1):
                 holds.append(factory.new(
-                    group.shape, design.ROLE_LADDER, group.seconds, rho_factor=factor,
+                    group.shape, tplan.role, group.seconds, rho_factor=factor,
                     rho=round(factor * unit_rho, 6), replicate=rep,
+                    max_model_error_rate=tplan.max_model_error_rate(factor),
                     note=f"part {group.part}: {factor:g} x {group.unit}"))
+    if not tplan.sentinels:
+        rng = random.Random(design.derived_seed(design_seed, model, "training-supplement-order"))
+        cut = tplan.overload_factor
+        if cut is None:
+            return interleave(holds, rng), []
+        # three tiers in turn, each interleaved: a run ends when a voided cell voids again on
+        # its retry, and C^'s error and route cuts make the near-knee long-output cells risky
+        tier = [2 if c.rho_factor >= cut else int(c.rho_factor >= SUPP_NEAR_KNEE_FACTOR) for c in holds]
+        return [c for k in (0, 1, 2)
+                for c in interleave([h for h, t in zip(holds, tier) if t == k], rng)], []
     sentinel_rho = round(SENTINEL_FACTOR * units[(SENTINEL_SHAPE, UNIT_SENTINEL)]["rho"], 6)
     sentinels = [
         factory.new(SENTINEL_SHAPE, design.ROLE_SENTINEL, SENTINEL_SECONDS,
@@ -382,8 +557,22 @@ def checks_text(tplan: TrainingPlan) -> str:
     if tplan.driven_parts:
         parts.append(f"driven: every part {'/'.join(tplan.driven_parts)} cell has a healthy or "
                      "violated verdict on >= 1 labelled post-warm-up window")
-    parts.append("sentinel drift not flagged")
+    if tplan.sentinels:
+        parts.append("sentinel drift not flagged")
+    if not parts:
+        return ("none: every cell is kept whatever its verdict (a void cell is re-run once, a "
+                "second void stops the run)")
     return "; ".join(parts) + f". A failure exits {EXIT_CHECK_FAILED} (D22)"
+
+
+def overload_doc(tplan: TrainingPlan) -> Optional[dict]:
+    """The per-cell void limit rule of a plan with overload cells (plan + manifest)."""
+    if tplan.overload_factor is None:
+        return None
+    return {"cells_at_or_above_factor": tplan.overload_factor,
+            "rule": "those cells are void past the stream-cut limit, every other at the run's "
+                    "--max-model-error-rate",
+            "stream_cut": stream_cut.record()}
 
 
 def build_plan(args, model: str, sequence: Sequence[design.DesignCell], resolved: Mapping,
@@ -419,6 +608,8 @@ def build_plan(args, model: str, sequence: Sequence[design.DesignCell], resolved
         "groups": groups,
         "units": units_doc,
         "capacity_rps": resolved["capacity"],
+        "capacity_prior": resolved.get("prior"),
+        "overload": overload_doc(tplan),
         "label": label_doc(label, args),
         "estimate": est,
         "in_flight": in_flight_estimate(sequence, resolved, cap),
@@ -433,10 +624,12 @@ def build_plan(args, model: str, sequence: Sequence[design.DesignCell], resolved
         "boundary_supplement_run": None if supp is None else str(supp),
         "bases": resolved["bases"],
         "units": units_doc,
+        "capacity_prior": resolved.get("prior"),
+        "overload": overload_doc(tplan),
         "groups": groups,
         "sentinel_rule": (f"{SENTINEL_FACTOR} x rho*_run2({SENTINEL_SHAPE}), {SENTINEL_SECONDS:g} s, "
                           f"positions {list(SENTINEL_POSITIONS)}; drift on "
-                          f"{design.SENTINEL_DRIFT_THRESHOLDS}"),
+                          f"{design.SENTINEL_DRIFT_THRESHOLDS}") if tplan.sentinels else "none",
         "checks": checks_text(tplan),
         "drain_limit_s": tplan.drain_limit_s,
         "label": provenance.get("label"),
@@ -461,15 +654,23 @@ def print_plan(plan: dict, model: str) -> None:
           f"{lb['ttft_slowdown_k']:g} x ({lb['ttft_idle_c_ms']:g} + {lb['ttft_idle_b_ms_per_token']:g} x L)), "
           f"TPOT p95 <= {lb['tpot_p95_ms']:g} ms, >= {lb['min_completed_requests']} completions, "
           f"{lb['window_ms'] / 1000:g} s windows / {lb['step_ms'] / 1000:g} s step ({lb['window_align']})")
+    prior = plan.get("capacity_prior")
+    if prior:
+        loo = ", ".join(f"{p['shape']} {p['loo_error']:+.0%}" for p in prior["leave_one_out"])
+        print(f"capacity prior: P {prior['prefill_tokens_per_s']:g} / D {prior['decode_tokens_per_s']:g} "
+              f"tokens/s, rms {prior['rms_relative_error']:.1%}; leave-one-out {loo}")
     for u in plan["units"]:
         cs = plan["capacity_rps"][u["shape"]]
-        print(f"  unit {u['shape']:3} {u['rho']:.6g} x C_s {cs:g} = {u['rho'] * cs:.4g} rps  [{u['unit']}]")
-    print(f"{model}: {len(plan['sequence'])} cells in run order (rho = x C_s of the shape):")
+        name = "C^" if u["unit"] == UNIT_PRIOR else "C_s"
+        print(f"  unit {u['shape']:3} {u['rho']:.6g} x {name} {cs:g} = {u['rho'] * cs:.4g} rps  [{u['unit']}]")
+    print(f"{model}: {len(plan['sequence'])} cells in run order (rho = x the shape's capacity):")
     for i, cell in enumerate(plan["static_cells"][model], start=1):
         cs = plan["capacity_rps"][cell["shape"]]
+        limit = cell.get("max_model_error_rate")
         print(f"  {i:2d} {cell['cell_id']:22} {cell['role']:8} {cell['shape']:3} "
               f"{cell['rho_factor']:>6g} x -> rho {cell['rho']:.4f} ({cell['rho'] * cs:.3f} rps) "
-              f"{cell['duration_s']:.0f}s  {cell['note']}")
+              f"{cell['duration_s']:.0f}s  {cell['note']}"
+              + (f"  [void past {limit:g} model errors]" if limit is not None else ""))
     est = plan["estimate"]
     print(f"  {est['cells']} cells, offered load {est['offered_load_s'] / 60:.0f} min; wall clock "
           f"~{est['seconds_expected'] / 3600:.2f} h expected, <= {est['seconds_upper'] / 3600:.2f} h "
@@ -559,6 +760,8 @@ class TrainingSupplementRun(PlannedRun):
                 if not healthy or not violated:
                     out.append(f"{self.model}/{shape} part {part}: {healthy} healthy and {violated} "
                                f"violated cells of {len(verdicts)} - the boundary is not bracketed")
+        if not self.training_plan.sentinels:
+            return out
         drift = design.sentinel_drift(self.sentinel_summaries)
         if drift.get("flagged"):
             out.append(f"{self.model}: sentinel drift flagged ({drift['verdict']})")
@@ -567,7 +770,8 @@ class TrainingSupplementRun(PlannedRun):
         return out
 
     def result(self, status: str) -> dict:
-        drift = design.sentinel_drift(self.sentinel_summaries)
+        drift = (design.sentinel_drift(self.sentinel_summaries) if self.training_plan.sentinels
+                 else None)
         return {"model": self.model, "status": status, "cells": self.outcomes,
                 "sentinels": self.sentinel_summaries, "sentinel_drift": drift,
                 "check_failures": self.failures() if status == "complete" else [],
@@ -613,6 +817,88 @@ def banner(lines: Sequence[str]) -> None:
     for line in lines:
         print(f"  {line}", flush=True)
     print(bar, flush=True)
+
+
+# --------------------------------------------------------------- the sealed set (E)
+
+#: What a sealed plan binds: the cells (ids, shapes, loads, seeds, prompt keys, splits, void
+#: limits), their order, the capacity each is scheduled against and how it was got, the label.
+SEALED_PLAN_KEYS = ("mode", "training_plan", "models", "design_seed", "serial_base",
+                    "static_cells", "sequence", "capacity_rps", "capacity_prior", "overload",
+                    "label")
+E_SHA256SUMS = "E_SHA256SUMS"
+E_MANIFEST = "E_manifest.json"
+
+
+def check_sealed_plan(path: Path, plan: Mapping) -> dict:
+    """The run's plan against the sealed one - its dry run's ``plan.json``, sealed with a
+    sha256sum sidecar before the collection: every :data:`SEALED_PLAN_KEYS` value must be
+    equal, else the run is refused (it would drive cells that were not sealed)."""
+    from scripts import calibration_t14 as t14
+
+    sealed, digest = t14._read_sidecar_checked(Path(path), "sealed plan")
+    ours = json.loads(json.dumps({k: plan.get(k) for k in SEALED_PLAN_KEYS}))
+    differ = [k for k in SEALED_PLAN_KEYS if sealed.get(k) != ours[k]]
+    if differ:
+        raise ValueError(f"{path}: this run's {', '.join(differ)} differ from the sealed plan - "
+                         "refusing to drive cells that were not sealed")
+    return {"path": str(Path(path).resolve()), "sha256": digest, "keys": list(SEALED_PLAN_KEYS)}
+
+
+def seal(out_dir: Path, raw_dir: Path, model: str, run: "TrainingSupplementRun",
+         plan: Mapping) -> dict:
+    """E_SHA256SUMS and E_manifest.json (both read-only), as M / T14 seal theirs - before the
+    dataset: every file of the out-dir (``dataset/`` and the backfilled ``cells/`` evidence
+    excluded) and every attempt's raw capture; the cells (their final attempts)."""
+    from scripts import calibration_t14 as t14
+
+    files = t14.sealed_files(out_dir, raw_dir, run.records)
+    body = "".join(f"{t14._file_sha256(f)}  {Path(f).resolve()}\n" for f in files)
+    sums = Path(out_dir) / E_SHA256SUMS
+    sums.write_text(body, encoding="utf-8")
+    os.chmod(sums, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    final = {r["cell_id"]: r for r in run.records}
+    keys = ("model", "cell_id", "attempt", "shape", "role", "split", "rho_factor", "rho",
+            "capacity_rps", "offered_rps", "duration_s", "warmup_s", "max_model_error_rate",
+            "verdict", "online_csv", "possibly_contaminated")
+    cells = []
+    for cell in run.sequence:
+        record = final[cell.cell_id]
+        raw = Path(raw_dir) / str(record["stem"])
+        cells.append({**{k: record.get(k) for k in keys},
+                      "raw_files": sorted(str(p.resolve()) for p in raw.rglob("*") if p.is_file())
+                      if raw.is_dir() else []})
+    doc = {
+        "what": (f"E ({plan['training_plan']}), the sealed held-out set of the 2026-11-03 "
+                 "supplement: evaluation only - nothing that fits or picks parameters may read "
+                 "it; its split is holdout"),
+        "model": model,
+        "mode": MODE,
+        "training_plan": plan["training_plan"],
+        "written_at_utc": campaign.utc_iso(),
+        "sealed_plan": plan.get("sealed_plan"),
+        "label": plan["label"],
+        "capacity_prior": plan.get("capacity_prior"),
+        "overload": plan.get("overload"),
+        "cells": cells,
+        "attempts": [{"cell_id": r["cell_id"], "attempt": r["attempt"],
+                      "void_reasons": r.get("void_reasons")} for r in run.records],
+        "run_manifest_sha256": plan.get("run_manifest_sha256"),
+        "sha256sums_file": E_SHA256SUMS,
+        "sha256sums_sha256": t14._file_sha256(sums),
+        "how_to_evaluate": (
+            f"Verify {E_SHA256SUMS} first. Read this run's standard dataset (<out-dir>/dataset, "
+            "built right after this seal; re-window it from the raw captures with "
+            "python -m scripts.calibration_dataset <out-dir> --window-ms ... --out-dir <new>): "
+            "every row is split holdout; keep the cells listed here and the windows after "
+            "warmup_s. Evaluate each candidate parameter set once. Never train on it, never "
+            "pass it as --h2-dataset."),
+    }
+    path = Path(out_dir) / E_MANIFEST
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    return {"manifest": str(path), "manifest_sha256": t14._file_sha256(path),
+            "sha256sums": str(sums), "files": len(files)}
 
 
 def source_runs(args) -> list[tuple[str, Path]]:
@@ -684,6 +970,17 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     sequence, _sentinels = build_cells(model, factory, resolved, int(args.design_seed), tplan)
     plan, manifest = build_plan(args, model, sequence, resolved, cap, tplan)
     plan["source_load_paths"] = manifest["source_load_paths"] = load_paths
+    sealed_plan = getattr(args, "sealed_plan", None)
+    if sealed_plan is not None and not tplan.sealed:
+        raise ValueError(f"--sealed-plan: --training-plan {tplan.name} is not a sealed set")
+    if tplan.sealed and sealed_plan is None and not args.dry_run:
+        raise ValueError(f"--training-plan {tplan.name} is a sealed held-out set: a run needs "
+                         "--sealed-plan (its dry run's plan.json, sha256 sidecar written before "
+                         "the collection)")
+    if sealed_plan is not None:
+        plan["sealed_plan"] = manifest["sealed_plan"] = check_sealed_plan(sealed_plan, plan)
+        print(f"sealed plan {sealed_plan} (sha256 {plan['sealed_plan']['sha256'][:12]}): this run's "
+              "cells are the sealed ones")
     out_dir.mkdir(parents=True, exist_ok=True)
     print_plan(plan, model)
     if args.dry_run:
@@ -710,7 +1007,7 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     run = TrainingSupplementRun(
         args, model, resolved["capacity"], factory=factory, cap=cap, out_dir=out_dir,
         raw_dir=raw_dir, drive=drive, sample=sample_factory(model), sleep=sleep, clock=clock,
-        sequence=sequence, plan=tplan)
+        capacity_source=tplan.capacity_source, sequence=sequence, plan=tplan)
     status, code = "failed", 1
     result = None
     try:
@@ -722,11 +1019,16 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
             result = run.result(f"stopped: {stop}")
             return code
         result = run.result("complete")
+        if tplan.sealed:
+            result["sealed"] = seal(out_dir, raw_dir, model, run, plan)
+            print(f"[{model}] sealed: {result['sealed']['manifest']} ({result['sealed']['files']} "
+                  f"files in {E_SHA256SUMS})", flush=True)
         if result["check_failures"]:
             banner(result["check_failures"])
             status, code = "complete_check_failed", EXIT_CHECK_FAILED
             return code
-        print(f"[{model}] complete; sentinel drift: {result['sentinel_drift']['verdict']}", flush=True)
+        drift = f"; sentinel drift: {result['sentinel_drift']['verdict']}" if tplan.sentinels else ""
+        print(f"[{model}] complete{drift}", flush=True)
         status, code = "complete", 0
         return 0
     except KeyboardInterrupt:
