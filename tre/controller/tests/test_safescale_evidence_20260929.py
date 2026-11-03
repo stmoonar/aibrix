@@ -335,6 +335,8 @@ def test_ceiling_multiplier_and_floor_come_from_config_and_registry(tmp_path) ->
 
 def test_registry_safescale_section_parsing() -> None:
     assert parse_safescale_config(None) == SafeScaleRegistryConfig()
+    # the built-in default (key absent) stays labels; the repo registry sets fixed explicitly
+    assert SafeScaleRegistryConfig().slo_mode == parse_safescale_config({}).slo_mode == "labels"
     # the repo registry's section = the built-in defaults, except slo_mode (fixed, live since 2026-10-31)
     assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale() == SafeScaleRegistryConfig(slo_mode="fixed")
     for bad in ({"slo_mode": "median"}, {"window_ceiling_s": 0}, {"min_commit_samples": 2.5},

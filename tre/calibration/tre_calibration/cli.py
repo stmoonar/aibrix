@@ -9,7 +9,7 @@ from typing import Sequence
 
 from tre_calibration.dataset import TssRecompute, load_windows_from_csv
 from tre_common.slo_labels import add_label_arguments, count_label_exclusions, label_def_from_args
-from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
+from tre_common.tss import FIT_EMA_TAU_MS, TSS_UNITS
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
     DEFAULT_CRITICAL_VIOLATION_QUANTILE,
@@ -263,8 +263,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--ema-tau-ms",
         type=float,
-        default=DEFAULT_EMA_TAU_MS,
-        help="EMA time constant for --recompute-tss (default 20000, as online; 0 = raw)",
+        default=FIT_EMA_TAU_MS,
+        help="EMA time constant for --recompute-tss (default 0 = raw, as the deployed registry names it; > 0 = time-constant EMA)",
     )
     parser.add_argument("--qmin", type=float, default=1.0)
     parser.add_argument("--generated-at")

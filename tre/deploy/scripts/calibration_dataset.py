@@ -84,9 +84,9 @@ README = "DATASET.md"
 #: 2: 30 s / 10 s grid-aligned windows (D8), three label arms (D6'), ttft_len_samples.
 FORMAT_REVISION = 2
 #: The fitting windows of revision 2 (plan 2026-09-21 §6.11 D8). The default window is
-#: the controller's (TRE_METRICS_WINDOW_MS, 20 s since 2026-10-28); 30 s reproduces the
-#: freezes before it (--window-ms 30000).
-DEFAULT_WINDOW_MS = 20_000
+#: the controller's (TRE_METRICS_WINDOW_MS, 10 s since 2026-11-03; 20 s from 2026-10-28); 30 s reproduces the
+#: freezes before 2026-10-28 (--window-ms 30000).
+DEFAULT_WINDOW_MS = 10_000
 DEFAULT_STEP_MS = 10_000
 DEFAULT_WINDOW_ALIGN = rewindow_from_raw.WINDOW_ALIGN_GRID
 

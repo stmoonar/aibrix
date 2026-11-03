@@ -53,7 +53,7 @@ from tre_calibration.fit import (
     ThetaFitConfig,
 )
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
-from tre_common.tss import DEFAULT_EMA_TAU_MS
+from tre_common.tss import FIT_EMA_TAU_MS
 
 from scripts.theta_verdict import (
     DEFAULT_THETA_SOURCE,
@@ -122,7 +122,7 @@ def fit_model(
     max_single_scenario_ratio: float = 0.7,
     families: dict[str, Path] | None = None,
     label_lambda_wait: float = DEFAULT_LABEL_LAMBDA_WAIT,
-    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS,
+    ema_tau_ms: float | None = FIT_EMA_TAU_MS,
     n_resamples: int = 200,
     family_resamples: int = 100,
     seed: int = 20260922,
@@ -340,7 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="MODEL:NAME=CSV, repeatable - per-family CSVs for the family rule and stop rule",
     )
     parser.add_argument("--label-lambda-wait", type=float, default=DEFAULT_LABEL_LAMBDA_WAIT)
-    parser.add_argument("--ema-tau-ms", type=float, default=DEFAULT_EMA_TAU_MS)
+    parser.add_argument("--ema-tau-ms", type=float, default=FIT_EMA_TAU_MS)
     parser.add_argument("--n-resamples", type=int, default=1000)
     parser.add_argument("--family-resamples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260922)

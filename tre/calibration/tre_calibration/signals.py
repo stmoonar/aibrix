@@ -111,7 +111,8 @@ def tss_series(
 ) -> list[Optional[float]]:
     """The signal a fit scores, one value per input (``None`` = undefined / idle).
 
-    Without ``ema_tau_ms`` this is the raw TSS. With it, each ``cell_id``'s windows are run
+    Without ``ema_tau_ms`` (None, or ``<= 0`` = no smoothing, what the deployed registry names) this is the raw TSS. With it,
+    each ``cell_id``'s windows are run
     through :class:`~tre_common.tss.TssEma` in input order, each window's ``preceding``
     windows first - exactly the sequence the online per-model EMA consumes.
     """
@@ -120,7 +121,7 @@ def tss_series(
         value = compute_trs(item, w_p=w_p, lambda_wait=lambda_wait, qmin=qmin).trs_floor
         return None if math.isnan(value) else value
 
-    if ema_tau_ms is None:
+    if ema_tau_ms is None or ema_tau_ms <= 0:
         return [raw_of(item) for item in inputs]
     emas: dict[Optional[str], TssEma] = {}
     out: list[Optional[float]] = []

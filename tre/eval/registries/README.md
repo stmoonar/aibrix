@@ -24,7 +24,7 @@ both since 2026-11-03. The controller's code default of `TRE_METRICS_WINDOW_MS` 
 
 Putting a snapshot live: check `arm_registry.py id` against the file name first. Tunables (`trs.*`, `slo.*`, `alt_thresholds.*`,
 replica bounds) go through `deploy/scripts/release/params_set.py --set ...` (bounds-checked, `--apply --restart --backup-dir`, SM
-before controller); `lambda_wait` above 20 (`f75155148eba1e61`: 31-33) is refused by `registry_params.py` of main until the
-`fix/lambda-bound-20261103` change (bound 20 -> 100) is merged. A whole-file replace of the ConfigMap key `registry.yaml` was done by
-`cm_replace.py` of the 10-30 / 10-31 apply scripts, which are not in the repo (`tre/eval/runner/drivers/README.md`, gaps).
+before controller); `lambda_wait` is accepted up to 100 (`f75155148eba1e61`: 31-33). A whole-file replace of the ConfigMap key
+`registry.yaml` was done by `cm_replace.py` of the 10-30 / 10-31 apply scripts, recorded verbatim under
+`tre/eval/runner/drivers/*/state-records/` (records, not code; `tre/eval/runner/drivers/README.md`).
 Set `TRE_METRICS_WINDOW_MS` together with the registry (`tre/eval/controller_env/`).

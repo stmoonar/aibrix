@@ -11,19 +11,26 @@ CONTROLLER_ENV_KEYS) and puts them back afterwards. The files next to this one a
                                               what applying FILE would change (read only); exit 0 = live env equals FILE,
                                               1 = it differs, 2 = FILE cannot be applied (see the message)
   controller_env.py apply FILE --backup-dir DIR [--registry-file F]
-                                              WRITES THE CLUSTER: make the live env equal FILE with one ``kubectl set env``
-                                              (one Recreate rollout of the controller). The env before goes to
-                                              DIR/controller-env.before.env and the Deployment to DIR/deploy.before.yaml;
+                                              WRITES THE CLUSTER: make the live env equal FILE with one ``kubectl patch``
+                                              (one Recreate rollout of the controller). The patch carries the resourceVersion
+                                              of the Deployment it was planned on, so a concurrent edit makes it fail instead of
+                                              being overwritten. The env before goes to DIR/controller-env.before.env and the
+                                              Deployment (the same read) to DIR/deploy.before.json;
                                               rollback = ``apply DIR/controller-env.before.env``.
 
 FILE: ``NAME=VALUE`` per line, ``#`` comments and blank lines ignored, every line is the whole state: a live variable
-that FILE does not name is removed (an entry fed by ``valueFrom`` is never touched). Refused when
-  * a campaign / arm runner is active (the runner owns the per-arm switches while it runs);
-  * TRE_METRICS_WINDOW_MS in FILE differs from a model's trs.theta_window_ms in the registry (live ConfigMap, or
-    --registry-file): the controller refuses to start on that mismatch (tre_common.tss.theta_basis_errors) and, being
+that FILE does not name is removed (an entry fed by ``valueFrom`` is never touched). ``apply`` is refused when
+  * an exclusive-window marker file exists (TRE_EXCLUSIVE_WINDOW_FILE, default $CAMPAIGN_DATA_ROOT/TRE_EXCLUSIVE_WINDOW): another
+    session owns the cluster;
+  * a campaign / arm runner or a campaign driver shell is active (the runner owns the per-arm switches while it runs);
+  * the EFFECTIVE TRE_METRICS_WINDOW_MS differs from a model's trs.theta_window_ms in the registry (live ConfigMap, or
+    --registry-file). Effective = the value in FILE; if FILE does not name it, applying unsets it and the controller falls
+    back to its code default (read from this checkout's tre_controller.config, an older image may differ - name the key
+    in FILE to be sure). The controller refuses to start on that mismatch (tre_common.tss.theta_basis_errors) and, being
     ``Recreate``, the cluster would be left without a controller. Publish the registry first, or both in one go.
+``diff`` applies the window check only.
 Environment: TRE_NS (tre-v2), CONTROLLER_DEPLOY (tre-v2-controller), CONTROLLER_CONTAINER (controller),
-REGISTRY_CM (tre-v2-registry), KUBECTL (kubectl).
+REGISTRY_CM (tre-v2-registry), KUBECTL (kubectl), TRE_EXCLUSIVE_WINDOW_FILE / CAMPAIGN_DATA_ROOT (marker location).
 """
 from __future__ import annotations
 
@@ -111,12 +118,48 @@ def registry_window_errors(registry_text: str, window: str) -> list[str]:
     return errs
 
 
+#: Anchored (``^``) so the shell that wraps this very command line does not match. A driver is a shell script under
+#: eval/runner/drivers/ (run_campaign-*.sh, run_all3.sh, ...); run_campaign.sh is the generic launcher.
+_ACTIVE_PATTERNS = (
+    r"^python3 .*campaign\.py run",
+    r"^bash .*run_arm_pilot\.sh",
+    r"^bash .*/drivers/.*\.sh",
+    r"^bash .*run_campaign\.sh",
+    r"^bash .*run_all3\.sh",
+)
+
+
 def runner_active() -> list[str]:
-    out = []
-    for pat in (r"^python3 .*campaign\.py run", r"^bash .*run_arm_pilot\.sh"):
+    own = {str(os.getpid()), str(os.getppid())}
+    out: list[str] = []
+    for pat in _ACTIVE_PATTERNS:
         r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
-        out += r.stdout.split()
+        out += [pid for pid in r.stdout.split() if pid not in own and pid not in out]
     return out
+
+
+def exclusive_window() -> Optional[str]:
+    """The first line of the exclusive-window marker if it exists (None: no marker, or its location is not configured)."""
+    path = os.environ.get("TRE_EXCLUSIVE_WINDOW_FILE")
+    if not path and os.environ.get("CAMPAIGN_DATA_ROOT"):
+        path = str(Path(os.environ["CAMPAIGN_DATA_ROOT"]) / "TRE_EXCLUSIVE_WINDOW")
+    if not path or not Path(path).exists():
+        return None
+    try:
+        return (Path(path).read_text().splitlines() or [""])[0].strip() or "(empty marker)"
+    except OSError:
+        return "(unreadable marker)"
+
+
+def controller_default_window() -> str:
+    """TRE_METRICS_WINDOW_MS as the controller code of this checkout falls back to when the variable is unset."""
+    tre = Path(__file__).resolve().parents[2]
+    for sub in ("common", "controller"):
+        if str(tre / sub) not in sys.path:
+            sys.path.insert(0, str(tre / sub))
+    from tre_controller.config import ControllerConfig  # noqa: PLC0415
+
+    return str(ControllerConfig.from_env({}).metrics_window_ms)
 
 
 def _registry_text(registry_file: Optional[str]) -> str:
@@ -126,12 +169,27 @@ def _registry_text(registry_file: Optional[str]) -> str:
 
 
 def _problems(want: dict[str, str], registry_file: Optional[str]) -> list[str]:
-    if WINDOW_KEY not in want:
-        return []
+    window = want.get(WINDOW_KEY)
+    how = ""
+    if window is None:
+        try:
+            window = controller_default_window()
+        except Exception as exc:  # noqa: BLE001 - any failure to read the code default refuses
+            return [f"FILE does not name {WINDOW_KEY} (applying unsets it) and the controller default cannot be read: {exc}"]
+        how = f" (not in FILE: applying unsets it, the controller falls back to its code default {window})"
     try:
-        return registry_window_errors(_registry_text(registry_file), want[WINDOW_KEY])
+        return [m + how for m in registry_window_errors(_registry_text(registry_file), window)]
     except EnvError as exc:
         return [f"registry unreadable: {exc}"]
+
+
+def env_patch(resource_version: str, p: dict) -> dict:
+    """The strategic-merge patch for plan ``p``: containers and env entries merge by name, ``$patch: delete`` removes an entry,
+    and the resourceVersion makes the API server refuse the patch when the Deployment changed since it was read."""
+    entries = [{"name": k, "value": v} for k, v in sorted(p["set"].items())]
+    entries += [{"name": k, "$patch": "delete"} for k in p["unset"]]
+    return {"metadata": {"resourceVersion": resource_version},
+            "spec": {"template": {"spec": {"containers": [{"name": CONTAINER, "env": entries}]}}}}
 
 
 def _print_plan(p: dict, unmanaged: list[str]) -> None:
@@ -172,14 +230,20 @@ def cmd_diff(a) -> int:
 def cmd_apply(a) -> int:
     want = parse_env_file(Path(a.file).read_text())
     probs = _problems(want, a.registry_file)
+    marker = exclusive_window()
+    if marker:
+        probs.append(f"an exclusive window is active: {marker}")
     act = runner_active()
     if act:
-        probs.append(f"a campaign / arm runner is active (pid {', '.join(act)})")
+        probs.append(f"a campaign / arm runner or driver is active (pid {', '.join(act)})")
+    if not os.environ.get("TRE_EXCLUSIVE_WINDOW_FILE") and not os.environ.get("CAMPAIGN_DATA_ROOT"):
+        print("info   exclusive-window marker not checked (set TRE_EXCLUSIVE_WINDOW_FILE or CAMPAIGN_DATA_ROOT)")
     if probs:
         for m in probs:
             print(f"REFUSED {m}")
         return 2
     deploy = json.loads(kubectl(["get", "deploy", DEPLOY, "-o", "json"]))
+    rv = deploy["metadata"]["resourceVersion"]
     live, other = live_env(deploy)
     p = plan(live, {k: v for k, v in want.items() if k not in other})
     _print_plan(p, other)
@@ -189,13 +253,11 @@ def cmd_apply(a) -> int:
     bdir = Path(a.backup_dir)
     bdir.mkdir(parents=True, exist_ok=True)
     (bdir / "controller-env.before.env").write_text(render_env_file(live, f"env before controller_env.py apply {a.file}"))
-    (bdir / "deploy.before.yaml").write_text(kubectl(["get", "deploy", DEPLOY, "-o", "yaml"]))
+    (bdir / "deploy.before.json").write_text(json.dumps(deploy, indent=2) + "\n")
     (bdir / "rollback.sh").write_text(f"#!/usr/bin/env bash\nexec python3 {Path(__file__).resolve()} apply {bdir}/controller-env.before.env "
                                       f"--backup-dir {bdir}/rollback\n")
     os.chmod(bdir / "rollback.sh", 0o755)
-    args = ["set", "env", f"deploy/{DEPLOY}", "-c", CONTAINER]
-    args += [f"{k}={v}" for k, v in sorted(p["set"].items())] + [f"{k}-" for k in p["unset"]]
-    kubectl(args)
+    kubectl(["patch", f"deploy/{DEPLOY}", "--type", "strategic", "-p", json.dumps(env_patch(rv, p))])
     kubectl(["rollout", "status", f"deploy/{DEPLOY}", "--timeout=300s"], timeout=330)
     after, _ = live_env()
     left = plan(after, {k: v for k, v in want.items() if k not in other})

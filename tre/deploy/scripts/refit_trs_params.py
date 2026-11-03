@@ -41,7 +41,7 @@ sweep of w_p, and are overridable via CLI for ad-hoc sweeps.
 
 Scoring口径 (plan 2026-09-21 §6.4): every candidate is scored on the unified TSS -
 ``tre_common.tss`` (rate numerator, qmin guard, idle rule) smoothed by the same
-wall-clock tau-EMA the controller runs (``--ema-tau-ms``, default 20 s; 0 = raw). The
+wall-clock tau-EMA the controller runs (``--ema-tau-ms``, default 0 = raw, as the deployed registry; > 0 = time-constant EMA). The
 former no-floor / no-EMA / window-total objective of the 0.4.0 search is retired, so a
 refit candidate and the live signal at the same parameters are the same number.
 """
@@ -63,7 +63,7 @@ from tre_calibration.dataset import (
     trim_scenario_ramp_windows,
 )
 from tre_common.slo_labels import LabelDefinition, LabelSpec, add_label_arguments, label_def_from_args
-from tre_common.tss import DEFAULT_EMA_TAU_MS
+from tre_common.tss import FIT_EMA_TAU_MS
 from tre_calibration.signals import (
     ParameterCandidateScore,
     SignalInputs,
@@ -243,7 +243,7 @@ def build_report(
     slo: dict[str, float] | None = None,
     generated_at: str | None = None,
     trim_ramp_windows: int = 0,
-    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS,
+    ema_tau_ms: float | None = FIT_EMA_TAU_MS,
 ) -> dict[str, Any]:
     """Score inherited vs grid-best and assemble the comparison report."""
     if not windows:
@@ -408,8 +408,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--ema-tau-ms",
         type=float,
-        default=DEFAULT_EMA_TAU_MS,
-        help="EMA time constant candidates are smoothed with, as online (default 20000; 0 = raw)",
+        default=FIT_EMA_TAU_MS,
+        help="EMA time constant candidates are smoothed with (default 0 = raw, as the deployed registry names it; > 0 = time-constant EMA)",
     )
     add_label_arguments(parser)
     parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")

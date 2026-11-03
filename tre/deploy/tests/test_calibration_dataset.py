@@ -168,7 +168,7 @@ def test_a_run_converts_into_the_standard_layout_without_touching_it(tmp_path):
     assert set(manifest["label_by_model"]) == {"dsqwen-7b", "dsllama-8b"}
     assert manifest["label"]["mode"] == "slowdown" and manifest["label"]["min_n"] == 20
     assert set(manifest["label"]["columns"].values()) == {"slo_label", "slo_label_fixed", "slo_label_k3"}
-    assert manifest["windowing"]["window_ms"] == dataset.DEFAULT_WINDOW_MS == 20000
+    assert manifest["windowing"]["window_ms"] == dataset.DEFAULT_WINDOW_MS == 10000
     assert manifest["windowing"]["step_ms"] == 10000
     assert manifest["windowing"]["window_align"] == "grid"
     assert all(int(w["window_end_ms"]) % 10000 == 0 for w in windows)
@@ -287,7 +287,8 @@ def test_an_old_probe_booked_healthy_on_two_windows_is_flagged(tmp_path):
                                 "cell_id": "i256_o128_c1060"})
     (out_dir / "boundary" / "dsqwen-7b_S1.json").write_text(json.dumps(search))
 
-    out = dataset.build_dataset(root)
+    # two independent windows in a 60 s probe is a fact of the 20 s window the old probe was booked with
+    out = dataset.build_dataset(root, overrides={"window_ms": 20_000})
     _, cells = _read(out / "cells.csv")
     row = next(c for c in cells if c["cell_id"] == "i256_o128_c1060")
     assert row["probe_verdict_recorded"] == "healthy"

@@ -1,9 +1,13 @@
 # Controller env of the recorded runs
 
 `controller_env.py` writes the env of the live controller Deployment to a file (`snapshot`), shows what a file would change (`diff`), and
-applies it with one `kubectl set env` = one Recreate rollout (`apply --backup-dir`, which also writes the rollback script). It refuses
-while a runner is active and when `TRE_METRICS_WINDOW_MS` in the file disagrees with `trs.theta_window_ms` of the registry (the
-controller would not start). Tested with a fake kubectl in `tre/eval/tests/test_repro_assets_20261103.py`.
+applies it with one `kubectl patch` = one Recreate rollout (`apply --backup-dir`, which also writes the rollback script). The patch
+carries the resourceVersion of the Deployment it was planned on, so a concurrent edit fails the apply instead of being overwritten.
+`apply` refuses while an exclusive-window marker exists (`TRE_EXCLUSIVE_WINDOW_FILE`, default `$CAMPAIGN_DATA_ROOT/TRE_EXCLUSIVE_WINDOW`),
+while a campaign runner or driver shell is active, and when the EFFECTIVE `TRE_METRICS_WINDOW_MS` disagrees with `trs.theta_window_ms`
+of the registry (the controller would not start). Effective = the value in the file; a file without the key unsets it, and the
+controller then falls back to the default of its code (read from this checkout; name the key in the file when the image may be older).
+Tested with a fake kubectl in `tre/eval/tests/test_repro_assets_20261103.py`.
 
 | file | runs (`runs.tsv`) | controller image |
 |---|---|---|
@@ -28,5 +32,5 @@ afterwards; the files hold the canonical state between arms.
 Every other variable is equal in name and value. How the 10 s window got onto the live Deployment: `TRE_METRICS_WINDOW_MS` is not a
 campaign `controller_env` key (the drivers only check it: `WINDOW_EXPECT=10000`). It was patched together with the registry in one
 step by the 10-30 `apply_win10.sh` (temporary, rolled back by `run_all3.sh` after the ktrace batch) and then left at 10000 by the
-10-31 `apply_w10refit.sh`. Both scripts are outside the repo (analysis directory of the cluster); `controller_env.py apply` is the
-repo-side replacement for the env half, `tre/eval/registries/` holds the registry half.
+10-31 `apply_w10refit.sh`. Both scripts are recorded verbatim under `tre/eval/runner/drivers/*/state-records/` (records, not code);
+`controller_env.py apply` is the repo-side replacement for the env half, `tre/eval/registries/` holds the registry half.

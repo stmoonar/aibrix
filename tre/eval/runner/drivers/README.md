@@ -37,7 +37,9 @@ Not path-only:
 * `campaign-tre-rerun-r3e-rep2-20261103.yaml` is regenerated with `make_rep2.sh` from the repo rep 1. The original (07:26) was stale: it
   still had `registry_id: "FILL_REGISTRY_ID"` and lacked the PARAMETERS header, because rep 1 was edited at 13:48 - 13:52 and `make_rep2.sh` was
   not re-run. It never ran.
-* The two 11-03 drivers create the work dir (`mkdir -p`) only on a real launch, so `--check` still writes nothing.
+* Work dir: the first-batch drivers (`icse-*/`) run `mkdir -p "$C"` unconditionally, as the originals did, so they create
+  `$CAMPAIGN_WORK_DIR` (default `$CAMPAIGN_DATA_ROOT/<campaign dir>`) even for a read-only look. The two 11-03 drivers create it only on a
+  real launch (`--check` writes nothing).
 
 Notes: the drivers pin `MAIN_SHA` (`d17bccea` for the 11-03 drivers; the first-batch drivers carry theirs in the script) and refuse another
 checkout; to run from a later main give `MAIN_SHA=<8 hex>`, as the driver's own message says.
@@ -69,8 +71,7 @@ file from `tre/eval/controller_env/` with `controller_env.py apply`.
   half `tre/eval/controller_env/`.
 * How tune D / F (`ee37...`, `f3ac...`) were produced and published (`campaign-icse-tune-20261031/`, `backups/tss-tune-20261031/`, the
   `make_tune*.py` scripts) is not in the repo; the registry files are the result.
-* The 11-03 TRE parameters (`f75155148eba1e61`) were published with `params_set.py` from `fix/lambda-bound-20261103`; main still refuses
-  `lambda_wait` > 20.
+* The 11-03 TRE parameters (`f75155148eba1e61`) were published with `params_set.py`; the registry file is the result.
 * Node name `nscc-ds-4a100-node9` in `precheck.disk_min_free_gb.nodes` of every spec (YAML keys are not expanded; same as the other specs of main).
 * Images are named by tag in the specs / guards (controller 20261029-d9fa1571, 20261101-c8279678, 20261102-420c69ef; SM 20261029-d9fa1571; gateway
   20261029-8b60253f-nozmq2; baseline-scaler 20261029-8b60253f) and must be built from the shas in `tre/eval/controller_env/runs.tsv` / the specs' headers.

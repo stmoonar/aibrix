@@ -125,3 +125,19 @@ def test_signal_inputs_without_a_window_use_totals() -> None:
     # (window_ms only drives the EMA idle-gap reset).
     [value] = tss_series([SignalInputs(10.0, 5.0, 0.0, 1.0, 0.0)], w_p=0.02, lambda_wait=3.0, qmin=1.0)
     assert value == 0.02 * 10.0 + 5.0
+
+
+def test_tau_zero_is_the_raw_signal_in_every_calibration_path() -> None:
+    """The fit tools default to tau 0 (what the deployed registry names): no smoothing, never an error."""
+    inputs = [SignalInputs(10.0, 5.0, 0.0, 1.0, 0.0)]
+    raw = tss_series(inputs, w_p=0.02, lambda_wait=3.0, qmin=1.0)
+    assert tss_series(inputs, w_p=0.02, lambda_wait=3.0, qmin=1.0, ema_tau_ms=0.0) == raw
+    assert tss_series(inputs, w_p=0.02, lambda_wait=3.0, qmin=1.0, ema_tau_ms=None) == raw
+    from tre_common.tss import FIT_EMA_TAU_MS
+
+    assert FIT_EMA_TAU_MS == 0.0
+    rows = _rows()
+    assert (recompute_tss_rows(rows, TssRecompute(w_p=0.02, lambda_wait=3.0, ema_tau_ms=0.0))
+            == recompute_tss_rows(rows, TssRecompute(w_p=0.02, lambda_wait=3.0, ema_tau_ms=None)))
+    assert TssRecompute(w_p=0.02, lambda_wait=3.0).ema_tau_ms == FIT_EMA_TAU_MS  # the default recompute runs without error
+    recompute_tss_rows(rows, TssRecompute(w_p=0.02, lambda_wait=3.0))

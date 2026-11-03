@@ -121,14 +121,13 @@ data:
             window_ms: 10000
             ema_tau_ms: 0.0
           direction: lower_is_healthier
-      # trs: the values live since 2026-11-03 (registry id f75155148eba1e61; snapshot tre/eval/registries/f75155148eba1e61.yaml).
-      # Refit on 10 s windows of the step-counter numerator with the tune F recipe (completion-time attribution, r* 5 %, training
-      # set old + A + B; workspace doc tss-param-fit-method-20261103.md, "Frecf_all"); lambda_wait = mean output tokens x TPOT_SLO /
-      # TTFT_SLO (= 0.15 x mean output, ~32), w_p = (TTFT_SLO / TPOT_SLO) / mean input tokens (workspace doc
-      # train-set-slo-review-20261102.md section 10). EXPLORATORY: not accepted against the preregistered acceptance, not validated on the sealed
-      # set. tau_low 1.0. ema_tau_ms 0 = EMA off (ema_alpha is the freeze registry field, inert). theta_window_ms must equal
-      # TRE_METRICS_WINDOW_MS in deploy/overlays/tre-v2/controller.yaml (10000): the controller refuses to start otherwise.
-      # alt_thresholds below are the live ones too (theta: tune F 2026-11-02 and merged theta 2026-11-02; bases at 10 s, EMA off).
+      # trs, alt_thresholds: the values live since 2026-11-03 (registry id f75155148eba1e61; snapshot tre/eval/registries/f75155148eba1e61.yaml).
+      # theta_m, tau_crit and tau_high are refit on 10 s windows of the step-counter numerator (labels attributed by completion time,
+      # r* 5 %) on the training runs available on 2026-11-03. lambda_wait = mean output tokens x TPOT SLO / TTFT SLO (= 0.15 x mean output
+      # for 75 / 500 ms, about 32) and w_p = (TTFT SLO / TPOT SLO) / mean input tokens are formula values, not fits. EXPLORATORY: not accepted
+      # against a preregistered acceptance and not validated on a held-out set. tau_low 1.0. ema_tau_ms 0 = EMA off (ema_alpha is the freeze
+      # registry field, inert). theta_window_ms must equal TRE_METRICS_WINDOW_MS in deploy/overlays/tre-v2/controller.yaml (10000): the
+      # controller refuses to start otherwise. The alt_thresholds are the live ones too (thetas refit 2026-11-02; bases at 10 s, EMA off).
       trs:
         w_p: 0.009472
         w_d: 1.0
@@ -234,14 +233,13 @@ data:
             window_ms: 10000
             ema_tau_ms: 0.0
           direction: lower_is_healthier
-      # trs: the values live since 2026-11-03 (registry id f75155148eba1e61; snapshot tre/eval/registries/f75155148eba1e61.yaml).
-      # Refit on 10 s windows of the step-counter numerator with the tune F recipe (completion-time attribution, r* 5 %, training
-      # set old + A + B; workspace doc tss-param-fit-method-20261103.md, "Frecf_all"); lambda_wait = mean output tokens x TPOT_SLO /
-      # TTFT_SLO (= 0.15 x mean output, ~32), w_p = (TTFT_SLO / TPOT_SLO) / mean input tokens (workspace doc
-      # train-set-slo-review-20261102.md section 10). EXPLORATORY: not accepted against the preregistered acceptance, not validated on the sealed
-      # set. tau_low 1.0. ema_tau_ms 0 = EMA off (ema_alpha is the freeze registry field, inert). theta_window_ms must equal
-      # TRE_METRICS_WINDOW_MS in deploy/overlays/tre-v2/controller.yaml (10000): the controller refuses to start otherwise.
-      # alt_thresholds below are the live ones too (theta: tune F 2026-11-02 and merged theta 2026-11-02; bases at 10 s, EMA off).
+      # trs, alt_thresholds: the values live since 2026-11-03 (registry id f75155148eba1e61; snapshot tre/eval/registries/f75155148eba1e61.yaml).
+      # theta_m, tau_crit and tau_high are refit on 10 s windows of the step-counter numerator (labels attributed by completion time,
+      # r* 5 %) on the training runs available on 2026-11-03. lambda_wait = mean output tokens x TPOT SLO / TTFT SLO (= 0.15 x mean output
+      # for 75 / 500 ms, about 32) and w_p = (TTFT SLO / TPOT SLO) / mean input tokens are formula values, not fits. EXPLORATORY: not accepted
+      # against a preregistered acceptance and not validated on a held-out set. tau_low 1.0. ema_tau_ms 0 = EMA off (ema_alpha is the freeze
+      # registry field, inert). theta_window_ms must equal TRE_METRICS_WINDOW_MS in deploy/overlays/tre-v2/controller.yaml (10000): the
+      # controller refuses to start otherwise. The alt_thresholds are the live ones too (thetas refit 2026-11-02; bases at 10 s, EMA off).
       trs:
         w_p: 0.009446
         w_d: 1.0
@@ -354,14 +352,13 @@ data:
             window_ms: 10000
             ema_tau_ms: 0.0
           direction: lower_is_healthier
-      # trs: the values live since 2026-11-03 (registry id f75155148eba1e61; snapshot tre/eval/registries/f75155148eba1e61.yaml).
-      # Refit on 10 s windows of the step-counter numerator with the tune F recipe (completion-time attribution, r* 5 %, training
-      # set old + A + B; workspace doc tss-param-fit-method-20261103.md, "Frecf_all"); lambda_wait = mean output tokens x TPOT_SLO /
-      # TTFT_SLO (= 0.15 x mean output, ~32), w_p = (TTFT_SLO / TPOT_SLO) / mean input tokens (workspace doc
-      # train-set-slo-review-20261102.md section 10). EXPLORATORY: not accepted against the preregistered acceptance, not validated on the sealed
-      # set. tau_low 1.0. ema_tau_ms 0 = EMA off (ema_alpha is the freeze registry field, inert). theta_window_ms must equal
-      # TRE_METRICS_WINDOW_MS in deploy/overlays/tre-v2/controller.yaml (10000): the controller refuses to start otherwise.
-      # alt_thresholds below are the live ones too (theta: tune F 2026-11-02 and merged theta 2026-11-02; bases at 10 s, EMA off).
+      # trs, alt_thresholds: the values live since 2026-11-03 (registry id f75155148eba1e61; snapshot tre/eval/registries/f75155148eba1e61.yaml).
+      # theta_m, tau_crit and tau_high are refit on 10 s windows of the step-counter numerator (labels attributed by completion time,
+      # r* 5 %) on the training runs available on 2026-11-03. lambda_wait = mean output tokens x TPOT SLO / TTFT SLO (= 0.15 x mean output
+      # for 75 / 500 ms, about 32) and w_p = (TTFT SLO / TPOT SLO) / mean input tokens are formula values, not fits. EXPLORATORY: not accepted
+      # against a preregistered acceptance and not validated on a held-out set. tau_low 1.0. ema_tau_ms 0 = EMA off (ema_alpha is the freeze
+      # registry field, inert). theta_window_ms must equal TRE_METRICS_WINDOW_MS in deploy/overlays/tre-v2/controller.yaml (10000): the
+      # controller refuses to start otherwise. The alt_thresholds are the live ones too (thetas refit 2026-11-02; bases at 10 s, EMA off).
       trs:
         w_p: 0.009425
         w_d: 1.0

@@ -173,7 +173,7 @@ def test_theta_verdict_and_holdout_run_end_to_end(tmp_path: Path) -> None:
     ]) == 0
     verdict = json.loads(out.read_text())
     assert verdict["label_def"]["e2e"] == "excluded"
-    assert verdict["tss"]["ema_tau_ms"] == 20000.0
+    assert verdict["tss"]["ema_tau_ms"] is None  # the default tau is 0 = raw, recorded as no EMA (as the deployed registry)
     assert verdict["merged"]["delta_crit"]["method"] == "ba_grid"
     assert verdict["family_verdict"]["publish"] in ("merged", "max_family")
     assert set(verdict["stop_rule"]) >= {"satisfied", "reasons"}

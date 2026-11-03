@@ -197,8 +197,8 @@ TRIM_RAMP_WINDOWS = 1
 #: ``--dt-ref-s`` / ``--horizon-ms`` / ``--dwell-windows``, thread the values explicitly
 #: (no module state changes), record them as ``windowing`` in their outputs, and the
 #: freeze carries them to ``accept``: a different window only needs an offline re-run.
-#: WINDOW_MS = the controller's TRE_METRICS_WINDOW_MS (20 s since 2026-10-28).
-WINDOW_MS = 20_000.0
+#: WINDOW_MS = the controller's TRE_METRICS_WINDOW_MS (10 s since 2026-11-03; 20 s from 2026-10-28).
+WINDOW_MS = 10_000.0
 #: The window of every stage output / freeze written before the windowing record
 #: (2026-09-30) and the default until 2026-10-28: :func:`windowing_of` reads a record
 #: without ``window_ms`` as this, never as the current default.

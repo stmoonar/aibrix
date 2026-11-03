@@ -212,9 +212,9 @@ def test_dt_ref_changes_alpha_and_the_step_response() -> None:
 
 
 def test_windowing_validates_and_old_documents_fall_back_to_defaults() -> None:
-    # 2026-10-28: new runs default to the controller's 20 s window; a document without a
-    # windowing record predates it and was cut at 30 s
-    assert dl.DEFAULT_WINDOWING == {"window_ms": 20_000.0, "step_ms": 10_000.0, "dt_ref_s": 10.0,
+    # 2026-11-03: new runs default to the controller's 10 s window (20 s from 2026-10-28); a document
+    # without a windowing record predates it and was cut at 30 s
+    assert dl.DEFAULT_WINDOWING == {"window_ms": 10_000.0, "step_ms": 10_000.0, "dt_ref_s": 10.0,
                                     "horizon_ms": 30_000, "dwell_windows": 2}
     assert dl.windowing_of({}) == dl.LEGACY_WINDOWING == {**dl.DEFAULT_WINDOWING, "window_ms": 30_000.0}
     assert dl.windowing_of({"windowing": {"dwell_windows": 3}})["dwell_windows"] == 3
@@ -246,7 +246,7 @@ def test_stage_flags_reach_alpha_fit_and_are_recorded(tmp_path, monkeypatch) -> 
     # defaults: the module constants, recorded as such
     assert dl.main(argv[:13]) == 0
     assert (seen["ns"].window_ms, seen["ns"].step_ms, seen["ns"].dt_ref_s, seen["ns"].dwell_windows) == (
-        20_000.0, 10_000.0, 10.0, 2)
+        10_000.0, 10_000.0, 10.0, 2)
     doc = json.loads((w["out"] / MODEL / base.ARM / "alpha.json").read_text())
     assert doc["windowing"] == dl.DEFAULT_WINDOWING
     assert doc["published_registry_fields"] == {"ema_tau_ms": 10_000.0, "ema_alpha": round(dl.alpha_of(10.0), 6)}

@@ -77,7 +77,7 @@ from tre_calibration.fit import (
 from tre_common.alt_signals import alt_signal_z_max, alt_tau_high_unreachable
 from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_calibration.profile import theta_fit_block
-from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
+from tre_common.tss import FIT_EMA_TAU_MS, TSS_UNITS
 
 from scripts import adaptive_boundary as boundary
 
@@ -115,7 +115,7 @@ class SignalSpec:
     signal: str
     label_lambda_wait: float
     tss: TssRecompute | None = None
-    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS
+    ema_tau_ms: float | None = FIT_EMA_TAU_MS
     #: How theta and the bands are chosen (:data:`tre_calibration.fit.FIT_METHODS`); TSS
     #: only - an alternative signal keeps its own candidate grid and the BA argmax.
     fit_method: str = DEFAULT_FIT_METHOD
@@ -199,7 +199,7 @@ def build_signal_spec(
     w_p: float | None = None,
     lambda_wait: float | None = None,
     qmin: float = 1.0,
-    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS,
+    ema_tau_ms: float | None = FIT_EMA_TAU_MS,
     label_lambda_wait: float | None = None,
     fit_method: str = DEFAULT_FIT_METHOD,
 ) -> SignalSpec:
@@ -717,7 +717,7 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
              "the primary TSS value for every ablation arm so all arms share one label",
     )
     v.add_argument("--qmin", type=float, default=1.0)
-    v.add_argument("--ema-tau-ms", type=float, default=DEFAULT_EMA_TAU_MS)
+    v.add_argument("--ema-tau-ms", type=float, default=FIT_EMA_TAU_MS)
     add_label_arguments(v)
     v.add_argument("--trim-ramp-windows", type=int, default=1)
     v.add_argument("--n-resamples", type=int, default=1000)
