@@ -25,3 +25,13 @@ with `--suite <set> --k-map <set>/_checks/k_map.json --v9 <azure>/v1-retrace/tra
 `preserve_history.json` of these traces (seeds 1-3 where present, 11 files) byte for byte once the two fields
 naming the generator (path, sha256) are set to the old copy's values (`--verify`). The rows of the 10 s files
 equal those of a first 10 s run made earlier that day by a wrapper around the old copies (no run used it).
+
+## `preserve_history_w10_train-tail-20261104.sha256`
+
+The 10 s pre-t0 histories of the same seven traces for the predictors trained on each trace's own past
+(`weights/preserve-mlstm-20261104-trace-w10`, policy `history_variant: train-tail-20261104`): the last 25 windows
+of the trace's training series = the end of its last training realization (seed 104), method
+`train-realization-tail-v1-20261104`, written by `preserve_train/trace_train.py finish`. Paths are relative to the
+generated-data directory (`<datasets>/preserve-train-trace-20261104`, see its SOURCES.md), not to the trace sets:
+these files are not next to the evaluation traces yet (a run copies the file next to the trace, or sets
+`history_path`).

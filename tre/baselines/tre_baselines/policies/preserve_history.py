@@ -57,23 +57,30 @@ class HistoryError(ValueError):
     pass
 
 
-def history_names(window_s: float) -> tuple[str, ...]:
+def history_names(window_s: float, variant: Optional[str] = None) -> tuple[str, ...]:
     """The history file names of a window, in lookup order (the one rule; the policy, the campaign
     runner and ``tools/preserve_history_azure`` call it): 30 s: ``pre_t0.json`` (the generator's,
     synthetic traces), then ``preserve_history.json``; another window W: ``preserve_history_w<W>.json``
-    only (2026-11-03; a file of another window refuses the policy anyway)."""
+    only (2026-11-03; a file of another window refuses the policy anyway). ``variant`` (policy param
+    ``history_variant``, 2026-11-04): another history method for the same trace, any window:
+    ``preserve_history_w<W>_<variant>.json`` only (e.g. ``train-tail-20261104``,
+    ``preserve_train/trace_train.py``)."""
     w = float(window_s)
     if not math.isfinite(w) or w <= 0:
         raise HistoryError(f"history: window_s {window_s!r} must be > 0")
+    if variant is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(variant)):
+            raise HistoryError(f"history: variant {variant!r} must be [A-Za-z0-9._-]+")
+        return (f"preserve_history_w{w:g}_{variant}.json",)
     if abs(w - LEGACY_WINDOW_S) < 1e-9:
         return (PRE_T0_NAME, DEFAULT_NAME)
     return (f"preserve_history_w{w:g}.json",)
 
 
-def default_path(trace_path: str, *, window_s: float) -> str:
+def default_path(trace_path: str, *, window_s: float, variant: Optional[str] = None) -> str:
     """The first of :func:`history_names` that exists next to the trace, else the last one."""
     d = Path(trace_path).parent
-    names = history_names(window_s)
+    names = history_names(window_s, variant)
     return str(next((d / n for n in names[:-1] if (d / n).exists()), d / names[-1]))
 
 

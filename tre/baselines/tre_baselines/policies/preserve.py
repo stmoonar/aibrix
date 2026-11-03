@@ -79,13 +79,19 @@ window_s                (required)             ours; shipped 10 since 2026-11-03
 lead_s                  0                      ours: fire Tier-1 this early (s)
 tier1                   mlstm                  paper; ``oracle_noisy`` / ``oracle`` /
                                                ``last_window`` = sensitivity (D8)
-predictors              (required, mlstm)      ``{set: {path, sha256}}`` (v1 paper_past weights)
+predictors              (required, mlstm)      ``{set: {path, sha256}}`` (v1 paper_past weights), or per
+                                               model ``{set: {models: {model: {path, sha256}}}}`` (2026-11-04,
+                                               ``preserve_train/trace_train.py``: one file per service)
+predictor_normalization per_sequence_mean      the normalization every predictor file must declare
+                                               (``per_sequence_mean`` = D15; ``minmax`` = paper Alg. 1)
 predictor_rules         Real_code->code,       ``[[trace name prefix, set]]``; else ``pooled``
                         Real_conv->conv
 seq_len                 25                     paper (the weights' own seq_len must match)
 history_path            <trace dir>/           the history before t0 (:mod:`preserve_history`):
                         pre_t0.json, else      the generator's (synthetic) / the Azure windows
                         preserve_history.json  before the slice (Real_*)
+history_variant         (none)                 ours (2026-11-04): another history file next to the trace,
+                                               ``preserve_history_w<W>_<variant>.json`` (``history_names``)
 noise_sigma, noise_seed                        oracle_noisy only (sensitivity)
 mu                      (required)             paper Alg.1 (``tools/velocity_ladder mu``)
 load_error_mode         paper_tab2             paper RQ2 "w/ load errors" (Tab. 2) | none
@@ -280,37 +286,25 @@ class PreServePolicy:
         # Tier-1 mLSTM: weights (sha256 checked) and the history before t0, at start (fail closed)
         self.seq_len = int(params.get("seq_len", 25))
         self.predictor_set: Optional[str] = None
-        self._predictors: Optional[Mapping[str, Any]] = None
+        #: {model: {"prompt", "response"}} (a per-model set, or one set for every model)
+        self._predictors: dict[str, Mapping[str, Any]] = {}
         self._history: dict[str, list] = {}
         self.history_info: dict[str, Any] = {}
         if self.mode == "mlstm":
             rules = params.get("predictor_rules") or DEFAULT_PREDICTOR_RULES
             self.predictor_set = predictor_set_for(self.trace_name, rules)
             if predictors is not None:
-                self._predictors = predictors
+                self._predictors = {m: predictors for m in self.mu}
             else:
-                from tre_baselines.policies import preserve_predictor  # numpy: only for this mode
-
-                spec = (params.get("predictors") or {}).get(self.predictor_set)
-                if not isinstance(spec, Mapping) or not spec.get("path") or not spec.get("sha256"):
-                    raise ValueError(f"preserve: predictors.{self.predictor_set} needs path and sha256")
-                wpath = Path(str(spec["path"]))
-                if not wpath.is_absolute():  # shipped weights: relative to tre/baselines
-                    wpath = BASELINES_ROOT / wpath
-                self._predictors = preserve_predictor.load_predictors(str(wpath), str(spec["sha256"]))
-                for k, pr in self._predictors.items():
-                    if pr.seq_len != self.seq_len:
-                        raise ValueError(f"preserve: predictor {k} seq_len {pr.seq_len} != seq_len {self.seq_len}")
-                    # a model forecasts the next window of its training length (2026-11-03)
-                    if pr.window_s is None or abs(float(pr.window_s) - self.window_s) > 1e-9:
-                        raise ValueError(f"preserve: predictor {self.predictor_set}/{k} was trained on "
-                                         f"{pr.window_s} s windows, params.window_s is {self.window_s}")
+                self._predictors = self._load_predictors(params)
             if history is not None:
                 self._history = {m: list(v) for m, v in history.items()}
                 self.history_info = {"path": None, "injected": True}
             else:
                 tpath = str(trace_path or oracle.path)
-                hpath = str(params.get("history_path") or preserve_history.default_path(tpath, window_s=self.window_s))
+                variant = params.get("history_variant")
+                hpath = str(params.get("history_path") or preserve_history.default_path(
+                    tpath, window_s=self.window_s, variant=None if variant is None else str(variant)))
                 self._history, self.history_info = preserve_history.load(
                     hpath, window_s=self.window_s, models=sorted(self.mu), seq_len=self.seq_len,
                     trace=self.trace_name, seed=preserve_history.seed_of(tpath))
@@ -656,6 +650,51 @@ class PreServePolicy:
             return None, "tier1_after_trace"
         return idx, None
 
+    def _load_predictors(self, params: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+        """{model: {"prompt", "response"}} of ``predictors.<set>`` (one file for every model, or ``models:``
+        one file per model), sha256 checked; every file must declare ``seq_len``, ``window_s`` and
+        ``predictor_normalization`` (fail closed)."""
+        from tre_baselines.policies import preserve_predictor  # numpy: only for this mode
+
+        want_norm = str(params.get("predictor_normalization", preserve_predictor.PER_SEQUENCE_MEAN))
+        if want_norm not in preserve_predictor.NORMALIZATIONS:
+            raise ValueError(f"preserve: predictor_normalization must be one of {preserve_predictor.NORMALIZATIONS}")
+        name = self.predictor_set
+        spec = (params.get("predictors") or {}).get(name)
+        if isinstance(spec, Mapping) and isinstance(spec.get("models"), Mapping):
+            per = {str(m): (f"{name}.models.{m}", s, str(m)) for m, s in spec["models"].items()}
+            missing = sorted(m for m in self.mu if m not in per)
+            if missing:
+                raise ValueError(f"preserve: predictors.{name}.models has no file for {missing}")
+            files = {m: per[m] for m in self.mu}
+        else:
+            files = {m: (name, spec, None) for m in self.mu}
+        loaded: dict[tuple, Mapping[str, Any]] = {}
+        out: dict[str, Mapping[str, Any]] = {}
+        for model, (where, fspec, owner) in files.items():
+            if not isinstance(fspec, Mapping) or not fspec.get("path") or not fspec.get("sha256"):
+                raise ValueError(f"preserve: predictors.{where} needs path and sha256")
+            wpath = Path(str(fspec["path"]))
+            if not wpath.is_absolute():  # shipped weights: relative to tre/baselines
+                wpath = BASELINES_ROOT / wpath
+            key = (str(wpath), str(fspec["sha256"]))
+            if key not in loaded:
+                loaded[key] = preserve_predictor.load_predictors(*key)
+            for k, pr in loaded[key].items():
+                if pr.seq_len != self.seq_len:
+                    raise ValueError(f"preserve: predictor {where}/{k} seq_len {pr.seq_len} != seq_len {self.seq_len}")
+                # a model forecasts the next window of its training length (2026-11-03)
+                if pr.window_s is None or abs(float(pr.window_s) - self.window_s) > 1e-9:
+                    raise ValueError(f"preserve: predictor {where}/{k} was trained on "
+                                     f"{pr.window_s} s windows, params.window_s is {self.window_s}")
+                if pr.normalization != want_norm:
+                    raise ValueError(f"preserve: predictor {where}/{k} normalization {pr.normalization!r} != "
+                                     f"params.predictor_normalization {want_norm!r}")
+                if owner is not None and pr.model is not None and pr.model != owner:
+                    raise ValueError(f"preserve: predictor {where}/{k} was trained for model {pr.model!r}")
+            out[model] = loaded[key]
+        return out
+
     def _mlstm_for(self, snap: ClusterSnapshot, model: str, st: _ModelState) -> Optional[tier1.MlstmTier1]:
         """The mLSTM Tier-1 of the current replay (a new ``t0`` starts a fresh history)."""
         if self.mode != "mlstm" or snap.replay is None or model not in self.mu:
@@ -667,7 +706,7 @@ class PreServePolicy:
             if st.pre_replay_lost_ms is not None and st.pre_replay_lost_ms >= t0:
                 raise ValueError("replay marker arrived after its arrival history was lost")
             st.mlstm = (t0, tier1.MlstmTier1(model=model, t0_ms=t0, window_s=self.window_s,
-                                             n_windows=self.oracle.n_windows, predictors=self._predictors,
+                                             n_windows=self.oracle.n_windows, predictors=self._predictors[model],
                                              mu=self.mu[model], seq_len=self.seq_len,
                                              history=self._history[model]))
             t1m = st.mlstm[1]
