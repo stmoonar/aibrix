@@ -25,7 +25,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: baseline-scaler
-          image: tre-v2-baseline-scaler:20261103-b067658e
+          image: tre-v2-baseline-scaler:20261104-791c8a89
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
