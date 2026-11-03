@@ -30,7 +30,8 @@ equal those of a first 10 s run made earlier that day by a wrapper around the ol
 
 The 10 s pre-t0 histories of the same seven traces for the predictors trained on each trace's own past
 (`weights/preserve-mlstm-20261104-trace-w10`, policy `history_variant: train-tail-20261104`): the last 25 windows
-of the trace's training series = the end of its last training realization (seed 104), method
+of the trace's training series = the end of its last training realization (synthetic: seed 104; Real_*: past1, the
+nearest free real Azure interval before the slice, see the weights' REPORT.md), method
 `train-realization-tail-v1-20261104`, written by `preserve_train/trace_train.py finish`. Paths are relative to the
 generated-data directory (`<datasets>/preserve-train-trace-20261104`, see its SOURCES.md), not to the trace sets:
 these files are not next to the evaluation traces yet (a run copies the file next to the trace, or sets
