@@ -75,11 +75,13 @@ FAILED_SUFFIX = ".CAMPAIGN_FAILED.json"
 ORDER_METHODS = ("williams", "cyclic", "fixed")
 # the PreServe policy's keys (tre_baselines/policies/preserve.py, 2026-10-26 port)
 PRESERVE_KEYS = {"calibration", "trace_path", "trace_seed", "trace_schedule", "trace_match_parts", "trace_name",
-                 "window_s", "lead_s", "tier1", "noise_sigma", "noise_seed", "seq_len", "predictors",
+                 "window_s", "lead_s", "tier1", "tier1_horizon", "tier1_d_source", "noise_sigma", "noise_seed", "seq_len", "predictors",
                  "predictor_rules", "history_path", "mu", "load_error_mode", "load_error_seed", "max_model_len",
                  "max_output_len", "map_factor", "lookahead_iters", "kv_high", "overload_frac", "t_f", "ext_frac",
                  "out_len_is_upper_bound", "t2_reset_at_window", "kv_capacity_tokens", "kv_agree_tol", "req_ttl_s"}
 TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
+TIER1_HORIZONS = ("paper_two_step", "one_step_now")
+TIER1_D_SOURCES = ("done_tokens", "arrival_max_tokens")
 # controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.
@@ -342,6 +344,10 @@ def arm_def(c: dict, arm_id: str) -> ArmDef:
         raise CampaignError(f"arm_defs.{arm_id}.policy: unknown PreServe keys {bad}")
     if "tier1" in pol and pol["tier1"] not in TIER1_MODES:
         raise CampaignError(f"arm_defs.{arm_id}.policy.tier1 must be one of {TIER1_MODES}")
+    if "tier1_horizon" in pol and pol["tier1_horizon"] not in TIER1_HORIZONS:
+        raise CampaignError(f"arm_defs.{arm_id}.policy.tier1_horizon must be one of {TIER1_HORIZONS}")
+    if "tier1_d_source" in pol and pol["tier1_d_source"] not in TIER1_D_SOURCES:
+        raise CampaignError(f"arm_defs.{arm_id}.policy.tier1_d_source must be one of {TIER1_D_SOURCES}")
     if shift is not None:
         if float(shift.get("period_s", 0)) <= 0 or not (0 < float(shift.get("frac", 0.25)) <= 0.5):
             raise CampaignError(f"arm_defs.{arm_id}.oracle_shift needs period_s > 0 and 0 < frac <= 0.5")
@@ -1493,7 +1499,8 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
                 d = arm_def(c, a)
                 _, params = render_preserve_policy(env["BL_CM_FILE"], "/x/t/seed1/f.json",
                                                    int(c["preserve"].get("match_parts", 3)), d.policy)
-                warnings.append(f"preserve arm {a}: tier1={params.get('tier1')} noise_sigma={params.get('noise_sigma')} "
+                warnings.append(f"preserve arm {a}: tier1={params.get('tier1')} horizon={params.get('tier1_horizon')} "
+                                f"d_source={params.get('tier1_d_source')} noise_sigma={params.get('noise_sigma')} "
                                 f"window_s={params.get('window_s')} match_parts={params.get('trace_match_parts')}"
                                 f"{' oracle_shift=' + str(d.oracle_shift) if d.oracle_shift else ''}")
             except Exception as exc:  # noqa: BLE001

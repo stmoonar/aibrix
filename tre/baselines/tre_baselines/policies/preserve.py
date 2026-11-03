@@ -20,7 +20,17 @@ Composition (v1 faithful)::
 * **N_T1** (Tier-1), set at the first tick of each window ``i`` of ``window_s`` (10 s; 30 s, v1 D18, until 2026-11-03)
   from the replay start ``t0``: ``N = ceil(max(P/(mu_p W), D/(mu_d W), (P+D)/(mu_t W)))`` with
   the forecast ``P_hat``, ``D_hat`` (:class:`preserve_tier1.MlstmTier1`; the history before
-  ``t0`` is the trace's history file, :mod:`preserve_history`). None before ``t0`` or without a
+  ``t0`` is the trace's history file, :mod:`preserve_history`). ``tier1_horizon``
+  ``paper_two_step`` (default, 2026-11-04; Alg. 2, §4.3.2): the firing at the start of ``T_i``
+  is the two-step forecast ``N_{i+1}`` (step 1 predicts ``T_i`` from the observed windows up to
+  ``T_{i-1}``, step 2 predicts ``T_{i+1}`` from that history plus the step-1 prediction), and it
+  is the target from the start of ``T_i`` on: the paper scales (pre-initializes or isolates) at
+  the beginning of ``T_i`` for ``T_{i+1}``. ``T_0`` (first tick at or after ``t0``) follows the
+  same rule on the pre-``t0`` history: ``N_1`` from the start of ``T_0``; ``N_0`` is not a
+  target (the paper's scaler would have acted on it during ``T_{-1}``, before the replay). The
+  last window's target ``T_n`` lies after the trace: ``N_T1`` keeps its last value.
+  ``one_step_now`` (before 2026-11-04, v1 D18): the firing at ``T_i`` is the one-step forecast
+  ``N_i`` of ``T_i`` itself. A prediction never enters the history. None before ``t0`` or without a
   replay; after the trace and on a forecast error the last value is kept. Tier-1 reads no
   Tier-2 signal, so **an evidence gap never holds it** (v1 D56 / D64); the shell's
   unknown-is-not-idle backstop is off for this policy (``evidence_backstop = False``), the
@@ -76,9 +86,19 @@ trace_name              path part -3           the trace's name (``<name>/seed<k
 window_s                (required)             ours; shipped 10 since 2026-11-03 (= TRE's 10 s metrics window; 30 s
                                                before, v1 D18; paper 600 s; our traces are 12 min);
                                                the predictors and the history must declare it
-lead_s                  0                      ours: fire Tier-1 this early (s)
+lead_s                  0                      ours: move the window boundary this much earlier (s);
+                                               only with ``one_step_now`` and an oracle mode (mlstm:
+                                               the observed window would close early; two-step: the
+                                               paper's one-window look-ahead is already the lead)
 tier1                   mlstm                  paper; ``oracle_noisy`` / ``oracle`` /
                                                ``last_window`` = sensitivity (D8)
+tier1_horizon           paper_two_step         paper (Alg. 2 two-step at the start of T_i, target
+                                               N_{i+1}, §4.3.2); ``one_step_now`` = runs before
+                                               2026-11-04 (one step, T_i itself, v1 D18)
+tier1_d_source          done_tokens            paper (Alg. 1/2: D_j = response tokens of T_j's
+                                               requests, known at completion: ``done`` out_tokens
+                                               before the forecast instant); mlstm only;
+                                               ``arrival_max_tokens`` = runs before 2026-11-04
 predictors              (required, mlstm)      ``{set: {path, sha256}}`` (v1 paper_past weights)
 predictor_rules         Real_code->code,       ``[[trace name prefix, set]]``; else ``pooled``
                         Real_conv->conv
@@ -248,10 +268,19 @@ class PreServePolicy:
         self.window_s = float(params["window_s"])
         if self.window_s <= 0:
             raise ValueError("preserve: window_s must be > 0")
+        self.t1_horizon = str(params.get("tier1_horizon", tier1.PAPER_TWO_STEP))
+        if self.t1_horizon not in tier1.HORIZONS:
+            raise ValueError(f"preserve: tier1_horizon must be one of {tier1.HORIZONS}")
+        self.d_source = str(params.get("tier1_d_source", tier1.DONE_TOKENS))
+        if self.d_source not in tier1.D_SOURCES:
+            raise ValueError(f"preserve: tier1_d_source must be one of {tier1.D_SOURCES}")
         self.lead_s = float(params.get("lead_s", 0.0))
         if self.lead_s != 0.0 and str(params.get("tier1", "mlstm")) == "mlstm":
             raise ValueError("preserve: lead_s must be 0 with tier1 mlstm (an early window start would close "
                              "the observed window before it ends)")
+        if self.lead_s != 0.0 and self.t1_horizon == tier1.PAPER_TWO_STEP:
+            raise ValueError("preserve: lead_s must be 0 with tier1_horizon paper_two_step (the forecast is "
+                             "already one window ahead)")
         self.mode = str(params.get("tier1", "mlstm"))
         if self.mode not in tier1.TIER1_MODES:
             raise ValueError(f"preserve: tier1 must be one of {tier1.TIER1_MODES}")
@@ -499,15 +528,7 @@ class PreServePolicy:
             if not e.client_id:
                 anom["no_client_id"] += 1
             if e.reissue == "none":
-                if t1m is not None:
-                    t1m.observe_arrival(int(e.ts_ms), e.in_tokens, e.max_tokens)
-                elif self.mode == "mlstm":
-                    # A late marker must not lose the first window. Retain only arrivals,
-                    # never ft/done, and bound both age and count (same scale as the stream).
-                    st.pre_replay.append(e)
-                    while st.pre_replay and (len(st.pre_replay) > 200000 or
-                                            e.ts_ms - st.pre_replay[0].ts_ms > self.req_ttl_ms):
-                        st.pre_replay_lost_ms = st.pre_replay.popleft().ts_ms
+                self._tier1_feed(st, e, t1m)
             if not e.pod:
                 anom["unknown_pod"] += 1
                 return
@@ -546,6 +567,8 @@ class PreServePolicy:
                     st.pending.pop(e.pod)
             return
         if e.kind == "done":
+            if e.reissue == "none" and self.d_source == tier1.DONE_TOKENS:
+                self._tier1_feed(st, e, t1m)  # before any Tier-2 bookkeeping: D is new demand, known now
             if key in st.gone_keys:
                 return
             if key in st.active or key in st.pending.get(e.pod, {}):
@@ -555,6 +578,25 @@ class PreServePolicy:
                 anom["unknown_req"] += 1
             return
         anom["bad_event"] += 1
+
+    def _tier1_feed(self, st: _ModelState, e: RequestEvent, t1m: Optional[tier1.MlstmTier1]) -> None:
+        """A new-demand ``arr`` (P, and D with ``arrival_max_tokens``) or ``done`` (D with ``done_tokens``)."""
+        if t1m is not None:
+            self._observe(t1m, e)
+        elif self.mode == "mlstm":
+            # A late marker must not lose the first window. Retain only new-demand arr (and done for
+            # done_tokens), never ft, and bound both age and count (same scale as the stream).
+            st.pre_replay.append(e)
+            while st.pre_replay and (len(st.pre_replay) > 200000 or
+                                    e.ts_ms - st.pre_replay[0].ts_ms > self.req_ttl_ms):
+                st.pre_replay_lost_ms = st.pre_replay.popleft().ts_ms
+
+    @staticmethod
+    def _observe(t1m: tier1.MlstmTier1, e: RequestEvent) -> None:
+        if e.kind == "arr":
+            t1m.observe_arrival(int(e.ts_ms), e.in_tokens, e.max_tokens, e.req_id)
+        elif e.kind == "done":
+            t1m.observe_done(int(e.ts_ms), e.req_id, e.out_tokens)
 
     def _add(self, ms: ModelSnapshot, st: _ModelState, key, info: "_ArrInfo", pod: str, ps: _PodState,
              anom: Counter) -> None:
@@ -669,31 +711,39 @@ class PreServePolicy:
             st.mlstm = (t0, tier1.MlstmTier1(model=model, t0_ms=t0, window_s=self.window_s,
                                              n_windows=self.oracle.n_windows, predictors=self._predictors,
                                              mu=self.mu[model], seq_len=self.seq_len,
-                                             history=self._history[model]))
+                                             history=self._history[model], horizon=self.t1_horizon,
+                                             d_source=self.d_source))
             t1m = st.mlstm[1]
             for event in st.pre_replay:
                 if event.ts_ms >= t0:
-                    t1m.observe_arrival(event.ts_ms, event.in_tokens, event.max_tokens)
+                    self._observe(t1m, event)
             st.pre_replay.clear()
             st.pre_replay_lost_ms = None
         return st.mlstm[1]
+
+    def _t1_target(self, idx: int) -> int:
+        """The window the Tier-1 firing at the start of window ``idx`` provisions."""
+        return idx + 1 if self.t1_horizon == tier1.PAPER_TWO_STEP else idx
 
     def _tier1_n(self, model: str, idx: int, t1m: Optional[tier1.MlstmTier1]) -> tuple[Optional[int], dict]:
         if self.mode == "mlstm":
             if t1m is None:
                 return None, {"window": idx, "mode": "mlstm", "error": "no_mlstm"}
             return t1m.decide(idx)
-        true = self.oracle.window(model, idx)
+        # The target window: idx + 1 (two-step) or idx. last_window reads the latest window observed at
+        # the start of T_idx (idx - 1) in both horizons: a last-value forecast iterated twice is the same.
+        target = self._t1_target(idx)
+        true = self.oracle.window(model, target)
         prev = None
         if idx > 0:
             p = self.oracle.window(model, idx - 1)
             prev = (p.P, p.D)
         est = tier1.estimate(self.mode, true_P=true.P, true_D=true.D, prev=prev, seed=self.seed,
-                             model=model, window=idx, sigma=self.sigma)
-        info: dict = {"window": idx, "mode": self.mode}
+                             model=model, window=target, sigma=self.sigma)
+        info: dict = {"window": idx, "target": target, "mode": self.mode, "horizon": self.t1_horizon}
         if est is None:
             return None, info
-        W = self.oracle.window_len_s(idx)
+        W = self.oracle.window_len_s(target)
         N = tier1.required_replicas(est[0], est[1], self.mu[model], W)
         info.update({"P_hat": round(est[0], 1), "D_hat": round(est[1], 1), "W": W, "N": N})
         return N, info
@@ -787,9 +837,15 @@ class PreServePolicy:
             # after the trace: the last forecast stays the floor (no evidence-free scale-down)
         elif t1_key != st.t1_window:
             st.t1_window = t1_key
-            N, t1_info = self._tier1_n(ms.model, idx, t1m)
+            if self._t1_target(idx) >= self.oracle.n_windows:
+                # two-step, last window: the target lies after the trace; N_T1 keeps its last value
+                N, t1_info = st.n_t1, {"window": idx, "target": idx + 1, "horizon": self.t1_horizon,
+                                       "kept": "tier1_target_after_trace"}
+            else:
+                N, t1_info = self._tier1_n(ms.model, idx, t1m)
             if N is None:
-                reasons.append("tier1_error")  # N_T1 keeps its last value
+                # N_T1 keeps its last value (None after a trace of one window: Tier-2 alone)
+                reasons.append("tier1_error" if "kept" not in t1_info else "tier1_kept")
             else:
                 st.n_t1 = clamp(N)
                 reasons.append("tier1_window")

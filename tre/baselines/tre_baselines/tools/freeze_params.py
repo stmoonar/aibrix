@@ -98,6 +98,8 @@ def render_preserve(mu: Optional[Mapping[str, Any]], sources: Mapping[str, str],
          "window_s: 10             # = TRE metrics window (2026-11-03; 30 s before, v1 D18; paper 600 s)",
          "lead_s: 0",
          "tier1: mlstm             # paper forecaster; v1 paper_past protocol at W = 10 s (train before the Real_* slices)",
+         "tier1_horizon: paper_two_step   # paper Alg. 2: two steps at the start of T_i -> N_{i+1} (2026-11-04)",
+         "tier1_d_source: done_tokens     # paper: observed D = done out_tokens, known at completion (2026-11-04)",
          "seq_len: 25",
          "predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)"]
     for name in WEIGHT_SETS:

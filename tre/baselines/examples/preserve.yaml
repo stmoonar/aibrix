@@ -14,8 +14,12 @@ trace_schedule: poisson
 trace_match_parts: 2
 window_s: 10              # 2026-11-03 (= TRE metrics window; 30 s before, v1 D18; paper 600 s);
                           # the predictors and the history must declare the same window
-lead_s: 0
+lead_s: 0                 # one_step_now + oracle modes only; paper_two_step already looks one window ahead
 tier1: mlstm              # paper; sensitivity: oracle_noisy | oracle | last_window
+tier1_horizon: paper_two_step   # paper Alg. 2: at the start of T_i, two steps -> N_{i+1}, the target from
+                          # then on; one_step_now = runs before 2026-11-04 (T_i itself, v1 D18)
+tier1_d_source: done_tokens     # paper: observed D = done out_tokens by arrival window, known at done;
+                          # arrival_max_tokens = runs before 2026-11-04
 seq_len: 25
 predictors:               # relative paths are under tre/baselines; sha256 is checked at start
   code: {path: weights/preserve-mlstm-20261103-paper-w10/code-paper-w10.npz, sha256: <sha256>}
