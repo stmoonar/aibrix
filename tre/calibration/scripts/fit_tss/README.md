@@ -76,7 +76,8 @@ Inputs (their sizes, mtimes and sha256 are in `fit.json` `data.<model>.sources[]
 
 * old: `<data root>/analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/<src>/<model>/dataset_hybrid`,
   sources run1 / run2 (14b: run2b) / supp / p1 (7b: p1r2), built 10-30 by `run_alphafit_w10.sh`
-  step 1 (`WINDOW_MS=10000 STEP_MS=10000`, builder main `9f2856a1`) from `<data root>/calib_20261003`.
+  step 1 (`WINDOW_MS=10000 STEP_MS=10000`, builder main `9f2856a1`) from `<data root>/calib_20261003`
+  (`build_datasets.sh --old <root> 10000` builds the same sources).
 * A, B: `<data root>/calib_supp_20261103/datasets/w10000/{A,B}/<model>/dataset_hybrid`, built 11-03 by
   `build_datasets.sh` (builder `97a4d4ab`) from the supplement campaign `<data root>/calib_supp_20261103/{A,B}`.
 * label registry of both builds: `tre/deploy/registry.yaml` at commit `e891d29b` (`fit_label_registry`).
@@ -85,7 +86,9 @@ Inputs (their sizes, mtimes and sha256 are in `fit.json` `data.<model>.sources[]
 
 `run_frecipe_formula.sh <dir> f_all f_old f_le1100` from this directory, on the host and with
 the packages of the original run (nice 10, 8 cores), against the original outputs
-(`<data root>/calib_supp_20261103/fit/adhoc/frecipe-20261103/`):
+(`<data root>/calib_supp_20261103/fit/adhoc/frecipe-20261103/`). The check's outputs:
+`<data root>/calib_supp_20261103/fit/adhoc/frecipe-repo-20261103/` and `.../fit-tss-repo-checks-20261103/`
+(selfcheck, smoke tests, rebuilt datasets and the fit on them).
 
 * `summary.txt`, `per_shape.csv`, `tau_high_by_shape.csv`: byte-identical, all three variants
   (f_all sha256 `8535e3ef…`, `d395c1ca…`, `d216cbf9…`).
@@ -98,7 +101,14 @@ the packages of the original run (nice 10, 8 cores), against the original output
 * `selfcheck.py` (which also runs `refit_fixedslo.py`'s own loading / filter / counting path):
   90/90 ok; `selfcheck.txt`, `.csv`, `.json` byte-identical with the original run's.
   `smoke_guard.py` and `smoke_newdata.py`: OK.
-* Not re-run: the dataset builds (the inputs were read as they are; their hashes match).
+* From the raw campaign data: `build_datasets.sh` (builder = this repo at `ff6398f9`) rebuilt
+  all 18 datasets (A, B and, with `--old`, the 12 old sources). A / B: `windows.csv`,
+  `requests.csv`, `cells.csv`, `DATASET.md` byte-identical. Old: the same except
+  `windows.csv`, which has the alternative-signal columns added after `9f2856a1` (`tpot_*`);
+  for byte-identical old roots build with `TRE` = a checkout of `9f2856a1`. `manifest.json`
+  differs in builder commit, build time and paths (the label registry's sha256 is equal).
+  Frecf_all fitted on the rebuilt datasets: `per_shape.csv`, `tau_high_by_shape.csv` and the
+  `candidate.json` values identical; `summary.txt` differs only in its header's data paths.
 
 ## Provenance
 
