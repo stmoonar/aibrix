@@ -99,14 +99,15 @@ def test_real_run_needs_the_exclusive_window_marker(cluster):
     assert preflight(tmp / "out", dry=1).returncode == 0
 
 
-def test_supplement_chain_records_a_failed_block_and_runs_the_next(tmp_path):
-    """run_chain_supp.sh: a block that exits non-zero gets its `end` and `block_failed`
-    status lines, the next block still runs, and the chain exits 1 (2026-11-03: `step`
-    turned `set -e` back on before returning, so the model's chain died at the failed
-    block without a status line). Fakes: run_stage3.sh (block A fails) and kubectl."""
+def _supplement_chain(tmp_path, *, git_repo: bool, blocks: str):
+    """run_chain_supp.sh --dry-run dsqwen-7b against fakes of run_stage3.sh (block A fails)
+    and kubectl; returns (CompletedProcess, [(step, event, rc, detail)])."""
     if shutil.which("bash") is None or shutil.which("flock") is None or shutil.which("git") is None:
         pytest.skip("bash / flock / git not available")
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # CALIB_REPO: a clean repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if git_repo:
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)  # CALIB_REPO: a clean repo
     cal = tmp_path / "cal"
     cal.mkdir()
     for name in ("run_chain_supp.sh", "lib.sh"):
@@ -121,15 +122,36 @@ def test_supplement_chain_records_a_failed_block_and_runs_the_next(tmp_path):
     logs = tmp_path / "logs"
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
            "CHAIN_LOG_DIR": str(logs), "CALIB_ROOT": str(tmp_path / "root"), "BASE_RUN": str(tmp_path / "base"),
-           "CHAIN_BLOCKS": "A B", "CHAIN_LOCK_DIR": str(tmp_path / "lock"), "CALIB_REPO": str(tmp_path)}
+           "CHAIN_BLOCKS": blocks, "CHAIN_LOCK_DIR": str(tmp_path / "lock"), "CALIB_REPO": str(repo)}
     r = subprocess.run(["bash", str(cal / "run_chain_supp.sh"), "--dry-run", "dsqwen-7b"], env=env, text=True,
                        capture_output=True)
-    status = (logs / "dryrun" / "logs" / "CHAIN_STATUS.jsonl").read_text(encoding="utf-8").splitlines()
-    events = [(d["step"], d["event"], d["rc"]) for d in map(json.loads, status) if d["model"] == "dsqwen-7b"]
+    path = logs / "dryrun" / "logs" / "CHAIN_STATUS.jsonl"
+    assert path.exists(), f"no status line at all (rc {r.returncode}): {r.stderr}"
+    status = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return r, [(d["step"], d["event"], d["rc"], d["detail"]) for d in status]
+
+
+def test_supplement_chain_records_a_failed_block_and_runs_the_next(tmp_path):
+    """run_chain_supp.sh: a block that exits non-zero gets its `end` and `block_failed`
+    status lines, the next block still runs, and the chain exits 1 (2026-11-03: `step`
+    turned `set -e` back on before returning, so the model's chain died at the failed
+    block without a status line)."""
+    r, status = _supplement_chain(tmp_path, git_repo=True, blocks="A B")
+    events = [(step, event, rc) for step, event, rc, _ in status]
     assert ("A", "end", 1) in events and ("A", "block_failed", 1) in events, (events, r.stderr)
     assert ("B", "end", 0) in events
     assert ("chain", "done", 1) in events
     assert r.returncode == 1
+
+
+def test_supplement_chain_reports_an_unreadable_repo(tmp_path):
+    """A CALIB_REPO git cannot read (not a repo; "dubious ownership" on another uid's NFS
+    checkout) is reported as a status line - a dry run warns and goes on, a real run refuses
+    through the same line - instead of ending the script before its first line (exit 128)."""
+    r, status = _supplement_chain(tmp_path, git_repo=False, blocks="B")
+    assert any(step == "code" and event == "warning" and "git status failed" in detail
+               for step, event, _, detail in status), (status, r.stderr)
+    assert r.returncode == 0, r.stderr
 
 
 @pytest.mark.parametrize("script", sorted(p.name for p in CALIB.glob("run_*.sh")))

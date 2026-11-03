@@ -41,19 +41,24 @@ pids=()
 for m in $MODELS; do for st in run1 run2 supp p1; do s=$(stage_for $m $st); build "$s" "$m" & pids+=($!); done; done
 fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done; [ $fail = 0 ] || exit 1
 # 2. trainset + 3. alpha_fit per model (fixed label)
-fit_one() {
-  local m=$1 F="$OUT/fit/$m" args=() lg=()
+fit_one() {  # each step's exit code is reported; the first failing step ends this model
+  local m=$1 F="$OUT/fit/$m" args=() lg=() rc=0
   for st in run1 run2; do s=$(stage_for $m $st); args+=(--h2-dataset "$s=$OUT/datasets/$s/$m/dataset_hybrid"); done
   for st in supp p1; do s=$(stage_for $m $st); args+=(--dataset "$s=$OUT/datasets/$s/$m/dataset_hybrid"); done
   "${PY[@]}" -m scripts.dline_refit trainset --train-dynamic --fit-dir "$F" --model "$m" --queue-estimator raw_mean \
-      --window-ms "$WINDOW_MS" --step-ms "$STEP_MS" "${args[@]}" > "$OUT/logs/trainset.$m.log" 2>&1
+      --window-ms "$WINDOW_MS" --step-ms "$STEP_MS" "${args[@]}" > "$OUT/logs/trainset.$m.log" 2>&1 || rc=$?
+  if [ "$rc" != 0 ]; then echo "trainset $m exit $rc"; return "$rc"; fi
   for st in run1 run2 supp p1; do s=$(stage_for $m $st); [ -f "$CALIB_ROOT/$s/$m/cells.jsonl" ] && lg+=(--ledger "$CALIB_ROOT/$s/$m/cells.jsonl"); done
   case $m in dsqwen-7b) W=0.025 L=2.125;; dsllama-8b) W=0.0125 L=2.0;; dsqwen-14b) W=0.01 L=2.0;; esac   # freeze = live
   "${PY[@]}" -m scripts.alpha_fit --model "$m" --fitting-csv "$F/${m}_fitting.csv" --w-p "$W" --lambda-wait "$L" \
       --ttft-slo-mode fixed --ttft-p95-ms 500 --tpot-p95-ms 75 --label-registry "$LABEL_REGISTRY" \
       --tau-grid-s $TAUS --dt-ref-s "$DT_REF_S" --dwell-windows "$DWELL" --window-ms "$WINDOW_MS" --step-ms "$STEP_MS" \
-      --bootstrap 300 "${lg[@]}" --output "$OUT/alpha.$m.json" > "$OUT/logs/alpha.$m.log" 2>&1
-  echo "alpha $m exit $?"
+      --bootstrap 300 "${lg[@]}" --output "$OUT/alpha.$m.json" > "$OUT/logs/alpha.$m.log" 2>&1 || rc=$?
+  echo "alpha $m exit $rc"
+  return "$rc"
 }
-for m in $MODELS; do fit_one "$m" & done; wait
+pids=()
+for m in $MODELS; do fit_one "$m" & pids+=($!); done
+fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done
 grep -h "tau=" "$OUT"/logs/alpha.*.log || true
+exit $fail

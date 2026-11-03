@@ -211,10 +211,13 @@ chain_model() {  # chain_model <model>: the blocks in turn; returns 0, 4 (STOP, 
 
 # ================================================================= main
 GIT="$(git -C "$CALIB_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
-DIRTY="$(git -C "$CALIB_REPO" status --porcelain --untracked-files=no 2>/dev/null | head -n 5)"
+# no pipe and no bare failure here: under set -euo pipefail a failing git (not a repo, "dubious
+# ownership") or a SIGPIPE from head ended the script before its first status line.
+st="$(git -C "$CALIB_REPO" status --porcelain --untracked-files=no 2>&1)" || st="git status failed: $st"
+DIRTY="$(sed -n 1,5p <<< "$st")"
 status all chain start null "dry_run=$DRY root=$CALIB_ROOT logs=$LOGS models=${MODELS[*]} blocks=$CHAIN_BLOCKS seed=$DESIGN_SEED instant_sample_ms=$CHAIN_INSTANT_SAMPLE_MS repo=$CALIB_REPO git=$GIT dirty=$([[ -z "$DIRTY" ]] && echo no || echo yes)"
 
-[[ -z "$DIRTY" ]] || refuse code "the worktree has uncommitted changes (a data run needs a clean commit): $DIRTY"
+[[ -z "$DIRTY" ]] || refuse code "the worktree is not a clean commit (uncommitted changes, or git cannot read it; a data run needs a clean commit): $DIRTY"
 
 allowed=(PREREG.md PREREG.sha256 E_seal)
 case "$CHAIN_LOG_DIR" in

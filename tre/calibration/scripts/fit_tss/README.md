@@ -31,14 +31,16 @@ Hermetic tests: `tre/calibration/tests/test_fit_tss.py` (the fit's TSS equals
 
 ## Configuration
 
-Nothing site-specific is written in the tools; the environment names every location.
+Nothing site-specific is written in the tools; the environment names every location. A site
+keeps its values (data root, denied hosts, CPUs, nice, site-packages, gitconfig) in an env file
+outside the repo and sources it before an entry point.
 
 | variable | meaning |
 |---|---|
 | `TRE_FIT_DATA_ROOT` | the directory that holds the calibration data roots (`calib_20261003/`, `calib_supp_20261103/`, `analysis-tss-params-20261030/`, `refit-fixedslo-w10-20261031/`, `freeze-ctr20-20261028/`). The `old` training roots, the freeze parameters and the sealed-root prefixes are named relative to it |
 | `TRE_FIT_PYLIB` | extra `PYTHONPATH` entries put first (a site-packages directory with the pinned numpy / pandas) |
 | `TRE_FIT_NICE`, `TRE_FIT_CPUS` | nice level (default 19) and `taskset -c` list (default: no pinning) |
-| `TRE_EXCLUSIVE_WINDOW_FILE`, `TRE_EXCLUSIVE_WINDOW_DENY_HOSTS` | the exclusive-window marker (default `<data root>/TRE_EXCLUSIVE_WINDOW`) and the hostname substrings that refuse to run while it exists |
+| `TRE_EXCLUSIVE_WINDOW_FILE`, `TRE_EXCLUSIVE_WINDOW_DENY_HOSTS` | the exclusive-window marker (default `<data root>/TRE_EXCLUSIVE_WINDOW`) and the hostname substrings that must not run while it exists. **Fail closed**: while the marker exists, the entry points and the python tools refuse unless `TRE_EXCLUSIVE_WINDOW_DENY_HOSTS` and `TRE_FIT_CPUS` are both set, the host is not denied and the process is pinned to exactly `TRE_FIT_CPUS` |
 | `TRE` | the `tre/` tree whose `scripts.calibration_dataset` builds datasets (default: this repo) |
 | `TRE_FIT_LEDGER` | the one-time ledger of `validate_supp.py --i-am-the-final-evaluation` (2026-11-03: `<data root>/calib_supp_20261103_fit_tools/final_eval_ledger.jsonl`) |
 | `GIT_CONFIG_GLOBAL` | for a host whose git refuses the repo ("dubious ownership"): a gitconfig with `[safe] directory = <repo>`, else the dataset manifests record `code_commit` null and `build_datasets.sh` refuses |
@@ -98,6 +100,11 @@ the packages of the original run (nice 10, 8 cores), against the original output
   and `fit_json_sha256` differ (it hashes `fit.json`).
 * logs: equal except the exclusive-window note (the original ran inside a window) and the
   path / line number in a numpy overflow warning of `refit_fixedslo.py`.
+* Re-run after the review fixes (fail-closed window rule, sealed roots by name, raw-TSS-only
+  `refit_fixedslo.py`; `supp_lib.py` `0704d5fb…`, `refit_fixedslo.py` `f8ebb777…`), from the site
+  env file with `TRE_FIT_CPUS=0-7 TRE_FIT_NICE=10`, into `.../frecipe-repo-r2-20261103/`: the
+  same result - the three tables byte-identical, `fit.json` / `candidate.json` different only in
+  the items above, `selfcheck` output byte-identical.
 * `selfcheck.py` (which also runs `refit_fixedslo.py`'s own loading / filter / counting path):
   90/90 ok; `selfcheck.txt`, `.csv`, `.json` byte-identical with the original run's.
   `smoke_guard.py` and `smoke_newdata.py`: OK.
@@ -120,15 +127,15 @@ data root. The changes are paths and host rules only; the fit logic is unchanged
 |---|---|---|---|
 | `refit_supp.py` | `calib_supp_20261103_fit_tools/refit_supp.py` | `6d71f11c7d44e4b3f205dd01cc959135d6bcc09fcfeddabc3203aa79f78390f7` | none (byte-identical) |
 | `selfcheck.py` | `calib_supp_20261103_fit_tools/selfcheck.py` | `0a4d7d450db687a2bd710e7b4902e48cf87da11b7b672b9f92327593a729f667` | none (byte-identical) |
-| `supp_lib.py` | `calib_supp_20261103_fit_tools/supp_lib.py` | `0a6d0b1b9325c1785dce28399c553a9956cd339987fd7a167d8082c5b5d42595` | data roots relative to `TRE_FIT_DATA_ROOT`; `refit_fixedslo.py` loaded from this directory; marker / host rule from the environment; freeze lambda check skipped (logged) without a data root |
+| `supp_lib.py` | `calib_supp_20261103_fit_tools/supp_lib.py` | `0a6d0b1b9325c1785dce28399c553a9956cd339987fd7a167d8082c5b5d42595` | data roots relative to `TRE_FIT_DATA_ROOT`; `refit_fixedslo.py` loaded from this directory; the sealed roots matched by name anywhere in a path (no data root needed; was: as prefixes under the data root); the exclusive-window rule from the environment, fail closed; freeze lambda check skipped (logged) without a data root |
 | `validate_supp.py` | `calib_supp_20261103_fit_tools/validate_supp.py` | `181cbb8197fea9710d5ce9898a556786726ba5515976802b53cd37b41eaa0334` | ledger from `--ledger` / `TRE_FIT_LEDGER` (final mode refuses without one) |
-| `refit_fixedslo.py` | `refit-fixedslo-w10-20261031/refit_fixedslo.py` | `0cdd5ba8fde42f83b4a92d1d8f78c15bc71ed4194206775574e5a3eca63988d9` | data roots relative to `TRE_FIT_DATA_ROOT`, `--out` without default; `tre_calibration.dataset` from this repo instead of the build tree of `e891d29b` (the raw-TSS path, `ema_tau_ms` None, of `recompute_tss_rows` / `tss_terms` is unchanged since that commit; `supp_lib.assert_tss` checks it on every fit) |
+| `refit_fixedslo.py` | `refit-fixedslo-w10-20261031/refit_fixedslo.py` | `0cdd5ba8fde42f83b4a92d1d8f78c15bc71ed4194206775574e5a3eca63988d9` | data roots relative to `TRE_FIT_DATA_ROOT`, `--out` without default; `tre_calibration.dataset` from this repo instead of the build tree of `e891d29b` (the raw-TSS path, `ema_tau_ms` None, of `recompute_tss_rows` / `tss_terms` is unchanged since that commit; `supp_lib.assert_tss` checks it on every fit). The EMA did change (`b8bd62d1`), so raw TSS only: `--ema-tau-ms` defaults to 0 (was 10000) and > 0 is refused; its own `main()` therefore does not reproduce the 10-29 refit (EMA tau 10 s) - that needs the original against the freeze tree |
 | `smoke_guard.py` | `calib_supp_20261103_fit_tools/test_guard.py` | `408ac121c32baead46850e5577e874171b27c1949ae86b88a796281eef28aa4c` | `--work`, `--candidate` instead of the tools directory |
 | `smoke_newdata.py` | `calib_supp_20261103_fit_tools/test_newdata.py` | `4b7690672e81230536886115df83da470b284755395e22d8583ef3a9e0237b03` | `--work` instead of the tools directory |
-| `build_datasets.sh` | `calib_supp_20261103_fit_tools/build_datasets.sh` | `65a136d18d0b88eb84daf6d95121175374f4a44fe8b5c370e72b933ef80d1035` | `fit_env.sh`; label registry from git (`e891d29b`) or `LABEL_REGISTRY`; logs under the output root |
+| `build_datasets.sh` | `calib_supp_20261103_fit_tools/build_datasets.sh` | `65a136d18d0b88eb84daf6d95121175374f4a44fe8b5c370e72b933ef80d1035` | `fit_env.sh`; label registry from git (`e891d29b`, an existing copy verified by sha256) or `LABEL_REGISTRY`; logs under the output root |
 | `run_after_campaign.sh` | `calib_supp_20261103_fit_tools/run_after_campaign.sh` | `56864d6c53f467212c6b9bb368fdcfa724a04a7f5bb874fdb4a5c4c19c402282` | `fit_env.sh`; `CALIB_ROOT`, `RAW_*`, `DS`, `FIT`, `TRE_FIT_LEDGER` from the environment |
 | `run_before.sh` | `calib_supp_20261103_fit_tools/run_before.sh` | `1059db6313d516bd660906de2baa25f2fd472f646956aae17d6364a057849afe` | `fit_env.sh`; writes under `OUT_DIR` (was the tools directory) |
-| `run_alphafit_w10.sh` | `analysis-tss-params-20261030/win10/run_alphafit_w10.sh` | `68f9b339c2c967feca0ed5b59dbda88dd0ab7d64b6628e04fff8edb5e08103ba` | `fit_env.sh`; `OUT` required; label registry as `build_datasets.sh` |
+| `run_alphafit_w10.sh` | `analysis-tss-params-20261030/win10/run_alphafit_w10.sh` | `68f9b339c2c967feca0ed5b59dbda88dd0ab7d64b6628e04fff8edb5e08103ba` | `fit_env.sh`; `OUT` required; label registry as `build_datasets.sh`; a failing trainset / alpha_fit step reports its exit code and the script exits non-zero (was: the model's background job died silently, `wait` returned 0) |
 | `run_frecipe_formula.sh` | `calib_supp_20261103/fit/adhoc/frecipe-20261103/run_frecipe_formula.sh` | `33f9d0fcf39b6ee59326ecf8d501544304dce596621aae294a61489b27f6b769` | `fit_env.sh`; output directory and variants as arguments; refuses an existing output |
 
 Not moved: `rstar_F.py` (`campaign-icse-tune-20261031/fit/`, sha256 `cca9746f…`; the tune F

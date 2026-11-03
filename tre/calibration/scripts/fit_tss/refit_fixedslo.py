@@ -6,14 +6,18 @@ the per-request violation probability reaches r* = 1 %.
 
 Read-only on freeze-ctr20-20261028 datasets; TSS recomputed with the freeze build tree
 (rel-e891d29b, the code the freeze ran); writes only to OUT.  CPU only.
-2026-11-03 repo copy (tre/calibration/scripts/fit_tss/): the paths are configuration - the data roots are named
-relative to TRE_FIT_DATA_ROOT, --out has no default, and recompute_tss_rows comes from this repo's tre/ tree instead
-of the build tree rel-e891d29b (= commit e891d29b; its raw-TSS path, ema_tau_ms None, is unchanged since: only the
-EMA idle rule changed on 10-29).  Nothing else changed.
+2026-11-03 repo copy (tre/calibration/scripts/fit_tss/).  Changes, all of them:
+  * paths are configuration: the data roots are named relative to TRE_FIT_DATA_ROOT, --out has no default;
+  * recompute_tss_rows comes from this repo's tre/ tree instead of the build tree rel-e891d29b (= commit e891d29b).
+    Its raw-TSS path (ema_tau_ms None: tss_terms, replica_factor) is unchanged since that commit; the EMA is not
+    (b8bd62d1, 10-29: idle = nothing in flight, a zero TSS advances the EMA);
+  * therefore raw TSS only: --ema-tau-ms defaults to 0 and a value > 0 is refused.  The 10-29 refit (EMA tau 10 s)
+    is reproducible only with the original against the freeze tree (backup: <data root>/backups/fit-tools-20261103/).
+The fit tools (supp_lib.configure) always pass --ema-tau-ms 0.
 Run: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 nice -n 19 python3 refit_fixedslo.py --no-stage2 \
        --ds-root DATASETS --window-ms 10000 --ema-tau-ms 0 --out OUTDIR
 2026-10-31 copy (refit-fixedslo-w10-20261031): window / EMA tau / dataset root / output dir are CLI
-parameters (defaults = the 10-29 run: freeze datasets, 20 s, tau 10 s). Nothing else changed.
+parameters (defaults then = the 10-29 run: freeze datasets, 20 s, tau 10 s; here tau 0, see above).
 --ema-tau-ms 0 = no EMA (raw TSS, ema_tau_ms=None in TssRecompute = the controller's tau <= 0 passthrough).
 A guard asserts every kept window is exactly --window-ms long (the dataset must be built at that window).
 Data loading / per-request label / PAVA crossing follow analysis-vz-by-shape-20261029/vz_by_shape.py.
@@ -33,7 +37,7 @@ DS = FREEZE + "/datasets" if FREEZE else None
 TRE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))  # this repo's tre/
 OUT = None  # main() needs --out (the 10-29 run wrote <data root>/refit-fixedslo-20261029)
 WINDOW_MS = 20000.0
-EMA_TAU_MS = 10000.0  # None = raw
+EMA_TAU_MS = None  # raw TSS only (the 10-31 default 10000 needs the freeze tree's EMA, see the header)
 sys.path[:0] = [TRE + "/common", TRE + "/calibration"]
 from tre_calibration.dataset import TssRecompute, recompute_tss_rows  # noqa: E402
 
@@ -578,11 +582,15 @@ def configure(argv=None):
     ap.add_argument("--no-stage2", action="store_true")
     ap.add_argument("--ds-root", default=DS)
     ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
-    ap.add_argument("--ema-tau-ms", type=float, default=EMA_TAU_MS)
+    ap.add_argument("--ema-tau-ms", type=float, default=0.0, help="0 only (raw TSS); > 0 is refused")
     ap.add_argument("--out", default=OUT)
     args = ap.parse_args(argv)
     DS, OUT, WINDOW_MS = args.ds_root, args.out, args.window_ms
-    EMA_TAU_MS = args.ema_tau_ms if args.ema_tau_ms and args.ema_tau_ms > 0 else None
+    if args.ema_tau_ms and args.ema_tau_ms > 0:
+        raise SystemExit(f"--ema-tau-ms {args.ema_tau_ms:g}: this repo copy computes raw TSS only - the EMA of the "
+                         "repo's recompute_tss_rows changed after the freeze tree e891d29b (b8bd62d1), so an EMA refit "
+                         "would not be the 10-29 one; use the original refit_fixedslo.py with the freeze tree")
+    EMA_TAU_MS = None
     print(f"config: ds={DS} window_ms={WINDOW_MS} ema_tau_ms={EMA_TAU_MS} out={OUT}", file=sys.stderr, flush=True)
     return args
 

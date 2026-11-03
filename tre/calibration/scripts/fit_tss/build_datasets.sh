@@ -21,6 +21,7 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fit_env.sh"
 MODELS=${MODELS:-"dsqwen-7b dsllama-8b dsqwen-14b"}
+fit_require_root   # the marker's default location, the old campaign root
 fit_marker_check
 guard() {  # $1 path, $2 final flag
   PYTHONPATH="$FIT_TSS_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -B -c '
@@ -46,7 +47,6 @@ dirty=$(git -C "$TRE" status --porcelain) || { echo "cannot read the work-tree s
 echo "builder: $TRE @ ${sha:0:8} (dirty: $(printf '%s' "$dirty" | grep -c . || true) files)"
 if [ "${1:-}" = "--old" ]; then
   OUT_ROOT=$2 W=$3
-  fit_require_root
   CALIB_ROOT_OLD=${CALIB_ROOT_OLD:-$TRE_FIT_DATA_ROOT/calib_20261003}
   LOG_DIR=${TRE_FIT_LOG_DIR:-$OUT_ROOT/build-logs}
   LABEL_REG=$(fit_label_registry "$OUT_ROOT")

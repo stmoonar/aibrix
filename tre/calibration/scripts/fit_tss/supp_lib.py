@@ -19,19 +19,20 @@ Generalised here (old roots give the same numbers; asserted by selfcheck.py):
     no scenario_id is in two sources; the new campaign may reuse cell serials);
   * attribution: first_token (prereg §2.1: send_ts + ttft in (end - 10 s, end]; a request without a first token, i.e. a
     failure, by its done / abort time, = analysis-train-slo-20261102/A/followup2/grid_ft.py) or completion (refit k1/n1);
-  * TSS vectorised (= tre_common.tss.tss_terms as recompute_tss_rows calls it, EMA 0), asserted equal to the freeze
-    tree's recompute_tss_rows on every source for every basis used;
+  * TSS vectorised (= tre_common.tss.tss_terms as recompute_tss_rows calls it, EMA 0), asserted equal to
+    recompute_tss_rows (this repo's; the freeze tree's until the 11-03 move) on every source for every basis used;
   * guard: sealed held-out data (M under calib_20261003/M, the coming E set) is refused BEFORE any file is opened.
 
 Site configuration (2026-11-03, moved into the repo; nothing site-specific is written here):
   TRE_FIT_DATA_ROOT   the directory that holds the calibration data roots (calib_20261003/, calib_supp_20261103/,
                       analysis-tss-params-20261030/, refit-fixedslo-w10-20261031/, freeze-ctr20-20261028/); the
                       'old' training roots, the freeze parameters and the sealed-root prefixes are named relative to it.
-                      Unset: '--data old' is refused, the freeze lambda cross-check is skipped (logged) and the sealed
-                      guard keeps only its path-component and pattern rules.
+                      Unset: '--data old' is refused and the freeze lambda cross-check is skipped (logged).  The
+                      sealed guard does not depend on it (it matches the sealed roots' names anywhere in a path).
   TRE_EXCLUSIVE_WINDOW_FILE  the exclusive-window marker (default <data root>/TRE_EXCLUSIVE_WINDOW)
-  TRE_EXCLUSIVE_WINDOW_DENY_HOSTS  comma list of hostname substrings that must not run the fit while the marker
-                      exists (at our site: the control-plane node); other hosts run it under nice + taskset (fit_env.sh)
+  TRE_EXCLUSIVE_WINDOW_DENY_HOSTS, TRE_FIT_CPUS  while the marker exists the tools run only when both are set, the
+                      host is not denied (a comma list of hostname substrings; at our site the control-plane node) and
+                      the process is pinned to exactly TRE_FIT_CPUS (fit_env.sh: nice + taskset).  Fail closed.
 """
 import hashlib
 import importlib.util
@@ -143,10 +144,10 @@ def configure(window_ms):
 
 
 # ------------------------------------------------------------------ sealed-set guard
-SEALED_PREFIXES = tuple(_under_root(p) for p in ("calib_20261003/M", "calib_20261003/next-20261005/M2",
-                                                 "calib_20261003/next-20261005/T14", "calib_20261003/T14",
-                                                 "calib_20261003/t14")) if DATA_ROOT else ()
-SUPP_RAW = _under_root("calib_supp_20261103")  # the new campaign's root: a component starting with 'E' there = the E set
+# sealed roots, matched as consecutive path components anywhere in a path (no data root needed)
+SEALED_ROOTS = ("calib_20261003/M", "calib_20261003/next-20261005/M2", "calib_20261003/next-20261005/T14",
+                "calib_20261003/T14", "calib_20261003/t14")
+SUPP_RAW_NAME = "calib_supp_20261103"  # the new campaign's root: a component starting with 'E' below it = the E set
 _SEALED_COMPONENT = re.compile(r"^(M|M2|T14|E|E[_\-.+].*|.*sealed.*|.*holdout.*|.*held[_\-]?out.*|.*validation.*"
                                r"|.*acceptance.*)$", re.I)
 
@@ -154,16 +155,18 @@ _SEALED_COMPONENT = re.compile(r"^(M|M2|T14|E|E[_\-.+].*|.*sealed.*|.*holdout.*|
 def sealed_reason(path, extra=()):
     """Why a path names sealed held-out data (None = not sealed).  String test only: no file-system access."""
     p = os.path.normpath(os.path.abspath(str(path)))
-    for pre in SEALED_PREFIXES:
-        if p == pre or p.startswith(pre + os.sep):
-            return f"under the sealed root {pre}"
-    for c in p.split(os.sep):
+    parts = p.split(os.sep)
+    for rel in SEALED_ROOTS:
+        rp = rel.split("/")
+        if any(parts[i:i + len(rp)] == rp for i in range(len(parts) - len(rp) + 1)):
+            return f"under the sealed root .../{rel}"
+    for c in parts:
         if c and _SEALED_COMPONENT.match(c):
             return f"path component {c!r} names a sealed / validation set"
-    if SUPP_RAW and p.startswith(SUPP_RAW + os.sep):
-        for c in p[len(SUPP_RAW) + 1:].split(os.sep):
+    if SUPP_RAW_NAME in parts:
+        for c in parts[parts.index(SUPP_RAW_NAME) + 1:]:
             if c.startswith("E"):
-                return f"component {c!r} under {SUPP_RAW} (the E set)"
+                return f"component {c!r} under .../{SUPP_RAW_NAME} (the E set)"
     pats = tuple(extra) + tuple(x for x in os.environ.get("SUPP_SEALED_PATTERNS", "").split(",") if x)
     for pat in pats:
         if re.search(pat, p):
@@ -294,8 +297,8 @@ def provenance(src, window_ms, final=False, extra=(), hash_files=True, allow_con
         if rec.get(k) is not None and rec[k] != CONTRACT[k]:
             soft.append(f"{k} {rec[k]!r} != {CONTRACT[k]!r}")
     if src.get("origin") != "old" and not rec.get("builder_commit"):  # provenance; the 10-03 old roots exempt
-        soft.append("builder code_commit is null (git could not read the builder repo; on 75 build with "
-                    "build_datasets.sh, which sets GIT_CONFIG_GLOBAL)")
+        soft.append("builder code_commit is null (git could not read the builder repo: build with "
+                    "build_datasets.sh, which refuses then; GIT_CONFIG_GLOBAL with [safe] directory, fit_env.sh)")
     if rec.get("attribution") not in (None, CONTRACT["attribution"]):
         rec["contract_problems"].append(f"attribution {rec['attribution']!r} (label columns only; not used here)")
     rec["contract_problems"] += hard + soft
@@ -442,7 +445,7 @@ def tss_vec(W, lam, wp, qmin=1.0):
 
 
 def assert_tss(W, lam, wp, tss):
-    """The vectorised TSS equals the freeze tree's recompute_tss_rows (EMA None) on every row."""
+    """The vectorised TSS equals recompute_tss_rows (EMA None; this repo's tre_calibration.dataset) on every row."""
     vals = r.recompute_tss_rows(W.to_dict("records"), r.TssRecompute(w_p=wp, lambda_wait=lam, qmin=1.0,
                                                                       ema_tau_ms=None))
     ref = np.array([np.nan if v is None else v for v in vals], float)
@@ -717,14 +720,41 @@ def tool_hashes():
     return out
 
 
+def cpu_list(spec):
+    """'0,1' / '0-7' / '0-3,8' -> set of CPU numbers (taskset -c syntax, no strides)."""
+    out = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
 def marker_check(host_ok_75=True):
-    """Exclusive window: the hosts in TRE_EXCLUSIVE_WINDOW_DENY_HOSTS must not run heavy work; elsewhere only with
-    nice + taskset (the caller's wrapper, fit_env.sh: TRE_FIT_NICE / TRE_FIT_CPUS)."""
+    """Exclusive window, fail closed: while the marker exists, run only when TRE_EXCLUSIVE_WINDOW_DENY_HOSTS and
+    TRE_FIT_CPUS are both set (the site env file), this host is not denied, and the process is pinned to exactly
+    TRE_FIT_CPUS (fit_env.sh starts the tools under nice TRE_FIT_NICE + taskset -c TRE_FIT_CPUS)."""
     mk = os.environ.get("TRE_EXCLUSIVE_WINDOW_FILE") or _under_root("TRE_EXCLUSIVE_WINDOW")
-    if mk and os.path.exists(mk):
-        host = os.uname().nodename
-        deny = [h for h in os.environ.get("TRE_EXCLUSIVE_WINDOW_DENY_HOSTS", "").split(",") if h]
-        if any(h in host for h in deny):
-            raise SystemExit(f"{mk} exists: exclusive window - do not run on {host}; use another host with "
-                             "nice + taskset (TRE_FIT_NICE / TRE_FIT_CPUS; the run_*.sh wrappers do it)")
-        log(f"note: {mk} exists; running on {host} (window rules: nice, taskset; see fit_env.sh)")
+    if not (mk and os.path.exists(mk)):
+        return
+    host = os.uname().nodename
+    deny = [h.strip() for h in os.environ.get("TRE_EXCLUSIVE_WINDOW_DENY_HOSTS", "").split(",") if h.strip()]
+    cpus = os.environ.get("TRE_FIT_CPUS", "").strip()
+    if not deny or not cpus:
+        raise SystemExit(f"{mk} exists: exclusive window - refusing: TRE_EXCLUSIVE_WINDOW_DENY_HOSTS and TRE_FIT_CPUS "
+                         "must both be set (the site env file) and the tool started by a run_*.sh wrapper")
+    if any(h in host for h in deny):
+        raise SystemExit(f"{mk} exists: exclusive window - do not run on {host}; use another host with "
+                         "nice + taskset (TRE_FIT_NICE / TRE_FIT_CPUS; the run_*.sh wrappers do it)")
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            want = cpu_list(cpus)
+        except ValueError:
+            raise SystemExit(f"TRE_FIT_CPUS {cpus!r} is not a CPU list")
+        have = os.sched_getaffinity(0)
+        if have != want:
+            raise SystemExit(f"{mk} exists: exclusive window - this process may run on {len(have)} CPUs, not "
+                             f"TRE_FIT_CPUS {cpus}: start it under taskset -c {cpus} (fit_env.sh does it)")
+    log(f"note: {mk} exists; running on {host}, CPUs {cpus} (window rules: nice, taskset; see fit_env.sh)")
