@@ -192,6 +192,16 @@ open(pl, "w").write("trace_path: /x/Alt/t.json\nmu: {a: {p: 1, d: 1, t: 8920}, b
                    f"predictors: {{pooled: {{path: w/p.npz, sha256: '{sha}'}}}}\n")
 rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg)
 expect("preserve mlstm with predictors accepted", rc == 0)
+# 2026-11-04: one file per model; every listed set and the set this trace picks must name a file for every model
+f = f"{{path: w/x.npz, sha256: '{sha}'}}"
+open(pl, "w").write("trace_path: /x/Alt/seed1/t.json\nmu: {a: {p: 1, d: 1, t: 8920}, b: {p: 1, d: 1, t: 1}}\n"
+                   f"predictors: {{v2: {{models: {{a: {f}, b: {f}}}}}, v1-Alt: {{models: {{a: {f}}}}}}}\n"
+                   "predictor_rules: [[Alt, v2]]\n")
+rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg)
+expect("preserve per-model predictors accepted", rc == 0)
+open(pl, "a").write("predictor_rules: [[Alt, v1-Alt]]\n")
+rc, out = run("check-policy", "--policy", "preserve", "--live", pl, "--registry", reg)
+expect("preserve per-model set without a model refused", rc == 2 and "predictors.v1-Alt.models" in out and "['b']" in out)
 tl = os.path.join(tmp, "tokenscale.yaml")
 grid = "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]"
 cen = "[[[1, 1], [1, 2], [1, 3]], [[2, 1], [2, 2], [2, 3]], [[3, 1], [3, 2], [3, 3]]]"

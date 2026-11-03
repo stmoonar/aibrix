@@ -73,12 +73,15 @@ DEFAULT_LABELS = {"tre": "TRE", "apa": "APA-kvcache", "chiron": "Chiron-global",
 DONE_MARKER = "CAMPAIGN_DONE.json"
 FAILED_SUFFIX = ".CAMPAIGN_FAILED.json"
 ORDER_METHODS = ("williams", "cyclic", "fixed")
-# the PreServe policy's keys (tre_baselines/policies/preserve.py, 2026-10-26 port)
+# the PreServe policy's keys (tre_baselines/policies/preserve.py, 2026-10-26 port): every params key the policy
+# reads, + calibration (policies/base.py); guard test eval/tests/test_campaign.py::test_preserve_keys_are_the_policys
 PRESERVE_KEYS = {"calibration", "trace_path", "trace_seed", "trace_schedule", "trace_match_parts", "trace_name",
                  "window_s", "lead_s", "tier1", "tier1_horizon", "tier1_d_source", "noise_sigma", "noise_seed", "seq_len", "predictors",
-                 "predictor_rules", "history_path", "mu", "load_error_mode", "load_error_seed", "max_model_len",
+                 "predictor_normalization", "predictor_rules", "history_path", "history_variant", "mu", "load_error_mode",
+                 "load_error_seed", "max_model_len",
                  "max_output_len", "map_factor", "lookahead_iters", "kv_high", "overload_frac", "t_f", "ext_frac",
-                 "out_len_is_upper_bound", "t2_reset_at_window", "underload_pending_gate", "kv_capacity_tokens", "kv_agree_tol", "req_ttl_s"}
+                 "out_len_is_upper_bound", "t2_reset_at_window", "underload_pending_gate", "kv_capacity_tokens", "kv_agree_tol", "req_ttl_s",
+                 "drain", "done_margin_s", "done_tpot_bound_s"}
 TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 TIER1_HORIZONS = ("paper_two_step", "one_step_now")
 TIER1_D_SOURCES = ("done_tokens", "done_or_predicted", "arrival_max_tokens")
@@ -124,8 +127,8 @@ DEFAULTS: dict = {
     "env": {},
     "arm_defs": {},
     "preserve": {"trace_host_root": None, "trace_pod_root": "/etc/tre-baselines-traces", "match_parts": 3,
-                 "history_root": None},   # histories not next to the trace: <history_root>/<trace>/seed<k>/<name>,
-                                          # name = preserve_history.history_names(window_s)[-1]
+                 "history_root": None},   # histories not next to the trace: <history_root>/[<set>/]<trace>/seed<k>/<name>,
+                                          # name = preserve_history.history_names(window_s, history_variant)[-1]
     # 2026-11-02: off by default (no reports while the campaign runs); the campaign files of earlier runs
     # keep their own `report.enabled: true` (the record of how those runs ran)
     "report": {"enabled": False, "per_arm": True, "capacity": None, "decision_points": None, "ref": "tre",
@@ -721,6 +724,13 @@ def render_preserve_policy(bl_cm_file: str, trace_pod_path: str, match_parts: in
     return head + yaml.safe_dump_all([d for d in docs if d], sort_keys=False), params
 
 
+def _mu_brief(mu: Any) -> str:
+    """``{model: p/d/t}`` in one short token for the dry-run line."""
+    if not isinstance(mu, dict):
+        return str(mu)
+    return ",".join(f"{m}:{'/'.join(f'{(v or {}).get(k)}' for k in ('p', 'd', 't'))}" for m, v in sorted(mu.items()))
+
+
 def _tail(path: str, parts: int) -> tuple:
     bits = [b for b in str(path).replace("\\", "/").split("/") if b]
     return tuple(bits[-parts:]) if parts > 0 else ()
@@ -741,12 +751,27 @@ def _load_preserve_history():
 PH = _load_preserve_history()
 
 
+def preserve_history_source(pc: dict, e: TraceEntry, tail: tuple, names: tuple) -> Optional[Path]:
+    """The history file for ``names`` (``preserve_history.history_names``): the first next to the replayed
+    trace, else ``<preserve.history_root>/<set>/<trace>/seed<k>/<last name>`` (``<set>`` = the trace set
+    directory of the source trace, as a generated-data tree keeps it: 2026-11-04 train-tail histories),
+    else ``<preserve.history_root>/<trace>/seed<k>/<last name>``; None if there is none."""
+    src = next((Path(e.src_dir) / n for n in names if (Path(e.src_dir) / n).is_file()), None)
+    root = pc.get("history_root")
+    if src is None and root:
+        parts = (e.trace, f"seed{e.seed}") if e.slice else tail[:-1]
+        tset = Path(e.src_dir).parent.parent.name if not e.slice else None
+        cands = ([Path(root) / tset / Path(*parts) / names[-1]] if tset else []) + [Path(root) / Path(*parts) / names[-1]]
+        src = next((p for p in cands if p.is_file()), None)
+    return src
+
+
 def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, tail: tuple,
-                          log: Callable[[str], None], *, window_s: float) -> dict:
+                          log: Callable[[str], None], *, window_s: float, variant: Optional[str] = None) -> dict:
     """PreServe mLSTM's history before t0 next to the oracle copy, under a name the policy finds by
-    itself (``preserve_history.default_path``): the first of ``history_names(window_s)`` next to the
-    replayed trace (30 s: the generator's ``pre_t0.json``, then ``preserve_history.json``; another
-    window W: ``preserve_history_w<W>.json``), else ``<preserve.history_root>/<trace>/seed<k>/<last name>``.
+    itself (``preserve_history.default_path``): ``history_names(window_s, variant)`` (30 s: the generator's
+    ``pre_t0.json``, then ``preserve_history.json``; another window W: ``preserve_history_w<W>.json``; a
+    ``history_variant`` V: ``preserve_history_w<W>_<V>.json``), looked up by :func:`preserve_history_source`.
     A shifted trace, or a slice that does not start at 0, has no matching past: refused for mlstm
     (a slice from 0 keeps the trace's own past; prepare_preserve names the source trace for it)."""
     if len(tail) < 3:
@@ -756,19 +781,15 @@ def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, t
         raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift; "
                             "a slice must start at 0)")
     try:
-        names = PH.history_names(window_s)
+        names = PH.history_names(window_s, None if variant is None else str(variant))
     except PH.HistoryError as ex:
         raise CampaignError(f"{e.out_name}/{d.id}: preserve {ex}") from None
-    src = next((Path(e.src_dir) / n for n in names if (Path(e.src_dir) / n).is_file()), None)
-    root = pc.get("history_root")
-    if src is None and root:
-        parts = (e.trace, f"seed{e.seed}") if e.slice else tail[:-1]
-        cand = Path(root) / Path(*parts) / names[-1]
-        src = cand if cand.is_file() else None
+    src = preserve_history_source(pc, e, tail, names)
     if src is None:
-        raise CampaignError(f"{e.out_name}/{d.id}: no PreServe history for window_s {float(window_s):g} "
+        raise CampaignError(f"{e.out_name}/{d.id}: no PreServe history for window_s {float(window_s):g}"
+                            f"{'' if variant is None else ', history_variant ' + str(variant)} "
                             f"({' / '.join(names)} in {e.src_dir}, or "
-                            f"preserve.history_root/<trace>/seed<k>/{names[-1]})")
+                            f"preserve.history_root/[<set>/]<trace>/seed<k>/{names[-1]})")
     dst = host_path.parent / src.name
     sha = sha256_file(src)
     if not (dst.is_file() and sha256_file(dst) == sha):
@@ -823,7 +844,8 @@ def prepare_preserve(c: dict, e: TraceEntry, d: ArmDef, log: Callable[[str], Non
         if "window_s" not in params:
             raise CampaignError(f"{bl_cm}: the PreServe ConfigMap must set window_s (it picks the history file)")
         # the copy keeps its name, which the policy finds next to the trace for its window (no history_path)
-        rec["history"] = copy_preserve_history(pc, e, d, host_path, tail, log, window_s=float(params["window_s"]))
+        rec["history"] = copy_preserve_history(pc, e, d, host_path, tail, log, window_s=float(params["window_s"]),
+                                               variant=params.get("history_variant"))
     pol_path = Path(c["results_root"]) / "_policy" / e.out_name / f"{d.id}.policy-configmaps.yaml"
     write_text_atomic(pol_path, text)
     rec.update(oracle_host_path=str(host_path), oracle_pod_path=pod_path, oracle_sha256=sha256_file(host_path),
@@ -1499,12 +1521,36 @@ def validate_inputs(c: dict, entries: list[TraceEntry], plan: list[PlanItem]) ->
                 d = arm_def(c, a)
                 _, params = render_preserve_policy(env["BL_CM_FILE"], "/x/t/seed1/f.json",
                                                    int(c["preserve"].get("match_parts", 3)), d.policy)
+                rules = params.get("predictor_rules") or []
                 warnings.append(f"preserve arm {a}: tier1={params.get('tier1')} horizon={params.get('tier1_horizon')} "
                                 f"d_source={params.get('tier1_d_source')} noise_sigma={params.get('noise_sigma')} "
-                                f"window_s={params.get('window_s')} match_parts={params.get('trace_match_parts')}"
+                                f"window_s={params.get('window_s')} match_parts={params.get('trace_match_parts')} "
+                                f"history_variant={params.get('history_variant')} "
+                                f"normalization={params.get('predictor_normalization')} "
+                                f"predictor_sets={sorted({str(s) for _p, s in rules})} "
+                                f"mu={_mu_brief(params.get('mu'))}"
                                 f"{' oracle_shift=' + str(d.oracle_shift) if d.oracle_shift else ''}")
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"preserve arm {a}: policy render failed: {exc}")
+        # every PreServe (mlstm) run finds its history before t0 (next to the trace or under history_root)
+        for i in plan:
+            if i.base_arm != "preserve":
+                continue
+            try:
+                e, d = next(x for x in entries if x.index == i.entry), arm_def(c, i.arm)
+                _, params = render_preserve_policy(env["BL_CM_FILE"], "/x/t/seed1/f.json",
+                                                   int(c["preserve"].get("match_parts", 3)),
+                                                   {**e.preserve_policy, **d.policy})
+                if str(params.get("tier1", "mlstm")) != "mlstm" or "window_s" not in params:
+                    continue
+                v = params.get("history_variant")
+                names = PH.history_names(float(params["window_s"]), None if v is None else str(v))
+                tail = _tail(str(Path(e.client_dir) / e.trace_file), int(c["preserve"].get("match_parts", 3)))
+                if preserve_history_source(c["preserve"], e, tail, names) is None:
+                    problems.append(f"{e.out_name}/{i.arm}: no PreServe history {names[-1]} (next to the trace or "
+                                    f"under preserve.history_root)")
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"{i.out_name}/{i.arm}: PreServe history check failed: {exc}")
     if any(i.base_arm == "preserve" for i in plan):
         hr = c["preserve"].get("trace_host_root")
         if not hr or not Path(hr).is_dir():

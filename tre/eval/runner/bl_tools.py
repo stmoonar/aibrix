@@ -201,7 +201,8 @@ def policy_problems(policy: str, params: dict, models: list[str]) -> list[str]:
     """Placeholder / missing parameters that the policy itself would refuse (checked early).
     Schema of the 2026-10-26 port (``tools/freeze_params`` renders the blocks): TokenScale
     ``bucket_centers`` + ``velocity.<m>.buckets`` (no ``v_prefill``, D51); PreServe ``mu`` p/d/t,
-    ``trace_path`` and, for ``tier1: mlstm`` (default), ``predictors.<set>`` path + sha256."""
+    ``trace_path`` and, for ``tier1: mlstm`` (default), ``predictors.<set>`` path + sha256 (or ``models: {m: {path,
+    sha256}}`` per model) for every set of ``predictor_rules`` and the set this trace picks."""
     out = []
     if not isinstance(params, dict) or not params:
         return ["policy file is empty ({}): parameters not frozen/applied yet"]
@@ -239,11 +240,21 @@ def policy_problems(policy: str, params: dict, models: list[str]) -> list[str]:
             out.append("trace_path missing")
         if str(params.get("tier1", "mlstm")) == "mlstm":
             preds = params.get("predictors") or {}
-            sets = {str(s) for _p, s in (params.get("predictor_rules") or [])} | {"pooled"}
-            for name in sorted(sets):
+            listed = [(str(pr), str(s)) for pr, s in (params.get("predictor_rules") or ())]
+            rules = listed or [("Real_code", "code"), ("Real_conv", "conv")]   # the policy's default rules
+            # the set the policy picks for this trace (preserve.predictor_set_for: first prefix, else pooled)
+            pieces = [x for x in str(params.get("trace_path") or "").replace("\\", "/").split("/") if x]
+            trace = str(params.get("trace_name") or (pieces[-3] if len(pieces) >= 3 else ""))
+            pick = next((s for pr, s in rules if trace.startswith(pr)), "pooled")
+            ok = lambda f: isinstance(f, dict) and bool(f.get("path")) and len(str(f.get("sha256") or "")) == 64  # noqa: E731
+            for name in sorted({s for _p, s in listed} | {pick}):
                 spec = preds.get(name) if isinstance(preds, dict) else None
-                sha = str((spec or {}).get("sha256") or "")
-                if not (spec or {}).get("path") or len(sha) != 64:
+                per = spec.get("models") if isinstance(spec, dict) else None
+                if isinstance(per, dict):  # one file per model (2026-11-04)
+                    bad = [m for m in models if not ok(per.get(m))]
+                    if bad:
+                        out.append(f"predictors.{name}.models needs path and a sha256 for {bad}")
+                elif not ok(spec):
                     out.append(f"predictors.{name} needs path and a sha256")
     return out
 

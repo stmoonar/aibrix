@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -488,6 +489,52 @@ def test_preserve_mlstm_history_follows_the_policy_window(tmp_path):
     (d / "preserve_history_w10.json").unlink()
     with pytest.raises(C.CampaignError, match="no PreServe history for window_s 10"):
         C.prepare_preserve(c, e, C.arm_def(c, "preserve"), lambda _m: None)
+
+
+def test_preserve_history_variant_is_copied_from_the_history_root_of_its_trace_set(tmp_path):
+    """2026-11-04: an arm's history_variant picks preserve_history_w<W>_<variant>.json; a generated-data tree keeps
+    the trace set directory (<history_root>/<set>/<trace>/seed<k>/); the copy lands where the policy looks for that
+    variant. An arm without the variant keeps the plain file; a missing variant file is refused (dry-run too)."""
+    hroot = tmp_path / "hist"
+    extra = {"traces": [{"trace": "Alternating", "arms": ["preserve", "preserve-tail"]}],
+             "arms": ["preserve"], "preserve": {"history_root": str(hroot)},
+             "arm_defs": {"preserve-tail": {"base": "preserve", "label": "PreServe-tail",
+                                            "policy": {"history_variant": "tail-x"}}}}
+    write_campaign(tmp_path, traces=["Alternating"], arms=["preserve"], extra=extra)
+    (tmp_path / "bl.yaml").write_text(BL_CM.replace("tier1: oracle_noisy", "tier1: mlstm")
+                                      .replace("window_s: 30", "window_s: 10"))
+    doc = lambda rows: json.dumps({"format": "tre-preserve-history-v1", "trace": "Alternating", "seed": 1,  # noqa: E731
+                                   "window_s": 10.0, "models": {"m7": [rows] * 25}})
+    (tmp_path / "traces" / "Alternating" / "seed1" / "preserve_history_w10.json").write_text(doc([10.0, 5.0]))
+    var = hroot / "traces" / "Alternating" / "seed1" / "preserve_history_w10_tail-x.json"   # set = "traces"
+    var.parent.mkdir(parents=True)
+    var.write_text(doc([20.0, 7.0]))
+    c = C.load_campaign(str(tmp_path / "campaign.yaml"))
+    (e,) = C.resolve_traces(c)
+    ph = pytest.importorskip("tre_baselines.policies.preserve_history")
+    plain = C.prepare_preserve(c, e, C.arm_def(c, "preserve"), lambda _m: None)["record"]
+    assert Path(plain["history"]["source"]).name == "preserve_history_w10.json"
+    rec = C.prepare_preserve(c, e, C.arm_def(c, "preserve-tail"), lambda _m: None)["record"]
+    assert Path(rec["history"]["source"]) == var and rec["policy_params_changed"]["history_variant"] == "tail-x"
+    assert ph.default_path(rec["oracle_host_path"], window_s=10.0, variant="tail-x") == rec["history"]["path"]
+    hist, _ = ph.load(rec["history"]["path"], window_s=10.0, models=["m7"], seq_len=25, trace="Alternating", seed=1)
+    assert tuple(hist["m7"][0]) == (20.0, 7.0)
+    plan = C.build_plan(c)
+    assert not [p for p in C.validate_inputs(c, C.resolve_traces(c), plan)[0] if "PreServe history" in p]
+    var.unlink()
+    with pytest.raises(C.CampaignError, match="history_variant tail-x"):
+        C.prepare_preserve(c, e, C.arm_def(c, "preserve-tail"), lambda _m: None)
+    probs = [p for p in C.validate_inputs(c, C.resolve_traces(c), plan)[0] if "PreServe history" in p]
+    assert len(probs) == 1 and "preserve-tail" in probs[0] and "preserve_history_w10_tail-x.json" in probs[0]
+
+
+def test_preserve_keys_are_the_policys():
+    """PRESERVE_KEYS (what a spec may override) = every params key the PreServe policy reads + calibration
+    (policies/base.py): a new policy key needs the runner's whitelist (2026-11-04: history_variant and
+    predictor_normalization were missing, so a spec could not set them)."""
+    src = (C.TRE_REPO_DEFAULT / "baselines" / "tre_baselines" / "policies" / "preserve.py").read_text()
+    read = set(re.findall(r"params(?:\.get\(|\[)\"([a-z_0-9]+)\"", src))
+    assert read and C.PRESERVE_KEYS == read | {"calibration"}
 
 
 def test_preserve_mlstm_on_a_slice_from_zero_uses_the_source_trace_history(tmp_path):
