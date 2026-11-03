@@ -41,7 +41,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
-from tre_common.slo_labels import TTFT_SLO_MODE_SLOWDOWN, LabelDefinition, label_def_for_model
+from tre_common.slo_labels import TTFT_SLO_MODE_SLOWDOWN, LabelDefinition, label_def_for_model, request_ttft_slo_ms
 
 DEFAULT_ROUTE_TIMEOUT_S = 150.0
 DEFAULT_WINDOW_S = 10.0
@@ -271,4 +271,46 @@ def judge_window_nl(requests: Sequence[Request], lo: float, hi: float, nl_slo: N
     n_viol = sum(by.values())
     return {"lo": lo, "hi": hi, "n": len(win), "violations": n_viol, **{f"v_{c}": by[c] for c in NL_CAUSES},
             "nl_p95_ms": _r(_q(nl, 0.95), 2), "nl_max_ms": _r(max(nl, default=None), 2),
+            "meets_slo": bool(win) and n_viol == 0}
+
+
+# ------------------------------------------------------------------ TTFT + TPOT limits from idle multiples
+
+TT_CAUSES = ("failed", "ttft", "tpot")
+TT_KEYS = ("c_ms", "b_ms_per_token", "k_ttft", "k_tpot", "ttft_floor_ms", "tpot_idle_ms")
+
+
+def judge_request_ttft_tpot(req: Request, params: Mapping[str, Mapping[str, float]], *,
+                            route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S) -> Dict[str, Any]:
+    """One request under the idle-multiple TTFT + TPOT rule (the limits of ``preserve_nl_slo``):
+    ``ttft <= max(floor, k_ttft * (c + b L))`` and ``tpot = (done - first) / (out - 1) <= k_tpot * tpot_idle``
+    (one output token: TTFT only). ``params[model]`` holds ``TT_KEYS``. Cause: failed | ttft | tpot | None."""
+    if not req.ok or req.done is None or req.done - req.send >= route_timeout_s:
+        return {"cause": "failed", "ttft_ms": None, "tpot_ms": None}
+    if req.first is None or req.prompt_tokens is None or req.completion_tokens is None:
+        raise UnjudgeableWindow(f"request {req.id} ({req.model}, sent {req.send:.3f}) was served without a "
+                                "first-token time or token counts: TTFT / TPOT unknown")
+    if req.model not in params:
+        raise UnjudgeableWindow(f"no TTFT / TPOT limits for model {req.model!r}")
+    q = params[req.model]
+    thr = request_ttft_slo_ms(req.prompt_tokens, c_ms=q["c_ms"], b_ms_per_token=q["b_ms_per_token"],
+                              k=q["k_ttft"], floor_ms=q["ttft_floor_ms"])
+    ttft = (req.first - req.send) * 1000.0
+    ct = int(req.completion_tokens)
+    tpot = (req.done - req.first) * 1000.0 / (ct - 1) if ct > 1 else None
+    cause = "ttft" if ttft > thr else ("tpot" if tpot is not None and tpot > q["k_tpot"] * q["tpot_idle_ms"] else None)
+    return {"cause": cause, "ttft_ms": ttft, "tpot_ms": tpot}
+
+
+def judge_window_ttft_tpot(requests: Sequence[Request], lo: float, hi: float, params: Mapping[str, Mapping[str, float]],
+                           *, route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S) -> Dict[str, Any]:
+    """The requests sent in [lo, hi): violations by cause; ``meets_slo`` = at least one request and none violates."""
+    win = [r for r in requests if lo <= r.send < hi]
+    judged = [judge_request_ttft_tpot(r, params, route_timeout_s=route_timeout_s) for r in win]
+    by = {c: sum(1 for j in judged if j["cause"] == c) for c in TT_CAUSES}
+    ttft = [j["ttft_ms"] for j in judged if j["ttft_ms"] is not None]
+    tpot = [j["tpot_ms"] for j in judged if j["tpot_ms"] is not None]
+    n_viol = sum(by.values())
+    return {"lo": lo, "hi": hi, "n": len(win), "violations": n_viol, **{f"v_{c}": by[c] for c in TT_CAUSES},
+            "ttft_p95_ms": _r(_q(ttft, 0.95), 2), "tpot_p95_ms": _r(_q(tpot, 0.95), 2),
             "meets_slo": bool(win) and n_viol == 0}

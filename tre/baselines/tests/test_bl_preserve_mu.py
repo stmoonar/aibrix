@@ -216,3 +216,26 @@ def test_alg1_default_envelope_must_be_named_and_match_its_traces(tmp_path) -> N
     with pytest.raises(SystemExit, match="not the default"):
         _alg1(tmp_path, cfg, root, tmp_path / "o3", "--envelope", str(env))
     assert _alg1(tmp_path, cfg, root, tmp_path / "o3", "--envelope", str(env), "--envelope-variant") == 0
+
+
+def test_alg1_ttft_tpot_rule_dirties_a_window_the_nl_rule_keeps(tmp_path) -> None:
+    import json
+
+    cfg, root = _alg1_dataset(tmp_path)           # NL 50 ms: w0 and w1 clean, mu_d = 20 (w0)
+    assert _alg1(tmp_path, cfg, root, tmp_path / "nl") == 0
+    assert yaml.safe_load((tmp_path / "nl" / "mu.yaml").read_text())["mu"]["dsqwen-7b"]["d"] == 20.0
+    # TTFT limit max(10, 0.02 L): 20 ms at L = 1000 (w0's TTFT is 50 ms: violation), 100 ms at L = 5000 (ok);
+    # TPOT limit 20 ms: w1 has 16.7 ms (ok), w2 has 60 ms (violation)
+    lim = {"k_ttft": 1.0, "k_tpot": 1.0, "ttft_floor_ms": 10.0, "ttft_idle_c_ms": 0.0,
+           "ttft_idle_b_ms_per_token": 0.02, "tpot_idle_ms": 20.0}
+    (tmp_path / "nl_slo.yaml").write_text(yaml.safe_dump({"nl_slo_ms": {"dsqwen-7b": 50.0}, "models": {"dsqwen-7b": lim}}))
+    out = tmp_path / "tt"
+    assert _alg1(tmp_path, cfg, root, out, "--rule", "ttft_tpot") == 0
+    res = json.loads((out / "result.json").read_text())
+    assert res["rule"]["rule"] == "ttft_tpot" and res["models"]["dsqwen-7b"]["ttft_tpot_limits"]["tpot_idle_ms"] == 20.0
+    assert res["models"]["dsqwen-7b"]["clean"] == 1 and res["mu"]["dsqwen-7b"] == {"p": 500.0, "d": 1.0, "t": 501.0}
+    assert "TTFT + TPOT" in (out / "summary.md").read_text()
+    # a file without the limits is refused
+    (tmp_path / "nl_slo.yaml").write_text(yaml.safe_dump({"nl_slo_ms": {"dsqwen-7b": 50.0}}))
+    with pytest.raises(SystemExit, match="TTFT / TPOT"):
+        _alg1(tmp_path, cfg, root, tmp_path / "tt2", "--rule", "ttft_tpot")

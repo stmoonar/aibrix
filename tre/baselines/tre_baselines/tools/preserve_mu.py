@@ -256,6 +256,7 @@ ALG1_FILTER_KEYS = ("splits", "cell_status", "held_out_shapes", "exclude_in_warm
                     "exclude_possibly_contaminated", "window_inside_cell")
 ALG1_WINDOW_COLS = ("src", "cell_id", "attempt", "shape", "primitive", "rho", "split", "window_start_ms",
                     "window_end_ms", "status", "n", "violations", "v_failed", "v_nl", "nl_p95_ms", "nl_max_ms",
+                    "v_ttft", "v_tpot", "ttft_p95_ms", "tpot_p95_ms",
                     "p", "d", "t")
 ENVELOPE_KEYS = ("share", "mean_in", "mean_out")   # P share = sum(in) / (sum(in) + sum(out)); mean lengths per request
 DATASET_FILES = ("windows.csv", "requests.csv", "cells.csv")
@@ -292,12 +293,13 @@ def load_alg1_config(path: str) -> dict:
     return cfg
 
 
-def apply_nl_slo(cfg: dict, nl_path: str, models: Sequence[str]) -> None:
+def apply_nl_slo(cfg: dict, nl_path: str, models: Sequence[str], rule: str = "nl") -> None:
     """Put the ``--nl-slo`` file's ``nl_slo_ms`` (``preserve_nl_slo`` output) into ``cfg`` for ``models``.
     Refuses a model without a positive value and, when the config pins ``nl_slo_expect_ms``, any value
     that differs from its pin."""
     with open(nl_path, "r", encoding="utf-8") as fh:
-        got = (yaml.safe_load(fh) or {}).get("nl_slo_ms") or {}
+        doc = yaml.safe_load(fh) or {}
+    got = doc.get("nl_slo_ms") or {}
     pins = cfg.get("nl_slo_expect_ms")
     use: dict = {}
     for m in models:
@@ -309,6 +311,19 @@ def apply_nl_slo(cfg: dict, nl_path: str, models: Sequence[str]) -> None:
                              f"nl_slo_expect_ms {pins.get(m)}; refusing (change the pin only on purpose)")
         use[m] = float(v)
     cfg["nl_slo_ms"] = use
+    cfg["rule"] = rule
+    if rule == "ttft_tpot":   # the TTFT / TPOT limits behind the NL value, same file (no hand-typed numbers)
+        tt: dict = {}
+        for m in models:
+            q = (doc.get("models") or {}).get(m) or {}
+            try:
+                tt[m] = {"c_ms": float(q["ttft_idle_c_ms"]), "b_ms_per_token": float(q["ttft_idle_b_ms_per_token"]),
+                         "k_ttft": float(q["k_ttft"]), "k_tpot": float(q["k_tpot"]),
+                         "ttft_floor_ms": float(q["ttft_floor_ms"]), "tpot_idle_ms": float(q["tpot_idle_ms"])}
+            except (KeyError, TypeError, ValueError):
+                raise SystemExit(f"preserve_mu alg1: {nl_path}: models.{m} lacks the TTFT / TPOT limits "
+                                 "(ttft_idle_c_ms, ttft_idle_b_ms_per_token, k_ttft, k_tpot, ttft_floor_ms, tpot_idle_ms)")
+        cfg["ttft_tpot"] = tt
     cfg["nl_slo_file"] = {"path": str(Path(nl_path).resolve()), "sha256": _sha256(Path(nl_path))}
 
 
@@ -445,10 +460,11 @@ def read_dataset_source(ddir: Path, model: str, name: str, filters: Mapping, win
 
 
 def alg1_window(reqs: Sequence[Any], sends: Sequence[float], lo_ms: int, hi_ms: int, nl_slo: float,
-                route_timeout_s: float) -> dict:
+                route_timeout_s: float, tt_params: Optional[Mapping] = None) -> dict:
     """Alg. 1 for one window: the requests that ARRIVE (send time) in [lo, hi); clean = at least one
     request and none violates the NL rule (failed = violation); rates = the arrived requests'
-    prompt / output / total tokens over the window length (``p(r)`` / ``d(r)`` / sum of both)."""
+    prompt / output / total tokens over the window length (``p(r)`` / ``d(r)`` / sum of both).
+    ``tt_params`` (rule ``ttft_tpot``): clean = no failure, TTFT and TPOT within the idle-multiple limits."""
     from bisect import bisect_left
 
     from tre_baselines.tools import slo_judge as sj
@@ -460,10 +476,16 @@ def alg1_window(reqs: Sequence[Any], sends: Sequence[float], lo_ms: int, hi_ms: 
     D = sum(int(r.completion_tokens or 0) for r in win)
     out = {"n": len(win), "p": P / secs, "d": D / secs, "t": (P + D) / secs}
     try:
-        v = sj.judge_window_nl(win, lo, hi, nl_slo, route_timeout_s=route_timeout_s)
+        if tt_params is not None:
+            v = sj.judge_window_ttft_tpot(win, lo, hi, tt_params, route_timeout_s=route_timeout_s)
+        else:
+            v = sj.judge_window_nl(win, lo, hi, nl_slo, route_timeout_s=route_timeout_s)
     except sj.UnjudgeableWindow as exc:
         return {**out, "status": "unjudgeable", "why": str(exc)}
     status = "empty" if not win else ("clean" if v["meets_slo"] else "dirty")
+    if tt_params is not None:
+        return {**out, "status": status, **{k: v[k] for k in ("violations", "v_failed", "v_ttft", "v_tpot",
+                                                              "ttft_p95_ms", "tpot_p95_ms")}}
     return {**out, "status": status, **{k: v[k] for k in ("violations", "v_failed", "v_nl", "nl_p95_ms",
                                                            "nl_max_ms")}}
 
@@ -517,7 +539,8 @@ def profile_alg1(cfg: Mapping, data_root: Path, models: Sequence[str]) -> tuple:
             sends = {k: [r.send for r in v] for k, v in reqs.items()}
             for w in kept:
                 res = alg1_window(reqs.get(w["key"], []), sends.get(w["key"], []), w["window_start_ms"],
-                                  w["window_end_ms"], nl_slo, route_timeout_s)
+                                  w["window_end_ms"], nl_slo, route_timeout_s,
+                                  {model: cfg["ttft_tpot"][model]} if cfg.get("rule") == "ttft_tpot" else None)
                 if res["status"] != "empty" and not inside_envelope(
                         res, bounds.get(model), (w["window_end_ms"] - w["window_start_ms"]) / 1000.0):
                     res = {**res, "status": "outside"}   # shape outside the envelope: not judged, not in mu
@@ -527,6 +550,8 @@ def profile_alg1(cfg: Mapping, data_root: Path, models: Sequence[str]) -> tuple:
                   f"{stats['requests']} requests, dropped {stats['dropped']}", file=sys.stderr)
         summ = alg1_summary(rows)
         summ["nl_slo_ms"] = nl_slo
+        if cfg.get("rule") == "ttft_tpot":
+            summ["ttft_tpot_limits"] = cfg["ttft_tpot"][model]
         summ["windows_in_files"] = sum(s["windows"] for s in sources if s["model"] == model)
         summaries[model] = summ
         all_rows.extend({"model": model, **r} for r in rows)
@@ -560,15 +585,19 @@ def _git_sha() -> Optional[str]:
 def _summary_md(summaries: Mapping, prov: Mapping, env: Optional[Mapping] = None) -> str:
     lines = ["# PreServe mu, Alg. 1 on the TSS / theta training set", "",
              f"tool `{prov['tool_sha']}`, config `{prov['config']}` (sha256 `{prov['config_sha256'][:12]}`), "
-             f"window {prov['window_s']:g} s, arrival attribution, NL rule, "
+             f"window {prov['window_s']:g} s, arrival attribution, {'TTFT + TPOT rule' if prov.get('rule') == 'ttft_tpot' else 'NL rule'}, "
              f"{'envelope ' + str(env.get('name')) if env else 'no shape filter'}.", "",
-             "| model | NL SLO ms | clean / judged (kept) | mu_p | mu_d | mu_t | bracketed p/d/t |",
+             f"| model | {'TTFT / TPOT limits' if prov.get('rule') == 'ttft_tpot' else 'NL SLO ms'} | clean / judged (kept) "
+             "| mu_p | mu_d | mu_t | bracketed p/d/t |",
              "|---|---|---|---|---|---|---|"]
     for m, s in summaries.items():
         T = s["terms"]
         mus = ["-" if T[k] is None else f"{T[k]['mu']:.0f}" for k in ALG1_TERMS]
         br = "/".join("-" if T[k] is None else ("Y" if T[k]["bracketed"] else "n") for k in ALG1_TERMS)
-        lines.append(f"| {m} | {s['nl_slo_ms']:g} | {s['clean']} / {s['clean'] + s['dirty']} ({s['windows_kept']}) "
+        q = s.get("ttft_tpot_limits")
+        lim = (f"TTFT max({q['ttft_floor_ms']:g}, {q['k_ttft']:g}*({q['c_ms']:g}+{q['b_ms_per_token']:g}L)); "
+               f"TPOT {q['k_tpot'] * q['tpot_idle_ms']:.2f} ms" if q else f"{s['nl_slo_ms']:g}")
+        lines.append(f"| {m} | {lim} | {s['clean']} / {s['clean'] + s['dirty']} ({s['windows_kept']}) "
                      f"| {mus[0]} | {mus[1]} | {mus[2]} | {br} |")
     lines += ["", "## Source window and top-5 clean values per term", ""]
     for m, s in summaries.items():
@@ -599,6 +628,10 @@ def main_alg1(argv: Sequence[str]) -> int:
     ap.add_argument("--models", default="", help="comma list (default: every model of the config)")
     ap.add_argument("--nl-slo", required=True, help="NL SLO file (preserve_nl_slo output, nl_slo.yaml); must "
                     "equal the config's nl_slo_expect_ms pins")
+    ap.add_argument("--rule", choices=("nl", "ttft_tpot"), default="nl",
+                    help="clean-window rule: nl (default, PreServe's e2e / output tokens <= NL SLO) or ttft_tpot "
+                    "(sensitivity: TTFT <= max(floor, k_ttft (c + b L)) and TPOT <= k_tpot TPOT_idle, limits read "
+                    "from the --nl-slo file)")
     ap.add_argument("--envelope", default="", help="envelope file (preserve_eval_envelope output: name, bounds "
                     "per model); keep only windows whose shape is inside it. Required when the config names an "
                     "envelope_default (or --no-envelope)")
@@ -611,7 +644,7 @@ def main_alg1(argv: Sequence[str]) -> int:
     bad = [m for m in models if m not in cfg["sources"]]
     if bad:
         raise SystemExit(f"preserve_mu alg1: no sources for {bad}")
-    apply_nl_slo(cfg, a.nl_slo, models)
+    apply_nl_slo(cfg, a.nl_slo, models, a.rule)
     apply_envelope(cfg, a.config, a.envelope, a.no_envelope, a.envelope_variant)
     out = Path(a.out)
     if (out / "result.json").exists():
@@ -629,13 +662,17 @@ def main_alg1(argv: Sequence[str]) -> int:
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     summaries, rows, sources = profile_alg1(cfg, root, models)
     prov = {"started": started, "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool_sha": _git_sha(),
-            "argv": ["alg1", *argv], "host": platform.node(), "python": platform.python_version(),
+            "argv": ["alg1", *argv], "rule": a.rule, "host": platform.node(), "python": platform.python_version(),
             "config": str(Path(a.config).resolve()), "config_sha256": _sha256(Path(a.config)),
             "data_root": str(root.resolve()), "window_s": float(cfg["window_s"]),
             "route_timeout_s": float(cfg.get("route_timeout_s", 150.0)), "files": files}
     rule = {"window": f"tumbling {float(cfg['window_s']):g} s, the dataset's own grid (window_start_ms / end_ms)",
             "requests": "requests whose send_ts_ms falls in [start, end) of the window, same cell",
-            "clean": "at least one request and none violates: failed / timed out, or NL = e2e / output tokens > NL SLO",
+            "rule": a.rule,
+            "clean": ("at least one request and none violates: failed / timed out, TTFT > max(floor, k_ttft * (c + b * L)), "
+                      "or TPOT = (e2e - ttft) / (out - 1) > k_tpot * TPOT_idle (out = 1: TTFT only); limits in "
+                      "config.ttft_tpot (from the nl_slo file)") if a.rule == "ttft_tpot" else
+                     "at least one request and none violates: failed / timed out, or NL = e2e / output tokens > NL SLO",
             "rates": "sum of the arrived requests' prompt (p) / output (d) / both (t) tokens / window seconds; "
                      "a failed request counts expected_prompt_tokens and 0 output tokens (dirty windows only)",
             "mu": "max over clean windows per term (Alg. 1 lines 8-11); one pod per cell; "
