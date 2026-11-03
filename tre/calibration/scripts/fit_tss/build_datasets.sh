@@ -52,7 +52,8 @@ if [ "${1:-}" = "--old" ]; then
   LABEL_REG=$(fit_label_registry "$OUT_ROOT")
   pids=()
   for m in $MODELS; do
-    case $m in dsqwen-7b) st="run1 run2 supp p1r2";; dsllama-8b) st="run1 run2 supp p1";; dsqwen-14b) st="run1 run2b supp p1";; esac
+    case $m in dsqwen-7b) st="run1 run2 supp p1r2";; dsllama-8b) st="run1 run2 supp p1";; dsqwen-14b) st="run1 run2b supp p1";;
+      *) echo "FATAL unknown model $m (no old-calibration stages for it)" >&2; exit 2;; esac
     for s in $st; do one "$CALIB_ROOT_OLD/$s/$m" "$OUT_ROOT/$s/$m/dataset_hybrid" "$W" & pids+=($!); done
   done
   fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done; exit $fail

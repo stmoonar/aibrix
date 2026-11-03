@@ -90,3 +90,25 @@ def test_policy_refuses_normalization_window_and_model_mismatch(tmp_path) -> Non
     swapped = {"trace": {"models": {MODELS[0]: files[MODELS[1]], MODELS[1]: files[MODELS[0]]}}}
     with pytest.raises(ValueError, match="trained for model"):
         _policy({"predictors": swapped, "predictor_normalization": "minmax"})
+
+
+def test_policy_refuses_a_shared_spec_file_of_one_model_or_another_trace(tmp_path) -> None:
+    """A file that names its service serves only that service, also from a shared ``{set: {path}}`` spec
+    (no ``models:``); a file that names a trace (not ``*``) serves only that trace."""
+    one = {"path": str(tmp_path / "7b.npz"), "sha256": _write(tmp_path / "7b.npz", model=MODELS[0])}
+    with pytest.raises(ValueError, match="trained for model 'dsqwen-7b', not 'dsllama-8b'"):
+        _policy({"predictors": {"trace": one}, "predictor_normalization": "minmax"})
+    trace = pp.load_predictors(one["path"], one["sha256"])["prompt"]
+    assert trace.trace is None  # no trace key: any trace
+    files = {}
+    for m in MODELS:
+        f = tmp_path / f"{m}.t.npz"
+        export_npz({"prompt": _ConstModel(0.5), "response": _ConstModel(0.5)}, str(f), seq_len=3, hidden=H, eps=1.0,
+                   window_s=10.0, normalization=pp.MINMAX, minmax={"prompt": (100.0, 300.0), "response": (10.0, 50.0)},
+                   meta={"model": m, "trace": "Other_trace"})
+        files[m] = {"path": str(f), "sha256": pp.sha256_of(str(f))}
+    with pytest.raises(ValueError, match="trained for trace 'Other_trace'"):
+        _policy({"predictors": {"trace": {"models": files}}, "predictor_normalization": "minmax"})
+    pol = _policy({"predictors": {"trace": {"models": files}}, "predictor_normalization": "minmax",
+                   "trace_name": "Other_trace"})
+    assert {pol._predictors[m]["prompt"].trace for m in MODELS} == {"Other_trace"}

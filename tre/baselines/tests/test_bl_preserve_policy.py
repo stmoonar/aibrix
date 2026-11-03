@@ -592,6 +592,44 @@ def test_done_or_predicted_counts_an_in_flight_request_by_its_d_hat_until_done()
     assert (info["d_predicted"], info["d_split"]) == (0.0, [])
 
 
+def test_done_or_predicted_drops_the_prediction_of_a_done_without_usage() -> None:
+    """A done without usage ends the request: its D_hat no longer counts from the next forecast instant
+    on, its D stays unknown (d_unknown, d_no_usage), and the forecast logs the known D total."""
+    p, preds = mlstm(history=[[3000.0, 0.0]] * 3, tier1_horizon="paper_two_step",
+                     tier1_d_source="done_or_predicted", load_error_mode="paper_tab2_relative",
+                     out_len_is_upper_bound=False)
+    pods = [pod("p0", 1000)]
+    p.decide(snap(1000, pods, replay=REPLAY))
+    evs = [*load("a", "p0", 5000, 1200, 600), *load("b", "p0", 6000, 1800, 300),
+           ev("done", "a", "p0", 20_000, out=500)]
+    p.decide(snap(21_000, pods, evs, replay=REPLAY))
+    d = p.decide(snap(32_000, pods, [ev("done", "b", "p0", 31_000, out=None)], replay=REPLAY))["m"]
+    d_hat_b = p._predicted_len("m", "c-b", 300, 1800)
+    assert preds["response"].calls[-2] == [0.0, 0.0, 500.0 + d_hat_b]  # its done is after the 30 s cut
+    i1 = d.inputs["tier1"]
+    assert (i1["d_unknown"], i1["d_requests"], i1["d_total"], i1["d_no_usage"]) == (1, 2, 500.0, 0)
+    _, info = p._models["m"].mlstm[1].decide(2)
+    assert preds["response"].calls[-2] == [0.0, 500.0, 0.0]  # no D_hat after the done, no actual either
+    assert (info["d_predicted"], info["d_unknown"], info["d_no_usage"], info["d_total"]) == (0.0, 1, 1, 500.0)
+
+
+def test_pre_replay_buffer_bounds_arrivals_not_their_done_events(monkeypatch) -> None:
+    """Before the replay marker the policy keeps new-demand arrivals (and their done events); the count
+    bound counts arrivals only, so the done events of kept arrivals never push an arrival out."""
+    import tre_baselines.policies.preserve as pre
+
+    monkeypatch.setattr(pre, "PRE_REPLAY_MAX_ARRIVALS", 3)
+    p, _ = _paper([[3000.0, 0.0]] * 3)
+    pods = [pod("p0", 1000)]
+    evs = [e for r, t in (("a", 100), ("b", 200), ("c", 300)) for e in load(r, "p0", t, 100, 10)]
+    evs += [ev("done", r, "p0", 400 + i, out=10) for i, r in enumerate("abc")]
+    p.decide(snap(1000, pods, evs))  # no replay marker yet
+    st = p._models["m"]
+    assert (st.pre_replay_arr, st.pre_replay_lost_ms) == (3, None) and len(st.pre_replay) == 6
+    p.decide(snap(1100, pods, load("d", "p0", 500, 100, 10)))
+    assert st.pre_replay_arr == 3 and st.pre_replay_lost_ms == 100  # the oldest arrival, not a done
+
+
 def test_paper_two_step_oracle_and_the_last_window() -> None:
     p = make(tier1_horizon="paper_two_step")
     pods = [pod("p0", 1000)]
@@ -663,9 +701,38 @@ def test_the_frozen_configmap_weights_declare_its_window() -> None:
     docs = [d for d in yaml.safe_load_all(fp.DEFAULT_CM.read_text()) if d]
     cm = [d for d in docs if d["metadata"]["name"] == "tre-v2-baseline-preserve"][0]
     params = yaml.safe_load(cm["data"]["preserve.yaml"])
+    norm = params.get("predictor_normalization", pp.PER_SEQUENCE_MEAN)
     for name, spec in params["predictors"].items():
-        prs = pp.load_predictors(str(Path(fp.TRE_ROOT) / "baselines" / spec["path"]), spec["sha256"])
-        assert {p.window_s for p in prs.values()} == {float(params["window_s"])}, name
+        files = spec["models"].items() if "models" in spec else [(None, spec)]
+        for model, f in files:
+            prs = pp.load_predictors(str(Path(fp.TRE_ROOT) / "baselines" / f["path"]), f["sha256"])
+            assert {p.window_s for p in prs.values()} == {float(params["window_s"])}, name
+            assert {p.normalization for p in prs.values()} == {norm}, name
+            assert {p.model for p in prs.values()} <= {model, None}, name
+
+
+def test_the_frozen_configmap_is_the_freeze_tools_rendering() -> None:
+    """2026-11-04: the PreServe block is what ``freeze_params preserve`` renders from its mu file and the
+    per-trace weights (the default V2 rules give every trace a set; a V1 arm's rules name the v1 sets);
+    the header records the mu file's sha256 and tool line and the weights manifest's sha256."""
+    yaml = pytest.importorskip("yaml")
+    from tre_baselines.tools import freeze_params as fp
+
+    docs = [d for d in yaml.safe_load_all(fp.DEFAULT_CM.read_text()) if d]
+    text = [d for d in docs if d["metadata"]["name"] == "tre-v2-baseline-preserve"][0]["data"]["preserve.yaml"]
+    params = yaml.safe_load(text)
+    assert text.startswith("# FROZEN (tools/freeze_params preserve). Sources: mu sha256 ") and "preserve_mu alg1" in text
+    assert "weights manifest sha256 " in text.split("\n")[0]
+    mu = {m: params["mu"][m] for m in fp.MODELS}
+    body = fp.render_preserve(mu, {}, fp.weights_sha256(), mu_kind="alg1")
+    strip = lambda t: "\n".join(ln for ln in t.split("\n") if not ln.startswith("#"))  # noqa: E731
+    assert strip(text) == strip(body)
+    assert params["predictor_rules"] == fp.predictor_rules("v2") and len(params["predictor_rules"]) == 7
+    v1 = fp.predictor_rules("v1")
+    assert {s for _t, s in v1} <= set(params["predictors"]) and all(s == f"v1-{t}" for t, s in v1)
+    assert (params["tier1_horizon"], params["tier1_d_source"], params["load_error_mode"],
+            params["underload_pending_gate"], params["predictor_normalization"]) == (
+        "paper_two_step", "done_tokens", "paper_tab2_relative", False, "minmax")
 
 
 # ------------------------------------------------------------ load errors

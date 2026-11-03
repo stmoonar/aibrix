@@ -8,7 +8,14 @@ outputs, so nothing is copied by hand:
 * ``tokenscale --report <buckets-report.yaml> --profile <ladder profile.yaml>``: ``bucket_centers``
   from the report (``tools/tokenscale_buckets``), ``velocity`` = the ladder's peak V per cell
   (``tools/velocity_ladder ladder`` / ``summarize``); a cell without V refuses;
-* ``preserve --mu <mu.yaml>``: ``mu`` = variant B of ``tools/velocity_ladder mu``.
+* ``preserve --mu <mu.yaml>``: ``mu`` = the ``mu`` block of ``tools/preserve_mu alg1`` (2026-11-04, paper
+  Alg. 1; the file's first comment line names the tool commit) or, for older files, ``mu_B`` of
+  ``tools/velocity_ladder mu``. ``--weights <dir>`` (relative to tre/baselines; default the 2026-11-04 per-trace
+  weights) and ``--predictor-variant v2|v1`` pick the Tier-1 predictors: a dir with ``v1/`` / ``v2/`` files
+  (``preserve_train/trace_train.py``) renders one set per variant and trace (``v2``: one file per model, every
+  trace; ``v1-<trace>``: the trace's own files) with ``predictor_normalization`` and ``history_variant`` from its
+  manifest, and ``predictor_rules`` mapping every trace to the chosen variant (a V1 arm overrides the rules with
+  :func:`predictor_rules` ``("v1")``); an older dir (``code`` / ``conv`` / ``pooled``) renders those three sets.
 
 ``--pending`` renders the block with ``calibration: pending`` and null values (the state before
 the calibration). ``--note TEXT`` (repeatable) adds a ``# NOTE:`` disclosure line under the header
@@ -33,11 +40,14 @@ import yaml
 TRE_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CM = TRE_ROOT / "deploy" / "baselines" / "tre" / "policy-configmaps.yaml"
 MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
-#: PreServe mLSTM weights shipped in the image (relative to tre/baselines): v1 paper_past protocol
-#: retrained at W = 10 s (2026-11-03; the 30 s weights of 2026-10-24 stay in weights/ for past runs)
-WEIGHTS = "weights/preserve-mlstm-20261103-paper-w10"
+#: PreServe mLSTM weights rendered by default (relative to tre/baselines): trained on each trace's own past
+#: (2026-11-04, ``preserve_train/trace_train.py``; V1 per trace x model, V2 = the 7 traces concatenated, min-max)
+WEIGHTS = "weights/preserve-mlstm-20261104-trace-w10"
+#: the v1 paper_past protocol at W = 10 s (2026-11-03; code / conv / pooled, per_sequence_mean), for past runs
+LEGACY_WEIGHTS = "weights/preserve-mlstm-20261103-paper-w10"
 WEIGHTS_SUFFIX = "-paper-w10"
 WEIGHT_SETS = ("code", "conv", "pooled")
+PREDICTOR_VARIANTS = ("v2", "v1")
 
 
 def sha256_file(path: str | Path) -> str:
@@ -82,31 +92,87 @@ def render_tokenscale(centers: Optional[Mapping[str, Any]], velocity: Optional[M
     return "\n".join(L) + "\n"
 
 
+def _manifest(weights: str) -> dict:
+    return json.loads((TRE_ROOT / "baselines" / weights / "manifest.json").read_text(encoding="utf-8"))
+
+
+def _per_trace(weights: str) -> bool:
+    """A ``trace_train.py`` dir (files ``v1/<trace>/<model>`` and ``v2/concat/<model>``)."""
+    files = _manifest(weights).get("files") or {}
+    return any(str(k).startswith("v2/") for k in files) and any(str(k).startswith("v1/") for k in files)
+
+
+def trace_names(weights: str = WEIGHTS) -> list[str]:
+    """The traces of a per-trace weights dir, in training-config order."""
+    out: list[str] = []
+    for k in _manifest(weights)["files"]:
+        bits = str(k).split("/")
+        if bits[0] == "v1" and bits[1] not in out:
+            out.append(bits[1])
+    return out
+
+
+def predictor_rules(variant: str, weights: str = WEIGHTS) -> list[list[str]]:
+    """``predictor_rules`` that give every trace of a per-trace weights dir its ``variant`` set."""
+    if variant not in PREDICTOR_VARIANTS:
+        raise ValueError(f"predictor variant must be one of {PREDICTOR_VARIANTS}, got {variant!r}")
+    return [[t, "v2" if variant == "v2" else f"v1-{t}"] for t in trace_names(weights)]
+
+
+def _predictor_lines(weights: str, w: Mapping[str, str], variant: str, models) -> list[str]:
+    if not _per_trace(weights):
+        L = ["predictor_normalization: per_sequence_mean   # the 2026-11-03 weights (D15)",
+             "predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)"]
+        L += [f"  {name}: {{path: {weights}/{name}{WEIGHTS_SUFFIX}.npz, sha256: {w[name]}}}" for name in WEIGHT_SETS]
+        L.append("predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled")
+        return L
+    man = _manifest(weights)
+    files = man["files"]
+    norm = str((man.get("normalization") or {}).get("name") or "")
+    hv = (man.get("history") or {}).get("variant")
+    L = [f"predictor_normalization: {norm}   # paper Alg. 1 line 3 (min / max of each file's training series)",
+         f"history_variant: {hv}   # history before t0 = the end of the trace's training series (weights' REPORT.md)",
+         f"predictors:              # under tre/baselines: {weights} (manifest.json); one file per model",
+         "  v2:                     # V2: trained on the 7 traces concatenated"
+         " (any trace)",
+         "    models:"]
+    L += [f"      {m}: {{path: {weights}/{files[f'v2/concat/{m}']['file']}, sha256: {w[f'v2/concat/{m}']}}}" for m in models]
+    for t in trace_names(weights):
+        L += [f"  v1-{t}:   # V1: trained on this trace's own past", "    models:"]
+        L += [f"      {m}: {{path: {weights}/{files[f'v1/{t}/{m}']['file']}, sha256: {w[f'v1/{t}/{m}']}}}" for m in models]
+    rules = predictor_rules(variant, weights)
+    L.append(f"predictor_rules: {_flow(rules)}   # {variant.upper()} for every trace (default); "
+             f"a {'V1' if variant == 'v2' else 'V2'} arm overrides the rules (freeze_params.predictor_rules)")
+    return L
+
+
 def render_preserve(mu: Optional[Mapping[str, Any]], sources: Mapping[str, str], weights: Mapping[str, str],
-                    models=MODELS) -> str:
+                    models=MODELS, *, weights_dir: str = WEIGHTS, variant: str = "v2", mu_kind: str = "alg1") -> str:
     frozen = mu is not None
     L = [f"# {'FROZEN' if frozen else 'PENDING'} (tools/freeze_params preserve). Sources: "
-         + (", ".join(f"{k} sha256 {v}" for k, v in sources.items()) or "none"),
+         + (", ".join(f"{k} {v}" for k, v in sources.items()) or "none"),
          f"calibration: {'frozen' if frozen else 'pending'}",
          "# The trace: replaced per run by the campaign runner (its oracle copy in the trace volume); the",
          "# history before t0 is next to it, named by the window (preserve_history.history_names): at 10 s",
-         "# preserve_history_w10.json (tools/preserve_history_azure); at 30 s pre_t0.json, else preserve_history.json.",
+         "# preserve_history_w10.json (tools/preserve_history_azure), with history_variant V",
+         "# preserve_history_w10_<V>.json; at 30 s pre_t0.json, else preserve_history.json.",
          "trace_path: /etc/tre-baselines-traces/case/seed1/traces_tre.effective.json",
          "trace_seed: 0",
          "trace_schedule: poisson",
          "trace_match_parts: 2",
          "window_s: 10             # = TRE metrics window (2026-11-03; 30 s before, v1 D18; paper 600 s)",
          "lead_s: 0",
-         "tier1: mlstm             # paper forecaster; v1 paper_past protocol at W = 10 s (train before the Real_* slices)",
+         "tier1: mlstm             # paper forecaster (Tier-1 mLSTM)",
          "tier1_horizon: paper_two_step   # paper Alg. 2: two steps at the start of T_i -> N_{i+1} (2026-11-04)",
          "tier1_d_source: done_tokens     # paper: observed D = done out_tokens, known at completion (2026-11-04)",
-         "seq_len: 25",
-         "predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)"]
-    for name in WEIGHT_SETS:
-        L.append(f"  {name}: {{path: {WEIGHTS}/{name}{WEIGHTS_SUFFIX}.npz, sha256: {weights[name]}}}")
-    L += ["predictor_rules: [[Real_code, code], [Real_conv, conv]]   # any other trace: pooled",
-          "mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,",
-          "                         # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu"]
+         "seq_len: 25"]
+    L += _predictor_lines(weights_dir, weights, variant, models)
+    if mu_kind == "alg1":
+        L += ["mu:                      # tok/s per replica, PreServe Alg. 1 (tools/preserve_mu alg1): 10 s windows of the",
+              "                         # TSS / theta training set, clean = every request within NL_SLO, max over clean windows"]
+    else:
+        L += ["mu:                      # tok/s per replica, PreServe Alg.1 on the V ladders: NL SLO = 3 x isolated NL,",
+              "                         # every request of a step, variant B (P share in the traces' p5-p95), tools/velocity_ladder mu"]
     for m in models:
         L.append(f"  {m}: {_flow({k: mu[m][k] for k in ('p', 'd', 't')}) if frozen else 'null'}")
     L += ["load_error_mode: paper_tab2_relative   # paper RQ2 'w/ load errors': Tab. 2 as a relative error (2026-11-04)",
@@ -126,6 +192,24 @@ def render_preserve(mu: Optional[Mapping[str, Any]], sources: Mapping[str, str],
     return "\n".join(L) + "\n"
 
 
+def read_mu(path: str) -> tuple[dict, str, str]:
+    """(mu, kind, provenance) of a mu file: ``preserve_mu alg1`` (``mu:``; its first comment line names the
+    tool commit and config) or ``velocity_ladder mu`` (``mu_B:``). Refuses a file that lacks p / d / t."""
+    text = Path(path).read_text(encoding="utf-8")
+    doc = yaml.safe_load(text) or {}
+    if isinstance(doc.get("mu"), Mapping):
+        mu, kind = doc["mu"], "alg1"
+    elif isinstance(doc.get("mu_B"), Mapping):
+        mu, kind = doc["mu_B"], "velocity_ladder"
+    else:
+        raise ValueError(f"{path}: no mu (preserve_mu alg1) or mu_B (velocity_ladder mu) block")
+    missing = [m for m in MODELS if not all((mu.get(m) or {}).get(k) for k in ("p", "d", "t"))]
+    if missing:
+        raise ValueError(f"{path}: mu lacks p / d / t for {missing}")
+    head = next((ln[1:].strip() for ln in text.splitlines() if ln.startswith("#")), "")
+    return {m: mu[m] for m in MODELS}, kind, " ".join(head.split())
+
+
 def replace_block(text: str, policy: str, block: str) -> str:
     """``text`` (the ConfigMaps file) with the ``<policy>.yaml: |`` literal block replaced."""
     head = f"  {policy}.yaml: |\n"
@@ -143,9 +227,17 @@ def with_notes(block: str, notes) -> str:
     return head + sep + lines + rest
 
 
-def weights_sha256() -> dict[str, str]:
-    root = TRE_ROOT / "baselines" / WEIGHTS
-    return {n: sha256_file(root / f"{n}{WEIGHTS_SUFFIX}.npz") for n in WEIGHT_SETS}
+def weights_sha256(weights: str = WEIGHTS) -> dict[str, str]:
+    """sha256 of every file of a weights dir, computed from the files (checked against its manifest)."""
+    root = TRE_ROOT / "baselines" / weights
+    if not _per_trace(weights):
+        return {n: sha256_file(root / f"{n}{WEIGHTS_SUFFIX}.npz") for n in WEIGHT_SETS}
+    out = {}
+    for k, f in _manifest(weights)["files"].items():
+        out[k] = sha256_file(root / f["file"])
+        if out[k] != f.get("sha256"):
+            raise ValueError(f"{weights}/{f['file']}: sha256 {out[k]} != manifest {f.get('sha256')}")
+    return out
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -156,6 +248,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     t.add_argument("--profile")
     p = sub.add_parser("preserve")
     p.add_argument("--mu")
+    p.add_argument("--weights", default=WEIGHTS, help="weights dir relative to tre/baselines")
+    p.add_argument("--predictor-variant", default="v2", choices=PREDICTOR_VARIANTS,
+                   help="the predictor_rules default of a per-trace weights dir")
     for s in (t, p):
         s.add_argument("--pending", action="store_true")
         s.add_argument("--configmaps", default=str(DEFAULT_CM))
@@ -183,18 +278,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 block = render_tokenscale(centers, vel, {"report": sha256_file(a.report),
                                                          "profile": sha256_file(a.profile)})
         else:
-            w = weights_sha256()
+            w = weights_sha256(a.weights)
+            wsrc = {}
+            if (TRE_ROOT / "baselines" / a.weights / "manifest.json").is_file():
+                wsrc = {"weights manifest": f"sha256 {sha256_file(TRE_ROOT / 'baselines' / a.weights / 'manifest.json')}"}
+            kw = {"weights_dir": a.weights, "variant": a.predictor_variant}
             if a.pending:
-                block = render_preserve(None, {}, w)
+                block = render_preserve(None, {}, w, **kw)
             else:
                 if not a.mu:
                     raise ValueError("--mu (or --pending)")
-                doc = yaml.safe_load(Path(a.mu).read_text(encoding="utf-8"))
-                mu = doc.get("mu_B") or {}
-                missing = [m for m in MODELS if not all((mu.get(m) or {}).get(k) for k in ("p", "d", "t"))]
-                if missing:
-                    raise ValueError(f"mu_B lacks p / d / t for {missing}")
-                block = render_preserve(mu, {"mu": sha256_file(a.mu)}, w)
+                mu, kind, prov = read_mu(a.mu)
+                src = {"mu": f"sha256 {sha256_file(a.mu)}" + (f" ({prov})" if prov else ""), **wsrc}
+                block = render_preserve(mu, src, w, mu_kind=kind, **kw)
     except (OSError, KeyError, ValueError, TypeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

@@ -169,6 +169,8 @@ LOG = logging.getLogger(__name__)
 DEFAULT_MAX_OUTPUT_LEN = 4096
 DEFAULT_PREDICTOR_RULES = (("Real_code", "code"), ("Real_conv", "conv"))
 DEFAULT_PREDICTOR_SET = "pooled"
+#: New-demand arrivals kept before the replay marker arrives (their ``done`` events are not counted).
+PRE_REPLAY_MAX_ARRIVALS = 200000
 #: An idle engine clears only map entries routed at least this long before the scrape (v1
 #: ``ENGINE_IDLE_MARGIN_MS``): a request routed just before it may not have reached the engine.
 ENGINE_IDLE_MARGIN_MS = 1000
@@ -214,6 +216,8 @@ class _ModelState:
     clients: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
     #: New-demand arrivals consumed before the replay marker arrives; bounded below.
     pre_replay: deque = field(default_factory=deque)
+    #: arrivals in ``pre_replay`` (the count bound; ``done`` events ride along uncounted)
+    pre_replay_arr: int = 0
     pre_replay_lost_ms: Optional[int] = None
     #: request key -> now_ms: requests of a slept pod (map, buffer or discarded), for ``done_pod_gone``.
     gone_keys: dict[tuple[str, Optional[str]], int] = field(default_factory=dict)
@@ -592,11 +596,15 @@ class PreServePolicy:
             self._observe(t1m, e)
         elif self.mode == "mlstm":
             # A late marker must not lose the first window. Retain only new-demand arr (and done for
-            # done_tokens), never ft, and bound both age and count (same scale as the stream).
+            # done_tokens), never ft, and bound both age and the number of arrivals (same scale as the
+            # stream; a done is at most one per arrival, so it does not count toward the bound).
             st.pre_replay.append(e)
-            while st.pre_replay and (len(st.pre_replay) > 200000 or
+            st.pre_replay_arr += e.kind == "arr"
+            while st.pre_replay and (st.pre_replay_arr > PRE_REPLAY_MAX_ARRIVALS or
                                     e.ts_ms - st.pre_replay[0].ts_ms > self.req_ttl_ms):
-                st.pre_replay_lost_ms = st.pre_replay.popleft().ts_ms
+                old = st.pre_replay.popleft()
+                st.pre_replay_arr -= old.kind == "arr"
+                st.pre_replay_lost_ms = old.ts_ms
 
     def _observe(self, t1m: tier1.MlstmTier1, e: RequestEvent) -> None:
         if e.kind == "arr":
@@ -753,8 +761,14 @@ class PreServePolicy:
                 if pr.normalization != want_norm:
                     raise ValueError(f"preserve: predictor {where}/{k} normalization {pr.normalization!r} != "
                                      f"params.predictor_normalization {want_norm!r}")
-                if owner is not None and pr.model is not None and pr.model != owner:
-                    raise ValueError(f"preserve: predictor {where}/{k} was trained for model {pr.model!r}")
+                # a file that names its service / trace serves only that one (a shared spec too)
+                p_model, p_trace = getattr(pr, "model", None), getattr(pr, "trace", None)
+                if p_model is not None and p_model != (owner or model):
+                    raise ValueError(f"preserve: predictor {where}/{k} was trained for model {p_model!r}, "
+                                     f"not {owner or model!r}")
+                if p_trace not in (None, "*") and p_trace != self.trace_name:
+                    raise ValueError(f"preserve: predictor {where}/{k} was trained for trace {p_trace!r}, "
+                                     f"this trace is {self.trace_name!r}")
             out[model] = loaded[key]
         return out
 
@@ -778,6 +792,7 @@ class PreServePolicy:
                 if event.ts_ms >= t0:
                     self._observe(t1m, event)
             st.pre_replay.clear()
+            st.pre_replay_arr = 0
             st.pre_replay_lost_ms = None
         return st.mlstm[1]
 

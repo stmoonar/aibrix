@@ -35,8 +35,8 @@ Normalization ``minmax`` (2026-11-04, the paper's Alg. 1 line 3, ``preserve_trai
 in the file (scalar keys ``<kind>.norm_min``, ``<kind>.norm_max``); the prediction is
 ``max(0, out * (max - min) + min)``. A file declares its normalization (key ``normalization``) and the policy
 refuses one that differs from ``params.predictor_normalization`` (default ``per_sequence_mean``). Optional
-scalar keys ``model`` / ``trace`` / ``variant`` name what a per-model file was trained on (the policy refuses a
-per-model file mapped to another model).
+scalar keys ``model`` / ``trace`` / ``variant`` name what a file was trained on (the policy refuses a file
+whose ``model`` is not the model it is loaded for, or whose ``trace`` is neither ``*`` nor the replayed trace).
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class Predictor:
     def __init__(self, weights: Dict[str, np.ndarray], seq_len: int, hidden: int, eps: float,
                  normalization: str, kind: str, window_s: Optional[float] = None,
                  norm_min: Optional[float] = None, norm_max: Optional[float] = None,
-                 model: Optional[str] = None):
+                 model: Optional[str] = None, trace: Optional[str] = None):
         if normalization not in NORMALIZATIONS:
             raise ValueError(f"unsupported normalization {normalization!r} (one of {NORMALIZATIONS})")
         if normalization == MINMAX:
@@ -81,6 +81,8 @@ class Predictor:
             self.norm_min = self.norm_max = None
         #: the service the file was trained for (per-model files), else None
         self.model = None if model is None else str(model)
+        #: the trace the file was trained for (``*`` = any trace), else None
+        self.trace = None if trace is None else str(trace)
         self.seq_len = int(seq_len)
         self.hidden = int(hidden)
         self.eps = float(eps)
@@ -143,7 +145,8 @@ def load_predictor(path: str, kind: str) -> Predictor:
         opt = {k: float(z[f"{prefix}{k}"]) for k in ("norm_min", "norm_max") if f"{prefix}{k}" in z.files}
         return Predictor(weights, seq_len=int(z["seq_len"]), hidden=int(z["hidden"]), eps=float(z["eps"]),
                          normalization=str(z["normalization"]), kind=kind, window_s=window_s,
-                         model=str(z["model"]) if "model" in z.files else None, **opt)
+                         model=str(z["model"]) if "model" in z.files else None,
+                         trace=str(z["trace"]) if "trace" in z.files else None, **opt)
 
 
 def sha256_of(path: str) -> str:

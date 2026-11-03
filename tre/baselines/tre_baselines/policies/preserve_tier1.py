@@ -23,13 +23,16 @@ Observed ``D`` (``tier1_d_source``, 2026-11-04):
     written once known: a forecast at the start of ``T_i`` (instant ``t0 + i W``) counts
     exactly the ``done`` events with a Redis time before that instant, never an in-flight
     request; a later forecast sees the later ``done`` events of the same window. The info logs
-    ``d_unknown`` (history requests whose ``done`` is not yet in). A ``done`` without usage
-    flags the window ``done_no_usage`` and adds nothing.
+    ``d_unknown`` (history requests whose ``done`` is not yet in, or came without usage), ``d_total``
+    (the D read from ``done`` events over those history windows) and ``d_requests`` (their requests).
+    A ``done`` without usage flags the window ``done_no_usage`` and adds nothing.
 ``done_or_predicted`` (sensitivity only, not the paper)
     as ``done_tokens``, but a request of a concluded window still in flight at the forecast
     instant contributes its Tier-2 predicted length ``D_hat`` (the look-ahead map's prediction,
     with the configured load error, computed at arrival from ``max_tokens``), replaced by its
-    ``out_tokens`` once its ``done`` precedes a later forecast instant. The info logs
+    ``out_tokens`` once its ``done`` precedes a later forecast instant; a ``done`` without usage
+    drops the prediction from the next forecast instant on (its D is unknown: ``d_unknown``,
+    ``d_no_usage``). The info logs
     ``d_actual`` / ``d_predicted`` (history totals) and ``d_split`` ``[[window, actual,
     predicted]]`` for the windows with a predicted part.
 ``arrival_max_tokens`` (before 2026-11-04, kept to reproduce those runs)
@@ -231,6 +234,8 @@ class MlstmTier1:
     _done: dict = field(default_factory=dict)
     #: done_or_predicted: window -> {req_id: D_hat}
     _pred: dict = field(default_factory=dict)
+    #: window -> {req_id: done Redis ms} of done events without usage (D unknown from then on)
+    _no_usage: dict = field(default_factory=dict)
     _n_req: dict = field(default_factory=dict)
     unknown_done: int = 0
 
@@ -287,37 +292,41 @@ class MlstmTier1:
             return
         if out_tokens is None:
             self.flag(i, "done_no_usage")
+            self._no_usage.setdefault(i, {})[req_id] = int(t_ms)
             return
         self._done.setdefault(i, []).append((int(t_ms), max(0, int(out_tokens)), req_id))
 
-    def _d_known(self, i: int, cut_ms: int) -> tuple[float, float, int]:
+    def _d_known(self, i: int, cut_ms: int) -> tuple[float, float, int, int]:
         """Window ``i`` as known at ``cut_ms``: (D from its done events before then, D_hat of its
-        other requests (``done_or_predicted``; else 0), requests whose done is not in yet)."""
+        other requests still in flight then (``done_or_predicted``; else 0), requests whose D is not
+        known (done not in yet, or done without usage), of those the done-without-usage ones)."""
         seen = [(out, rid) for ts, out, rid in self._done.get(i, ()) if ts < cut_ms]
         actual = float(sum(out for out, _ in seen))
+        gone = {rid for rid, ts in self._no_usage.get(i, {}).items() if ts < cut_ms}
         pred = 0.0
         if self.d_source == DONE_OR_PREDICTED:
-            ids = {rid for _, rid in seen}
+            ids = {rid for _, rid in seen} | gone
             pred = float(sum(d for rid, d in self._pred.get(i, {}).items() if rid not in ids))
-        return actual, pred, self._n_req.get(i, 0) - len(seen)
+        return actual, pred, self._n_req.get(i, 0) - len(seen), len(gone)
 
     def _history_d(self, idx_now: int) -> tuple[list, dict]:
         """The D history as known at the start of window ``idx_now`` and what it is made of."""
         if self.d_source not in BY_DONE:
             return list(self.hist_d), {}
         cut = self.t0_ms + int(round(idx_now * self.window_s * 1000.0))
-        out, unknown, tot_a, tot_p, split = [], 0, 0.0, 0.0, []
+        out, unknown, no_usage, n_req, tot_a, tot_p, split = [], 0, 0, 0, 0.0, 0.0, []
         for v, w in zip(self.hist_d, self.hist_dw):
             if w is None:
                 out.append(v)
                 continue
-            a, p, u = self._d_known(w, cut)
+            a, p, u, g = self._d_known(w, cut)
             out.append(a + p)
-            unknown += u
+            unknown, no_usage, n_req = unknown + u, no_usage + g, n_req + self._n_req.get(w, 0)
             tot_a, tot_p = tot_a + a, tot_p + p
             if p > 0:
                 split.append([w, a, p])
-        info: dict = {"d_unknown": unknown}
+        # per forecast: how much of the observed D history is known (paper literal: done tokens only)
+        info: dict = {"d_unknown": unknown, "d_requests": n_req, "d_total": tot_a, "d_no_usage": no_usage}
         if self.d_source == DONE_OR_PREDICTED:
             info.update(d_actual=tot_a, d_predicted=tot_p, d_split=split)
         return out, info
@@ -343,7 +352,7 @@ class MlstmTier1:
             self.closed = i
         # windows that left the history: their done events are no longer read
         keep = {w for w in self.hist_dw if w is not None}
-        for store in (self._done, self._n_req, self._pred):
+        for store in (self._done, self._n_req, self._pred, self._no_usage):
             for w in [w for w in store if w <= self.closed and w not in keep]:
                 store.pop(w)
         if self._req_win:
