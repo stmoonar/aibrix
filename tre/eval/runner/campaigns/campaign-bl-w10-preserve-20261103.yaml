@@ -1,0 +1,140 @@
+# 2026-11-03 PreServe with a 10 s decision window on the 7 ICSE-suite traces (user decision 2026-11-03), seed 1, 8 arms:
+# 7 x PreServe (trace-major, file order), then ONE APA rerun on Alternating at the END. NO TRE arm, NO TokenScale arm.
+# WHY: does the 10 s window improve PreServe? Same trace files and registry as campaign-bl-w10-apa-ts-20261103 (APA and
+# TokenScale at 10 s), so the three baselines at 10 s can be compared trace by trace.
+# WHAT CHANGED against the PreServe arms of the first sample and of campaign-bl-rep2-r3e-20261103 (both: window 30 s):
+#   - window_s 30 -> 10 in tre/deploy/baselines/tre/policy-configmaps.yaml (tre-v2-baseline-preserve);
+#   - Tier-1 mLSTM weights retrained for W = 10 s by the repo trainer (tre/baselines/preserve_train, v1 paper_past protocol):
+#     tre/baselines/weights/preserve-mlstm-20261103-paper-w10/{code,conv,pooled}-paper-w10.npz (manifest.json, REPORT.md);
+#     the image must hold them (the policy refuses weights whose window_s differs from the ConfigMap's);
+#   - history before t0 at 10 s: <trace dir>/preserve_history_w10.json (tools/preserve_history_azure, method
+#     azure-segment-v1-20261031; the same segment as the 30 s histories), sha256 list
+#     tre/baselines/histories/preserve_history_w10-20261103.sha256 (paths relative to ${CAMPAIGN_DATA_ROOT}); the runner copies it
+#     next to the oracle trace under the name preserve_history.history_names(10) (no history_path).
+#   Everything else of PreServe (mu, load errors, Tier-2, drain) is as in the earlier samples; the history magnitude rule is unchanged.
+# The runner applies the ConfigMap file of ITS checkout (env BL_CM_FILE below, rendered per trace by the runner), so this campaign
+# must run from a checkout that holds the 10 s files: feat/bl-window10-20261103 (or main after its merge), and the baseline-scaler
+# image must be built from a commit with the same tre/baselines tree (the driver checks both; image tag = parameter EXPECT_BL).
+# APA RERUN (last arm, id apa-rerun, label APA-kvcache-rerun): APA x Alternating once more, because the first APA arm of
+# campaign-bl-w10-apa-ts-20261103 overlapped a make check on the control-plane node (16:22-16:25). The distinct arm id and label keep
+# both runs separate. The APA CRs come from the checkout (deploy/baselines/apa, window 10 s), as in that batch.
+# Traces (first sample: the run each trace file was generated for), the files replayed now (traces_tre.effective.json), the same
+# files (sha256) as campaign-bl-w10-apa-ts-20261103:
+#   Alternating_hot_model_periodic_A   r3c k1.65   traces-icse-r3c-20261101   sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+#   Simultaneous_spike_ramp_twice_tps1o2 r3c k1.325 traces-icse-r3c-20261101   sha256 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93
+#   Prefill_mixed_corner_decode_mix    r3c k1.7    traces-icse-r3c-20261101   sha256 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e
+#   Decode_heavy_burst                 ktrace x1.2 traces-icse-ktrace-20261031 sha256 f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929
+#   Sinusoidal_demand                  ktrace x1.3 traces-icse-ktrace-20261031 sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+#   Real_conv_2023_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5
+#   Real_code_2024_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c
+# The baselines read no TRE parameter: the registry is pinned to the live one (registry_expect, a hard pre-check of every arm), the
+# same id as campaign-bl-w10-apa-ts-20261103.
+#
+# RUN ORDER (user 2026-11-03): PreServe on the 7 traces in file order first (results come first), then the APA rerun. order: fixed;
+# the 8th trace entry is Alternating again with its own arm list. The FIRST run is PreServe x Alternating: check it at once with
+# first_run_check.py.
+# ETA: ~920 s per arm (720 s trace + ~200 s overhead; campaign-bl-w10-apa-ts-20261103 arms 905 s wall, PreServe arms of
+# campaign-bl-rep2-r3e-20261103 ~937 s) -> 8 arms ~2.0 h (+ first pre-check / reset 2-10 min; + about 17 min per retried arm).
+#
+# Parameters (environment): CAMPAIGN_DATA_ROOT = the directory with the results roots, the trace sets, the baseline trace volume
+# (baseline-traces, the hostPath of the baseline-scaler) and the exclusive-window marker (required); TRE_REPO = the tre/ tree of the
+# checkout (default: this checkout). Site-specific and NOT parameterised (YAML keys are not expanded): the node name under
+# precheck.disk_min_free_gb.nodes.
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-bl-w10-preserve-20261103.yaml --dry-run
+#   CAMPAIGN_DATA_ROOT=... EXPECT_BL=tre-v2-baseline-scaler:<tag> bash tre/eval/runner/drivers/bl-w10-preserve-20261103/run_campaign-bl-w10-preserve-20261103.sh --check
+#   python3 tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/preserve   # after run 1, then every 50 min
+name: campaign-bl-w10-preserve-20261103
+round: campaign-bl-w10-preserve-20261103
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-w10-preserve-20261103-run
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [preserve]          # every trace entry but the last; the last one lists its own arm (apa-rerun)
+order: fixed
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 200, report_s: 150}
+
+arm_defs:
+  preserve: {base: preserve, label: PreServe, policy: {tier1: mlstm}}
+  apa-rerun: {base: apa, label: APA-kvcache-rerun}
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces    # = the hostPath of the baseline-scaler's trace volume
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+registry_expect:
+  registry_id: f75155148eba1e61     # live registry since 2026-11-03 13:49; the same pin as campaign-bl-w10-apa-ts-20261103
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+report:
+  enabled: false                    # project rule 2026-11-02: no reports while a campaign runs (viz.sh afterwards)
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: apa-rerun
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; per-trace dir = <trace set>/<trace>/seed1 (traces_tre.effective.json, manifest.json,
+# preserve_history_w10.json)
+traces:
+  - trace: Alternating_hot_model_periodic_A
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+    # Alternating r3c k1.65
+  - trace: Simultaneous_spike_ramp_twice_tps1o2
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+    # Simultaneous r3c k1.325
+  - trace: Prefill_mixed_corner_decode_mix
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+    # Prefill_mixed r3c k1.7
+  - trace: Decode_heavy_burst
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+    # Decode_heavy ktrace x1.2
+  - trace: Sinusoidal_demand
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+    # Sinusoidal ktrace x1.3
+  - trace: Real_conv_2023_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+    # Real_conv r3e
+  - trace: Real_code_2024_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+    # Real_code r3e
+  - trace: Alternating_hot_model_periodic_A
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+    arms: [apa-rerun]
+    # APA rerun (the first APA arm of campaign-bl-w10-apa-ts-20261103 overlapped a make check); last
