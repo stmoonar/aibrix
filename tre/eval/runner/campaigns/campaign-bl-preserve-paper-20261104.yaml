@@ -1,0 +1,168 @@
+# 2026-11-04 PreServe as in the paper (user decisions 2026-11-04, HANDOFF §3 B / B2) on the 7 ICSE-suite traces, seed 1, 18 arms:
+#   a. PreServe V2 (one mLSTM per model trained on the 7 traces concatenated) x 7 traces (file order);
+#   b. PreServe V1 (one mLSTM per trace x model trained on that trace's own past; Real_* on the real Azure past) x 7 traces;
+#   c. sensitivity, V1: tier1_d_source done_or_predicted (an in-flight request counts its Tier-2 D_hat) x Decode_heavy, Real_code;
+#   d. sensitivity, V1: mu calibrated with TTFT + TPOT idle-multiple limits instead of NL_SLO x Decode_heavy, Real_code.
+# NO TRE / APA / TokenScale arm.
+# WHAT CHANGED against campaign-bl-w10-preserve-20261103 (PreServe at 10 s, the weights / mu / Tier-1 of 2026-11-03):
+#   - mu: PreServe Alg. 1 on dataset A (the TSS / theta training set), 10 s windows, rates of the arriving requests, a window is
+#     clean when every request meets NL_SLO (62.38 / 64.97 / 43.34 ms, tools/preserve_nl_slo), max over clean windows, envelope c
+#     (window mean input / output in the evaluation traces' range): tools/preserve_mu alg1 at 43edd63e, final file
+#     calib_preserve_mu_20261104/repro-43edd63e/alg1-env-c/mu.yaml (sha256 54a4bb757bdc49ba6ce2f1c302538d3aa9cde1df52ae29eb6fe25e8ca64636cf;
+#     chain tre/baselines/docs/preserve-mu-calibration.md), rendered into the ConfigMap by tools/freeze_params preserve
+#     (7b 10137.6 / 7424 / 12672, 8b 8140.8 / 5056 / 10176, 14b 6374.4 / 4480 / 7968 tok/s p / d / t);
+#   - Tier-1 as in the paper: tier1_horizon paper_two_step (Alg. 2: two steps at the start of T_i -> N_{i+1}), tier1_d_source
+#     done_tokens (D of a window = done out_tokens known before the forecast instant; the in-flight part is logged per forecast as
+#     d_unknown of d_requests, d_total; to be disclosed), load_error_mode paper_tab2_relative, underload_pending_gate false;
+#   - predictors: tre/baselines/weights/preserve-mlstm-20261104-trace-w10 (min-max, paper Alg. 1; preserve_train/trace_train.py),
+#     ConfigMap sets v2 (default rules: every trace -> v2) and v1-<trace>; a V1 arm sets predictor_rules (every trace -> v1-<trace>,
+#     = freeze_params.predictor_rules("v1")). The synthetic traces' training realizations differ from the evaluation one by
+#     0.3-2.2 % per window (V1 is PreServe's best case there; disclosed); Real_* V1 is trained on the real Azure past of the slice;
+#   - history before t0: history_variant train-tail-20261104 = the last 25 windows of the trace's training series
+#     (preserve_history_w10_train-tail-20261104.json); not next to the evaluation traces: the runner copies it from
+#     preserve.history_root/<trace set>/<trace>/seed1/ (sha256 list tre/baselines/histories/preserve_history_w10_train-tail-20261104.sha256,
+#     paths relative to ${CAMPAIGN_DATA_ROOT}/datasets/preserve-train-trace-20261104).
+# Sensitivity d (arm preserve-v1-mutt): mu = calib_preserve_mu_20261104/alg1-d379c2f0-env-c-ttfttpot/mu.yaml (sha256
+#   3026ff397d385d9481c6e0bc8960ca1b726cd41881b288de063ef2c0b7727d02; preserve_mu alg1 --rule ttft_tpot at d379c2f0), values below
+#   (the driver checks them against the file).
+# Scoring: the TTFT + TPOT standard (as before); the new idle-multiple SLO is applied offline afterwards (user 2026-11-04).
+# Traces = the files of campaign-bl-w10-preserve-20261103 (same sha256 list):
+#   Alternating_hot_model_periodic_A   r3c k1.65   traces-icse-r3c-20261101   sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+#   Simultaneous_spike_ramp_twice_tps1o2 r3c k1.325 traces-icse-r3c-20261101   sha256 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93
+#   Prefill_mixed_corner_decode_mix    r3c k1.7    traces-icse-r3c-20261101   sha256 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e
+#   Decode_heavy_burst                 ktrace x1.2 traces-icse-ktrace-20261031 sha256 f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929
+#   Sinusoidal_demand                  ktrace x1.3 traces-icse-ktrace-20261031 sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+#   Real_conv_2023_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5
+#   Real_code_2024_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c
+# The baselines read no TRE parameter: the registry is pinned to the live one (registry_expect), the same id as the 11-03 batches.
+#
+# RUN ORDER (user 2026-11-04): V2 x 7 first, then V1 x 7, then the 4 sensitivity arms. order: fixed (trace entries in file order,
+# one arm each). The FIRST run is PreServe-V2 x Alternating: check it at once with first_run_check.py.
+# ETA: ~920 s per arm (720 s trace + ~200 s overhead, as campaign-bl-w10-preserve-20261103) -> 18 arms ~4.6 h.
+#
+# Parameters (environment): CAMPAIGN_DATA_ROOT = the directory with the results roots, the trace sets, the baseline trace volume
+# (baseline-traces), datasets/ and the exclusive-window marker (required); TRE_REPO = the tre/ tree of the checkout (default: this
+# checkout). Site-specific and NOT parameterised: the node name under precheck.disk_min_free_gb.nodes.
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-bl-preserve-paper-20261104.yaml --dry-run
+#   CAMPAIGN_DATA_ROOT=... EXPECT_BL=tre-v2-baseline-scaler:<tag> bash tre/eval/runner/drivers/bl-preserve-paper-20261104/run_campaign-bl-preserve-paper-20261104.sh --check
+#   python3 tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/preserve-v2   # after run 1
+name: campaign-bl-preserve-paper-20261104
+round: campaign-bl-preserve-paper-20261104
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-preserve-paper-20261104-run
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [preserve-v2]       # every trace entry lists its own arm
+order: fixed
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 200, report_s: 150}
+
+arm_defs:
+  # the ConfigMap default (V2 rules, done_tokens, NL mu)
+  preserve-v2: {base: preserve, label: PreServe-V2, policy: {tier1: mlstm}}
+  preserve-v1:
+    base: preserve
+    label: PreServe-V1
+    policy:
+      tier1: mlstm
+      # every trace -> its own v1 set (= tre_baselines.tools.freeze_params.predictor_rules("v1"); guard test)
+      predictor_rules: &v1_rules
+        - [Alternating_hot_model_periodic_A, v1-Alternating_hot_model_periodic_A]
+        - [Simultaneous_spike_ramp_twice_tps1o2, v1-Simultaneous_spike_ramp_twice_tps1o2]
+        - [Prefill_mixed_corner_decode_mix, v1-Prefill_mixed_corner_decode_mix]
+        - [Decode_heavy_burst, v1-Decode_heavy_burst]
+        - [Sinusoidal_demand, v1-Sinusoidal_demand]
+        - [Real_conv_2023_slice_a_tok70, v1-Real_conv_2023_slice_a_tok70]
+        - [Real_code_2024_slice_a_tok70, v1-Real_code_2024_slice_a_tok70]
+  preserve-v1-dpred:
+    base: preserve
+    label: PreServe-V1-Dpred
+    policy: {tier1: mlstm, predictor_rules: *v1_rules, tier1_d_source: done_or_predicted}
+  preserve-v1-mutt:
+    base: preserve
+    label: PreServe-V1-muTT
+    policy:
+      tier1: mlstm
+      predictor_rules: *v1_rules
+      mu:                 # alg1-d379c2f0-env-c-ttfttpot/mu.yaml (TTFT + TPOT clean-window rule)
+        dsqwen-7b: {p: 8832.0, d: 5376.0, t: 11040.0}
+        dsllama-8b: {p: 7603.2, d: 5056.0, t: 9504.0}
+        dsqwen-14b: {p: 6374.4, d: 4480.0, t: 7968.0}
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces    # = the hostPath of the baseline-scaler's trace volume
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+  history_root: ${CAMPAIGN_DATA_ROOT}/datasets/preserve-train-trace-20261104/history   # <set>/<trace>/seed1/<variant file>
+
+registry_expect:
+  registry_id: f75155148eba1e61     # live registry since 2026-11-03 13:49; the same pin as the 11-03 baseline batches
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+report:
+  enabled: false                    # project rule 2026-11-02: no reports while a campaign runs (viz.sh afterwards)
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: preserve-v2
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; per-trace dir = <trace set>/<trace>/seed1
+traces:
+  # a. V2 x 7
+  - {trace: Alternating_hot_model_periodic_A, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1", arms: [preserve-v2]}
+  - {trace: Simultaneous_spike_ramp_twice_tps1o2, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1", arms: [preserve-v2]}
+  - {trace: Prefill_mixed_corner_decode_mix, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1", arms: [preserve-v2]}
+  - {trace: Decode_heavy_burst, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1", arms: [preserve-v2]}
+  - {trace: Sinusoidal_demand, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1", arms: [preserve-v2]}
+  - {trace: Real_conv_2023_slice_a_tok70, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1", arms: [preserve-v2]}
+  - {trace: Real_code_2024_slice_a_tok70, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1", arms: [preserve-v2]}
+  # b. V1 x 7
+  - {trace: Alternating_hot_model_periodic_A, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1", arms: [preserve-v1]}
+  - {trace: Simultaneous_spike_ramp_twice_tps1o2, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1", arms: [preserve-v1]}
+  - {trace: Prefill_mixed_corner_decode_mix, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1", arms: [preserve-v1]}
+  - {trace: Decode_heavy_burst, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1", arms: [preserve-v1]}
+  - {trace: Sinusoidal_demand, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1", arms: [preserve-v1]}
+  - {trace: Real_conv_2023_slice_a_tok70, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1", arms: [preserve-v1]}
+  - {trace: Real_code_2024_slice_a_tok70, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1", arms: [preserve-v1]}
+  # c. V1 + D completed by the Tier-2 prediction (sensitivity)
+  - {trace: Decode_heavy_burst, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1", arms: [preserve-v1-dpred]}
+  - {trace: Real_code_2024_slice_a_tok70, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1", arms: [preserve-v1-dpred]}
+  # d. V1 + mu of the TTFT + TPOT rule (sensitivity)
+  - {trace: Decode_heavy_burst, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1", arms: [preserve-v1-mutt]}
+  - {trace: Real_code_2024_slice_a_tok70, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1", arms: [preserve-v1-mutt]}
