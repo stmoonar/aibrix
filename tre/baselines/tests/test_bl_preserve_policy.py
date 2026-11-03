@@ -2,6 +2,7 @@
 mLSTM Tier-1, load errors."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -243,8 +244,8 @@ def test_first_tokens_before_the_first_awake_snapshot_are_retained():
     assert d.inputs["anom"]["ft_buffered_applied"] == 1
 
 
-def test_waiting_does_not_advance_decode_and_blocks_underload_shrink():
-    p = make()
+def test_waiting_does_not_advance_decode_and_blocks_underload_shrink_only_with_the_old_gate():
+    p = make(underload_pending_gate=True)
     p.decide(snap(1000, [pod("p0", 1000)], [ev("arr", "q", "p0", 1000, 2000, 50)]))
     d = p.decide(snap(5000, [pod("p0", 5000)]))["m"]
     assert d.inputs["tier2"]["p0"]["reqs"] == 0
@@ -253,6 +254,12 @@ def test_waiting_does_not_advance_decode_and_blocks_underload_shrink():
     d = p.decide(snap(6000, [pod("p0", 6000)], [ev("ft", "q", "p0", 6000)]))["m"]
     assert d.inputs["tier2"]["p0"]["reqs"] == 1
     assert d.inputs["tier2"]["p0"]["U0"] == pytest.approx(0.2)
+    # the paper's rule (default): a queued / prefilling request is not in the map and does not block it
+    pods = [pod("p0", 1000), pod("p1", 1000)]
+    d = make().decide(snap(1000, pods, [ev("arr", "q", "p0", 1000, 2000, 50)]))["m"]
+    assert d.reason == "tier2_underload" and d.desired == 1
+    d = make(underload_pending_gate=True).decide(snap(1000, pods, [ev("arr", "q", "p0", 1000, 2000, 50)]))["m"]
+    assert d.inputs["down"] == "pending_prefill" and d.desired == 2
 
 
 def test_wake_keeps_new_attempts_and_rejects_old_attempt_events():
@@ -564,6 +571,27 @@ def test_an_in_flight_requests_d_is_not_visible_before_its_done() -> None:
     assert preds["response"].calls[-2] == [0.0, 780.0, 0.0] and info["d_unknown"] == 0
 
 
+def test_done_or_predicted_counts_an_in_flight_request_by_its_d_hat_until_done() -> None:
+    """Sensitivity mode: at the boundary an in-flight request of a concluded window contributes its
+    Tier-2 D_hat (with the load error); at the next boundary, after its done, its actual tokens."""
+    p, preds = mlstm(history=[[3000.0, 0.0]] * 3, tier1_horizon="paper_two_step",
+                     tier1_d_source="done_or_predicted", load_error_mode="paper_tab2_relative",
+                     out_len_is_upper_bound=False)
+    pods = [pod("p0", 1000)]
+    p.decide(snap(1000, pods, replay=REPLAY))
+    evs = [*load("a", "p0", 5000, 1200, 600), *load("b", "p0", 6000, 1800, 300),
+           ev("done", "a", "p0", 20_000, out=500)]
+    p.decide(snap(21_000, pods, evs, replay=REPLAY))
+    d = p.decide(snap(32_000, pods, [ev("done", "b", "p0", 31_000, out=280)], replay=REPLAY))["m"]
+    d_hat_b = p._predicted_len("m", "c-b", 300, 1800)
+    assert d_hat_b != 300  # the load error, not the max_tokens oracle
+    assert preds["response"].calls[-2] == [0.0, 0.0, 500.0 + d_hat_b]
+    assert d.inputs["tier1"]["d_split"] == [[0, 500.0, float(d_hat_b)]]
+    _, info = p._models["m"].mlstm[1].decide(2)
+    assert preds["response"].calls[-2] == [0.0, 780.0, 0.0]
+    assert (info["d_predicted"], info["d_split"]) == (0.0, [])
+
+
 def test_paper_two_step_oracle_and_the_last_window() -> None:
     p = make(tier1_horizon="paper_two_step")
     pods = [pod("p0", 1000)]
@@ -664,6 +692,29 @@ def test_load_errors_are_a_function_of_the_client_id_and_enter_the_map() -> None
     assert not amap(p, "p0").requests
     assert amap(p, "p1").requests[("x", "p1")].D_pred == p.errors.predict("m", "c-x", 400, 100, p.max_model_len)
     assert d["m"].inputs["load_err"]["cum"]["n"] == 1
+
+
+def test_default_load_errors_are_relative_to_the_length_and_keyed_by_the_client_id() -> None:
+    """paper_tab2_relative (default): err = sign * |r| * D, |r| of the Tab. 2 fit, one draw per
+    (seed, model, client id), the sign symmetric."""
+    from tre_baselines.policies import preserve_load_errors as le
+
+    p = PreServePolicy(cfg({"mu": {"m": dict(MU)}, "tier1": "oracle", "window_s": 600.0,
+                            "out_len_is_upper_bound": False}), oracle=ORACLE)
+    assert isinstance(p.errors, le.Tab2RelativeErrors)
+    e = p.errors
+    rs = [e.rel_error("m", f"c{i}") for i in range(20_000)]
+    assert rs[:50] == [le.Tab2RelativeErrors(0).rel_error("m", f"c{i}") for i in range(50)]
+    assert 0.48 < sum(r > 0 for r in rs) / len(rs) < 0.52
+    mx = le.REL_MIXTURE
+    half_s2 = mx["sigma"] ** 2 / 2
+    mean_abs = (1 - mx["w"]) * math.exp(mx["mu1"] + half_s2) + mx["w"] * math.exp(mx["mu2"] + half_s2)
+    assert sum(abs(r) for r in rs) / len(rs) == pytest.approx(mean_abs, rel=0.03)
+    # relative: the same request is off by ten times more tokens at ten times the length
+    for k in ("c1", "c2", "c3"):
+        r = e.rel_error("m", k)
+        assert e.predict("m", k, 1000, 10, 131072) == max(1, 1000 + round(r * 1000))
+        assert e.predict("m", k, 100, 10, 131072) == max(1, 100 + round(r * 100))
 
 
 def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:

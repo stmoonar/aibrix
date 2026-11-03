@@ -34,7 +34,9 @@ mu:
   dsqwen-14b: {p: 0.0, d: 0.0, t: 0.0}
 
 # --- Tier-2 (in-window, per pod, paper §4.3.1 / §4.3.2) ---
-load_error_mode: paper_tab2   # paper RQ2 "PreServe w/ load errors"; none = max_tokens exact
+load_error_mode: paper_tab2_relative   # paper RQ2 "w/ load errors": Tab. 2 fitted as a relative error on
+                          # ShareGPT; paper_tab2 = absolute tokens (runs before 2026-11-04); none = exact
+underload_pending_gate: false   # paper §4.3.2; true = runs before 2026-11-04
 max_model_len: 131072
 # max_output_len: 4096    # default: the trace's largest max_tokens per model, else 4096
 map_factor: 1.2

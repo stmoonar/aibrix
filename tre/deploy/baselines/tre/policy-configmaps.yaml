@@ -94,6 +94,8 @@ data:
     window_s: 10             # = TRE metrics window (2026-11-03; 30 s before, v1 D18; paper 600 s)
     lead_s: 0
     tier1: mlstm             # paper forecaster; v1 paper_past protocol at W = 10 s (train before the Real_* slices)
+    tier1_horizon: paper_two_step   # paper Alg. 2: two steps at the start of T_i -> N_{i+1} (2026-11-04)
+    tier1_d_source: done_tokens     # paper: observed D = done out_tokens, known at completion (2026-11-04)
     seq_len: 25
     predictors:              # relative paths: under tre/baselines (in the image /app/tre/baselines)
       code: {path: weights/preserve-mlstm-20261103-paper-w10/code-paper-w10.npz, sha256: f8b74a2b91cd570e3b9b565ae8ac0fb5d47a7e9366699bf138d40f91509340c2}
@@ -105,7 +107,8 @@ data:
       dsqwen-7b: {"p": 6775.7, "d": 5137.7, "t": 9547.0}
       dsllama-8b: {"p": 3196.9, "d": 4458.1, "t": 7655.0}
       dsqwen-14b: {"p": 6164.9, "d": 4013.3, "t": 7533.4}
-    load_error_mode: paper_tab2   # paper RQ2 'PreServe w/ load errors' (Tab. 2 error model)
+    load_error_mode: paper_tab2_relative   # paper RQ2 'w/ load errors': Tab. 2 as a relative error (2026-11-04)
+    underload_pending_gate: false   # paper §4.3.2 scale-in rule only (2026-11-04)
     load_error_seed: 0       # the same draws in every arm and replay seed (as TokenScale seed: 0)
     max_model_len: 131072
     map_factor: 1.2

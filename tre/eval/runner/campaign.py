@@ -78,10 +78,10 @@ PRESERVE_KEYS = {"calibration", "trace_path", "trace_seed", "trace_schedule", "t
                  "window_s", "lead_s", "tier1", "tier1_horizon", "tier1_d_source", "noise_sigma", "noise_seed", "seq_len", "predictors",
                  "predictor_rules", "history_path", "mu", "load_error_mode", "load_error_seed", "max_model_len",
                  "max_output_len", "map_factor", "lookahead_iters", "kv_high", "overload_frac", "t_f", "ext_frac",
-                 "out_len_is_upper_bound", "t2_reset_at_window", "kv_capacity_tokens", "kv_agree_tol", "req_ttl_s"}
+                 "out_len_is_upper_bound", "t2_reset_at_window", "underload_pending_gate", "kv_capacity_tokens", "kv_agree_tol", "req_ttl_s"}
 TIER1_MODES = ("mlstm", "oracle_noisy", "oracle", "last_window")
 TIER1_HORIZONS = ("paper_two_step", "one_step_now")
-TIER1_D_SOURCES = ("done_tokens", "arrival_max_tokens")
+TIER1_D_SOURCES = ("done_tokens", "done_or_predicted", "arrival_max_tokens")
 # controller ablation switches an arm may set (arm_defs.<id>.controller_env, base tre only). run_arm_pilot.sh
 # sets them on the controller Deployment before the arm, checks the controller's startup log line
 # `ablation_switches` and puts every one back to "false" (production) at the end of the arm.

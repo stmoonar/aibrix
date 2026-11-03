@@ -25,6 +25,13 @@ Observed ``D`` (``tier1_d_source``, 2026-11-04):
     request; a later forecast sees the later ``done`` events of the same window. The info logs
     ``d_unknown`` (history requests whose ``done`` is not yet in). A ``done`` without usage
     flags the window ``done_no_usage`` and adds nothing.
+``done_or_predicted`` (sensitivity only, not the paper)
+    as ``done_tokens``, but a request of a concluded window still in flight at the forecast
+    instant contributes its Tier-2 predicted length ``D_hat`` (the look-ahead map's prediction,
+    with the configured load error, computed at arrival from ``max_tokens``), replaced by its
+    ``out_tokens`` once its ``done`` precedes a later forecast instant. The info logs
+    ``d_actual`` / ``d_predicted`` (history totals) and ``d_split`` ``[[window, actual,
+    predicted]]`` for the windows with a predicted part.
 ``arrival_max_tokens`` (before 2026-11-04, kept to reproduce those runs)
     ``D_j`` = the ``max_tokens`` of ``T_j``'s arrivals, known at arrival.
 
@@ -82,8 +89,10 @@ PAPER_TWO_STEP = "paper_two_step"
 ONE_STEP_NOW = "one_step_now"
 HORIZONS = (PAPER_TWO_STEP, ONE_STEP_NOW)
 DONE_TOKENS = "done_tokens"
+DONE_OR_PREDICTED = "done_or_predicted"
 ARRIVAL_MAX_TOKENS = "arrival_max_tokens"
-D_SOURCES = (DONE_TOKENS, ARRIVAL_MAX_TOKENS)
+D_SOURCES = (DONE_TOKENS, DONE_OR_PREDICTED, ARRIVAL_MAX_TOKENS)
+BY_DONE = (DONE_TOKENS, DONE_OR_PREDICTED)
 #: Paper Table 1, overall mean APE of PreServe's workload predictor.
 PAPER_MEAN_APE = 0.0617
 
@@ -218,8 +227,10 @@ class MlstmTier1:
     _flags: dict = field(default_factory=dict)
     #: done_tokens: gateway req_id of a new-demand arrival -> its window, until its done
     _req_win: dict = field(default_factory=dict)
-    #: done_tokens: window -> [(done Redis ms, out_tokens)]; requests per window
+    #: done_tokens: window -> [(done Redis ms, out_tokens, req_id)]; requests per window
     _done: dict = field(default_factory=dict)
+    #: done_or_predicted: window -> {req_id: D_hat}
+    _pred: dict = field(default_factory=dict)
     _n_req: dict = field(default_factory=dict)
     unknown_done: int = 0
 
@@ -239,7 +250,7 @@ class MlstmTier1:
         return int(math.floor((int(t_ms) - self.t0_ms) / (self.window_s * 1000.0)))
 
     def observe_arrival(self, t_ms: int, in_tokens: Optional[int], max_tokens: Optional[int],
-                        req_id: Optional[str] = None) -> None:
+                        req_id: Optional[str] = None, d_hat: Optional[int] = None) -> None:
         i = self.index(t_ms)
         if i < 0:
             self.pre_t0_arrivals += 1
@@ -248,7 +259,7 @@ class MlstmTier1:
             self.flag(i, "late_event")
             return
         o = self._obs.setdefault(i, _Obs())
-        by_done = self.d_source == DONE_TOKENS
+        by_done = self.d_source in BY_DONE
         if in_tokens is None or (max_tokens is None and not by_done):
             o.incomplete += 1
             return
@@ -259,12 +270,16 @@ class MlstmTier1:
         elif req_id:
             self._req_win[req_id] = i
             self._n_req[i] = self._n_req.get(i, 0) + 1
+            if self.d_source == DONE_OR_PREDICTED:
+                self._pred.setdefault(i, {})[req_id] = max(0, int(d_hat or 0))
+                if d_hat is None:
+                    o.incomplete += 1  # no prediction (no max_tokens): counts 0 until done
         else:
             o.incomplete += 1  # its done cannot be matched
 
     def observe_done(self, t_ms: int, req_id: Optional[str], out_tokens: Optional[int]) -> None:
         """``done_tokens``: a new-demand request completed; its response tokens join its arrival window."""
-        if self.d_source != DONE_TOKENS:
+        if self.d_source not in BY_DONE:
             return
         i = self._req_win.pop(req_id, None) if req_id else None
         if i is None:
@@ -273,27 +288,39 @@ class MlstmTier1:
         if out_tokens is None:
             self.flag(i, "done_no_usage")
             return
-        self._done.setdefault(i, []).append((int(t_ms), max(0, int(out_tokens))))
+        self._done.setdefault(i, []).append((int(t_ms), max(0, int(out_tokens)), req_id))
 
-    def _d_known(self, i: int, cut_ms: int) -> tuple[float, int]:
-        """(D of window ``i`` from the done events before ``cut_ms``, its requests still unknown)."""
-        seen = [out for ts, out in self._done.get(i, ()) if ts < cut_ms]
-        return float(sum(seen)), self._n_req.get(i, 0) - len(seen)
+    def _d_known(self, i: int, cut_ms: int) -> tuple[float, float, int]:
+        """Window ``i`` as known at ``cut_ms``: (D from its done events before then, D_hat of its
+        other requests (``done_or_predicted``; else 0), requests whose done is not in yet)."""
+        seen = [(out, rid) for ts, out, rid in self._done.get(i, ()) if ts < cut_ms]
+        actual = float(sum(out for out, _ in seen))
+        pred = 0.0
+        if self.d_source == DONE_OR_PREDICTED:
+            ids = {rid for _, rid in seen}
+            pred = float(sum(d for rid, d in self._pred.get(i, {}).items() if rid not in ids))
+        return actual, pred, self._n_req.get(i, 0) - len(seen)
 
-    def _history_d(self, idx_now: int) -> tuple[list, int]:
-        """The D history as known at the start of window ``idx_now`` (+ requests without done)."""
-        if self.d_source != DONE_TOKENS:
-            return list(self.hist_d), 0
+    def _history_d(self, idx_now: int) -> tuple[list, dict]:
+        """The D history as known at the start of window ``idx_now`` and what it is made of."""
+        if self.d_source not in BY_DONE:
+            return list(self.hist_d), {}
         cut = self.t0_ms + int(round(idx_now * self.window_s * 1000.0))
-        out, unknown = [], 0
+        out, unknown, tot_a, tot_p, split = [], 0, 0.0, 0.0, []
         for v, w in zip(self.hist_d, self.hist_dw):
             if w is None:
                 out.append(v)
-            else:
-                d, u = self._d_known(w, cut)
-                out.append(d)
-                unknown += u
-        return out, unknown
+                continue
+            a, p, u = self._d_known(w, cut)
+            out.append(a + p)
+            unknown += u
+            tot_a, tot_p = tot_a + a, tot_p + p
+            if p > 0:
+                split.append([w, a, p])
+        info: dict = {"d_unknown": unknown}
+        if self.d_source == DONE_OR_PREDICTED:
+            info.update(d_actual=tot_a, d_predicted=tot_p, d_split=split)
+        return out, info
 
     def flag(self, i: int, why: str) -> None:
         """Mark window ``i`` as observed with a gap (logged with the closed window)."""
@@ -304,7 +331,7 @@ class MlstmTier1:
         for i in range(self.closed + 1, min(idx_now, self.n_windows)):
             o = self._obs.pop(i, _Obs())
             self.hist_p = (self.hist_p + [o.P])[-self.seq_len:]
-            by_done = self.d_source == DONE_TOKENS
+            by_done = self.d_source in BY_DONE
             self.hist_d = (self.hist_d + [0.0 if by_done else o.D])[-self.seq_len:]
             self.hist_dw = (self.hist_dw + [i if by_done else None])[-self.seq_len:]
             self.observed += 1
@@ -316,7 +343,7 @@ class MlstmTier1:
             self.closed = i
         # windows that left the history: their done events are no longer read
         keep = {w for w in self.hist_dw if w is not None}
-        for store in (self._done, self._n_req):
+        for store in (self._done, self._n_req, self._pred):
             for w in [w for w in store if w <= self.closed and w not in keep]:
                 store.pop(w)
         if self._req_win:
@@ -338,9 +365,8 @@ class MlstmTier1:
         info: dict = {"window": idx_now, "target": idx_now + 1 if two else idx_now, "mode": "mlstm",
                       "horizon": self.horizon, "hist_observed": min(self.observed, self.seq_len),
                       "last_closed": self.last_closed}
-        hist_d, d_unknown = self._history_d(idx_now)
-        if self.d_source == DONE_TOKENS:
-            info["d_unknown"] = d_unknown
+        hist_d, d_info = self._history_d(idx_now)
+        info.update(d_info)
         try:
             p_hat, d_hat = self._step(self.hist_p, hist_d)
             if two:

@@ -47,10 +47,15 @@ Composition (v1 faithful)::
     paper window ``U[t, t + l)`` is above ``kv_high`` (a checker that runs every iteration
     between two ticks). A new overload episode on ``k`` pods: ``N_T2 = max(N_T1, N_T2) + k``
     (one extra instance per potentially overloaded instance, on the current count);
-  - **underload**, at most once per window: when every pod's ``max U[0:l] < T_f``,
-    ``N_T2 = max(1, ceil(sum max U / T_f))`` if that is below ``N_T2`` (the load packed onto
-    instances each at ``T_f``; the isolated ones are drained, see below);
-  - **incomplete evidence holds Tier-2 in both directions** (``frozen``): any gap of
+  - **underload**, at most once per window: when every pod's ``max U[0:l] < T_f`` (the paper's
+    next ``l`` iterations from now), ``N_T2 = max(1, ceil(sum max U / T_f))`` if that is below
+    ``N_T2`` (the load packed onto instances each at ``T_f``; the isolated ones are drained, see
+    below). The paper's rule only (2026-11-04): requests queued or prefilling (not yet in the
+    map, as in the paper) do not block it; ``underload_pending_gate: true`` restores the earlier
+    extra condition (no such request on any pod of the model, ``down: pending_prefill``);
+  - **infrastructure guard, not a PreServe rule**: incomplete *measurement* evidence holds
+    Tier-2 in both directions (``frozen``). The paper's system sees every request and every
+    iteration; ours reads them from scrapes and an event stream, which can have gaps. Any gap of
     :func:`~tre_baselines.snapshot.evidence_gaps` (event loss, unscraped pod, missing gauges,
     stale scrape) or a pod without a KV capacity. ``frozen`` (every tick, also under
     ``inputs``) and ``t2_hold`` (the reasons) are logged; the run's frozen-tick share is a
@@ -61,8 +66,8 @@ iterations, fraction carried; ``TPOT_pod`` = mean inter-token latency between th
 scrapes, else the model's TPOT SLO. Each event first walks its pod to the event's Redis time.
 
 A request is pending at ``arr`` and enters the decode look-ahead map at ``ft``
-(prefill completed). Waiting requests do not accrue imaginary decoded tokens and prevent
-evidence-free Tier-2 shrink. Attempt identity is (gateway req_id, pod); client_id links
+(prefill completed). Waiting requests do not accrue imaginary decoded tokens (and, with
+``underload_pending_gate``, prevent the Tier-2 shrink). Attempt identity is (gateway req_id, pod); client_id links
 sidecar reissues. A reissue supersedes its former execution immediately; a late parent
 ft/done cannot resurrect it or remove its successor. No routing rule changes.
 
@@ -98,7 +103,9 @@ tier1_horizon           paper_two_step         paper (Alg. 2 two-step at the sta
 tier1_d_source          done_tokens            paper (Alg. 1/2: D_j = response tokens of T_j's
                                                requests, known at completion: ``done`` out_tokens
                                                before the forecast instant); mlstm only;
-                                               ``arrival_max_tokens`` = runs before 2026-11-04
+                                               ``arrival_max_tokens`` = runs before 2026-11-04;
+                                               ``done_or_predicted`` = sensitivity (in-flight
+                                               requests count their Tier-2 D_hat until done)
 predictors              (required, mlstm)      ``{set: {path, sha256}}`` (v1 paper_past weights)
 predictor_rules         Real_code->code,       ``[[trace name prefix, set]]``; else ``pooled``
                         Real_conv->conv
@@ -108,7 +115,12 @@ history_path            <trace dir>/           the history before t0 (:mod:`pres
                         preserve_history.json  before the slice (Real_*)
 noise_sigma, noise_seed                        oracle_noisy only (sensitivity)
 mu                      (required)             paper Alg.1 (``tools/velocity_ladder mu``)
-load_error_mode         paper_tab2             paper RQ2 "w/ load errors" (Tab. 2) | none
+load_error_mode         paper_tab2_relative    paper RQ2 "w/ load errors": Tab. 2 as a relative error
+                                               fitted on ShareGPT (:mod:`preserve_load_errors`);
+                                               ``paper_tab2`` = Tab. 2 as absolute tokens (runs
+                                               before 2026-11-04) | none
+underload_pending_gate  false                  paper §4.3.2 (scale in on U < T_f alone); true = runs
+                                               before 2026-11-04 (also no queued/prefilling request)
 load_error_seed         config.seed            ours
 max_model_len           131072                 engine context (upper clip of D_hat)
 max_output_len          trace max max_tokens   map ring base length; int or {model: int}
@@ -348,9 +360,10 @@ class PreServePolicy:
                 raise ValueError(f"preserve: history lacks {self.seq_len} windows for {missing}")
 
         # load errors (paper RQ2 "PreServe w/ load errors")
-        self.load_error_mode = str(params.get("load_error_mode", "paper_tab2"))
+        self.load_error_mode = str(params.get("load_error_mode", "paper_tab2_relative"))
         self.errors = load_errors.make(self.load_error_mode, int(params.get("load_error_seed", cfg_seed)))
         self.max_model_len = int(params.get("max_model_len", 131072))
+        self.underload_pending_gate = bool(params.get("underload_pending_gate", False))
         self.out_len_is_upper_bound = bool(params.get("out_len_is_upper_bound", self.errors is None))
         if self.errors is not None and self.out_len_is_upper_bound:
             raise ValueError("preserve: with load errors D_hat is a prediction, not an upper bound "
@@ -567,7 +580,7 @@ class PreServePolicy:
                     st.pending.pop(e.pod)
             return
         if e.kind == "done":
-            if e.reissue == "none" and self.d_source == tier1.DONE_TOKENS:
+            if e.reissue == "none" and self.d_source in tier1.BY_DONE:
                 self._tier1_feed(st, e, t1m)  # before any Tier-2 bookkeeping: D is new demand, known now
             if key in st.gone_keys:
                 return
@@ -591,12 +604,20 @@ class PreServePolicy:
                                     e.ts_ms - st.pre_replay[0].ts_ms > self.req_ttl_ms):
                 st.pre_replay_lost_ms = st.pre_replay.popleft().ts_ms
 
-    @staticmethod
-    def _observe(t1m: tier1.MlstmTier1, e: RequestEvent) -> None:
+    def _observe(self, t1m: tier1.MlstmTier1, e: RequestEvent) -> None:
         if e.kind == "arr":
-            t1m.observe_arrival(int(e.ts_ms), e.in_tokens, e.max_tokens, e.req_id)
+            d_hat = None
+            if t1m.d_source == tier1.DONE_OR_PREDICTED and e.max_tokens and e.max_tokens > 0:
+                d_hat = self._predicted_len(e.model, e.draw_key or e.req_id, int(e.max_tokens), e.in_tokens)
+            t1m.observe_arrival(int(e.ts_ms), e.in_tokens, e.max_tokens, e.req_id, d_hat)
         elif e.kind == "done":
             t1m.observe_done(int(e.ts_ms), e.req_id, e.out_tokens)
+
+    def _predicted_len(self, model: str, draw_key: str, max_tokens: int, in_tokens: Optional[int]) -> int:
+        """The Tier-2 predicted response length D_hat (the map's; with load errors, keyed by the client id)."""
+        if self.errors is None:
+            return int(max_tokens)
+        return int(self.errors.predict(model, draw_key, int(max_tokens), int(in_tokens or 0), self.max_model_len))
 
     def _add(self, ms: ModelSnapshot, st: _ModelState, key, info: "_ArrInfo", pod: str, ps: _PodState,
              anom: Counter) -> None:
@@ -612,7 +633,7 @@ class PreServePolicy:
             D = self._mol(ms.model)
         true_d = int(D)
         if self.errors is not None and info.max_tokens:
-            D = self.errors.predict(ms.model, info.draw_key or key[0], true_d, int(P), self.max_model_len)
+            D = self._predicted_len(ms.model, info.draw_key or key[0], true_d, P)
             if not info.reissue:  # the realised error of new demand (a reissue repeats its original's)
                 st.err.add(true_d, int(D))
                 st.err_rows.append([info.draw_key or key[0], true_d, int(D)])
@@ -871,8 +892,8 @@ class PreServePolicy:
                                       else ("wall", int(snap.now_ms) // int(self.window_s * 1000)))
                 if not max_us:
                     down_info = "no_pods"
-                elif st.pending:
-                    down_info = "pending_prefill"  # queued/prefilling is not idle decode capacity
+                elif self.underload_pending_gate and st.pending:
+                    down_info = "pending_prefill"  # (old rule) queued/prefilling is not idle decode capacity
                 elif any(u >= self.t_f for u in max_us):
                     down_info = "above_t_f"
                 elif down_key == st.t2_down_key:
