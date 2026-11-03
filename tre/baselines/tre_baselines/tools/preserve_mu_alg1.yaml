@@ -1,0 +1,53 @@
+# Input of `python3 -m tre_baselines.tools.preserve_mu alg1 --config <this file> --data-root <root> --out <dir>`:
+# PreServe mu by Alg. 1 (arXiv 2504.03702v2) on the TRE TSS / theta training set ("dataset A"). User decisions 2026-11-04.
+#
+# Windows: the datasets' own 10 s tumbling grid; a request belongs to the window its send time falls in;
+# clean = no request failed / timed out and every request's NL = e2e / output tokens <= nl_slo_ms; no P-share filter.
+window_s: 10
+route_timeout_s: 150          # slo_judge's route timeout: a request running this long counts as failed
+
+# NL equivalent of the unified SLO at the model's mix shape (L_mix x out_mix, 10-26 isolated buckets report,
+# traces-v2-720-20261026): NL_slo = (TTFT_slo(L_mix) + (out_mix - 1) * TPOT_slo) / out_mix, TTFT_slo(L) =
+# max(500, 5 (c + b L)), TPOT_slo = 75 ms (local docs/slo-idle-multiples-20261104.md section 4.1).
+nl_slo_ms:
+  dsqwen-7b: 62.38
+  dsllama-8b: 64.97
+  dsqwen-14b: 43.34
+
+# The 11-03 TSS fit's training-set filter (calib_supp_20261103_fit_tools/supp_lib.py, sha256 0a6d0b1b9325c178...:
+# TRAIN_SPLITS, HELD_OUT_SHAPES, kept()), as the 11-04 feasibility audit applied it per window
+# (adhoc/preserve-mu-from-runs-20261104/mu_from_history.py load_A, sha256 4bb89056012b6622...).
+filters:
+  splits: [train, auxiliary]
+  cell_status: [valid]
+  held_out_shapes: [M, MP, MD, G800x240, U512x512, G512x256, G1200x240, G640x400, G1800x160, G3072x96,
+                    G4096x64, G256x768, G512x1024, ES, EL]
+  exclude_in_warmup: true
+  exclude_possibly_contaminated: true
+  window_inside_cell: true    # window_end_ms <= cells.csv end_ms (+1 ms)
+
+# The training sources (supp_lib OLD_SOURCES at 10 s + the 11-03 supplement blocks A, B), relative to --data-root.
+# old: calibration_dataset.py (main 9f2856a1) --attribution hybrid --queue-estimator raw_mean --numerator vllm_counter
+# --step-ms 10000 over calib_20261003/<stage>/<model>.
+sources:
+  dsqwen-7b:
+    - {name: run1,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/run1/dsqwen-7b/dataset_hybrid}
+    - {name: run2,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/run2/dsqwen-7b/dataset_hybrid}
+    - {name: supp,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/supp/dsqwen-7b/dataset_hybrid}
+    - {name: p1r2,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/p1r2/dsqwen-7b/dataset_hybrid}
+    - {name: suppA, path: calib_supp_20261103/datasets/w10000/A/dsqwen-7b/dataset_hybrid}
+    - {name: suppB, path: calib_supp_20261103/datasets/w10000/B/dsqwen-7b/dataset_hybrid}
+  dsllama-8b:
+    - {name: run1,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/run1/dsllama-8b/dataset_hybrid}
+    - {name: run2,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/run2/dsllama-8b/dataset_hybrid}
+    - {name: supp,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/supp/dsllama-8b/dataset_hybrid}
+    - {name: p1,    path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/p1/dsllama-8b/dataset_hybrid}
+    - {name: suppA, path: calib_supp_20261103/datasets/w10000/A/dsllama-8b/dataset_hybrid}
+    - {name: suppB, path: calib_supp_20261103/datasets/w10000/B/dsllama-8b/dataset_hybrid}
+  dsqwen-14b:
+    - {name: run1,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/run1/dsqwen-14b/dataset_hybrid}
+    - {name: run2b, path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/run2b/dsqwen-14b/dataset_hybrid}
+    - {name: supp,  path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/supp/dsqwen-14b/dataset_hybrid}
+    - {name: p1,    path: analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets/p1/dsqwen-14b/dataset_hybrid}
+    - {name: suppA, path: calib_supp_20261103/datasets/w10000/A/dsqwen-14b/dataset_hybrid}
+    - {name: suppB, path: calib_supp_20261103/datasets/w10000/B/dsqwen-14b/dataset_hybrid}

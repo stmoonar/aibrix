@@ -25,6 +25,15 @@ A **window** [lo, hi) holds the requests *sent* in it; it is SLO-clean when it h
 request and none violates. A served request without a first-token time (not streamed) cannot be
 judged: the window is refused (:class:`UnjudgeableWindow`), never judged on the rest.
 :func:`judge_windows` cuts a span into tumbling windows (10 s by default, user 2026-11-04).
+
+**NL rule** (PreServe's own SLO, arXiv 2504.03702v2: normalized latency NL = e2e / output tokens):
+:func:`judge_request_nl` / :func:`judge_window_nl` judge the same :class:`Request` records with one
+NL threshold per model (ms per output token; user 2026-11-04: the NL equivalent of the unified SLO at
+the model's mix shape, an input of the caller, never a constant here). Step 1 (failed / route
+timeout) is the same; else NL = ``(done - send) / completion_tokens`` > NL_slo -> ``nl``. A served
+request without an output-token count cannot be judged (:class:`UnjudgeableWindow`).
+:func:`from_dataset_row` adapts a ``calibration_dataset`` ``requests.csv`` row (the TSS / theta
+training set).
 """
 from __future__ import annotations
 
@@ -186,3 +195,80 @@ def judge_windows(requests: Sequence[Request], slo: Slo, *, window_s: float = DE
         out.append(judge_window(requests, lo, lo + window_s, slo, route_timeout_s=route_timeout_s))
         k += 1
     return out
+
+
+# ------------------------------------------------------------------ NL rule (PreServe)
+
+#: one NL SLO (ms per output token), or model -> NL SLO
+NlSlo = Union[float, Mapping[str, float]]
+NL_CAUSES = ("failed", "nl")
+
+
+def _num(v: Any) -> Optional[float]:
+    """A CSV / JSON number; '' / 'nan' / None -> None."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if not v or v.lower() == "nan":
+            return None
+    x = float(v)
+    return None if math.isnan(x) else x
+
+
+def from_dataset_row(row: Mapping[str, Any]) -> Request:
+    """A ``calibration_dataset`` ``requests.csv`` row (ms, csv strings or numbers): send / first / done
+    = ``send_ts_ms`` / ``first_token_ts_ms`` / ``done_ts_ms``, ok = ``outcome == "ok"``, prompt =
+    ``input_tokens`` (a failed request has none: ``expected_prompt_tokens``), completion =
+    ``output_tokens`` (None for a failed request)."""
+    def sec(key: str) -> Optional[float]:
+        x = _num(row.get(key))
+        return None if x is None else x / 1000.0
+
+    L = _num(row.get("input_tokens"))
+    if L is None:
+        L = _num(row.get("expected_prompt_tokens"))
+    ct = _num(row.get("output_tokens"))
+    return Request(model=str(row.get("model")), send=float(sec("send_ts_ms")), first=sec("first_token_ts_ms"),
+                   done=sec("done_ts_ms"), ok=str(row.get("outcome")) == "ok",
+                   prompt_tokens=None if L is None else int(L), completion_tokens=None if ct is None else int(ct),
+                   id=row.get("request_id"))
+
+
+def _nl_of(nl_slo: NlSlo, model: str) -> float:
+    if isinstance(nl_slo, Mapping):
+        if model not in nl_slo:
+            raise UnjudgeableWindow(f"no NL SLO for model {model!r}")
+        nl_slo = nl_slo[model]
+    v = float(nl_slo)
+    if not (math.isfinite(v) and v > 0):
+        raise ValueError(f"NL SLO for {model!r} must be > 0 ms, got {v}")
+    return v
+
+
+def judge_request_nl(req: Request, nl_slo: NlSlo, *,
+                     route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S) -> Dict[str, Any]:
+    """One request under PreServe's NL rule: ``{cause: failed|nl|None, nl_ms, nl_slo_ms}``."""
+    if not req.ok or req.done is None or req.done - req.send >= route_timeout_s:
+        return {"cause": "failed", "nl_ms": None, "nl_slo_ms": None}
+    ct = req.completion_tokens
+    if ct is None or int(ct) < 1:
+        raise UnjudgeableWindow(f"request {req.id} ({req.model}, sent {req.send:.3f}) was served without an "
+                                "output-token count: NL unknown")
+    thr = _nl_of(nl_slo, req.model)
+    nl = (req.done - req.send) * 1000.0 / int(ct)
+    return {"cause": "nl" if nl > thr else None, "nl_ms": nl, "nl_slo_ms": thr}
+
+
+def judge_window_nl(requests: Sequence[Request], lo: float, hi: float, nl_slo: NlSlo, *,
+                    route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S) -> Dict[str, Any]:
+    """The requests sent in [lo, hi) under the NL rule: count, violations by cause, NL p95 / max;
+    ``meets_slo`` = at least one request and no violation. Raises :class:`UnjudgeableWindow`."""
+    win = [r for r in requests if lo <= r.send < hi]
+    judged = [judge_request_nl(r, nl_slo, route_timeout_s=route_timeout_s) for r in win]
+    by = {c: sum(1 for j in judged if j["cause"] == c) for c in NL_CAUSES}
+    nl = [j["nl_ms"] for j in judged if j["nl_ms"] is not None]
+    n_viol = sum(by.values())
+    return {"lo": lo, "hi": hi, "n": len(win), "violations": n_viol, **{f"v_{c}": by[c] for c in NL_CAUSES},
+            "nl_p95_ms": _r(_q(nl, 0.95), 2), "nl_max_ms": _r(max(nl, default=None), 2),
+            "meets_slo": bool(win) and n_viol == 0}

@@ -61,7 +61,7 @@ tre_baselines/   snapshot.py (policy contract)  sources.py  loop.py  sm_client.p
                  policies/{chiron,tokenscale,preserve,static}.py   trace_oracle.py
                  policies/preserve_{tier1,anticipator,predictor,load_errors,history}.py
                  tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  velocity_ladder.py  freeze_params.py
-                          preserve_history{,_azure,_frozen}.py  tokenscale_profile.py  preserve_mu.py (old procedure)
+                          preserve_history{,_azure,_frozen}.py  tokenscale_profile.py  preserve_mu.py (old procedure; `alg1`: Alg. 1 on the TSS set)
 preserve_train/  offline trainer of weights/ (copy of the v1 trainer, needs torch; not imported by tre_baselines)
 weights/         preserve-mlstm-20261103-paper-w10/{code,conv,pooled}-paper-w10.npz (v1 paper_past at 10 s,
                  REPORT.md, the ConfigMap's); preserve-mlstm-20261024-paper/ (30 s, runs before 2026-11-03)
@@ -173,6 +173,13 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   v1's range was narrow because its traces were; `--p-share-range minmax` restores it). Tier-1 needs the
   history before t0 next to the trace (below). The old knee / closed-loop procedure (`tokenscale_profile`,
   `preserve_mu`) and its sensitivity rows (TokenScale-aggressive / window10, PreServe window600) are retired.
+- PreServe mu by the paper's Alg. 1, literally (user 2026-11-04): `python3 -m tre_baselines.tools.preserve_mu
+  alg1 --config tre_baselines/tools/preserve_mu_alg1.yaml --data-root <data root> --out <new dir>` on the TSS /
+  theta training set (the 11-03 fit's sources and window filters, listed in the config with the sha256 of
+  `supp_lib.py` and of the 11-04 audit script they were copied from). 10 s windows of the datasets' own grid,
+  requests by send time, clean = no failed request and every NL = e2e / output tokens <= the config's
+  `nl_slo_ms` (NL equivalent of the unified SLO at the mix shape), mu = max over clean windows, no P-share
+  filter. `result.json` records the tool sha, the config and every file read with its sha256.
 
 ## PreServe history before t0
 

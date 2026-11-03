@@ -65,3 +65,87 @@ def test_cli_prints_the_policy_mu_format(capsys) -> None:
     assert yaml.safe_load(capsys.readouterr().out) == {"mu": {}}
     with pytest.raises(SystemExit):
         pm.main([str(FIX / "nowhere"), "--registry", REGISTRY])
+
+
+# ------------------------------------------------------------------ alg1 (PreServe Alg. 1 on a dataset dir)
+
+T0 = 1_000_000
+WIN_COLS = ["model", "shape", "primitive", "rho", "cell_id", "attempt", "split", "cell_status",
+            "possibly_contaminated", "in_warmup", "window_start_ms", "window_end_ms"]
+REQ_COLS = ["model", "cell_id", "attempt", "request_id", "send_ts_ms", "first_token_ts_ms", "done_ts_ms",
+            "input_tokens", "output_tokens", "expected_prompt_tokens", "outcome", "target_pod"]
+
+
+def _alg1_dataset(tmp_path: Path) -> tuple[Path, Path]:
+    """One cell, five 10 s windows, NL SLO 50 ms:
+    w0 clean: 2 x (1000 in, 100 out, NL 10); the 2nd is sent at 9.9 s and done in w1 -> p 200 d 20 t 220
+    w1 clean: 1 x (5000 in, 10 out), P share 0.998                                -> p 500 d 1  t 501
+    w2 dirty: 1 x (8000 in, 100 out) with NL 60 ms                                -> p 800 d 10 t 810
+    w3 dirty: a client timeout (expected 3000 in) + 1 clean (1000 in, 100 out)    -> p 400 d 10 t 410
+    w4 in warm-up: a huge clean load                                              -> dropped
+    so mu = {p: 500 (w1, no P-share filter), d: 20 (w0, by arrival), t: 501}; p and t bracketed by w2."""
+    import csv
+
+    ddir = tmp_path / "data" / "src1" / "dataset_hybrid"
+    ddir.mkdir(parents=True)
+    with (ddir / "windows.csv").open("w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(WIN_COLS)
+        for i in range(5):
+            wr.writerow(["dsqwen-7b", "S1", "hold", "0.5", "c1", "1", "train", "valid", "False",
+                         "True" if i == 4 else "False", T0 + i * 10000, T0 + (i + 1) * 10000])
+    (ddir / "cells.csv").write_text(f"cell_id,attempt,end_ms\nc1,1,{T0 + 50000}\n")
+    reqs = [  # (send offset ms, e2e ms, in, out, outcome)
+        (100, 1000, 1000, 100, "ok"), (9900, 1000, 1000, 100, "ok"),
+        (10100, 200, 5000, 10, "ok"),
+        (20100, 6000, 8000, 100, "ok"),
+        (30100, 30000, None, None, "client_timeout"), (30200, 1000, 1000, 100, "ok"),
+        (40100, 1000, 90000, 9000, "ok")]
+    with (ddir / "requests.csv").open("w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(REQ_COLS)
+        for k, (s, e2e, L, out, oc) in enumerate(reqs):
+            wr.writerow(["dsqwen-7b", "c1", "1", f"r{k}", T0 + s, "" if oc != "ok" else T0 + s + 50, T0 + s + e2e,
+                         "" if L is None else L, "" if out is None else out, 3000, oc, "pod-a"])
+    cfg = {"window_s": 10, "route_timeout_s": 150, "nl_slo_ms": {"dsqwen-7b": 50.0},
+           "filters": {"splits": ["train", "auxiliary"], "cell_status": ["valid"], "held_out_shapes": ["M"],
+                       "exclude_in_warmup": True, "exclude_possibly_contaminated": True,
+                       "window_inside_cell": True},
+           "sources": {"dsqwen-7b": [{"name": "src1", "path": "src1/dataset_hybrid"}]}}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    return path, tmp_path / "data"
+
+
+def test_alg1_max_over_clean_windows_by_arrival(tmp_path) -> None:
+    import json
+
+    cfg, root = _alg1_dataset(tmp_path)
+    out = tmp_path / "out"
+    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(out)]) == 0
+    res = json.loads((out / "result.json").read_text())
+    m = res["models"]["dsqwen-7b"]
+    assert res["mu"] == {"dsqwen-7b": {"p": 500.0, "d": 20.0, "t": 501.0}}
+    assert yaml.safe_load((out / "mu.yaml").read_text()) == {"mu": res["mu"]}
+    assert (m["windows_kept"], m["clean"], m["dirty"]) == (4, 2, 2)
+    assert res["sources"][0]["dropped"] == {"in_warmup": 1}
+    T = m["terms"]
+    assert T["p"]["window"]["window_start_ms"] == T0 + 10000             # the P-share-0.998 window counts
+    assert T["p"]["bracketed"] and T["p"]["max_dirty"] == 800.0 and not T["d"]["bracketed"]
+    assert [x["value"] for x in T["t"]["top"]] == [501.0, 220.0]
+    # provenance: every file read with its sha256, the NL SLO used
+    assert sorted(Path(f["path"]).name for f in res["provenance"]["files"]) == ["cells.csv", "requests.csv",
+                                                                                "windows.csv"]
+    assert all(len(f["sha256"]) == 64 for f in res["provenance"]["files"]) and m["nl_slo_ms"] == 50.0
+    with pytest.raises(SystemExit):                                     # never overwrites a result
+        pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(out)])
+
+
+def test_alg1_a_stricter_nl_slo_dirties_the_window_holding_mu(tmp_path) -> None:
+    cfg, root = _alg1_dataset(tmp_path)
+    c = yaml.safe_load(cfg.read_text())
+    c["nl_slo_ms"]["dsqwen-7b"] = 15.0                                  # w1's NL is 20 ms
+    cfg.write_text(yaml.safe_dump(c))
+    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(tmp_path / "o")]) == 0
+    assert yaml.safe_load((tmp_path / "o" / "mu.yaml").read_text())["mu"]["dsqwen-7b"] == {
+        "p": 200.0, "d": 20.0, "t": 220.0}

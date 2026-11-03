@@ -106,3 +106,32 @@ def test_mu_unified_takes_the_registry_slo_and_refuses_unstreamed_steps(tmp_path
 def test_mu_unified_refuses_a_ladder_that_did_not_stream_every_request(tmp_path):
     base = _ladder(tmp_path, stream=False)
     assert vl.main(base + ["--slo-rule", "unified", "--registry", str(REGISTRY)]) == 2
+
+
+def test_nl_rule_one_slow_or_failed_request_fails_the_window():
+    """PreServe's NL rule: NL = e2e / output tokens; 30 requests at 0.1 + 0.03 * 199 s / 200 = 30.35 ms."""
+    def win(**bad):
+        reqs = [_req(k, 1.0 + k) for k in range(30)]
+        if bad:
+            reqs[7] = _req(7, 8.0, **bad)
+        return sj.judge_window_nl(reqs, 0.0, 100.0, {"dsqwen-7b": 40.0})
+    assert win()["meets_slo"] and win()["nl_max_ms"] == pytest.approx(30.35)
+    w = win(tpot_s=0.05)                              # NL 50.25 ms > 40: one slow request
+    assert not w["meets_slo"] and w["v_nl"] == 1 and w["v_failed"] == 0
+    w = win(ok=False)
+    assert not w["meets_slo"] and w["v_failed"] == 1
+    # TTFT 600 ms alone breaks the unified rule, not NL (spread over 200 tokens: 32.85 ms)
+    assert win(ttft_s=0.6)["meets_slo"] and not _window(ttft_s=0.6)["meets_slo"]
+    with pytest.raises(sj.UnjudgeableWindow):         # no NL SLO for the model
+        sj.judge_window_nl([_req(0, 1.0)], 0.0, 10.0, {"other": 40.0})
+
+
+def test_dataset_row_adapter_reads_ms_and_failed_rows():
+    ok = sj.from_dataset_row({"model": "m", "request_id": "a", "send_ts_ms": "1000", "first_token_ts_ms": "1100",
+                              "done_ts_ms": "3000", "input_tokens": "512", "output_tokens": "100", "outcome": "ok"})
+    assert (ok.send, ok.done, ok.prompt_tokens, ok.completion_tokens, ok.ok) == (1.0, 3.0, 512, 100, True)
+    assert sj.judge_request_nl(ok, 20.0)["nl_ms"] == pytest.approx(20.0)
+    bad = sj.from_dataset_row({"model": "m", "send_ts_ms": "1000", "first_token_ts_ms": "", "done_ts_ms": "31000",
+                               "input_tokens": "", "expected_prompt_tokens": "768", "output_tokens": "",
+                               "outcome": "client_timeout"})
+    assert bad.prompt_tokens == 768 and not bad.ok and sj.judge_request_nl(bad, 20.0)["cause"] == "failed"
