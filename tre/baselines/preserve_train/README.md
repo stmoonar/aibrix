@@ -90,7 +90,7 @@ PYTHONPATH=. python3 -m preserve_train.trace_train realize --data-root $X --out 
   --v1-gen <v1 CustomTraceGenerator> --azure-root <datasets/azure-llm-inference> --cpus 56-63   # 76: v1 generator
 PYTHONPATH=. python3 -m preserve_train.trace_train series --data-root $X --out $OUT
 PYTHONPATH=. python3 -m preserve_train.trace_train train --series $OUT/series_w10.json --train-dir <dir>   # torch
-PYTHONPATH=. python3 -m preserve_train.trace_train finish --data-root $X --out $OUT --series $OUT/series_w10.json \
+OMP_NUM_THREADS=1 PYTHONPATH=. python3 -m preserve_train.trace_train finish --data-root $X --out $OUT --series $OUT/series_w10.json \
   --train-dir <dir> --weights-out weights/preserve-mlstm-20261104-trace-w10 \
   --history-sha256-out histories/preserve_history_w10_train-tail-20261104.sha256
 ```
