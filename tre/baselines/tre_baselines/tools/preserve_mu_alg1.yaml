@@ -1,4 +1,5 @@
-# Input of `python3 -m tre_baselines.tools.preserve_mu alg1 --config <this file> --data-root <root> --out <dir>`:
+# Input of `python3 -m tre_baselines.tools.preserve_mu alg1 --config <this file> --data-root <root>
+#   --nl-slo <nl_slo.yaml> --envelope <envelope_c.yaml> --out <dir>` (chain: tre/baselines/docs/preserve-mu-calibration.md):
 # PreServe mu by Alg. 1 (arXiv 2504.03702v2) on the TRE TSS / theta training set ("dataset A"). User decisions 2026-11-04.
 #
 # Windows: the datasets' own 10 s tumbling grid; a request belongs to the window its send time falls in;
@@ -6,13 +7,21 @@
 window_s: 10
 route_timeout_s: 150          # slo_judge's route timeout: a request running this long counts as failed
 
-# NL equivalent of the unified SLO at the model's mix shape (L_mix x out_mix, 10-26 isolated buckets report,
-# traces-v2-720-20261026): NL_slo = (TTFT_slo(L_mix) + (out_mix - 1) * TPOT_slo) / out_mix, TTFT_slo(L) =
-# max(500, 5 (c + b L)), TPOT_slo = 75 ms (local docs/slo-idle-multiples-20261104.md section 4.1).
-nl_slo_ms:
+# PreServe's NL SLO = the NL equivalent of the per-request SLO (idle multiples) at the model's mix shape, computed
+# from raw data by tools/preserve_nl_slo (config preserve_nl_slo.yaml) and given with --nl-slo <its nl_slo.yaml>.
+# These pins are the values of 2026-11-04 (local docs/slo-idle-multiples-20261104.md section 4.1); alg1 refuses
+# an --nl-slo file whose values differ (a changed input or definition must change the pins on purpose).
+nl_slo_expect_ms:
   dsqwen-7b: 62.38
   dsllama-8b: 64.97
   dsqwen-14b: 43.34
+
+# The shape envelope (user 2026-11-04: envelope c): a run gives --envelope <dir>/envelope_c.yaml of
+# tools/preserve_eval_envelope --config preserve_mu_envelope.yaml (relative to this file); alg1 refuses another
+# name (unless --envelope-variant) and a file whose source (window, trace sha256) differs from that config.
+envelope_default:
+  name: lengths-minmax
+  config: preserve_mu_envelope.yaml
 
 # The 11-03 TSS fit's training-set filter (calib_supp_20261103_fit_tools/supp_lib.py, sha256 0a6d0b1b9325c178...:
 # TRAIN_SPLITS, HELD_OUT_SHAPES, kept()), as the 11-04 feasibility audit applied it per window

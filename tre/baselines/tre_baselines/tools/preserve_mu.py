@@ -26,9 +26,10 @@ We read that from a TRE calibration capture (layout: ``tre/calibration/README.md
 Prints YAML in the policy's ``mu`` format on stdout, a summary on stderr. Exit 1 when a
 model has no violation-free window (the policy refuses to start without its mu).
 
-**alg1** (``preserve_mu alg1 --config preserve_mu_alg1.yaml --data-root R --out DIR``; user
-decisions 2026-11-04): PreServe Alg. 1 (arXiv 2504.03702v2) literally, on ``calibration_dataset``
-dirs (``windows.csv`` / ``requests.csv`` / ``cells.csv``; the TSS / theta training set):
+**alg1** (``preserve_mu alg1 --config preserve_mu_alg1.yaml --data-root R --nl-slo NL.yaml
+--envelope ENV.yaml --out DIR``; user decisions 2026-11-04; the whole chain from raw data:
+``tre/baselines/docs/preserve-mu-calibration.md``): PreServe Alg. 1 (arXiv 2504.03702v2) literally, on
+``calibration_dataset`` dirs (``windows.csv`` / ``requests.csv`` / ``cells.csv``; the TSS / theta training set):
 
 * windows T_i = the dataset's own tumbling windows (``window_start_ms`` / ``window_end_ms``, all
   ``window_s`` long), kept by the config's training-set filters (split, cell status, held-out
@@ -36,7 +37,10 @@ dirs (``windows.csv`` / ``requests.csv`` / ``cells.csv``; the TSS / theta traini
 * r in T_i = the cell's requests whose ``send_ts_ms`` lies in [start, end);
 * T_i is clean when it has a request and none violates PreServe's NL SLO
   (``slo_judge.judge_window_nl``: failed / timed out, or e2e / output tokens > ``nl_slo_ms`` of
-  the model, a config input);
+  the model, read from the ``--nl-slo`` file of ``preserve_nl_slo`` and refused unless equal to the
+  config's ``nl_slo_expect_ms`` pins);
+* with ``--envelope`` (required when the config names ``envelope_default``; the file of
+  ``preserve_eval_envelope``), only windows whose arrived requests' shape lies inside it are judged;
 * mu_p / mu_d / mu_t = max over clean windows of sum p(r) / sum d(r) / sum (p + d) over the window
   seconds (no P-share filter; each cell ran on one pod, checked, so the rate is per instance).
 
@@ -262,28 +266,81 @@ def _truthy(v: Any) -> bool:
 
 
 def load_alg1_config(path: str) -> dict:
-    """The alg1 input file (``preserve_mu_alg1.yaml``): window_s, route_timeout_s, nl_slo_ms per model,
-    filters, sources per model (paths relative to ``--data-root``). Refuses an incomplete file."""
+    """The alg1 input file (``preserve_mu_alg1.yaml``): window_s, route_timeout_s, filters, sources per model
+    (paths relative to ``--data-root``), optional ``nl_slo_expect_ms`` (pins of the ``--nl-slo`` file) and
+    ``envelope_default`` (``{name, config}``: the envelope a run must name). Refuses an incomplete file and a
+    hand-typed ``nl_slo_ms`` / inline ``envelope`` (both come from tool outputs, ``--nl-slo`` / ``--envelope``)."""
     with open(path, "r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
-    for key in ("window_s", "nl_slo_ms", "filters", "sources"):
+    for key in ("window_s", "filters", "sources"):
         if key not in cfg:
             raise SystemExit(f"preserve_mu alg1: {path}: missing {key!r}")
+    for key, flag in (("nl_slo_ms", "--nl-slo (preserve_nl_slo output)"), ("envelope", "--envelope")):
+        if key in cfg:
+            raise SystemExit(f"preserve_mu alg1: {path}: {key!r} is not a config key; give it with {flag}")
     unknown = sorted(set(cfg["filters"]) - set(ALG1_FILTER_KEYS))
     missing = sorted(set(ALG1_FILTER_KEYS) - set(cfg["filters"]))
     if unknown or missing:
         raise SystemExit(f"preserve_mu alg1: {path}: filters unknown {unknown} / missing {missing}")
     for model, srcs in cfg["sources"].items():
-        v = cfg["nl_slo_ms"].get(model)
-        if v is None or not float(v) > 0:
-            raise SystemExit(f"preserve_mu alg1: {path}: no positive nl_slo_ms for {model}")
         if not srcs or any(not s.get("name") or not s.get("path") for s in srcs):
             raise SystemExit(f"preserve_mu alg1: {path}: sources of {model} need name and path")
     if not float(cfg["window_s"]) > 0:
         raise SystemExit(f"preserve_mu alg1: {path}: window_s must be > 0")
-    if cfg.get("envelope"):
-        check_envelope(cfg["envelope"], path)
+    if "envelope_default" in cfg and not (cfg["envelope_default"] or {}).get("name"):
+        raise SystemExit(f"preserve_mu alg1: {path}: envelope_default needs a name")
     return cfg
+
+
+def apply_nl_slo(cfg: dict, nl_path: str, models: Sequence[str]) -> None:
+    """Put the ``--nl-slo`` file's ``nl_slo_ms`` (``preserve_nl_slo`` output) into ``cfg`` for ``models``.
+    Refuses a model without a positive value and, when the config pins ``nl_slo_expect_ms``, any value
+    that differs from its pin."""
+    with open(nl_path, "r", encoding="utf-8") as fh:
+        got = (yaml.safe_load(fh) or {}).get("nl_slo_ms") or {}
+    pins = cfg.get("nl_slo_expect_ms")
+    use: dict = {}
+    for m in models:
+        v = got.get(m)
+        if v is None or not float(v) > 0:
+            raise SystemExit(f"preserve_mu alg1: {nl_path}: no positive nl_slo_ms for {m}")
+        if pins is not None and (pins.get(m) is None or abs(float(v) - float(pins[m])) > 1e-9):
+            raise SystemExit(f"preserve_mu alg1: {nl_path}: nl_slo_ms {m} = {v} but the config pins "
+                             f"nl_slo_expect_ms {pins.get(m)}; refusing (change the pin only on purpose)")
+        use[m] = float(v)
+    cfg["nl_slo_ms"] = use
+    cfg["nl_slo_file"] = {"path": str(Path(nl_path).resolve()), "sha256": _sha256(Path(nl_path))}
+
+
+def apply_envelope(cfg: dict, config_path: str, env_path: str, no_envelope: bool, allow_variant: bool) -> None:
+    """``--envelope`` / ``--no-envelope`` against the config's ``envelope_default``: with a default, a run
+    names an envelope file (or says ``--no-envelope``); its ``name`` must be the default's unless
+    ``--envelope-variant``; its ``source`` (window, trace sha256) must equal the envelope config's
+    (``envelope_default.config``, relative to the alg1 config)."""
+    if env_path and no_envelope:
+        raise SystemExit("preserve_mu alg1: --envelope and --no-envelope exclude each other")
+    dflt = cfg.get("envelope_default") or {}
+    if dflt and not env_path and not no_envelope:
+        raise SystemExit(f"preserve_mu alg1: the config's default envelope is {dflt['name']!r}: give its file "
+                         "with --envelope (preserve_eval_envelope output) or --no-envelope")
+    if not env_path:
+        return
+    with open(env_path, "r", encoding="utf-8") as fh:
+        env = yaml.safe_load(fh) or {}
+    check_envelope(env, env_path)
+    if dflt and env.get("name") != dflt["name"] and not allow_variant:
+        raise SystemExit(f"preserve_mu alg1: {env_path}: envelope {env.get('name')!r} is not the default "
+                         f"{dflt['name']!r}; --envelope-variant for a sensitivity row")
+    if dflt.get("config"):
+        ec_path = Path(config_path).resolve().parent / dflt["config"]
+        with ec_path.open("r", encoding="utf-8") as fh:
+            ec = yaml.safe_load(fh) or {}
+        want = {t["trace"]: t["sha256"] for t in ec.get("traces") or []}
+        src = env.get("source") or {}
+        if src.get("trace_sha256") != want or float(src.get("window_s", -1)) != float(ec.get("window_s", -2)):
+            raise SystemExit(f"preserve_mu alg1: {env_path}: source (window, trace sha256) differs from {ec_path}")
+    env["file_sha256"] = _sha256(Path(env_path))
+    cfg["envelope"] = env
 
 
 def check_envelope(env: Mapping, where: str = "envelope") -> None:
@@ -540,20 +597,22 @@ def main_alg1(argv: Sequence[str]) -> int:
     ap.add_argument("--data-root", required=True, help="root the config's source paths are relative to")
     ap.add_argument("--out", required=True, help="output dir (must not hold a result.json)")
     ap.add_argument("--models", default="", help="comma list (default: every model of the config)")
-    ap.add_argument("--envelope", default="", help="envelope file (yaml: name, bounds per model); keep only "
-                    "windows whose shape is inside it. Default: the config's `envelope`, else no filter")
+    ap.add_argument("--nl-slo", required=True, help="NL SLO file (preserve_nl_slo output, nl_slo.yaml); must "
+                    "equal the config's nl_slo_expect_ms pins")
+    ap.add_argument("--envelope", default="", help="envelope file (preserve_eval_envelope output: name, bounds "
+                    "per model); keep only windows whose shape is inside it. Required when the config names an "
+                    "envelope_default (or --no-envelope)")
+    ap.add_argument("--envelope-variant", action="store_true", help="accept an envelope other than the default")
+    ap.add_argument("--no-envelope", action="store_true", help="no shape filter (sensitivity row)")
     a = ap.parse_args(list(argv))
     cfg = load_alg1_config(a.config)
-    if a.envelope:
-        with open(a.envelope, "r", encoding="utf-8") as fh:
-            cfg["envelope"] = yaml.safe_load(fh) or {}
-        check_envelope(cfg["envelope"], a.envelope)
-        cfg["envelope"]["file_sha256"] = _sha256(Path(a.envelope))
     only = [m.strip() for m in a.models.split(",") if m.strip()]
     models = only or list(cfg["sources"])
     bad = [m for m in models if m not in cfg["sources"]]
     if bad:
         raise SystemExit(f"preserve_mu alg1: no sources for {bad}")
+    apply_nl_slo(cfg, a.nl_slo, models)
+    apply_envelope(cfg, a.config, a.envelope, a.no_envelope, a.envelope_variant)
     out = Path(a.out)
     if (out / "result.json").exists():
         raise SystemExit(f"preserve_mu alg1: {out}/result.json exists; use a new --out")

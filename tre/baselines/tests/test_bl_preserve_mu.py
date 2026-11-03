@@ -107,14 +107,27 @@ def _alg1_dataset(tmp_path: Path) -> tuple[Path, Path]:
         for k, (s, e2e, L, out, oc) in enumerate(reqs):
             wr.writerow(["dsqwen-7b", "c1", "1", f"r{k}", T0 + s, "" if oc != "ok" else T0 + s + 50, T0 + s + e2e,
                          "" if L is None else L, "" if out is None else out, 3000, oc, "pod-a"])
-    cfg = {"window_s": 10, "route_timeout_s": 150, "nl_slo_ms": {"dsqwen-7b": 50.0},
+    cfg = {"window_s": 10, "route_timeout_s": 150,
            "filters": {"splits": ["train", "auxiliary"], "cell_status": ["valid"], "held_out_shapes": ["M"],
                        "exclude_in_warmup": True, "exclude_possibly_contaminated": True,
                        "window_inside_cell": True},
            "sources": {"dsqwen-7b": [{"name": "src1", "path": "src1/dataset_hybrid"}]}}
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(cfg))
+    _nl(tmp_path, 50.0)
     return path, tmp_path / "data"
+
+
+def _nl(tmp_path: Path, v: float) -> str:
+    """The --nl-slo file (preserve_nl_slo output format)."""
+    p = tmp_path / "nl_slo.yaml"
+    p.write_text(yaml.safe_dump({"nl_slo_ms": {"dsqwen-7b": v}}))
+    return str(p)
+
+
+def _alg1(tmp_path: Path, cfg: Path, root: Path, out: Path, *extra: str) -> int:
+    return pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--nl-slo", str(tmp_path / "nl_slo.yaml"),
+                    "--out", str(out), *extra])
 
 
 def test_alg1_max_over_clean_windows_by_arrival(tmp_path) -> None:
@@ -122,7 +135,7 @@ def test_alg1_max_over_clean_windows_by_arrival(tmp_path) -> None:
 
     cfg, root = _alg1_dataset(tmp_path)
     out = tmp_path / "out"
-    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(out)]) == 0
+    assert _alg1(tmp_path, cfg, root, out) == 0
     res = json.loads((out / "result.json").read_text())
     m = res["models"]["dsqwen-7b"]
     assert res["mu"] == {"dsqwen-7b": {"p": 500.0, "d": 20.0, "t": 501.0}}
@@ -138,15 +151,13 @@ def test_alg1_max_over_clean_windows_by_arrival(tmp_path) -> None:
                                                                                 "windows.csv"]
     assert all(len(f["sha256"]) == 64 for f in res["provenance"]["files"]) and m["nl_slo_ms"] == 50.0
     with pytest.raises(SystemExit):                                     # never overwrites a result
-        pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(out)])
+        _alg1(tmp_path, cfg, root, out)
 
 
 def test_alg1_a_stricter_nl_slo_dirties_the_window_holding_mu(tmp_path) -> None:
     cfg, root = _alg1_dataset(tmp_path)
-    c = yaml.safe_load(cfg.read_text())
-    c["nl_slo_ms"]["dsqwen-7b"] = 15.0                                  # w1's NL is 20 ms
-    cfg.write_text(yaml.safe_dump(c))
-    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(tmp_path / "o")]) == 0
+    _nl(tmp_path, 15.0)                                                 # w1's NL is 20 ms
+    assert _alg1(tmp_path, cfg, root, tmp_path / "o") == 0
     assert yaml.safe_load((tmp_path / "o" / "mu.yaml").read_text())["mu"]["dsqwen-7b"] == {
         "p": 200.0, "d": 20.0, "t": 220.0}
 
@@ -158,14 +169,50 @@ def test_alg1_envelope_drops_windows_outside_the_shape_bounds(tmp_path) -> None:
     env = tmp_path / "env.yaml"                       # P share: w0 .91 in; w1 .998, w2 .988, w3 .976 out
     env.write_text(yaml.safe_dump({"name": "t", "bounds": {"dsqwen-7b": {"share": [0.5, 0.95]}}}))
     out = tmp_path / "out"
-    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(out),
-                    "--envelope", str(env)]) == 0
+    assert _alg1(tmp_path, cfg, root, out, "--envelope", str(env)) == 0
     res = json.loads((out / "result.json").read_text())
     m = res["models"]["dsqwen-7b"]
     assert res["mu"] == {"dsqwen-7b": {"p": 200.0, "d": 20.0, "t": 220.0}}       # only w0 is inside
     assert (m["clean"], m["outside_envelope"]) == (1, 3) and res["config"]["envelope"]["name"] == "t"
     # a mean-length bound counts per request: w0 has 1000 in / 100 out on average
     env.write_text(yaml.safe_dump({"name": "l", "bounds": {"dsqwen-7b": {"mean_in": [900, 1100], "mean_out": [90, 110]}}}))
-    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(tmp_path / "o2"),
-                    "--envelope", str(env)]) == 0
+    assert _alg1(tmp_path, cfg, root, tmp_path / "o2", "--envelope", str(env)) == 0
     assert yaml.safe_load((tmp_path / "o2" / "mu.yaml").read_text())["mu"]["dsqwen-7b"]["p"] == 200.0
+
+
+def test_alg1_takes_the_nl_slo_file_and_refuses_one_off_its_pin(tmp_path) -> None:
+    cfg, root = _alg1_dataset(tmp_path)
+    c = yaml.safe_load(cfg.read_text())
+    c["nl_slo_expect_ms"] = {"dsqwen-7b": 50.0}
+    cfg.write_text(yaml.safe_dump(c))
+    assert _alg1(tmp_path, cfg, root, tmp_path / "o") == 0             # file 50.0 == pin
+    _nl(tmp_path, 50.01)
+    with pytest.raises(SystemExit, match="pins"):
+        _alg1(tmp_path, cfg, root, tmp_path / "o2")
+    c["nl_slo_ms"] = {"dsqwen-7b": 50.0}                                # a hand-typed value is refused
+    cfg.write_text(yaml.safe_dump(c))
+    with pytest.raises(SystemExit, match="--nl-slo"):
+        _alg1(tmp_path, cfg, root, tmp_path / "o3")
+
+
+def test_alg1_default_envelope_must_be_named_and_match_its_traces(tmp_path) -> None:
+    cfg, root = _alg1_dataset(tmp_path)
+    c = yaml.safe_load(cfg.read_text())
+    c["envelope_default"] = {"name": "lengths-minmax", "config": "env-cfg.yaml"}
+    cfg.write_text(yaml.safe_dump(c))
+    (tmp_path / "env-cfg.yaml").write_text(yaml.safe_dump({"window_s": 10, "traces": [{"trace": "T", "sha256": "ab"}]}))
+    env = tmp_path / "env.yaml"
+    body = {"name": "lengths-minmax", "source": {"window_s": 10.0, "trace_sha256": {"T": "ab"}},
+            "bounds": {"dsqwen-7b": {"mean_in": [900, 1100], "mean_out": [90, 110]}}}
+    env.write_text(yaml.safe_dump(body))
+    with pytest.raises(SystemExit, match="--no-envelope"):              # the default needs a file (or an opt-out)
+        _alg1(tmp_path, cfg, root, tmp_path / "o")
+    assert _alg1(tmp_path, cfg, root, tmp_path / "o", "--envelope", str(env)) == 0
+    assert _alg1(tmp_path, cfg, root, tmp_path / "o1", "--no-envelope") == 0
+    env.write_text(yaml.safe_dump({**body, "source": {"window_s": 10.0, "trace_sha256": {"T": "cd"}}}))
+    with pytest.raises(SystemExit, match="differs"):                    # made from other trace files
+        _alg1(tmp_path, cfg, root, tmp_path / "o2", "--envelope", str(env))
+    env.write_text(yaml.safe_dump({**body, "name": "share-minmax"}))
+    with pytest.raises(SystemExit, match="not the default"):
+        _alg1(tmp_path, cfg, root, tmp_path / "o3", "--envelope", str(env))
+    assert _alg1(tmp_path, cfg, root, tmp_path / "o3", "--envelope", str(env), "--envelope-variant") == 0

@@ -62,6 +62,7 @@ tre_baselines/   snapshot.py (policy contract)  sources.py  loop.py  sm_client.p
                  policies/preserve_{tier1,anticipator,predictor,load_errors,history}.py
                  tools/   arm.py  chiron_theta.py  tokenscale_buckets.py  velocity_ladder.py  freeze_params.py
                           preserve_history{,_azure,_frozen}.py  tokenscale_profile.py  preserve_mu.py (old procedure; `alg1`: Alg. 1 on the TSS set)
+                          preserve_nl_slo.py  preserve_eval_envelope.py  slo_judge.py (PreServe mu chain: docs/preserve-mu-calibration.md)
 preserve_train/  offline trainer of weights/ (copy of the v1 trainer, needs torch; not imported by tre_baselines)
 weights/         preserve-mlstm-20261103-paper-w10/{code,conv,pooled}-paper-w10.npz (v1 paper_past at 10 s,
                  REPORT.md, the ConfigMap's); preserve-mlstm-20261024-paper/ (30 s, runs before 2026-11-03)
@@ -174,12 +175,15 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   history before t0 next to the trace (below). The old knee / closed-loop procedure (`tokenscale_profile`,
   `preserve_mu`) and its sensitivity rows (TokenScale-aggressive / window10, PreServe window600) are retired.
 - PreServe mu by the paper's Alg. 1, literally (user 2026-11-04): `python3 -m tre_baselines.tools.preserve_mu
-  alg1 --config tre_baselines/tools/preserve_mu_alg1.yaml --data-root <data root> --out <new dir>` on the TSS /
-  theta training set (the 11-03 fit's sources and window filters, listed in the config with the sha256 of
-  `supp_lib.py` and of the 11-04 audit script they were copied from). 10 s windows of the datasets' own grid,
-  requests by send time, clean = no failed request and every NL = e2e / output tokens <= the config's
-  `nl_slo_ms` (NL equivalent of the unified SLO at the mix shape), mu = max over clean windows, no P-share
-  filter. `result.json` records the tool sha, the config and every file read with its sha256.
+  alg1 --config tre_baselines/tools/preserve_mu_alg1.yaml --data-root <data root> --nl-slo <nl_slo.yaml>
+  --envelope <envelope_c.yaml> --out <new dir>` on the TSS / theta training set (the 11-03 fit's sources and
+  window filters, listed in the config with the sha256 of `supp_lib.py` and of the 11-04 audit script they were
+  copied from). 10 s windows of the datasets' own grid, requests by send time, clean = no failed request and
+  every NL = e2e / output tokens <= NL_SLO (`tools/preserve_nl_slo`: the NL equivalent of the idle-multiple SLO
+  at the mix shape, pinned in the config), only windows inside envelope c (`tools/preserve_eval_envelope`:
+  mean input / output length within [min, max] of the evaluation traces' 10 s windows), mu = max over clean
+  windows. `result.json` records the tool sha, the config and every file read with its sha256. **The whole
+  chain from raw data, with commands, inputs, outputs and sha256: [`docs/preserve-mu-calibration.md`](docs/preserve-mu-calibration.md).**
 
 ## PreServe history before t0
 

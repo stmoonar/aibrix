@@ -1,0 +1,23 @@
+# Input of `python3 -m tre_baselines.tools.preserve_nl_slo --config <this file> --data-root <root> --registry
+# <tre>/deploy/registry.yaml --out <dir>`: PreServe's NL SLO per model (the --nl-slo file of preserve_mu alg1).
+# SLO = multiples of the idle latencies (user 2026-11-04; local workspace docs/slo-idle-multiples-20261104.md):
+#   TTFT_slo(L) = max(ttft_floor_ms, k_ttft * (c + b L)), c / b = registry models[].slo.ttft_idle_c_ms / _b_ms_per_token
+#   TPOT_slo    = k_tpot * TPOT_idle, TPOT_idle = median tpot_ms of the ok idle records (idle_raw)
+#   NL_SLO      = (TTFT_slo(L_mix) + (out_mix - 1) TPOT_slo) / out_mix at the model's mix shape (isolated run)
+# Expected (2026-11-04): TPOT_idle 12.188 / 12.675 / 13.982 ms, NL_SLO 62.38 / 64.97 / 43.34 ms (7b / 8b / 14b).
+round_decimals: 2
+
+# Relative to --data-root. idle_raw: the 2026-10-03 idle capture (scripts.ttft_idle_capture via
+# deploy/scripts/calibration/run_cb_idle.sh, RUN-calib-theta-20261003.md section B; the c / b of the registry are
+# its fit idle_fit, scripts.ttft_idle_fit --min-gap-ms 500). isolated_dir: the 2026-10-26 isolated run
+# (velocity_ladder isolated, shapes from the buckets report of traces-v2-720-20261026).
+inputs:
+  idle_raw: calib_20261003/cb_idle/{model}/raw/idle/i0_o16_c1.jsonl
+  idle_fit: calib_20261003/cb_idle/ttft_idle_fit.json
+  isolated_dir: bl-calib-20261026/isolated
+  mix_shape: mix
+
+models:
+  dsqwen-7b:  {k_ttft: 3, k_tpot: 5, ttft_floor_ms: 450}
+  dsllama-8b: {k_ttft: 3, k_tpot: 5, ttft_floor_ms: 450}
+  dsqwen-14b: {k_ttft: 5, k_tpot: 3, ttft_floor_ms: 450}
