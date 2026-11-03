@@ -81,7 +81,7 @@ def test_registered_and_factory_fails_closed() -> None:
     trace = str(FIX / "preserve_trace_requests.json")
     models = ("dsqwen-7b", "dsllama-8b")
     mu = {m: dict(MU) for m in models}
-    base = {"mu": mu, "trace_path": trace, "tier1": "oracle"}
+    base = {"mu": mu, "trace_path": trace, "tier1": "oracle", "window_s": 10.0}
     policy = build_policy("preserve", cfg(base, models))
     assert isinstance(policy, Policy) and policy.oracle.n_requests == 5
     assert policy.map_length("dsqwen-7b") == 100  # trace max max_tokens 70 x 1.2 = 84 < l
@@ -94,16 +94,19 @@ def test_registered_and_factory_fails_closed() -> None:
     with pytest.raises(ValueError):
         build_policy("preserve", cfg({**base, "mu": {**mu, "dsqwen-7b": {"p": 1, "d": 1, "t": 0}}}, models))
     with pytest.raises(ValueError, match="trace_path"):
-        build_policy("preserve", cfg({"mu": mu, "tier1": "oracle"}, models))
+        build_policy("preserve", cfg({"mu": mu, "tier1": "oracle", "window_s": 10.0}, models))
     with pytest.raises(ValueError, match="calibration pending"):
         build_policy("preserve", cfg({**base, "calibration": "pending"}, models))
     with pytest.raises(ValueError, match="upper bound"):  # D_hat with errors is a prediction
         build_policy("preserve", cfg({**base, "out_len_is_upper_bound": True}, models))
     # mlstm (the default) needs the weights with their sha256 and a history file next to the trace
     with pytest.raises(ValueError, match="predictors"):
-        build_policy("preserve", cfg({"mu": mu, "trace_path": trace}, models))
+        build_policy("preserve", cfg({"mu": mu, "trace_path": trace, "window_s": 10.0}, models))
     with pytest.raises(ValueError, match="lead_s"):
-        build_policy("preserve", cfg({"mu": mu, "trace_path": trace, "lead_s": 5}, models))
+        build_policy("preserve", cfg({"mu": mu, "trace_path": trace, "lead_s": 5, "window_s": 10.0}, models))
+    # no silent default window (2026-11-03): the predictors and the history are per window
+    with pytest.raises(ValueError, match="window_s is required"):
+        build_policy("preserve", cfg({k: v for k, v in base.items() if k != "window_s"}, models))
 
 
 def test_trace_name_and_predictor_set() -> None:
@@ -264,8 +267,9 @@ def test_wake_keeps_new_attempts_and_rejects_old_attempt_events():
     assert set(amap(p).requests) == {("new", "p0")}
 
 
-def test_a_request_without_done_expires_and_holds_tier2_for_one_window() -> None:
-    """v1 parity: a lost done must not keep a request in the map; Tier-2 holds meanwhile."""
+def test_a_request_without_done_expires_and_holds_tier2_for_30_s_whatever_the_window() -> None:
+    """v1 parity: a lost done must not keep a request in the map; Tier-2 holds for DONE_LOST_HOLD_S
+    (30 s, an evidence-gap hold: not the forecast window)."""
     p = make(done_margin_s=10)  # window_s 600
     p.decide(snap(1000, [pod("p0", 1000)], load("r", "p0", 1000, 100, 10)))
     d = p.decide(snap(12_000, [pod("p0", 12_000)]))["m"]  # 11 s < 10 x 0.2 + 10 = 12 s
@@ -273,7 +277,9 @@ def test_a_request_without_done_expires_and_holds_tier2_for_one_window() -> None
     d = p.decide(snap(14_000, [pod("p0", 14_000)]))["m"]
     assert amap(p).requests == {} and p.anomalies["m"]["expired_routed"] == 1
     assert d.inputs["frozen"] is True and "done_lost" in d.inputs["t2_hold"]
-    d = p.decide(snap(614_500, [pod("p0", 614_500)]))["m"]  # one window (600 s) later
+    d = p.decide(snap(43_000, [pod("p0", 43_000)]))["m"]  # 29 s later: still held (the window is 600 s)
+    assert "done_lost" in d.inputs["t2_hold"]
+    d = p.decide(snap(44_500, [pod("p0", 44_500)]))["m"]  # 30.5 s later: released
     assert "done_lost" not in d.inputs.get("gaps", [])
 
 
@@ -608,15 +614,15 @@ def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:
     d.mkdir(parents=True)
     trace = d / "traces_tre.effective.json"
     trace.write_text("[]")
-    assert ph.default_path(str(trace)) == str(d / ph.DEFAULT_NAME)  # Real_*: no pre_t0.json
+    assert ph.default_path(str(trace), window_s=30.0) == str(d / ph.DEFAULT_NAME)  # Real_*: no pre_t0.json
     wins = [{"start_s": -90.0 + 30 * i, "end_s": -60.0 + 30 * i, "requests": 1, "prompt_tokens": 100 * (i + 1),
              "output_tokens": 10 * (i + 1)} for i in range(3)]
     doc = {"format": ph.PRE_T0_FORMAT, "trace": "Tight_pool", "seed": 2, "t0_s": 0.0, "window_s": 30.0,
            "windows": {"m": wins}, "requests": []}
     (d / ph.PRE_T0_NAME).write_text(json.dumps(doc))
-    assert ph.default_path(str(trace)) == str(d / ph.PRE_T0_NAME)
+    assert ph.default_path(str(trace), window_s=30.0) == str(d / ph.PRE_T0_NAME)
     kw = dict(window_s=30.0, models=["m"], seq_len=3, trace="Tight_pool", seed=ph.seed_of(str(trace)))
-    hist, info = ph.load(ph.default_path(str(trace)), **kw)
+    hist, info = ph.load(ph.default_path(str(trace), window_s=30.0), **kw)
     assert hist == {"m": [(100.0, 10.0), (200.0, 20.0), (300.0, 30.0)]} and info["format"] == ph.PRE_T0_FORMAT
     for bad, match in (({"seed": 1}, "seed"), ({"seed": None}, "seed"), ({"trace": "Simul_spike"}, "trace"),
                        ({"trace": None}, "trace"), ({"t0_s": None}, "t0_s"), ({"window_s": 60.0}, "window_s"),
@@ -624,6 +630,29 @@ def test_history_file_of_the_trace_generator_and_its_checks(tmp_path) -> None:
                        ({"windows": {"m": wins[1:]}}, "seq_len")):
         with pytest.raises(ph.HistoryError, match=match):
             ph.parse({**doc, **bad}, **kw)
+
+
+def test_one_history_name_rule_for_every_window(tmp_path) -> None:
+    """2026-11-03: the policy, the campaign runner (campaign.copy_preserve_history) and
+    tools/preserve_history_azure take the file name of a window from history_names alone; another
+    window never falls back to a 30 s file next to the trace."""
+    from tre_baselines.policies import preserve_history as ph
+    from tre_baselines.tools import preserve_history_azure as pha
+
+    d = tmp_path / "Real_code" / "seed1"
+    d.mkdir(parents=True)
+    trace = str(d / "traces_tre.effective.json")
+    for name in (ph.PRE_T0_NAME, ph.DEFAULT_NAME):
+        (d / name).write_text("{}")
+    assert ph.default_path(trace, window_s=30.0) == str(d / ph.PRE_T0_NAME)
+    assert ph.default_path(trace, window_s=10.0) == str(d / "preserve_history_w10.json")
+    assert pha.out_name(30.0) == ph.DEFAULT_NAME and pha.out_name(10.0) == "preserve_history_w10.json"
+    # the recorded 10 s files (baselines/histories) carry that name
+    sums = (Path(__file__).resolve().parents[1] / "histories" / "preserve_history_w10-20261103.sha256").read_text()
+    assert {Path(line.split()[1]).name for line in sums.splitlines()} == {pha.out_name(10.0)}
+    with pytest.raises(ph.HistoryError):
+        ph.history_names(0)
+
 
 def test_late_replay_marker_backfills_arrivals_already_consumed():
     p, _ = mlstm()

@@ -451,8 +451,8 @@ def test_preserve_mlstm_arm_gets_the_history_next_to_its_oracle_copy(tmp_path):
         from tre_baselines.policies.preserve import trace_name_of
 
         host = rec["oracle_host_path"]
-        assert ph.default_path(host) == rec["history"]["path"]
-        hist, _info = ph.load(ph.default_path(host), window_s=30.0, models=["m7"], seq_len=25,
+        assert ph.default_path(host, window_s=30.0) == rec["history"]["path"]
+        hist, _info = ph.load(ph.default_path(host, window_s=30.0), window_s=30.0, models=["m7"], seq_len=25,
                               trace=trace_name_of(rec["oracle_pod_path"]), seed=ph.seed_of(rec["oracle_pod_path"]))
         assert len(hist["m7"]) == 25
     real.unlink()
@@ -461,8 +461,8 @@ def test_preserve_mlstm_arm_gets_the_history_next_to_its_oracle_copy(tmp_path):
 
 
 def test_preserve_mlstm_history_follows_the_policy_window(tmp_path):
-    """2026-11-03: window_s 10 reads preserve_history_w10.json (not the 30 s file next to it) and the
-    policy is pointed at the copy; without that file the arm is refused."""
+    """2026-11-03: window_s 10 copies preserve_history_w10.json (not the 30 s file next to it) to where
+    the policy looks for its window (no history_path override); without that file the arm is refused."""
     write_campaign(tmp_path, traces=["Alternating"], arms=["preserve"],
                    extra={"traces": [{"trace": "Alternating", "arms": ["preserve"]}], "arms": ["preserve"]})
     (tmp_path / "bl.yaml").write_text(BL_CM.replace("tier1: oracle_noisy", "tier1: mlstm")
@@ -476,13 +476,13 @@ def test_preserve_mlstm_history_follows_the_policy_window(tmp_path):
     out = C.prepare_preserve(c, e, C.arm_def(c, "preserve"), lambda _m: None)
     rec = out["record"]
     assert Path(rec["history"]["source"]).name == "preserve_history_w10.json"
-    pod_hist = rec["policy_params_changed"]["history_path"]
-    assert pod_hist == str(Path(rec["oracle_pod_path"]).parent / "preserve_history_w10.json")
     yaml = pytest.importorskip("yaml")
     cms = [x for x in yaml.safe_load_all(Path(out["env"]["BL_CM_FILE"]).read_text()) if x]
     pre = [x for x in cms if x["metadata"]["name"] == "tre-v2-baseline-preserve"][0]
-    assert yaml.safe_load(pre["data"]["preserve.yaml"])["history_path"] == pod_hist
+    assert "history_path" not in yaml.safe_load(pre["data"]["preserve.yaml"])
     ph = pytest.importorskip("tre_baselines.policies.preserve_history")
+    # the policy's own lookup for its window finds the copy (one name rule for the runner and the policy)
+    assert ph.default_path(rec["oracle_host_path"], window_s=10.0) == rec["history"]["path"]
     hist, _ = ph.load(rec["history"]["path"], window_s=10.0, models=["m7"], seq_len=25, trace="Alternating", seed=1)
     assert len(hist["m7"]) == 25
     (d / "preserve_history_w10.json").unlink()

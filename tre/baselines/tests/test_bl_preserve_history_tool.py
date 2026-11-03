@@ -52,4 +52,3 @@ def test_another_window_keeps_the_segment_lengths_and_planned_level(azure):
     ph.parse(d10, window_s=10.0, models=pha.MODELS, seq_len=25, trace=TRACE, seed=1)
     with pytest.raises(ph.HistoryError):
         ph.parse(d10, window_s=30.0, models=pha.MODELS, seq_len=25, trace=TRACE, seed=1)
-    assert pha.out_name(30, 25) == "preserve_history.json" and pha.out_name(10, 25) == "preserve_history_w10.json"

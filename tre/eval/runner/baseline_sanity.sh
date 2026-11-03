@@ -65,11 +65,11 @@ S4_PRE_S="${S4_PRE_S:-60}"; S4_CONT_S="${S4_CONT_S:-240}"; S4_REL_S="${S4_REL_S:
 S4_M1="${S4_M1:-3.5}"; S4_M2="${S4_M2:-2.5}"; S4_M2_REL="${S4_M2_REL:-0.3}"; RELEASE_DEADLINE_S="${RELEASE_DEADLINE_S:-30}"
 PRESERVE_TRACE_HOST_ROOT="${PRESERVE_TRACE_HOST_ROOT:-}"   # host dir that the scaler pod mounts at PRESERVE_TRACE_POD_ROOT
 PRESERVE_TRACE_POD_ROOT="${PRESERVE_TRACE_POD_ROOT:-/etc/tre-baselines-traces}"
-PRESERVE_SANITY_WINDOW_S="${PRESERVE_SANITY_WINDOW_S:-60}"  # sanity only (paper/main runs: 600)
+PRESERVE_SANITY_WINDOW_S="${PRESERVE_SANITY_WINDOW_S:-60}"  # sanity only, tier1 oracle*; tier1 mlstm keeps the ConfigMap's window
 case "$ARM" in
   chiron)     UP_DEADLINE_S="${UP_DEADLINE_S:-10}"; DOWN_DEADLINE_S="${DOWN_DEADLINE_S:-20}"; S23_HIGH="${S23_HIGH:-4.0}" ;;
   tokenscale) UP_DEADLINE_S="${UP_DEADLINE_S:-25}"; DOWN_DEADLINE_S="${DOWN_DEADLINE_S:-25}" ;;
-  preserve)   UP_DEADLINE_S="${UP_DEADLINE_S:-30}"; DOWN_DEADLINE_S="${DOWN_DEADLINE_S:-$((PRESERVE_SANITY_WINDOW_S + 30))}" ;;
+  preserve)   UP_DEADLINE_S="${UP_DEADLINE_S:-30}" ;;   # DOWN_DEADLINE_S: window + 30 s, set once the window is known
 esac
 S23_HIGH="${S23_HIGH:-3.0}"
 
@@ -161,8 +161,16 @@ C2=$(BLT capacity --policy-dir "$SD/policies" --model "$MODEL2" --src "$CAP_SRC"
 echo "{\"$MODEL\": $C1, \"$MODEL2\": $C2}" > "$SD/capacity.json"
 log "1.0x capacity: $(tr '\n' ' ' < "$SD/capacity.json")"
 CAP_AWAKE=$(python3 -c 'import yaml,sys;m=[x for x in yaml.safe_load(open(sys.argv[1]))["models"] if x["name"]==sys.argv[2]][0];print(m.get("max_awake_replicas") or m.get("max_replicas"))' "$SD/live-registry.yaml" "$MODEL")
-PRESERVE_WIN=$(python3 -c 'import yaml,sys;print((yaml.safe_load(open(sys.argv[1])) or {}).get("window_s",600))' "$SD/policies/preserve.yaml")
-[ "$ARM" = preserve ] && PRESERVE_WIN=$PRESERVE_SANITY_WINDOW_S
+PRESERVE_WIN=$(python3 -c 'import yaml,sys;print("%g" % float((yaml.safe_load(open(sys.argv[1])) or {}).get("window_s",600)))' "$SD/policies/preserve.yaml")
+if [ "$ARM" = preserve ]; then
+  PRESERVE_TIER1=$(python3 -c 'import yaml,sys;print((yaml.safe_load(open(sys.argv[1])) or {}).get("tier1","mlstm"))' "$SD/policies/preserve.yaml")
+  # 2026-11-03: the mlstm predictors and the history are trained for the ConfigMap's window (the policy
+  # refuses another one): keep it; the shorter sanity window is for the oracle Tier-1 modes only
+  [ "$PRESERVE_TIER1" = mlstm ] && PRESERVE_SANITY_WINDOW_S=$PRESERVE_WIN
+  PRESERVE_WIN=$PRESERVE_SANITY_WINDOW_S
+  DOWN_DEADLINE_S="${DOWN_DEADLINE_S:-$(( ${PRESERVE_WIN%.*} + 30 ))}"
+  log "preserve tier1 $PRESERVE_TIER1: sanity window_s $PRESERVE_WIN, down deadline ${DOWN_DEADLINE_S}s"
+fi
 
 # ---- decision source NONE, event stream on, shell seed
 # (2026-10-07) NONE = controller run mode observe (set by reset_baseline) + 0 APA CRs + no
@@ -189,7 +197,7 @@ run_part() {
   local MARK_TRACE="$PD/trace.json"
   reset_baseline; wait_engines_idle || true
   log "run mode -> $(mode observe active)"
-  if [ "$ARM" = preserve ]; then   # sanity copy of the frozen params: shorter window (+ the synthetic trace when mountable)
+  if [ "$ARM" = preserve ]; then   # sanity copy of the frozen params: sanity window (+ the synthetic trace when mountable)
     local TP=""
     if [ -n "$PRESERVE_TRACE_HOST_ROOT" ]; then
       mkdir -p "$PRESERVE_TRACE_HOST_ROOT/sanity-$ARM/$PART-$MODE"

@@ -73,7 +73,7 @@ trace_schedule          poisson                ours: what ``tre_replayer.run_tra
 trace_match_parts       2                      ours: replay marker must end in the same N parts
 trace_name              path part -3           the trace's name (``<name>/seed<k>/<file>``):
                                                picks the predictor set
-window_s                10                     ours 2026-11-03 (= TRE's 10 s metrics window; 30 s
+window_s                (required)             ours; shipped 10 since 2026-11-03 (= TRE's 10 s metrics window; 30 s
                                                before, v1 D18; paper 600 s; our traces are 12 min);
                                                the predictors and the history must declare it
 lead_s                  0                      ours: fire Tier-1 this early (s)
@@ -134,6 +134,10 @@ DEFAULT_PREDICTOR_SET = "pooled"
 #: An idle engine clears only map entries routed at least this long before the scrape (v1
 #: ``ENGINE_IDLE_MARGIN_MS``): a request routed just before it may not have reached the engine.
 ENGINE_IDLE_MARGIN_MS = 1000
+#: How long a request that expired without ``done`` holds Tier-2 (gap ``done_lost``: it may still run
+#: unseen). v1's value, 30 s, its window then; an evidence-gap hold, not the forecast window, so it
+#: does not follow ``window_s`` (2026-11-03: 10 s windows would shorten the hold to 10 s).
+DONE_LOST_HOLD_S = 30.0
 #: tre/baselines (in the image /app/tre/baselines): relative predictor paths resolve here.
 BASELINES_ROOT = Path(__file__).resolve().parents[2]
 
@@ -175,7 +179,7 @@ class _ModelState:
     pre_replay_lost_ms: Optional[int] = None
     #: request key -> now_ms: requests of a slept pod (map, buffer or discarded), for ``done_pod_gone``.
     gone_keys: dict[tuple[str, Optional[str]], int] = field(default_factory=dict)
-    #: now_ms of the last request expired without done (``done_lost`` gap for one window, v1).
+    #: now_ms of the last request expired without done (``done_lost`` gap for DONE_LOST_HOLD_S, v1).
     last_done_lost_ms: Optional[int] = None
     #: active request key -> pod holding it.
     active: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
@@ -238,7 +242,10 @@ class PreServePolicy:
         models = dict(getattr(config, "models", None) or {})
         cfg_seed = int(getattr(config, "seed", 0) or 0)
         self.seed = int(params.get("noise_seed", cfg_seed))
-        self.window_s = float(params.get("window_s", 10.0))
+        if params.get("window_s") is None:
+            raise ValueError("preserve: params.window_s is required (the Tier-1 window; the predictors and the "
+                             "history must declare the same)")
+        self.window_s = float(params["window_s"])
         if self.window_s <= 0:
             raise ValueError("preserve: window_s must be > 0")
         self.lead_s = float(params.get("lead_s", 0.0))
@@ -303,7 +310,7 @@ class PreServePolicy:
                 self.history_info = {"path": None, "injected": True}
             else:
                 tpath = str(trace_path or oracle.path)
-                hpath = str(params.get("history_path") or preserve_history.default_path(tpath))
+                hpath = str(params.get("history_path") or preserve_history.default_path(tpath, window_s=self.window_s))
                 self._history, self.history_info = preserve_history.load(
                     hpath, window_s=self.window_s, models=sorted(self.mu), seq_len=self.seq_len,
                     trace=self.trace_name, seed=preserve_history.seed_of(tpath))
@@ -730,7 +737,7 @@ class PreServePolicy:
                 self._advance_to(st, ps, max(int(snap.now_ms), ps.last_ms or 0), anom)
         self._expire(st, int(snap.now_ms), anom)
         gaps = list(evidence_gaps(ms, int(snap.now_ms), tick_s, events=True))
-        if st.last_done_lost_ms is not None and int(snap.now_ms) - st.last_done_lost_ms < self.window_s * 1000:
+        if st.last_done_lost_ms is not None and int(snap.now_ms) - st.last_done_lost_ms < DONE_LOST_HOLD_S * 1000:
             gaps.append("done_lost")  # v1: a request may still run unseen
         lossy = sorted(g for g in gaps if g in ("no_event_history", "event_gap"))
         if t1m is not None and lossy:

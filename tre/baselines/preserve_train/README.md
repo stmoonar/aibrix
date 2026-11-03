@@ -63,6 +63,10 @@ paper_past"), directory `python/tre_preserve/train/`: the trainer of `weights/pr
 | `train_mlstm.py` | `train/train_mlstm.py` | `0d73924238090c9c68c9bb112412479b817e4a8b279294222886cbe9b09ce47f` | imports (`preserve_train.*`, the v2 predictor for the numpy vs torch check); passes `window_s` to the export |
 | `pipeline.py` | - | - | new (2026-11-03): pandas-free window caches, naive MAPE, REPORT, one command |
 
+Later tre_code change not taken: 40c6bbc (2026-10-24 22:12, item 7) lets `data.iso_to_ns` accept a trailing
+`Z`. `data.py` stays the copy of 80571402, the commit that trained `preserve-mlstm-20261024-paper`; the
+trainer passes it only `+00:00` times (exclusions, cut-offs), where both versions agree.
+
 Not copied: `eval_pre_t0.py`, `eval_traces.py` (v1 evaluations on v1 traces; they do not produce weights).
 The manifest key `dirty_tre_preserve_train` keeps its v1 name; here it means "preserve_train has
 uncommitted changes".

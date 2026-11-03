@@ -36,8 +36,9 @@ set.
                 second t; marker (r3c / r3e): the design's per-second lists real_traces/<m>.json (k = 1).
    The time shape and noise inside the history stay the real segment's.
 
-Output: ``<suite>/<trace>/seed<s>/preserve_history.json`` at 30 s x 25 (the legacy name), else
-``preserve_history_w<W>.json`` (the name tre/eval/runner/campaign.py looks for). An existing file is never
+Output: ``<suite>/<trace>/seed<s>/<name>``, name = the last of ``policies/preserve_history.history_names(W)``
+(30 s: ``preserve_history.json``, the legacy name; another W: ``preserve_history_w<W>.json``), the name
+the policy and the campaign runner look for. An existing file is never
 overwritten (identical -> skipped, different -> exit 2). ``--verify`` writes nothing: it compares each output
 with the existing file. A file records its generator's path and sha256, so a file of an old copy cannot be
 byte-identical to this tool's output; ``--verify`` reports the raw comparison and the comparison with those two
@@ -168,11 +169,11 @@ def cround(x: float) -> int:
     return int(math.floor(x + 0.5))
 
 
-def out_name(window_s: float, seq_len: int) -> str:
-    """The file name the campaign runner reads for this window (preserve_history_name in campaign.py)."""
-    if abs(float(window_s) - LEGACY_WINDOW_S) < 1e-9:
-        return "preserve_history.json"
-    return f"preserve_history_w{float(window_s):g}.json"
+def out_name(window_s: float) -> str:
+    """The file name of this window: the last of ``preserve_history.history_names`` (the policy's and
+    the campaign runner's rule)."""
+    from tre_baselines.policies import preserve_history as ph
+    return ph.history_names(window_s)[-1]
 
 
 # ------------------------------------------------------------------ plan (design inputs only)
@@ -399,6 +400,7 @@ def build(profile: str, trace: str, seed: int, k: float, *, plan_doc: dict, azur
         fam = sg["family"]
         raw = read_segment(Path(azure_root) / FILES[fam]["rel"], sg["start"], sg["end"])
         ins, outs = [r[1] for r in raw], [r[2] for r in raw]
+        lo_i, hi_i, lo_o, hi_o = min(ins), max(ins), min(outs), max(outs)   # over the whole segment
         tgt = TOKEN_TARGETS[fam][m]
         pl = plan_doc[m]
         cap_in, cap_out = int(pl["max_in"]), int(pl["max_out"])
@@ -408,8 +410,8 @@ def build(profile: str, trace: str, seed: int, k: float, *, plan_doc: dict, azur
             if t < lead:
                 continue
             j = int((t - lead) // window_s)
-            mi = min(cap_in, max(1, int(round(_minmax(i, min(ins), max(ins), *tgt["input"])))))
-            mo = min(cap_out, max(1, int(round(_minmax(o, min(outs), max(outs), *tgt["output"])))))
+            mi = min(cap_in, max(1, int(round(_minmax(i, lo_i, hi_i, *tgt["input"])))))
+            mo = min(cap_out, max(1, int(round(_minmax(o, lo_o, hi_o, *tgt["output"])))))
             win[j][0] += 1; win[j][1] += mi; win[j][2] += mo
             used += 1
         mp = statistics.mean(w[1] for w in win)
@@ -430,8 +432,8 @@ def build(profile: str, trace: str, seed: int, k: float, *, plan_doc: dict, azur
         pm[f"raw_count_cv_{window_s:g}s"] = round(statistics.pstdev(counts) / statistics.mean(counts), 4)
         if not legacy:
             pm["empty_windows"] = sum(1 for c in counts if c == 0)
-        pm["raw_in_range"] = [min(ins), max(ins)]
-        pm["raw_out_range"] = [min(outs), max(outs)]
+        pm["raw_in_range"] = [lo_i, hi_i]
+        pm["raw_out_range"] = [lo_o, hi_o]
         pm["length_transform"] = (f"v9 min-max to {tgt['input']} / {tgt['output']} ({fam} targets), "
                                   f"cap {cap_in} / {cap_out}"
                                   + ("" if legacy else f" (min / max over the whole {SEGMENT_S:g} s segment)"))
@@ -524,7 +526,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.seq_len != LEGACY_SEQ_LEN and not a.out_name:
         ap.error("--seq-len other than 25 needs --out-name (the runner's names assume 25 windows)")
-    name = a.out_name or out_name(a.window_s, a.seq_len)
+    name = a.out_name or out_name(a.window_s)
     if not a.verify:
         from tre_baselines.policies import preserve_history as ph
     kmap = json.loads(Path(a.k_map).read_text())

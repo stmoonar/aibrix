@@ -66,7 +66,7 @@ key                          default     meaning
                                          accurate length predictor.
 ``seed``                     config.seed seed of the per-request draws. ours
 ``skip_reissue``             true        ignore events with ``reissue != "none"``. ours
-``window_s``                 10          lambda window over ``ts_ms`` = TRE's metrics window
+``window_s``                 (required)  lambda window over ``ts_ms``; shipped 10 = TRE's metrics window
                                          (controller ``TRE_METRICS_WINDOW_MS`` 10000, tune F;
                                          30 until 2026-11-03). ours (not in paper)
 ``max_estimate_frac``        0.05        degraded when the window's share of
@@ -218,7 +218,9 @@ class TokenScalePolicy:
     def __init__(self, config: Any) -> None:
         p: Mapping[str, Any] = dict(getattr(config, "policy_params", None) or {})
         refuse_pending(p, self.name)
-        self.window_s = float(p.get("window_s", 10.0))  # not in paper
+        if p.get("window_s") is None:
+            raise ValueError("tokenscale: params.window_s is required (the lambda window; not in the paper)")
+        self.window_s = float(p["window_s"])  # not in paper
         #: A scale-down needs this much gap-free event history (the whole window).
         self.event_history_s = self.window_s
         self.max_estimate_frac = float(p.get("max_estimate_frac", 0.05))  # not in paper

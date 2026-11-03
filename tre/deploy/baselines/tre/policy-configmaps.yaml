@@ -85,8 +85,8 @@ data:
     # NOTE: calibration 2026-10-26; provenance <data root>/bl-calib-20261026/SOURCES.md
     calibration: frozen
     # The trace: replaced per run by the campaign runner (its oracle copy in the trace volume); the
-    # history before t0 is next to it: pre_t0.json (synthetic, the generator's), else preserve_history.json
-    # (Real_*, tools/preserve_history real); see tre_baselines.policies.preserve_history.
+    # history before t0 is next to it, named by the window (preserve_history.history_names): at 10 s
+    # preserve_history_w10.json (tools/preserve_history_azure); at 30 s pre_t0.json, else preserve_history.json.
     trace_path: /etc/tre-baselines-traces/case/seed1/traces_tre.effective.json
     trace_seed: 0
     trace_schedule: poisson

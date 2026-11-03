@@ -257,6 +257,8 @@ def test_factory_fails_closed_on_missing_model_or_edges():
         _policy(bucket_edges={})
     with pytest.raises(ValueError, match="out_len_source"):
         _policy(out_len_source="predictor")
+    with pytest.raises(ValueError, match="window_s is required"):  # no silent default window (2026-11-03)
+        build_policy("tokenscale", _cfg({k: v for k, v in _params().items() if k != "window_s"}))
 
 
 def test_registry_models_must_all_have_velocity():

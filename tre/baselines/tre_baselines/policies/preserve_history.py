@@ -3,8 +3,10 @@
 Paper section 5.3: the forecaster is trained on the past and tested on the future, so at the
 replay start ``t0`` its input already holds the windows *before* the test trace. The shell
 reads that past from a **history file** next to the replayed trace (policy param
-``history_path``; default: ``<trace dir>/pre_t0.json`` if it exists, else
-``<trace dir>/preserve_history.json``); it never builds the past from the test windows
+``history_path``; default :func:`default_path`: the first of :func:`history_names` for the
+policy's ``window_s`` that exists next to the trace: at 30 s ``pre_t0.json``, else
+``preserve_history.json``; at another window W ``preserve_history_w<W>.json``, 2026-11-03; the
+campaign runner and ``tools/preserve_history_azure`` use the same names); it never builds the past from the test windows
 themselves (v1's 10-22 cyclic prefill did, D18). The file must name the same trace (and seed)
 as the trace path ``.../<trace>/seed<k>/<file>``.
 
@@ -47,16 +49,32 @@ FORMAT = "tre-preserve-history-v1"
 PRE_T0_FORMAT = "tre-pre-t0-v1"
 DEFAULT_NAME = "preserve_history.json"
 PRE_T0_NAME = "pre_t0.json"
+#: the window of the two names above (every history file before 2026-11-03)
+LEGACY_WINDOW_S = 30.0
 
 
 class HistoryError(ValueError):
     pass
 
 
-def default_path(trace_path: str) -> str:
-    """``pre_t0.json`` next to the trace if present (synthetic), else ``preserve_history.json``."""
+def history_names(window_s: float) -> tuple[str, ...]:
+    """The history file names of a window, in lookup order (the one rule; the policy, the campaign
+    runner and ``tools/preserve_history_azure`` call it): 30 s: ``pre_t0.json`` (the generator's,
+    synthetic traces), then ``preserve_history.json``; another window W: ``preserve_history_w<W>.json``
+    only (2026-11-03; a file of another window refuses the policy anyway)."""
+    w = float(window_s)
+    if not math.isfinite(w) or w <= 0:
+        raise HistoryError(f"history: window_s {window_s!r} must be > 0")
+    if abs(w - LEGACY_WINDOW_S) < 1e-9:
+        return (PRE_T0_NAME, DEFAULT_NAME)
+    return (f"preserve_history_w{w:g}.json",)
+
+
+def default_path(trace_path: str, *, window_s: float) -> str:
+    """The first of :func:`history_names` that exists next to the trace, else the last one."""
     d = Path(trace_path).parent
-    return str(d / PRE_T0_NAME) if (d / PRE_T0_NAME).exists() else str(d / DEFAULT_NAME)
+    names = history_names(window_s)
+    return str(next((d / n for n in names[:-1] if (d / n).exists()), d / names[-1]))
 
 
 def _pre_t0_rows(doc: Mapping[str, Any], window_s: float) -> dict[str, list]:

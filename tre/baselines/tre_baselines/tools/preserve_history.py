@@ -71,7 +71,7 @@ def build_real(counts: str, trace: str, *, window_s: float = 30.0, n: Optional[i
 
 
 def check(trace: str, history: Optional[str], *, window_s: float = 30.0, seq_len: int = 25) -> dict[str, Any]:
-    path = history or ph.default_path(trace)
+    path = history or ph.default_path(trace, window_s=window_s)
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
     models = sorted(doc.get("models") or doc.get("windows") or {})
     hist, info = ph.load(path, window_s=window_s, models=models, seq_len=seq_len, trace=trace_name_of(trace),
