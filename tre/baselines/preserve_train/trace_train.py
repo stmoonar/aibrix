@@ -107,6 +107,21 @@ def trace_dir(root: Path, set_name: str, trace: str, seed: int) -> Path:
     return root / set_name / trace / f"seed{seed}"
 
 
+def train_keys(cfg: dict, t: dict) -> List[str]:
+    """The training realizations of a trace, oldest first: the training seeds, or for ``train_source: real_past``
+    (user 2026-11-04, Real_*) the real Azure intervals before the slice, ``past<n>`` .. ``past1`` (past1 ends where
+    the evaluation slice's source interval starts)."""
+    if t.get("train_source") == "real_past":
+        return [f"past{k}" for k in range(int(cfg["real_past"]["n"]), 0, -1)]
+    return [str(s) for s in cfg["train_seeds"]]
+
+
+def train_file(cfg: dict, out: Path, t: dict, key: str) -> Path:
+    if key.startswith("past"):
+        return out / "real-past" / t["set"] / key / t["trace"] / f"seed{cfg['eval_seed']}" / "traces_tre.effective.json"
+    return trace_dir(out, t["set"], t["trace"], int(key)) / "traces_tre.effective.json"
+
+
 # ----------------------------------------------------------------------------------------------- realize
 
 
@@ -213,6 +228,151 @@ def verify_realizations(cfg: dict, root: Path, out: Path) -> List[dict]:
     return checks
 
 
+# ----------------------------------------------------------------------------------------------- real past
+
+
+def used_intervals(root: Path, PHA) -> List[Tuple[str, Optional[str], dt.datetime, dt.datetime]]:
+    """Azure intervals already used: the generator's exclusion zones (Real_* v1 slices + pre-slice history, other
+    suites, with their guards), the r3c / r3d / r3e Real_* source intervals (no guard) and every history segment
+    recorded by a ``preserve_history*.json`` of a trace set under ``root``. (name, family or None = both, a, b)."""
+    out = [(n, None, a, b) for n, a, b in PHA.EXCLUDE_BASE]
+    out += [(f"r3c {n}", f, PHA._z(st), PHA._z(st) + dt.timedelta(seconds=720)) for n, f, st in PHA.R3C_REAL]
+    out += [(f"r3d {n}", f, PHA._z(st), PHA._z(st) + dt.timedelta(seconds=L)) for n, f, st, L in PHA.R3D_REAL]
+    out += [(f"r3e {n}", f, PHA._z(st), PHA._z(st) + dt.timedelta(seconds=L)) for n, f, st, L in PHA.R3E_REAL]
+    seen = set()
+    for p in sorted(root.glob("traces-*/*/seed*/preserve_history*.json")):
+        try:
+            src = json.loads(p.read_text()).get("source") or {}
+        except ValueError:
+            continue
+        for m, r in (src.get("per_model") or {}).items():
+            if isinstance(r, dict) and r.get("segment_start_utc") and r.get("family"):
+                key = (r["family"], r["segment_start_utc"], r["segment_end_utc_exclusive"])
+                if key not in seen:
+                    seen.add(key)
+                    out.append((f"history {p.relative_to(root).parts[0]}/{p.parent.parent.name}/{m}", r["family"],
+                                PHA._z(r["segment_start_utc"]), PHA._z(r["segment_end_utc_exclusive"])))
+    return out
+
+
+def _past_unit(args) -> dict:
+    """One past interval of one trace through the r3e generator (forked; ``run_unit`` chdirs / edits sys.path)."""
+    gsrc, trace, seed, a = args
+    sys.path.insert(0, gsrc)
+    import gen_r3e as G  # noqa: E402
+
+    return G.run_unit((trace, seed, a))
+
+
+def cmd_realize_real_past(a) -> int:
+    """Real_* (user 2026-11-04): train on the real Azure past of the slice. Per model, the n intervals right before
+    the slice's own source interval (same length, contiguous going back; an interval that overlaps a used one moves
+    back on the 60 s grid to the nearest earlier free position), each through the r3e transform of the slice
+    (``r3e_select.materialize``: x8 compression, 121 s envelope, plateau-clip min-max to the model's lo..hi target x
+    the slice's beta, tok70 lengths, thinning / copies) and the r3e generator (``gen_r3e.run_unit``, the slice's
+    seed), into ``<out>/real-past/<set>/past<k>/``."""
+    cfg = load_config(a.config)
+    root, out = Path(a.data_root), Path(a.out)
+    rp = cfg["real_past"]
+    set_name = rp["set"]
+    sset = cfg["sets"][set_name]
+    gsrc = out / "_gen_src" / set_name
+    for name in ("gen_r3e.py", "r3e_select.py", "preserve_history_azure.py"):
+        if sha256_file(gsrc / name) != sha256_file(root / set_name / "_src" / name):
+            raise SystemExit(f"{gsrc / name} differs from the set's _src copy")
+    sys.path.insert(0, str(gsrc))
+    import gen_r3e as G  # noqa: E402
+    import preserve_history_azure as PHA  # noqa: E402
+    import r3e_select as RS  # noqa: E402
+
+    sel = json.loads((root / sset["selection"]).read_text())
+    traces = [t for t in cfg["traces"] if t.get("train_source") == "real_past"]
+    fams = {G.REAL[t["trace"]] for t in traces}
+    counts = {f: np.load(root / sset["counts_cache"] / f"{f}_counts.npy") for f in fams}
+    used = used_intervals(root, PHA)
+    L, n, grid = RS.C * RS.DUR, int(rp["n"]), int(RS.GRID_S)
+    plan, intervals = {}, []
+    for t in traces:
+        tr = t["trace"]
+        fam = G.REAL[tr]
+        r = sel["selection"][fam]
+        for m in G.MODELS:
+            end = int(r["chosen"][m]["start_s"])
+            for k in range(1, n + 1):
+                st, skipped = end - L, []
+                while True:
+                    a0 = RS.START[fam] + dt.timedelta(seconds=st)
+                    a1 = a0 + dt.timedelta(seconds=L)
+                    hit = [nm for nm, f, u0, u1 in used if (f is None or f == fam) and a0 < u1 and u0 < a1]
+                    if not hit:
+                        break
+                    skipped += [h for h in hit if h not in skipped]
+                    st -= grid
+                if st < 0:
+                    raise SystemExit(f"{tr}/{m} past{k}: before the start of the week")
+                u = RS.clip_u(RS.envelope(RS.compress(counts[fam], st)))
+                hl, hs = RS.hot_block(u)
+                x = {"start_s": st, "hot_len": hl, "hot_start": hs, "head": float(u[:60].mean())}
+                plan[(tr, m, k)] = (fam, x, r["beta"])
+                intervals.append({"trace": tr, "model": m, "key": f"past{k}", "family": fam, "start_s": st,
+                                  "start_utc": a0.isoformat(), "end_utc": a1.isoformat(),
+                                  "shifted_s": end - L - st, "collisions_skipped": skipped,
+                                  "slice_start_utc": r["chosen"][m]["start_utc"]})
+                used.append((f"real-past {tr}/{m}/past{k}", fam, a0, a1))  # the pasts of one family never overlap
+                end = st
+    v1 = Path(a.v1_gen)
+    git = lambda *x: subprocess.run(["git", "-C", str(v1), *x], capture_output=True, text=True).stdout.strip()
+    v1_prov = {"repo": str(v1), "git_sha": git("rev-parse", "HEAD"), "dirty_src": git("status", "--porcelain", "--", "src"),
+               **{f"{nm}_sha256": sha256_file(v1 / "src" / nm) for nm in
+                  ("trace_generator.py", "data_generator.py", "real_trace_adapter.py", "config_manager.py")}}
+    units = []
+    for k in range(1, n + 1):
+        base = out / "real-past" / set_name
+        design = base / f"past{k}.design"
+        (design / "config" / "icse_final").mkdir(parents=True, exist_ok=True)
+        if not (design / "src").exists():
+            os.symlink(v1 / "src", design / "src")
+        for t in traces:
+            tr = t["trace"]
+            dd = design / "config" / "icse_final" / tr
+            (dd / "real_traces").mkdir(parents=True, exist_ok=True)
+            if not (dd / "config.yaml").exists():
+                os.symlink(v1 / "config" / "icse_final" / tr / "config.yaml", dd / "config.yaml")
+            prov = {}
+            for m in G.MODELS:
+                fam, x, beta = plan[(tr, m, k)]
+                rows, pv = RS.materialize(fam, m, x, beta, Path(a.azure_root), counts[fam])
+                f = dd / "real_traces" / f"{m}.json"
+                f.write_text(json.dumps(rows) + "\n")
+                prov[m] = {**pv, "design_list_sha256": sha256_file(f)}
+                log(f"{tr}/{m} past{k}: {pv['interval_start_utc']} {pv['requests']} requests")
+            mk = json.loads((root / (set_name + ".design") / "config" / "icse_final" / tr / "r3e.json").read_text())
+            mk.update(per_model=prov, real_past={"k": k, "rule": cmd_realize_real_past.__doc__})
+            (dd / "r3e.json").write_text(json.dumps(mk, indent=1, default=float) + "\n")
+            if not (base / f"past{k}" / tr / f"seed{cfg['eval_seed']}" / "manifest.json").exists():
+                ua = {"design": str(design), "out": str(base / f"past{k}"), "v1_gen": str(v1),
+                      "v9": str(Path(a.azure_root) / "v1-retrace/traces_v9"), "azure_root": str(a.azure_root),
+                      "me": sha256_file(gsrc / "gen_r3e.py"), "v1_prov": v1_prov}
+                units.append((str(gsrc), tr, int(cfg["eval_seed"]), ua))
+    t0 = time.time()
+    with mp.get_context("fork").Pool(a.processes, maxtasksperchild=1) as pool:
+        for res in pool.imap_unordered(_past_unit, units):
+            log(f"generated {res}")
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rec = {"created_utc": stamp, "tool": git_info(HERE), "host": platform.node(), "set": set_name,
+           "seed": int(cfg["eval_seed"]), "rule": cmd_realize_real_past.__doc__.strip(),
+           "used_intervals": [[nm, f, u0.isoformat(), u1.isoformat()] for nm, f, u0, u1 in used
+                              if not nm.startswith("real-past")],
+           "intervals": intervals, "generator_sha256": {nm: sha256_file(gsrc / nm) for nm in
+                                                        ("gen_r3e.py", "r3e_select.py", "preserve_history_azure.py")},
+           "seconds": round(time.time() - t0, 1)}
+    write_new(out / "_logs" / f"real-past-{stamp}.json", json.dumps(rec, indent=1) + "\n")
+    for it in intervals:
+        log(f"{it['trace']}/{it['model']} {it['key']}: {it['start_utc']} .. {it['end_utc']} shifted {it['shifted_s']} s "
+            f"skipped {it['collisions_skipped']}")
+    return 0
+
+
 # ----------------------------------------------------------------------------------------------- series
 
 
@@ -263,15 +423,16 @@ def cmd_series(a) -> int:
         s, tr = t["set"], t["trace"]
         caps = loadgen_caps(tre, cfg["loadgen_configs"], tr)
         rows = {}
-        for seed in [cfg["eval_seed"], *cfg["train_seeds"]]:
-            base = root if seed == cfg["eval_seed"] else out
-            p = trace_dir(base, s, tr, seed) / "traces_tre.effective.json"
+        keys = train_keys(cfg, t)
+        for key in [str(cfg["eval_seed"]), *keys]:
+            p = (trace_dir(root, s, tr, cfg["eval_seed"]) / "traces_tre.effective.json" if key == str(cfg["eval_seed"])
+                 else train_file(cfg, out, t, key))
             recs = json.loads(p.read_text())
             ser, meta = window_series(recs, cfg["models"], W, n, caps)
-            rows[str(seed)] = {"file": str(p), "sha256": sha256_file(p), **meta, "series": ser}
-            log(f"series {tr} seed{seed}: {meta['requests']} requests, nulls {meta['null_max_output_tokens']}")
-        doc["traces"][tr] = {"set": s, "eval_seed": cfg["eval_seed"], "train_seeds": cfg["train_seeds"],
-                             "loadgen_max_tokens": caps, "seeds": rows}
+            rows[key] = {"file": str(p), "sha256": sha256_file(p), **meta, "series": ser}
+            log(f"series {tr} {key}: {meta['requests']} requests, nulls {meta['null_max_output_tokens']}")
+        doc["traces"][tr] = {"set": s, "eval_seed": cfg["eval_seed"], "train_keys": keys,
+                             "train_source": t.get("train_source", "seeds"), "loadgen_max_tokens": caps, "seeds": rows}
     doc["variability"] = variability(doc, cfg)
     write_new(out / f"series_w{W:g}.json", json.dumps(doc) + "\n")
     log(f"wrote {out / f'series_w{W:g}.json'}")
@@ -302,10 +463,20 @@ def write_sources(cfg: dict, root: Path, out: Path, doc: dict) -> None:
     L += ["", "## Checks (seed-1 rerun vs the evaluation files; rebuilt design inputs vs the evaluation set's)\n",
           "| check | equal |", "|---|---|"]
     L += [f"| {c['what']} | {c['equal']} |" for c in rz["checks"]]
-    L += ["", "## Realizations\n", "| trace | seed | requests | traces_tre.effective.json sha256 |", "|---|---:|---:|---|"]
+    rp = sorted((out / "_logs").glob("real-past-*.json"))
+    if rp:
+        r = json.loads(rp[-1].read_text())
+        L += ["", "## Real_* training source: the real Azure intervals before the slice (user 2026-11-04)\n",
+              r["rule"], "", f"Record `_logs/{rp[-1].name}`. Generator: `_gen_src/{r['set']}/` "
+              f"(`r3e_select.materialize` per interval, then `gen_r3e.run_unit` seed {r['seed']}).\n",
+              "| trace | model | key | source interval (UTC) | shifted back (s) | overlaps |", "|---|---|---|---|---:|---|"]
+        for it in r["intervals"]:
+            L.append(f"| {it['trace']} | {it['model']} | {it['key']} | {it['start_utc']} .. {it['end_utc']} | "
+                     f"{it['shifted_s']} | {', '.join(it['collisions_skipped']) or 'none'} |")
+    L += ["", "## Realizations\n", "| trace | key | requests | traces_tre.effective.json sha256 |", "|---|---|---:|---|"]
     for t in cfg["traces"]:
-        for sd in cfg["train_seeds"]:
-            rec = doc["traces"][t["trace"]]["seeds"][str(sd)]
+        for sd in doc["traces"][t["trace"]]["train_keys"]:
+            rec = doc["traces"][t["trace"]]["seeds"][sd]
             rel = Path(rec["file"]).relative_to(out)
             L.append(f"| {t['trace']} | {sd} | {rec['requests']} | `{rec['sha256']}` |")
             sums.append(f"{rec['sha256']}  {rel}\n")
@@ -329,7 +500,7 @@ def variability(doc: dict, cfg: dict) -> dict:
             for k in ("P", "D"):
                 y = np.asarray(ev[m][k], dtype=float)
                 vals = []
-                for s in cfg["train_seeds"]:
+                for s in td["train_keys"]:
                     x = np.asarray(td["seeds"][str(s)]["series"][m][k], dtype=float)
                     ok = y > 0
                     vals.append(float(np.mean(np.abs(x[ok] - y[ok]) / y[ok]) * 100) if ok.any() else float("nan"))
@@ -346,13 +517,13 @@ def training_series(doc: dict, cfg: dict) -> Tuple[dict, dict]:
         tr = t["trace"]
         td = doc["traces"][tr]
         for m in cfg["models"]:
-            cat = {k: sum((td["seeds"][str(s)]["series"][m][k] for s in cfg["train_seeds"]), []) for k in ("P", "D")}
+            cat = {k: sum((td["seeds"][s]["series"][m][k] for s in td["train_keys"]), []) for k in ("P", "D")}
             v1[(tr, m)] = cat
         start = len(v2[cfg["models"][0]]["P"])
         for m in cfg["models"]:
             for k in ("P", "D"):
                 v2[m][k] += v1[(tr, m)][k]
-        segs.append({"trace": tr, "seeds": cfg["train_seeds"], "windows": [start, len(v2[cfg["models"][0]]["P"])]})
+        segs.append({"trace": tr, "seeds": td["train_keys"], "windows": [start, len(v2[cfg["models"][0]]["P"])]})
     return v1, {"series": v2, "segments": segs}
 
 
@@ -469,8 +640,8 @@ def history_doc(cfg: dict, doc: dict, trace: str, variant: str) -> dict:
     series = the end of the last training realization (seed order)."""
     L, W = int(cfg["seq_len"]), float(cfg["window_s"])
     td = doc["traces"][trace]
-    last = cfg["train_seeds"][-1]
-    rec = td["seeds"][str(last)]
+    last = td["train_keys"][-1]
+    rec = td["seeds"][last]
     n = int(doc["n_windows"])
     if n < L:
         raise SystemExit("a realization is shorter than seq_len")
@@ -480,9 +651,10 @@ def history_doc(cfg: dict, doc: dict, trace: str, variant: str) -> dict:
             "models": rows,
             "source": {"method": HISTORY_METHOD, "variant": variant,
                        "rule": "the last seq_len windows of the trace's training series (its training realizations "
-                               "concatenated in seed order) = windows [n - seq_len, n) of the last training seed; "
-                               "the evaluation realization is the next one",
-                       "realization": {"set": td["set"], "trace": trace, "seed": last, "file": rec["file"],
+                               "concatenated oldest first) = windows [n - seq_len, n) of the last one (synthetic: the "
+                               "last training seed; Real_*: past1, the real Azure interval right before the slice's "
+                               "source interval, i.e. the true pre-context); the evaluation realization is the next one",
+                       "realization": {"set": td["set"], "trace": trace, "key": last, "file": rec["file"],
                                        "sha256": rec["sha256"], "windows": [n - L, n]},
                        "series_rule": doc["rule"], "tool": "tre/baselines/preserve_train/trace_train.py",
                        "tool_git": git_info(HERE)}}
@@ -624,13 +796,23 @@ def cmd_finish(a) -> int:
            "files": tman["files"],
            "history": {"variant": variant, "name": name, "method": HISTORY_METHOD,
                        "files": [{"path": p, "sha256": h} for h, p in hist_files]},
-           "eval": ev, "variability": doc["variability"]}
+           "eval": ev, "variability": doc["variability"],
+           "real_past": _real_past_record(out)}
     (wout / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
     (wout / "REPORT.md").write_text(report(man, cfg))
     if a.history_sha256_out:
         Path(a.history_sha256_out).write_text("".join(f"{h}  {p}\n" for h, p in hist_files))
     log(f"wrote {wout / 'manifest.json'}, REPORT.md")
     return 0
+
+
+def _real_past_record(out: Path) -> Optional[dict]:
+    rp = sorted((out / "_logs").glob("real-past-*.json"))
+    if not rp:
+        return None
+    r = json.loads(rp[-1].read_text())
+    return {"record": str(rp[-1]), "rule": r["rule"], "seed": r["seed"], "intervals": r["intervals"],
+            "generator_sha256": r["generator_sha256"]}
 
 
 def _f(x) -> str:
@@ -653,6 +835,11 @@ def report(man: dict, cfg: dict) -> str:
          f"4 x 72 windows of {man['window_s']:g} s = 288 windows (paper: 2 days of 10 min windows = 288).\n",
          "- **V1 per trace** (`v1/<trace>.<model>.npz`, 21 files): training series = the trace's 4 realizations "
          "concatenated in seed order (288 windows, 263 sequences).",
+         "- **Real_* (user 2026-11-04)**: V1 of Real_conv / Real_code is trained on the REAL past of the slice "
+         "instead of seed realizations: per model the 4 Azure intervals right before the slice's own source "
+         "interval, each through the slice's r3e transform and generator (table below); training order past4 .. "
+         "past1, so the history before t0 (end of the training series) is the true pre-context of the slice."
+         if man.get("real_past") else "",
          "- **V2 concat** (`v2/concat.<model>.npz`, 3 files): training series = all 7 traces concatenated "
          "(config order: " + ", ".join(s["trace"] for s in man["v2_segments"]) + "; each trace's realizations in "
          "seed order; 2016 windows; sequences run across trace boundaries).",
@@ -696,6 +883,13 @@ def report(man: dict, cfg: dict) -> str:
             cells = [f"{_f(r[v]['P'])} / {_f(r[v]['D'])} / {_f(r[v]['total'])}" for v in
                      ("V1", "V2", "current", "naive", "V1_2step", "V2_2step", "current_2step")]
             L.append(f"| {tr} | {m} | {r['current_set']} | " + " | ".join(cells) + " |")
+    if man.get("real_past"):
+        L += ["", "## Real_* training intervals (real Azure past of each model's slice)\n", man["real_past"]["rule"], "",
+              "| trace | model | key | source interval (UTC) | slice starts | shifted back (s) | collisions skipped |",
+              "|---|---|---|---|---|---:|---|"]
+        for it in man["real_past"]["intervals"]:
+            L.append(f"| {it['trace']} | {it['model']} | {it['key']} | {it['start_utc']} .. {it['end_utc']} | "
+                     f"{it['slice_start_utc']} | {it['shifted_s']} | {'; '.join(it['collisions_skipped']) or 'none'} |")
     L += ["", "## How different the training realizations are from the evaluation one\n",
           "Mean over windows of |x_seed - x_eval| / x_eval (%), mean (max) over the 4 training seeds. Near 0 means "
           "the generator fixes the window sums and the seed only moves arrivals inside a second / prompt text: "
@@ -743,6 +937,12 @@ def main(argv=None) -> int:
     p.add_argument("--cpus", default="", help="taskset CPU list for the generators")
     p.add_argument("--nice", type=int, default=19)
     p.set_defaults(fn=cmd_realize)
+    p = sub.add_parser("realize-real-past")
+    common(p)
+    p.add_argument("--v1-gen", required=True)
+    p.add_argument("--azure-root", required=True)
+    p.add_argument("--processes", type=int, default=4)
+    p.set_defaults(fn=cmd_realize_real_past)
     p = sub.add_parser("series")
     common(p)
     p.set_defaults(fn=cmd_series)

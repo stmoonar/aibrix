@@ -1,52 +1,112 @@
 {
   "name": "preserve-mlstm-20261104-trace-w10",
-  "purpose": "PreServe Tier-1 mLSTM trained on the same service's own past (paper section 5.3 RQ2: the first two days of a service train its predictor): 4 independent realizations of each evaluation trace, made by that trace's own generator and spec with seeds that no evaluation uses; 4 x 72 windows of 10 s = 288 windows (the paper: 2 days of 10 min windows = 288). Normalization = paper Alg. 1 min-max over the training series.",
+  "purpose": "PreServe Tier-1 mLSTM trained on the same service's own past (paper section 5.3 RQ2: the first two days of a service train its predictor): 4 independent realizations of each evaluation trace, made by that trace's own generator and spec with seeds that no evaluation uses; 4 x 72 windows of 10 s = 288 windows (the paper: 2 days of 10 min windows = 288). Normalization = paper Alg. 1 min-max over the training series. Real_* (user 2026-11-04): trained instead on the real Azure intervals right before the slice (real_past).",
   "window_s": 10,
   "seq_len": 25,
   "duration_s": 720,
-  "models": ["dsqwen-7b", "dsllama-8b", "dsqwen-14b"],
+  "models": [
+    "dsqwen-7b",
+    "dsllama-8b",
+    "dsqwen-14b"
+  ],
   "eval_seed": 1,
-  "train_seeds": [101, 102, 103, 104],
+  "train_seeds": [
+    101,
+    102,
+    103,
+    104
+  ],
   "history_variant": "train-tail-20261104",
   "eval_campaign": "campaign-bl-w10-preserve-20261103",
   "loadgen_configs": "loadgen_v1/configs/traces_v14",
-  "hyper": {"hidden": 64, "epochs": 50, "batch_size": 32, "lr": 0.001, "seed": 42, "normalization": "minmax"},
+  "hyper": {
+    "hidden": 64,
+    "epochs": 50,
+    "batch_size": 32,
+    "lr": 0.001,
+    "seed": 42,
+    "normalization": "minmax"
+  },
   "sets": {
     "traces-icse-r3c-20261101": {
-      "profile": "r3c", "script": "gen_r3c.py",
+      "profile": "r3c",
+      "script": "gen_r3c.py",
       "counts_cache": "tools/trace_suite_r3c_20261101/cache"
     },
     "traces-icse-ktrace-20261031": {
-      "profile": "ktrace", "script": "scale_icse_suite.py",
+      "profile": "ktrace",
+      "script": "scale_icse_suite.py",
       "k_map": "traces-icse-ktrace-20261031/_checks/k_map.json",
       "v1_history_dir": "tre_v1/tre_code/python/tre_preserve/history"
     },
     "traces-icse-r3e-20261101": {
-      "profile": "r3e", "script": "gen_r3e.py",
+      "profile": "r3e",
+      "script": "gen_r3e.py",
       "counts_cache": "tools/trace_suite_r3e_20261101/cache",
       "selection": "traces-icse-r3e-20261101/_checks/selection.json"
     }
   },
   "traces": [
-    {"trace": "Alternating_hot_model_periodic_A", "set": "traces-icse-r3c-20261101",
-     "eval_sha256": "574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf"},
-    {"trace": "Simultaneous_spike_ramp_twice_tps1o2", "set": "traces-icse-r3c-20261101",
-     "eval_sha256": "6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93"},
-    {"trace": "Prefill_mixed_corner_decode_mix", "set": "traces-icse-r3c-20261101",
-     "eval_sha256": "91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e"},
-    {"trace": "Decode_heavy_burst", "set": "traces-icse-ktrace-20261031",
-     "eval_sha256": "f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929"},
-    {"trace": "Sinusoidal_demand", "set": "traces-icse-ktrace-20261031",
-     "eval_sha256": "5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab"},
-    {"trace": "Real_conv_2023_slice_a_tok70", "set": "traces-icse-r3e-20261101",
-     "eval_sha256": "431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5"},
-    {"trace": "Real_code_2024_slice_a_tok70", "set": "traces-icse-r3e-20261101",
-     "eval_sha256": "457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c"}
+    {
+      "trace": "Alternating_hot_model_periodic_A",
+      "set": "traces-icse-r3c-20261101",
+      "eval_sha256": "574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf"
+    },
+    {
+      "trace": "Simultaneous_spike_ramp_twice_tps1o2",
+      "set": "traces-icse-r3c-20261101",
+      "eval_sha256": "6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93"
+    },
+    {
+      "trace": "Prefill_mixed_corner_decode_mix",
+      "set": "traces-icse-r3c-20261101",
+      "eval_sha256": "91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e"
+    },
+    {
+      "trace": "Decode_heavy_burst",
+      "set": "traces-icse-ktrace-20261031",
+      "eval_sha256": "f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929"
+    },
+    {
+      "trace": "Sinusoidal_demand",
+      "set": "traces-icse-ktrace-20261031",
+      "eval_sha256": "5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab"
+    },
+    {
+      "trace": "Real_conv_2023_slice_a_tok70",
+      "set": "traces-icse-r3e-20261101",
+      "eval_sha256": "431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5",
+      "train_source": "real_past"
+    },
+    {
+      "trace": "Real_code_2024_slice_a_tok70",
+      "set": "traces-icse-r3e-20261101",
+      "eval_sha256": "457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c",
+      "train_source": "real_past"
+    }
   ],
   "current": {
     "weights_dir": "weights/preserve-mlstm-20261103-paper-w10",
-    "files": {"code": "code-paper-w10.npz", "conv": "conv-paper-w10.npz", "pooled": "pooled-paper-w10.npz"},
-    "rules": [["Real_code", "code"], ["Real_conv", "conv"]],
+    "files": {
+      "code": "code-paper-w10.npz",
+      "conv": "conv-paper-w10.npz",
+      "pooled": "pooled-paper-w10.npz"
+    },
+    "rules": [
+      [
+        "Real_code",
+        "code"
+      ],
+      [
+        "Real_conv",
+        "conv"
+      ]
+    ],
     "default": "pooled"
+  },
+  "real_past": {
+    "n": 4,
+    "set": "traces-icse-r3e-20261101",
+    "rule": "user 2026-11-04: Real_* train on the real Azure past of the slice: per model the 4 intervals right before the slice's own source interval (same length 5760 s, contiguous going back; an interval overlapping a used one moves back on the 60 s grid), each through the slice's r3e transform and generator with the slice's seed (1); the generator seed only places arrivals inside a second"
   }
 }
