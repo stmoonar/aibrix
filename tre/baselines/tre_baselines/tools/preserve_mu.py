@@ -253,6 +253,7 @@ ALG1_FILTER_KEYS = ("splits", "cell_status", "held_out_shapes", "exclude_in_warm
 ALG1_WINDOW_COLS = ("src", "cell_id", "attempt", "shape", "primitive", "rho", "split", "window_start_ms",
                     "window_end_ms", "status", "n", "violations", "v_failed", "v_nl", "nl_p95_ms", "nl_max_ms",
                     "p", "d", "t")
+ENVELOPE_KEYS = ("share", "mean_in", "mean_out")   # P share = sum(in) / (sum(in) + sum(out)); mean lengths per request
 DATASET_FILES = ("windows.csv", "requests.csv", "cells.csv")
 
 
@@ -280,7 +281,32 @@ def load_alg1_config(path: str) -> dict:
             raise SystemExit(f"preserve_mu alg1: {path}: sources of {model} need name and path")
     if not float(cfg["window_s"]) > 0:
         raise SystemExit(f"preserve_mu alg1: {path}: window_s must be > 0")
+    if cfg.get("envelope"):
+        check_envelope(cfg["envelope"], path)
     return cfg
+
+
+def check_envelope(env: Mapping, where: str = "envelope") -> None:
+    """Optional shape envelope: ``{name, bounds: {model: {share|mean_in|mean_out: [lo, hi]}}}`` (inclusive)."""
+    for model, b in (env.get("bounds") or {}).items():
+        bad = sorted(set(b) - set(ENVELOPE_KEYS))
+        if bad or not b or any(len(v) != 2 or not float(v[0]) <= float(v[1]) for v in b.values()):
+            raise SystemExit(f"preserve_mu alg1: {where}: envelope of {model}: keys {bad} / need [lo, hi] each")
+    if not env.get("bounds"):
+        raise SystemExit(f"preserve_mu alg1: {where}: envelope has no bounds")
+
+
+def inside_envelope(res: Mapping, bounds: Optional[Mapping], secs: float) -> bool:
+    """Window shape (arrived requests: P share, mean input, mean output tokens) inside ``bounds`` (None = no
+    filter). A window without requests has no shape and is outside any envelope."""
+    if not bounds:
+        return True
+    n = res["n"]
+    if not n:
+        return False
+    P, D = res["p"] * secs, res["d"] * secs
+    shape = {"share": P / (P + D) if P + D else 0.0, "mean_in": P / n, "mean_out": D / n}
+    return all(float(lo) <= shape[k] <= float(hi) for k, (lo, hi) in bounds.items())
 
 
 def _cell_key(cell_id: Any, attempt: Any) -> tuple:
@@ -396,6 +422,7 @@ def alg1_summary(rows: Sequence[Mapping], top_k: int = 5) -> dict:
     dirty = [r for r in rows if r["status"] == "dirty"]
     out: dict = {"windows_kept": len(rows), "clean": len(clean), "dirty": len(dirty),
                  "empty": sum(1 for r in rows if r["status"] == "empty"),
+                 "outside_envelope": sum(1 for r in rows if r["status"] == "outside"),
                  "unjudgeable": sum(1 for r in rows if r["status"] == "unjudgeable"), "terms": {}}
     for term in ALG1_TERMS:
         if not clean:
@@ -422,6 +449,7 @@ def profile_alg1(cfg: Mapping, data_root: Path, models: Sequence[str]) -> tuple:
     summaries: dict = {}
     all_rows: list[dict] = []
     sources: list[dict] = []
+    bounds = (cfg.get("envelope") or {}).get("bounds") or {}
     for model in models:
         nl_slo = float(cfg["nl_slo_ms"][model])
         rows: list[dict] = []
@@ -433,6 +461,9 @@ def profile_alg1(cfg: Mapping, data_root: Path, models: Sequence[str]) -> tuple:
             for w in kept:
                 res = alg1_window(reqs.get(w["key"], []), sends.get(w["key"], []), w["window_start_ms"],
                                   w["window_end_ms"], nl_slo, route_timeout_s)
+                if res["status"] != "empty" and not inside_envelope(
+                        res, bounds.get(model), (w["window_end_ms"] - w["window_start_ms"]) / 1000.0):
+                    res = {**res, "status": "outside"}   # shape outside the envelope: not judged, not in mu
                 rows.append({**{k: v for k, v in w.items() if k != "key"}, **res})
             sources.append(stats)
             print(f"# {model} {src['name']}: {stats['kept']}/{stats['windows']} windows kept, "
@@ -469,10 +500,11 @@ def _git_sha() -> Optional[str]:
     return f"{sha}{'-dirty' if dirty else ''}" if sha else None
 
 
-def _summary_md(summaries: Mapping, prov: Mapping) -> str:
+def _summary_md(summaries: Mapping, prov: Mapping, env: Optional[Mapping] = None) -> str:
     lines = ["# PreServe mu, Alg. 1 on the TSS / theta training set", "",
              f"tool `{prov['tool_sha']}`, config `{prov['config']}` (sha256 `{prov['config_sha256'][:12]}`), "
-             f"window {prov['window_s']:g} s, arrival attribution, NL rule, no P-share filter.", "",
+             f"window {prov['window_s']:g} s, arrival attribution, NL rule, "
+             f"{'envelope ' + str(env.get('name')) if env else 'no shape filter'}.", "",
              "| model | NL SLO ms | clean / judged (kept) | mu_p | mu_d | mu_t | bracketed p/d/t |",
              "|---|---|---|---|---|---|---|"]
     for m, s in summaries.items():
@@ -508,8 +540,15 @@ def main_alg1(argv: Sequence[str]) -> int:
     ap.add_argument("--data-root", required=True, help="root the config's source paths are relative to")
     ap.add_argument("--out", required=True, help="output dir (must not hold a result.json)")
     ap.add_argument("--models", default="", help="comma list (default: every model of the config)")
+    ap.add_argument("--envelope", default="", help="envelope file (yaml: name, bounds per model); keep only "
+                    "windows whose shape is inside it. Default: the config's `envelope`, else no filter")
     a = ap.parse_args(list(argv))
     cfg = load_alg1_config(a.config)
+    if a.envelope:
+        with open(a.envelope, "r", encoding="utf-8") as fh:
+            cfg["envelope"] = yaml.safe_load(fh) or {}
+        check_envelope(cfg["envelope"], a.envelope)
+        cfg["envelope"]["file_sha256"] = _sha256(Path(a.envelope))
     only = [m.strip() for m in a.models.split(",") if m.strip()]
     models = only or list(cfg["sources"])
     bad = [m for m in models if m not in cfg["sources"]]
@@ -540,7 +579,10 @@ def main_alg1(argv: Sequence[str]) -> int:
             "clean": "at least one request and none violates: failed / timed out, or NL = e2e / output tokens > NL SLO",
             "rates": "sum of the arrived requests' prompt (p) / output (d) / both (t) tokens / window seconds; "
                      "a failed request counts expected_prompt_tokens and 0 output tokens (dirty windows only)",
-            "mu": "max over clean windows per term (Alg. 1 lines 8-11); no P-share filter; one pod per cell",
+            "mu": "max over clean windows per term (Alg. 1 lines 8-11); one pod per cell; "
+                  + (f"windows outside envelope {cfg['envelope'].get('name')!r} (shape of the arrived requests: P share, "
+                     "mean input, mean output tokens) are dropped before judging" if cfg.get("envelope")
+                     else "no shape filter"),
             "empty windows": "skipped (no requests: Alg. 1's max is unchanged by them)"}
     out.mkdir(parents=True, exist_ok=True)
     mu = {m: {k: s["terms"][k]["mu"] for k in ALG1_TERMS} for m, s in summaries.items() if s["clean"]}
@@ -556,7 +598,7 @@ def main_alg1(argv: Sequence[str]) -> int:
         wr.writeheader()
         for r in rows:
             wr.writerow({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
-    (out / "summary.md").write_text(_summary_md(summaries, prov), encoding="utf-8")
+    (out / "summary.md").write_text(_summary_md(summaries, prov, cfg.get("envelope")), encoding="utf-8")
     sys.stdout.write(yaml.safe_dump({"mu": mu}, sort_keys=True, default_flow_style=None))
     return 0 if len(mu) == len(models) else 1
 

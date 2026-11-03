@@ -149,3 +149,23 @@ def test_alg1_a_stricter_nl_slo_dirties_the_window_holding_mu(tmp_path) -> None:
     assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(tmp_path / "o")]) == 0
     assert yaml.safe_load((tmp_path / "o" / "mu.yaml").read_text())["mu"]["dsqwen-7b"] == {
         "p": 200.0, "d": 20.0, "t": 220.0}
+
+
+def test_alg1_envelope_drops_windows_outside_the_shape_bounds(tmp_path) -> None:
+    import json
+
+    cfg, root = _alg1_dataset(tmp_path)
+    env = tmp_path / "env.yaml"                       # P share: w0 .91 in; w1 .998, w2 .988, w3 .976 out
+    env.write_text(yaml.safe_dump({"name": "t", "bounds": {"dsqwen-7b": {"share": [0.5, 0.95]}}}))
+    out = tmp_path / "out"
+    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(out),
+                    "--envelope", str(env)]) == 0
+    res = json.loads((out / "result.json").read_text())
+    m = res["models"]["dsqwen-7b"]
+    assert res["mu"] == {"dsqwen-7b": {"p": 200.0, "d": 20.0, "t": 220.0}}       # only w0 is inside
+    assert (m["clean"], m["outside_envelope"]) == (1, 3) and res["config"]["envelope"]["name"] == "t"
+    # a mean-length bound counts per request: w0 has 1000 in / 100 out on average
+    env.write_text(yaml.safe_dump({"name": "l", "bounds": {"dsqwen-7b": {"mean_in": [900, 1100], "mean_out": [90, 110]}}}))
+    assert pm.main(["alg1", "--config", str(cfg), "--data-root", str(root), "--out", str(tmp_path / "o2"),
+                    "--envelope", str(env)]) == 0
+    assert yaml.safe_load((tmp_path / "o2" / "mu.yaml").read_text())["mu"]["dsqwen-7b"]["p"] == 200.0
