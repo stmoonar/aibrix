@@ -66,8 +66,9 @@ key                          default     meaning
                                          accurate length predictor.
 ``seed``                     config.seed seed of the per-request draws. ours
 ``skip_reissue``             true        ignore events with ``reissue != "none"``. ours
-``window_s``                 30          lambda window over ``ts_ms`` (= TRE TSS window).
-                                         ours (not in paper)
+``window_s``                 10          lambda window over ``ts_ms`` = TRE's metrics window
+                                         (controller ``TRE_METRICS_WINDOW_MS`` 10000, tune F;
+                                         30 until 2026-11-03). ours (not in paper)
 ``max_estimate_frac``        0.05        degraded when the window's share of
                                          ``in_src == "estimate"`` exceeds it. ours
 ``calibration``              (none)      ``pending``: the factory refuses (values not frozen)
@@ -217,7 +218,7 @@ class TokenScalePolicy:
     def __init__(self, config: Any) -> None:
         p: Mapping[str, Any] = dict(getattr(config, "policy_params", None) or {})
         refuse_pending(p, self.name)
-        self.window_s = float(p.get("window_s", 30.0))  # not in paper
+        self.window_s = float(p.get("window_s", 10.0))  # not in paper
         #: A scale-down needs this much gap-free event history (the whole window).
         self.event_history_s = self.window_s
         self.max_estimate_frac = float(p.get("max_estimate_frac", 0.05))  # not in paper

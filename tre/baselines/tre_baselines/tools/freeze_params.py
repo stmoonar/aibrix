@@ -75,7 +75,7 @@ def render_tokenscale(centers: Optional[Mapping[str, Any]], velocity: Optional[M
           "misbucket_rate: 0.15     # paper: 85 %-accurate length predictor; draw = hash(seed, model, client id)",
           "seed: 0",
           "skip_reissue: true",
-          "window_s: 30             # = TRE TSS window (30 s); paper gives no value",
+          "window_s: 10             # = TRE metrics window (TRE_METRICS_WINDOW_MS 10000, tune F); paper gives no value",
           "max_estimate_frac: 0.05  # not in paper"]
     return "\n".join(L) + "\n"
 

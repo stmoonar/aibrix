@@ -22,6 +22,12 @@ File layout (written by ``tre_preserve.train.export.export_npz``): scalar keys `
 (``prompt`` / ``response``) the tensors ``<kind>.W_ih.weight`` (4H x 1), ``<kind>.W_ih.bias``,
 ``<kind>.W_hh.weight`` (4H x H), ``<kind>.W_hh.bias``, ``<kind>.fc.weight`` (1 x H),
 ``<kind>.fc.bias`` (+ unused ``<kind>.W_m.*`` / ``<kind>.U_m.*``).
+
+Window (2026-11-03): a model predicts the next window of the length it was trained on, so a file
+declares it: scalar key ``window_s`` (written by ``tools/preserve_mlstm_retrain.py finish``). The
+three files of ``weights/preserve-mlstm-20261024-paper`` predate the key; their window (30 s, their
+REPORT.md) is known by sha256 (:data:`LEGACY_WINDOW_S`). Any other file without the key is refused,
+and the policy refuses weights of another window than ``params.window_s``.
 """
 
 from __future__ import annotations
@@ -34,6 +40,12 @@ import numpy as np
 FORMAT_VERSION = 1
 KINDS = ("prompt", "response")
 PER_SEQUENCE_MEAN = "per_sequence_mean"
+#: sha256 -> training window (s) of exported files without a ``window_s`` key (v1 paper_past, 10-24).
+LEGACY_WINDOW_S = {
+    "3e70e4642829427ac5a528bfd6ff77e8e29335960adbab76832a6d5168251fb4": 30.0,  # code-paper.npz
+    "64448df062646bbb0cbe0ce8936330509172046c4bd2ee568b595b4ad4dc4478": 30.0,  # conv-paper.npz
+    "0dfd5649600b2c86208528e3f0de5b19ac3266fc27af77c2189d6851134c1585": 30.0,  # pooled-paper.npz
+}
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -44,7 +56,7 @@ class Predictor:
     """One trained mLSTM (prompt tokens or response tokens) for one model set."""
 
     def __init__(self, weights: Dict[str, np.ndarray], seq_len: int, hidden: int, eps: float,
-                 normalization: str, kind: str):
+                 normalization: str, kind: str, window_s: Optional[float] = None):
         if normalization != PER_SEQUENCE_MEAN:
             raise ValueError(f"unsupported normalization {normalization!r} (only {PER_SEQUENCE_MEAN!r} ships)")
         self.seq_len = int(seq_len)
@@ -52,6 +64,8 @@ class Predictor:
         self.eps = float(eps)
         self.normalization = normalization
         self.kind = kind
+        #: training window (s); None = the file does not say (see :func:`load_predictors`)
+        self.window_s = None if window_s is None else float(window_s)
         h = self.hidden
         self._w_ih = np.asarray(weights["W_ih.weight"], dtype=np.float64).reshape(4 * h, -1)[:, 0]
         self._b = (np.asarray(weights["W_ih.bias"], dtype=np.float64)
@@ -99,8 +113,9 @@ def load_predictor(path: str, kind: str) -> Predictor:
         weights = {k[len(prefix):]: z[k] for k in z.files if k.startswith(prefix)}
         if not weights:
             raise ValueError(f"{path}: no {kind!r} model in file")
+        window_s = float(z["window_s"]) if "window_s" in z.files else None
         return Predictor(weights, seq_len=int(z["seq_len"]), hidden=int(z["hidden"]), eps=float(z["eps"]),
-                         normalization=str(z["normalization"]), kind=kind)
+                         normalization=str(z["normalization"]), kind=kind, window_s=window_s)
 
 
 def sha256_of(path: str) -> str:
@@ -113,9 +128,16 @@ def sha256_of(path: str) -> str:
 
 def load_predictors(path: str, sha256: Optional[str] = None) -> Dict[str, Predictor]:
     """Both models of one exported set: {"prompt": Predictor, "response": Predictor}. With
-    ``sha256`` the file must have exactly that digest."""
-    if sha256 is not None:
-        got = sha256_of(path)
-        if got != str(sha256).strip().lower():
-            raise ValueError(f"{path}: sha256 {got} != expected {sha256}")
-    return {k: load_predictor(path, k) for k in KINDS}
+    ``sha256`` the file must have exactly that digest. Each predictor's ``window_s`` is the file's
+    key, else :data:`LEGACY_WINDOW_S` of its digest; neither -> ValueError (fail closed)."""
+    got = sha256_of(path)
+    if sha256 is not None and got != str(sha256).strip().lower():
+        raise ValueError(f"{path}: sha256 {got} != expected {sha256}")
+    out = {k: load_predictor(path, k) for k in KINDS}
+    for pr in out.values():
+        if pr.window_s is None:
+            pr.window_s = LEGACY_WINDOW_S.get(got)
+        if pr.window_s is None:
+            raise ValueError(f"{path}: the weights do not declare their training window (no window_s key, "
+                             "not a known legacy file)")
+    return out

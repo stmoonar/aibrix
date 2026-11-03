@@ -292,6 +292,10 @@ class PreServePolicy:
                 for k, pr in self._predictors.items():
                     if pr.seq_len != self.seq_len:
                         raise ValueError(f"preserve: predictor {k} seq_len {pr.seq_len} != seq_len {self.seq_len}")
+                    # a model forecasts the next window of its training length (2026-11-03)
+                    if pr.window_s is None or abs(float(pr.window_s) - self.window_s) > 1e-9:
+                        raise ValueError(f"preserve: predictor {self.predictor_set}/{k} was trained on "
+                                         f"{pr.window_s} s windows, params.window_s is {self.window_s}")
             if history is not None:
                 self._history = {m: list(v) for m, v in history.items()}
                 self.history_info = {"path": None, "injected": True}
