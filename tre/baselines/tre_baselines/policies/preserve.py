@@ -17,7 +17,7 @@ Composition (v1 faithful)::
 
     desired = clamp(max(N_T1, N_T2), min_replicas, max_replicas)
 
-* **N_T1** (Tier-1), set at the first tick of each window ``i`` of ``window_s`` (30 s, v1 D18)
+* **N_T1** (Tier-1), set at the first tick of each window ``i`` of ``window_s`` (10 s; 30 s, v1 D18, until 2026-11-03)
   from the replay start ``t0``: ``N = ceil(max(P/(mu_p W), D/(mu_d W), (P+D)/(mu_t W)))`` with
   the forecast ``P_hat``, ``D_hat`` (:class:`preserve_tier1.MlstmTier1`; the history before
   ``t0`` is the trace's history file, :mod:`preserve_history`). None before ``t0`` or without a
@@ -73,7 +73,9 @@ trace_schedule          poisson                ours: what ``tre_replayer.run_tra
 trace_match_parts       2                      ours: replay marker must end in the same N parts
 trace_name              path part -3           the trace's name (``<name>/seed<k>/<file>``):
                                                picks the predictor set
-window_s                30                     v1 D18 (paper 600 s; our traces are 12 min)
+window_s                10                     ours 2026-11-03 (= TRE's 10 s metrics window; 30 s
+                                               before, v1 D18; paper 600 s; our traces are 12 min);
+                                               the predictors and the history must declare it
 lead_s                  0                      ours: fire Tier-1 this early (s)
 tier1                   mlstm                  paper; ``oracle_noisy`` / ``oracle`` /
                                                ``last_window`` = sensitivity (D8)
@@ -236,7 +238,7 @@ class PreServePolicy:
         models = dict(getattr(config, "models", None) or {})
         cfg_seed = int(getattr(config, "seed", 0) or 0)
         self.seed = int(params.get("noise_seed", cfg_seed))
-        self.window_s = float(params.get("window_s", 30.0))
+        self.window_s = float(params.get("window_s", 10.0))
         if self.window_s <= 0:
             raise ValueError("preserve: window_s must be > 0")
         self.lead_s = float(params.get("lead_s", 0.0))

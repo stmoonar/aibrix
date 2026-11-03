@@ -721,13 +721,27 @@ def _tail(path: str, parts: int) -> tuple:
 
 PRE_T0_NAME = "pre_t0.json"                    # the generator's history (synthetic traces)
 PRESERVE_HISTORY_NAME = "preserve_history.json"  # frozen-suite history (synthetic or Real_*)
+#: the window of the files above (30 s; every campaign before 2026-11-03)
+LEGACY_HISTORY_WINDOW_S = 30.0
+
+
+def preserve_history_name(window_s: float) -> Optional[str]:
+    """The history file of a PreServe window: None = the 30 s names above (pre_t0.json, else
+    preserve_history.json); another window W reads ``preserve_history_w<W>.json`` (2026-11-03: the
+    rendered policy's ``window_s`` picks the file; the policy refuses a file of another window)."""
+    w = float(window_s)
+    if not math.isfinite(w) or w <= 0:
+        raise CampaignError(f"preserve window_s {window_s!r} must be > 0")
+    return None if abs(w - LEGACY_HISTORY_WINDOW_S) < 1e-9 else f"preserve_history_w{w:g}.json"
 
 
 def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, tail: tuple,
-                          log: Callable[[str], None]) -> dict:
-    """PreServe mLSTM's history before t0 next to the oracle copy (the policy reads
+                          log: Callable[[str], None], window_s: float = LEGACY_HISTORY_WINDOW_S) -> dict:
+    """PreServe mLSTM's history before t0 next to the oracle copy. 30 s (the policy reads
     ``<trace dir>/pre_t0.json``, else ``preserve_history.json``): the generator's ``pre_t0.json``
     or ``preserve_history.json`` next to the replayed trace, else ``<preserve.history_root>/<trace>/seed<k>/preserve_history.json``.
+    Another window W: ``preserve_history_w<W>.json`` in the same two places (no pre_t0.json; the
+    caller points the policy's ``history_path`` at the copy).
     A shifted trace, or a slice that does not start at 0, has no matching past: refused for mlstm
     (a slice from 0 keeps the trace's own past; prepare_preserve names the source trace for it)."""
     if len(tail) < 3:
@@ -736,16 +750,19 @@ def copy_preserve_history(pc: dict, e: TraceEntry, d: ArmDef, host_path: Path, t
     if d.oracle_shift or (e.slice and float(e.slice["start_s"]) != 0.0):
         raise CampaignError(f"{e.out_name}/{d.id}: tier1 mlstm needs the trace's own history (no oracle_shift; "
                             "a slice must start at 0)")
-    src = Path(e.src_dir) / PRE_T0_NAME
+    wname = preserve_history_name(window_s)
+    name = wname or PRESERVE_HISTORY_NAME
+    src = Path(e.src_dir) / (wname or PRE_T0_NAME)
     if not src.is_file():
-        src = Path(e.src_dir) / PRESERVE_HISTORY_NAME
+        src = Path(e.src_dir) / name
     if not src.is_file():
         root = pc.get("history_root")
         parts = (e.trace, f"seed{e.seed}") if e.slice else tail[:-1]
-        src = Path(root) / Path(*parts) / PRESERVE_HISTORY_NAME if root else src
+        src = Path(root) / Path(*parts) / name if root else src
     if not src.is_file():
-        raise CampaignError(f"{e.out_name}/{d.id}: no PreServe history ({Path(e.src_dir) / PRE_T0_NAME}, or "
-                            f"preserve.history_root/<trace>/seed<k>/{PRESERVE_HISTORY_NAME})")
+        raise CampaignError(f"{e.out_name}/{d.id}: no PreServe history for window_s {float(window_s):g} "
+                            f"({Path(e.src_dir) / (wname or PRE_T0_NAME)}, or "
+                            f"preserve.history_root/<trace>/seed<k>/{name})")
     dst = host_path.parent / src.name
     sha = sha256_file(src)
     if not (dst.is_file() and sha256_file(dst) == sha):
@@ -797,7 +814,14 @@ def prepare_preserve(c: dict, e: TraceEntry, d: ArmDef, log: Callable[[str], Non
         overrides["trace_name"] = e.trace
     text, params = render_preserve_policy(bl_cm, pod_path, parts, overrides)
     if str(params.get("tier1", "mlstm")) == "mlstm":
-        rec["history"] = copy_preserve_history(pc, e, d, host_path, tail, log)
+        if "window_s" not in params:
+            raise CampaignError(f"{bl_cm}: the PreServe ConfigMap must set window_s (it picks the history file)")
+        rec["history"] = copy_preserve_history(pc, e, d, host_path, tail, log, window_s=float(params["window_s"]))
+        hname = preserve_history_name(params["window_s"])
+        if hname and "history_path" not in overrides:
+            # not a name the policy finds by itself: point it at the copy (pod path)
+            overrides["history_path"] = str(Path(pod_path).parent / hname)
+            text, params = render_preserve_policy(bl_cm, pod_path, parts, overrides)
     pol_path = Path(c["results_root"]) / "_policy" / e.out_name / f"{d.id}.policy-configmaps.yaml"
     write_text_atomic(pol_path, text)
     rec.update(oracle_host_path=str(host_path), oracle_pod_path=pod_path, oracle_sha256=sha256_file(host_path),

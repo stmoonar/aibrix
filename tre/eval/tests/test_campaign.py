@@ -460,6 +460,36 @@ def test_preserve_mlstm_arm_gets_the_history_next_to_its_oracle_copy(tmp_path):
         C.prepare_preserve(c, entries[1], d, lambda _m: None)
 
 
+def test_preserve_mlstm_history_follows_the_policy_window(tmp_path):
+    """2026-11-03: window_s 10 reads preserve_history_w10.json (not the 30 s file next to it) and the
+    policy is pointed at the copy; without that file the arm is refused."""
+    write_campaign(tmp_path, traces=["Alternating"], arms=["preserve"],
+                   extra={"traces": [{"trace": "Alternating", "arms": ["preserve"]}], "arms": ["preserve"]})
+    (tmp_path / "bl.yaml").write_text(BL_CM.replace("tier1: oracle_noisy", "tier1: mlstm")
+                                      .replace("window_s: 30", "window_s: 10"))
+    d = tmp_path / "traces" / "Alternating" / "seed1"
+    for name, w in (("preserve_history.json", 30.0), ("preserve_history_w10.json", 10.0)):
+        (d / name).write_text(json.dumps({"format": "tre-preserve-history-v1", "trace": "Alternating", "seed": 1,
+                                          "window_s": w, "models": {"m7": [[10.0, 5.0]] * 25}}))
+    c = C.load_campaign(str(tmp_path / "campaign.yaml"))
+    (e,) = C.resolve_traces(c)
+    out = C.prepare_preserve(c, e, C.arm_def(c, "preserve"), lambda _m: None)
+    rec = out["record"]
+    assert Path(rec["history"]["source"]).name == "preserve_history_w10.json"
+    pod_hist = rec["policy_params_changed"]["history_path"]
+    assert pod_hist == str(Path(rec["oracle_pod_path"]).parent / "preserve_history_w10.json")
+    yaml = pytest.importorskip("yaml")
+    cms = [x for x in yaml.safe_load_all(Path(out["env"]["BL_CM_FILE"]).read_text()) if x]
+    pre = [x for x in cms if x["metadata"]["name"] == "tre-v2-baseline-preserve"][0]
+    assert yaml.safe_load(pre["data"]["preserve.yaml"])["history_path"] == pod_hist
+    ph = pytest.importorskip("tre_baselines.policies.preserve_history")
+    hist, _ = ph.load(rec["history"]["path"], window_s=10.0, models=["m7"], seq_len=25, trace="Alternating", seed=1)
+    assert len(hist["m7"]) == 25
+    (d / "preserve_history_w10.json").unlink()
+    with pytest.raises(C.CampaignError, match="no PreServe history for window_s 10"):
+        C.prepare_preserve(c, e, C.arm_def(c, "preserve"), lambda _m: None)
+
+
 def test_preserve_mlstm_on_a_slice_from_zero_uses_the_source_trace_history(tmp_path):
     """A smoke slice that starts at 0 keeps the trace's own past: the history is copied and the
     policy is told the source trace's name (the history refuses another); any other start is refused."""

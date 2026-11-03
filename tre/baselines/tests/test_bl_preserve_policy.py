@@ -525,7 +525,7 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
     hist = {"format": ph.FORMAT, "trace": "Real_code", "seed": 1, "window_s": 30,
             "models": {"m": [[30000.0 + 100 * i, 15000.0] for i in range(25)]}}
     (trace.parent / ph.DEFAULT_NAME).write_text(__import__("json").dumps(hist))
-    params = {"mu": {"m": dict(MU)}, "trace_path": str(trace), "load_error_mode": "none",
+    params = {"mu": {"m": dict(MU)}, "trace_path": str(trace), "load_error_mode": "none", "window_s": 30,
               "predictors": {k: {"path": f"{fp.WEIGHTS}/{k}-paper.npz", "sha256": v} for k, v in sha.items()}}
     p = build_policy("preserve", cfg(params))
     assert p.predictor_set == "code" and p.history_info["trace"] == "Real_code"
@@ -546,6 +546,9 @@ def test_shipped_weights_load_with_their_sha256_and_predict(tmp_path) -> None:
                                                                      "sha256": "0" * 64}}}
     with pytest.raises(ValueError, match="sha256"):
         build_policy("preserve", cfg(bad))
+    # the 10-24 weights were trained on 30 s windows: another window is refused (2026-11-03)
+    with pytest.raises(ValueError, match="trained on 30.0 s windows"):
+        build_policy("preserve", cfg({**params, "window_s": 10}))
     (trace.parent / ph.DEFAULT_NAME).unlink()
     with pytest.raises(ValueError, match="history"):
         build_policy("preserve", cfg(params))
