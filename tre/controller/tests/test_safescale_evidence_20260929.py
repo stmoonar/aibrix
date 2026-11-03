@@ -319,23 +319,24 @@ def test_ceiling_multiplier_and_floor_come_from_config_and_registry(tmp_path) ->
     cfg = ControllerConfig.from_env({})
     assert cfg.safescale.window_ceiling_ms == 60_000.0
     assert (cfg.safescale.min_window_ms, cfg.safescale.e2e_multiplier) == (20_000.0, 2.0)
-    assert (cfg.safescale.slo_mode, cfg.safescale.min_commit_samples) == ("labels", 20)
+    assert (cfg.safescale.slo_mode, cfg.safescale.min_commit_samples) == ("fixed", 20)  # the repo registry: fixed (live, 2026-10-31)
     assert cfg.safescale.evidence_clock_tolerance_ms == 20_000.0
     raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
-    raw["safescale"] = {"slo_mode": "fixed", "window_ceiling_s": 90, "min_commit_samples": 30,
+    raw["safescale"] = {"slo_mode": "labels", "window_ceiling_s": 90, "min_commit_samples": 30,
                         "evidence_clock_tolerance_s": 15}
     path = tmp_path / "r.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     tuned = ControllerConfig.from_env({
         "TRE_REGISTRY_PATH": str(path), "SAFE_SCALE_E2E_MULTIPLIER": "3", "SAFE_SCALE_WINDOW_FLOOR_MS": "25000",
     }).safescale
-    assert (tuned.window_ceiling_ms, tuned.slo_mode, tuned.min_commit_samples) == (90_000.0, "fixed", 30)
+    assert (tuned.window_ceiling_ms, tuned.slo_mode, tuned.min_commit_samples) == (90_000.0, "labels", 30)
     assert (tuned.evidence_clock_tolerance_ms, tuned.e2e_multiplier, tuned.min_window_ms) == (15_000.0, 3.0, 25_000.0)
 
 
 def test_registry_safescale_section_parsing() -> None:
     assert parse_safescale_config(None) == SafeScaleRegistryConfig()
-    assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale() == SafeScaleRegistryConfig()
+    # the repo registry's section = the built-in defaults, except slo_mode (fixed, live since 2026-10-31)
+    assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale() == SafeScaleRegistryConfig(slo_mode="fixed")
     for bad in ({"slo_mode": "median"}, {"window_ceiling_s": 0}, {"min_commit_samples": 2.5},
                 {"min_commit_samples": -1}, {"evidence_clock_tolerance_s": -3}):
         with pytest.raises(ValueError):
@@ -817,7 +818,7 @@ def test_the_app_wires_the_evidence_reader_thresholds_and_hide_callback() -> Non
     from test_controller_app import REGISTRY_PATH as APP_REGISTRY
     from tre_controller.app import create_controller_dependencies
 
-    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(APP_REGISTRY)})
+    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(APP_REGISTRY)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert isinstance(deps.safescale._evidence, MetricsEvidenceReader)
     assert isinstance(deps.safescale._thresholds, RegistryThresholds)

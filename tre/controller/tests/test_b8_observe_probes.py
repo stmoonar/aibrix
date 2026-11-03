@@ -396,7 +396,7 @@ def test_the_app_wires_the_mode_gate_and_the_max_age():
     from test_controller_app import REGISTRY_PATH, EmptyRedis
     from tre_controller.app import create_controller_dependencies
 
-    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(REGISTRY_PATH)})
+    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(REGISTRY_PATH)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert deps.observe_gate is not None
     assert deps.queue._is_observe == deps.observe_gate.is_observe

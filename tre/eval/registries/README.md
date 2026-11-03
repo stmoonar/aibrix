@@ -18,8 +18,9 @@ All five stamp `trs.numerator: step_counters` and `trs.theta_window_ms: 10000`, 
 controller (the controller refuses to start otherwise). The overlay says 10000 since 2026-11-03. The bootstrap registry
 (`deploy/registry.yaml` and its copy `deploy/overlays/tre-v2/params.yaml`) carries the per-model `trs` and `alt_thresholds` values of
 `f75155148eba1e61` since 2026-11-03 (a fresh install starts the controller; `deploy/tests/test_kustomize_overlays.py` checks the stamp
-against the overlay) but is NOT identical to it: `scaling` keys and `safescale.slo_mode` differ (bootstrap: TSS-only `scaling`, `labels`;
-the live ConfigMap still holds the retired `scaling` keys and `fixed`).
+against the overlay) but is NOT identical to it: the `scaling` section differs (bootstrap: the TSS-only keys; the live ConfigMap
+still holds the retired `breakpoint_*` / `saturation_*` / `rescue_*` keys, which the controller ignores). `safescale.slo_mode` is `fixed` in
+both since 2026-11-03. The controller's code default of `TRE_METRICS_WINDOW_MS` is 10000 as well.
 
 Putting a snapshot live: check `arm_registry.py id` against the file name first. Tunables (`trs.*`, `slo.*`, `alt_thresholds.*`,
 replica bounds) go through `deploy/scripts/release/params_set.py --set ...` (bounds-checked, `--apply --restart --backup-dir`, SM

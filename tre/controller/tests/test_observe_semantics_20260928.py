@@ -222,7 +222,7 @@ def test_the_app_wires_the_fresh_mode_read_and_the_safescale_observe_gate():
     from tre_controller.app import build_controller_task_specs, create_controller_dependencies
     from tre_controller.config import ControllerConfig
 
-    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(REGISTRY_PATH)})
+    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(REGISTRY_PATH)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     assert deps.queue._is_observe_fresh == deps.observe_gate.is_observe_fresh
     # EmptyRedis has no mode key: the controller starts in observe (fail-closed)

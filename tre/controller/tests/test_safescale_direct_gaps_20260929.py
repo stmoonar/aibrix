@@ -346,7 +346,7 @@ def test_the_app_targets_only_a_fresh_cluster_view_and_closes_the_collector(monk
     from tre_controller.app import create_controller_dependencies
     from tre_controller.loops.cluster_view_task import cluster_view_from_state
 
-    cfg = ControllerConfig.from_env({"TRE_METRICS_WINDOW_MS": "10000", "TRE_REGISTRY_PATH": str(APP_REGISTRY)})
+    cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(APP_REGISTRY)})
     deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
     state = {"bindings": [{"serve_id": "m-0", "model": "m", "node": "n", "gpu_ids": [0], "awake": True,
                            "hidden": False}],

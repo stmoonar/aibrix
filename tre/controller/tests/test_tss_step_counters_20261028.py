@@ -132,10 +132,10 @@ def test_flat_counters_while_asleep_are_no_reset():
     assert w.generation_tokens == pytest.approx(100.0 * 8.0)
 
 
-def test_thetas_must_be_stamped_for_the_window_of_the_controller(tmp_path):
-    # the code default is 20 s (2026-10-28); the deployed controller sets TRE_METRICS_WINDOW_MS=10000 (overlay, 2026-11-03)
-    # and the bootstrap registry is stamped for that (deploy/tests/test_kustomize_overlays.py checks it against the overlay)
-    assert ControllerConfig.from_env({}).metrics_window_ms == 20_000
+def test_the_window_is_10s_from_config_and_thetas_must_be_stamped_for_it(tmp_path):
+    # 10 s since 2026-11-03 (20 s from 2026-10-28): the code default, the overlay (deploy/tests/test_kustomize_overlays.py
+    # checks the bootstrap registry against it) and the live registry agree
+    assert ControllerConfig.from_env({}).metrics_window_ms == 10_000
     registry = load_registry(str(REGISTRY_PATH))
     assert theta_basis_errors(registry.models(), window_ms=10_000) == []
     assert len(theta_basis_errors(registry.models(), window_ms=20_000)) == len(registry.models())

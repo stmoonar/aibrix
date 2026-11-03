@@ -23,7 +23,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.metrics_refresh_interval_s == 5.0
     assert config.rescue_interval_s == 5.0
     assert config.fairness_interval_s == 10.0
-    assert config.metrics_window_ms == 20_000  # 2026-10-28: 20 s with the step-counter numerator
+    assert config.metrics_window_ms == 10_000  # 2026-11-03: 10 s (20 s from 2026-10-28)
     assert config.metrics_window_mode == "sliding"
     # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 2 s); the read
     # offset defaults to min(2 s, evidence / 2).
@@ -160,7 +160,7 @@ def test_config_accepts_unfitted_signal_sources(source: str) -> None:
 def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
     path = _registry_with_alt(tmp_path, source)
     cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
-                                     "TRE_METRICS_WINDOW_MS": "10000", "TRE_DISABLE_ETA_GATE": "true"})
+                                     "TRE_DISABLE_ETA_GATE": "true"})
     assert cfg.signal_source == source and cfg.disable_eta_gate is True
 
 
@@ -168,7 +168,7 @@ def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
 def test_alt_source_refuses_to_start_with_the_eta_gate_on(tmp_path, source: str) -> None:
     """Plan section 8: only the signal changes on an alt arm - the eta gate is off there."""
     path = _registry_with_alt(tmp_path, source) if source in FITTED_ALT_SOURCES else None
-    env = {"TRE_SIGNAL_SOURCE": source, "TRE_METRICS_WINDOW_MS": "10000", **({"TRE_REGISTRY_PATH": str(path)} if path else {})}
+    env = {"TRE_SIGNAL_SOURCE": source, **({"TRE_REGISTRY_PATH": str(path)} if path else {})}
     with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires TRE_DISABLE_ETA_GATE=true"):
         ControllerConfig.from_env(env)
     with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE"):
@@ -203,7 +203,7 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
         basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000}
     path = _registry_with_alt(tmp_path, source, basis=basis)
     with pytest.raises(ValueError, match="basis does not match.*dsqwen-7b"):
-        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path), "TRE_METRICS_WINDOW_MS": "10000"})
+        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
     # the same stamp is accepted when the controller window matches it
     if basis is not None and basis["window_ms"] == 30_000:
         cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
@@ -215,9 +215,9 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
 def test_alt_source_starts_on_the_repo_registry_only_at_the_window_it_is_fitted_on(source: str) -> None:
     """Since 2026-11-03 the repo registry carries the live fitted alt thresholds (basis: 10 s window, EMA off)."""
     env = {"TRE_SIGNAL_SOURCE": source, "TRE_DISABLE_ETA_GATE": "true"}
-    assert ControllerConfig.from_env({**env, "TRE_METRICS_WINDOW_MS": "10000"}).signal_source == source
+    assert ControllerConfig.from_env(env).signal_source == source  # the code default window is 10 s
     with pytest.raises(ValueError, match="basis does not match"):
-        ControllerConfig.from_env(env)  # the code default window (20 s) is another window
+        ControllerConfig.from_env({**env, "TRE_METRICS_WINDOW_MS": "20000"})
 
 
 def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:

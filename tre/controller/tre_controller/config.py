@@ -374,10 +374,11 @@ class ControllerConfig:
             ),
         )
 
-        # 2026-10-28 (user decision): 20 s (was 30 s). The registry's thetas are window
+        # 2026-11-03 (user decision): 10 s (20 s from 2026-10-28, 30 s before) = the window the
+        # live registry and the repo registry are stamped for. The registry's thetas are window
         # token totals fitted on one window: their trs.theta_window_ms must equal this
         # (checked at start, tre_common.tss.theta_basis_errors).
-        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 20_000)
+        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 10_000)
         _validate_signal_thresholds(registry_path, signal_source, window_ms=metrics_window_ms)
         disable_eta_gate = _get_bool(values, "TRE_DISABLE_ETA_GATE", False)
         if signal_source != "zm" and not disable_eta_gate:

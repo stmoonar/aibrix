@@ -19,7 +19,7 @@ afterwards; the files hold the canonical state between arms.
 
 | variable | live | overlay | read by the controller (image 420c69ef, `config.py`) | effect |
 |---|---|---|---|---|
-| `TRE_METRICS_WINDOW_MS` | 10000 | 10000 (was 20000 until 11-03) | yes, default 20000 | real: the TSS window; must equal every model's `trs.theta_window_ms` |
+| `TRE_METRICS_WINDOW_MS` | 10000 | 10000 (was 20000 until 11-03) | yes, default 10000 (20000 until 11-03) | real: the TSS window; must equal every model's `trs.theta_window_ms` |
 | `TRE_ACTION_COOLDOWN` | 1 | absent | no: in `REMOVED_TIMER_ENV`, logged once and ignored since 10-29 (TSS-only release) | none (leftover on the live Deployment) |
 | `TRE_DISABLE_ETA_GATE` | false | absent | yes (`_get_bool`, default false) | none for `TRE_SIGNAL_SOURCE=zm` (false is the default; it must be true for the alt-signal arms); written `false` by the runner's reset |
 | `TRE_SIGNAL_SOURCE` | unset | zm | yes, default `zm` | none (unset = zm; the runner's canonical state is unset) |
