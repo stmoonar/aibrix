@@ -127,16 +127,16 @@ def request_clean(done: Sequence[dict], unserved: int, label: Any, min_requests:
     served = [r for r in done if _served(r)]
     if len(served) < max(1, min_requests):
         return None
+    from tre_common import slo as slo_def
+
+    thresholds = label.thresholds()
     for r in served:
-        ttft = r.get("ttft_ms")
-        if ttft is not None:
-            L = r.get("input_tokens")
-            if label.slowdown and L is None:
-                return None
-            if float(ttft) > label.ttft_slo_ms(L):
-                return False
-        tpot = r.get("tpot_ms")
-        if tpot is not None and float(tpot) > float(label.tpot_p95_ms):
+        ttft, L = r.get("ttft_ms"), r.get("input_tokens")
+        if ttft is not None and label.per_request_ttft and L is None:
+            return None
+        v = slo_def.judge_request(thresholds, completed=True, prompt_tokens=L,
+                                  ttft_ms=None if ttft is None else float(ttft), tpot_ms=r.get("tpot_ms"))
+        if v.violated:
             return False
     return True
 

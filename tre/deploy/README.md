@@ -271,9 +271,10 @@ Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
   deadline moves one gateway period past the newest evidence, up to `W_max` (W counts
   from the confirmed hide); still short there: no traffic -> commit, traffic -> latency
   skipped (Z / KV judged);
-- thresholds: registry `safescale.slo_mode` (`labels` = the calibration label rule,
-  `fixed` = `models[].slo`); env `SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS`
-  are optional overrides (unset);
+- thresholds: the registry's top-level `slo_mode` (2026-11-04: the one SLO switch of every
+  consumer, `tre_common.slo`; `fixed` / `slowdown` / `idle_multiple`, replaces
+  `safescale.slo_mode`); a per-request mode is judged at the window's mean prompt length;
+  env `SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` are optional overrides (unset);
 - clock / continuity check (fail-closed, `evidence_clock_skew`): each remaining pod's
   first evidence doc within `[S, N + safescale.evidence_clock_tolerance_s]`, and the
   newest-doc read at the hide must have worked; offsets of Redis `TIME`, the gateway

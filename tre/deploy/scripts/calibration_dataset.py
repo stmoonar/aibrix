@@ -522,7 +522,7 @@ class Settings:
         """The primary (D6') label of ``model``: its idle TTFT fit from ``registry`` (the
         label registry, :attr:`label_registry_path`)."""
         return slo_labels.label_def_for_model(
-            model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms,
+            model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms, mode=slo_labels.D6_PRIME_MODE,
             min_completed_requests=self.min_completed_requests, registry=registry,
             attribution=self.attribution,
         )

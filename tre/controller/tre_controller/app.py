@@ -410,6 +410,7 @@ def create_controller_dependencies(
         "min_commit_samples": cfg.safescale.min_commit_samples,
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
         "slo_mode": cfg.safescale.slo_mode,
+        "slo_mode_source": registry.slo_mode_resolution().source,
         "early_commit": cfg.safescale.early_commit,
         "early_commit_min_evidence_ms": cfg.safescale.early_commit_min_evidence_ms,
         "rollback_retry_min_evidence_ms": cfg.safescale.rollback_retry_min_evidence_ms,

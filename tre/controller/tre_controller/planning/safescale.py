@@ -18,6 +18,7 @@ from tre_controller.planning.safescale_direct import (
     evaluate_poll,
     take_baseline,
 )
+from tre_common import slo as slo_def
 from tre_common.persistence import span_reaches
 from tre_controller.planning.safescale_evidence import (
     EvidenceSource,
@@ -2405,8 +2406,9 @@ def _summarize_tail(
             limits = thresholds(newest)
             ttft_limit, tpot_limit = limits["ttft_ms"], limits["tpot_ms"]
         else:
-            ttft_limit = 500.0 if ttft_p95_slo_ms is None else ttft_p95_slo_ms
-            tpot_limit = 75.0 if tpot_p95_slo_ms is None else tpot_p95_slo_ms
+            # No resolver (direct constructions): the fixed mode's defaults (tre_common.slo).
+            ttft_limit = slo_def.FIXED_TTFT_MS if ttft_p95_slo_ms is None else ttft_p95_slo_ms
+            tpot_limit = slo_def.FIXED_TPOT_MS if tpot_p95_slo_ms is None else tpot_p95_slo_ms
         if ttft is not None and ttft > ttft_limit:
             latency_ok = False
         if tpot is not None and tpot > tpot_limit:

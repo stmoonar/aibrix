@@ -37,7 +37,7 @@ def test_ttft_threshold_is_the_one_shared_definition():
     label = label_def_for_model("m", mode="slowdown", c=41.1, b=0.0694, k=5.0, floor=500.0)
     for L in (0, 256, 1000, 2048, 8000):
         assert M.ttft_threshold_ms(slo7, L) == label.ttft_slo_ms(L) == request_ttft_slo_ms(
-            L, c_ms=41.1, b_ms_per_token=0.0694)
+            L, c_ms=41.1, b_ms_per_token=0.0694, k=5.0, floor_ms=500.0)
 
 
 def test_metrics_import_with_only_tre_eval_on_the_path():

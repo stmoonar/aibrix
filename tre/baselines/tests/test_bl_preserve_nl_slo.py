@@ -39,15 +39,16 @@ def _fixture(tmp_path: Path) -> tuple:
              "queue_before": 0, "e2e_s": 0.0125 * o}
         (iso / f"{m}.jsonl").write_text(json.dumps(r) + "\n")
     reg = tmp_path / "registry.yaml"
-    reg.write_text(yaml.safe_dump({"models": [
-        {"name": "dsqwen-7b", "slo": {"ttft_idle_c_ms": 41.1, "ttft_idle_b_ms_per_token": 0.0694}},
-        {"name": "dsqwen-14b", "slo": {"ttft_idle_c_ms": 45.3, "ttft_idle_b_ms_per_token": 0.0879}}]}))
+    reg.write_text(yaml.safe_dump({"slo_mode": "fixed", "models": [  # the tool judges idle_multiple whatever is live
+        {"name": "dsqwen-7b", "slo": {"ttft_idle_c_ms": 41.1, "ttft_idle_b_ms_per_token": 0.0694, "idle_multiple": {
+            "ttft_k": 3, "tpot_k": 5, "ttft_floor_ms": 450, "tpot_idle_ms": TPOT["dsqwen-7b"]}}},
+        {"name": "dsqwen-14b", "slo": {"ttft_idle_c_ms": 45.3, "ttft_idle_b_ms_per_token": 0.0879, "idle_multiple": {
+            "ttft_k": 5, "tpot_k": 3, "ttft_floor_ms": 450, "tpot_idle_ms": TPOT["dsqwen-14b"]}}}]}))
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(yaml.safe_dump({
         "round_decimals": 2,
         "inputs": {"idle_raw": "cb/{model}/idle.jsonl", "idle_fit": "fit.json", "isolated_dir": "iso", "mix_shape": "mix"},
-        "models": {"dsqwen-7b": {"k_ttft": 3, "k_tpot": 5, "ttft_floor_ms": 450},
-                   "dsqwen-14b": {"k_ttft": 5, "k_tpot": 3, "ttft_floor_ms": 450}}}))
+        "models": ["dsqwen-7b", "dsqwen-14b"]}))
     return cfg, root, reg
 
 
@@ -66,3 +67,12 @@ def test_nl_slo_reproduces_the_fixed_numbers(tmp_path) -> None:
         "iso/dsqwen-7b.jsonl", "iso/isolated-meta.json"]
     with pytest.raises(SystemExit):                                     # never overwrites
         nl.main(["--config", str(cfg), "--data-root", str(root), "--registry", str(reg), "--out", str(out)])
+
+
+def test_nl_slo_refuses_a_registry_tpot_idle_that_is_not_the_raw_median(tmp_path) -> None:
+    cfg, root, reg = _fixture(tmp_path)
+    doc = yaml.safe_load(reg.read_text())
+    doc["models"][1]["slo"]["idle_multiple"]["tpot_idle_ms"] = 13.982   # rounded: not the median
+    reg.write_text(yaml.safe_dump(doc))
+    with pytest.raises(SystemExit, match="tpot_idle_ms"):
+        nl.main(["--config", str(cfg), "--data-root", str(root), "--registry", str(reg), "--out", str(tmp_path / "o")])

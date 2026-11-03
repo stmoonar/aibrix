@@ -1,15 +1,13 @@
-"""The unified per-request SLO and the SLO-clean window judge (user decisions 2026-11-04).
+"""The per-request SLO and the SLO-clean window judge (user decisions 2026-11-04).
 
-One SLO for every request of every tool that calibrates on it (PreServe's mu first):
+The SLO is the registry's (``tre_common.slo``, the one definition every consumer uses): the mode
+is the registry's top-level ``slo_mode`` unless the caller names one (``mode=``: a tool that
+calibrates for the definition of a coming release, e.g. ``idle_multiple`` while ``fixed`` is live);
+the thresholds come from the model's ``models[].slo`` block through ``tre_common.slo.slo_thresholds``
+and the request verdict is ``tre_common.slo.judge_request``:
 
-* TTFT_slo(L) = ``max(floor, k * (c_m + b_m * L))``, the one threshold function
-  ``tre_common.slo_labels.request_ttft_slo_ms`` (c / b = registry ``models[].slo.ttft_idle_c_ms`` /
-  ``ttft_idle_b_ms_per_token``, k = ``ttft_slowdown_k`` (5), floor = ``ttft_floor_ms`` (500 ms),
-  L = the request's prompt tokens);
-* TPOT_slo = the registry ``slo.tpot_p95_ms`` (75 ms).
-
-The rule is the slowdown formula whatever the registry's ``ttft_slo_mode`` says (that key picks the
-online / scoring mode; it is recorded, not obeyed).
+* TTFT_slo(L) = ``max(floor, k * (c_m + b_m * L))`` in the per-request modes (``fixed``: one value);
+* TPOT_slo = ``tpot_p95_ms`` (fixed / slowdown) or ``tpot_k * tpot_idle_ms`` (idle_multiple).
 
 Input is a list of :class:`Request` (unix seconds), independent of where it was logged; one thin
 adapter per source turns that source's rows into it (:func:`from_ladder_record` for the
@@ -41,7 +39,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
-from tre_common.slo_labels import TTFT_SLO_MODE_SLOWDOWN, LabelDefinition, label_def_for_model
+from tre_common import slo as slo_def
+from tre_common.slo_labels import LabelDefinition, label_def_for_model
 
 DEFAULT_ROUTE_TIMEOUT_S = 150.0
 DEFAULT_WINDOW_S = 10.0
@@ -100,24 +99,22 @@ def from_client_row(row: Mapping[str, Any]) -> Request:
 
 # ------------------------------------------------------------------ SLO
 
-def unified_slo(model: str, registry: Any) -> LabelDefinition:
-    """The model's unified SLO from a registry (path or loaded): slowdown TTFT with the registry's
-    c / b / k / floor, TPOT = the registry's ``tpot_p95_ms``. Refuses (SystemExit) without c / b."""
+def unified_slo(model: str, registry: Any, mode: Optional[str] = None) -> LabelDefinition:
+    """The model's SLO from a registry (path or loaded) under ``mode`` (default: the registry's
+    ``slo_mode``). Refuses (SystemExit) when the block lacks the mode's parameters."""
     if registry is None or isinstance(registry, str):
         from tre_common.registry import load_registry
 
         registry = load_registry(registry)
     spec = registry.model(model).slo
-    return label_def_for_model(model, mode=TTFT_SLO_MODE_SLOWDOWN, tpot_p95_ms=spec.tpot_p95_ms,
+    return label_def_for_model(model, mode=mode or registry.slo_mode(), tpot_p95_ms=spec.tpot_p95_ms,
                                ttft_p95_ms=spec.ttft_p95_ms, registry=registry)
 
 
 def slo_record(slo: LabelDefinition, registry_mode: Optional[str] = None) -> Dict[str, Any]:
-    """What a result file records of the SLO it judged with."""
-    return {"rule": "TTFT <= max(floor_ms, k * (c_ms + b_ms_per_token * L)), TPOT <= tpot_ms",
-            "c_ms": slo.ttft_idle_c_ms, "b_ms_per_token": slo.ttft_idle_b_ms_per_token,
-            "k": slo.ttft_slowdown_k, "floor_ms": slo.ttft_floor_ms, "tpot_ms": slo.tpot_p95_ms,
-            "registry_ttft_slo_mode": registry_mode}
+    """What a result file records of the SLO it judged with (``registry_mode``: the registry's
+    ``slo_mode``, recorded next to the mode judged with)."""
+    return {**slo.thresholds().as_record(), "registry_slo_mode": registry_mode}
 
 
 def _slo_of(slo: Slo, model: str) -> LabelDefinition:
@@ -140,12 +137,10 @@ def judge_request(req: Request, slo: Slo, *, route_timeout_s: float = DEFAULT_RO
     if req.prompt_tokens is None:
         raise UnjudgeableWindow(f"request {req.id} ({req.model}): no prompt_tokens, TTFT SLO unknown")
     s = _slo_of(slo, req.model)
-    thr = float(s.ttft_slo_ms(req.prompt_tokens))
-    ttft = (req.first - req.send) * 1000.0
-    ct = req.completion_tokens
-    tpot = (req.done - req.first) * 1000.0 / (int(ct) - 1) if ct is not None and int(ct) > 1 else None
-    cause = "ttft" if ttft > thr else ("tpot" if tpot is not None and tpot > float(s.tpot_p95_ms) else None)
-    return {"cause": cause, "ttft_ms": ttft, "tpot_ms": tpot, "ttft_slo_ms": thr}
+    v = slo_def.judge_request(s.thresholds(), completed=True, prompt_tokens=req.prompt_tokens,
+                              ttft_ms=(req.first - req.send) * 1000.0, e2e_ms=(req.done - req.send) * 1000.0,
+                              output_tokens=req.completion_tokens)
+    return {"cause": v.cause, "ttft_ms": v.ttft_ms, "tpot_ms": v.tpot_ms, "ttft_slo_ms": v.ttft_slo_ms}
 
 
 def _q(vals: Sequence[float], q: float) -> Optional[float]:

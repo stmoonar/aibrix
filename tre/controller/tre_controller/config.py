@@ -75,8 +75,8 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 class SafeScaleConfig:
     # Optional OVERRIDES of the probe's latency thresholds (env SAFE_SCALE_TTFT_P95_SLO_MS /
     # SAFE_SCALE_TPOT_P95_SLO_MS, unset by default). None = the registry decides
-    # (safescale.slo_mode: labels -> tre_common.slo_labels rule, fixed -> models[].slo);
-    # without a registry resolver (direct constructions) None means 500 / 75 ms.
+    # (its top-level slo_mode, thresholds from tre_common.slo); without a registry
+    # resolver (direct constructions) None means 500 / 75 ms.
     ttft_p95_slo_ms: float | None = None
     tpot_p95_slo_ms: float | None = None
     # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).
@@ -93,10 +93,12 @@ class SafeScaleConfig:
     # Never below min_window_ms (calc_probe_window_details raises it to the floor).
     # None = no ceiling and no deadline extension (direct constructions only).
     window_ceiling_ms: float | None = 60_000.0
-    # Registry safescale.slo_mode (labels | fixed), min_commit_samples and
-    # evidence_clock_tolerance_s (ms here). Round 4: no evidence period here - the Redis
-    # evidence path's doc grid is the store's (store.evidence_grid.EvidenceGrid).
-    slo_mode: str = "labels"
+    # The registry's top-level slo_mode (tre_common.slo: fixed | slowdown | idle_multiple;
+    # the one SLO switch, 2026-11-04 - replaces safescale.slo_mode labels | fixed), and
+    # safescale.min_commit_samples / evidence_clock_tolerance_s (ms here). Round 4: no
+    # evidence period here - the Redis evidence path's doc grid is the store's
+    # (store.evidence_grid.EvidenceGrid).
+    slo_mode: str = "slowdown"
     min_commit_samples: int = 20
     evidence_clock_tolerance_ms: float = 20_000.0
     # Registry safescale.evidence_source / evidence_poll_s / scrape_timeout_s /
@@ -349,7 +351,7 @@ class ControllerConfig:
             min_window_ms=_safescale_window_floor_ms(values),
             e2e_multiplier=_get_positive_float(values, "SAFE_SCALE_E2E_MULTIPLIER", 2.0),
             window_ceiling_ms=float(safescale_registry.window_ceiling_s) * 1000.0,
-            slo_mode=safescale_registry.slo_mode,
+            slo_mode=_registry_slo_mode(registry_path),
             min_commit_samples=int(safescale_registry.min_commit_samples),
             evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
             evidence_source=safescale_registry.evidence_source,
@@ -566,10 +568,28 @@ def _get_span_ms(
     return value
 
 
+def _registry_slo_mode(registry_path: str) -> str:
+    """The registry's ``slo_mode`` (the SLO definition of every consumer). A legacy
+    registry (no ``slo_mode``) whose two retired keys disagree - the probe obeyed
+    ``safescale.slo_mode``, the scorer and the labels ``models[].slo.ttft_slo_mode`` - is
+    refused: set ``slo_mode`` (release step, params_set.py --set slo_mode=...). An
+    unreadable registry only warns here (the controller's own load fails right after)."""
+    try:
+        resolution = load_registry(registry_path).slo_mode_resolution()
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - load_registry fails loudly later on
+        LOG.warning("registry %s unreadable (%r): SLO mode default", registry_path, exc)
+        return SafeScaleConfig().slo_mode
+    if resolution.legacy_conflict:
+        raise ValueError(f"registry {registry_path}: {resolution.legacy_conflict}")
+    return resolution.mode
+
+
 def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
-    """The registry ``safescale:`` section (window ceiling, threshold mode, minimum
+    """The registry ``safescale:`` section (window ceiling, minimum
     commit samples, evidence clock tolerance). A registry without the section gets the
-    built-in defaults (60 s, labels, 20, 20 s). A section with invalid values refuses
+    built-in defaults (60 s, 20, 20 s). A section with invalid values refuses
     the start (ValueError from the parser); an unreadable registry file only warns here
     (the controller's own registry load fails right after)."""
     try:

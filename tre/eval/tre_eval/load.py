@@ -75,6 +75,8 @@ class Arm:
     models: list[str] = field(default_factory=list)
     tp: dict[str, int] = field(default_factory=dict)
     slo: dict[str, dict] = field(default_factory=dict)
+    #: The registry's SLO mode (``tre_common.slo.resolve_slo_mode``; None = no registry).
+    slo_mode: str | None = None
     trs: dict[str, dict] = field(default_factory=dict)
     layout: list[tuple[float, dict]] = field(default_factory=list)
     gauges: list[tuple[float, dict]] = field(default_factory=list)
@@ -252,6 +254,13 @@ def load_arm(path: str, clock_offsets: dict[str, float] | None = None,
             arm.warn(f"live-registry.yaml unreadable: {e}")
     else:
         arm.warn("live-registry.yaml missing: SLO thresholds unavailable (V_req not computed)")
+    if arm.registry:
+        try:
+            from .metrics import slo_def  # tre_common.slo (metrics puts tre/common on the path)
+
+            arm.slo_mode = slo_def.resolve_slo_mode(arm.registry).mode
+        except ValueError as e:
+            arm.warn(f"live-registry.yaml: SLO mode unresolvable: {e}")
     for m in arm.registry.get("models") or []:
         arm.models.append(m["name"])
         arm.tp[m["name"]] = int(m.get("tp_size") or 1)

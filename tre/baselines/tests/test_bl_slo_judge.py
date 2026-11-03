@@ -92,12 +92,13 @@ def _ladder(tmp_path, stream=True):
 def test_mu_unified_takes_the_registry_slo_and_refuses_unstreamed_steps(tmp_path):
     base = _ladder(tmp_path)
     assert vl.main(base + ["--slo-rule", "unified"]) == 2            # no --registry
-    assert vl.main(base + ["--slo-rule", "unified", "--registry", str(REGISTRY)]) == 0
+    assert vl.main(base + ["--slo-rule", "unified", "--registry", str(REGISTRY), "--slo-mode", "slowdown"]) == 0
     doc = yaml.safe_load((tmp_path / "mu.yaml").read_text())
     reg = yaml.safe_load(REGISTRY.read_text())
     want = next(m["slo"] for m in reg["models"] if m["name"] == "dsqwen-7b")
     got = doc["models"]["dsqwen-7b"]["slo"]
-    assert (got["c_ms"], got["b_ms_per_token"], got["tpot_ms"]) == (
+    assert (got["mode"], got["registry_slo_mode"]) == ("slowdown", reg["slo_mode"])
+    assert (got["c_ms"], got["b_ms_per_token"], got["tpot_slo_ms"]) == (
         want["ttft_idle_c_ms"], want["ttft_idle_b_ms_per_token"], want["tpot_p95_ms"])
     assert doc["sources"]["registry_sha256"] and doc["mu_B"]["dsqwen-7b"]["t"] == 3500.0
     assert doc["models"]["dsqwen-7b"]["cells_B"]["b11"]["bracketed_below"]
