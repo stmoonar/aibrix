@@ -76,11 +76,13 @@ byte-identical.
 
 ## c. NL_SLO (CPU)
 
-`tools/preserve_nl_slo.py`, config `tools/preserve_nl_slo.yaml` (k_ttft / k_tpot / TTFT floor per model: 7b, 8b
-3 / 5, 14b 5 / 3, floor 450 ms; input paths):
+`tools/preserve_nl_slo.py`, config `tools/preserve_nl_slo.yaml` (models, input paths). Since 2026-11-04 the SLO
+parameters are the registry's `models[].slo.idle_multiple` (`tre_common.slo` mode `idle_multiple`: ttft_k / tpot_k
+7b, 8b 3 / 5, 14b 5 / 3, ttft_floor_ms 450, tpot_idle_ms), not the config's:
 
-* TTFT_slo(L) = max(floor, k_ttft (c + b L)), c / b from the registry;
-* TPOT_slo = k_tpot x TPOT_idle, TPOT_idle = median `tpot_ms` of the `outcome == ok` idle records (step a);
+* TTFT_slo(L) = max(floor, ttft_k (c + b L)), c / b from the registry;
+* TPOT_slo = tpot_k x tpot_idle_ms; the tool recomputes TPOT_idle = median `tpot_ms` of the `outcome == ok` idle
+  records (step a) and refuses a registry whose `tpot_idle_ms` is not that median;
 * NL_SLO = (TTFT_slo(L_mix) + (out_mix - 1) TPOT_slo) / out_mix at the mix shape (step b), rounded to 0.01 ms.
 
 ```bash

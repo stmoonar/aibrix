@@ -196,7 +196,8 @@ def test_the_window_table_is_the_labelling_path_s_output(tmp_path):
         records, instants, r3_grid.GridCell.from_scenario_id("i256_o128_c95"),
         load_registry(str(REGISTRY_PATH)).model("dsqwen-7b"),
         label=slo_labels.label_def_for_model(
-            "dsqwen-7b", ttft_p95_ms=500.0, tpot_p95_ms=75.0, registry=str(REGISTRY_PATH)),
+            "dsqwen-7b", ttft_p95_ms=500.0, tpot_p95_ms=75.0, mode=slo_labels.D6_PRIME_MODE,
+            registry=str(REGISTRY_PATH)),
         window_ms=dataset.DEFAULT_WINDOW_MS, step_ms=10000, window_align="grid",
         percentile_mode="bucket_upper", min_latency_samples=10,
         instant_sample_interval_ms=10000, instant_grid="live",

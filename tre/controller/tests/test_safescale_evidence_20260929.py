@@ -319,27 +319,42 @@ def test_ceiling_multiplier_and_floor_come_from_config_and_registry(tmp_path) ->
     cfg = ControllerConfig.from_env({})
     assert cfg.safescale.window_ceiling_ms == 60_000.0
     assert (cfg.safescale.min_window_ms, cfg.safescale.e2e_multiplier) == (20_000.0, 2.0)
-    assert (cfg.safescale.slo_mode, cfg.safescale.min_commit_samples) == ("fixed", 20)  # the repo registry: fixed (live, 2026-10-31)
+    # The probe's SLO mode is the registry's one switch (repo registry: fixed, the live one).
+    assert (cfg.safescale.slo_mode, cfg.safescale.min_commit_samples) == ("fixed", 20)
     assert cfg.safescale.evidence_clock_tolerance_ms == 20_000.0
     raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
-    raw["safescale"] = {"slo_mode": "labels", "window_ceiling_s": 90, "min_commit_samples": 30,
-                        "evidence_clock_tolerance_s": 15}
+    raw["slo_mode"] = "idle_multiple"
+    raw["safescale"] = {"window_ceiling_s": 90, "min_commit_samples": 30, "evidence_clock_tolerance_s": 15}
     path = tmp_path / "r.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     tuned = ControllerConfig.from_env({
         "TRE_REGISTRY_PATH": str(path), "SAFE_SCALE_E2E_MULTIPLIER": "3", "SAFE_SCALE_WINDOW_FLOOR_MS": "25000",
     }).safescale
-    assert (tuned.window_ceiling_ms, tuned.slo_mode, tuned.min_commit_samples) == (90_000.0, "labels", 30)
+    assert (tuned.window_ceiling_ms, tuned.slo_mode, tuned.min_commit_samples) == (90_000.0, "idle_multiple", 30)
     assert (tuned.evidence_clock_tolerance_ms, tuned.e2e_multiplier, tuned.min_window_ms) == (15_000.0, 3.0, 25_000.0)
+
+
+def test_a_legacy_registry_whose_probe_and_scorer_modes_disagree_is_refused(tmp_path) -> None:
+    # The live registry before 2026-11-04: probe safescale.slo_mode fixed, scorer / labels
+    # models[].slo.ttft_slo_mode slowdown. Two switches -> the controller refuses it.
+    raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
+    raw.pop("slo_mode")
+    raw["safescale"] = {"slo_mode": "fixed"}
+    for model in raw["models"]:
+        model["slo"]["ttft_slo_mode"] = "slowdown"
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="slo_mode"):
+        ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)})
+    raw["safescale"] = {"slo_mode": "labels"}  # agreeing legacy keys: that mode
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    assert ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)}).safescale.slo_mode == "slowdown"
 
 
 def test_registry_safescale_section_parsing() -> None:
     assert parse_safescale_config(None) == SafeScaleRegistryConfig()
-    # the built-in default (key absent) stays labels; the repo registry sets fixed explicitly
-    assert SafeScaleRegistryConfig().slo_mode == parse_safescale_config({}).slo_mode == "labels"
-    # the repo registry's section = the built-in defaults, except slo_mode (fixed, live since 2026-10-31)
-    assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale() == SafeScaleRegistryConfig(slo_mode="fixed")
-    for bad in ({"slo_mode": "median"}, {"window_ceiling_s": 0}, {"min_commit_samples": 2.5},
+    assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale() == SafeScaleRegistryConfig()
+    for bad in ({"window_ceiling_s": 0}, {"min_commit_samples": 2.5},
                 {"min_commit_samples": -1}, {"evidence_clock_tolerance_s": -3}):
         with pytest.raises(ValueError):
             parse_safescale_config(bad)
@@ -348,8 +363,7 @@ def test_registry_safescale_section_parsing() -> None:
 # ============================================================ 4. thresholds
 def _slo_registry(**slo) -> Registry:
     values = dict(ttft_p95_ms=800.0, tpot_p95_ms=90.0, e2e_p95_ms=12_000.0, ttft_idle_c_ms=40.0,
-                  ttft_idle_b_ms_per_token=0.05, ttft_slo_mode="slowdown", ttft_slowdown_k=5.0,
-                  ttft_floor_ms=500.0)
+                  ttft_idle_b_ms_per_token=0.05, ttft_slowdown_k=5.0, ttft_floor_ms=500.0)
     values.update(slo)
     spec = ModelSpec(
         name=MODEL, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=2, vllm_image="img",
@@ -357,28 +371,30 @@ def _slo_registry(**slo) -> Registry:
         trs=TrsParams(w_p=0.04, w_d=1.0, lambda_wait=2.0, qmin=1.0, ema_alpha=0.0, theta_m=100.0, tau_crit=0.8,
                       tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=1),
     )
-    return Registry(ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)), [spec])
+    return Registry(ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)), [spec],
+                    slo_mode="slowdown")
 
 
 def test_labels_mode_uses_the_calibration_label_rule_with_the_evidence_prompt_length() -> None:
     labels = RegistryThresholds(_slo_registry())
-    long = labels.resolve(MODEL, 4_000.0)  # 5 * (40 + 0.05 * 4000) = 1200
-    assert (long["mode"], long["ttft_ms"], long["tpot_ms"]) == ("labels", pytest.approx(1_200.0), 75.0)
+    long = labels.resolve(MODEL, 4_000.0)  # 5 * (40 + 0.05 * 4000) = 1200; TPOT = slo.tpot_p95_ms
+    assert (long["mode"], long["ttft_ms"], long["tpot_ms"]) == ("slowdown", pytest.approx(1_200.0), 90.0)
     assert labels.resolve(MODEL, 100.0)["ttft_ms"] == 500.0  # 5 * 45 = 225 -> floor 500
     assert labels.resolve(MODEL, None)["ttft_ms"] == 500.0  # L unknown -> the floor
     # The same function the theta labels use, on the shipped registry.
     shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))
     model = shipped.models()[0].name
-    assert RegistryThresholds(shipped).resolve(model, 3_000.0)["ttft_ms"] == pytest.approx(
-        label_def_for_model(model, registry=shipped).ttft_slo_ms(3_000.0)
-    )
+    for mode in ("fixed", "slowdown", "idle_multiple"):
+        assert RegistryThresholds(shipped, mode=mode).resolve(model, 3_000.0)["ttft_ms"] == pytest.approx(
+            label_def_for_model(model, mode=mode, registry=shipped).ttft_slo_ms(3_000.0)
+        )
 
 
 def test_fixed_mode_uses_models_slo_and_env_overrides_either_mode() -> None:
     fixed = RegistryThresholds(_slo_registry(), mode="fixed").resolve(MODEL, 4_000.0)
     assert (fixed["mode"], fixed["ttft_ms"], fixed["tpot_ms"]) == ("fixed", 800.0, 90.0)
     over = RegistryThresholds(_slo_registry(), ttft_override_ms=1_234.0).resolve(MODEL, 4_000.0)
-    assert (over["ttft_ms"], over["tpot_ms"], over["source"]) == (1_234.0, 75.0, "env_override")
+    assert (over["ttft_ms"], over["tpot_ms"], over["source"]) == (1_234.0, 90.0, "env_override")
     # No idle fit -> the label cannot be built: fixed values, recorded.
     fallback = RegistryThresholds(_slo_registry(ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None)).resolve(MODEL, 1.0)
     assert (fallback["mode"], fallback["ttft_ms"]) == ("fixed", 800.0) and "fallback" in fallback
@@ -399,7 +415,7 @@ def test_the_gate_judges_evidence_against_the_labels_threshold_of_its_prompt_len
     labels.observe(MODEL, _obs(110_000), now_ms=110_000)
     decision = labels.observe(MODEL, _obs(120_000), now_ms=120_000)
     assert decision.status == "commit"
-    assert (decision.details["threshold_mode"], decision.details["mean_prompt_tokens"]) == ("labels", 4_000.0)
+    assert (decision.details["threshold_mode"], decision.details["mean_prompt_tokens"]) == ("slowdown", 4_000.0)
     assert decision.details["ttft_threshold_ms"] == pytest.approx(1_200.0)
     fixed = _machine(FakeEvidence([_window(50, ttft=1_000.0, prompt_tokens=200_000.0, prompt_count=50.0)]),
                      thresholds=RegistryThresholds(_slo_registry(), mode="fixed"))

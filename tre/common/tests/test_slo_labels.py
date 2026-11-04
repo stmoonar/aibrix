@@ -161,7 +161,9 @@ def test_the_cli_builds_the_registry_primary_and_its_arms(tmp_path) -> None:
     ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
     ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
     slo_labels.add_label_arguments(ap, include_fixed=False)
-    args = ap.parse_args(["--label-registry", str(registry)])
+    default = slo_labels.label_def_from_args(ap.parse_args(["--label-registry", str(registry)]), "dsqwen-7b")
+    assert default.ttft_slo_mode == "fixed"  # no flag: the registry's slo_mode
+    args = ap.parse_args(["--label-registry", str(registry), "--ttft-slo-mode", "slowdown"])
     primary = slo_labels.label_def_from_args(args, "dsqwen-7b")
     assert primary.slowdown and primary.min_completed_requests == 20
     assert (primary.ttft_slowdown_k, primary.ttft_floor_ms) == (5.0, 500.0)

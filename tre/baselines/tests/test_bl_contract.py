@@ -121,8 +121,10 @@ def test_controller_mode_key_matches_tre_common() -> None:
 
 
 def test_missing_idle_ttft_fit_refuses_an_actuating_shell(tmp_path) -> None:
-    """c/b are live values (the TRE arm's TTFT SLO): no silent 500/75 fallback when acting."""
-    text = Path(REGISTRY).read_text(encoding="utf-8")
+    """c/b are live values in a per-request SLO mode (the TRE arm's TTFT SLO): no silent 500/75
+    fallback when acting."""
+    text = Path(REGISTRY).read_text(encoding="utf-8").replace("\nslo_mode: fixed\n", "\nslo_mode: slowdown\n")
+    assert "slo_mode: slowdown" in text
     stripped = "\n".join(ln for ln in text.splitlines()
                           if "ttft_idle_c_ms:" not in ln and "ttft_idle_b_ms_per_token:" not in ln)
     reg = tmp_path / "registry.yaml"

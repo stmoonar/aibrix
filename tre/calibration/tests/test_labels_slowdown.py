@@ -223,8 +223,11 @@ def test_dataset_loader_uses_the_definition(tmp_path: Path) -> None:
 
 
 def test_d6_prime_primary_label_is_the_default() -> None:
-    """Plan 6.11 D6': no mode flag -> slowdown, k = 5, floor 500 ms, TPOT 75 ms."""
-    args = _parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75"])
+    """Plan 6.11 D6': slowdown, k = 5, floor 500 ms, TPOT 75 ms. Since 2026-11-04 no mode flag
+    means the registry's slo_mode (the repo registry: fixed, the live definition)."""
+    default = label_def_from_args(_parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75"]), "dsqwen-7b")
+    assert default.ttft_slo_mode == load_registry().slo_mode() == "fixed"
+    args = _parser().parse_args(["--ttft-slo-mode", "slowdown", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75"])
     label = label_def_from_args(args, "dsqwen-7b")
     assert label.slowdown and label.ttft_slowdown_k == 5.0 and label.ttft_floor_ms == 500.0
     assert label.tpot_p95_ms == 75.0
@@ -243,7 +246,8 @@ def test_d6_prime_primary_label_is_the_default() -> None:
 def test_label_arms_primary_comparison_ablation() -> None:
     from tre_common.slo_labels import label_arms
 
-    primary = label_def_from_args(_parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75"]), "dsllama-8b")
+    primary = label_def_from_args(_parser().parse_args(["--ttft-slo-mode", "slowdown", "--ttft-p95-ms", "500",
+                                                        "--tpot-p95-ms", "75"]), "dsllama-8b")
     arms = label_arms(primary)
     assert arms["primary"] == primary
     assert arms["fixed_comparison"].as_dict()["mode"] == "fixed"

@@ -8,23 +8,53 @@ from typing import Any
 
 import yaml
 
+from tre_common.slo import (
+    IDLE_MULTIPLE_FIELDS,
+    IDLE_MULTIPLE_KEY,
+    SLO_MODE_IDLE_MULTIPLE,
+    SloConfigError,
+    SloModeResolution,
+    SloThresholds,
+    resolve_slo_mode,
+    slo_thresholds,
+)
+
+
+@dataclass(frozen=True)
+class IdleMultipleSlo:
+    """``models[].slo.idle_multiple``: the parameters of ``slo_mode: idle_multiple`` (user
+    2026-11-04): TTFT_slo(L) = max(ttft_floor_ms, ttft_k * (c + b * L)), TPOT_slo =
+    tpot_k * tpot_idle_ms. Read only by ``tre_common.slo.slo_thresholds``."""
+
+    ttft_k: float
+    tpot_k: float
+    ttft_floor_ms: float
+    #: Idle TPOT (ms): median per-request ``tpot_ms`` of the idle capture the c / b fit
+    #: comes from (``tre_baselines.tools.preserve_nl_slo`` recomputes and checks it).
+    tpot_idle_ms: float
+
 
 @dataclass(frozen=True)
 class SloSpec:
+    """``models[].slo``: the parameters of every SLO mode (``tre_common.slo``; the mode in
+    force is the registry's top-level ``slo_mode``). Consumers never read these fields to
+    build a threshold themselves: ``tre_common.slo.slo_thresholds(spec.slo, mode)``."""
+
+    #: ``fixed``: TTFT / TPOT thresholds; ``slowdown``: TPOT threshold (ttft_p95_ms unused).
     ttft_p95_ms: float
     tpot_p95_ms: float
+    #: Diagnostic e2e limit (scorer's ``viol_with_e2e``, the replayer's V_sys); no SLO mode
+    #: judges it.
     e2e_p95_ms: float
-    #: Idle (isolated-request) TTFT fit ``c + b * prompt_tokens`` that the calibration
-    #: label's slowdown TTFT SLO scales (plan 2026-09-21 6.9h, D6). Optional: absent in
-    #: older registries, and nothing online reads it.
+    #: Idle (isolated-request) TTFT fit ``c + b * prompt_tokens`` both per-request modes
+    #: scale (plan 2026-09-21 6.9h, D6; 2026-10-03 capture).
     ttft_idle_c_ms: float | None = None
     ttft_idle_b_ms_per_token: float | None = None
-    #: The calibration label built from it (plan 2026-09-21 6.11 D6'): mode, slowdown
-    #: factor k and floor. Offline only; ``tre_common.slo_labels`` falls back to its
-    #: module defaults (slowdown, 5, 500 ms) when absent.
-    ttft_slo_mode: str | None = None
+    #: ``slowdown`` (plan 2026-09-21 6.11 D6'): k and floor (defaults 5 / 500 ms).
     ttft_slowdown_k: float | None = None
     ttft_floor_ms: float | None = None
+    #: ``idle_multiple`` (2026-11-04).
+    idle_multiple: IdleMultipleSlo | None = None
 
 
 ALT_THRESHOLD_DIRECTIONS = {"higher_is_healthier", "lower_is_healthier"}
@@ -595,11 +625,11 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
     )
 
 
-#: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.
-#: ``labels`` - the calibration label's rule (``tre_common.slo_labels.label_def_for_model``:
-#: TPOT 75 ms, TTFT = max(floor, k * (c + b * L)) with the mean prompt length L of the
-#: evidence window); ``fixed`` - the model's ``models[].slo`` ttft_p95_ms / tpot_p95_ms.
-SAFESCALE_SLO_MODES = ("labels", "fixed")
+#: ``safescale.slo_mode`` (labels | fixed) is retired (2026-11-04): the probe's thresholds
+#: follow the registry's top-level ``slo_mode`` like every other consumer
+#: (``tre_common.slo``). An old registry's key is read only by
+#: ``tre_common.slo.resolve_slo_mode`` (legacy reproduction); this parser skips it.
+RETIRED_SAFESCALE_KEYS = frozenset({"slo_mode"})
 
 
 @dataclass(frozen=True)
@@ -609,7 +639,6 @@ class SafeScaleRegistryConfig:
     Read at controller start (restart-to-apply). Controller images before this
     section existed ignore it."""
 
-    slo_mode: str = "labels"
     #: Upper bound (s) of the probe window W, deadline extensions included:
     #: W = min(max(multiplier * p95_e2e, floor), window_ceiling_s).
     window_ceiling_s: float = 60.0
@@ -658,7 +687,7 @@ class SafeScaleRegistryConfig:
 
 
 SAFESCALE_KEYS = frozenset({
-    "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
+    "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
     "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port", "baseline_delay_ms",
     "rollback_retry_z_margin", "early_commit",
 })
@@ -686,7 +715,7 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         return SafeScaleRegistryConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"safescale must be a mapping, got {raw!r}")
-    unknown = sorted(str(key) for key in set(raw) - SAFESCALE_KEYS)
+    unknown = sorted(str(key) for key in set(raw) - SAFESCALE_KEYS - RETIRED_SAFESCALE_KEYS)
     if unknown:
         LOG.warning("registry safescale: ignoring unknown keys %s (known: %s)", unknown, sorted(SAFESCALE_KEYS))
     defaults = SafeScaleRegistryConfig()
@@ -716,9 +745,6 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         valid_port = False
     if not valid_port:
         raise ValueError(f"safescale.metrics_port must be a port number, got {port!r}")
-    mode = str(raw.get("slo_mode") or defaults.slo_mode).strip().lower()
-    if mode not in SAFESCALE_SLO_MODES:
-        raise ValueError(f"safescale.slo_mode must be one of {SAFESCALE_SLO_MODES}, got {mode!r}")
     ceiling = _safescale_num(raw, "window_ceiling_s", defaults.window_ceiling_s)
     tolerance = _safescale_num(raw, "evidence_clock_tolerance_s", defaults.evidence_clock_tolerance_s)
     for name, value in (("window_ceiling_s", ceiling), ("evidence_clock_tolerance_s", tolerance)):
@@ -739,7 +765,6 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
     if not isinstance(early, bool):
         raise ValueError(f"safescale.early_commit must be true or false, got {early!r}")
     return SafeScaleRegistryConfig(
-        slo_mode=mode,
         window_ceiling_s=float(ceiling),
         min_commit_samples=int(float(samples)),
         evidence_clock_tolerance_s=float(tolerance),
@@ -1098,7 +1123,16 @@ class Registry:
         placement: PlacementConfig | None = None,
         safescale: SafeScaleRegistryConfig | None = None,
         scaling: ScalingRegistryConfig | None = None,
+        slo_mode: SloModeResolution | str | None = None,
     ) -> None:
+        if isinstance(slo_mode, str):
+            slo_mode = SloModeResolution(mode=slo_mode, source="slo_mode")
+        if slo_mode is None:
+            # Direct constructions (tests): the rule of a registry without any switch.
+            slo_mode = resolve_slo_mode({"models": [
+                {"slo": {"ttft_idle_c_ms": m.slo.ttft_idle_c_ms,
+                         "ttft_idle_b_ms_per_token": m.slo.ttft_idle_b_ms_per_token}} for m in models]})
+        self._slo_mode = slo_mode
         self._safescale = safescale or SafeScaleRegistryConfig()
         self._scaling = scaling or ScalingRegistryConfig()
         self._topology = topology
@@ -1132,6 +1166,18 @@ class Registry:
 
     def scaling(self) -> ScalingRegistryConfig:
         return self._scaling
+
+    def slo_mode(self) -> str:
+        """The SLO definition in force for every consumer (top-level ``slo_mode``)."""
+        return self._slo_mode.mode
+
+    def slo_mode_resolution(self) -> SloModeResolution:
+        """``slo_mode`` with where it came from (a legacy registry: which key, conflict)."""
+        return self._slo_mode
+
+    def slo_thresholds(self, model: str, mode: str | None = None) -> SloThresholds:
+        """``model``'s thresholds under ``mode`` (default: the registry's ``slo_mode``)."""
+        return slo_thresholds(self.model(model).slo, mode or self.slo_mode())
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -1345,6 +1391,19 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     ]
     if tp_errors:
         raise ValueError("invalid registry: " + "; ".join(tp_errors))
+    # One SLO switch for every consumer (tre_common.slo). The mode in force must be
+    # buildable for every model: refused at load, so no consumer falls back to another
+    # definition. The legacy modes keep their fallback (an old registry still loads).
+    slo_mode = resolve_slo_mode(raw)
+    if slo_mode.mode == SLO_MODE_IDLE_MULTIPLE:
+        slo_errors = []
+        for model in models:
+            try:
+                slo_thresholds(model.slo, slo_mode.mode)
+            except SloConfigError as exc:
+                slo_errors.append(f"model {model.name}: {exc}")
+        if slo_errors:
+            raise ValueError(f"invalid registry: slo_mode {slo_mode.mode}: " + "; ".join(slo_errors))
     max_bound = cluster.get("max_bound_per_gpu")
     return Registry(
         ClusterTopology(
@@ -1363,6 +1422,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         placement=parse_placement_config(raw.get("placement")),
         safescale=parse_safescale_config(raw.get("safescale")),
         scaling=parse_scaling_config(raw.get("scaling")),
+        slo_mode=slo_mode,
     )
 
 
@@ -1808,6 +1868,29 @@ def _parse_tp_size(value: Any, name: Any) -> int:
         raise ValueError(f"model {name}: tp_size must be an int, got {value!r}") from None
 
 
+def _parse_idle_multiple(raw: Any, model: Any) -> IdleMultipleSlo | None:
+    """``models[].slo.idle_multiple`` (absent = None; present = complete and positive)."""
+    if raw is None:
+        return None
+    where = f"model {model}: slo.{IDLE_MULTIPLE_KEY}"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = sorted(set(raw) - set(IDLE_MULTIPLE_FIELDS))
+    if unknown:
+        raise ValueError(f"{where}: unknown keys {unknown} (known: {', '.join(IDLE_MULTIPLE_FIELDS)})")
+    values: dict[str, float] = {}
+    for key in IDLE_MULTIPLE_FIELDS:
+        value = raw.get(key)
+        try:
+            number = float(value) if value is not None and not isinstance(value, bool) else math.nan
+        except (TypeError, ValueError):
+            number = math.nan
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError(f"{where}.{key} must be a positive number, got {value!r}")
+        values[key] = number
+    return IdleMultipleSlo(**values)
+
+
 def _parse_model(raw: dict[str, Any]) -> ModelSpec:
     slo = raw.get("slo") or {}
     trs = raw.get("trs") or {}
@@ -1837,9 +1920,9 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
                 if slo.get("ttft_idle_b_ms_per_token") is not None
                 else None
             ),
-            ttft_slo_mode=(str(slo["ttft_slo_mode"]) if slo.get("ttft_slo_mode") is not None else None),
             ttft_slowdown_k=(float(slo["ttft_slowdown_k"]) if slo.get("ttft_slowdown_k") is not None else None),
             ttft_floor_ms=(float(slo["ttft_floor_ms"]) if slo.get("ttft_floor_ms") is not None else None),
+            idle_multiple=_parse_idle_multiple(slo.get(IDLE_MULTIPLE_KEY), raw.get("name")),
         ),
         trs=TrsParams(
             w_p=float(trs["w_p"]),

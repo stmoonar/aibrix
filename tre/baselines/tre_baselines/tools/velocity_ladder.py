@@ -46,10 +46,9 @@ Port of the TRE v1 tool (``tre_code`` dev ``python/tre_tokenscale/tools/profile_
   - ``unified`` (user decision 2026-11-04, the rule for new calibrations): the one per-request SLO
     of ``tools/slo_judge.py`` (format-independent; this tool adapts its raw records with
     ``slo_judge.from_ladder_record``) - a request violates when it failed or hit the route timeout, when
-    its TTFT > ``max(floor, k * (c_m + b_m * L))`` (``tre_common.slo_labels.request_ttft_slo_ms``,
-    c / b / k / floor from the ``--registry`` ``slo`` block, L = its prompt tokens) or its TPOT =
-    (done - first) / (completion tokens - 1) > ``tpot_p95_ms`` (75 ms; one output token: TTFT
-    only). Needs a first-token time for every served request (a ladder run with
+    its TTFT > TTFT_slo(L) or its TPOT = (done - first) / (completion tokens - 1) > TPOT_slo
+    (``tre_common.slo``, the ``--registry`` ``slo`` blocks under ``--slo-mode``, default the
+    registry's ``slo_mode``; one output token: TTFT only). Needs a first-token time for every served request (a ladder run with
     ``--stream-frac 1.0``); a non-streamed request in a judged window makes ``mu`` refuse, it is
     never skipped. The output records the registry path + sha256 and the resolved c / b / k /
     floor / TPOT per model, per step the violations by cause and TTFT / TPOT p95 and max, per
@@ -1458,8 +1457,10 @@ def mu_main(argv: List[str]) -> int:
     ap.add_argument("--ladder-dir", required=True, help="out-dir of the ladder run (step logs + raw/)")
     ap.add_argument("--slo-rule", choices=["nl", "unified"], default="nl",
                     help="nl: paper NL <= slo-factor x isolated NL of the mix (D58, the 10-26 result); unified: "
-                         "per request TTFT <= max(floor, k (c + b L)) and TPOT <= tpot_p95_ms of --registry "
-                         "(user 2026-11-04; every request must have streamed)")
+                         "the per-request SLO of --registry (tre_common.slo, mode --slo-mode; user 2026-11-04; "
+                         "every request must have streamed)")
+    ap.add_argument("--slo-mode", default=None, choices=["fixed", "slowdown", "idle_multiple"],
+                    help="--slo-rule unified: the SLO mode to judge with (default: the registry's slo_mode)")
     ap.add_argument("--isolated-dir", default=None, help="out-dir of the isolated run (--slo-rule nl)")
     ap.add_argument("--registry", default=None, help="registry YAML with the models' slo blocks (--slo-rule unified)")
     ap.add_argument("--report", required=True, help="buckets report (p_share range)")
@@ -1516,11 +1517,11 @@ def mu_main(argv: List[str]) -> int:
         entry: Dict[str, Any] = {}
         if unified:
             try:
-                slo = slo_judge.unified_slo(m, registry)
+                slo = slo_judge.unified_slo(m, registry, mode=a.slo_mode)
             except (KeyError, SystemExit, ValueError) as exc:
                 print(f"error: {m}: no unified SLO in {a.registry}: {exc}", file=sys.stderr)
                 return 2
-            entry["slo"] = slo_judge.slo_record(slo, registry.model(m).slo.ttft_slo_mode)
+            entry["slo"] = slo_judge.slo_record(slo, registry.slo_mode())
         else:
             iso = Path(a.isolated_dir)
             recs = [json.loads(x) for x in (iso / f"{m}.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]

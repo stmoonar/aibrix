@@ -192,7 +192,7 @@ SECONDARY_FIT_TOLERANCE = 0.05
 #: 2026-09-21 6.11 D6', max(500 ms, 5 * idle TTFT(L)), TPOT 75 ms. ``--fit-ttft-slo-mode
 #: fixed`` gives the 500/75 ms comparison column, ``--fit-ttft-slowdown-k 3
 #: --fit-ttft-floor-ms 150`` the D6 ablation arm; k/floor default to the registry profile.
-DEFAULT_FIT_TTFT_SLO_MODE = "slowdown"
+DEFAULT_FIT_TTFT_SLO_MODE = slo_labels.D6_PRIME_MODE
 
 
 def utc_iso() -> str:
@@ -599,7 +599,7 @@ def primary_label(args, model: str) -> slo_labels.LabelDefinition:
         model,
         ttft_p95_ms=args.ttft_slo_ms,
         tpot_p95_ms=args.tpot_slo_ms,
-        mode=getattr(args, "fit_ttft_slo_mode", None),
+        mode=getattr(args, "fit_ttft_slo_mode", None) or DEFAULT_FIT_TTFT_SLO_MODE,
         k=getattr(args, "fit_ttft_slowdown_k", None),
         floor=getattr(args, "fit_ttft_floor_ms", None),
         min_completed_requests=getattr(

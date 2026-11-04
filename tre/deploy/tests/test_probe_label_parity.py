@@ -96,7 +96,7 @@ def _args(window_align: str = "none", step_ms: int = 5000) -> Namespace:
 def _primary() -> slo_labels.LabelDefinition:
     """The primary (D6') label the probe is judged on: registry idle fit, 500 / 75 ms."""
     return slo_labels.label_def_for_model(
-        MODEL, ttft_p95_ms=TTFT_SLO, tpot_p95_ms=TPOT_SLO, registry=str(REGISTRY_PATH))
+        MODEL, ttft_p95_ms=TTFT_SLO, tpot_p95_ms=TPOT_SLO, mode=slo_labels.D6_PRIME_MODE, registry=str(REGISTRY_PATH))
 
 
 def _online_rows(records, sidecar, spec, window_align: str = "none", step_ms: int = 5000) -> list[dict]:
@@ -136,7 +136,7 @@ def _rewindow(monkeypatch, raw_dir: Path, out: Path, window_align: str = "none",
         "--window-align", window_align,
         "--instant-grid", "live", "--instant-sample-ms", "10000",
         "--ttft-slo-ms", str(TTFT_SLO), "--tpot-slo-ms", str(TPOT_SLO),
-        "--registry", str(REGISTRY_PATH),
+        "--registry", str(REGISTRY_PATH), "--ttft-slo-mode", "slowdown",  # the D6' primary
     ])
     assert rewindow_from_raw.main() == 0
 
@@ -295,7 +295,7 @@ def test_the_driver_itself_writes_what_the_re_window_reproduces(tmp_path, monkey
         "--min-latency-samples", "1", "--ttft-slo-ms", "30", "--tpot-slo-ms", "75",
         "--min-completed-requests", "1",
         "--pod-endpoint", "http://pod/metrics", "--prompt-mode", mode,
-        "--registry", str(REGISTRY_PATH), "--guard-mode", "warn",
+        "--registry", str(REGISTRY_PATH), "--guard-mode", "warn", "--ttft-slo-mode", "slowdown",
     ])
     rows, guard = r3_grid.run_schedule_cell(args, _FakeStore(), spec)
     artifact = json.loads(next((tmp_path / "raw").rglob("*.guard.json")).read_text())
@@ -311,7 +311,7 @@ def test_the_driver_itself_writes_what_the_re_window_reproduces(tmp_path, monkey
         "--output", str(fit), "--window-ms", "400", "--step-ms", "200",
         "--instant-grid", "live", "--instant-sample-ms", "10000", "--min-latency-samples", "1",
         "--ttft-slo-ms", "30", "--tpot-slo-ms", "75", "--min-completed-requests", "1",
-        "--registry", str(REGISTRY_PATH),
+        "--registry", str(REGISTRY_PATH), "--ttft-slo-mode", "slowdown",
     ])
     assert rewindow_from_raw.main() == 0
 

@@ -45,7 +45,13 @@ A window is labelled by a :class:`LabelDefinition`, in this order:
 3. ``violated`` when the window TTFT term or the p95 TPOT is above its SLO.
 4. ``healthy`` otherwise.
 
-The TTFT term has two modes (``ttft_slo_mode``):
+The thresholds come from ``tre_common.slo`` (the one SLO definition); the label's
+``ttft_slo_mode`` is one of its modes (default: the registry's top-level ``slo_mode``):
+
+``idle_multiple`` - the 2026-11-04 definition
+    like ``slowdown`` with the model's own TTFT multiple and floor
+    (``models[].slo.idle_multiple.ttft_k`` / ``ttft_floor_ms``, 450 ms) and the TPOT
+    threshold ``tpot_k * tpot_idle_ms`` (the label's ``tpot_p95_ms`` is that product).
 
 ``slowdown`` - the primary label (plan 2026-09-21 §6.11 D6')
     per request ``TTFT_slo(L) = max(floor, k * (c_m + b_m * L))`` with the model's idle
@@ -73,6 +79,7 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Optional, Union
 
+from tre_common import slo as _slo
 from tre_common.percentile import histogram_percentile
 
 # --------------------------------------------------------------------------- columns
@@ -151,6 +158,9 @@ LABEL_DEF_NAME_SLOWDOWN = "p95_ttft_slowdown_tpot_plus_unserved_v1"
 #: definition (completion attribution) keeps its v1 name and its byte-identical record.
 LABEL_DEF_NAME_V2 = "p95_ttft_tpot_plus_unserved_v2"
 LABEL_DEF_NAME_SLOWDOWN_V2 = "p95_ttft_slowdown_tpot_plus_unserved_v2"
+#: The 2026-11-04 definition (``tre_common.slo`` mode ``idle_multiple``).
+LABEL_DEF_NAME_IDLE_MULTIPLE = "p95_ttft_idle_multiple_tpot_idle_multiple_plus_unserved_v1"
+LABEL_DEF_NAME_IDLE_MULTIPLE_V2 = "p95_ttft_idle_multiple_tpot_idle_multiple_plus_unserved_v2"
 
 #: Which window a served request's latency samples count in.
 #: ``completion`` (v1, every label before 2026-10-05): TTFT, TPOT and the min-n count all go
@@ -170,19 +180,26 @@ ATTRIBUTION_RULES = {
                          "(recv_first_token_ts_ms); TPOT / e2e samples by completion (done_ts_ms)"),
 }
 
-TTFT_SLO_MODE_FIXED = "fixed"
-TTFT_SLO_MODE_SLOWDOWN = "slowdown"
-TTFT_SLO_MODES = (TTFT_SLO_MODE_FIXED, TTFT_SLO_MODE_SLOWDOWN)
+TTFT_SLO_MODE_FIXED = _slo.SLO_MODE_FIXED
+TTFT_SLO_MODE_SLOWDOWN = _slo.SLO_MODE_SLOWDOWN
+TTFT_SLO_MODE_IDLE_MULTIPLE = _slo.SLO_MODE_IDLE_MULTIPLE
+TTFT_SLO_MODES = _slo.SLO_MODES
 
 #: Primary label (plan §6.11 D6', supersedes D6): ``max(500 ms, 5 * idle TTFT(L))``
 #: (DynamoLLM / SLOs-Serve loose 5x; the 500 ms floor keeps short prompts on the fixed
 #: rule - a purely length-normalised SLO turns head-of-line blocking of short prompts
 #: into violations TSS cannot see).
-DEFAULT_TTFT_SLO_MODE = TTFT_SLO_MODE_SLOWDOWN
-DEFAULT_TTFT_SLOWDOWN_K = 5.0
-DEFAULT_TTFT_FLOOR_MS = 500.0
-DEFAULT_TTFT_P95_MS = 500.0
-DEFAULT_TPOT_P95_MS = 75.0
+DEFAULT_TTFT_SLO_MODE = _slo.DEFAULT_SLO_MODE
+#: The mode of the D6' primary label (plan 2026-09-21 6.11): the label the 10-03 calibration
+#: chain (calibration_campaign / _supplement / _dataset, dline_refit, their freezes and
+#: sealed label hashes) is defined on. Those tools name it explicitly (a frozen record's
+#: definition, not the one in force); every other consumer defaults to the registry's
+#: ``slo_mode``.
+D6_PRIME_MODE = TTFT_SLO_MODE_SLOWDOWN
+DEFAULT_TTFT_SLOWDOWN_K = _slo.SLOWDOWN_K
+DEFAULT_TTFT_FLOOR_MS = _slo.SLOWDOWN_FLOOR_MS
+DEFAULT_TTFT_P95_MS = _slo.FIXED_TTFT_MS
+DEFAULT_TPOT_P95_MS = _slo.FIXED_TPOT_MS
 #: The D6 arm (plan §6.9h: k = 3, 150 ms floor), kept as the "why not pure slowdown" ablation.
 ABLATION_TTFT_SLOWDOWN_K = 3.0
 ABLATION_TTFT_FLOOR_MS = 150.0
@@ -207,22 +224,8 @@ class LabelInputError(ValueError):
     """The window row lacks a column the label definition needs."""
 
 
-def request_ttft_slo_ms(
-    prompt_tokens: float,
-    *,
-    c_ms: float,
-    b_ms_per_token: float,
-    k: float = DEFAULT_TTFT_SLOWDOWN_K,
-    floor_ms: float = DEFAULT_TTFT_FLOOR_MS,
-) -> float:
-    """The one per-request slowdown TTFT threshold: ``max(floor, k * (c + b * L))``.
-
-    ``c`` / ``b`` = the model's idle TTFT fit (registry ``slo.ttft_idle_c_ms`` /
-    ``ttft_idle_b_ms_per_token``), ``L`` = the request's prompt tokens. Every consumer
-    (:meth:`LabelDefinition.ttft_slo_ms`, ``tre_eval.metrics.ttft_threshold_ms``, the
-    baseline calibration tools) computes the threshold here."""
-    idle = float(c_ms) + float(b_ms_per_token) * float(prompt_tokens)
-    return max(float(floor_ms), float(k) * idle)
+#: The per-request TTFT threshold ``max(floor, k * (c + b * L))`` (``tre_common.slo``).
+request_ttft_slo_ms = _slo.request_ttft_slo_ms
 
 
 # -------------------------------------------------------------------- row accessors
@@ -384,6 +387,10 @@ class LabelDefinition:
     #: ``ttft_len_samples`` / ``completed_requests`` / p95 columns were attributed
     #: (``scripts.rewindow_from_raw``), and it is part of the definition's hash.
     attribution: str = ATTRIBUTION_COMPLETION
+    #: ``idle_multiple`` only: TPOT multiple and idle TPOT (ms); ``tpot_p95_ms`` must be
+    #: ``tre_common.slo.tpot_idle_multiple_ms`` of them.
+    tpot_k: Optional[float] = None
+    tpot_idle_ms: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.attribution not in ATTRIBUTIONS:
@@ -396,7 +403,7 @@ class LabelDefinition:
             raise ValueError(f"ttft_slo_mode must be one of {TTFT_SLO_MODES}")
         if int(self.min_completed_requests) < 0:
             raise ValueError("min_completed_requests must be >= 0")
-        if self.ttft_slo_mode == TTFT_SLO_MODE_SLOWDOWN:
+        if self.per_request_ttft:
             for name in ("ttft_slowdown_k", "ttft_floor_ms"):
                 value = float(getattr(self, name))
                 if not math.isfinite(value) or value <= 0:
@@ -409,6 +416,16 @@ class LabelDefinition:
             c, b = float(self.ttft_idle_c_ms), float(self.ttft_idle_b_ms_per_token)
             if not (math.isfinite(c) and math.isfinite(b)) or c < 0 or b < 0 or c + b <= 0:
                 raise ValueError("idle TTFT fit must be non-negative and not all zero")
+        if self.ttft_slo_mode == TTFT_SLO_MODE_IDLE_MULTIPLE:
+            if self.tpot_k is None or self.tpot_idle_ms is None:
+                raise ValueError("idle_multiple SLO needs tpot_k and tpot_idle_ms (registry slo.idle_multiple)")
+            try:
+                expected = self.thresholds().tpot_ms
+            except _slo.SloConfigError as exc:
+                raise ValueError(str(exc)) from None
+            if abs(float(self.tpot_p95_ms) - expected) > 1e-9 * max(1.0, expected):
+                raise ValueError(f"idle_multiple tpot_p95_ms {self.tpot_p95_ms} != tpot_k * tpot_idle_ms "
+                                 f"{expected} (build the label with label_def_for_model)")
 
     # -- construction ------------------------------------------------------------------
 
@@ -450,7 +467,7 @@ class LabelDefinition:
             "min_completed_requests": int(raw.get("min_n", 0)),
             "attribution": str(raw.get("attribution") or ATTRIBUTION_COMPLETION),
         }
-        if mode == TTFT_SLO_MODE_SLOWDOWN:
+        if mode in _slo.PER_REQUEST_TTFT_MODES:
             kwargs.update(
                 ttft_slowdown_k=float(raw["k"]),
                 ttft_floor_ms=float(raw["floor_ms"]),
@@ -458,6 +475,8 @@ class LabelDefinition:
                 ttft_idle_b_ms_per_token=float(raw["b_ms_per_token"]),
                 percentile_mode=str(raw.get("percentile_mode", DEFAULT_PERCENTILE_MODE)),
             )
+        if mode == TTFT_SLO_MODE_IDLE_MULTIPLE:
+            kwargs.update(tpot_k=float(raw["tpot_k"]), tpot_idle_ms=float(raw["tpot_idle_ms"]))
         return cls(**kwargs)
 
     def with_mode(self, mode: str, **overrides: Any) -> "LabelDefinition":
@@ -467,18 +486,47 @@ class LabelDefinition:
 
     @property
     def slowdown(self) -> bool:
+        """The 09-21 slowdown mode (record names, the k = 3 arm). For "the TTFT term needs
+        each request's prompt length" use :attr:`per_request_ttft`."""
         return self.ttft_slo_mode == TTFT_SLO_MODE_SLOWDOWN
+
+    @property
+    def idle_multiple(self) -> bool:
+        return self.ttft_slo_mode == TTFT_SLO_MODE_IDLE_MULTIPLE
+
+    @property
+    def per_request_ttft(self) -> bool:
+        return self.ttft_slo_mode in _slo.PER_REQUEST_TTFT_MODES
+
+    def thresholds(self) -> "_slo.SloThresholds":
+        """This label's thresholds, built by the one SLO implementation (``tre_common.slo``)."""
+        block: dict[str, Any] = {
+            "ttft_p95_ms": self.ttft_p95_ms, "tpot_p95_ms": self.tpot_p95_ms,
+            "ttft_idle_c_ms": self.ttft_idle_c_ms, "ttft_idle_b_ms_per_token": self.ttft_idle_b_ms_per_token,
+            "ttft_slowdown_k": self.ttft_slowdown_k, "ttft_floor_ms": self.ttft_floor_ms,
+        }
+        if self.idle_multiple:
+            block[_slo.IDLE_MULTIPLE_KEY] = {
+                "ttft_k": self.ttft_slowdown_k, "ttft_floor_ms": self.ttft_floor_ms,
+                "tpot_k": self.tpot_k, "tpot_idle_ms": self.tpot_idle_ms,
+            }
+        return _slo.slo_thresholds(block, self.ttft_slo_mode)
 
     def ttft_slo_ms(self, prompt_tokens: Optional[float] = None) -> float:
         """TTFT SLO of one request: fixed, or ``max(floor, k*(c + b*L))``."""
-        if not self.slowdown:
+        if not self.per_request_ttft:
             return float(self.ttft_p95_ms)
         if prompt_tokens is None:
-            raise ValueError("slowdown TTFT SLO needs the prompt length")
-        return request_ttft_slo_ms(
-            prompt_tokens, c_ms=self.ttft_idle_c_ms, b_ms_per_token=self.ttft_idle_b_ms_per_token,
-            k=self.ttft_slowdown_k, floor_ms=self.ttft_floor_ms,
-        )
+            raise ValueError(f"{self.ttft_slo_mode} TTFT SLO needs the prompt length")
+        return self._thresholds.ttft_ms(prompt_tokens)
+
+    @property
+    def _thresholds(self) -> "_slo.SloThresholds":
+        cached = self.__dict__.get("_thresholds_cache")
+        if cached is None:
+            cached = self.thresholds()
+            object.__setattr__(self, "_thresholds_cache", cached)
+        return cached
 
     def latency_slo_ms(self) -> dict[str, float]:
         """Fixed-mode thresholds keyed by SLO name (the fixed arm; legacy callers)."""
@@ -486,7 +534,7 @@ class LabelDefinition:
 
     def required_columns(self) -> dict[str, str]:
         cols = {"tpot_p95": SLO_COLUMNS["tpot_p95"]}
-        cols["ttft_p95"] = TTFT_LEN_SAMPLES_COLUMN if self.slowdown else SLO_COLUMNS["ttft_p95"]
+        cols["ttft_p95"] = TTFT_LEN_SAMPLES_COLUMN if self.per_request_ttft else SLO_COLUMNS["ttft_p95"]
         return cols
 
     @property
@@ -498,7 +546,9 @@ class LabelDefinition:
         completion (v1) definition's record is byte-identical to the one written before the
         ``attribution`` field existed; a hybrid one is v2: own name, ``attribution`` and its
         rule."""
-        if self.hybrid:
+        if self.idle_multiple:
+            name = LABEL_DEF_NAME_IDLE_MULTIPLE_V2 if self.hybrid else LABEL_DEF_NAME_IDLE_MULTIPLE
+        elif self.hybrid:
             name = LABEL_DEF_NAME_SLOWDOWN_V2 if self.slowdown else LABEL_DEF_NAME_V2
         else:
             name = LABEL_DEF_NAME_SLOWDOWN if self.slowdown else LABEL_DEF_NAME
@@ -516,7 +566,7 @@ class LabelDefinition:
             "missing_latency": "unlabeled unless unserved (also when completed_requests < min_n)",
             "latency_columns": [SLO_COLUMNS["ttft_p95"], SLO_COLUMNS["tpot_p95"]],
         }
-        if self.slowdown:
+        if self.per_request_ttft:
             base.update(
                 {
                     "k": float(self.ttft_slowdown_k),
@@ -532,6 +582,9 @@ class LabelDefinition:
                     ),
                 }
             )
+            if self.idle_multiple:
+                base.update({"tpot_k": float(self.tpot_k), "tpot_idle_ms": float(self.tpot_idle_ms),  # type: ignore[arg-type]
+                             "tpot_p95_ms_rule": "tpot_k * tpot_idle_ms"})
         else:
             base["violated_if"] = (
                 "p95_ttft_client_ms > ttft_p95_ms or p95_tpot_client_ms > tpot_p95_ms or unserved"
@@ -554,7 +607,7 @@ class LabelDefinition:
         if not low_n:
             tpot = latency_value(row, "tpot_p95")
             tpot_ratio = None if tpot is None else tpot / float(self.tpot_p95_ms)
-            if self.slowdown:
+            if self.per_request_ttft:
                 ttft_ratio = self.window_ttft_ratio(row)
             else:
                 ttft = latency_value(row, "ttft_p95")
@@ -577,10 +630,10 @@ class LabelDefinition:
         return LABEL_UNLABELED if lab is None else lab.label
 
     def window_ttft_ratio(self, row: Mapping[str, Any]) -> Optional[float]:
-        """p95 over the window's requests of TTFT_i / TTFT_slo(L_i) (slowdown mode)."""
+        """p95 over the window's requests of TTFT_i / TTFT_slo(L_i) (per-request modes)."""
         if TTFT_LEN_SAMPLES_COLUMN not in row:
             raise LabelInputError(
-                f"slowdown TTFT label needs the {TTFT_LEN_SAMPLES_COLUMN!r} column; "
+                f"{self.ttft_slo_mode} TTFT label needs the {TTFT_LEN_SAMPLES_COLUMN!r} column; "
                 "re-window the raw with this version of rewindow_from_raw"
             )
         pairs = parse_ttft_len_samples(row.get(TTFT_LEN_SAMPLES_COLUMN))
@@ -659,13 +712,18 @@ def count_label_exclusions(rows: Iterable[Mapping[str, Any]], label: LabelDefini
 
 def label_arms(primary: LabelDefinition) -> dict[str, LabelDefinition]:
     """The labels every published fit reports (plan §6.11 D6'): the primary slowdown
-    label, the fixed 500/75 ms comparison column and the k = 3 / 150 ms-floor ablation."""
-    if not primary.slowdown:
-        raise ValueError("label arms are built from the slowdown primary label")
+    label, the fixed 500/75 ms comparison column and the k = 3 / 150 ms-floor ablation.
+    An ``idle_multiple`` primary gets the fixed comparison (500 / 75 ms) and no k = 3 arm."""
+    if not primary.per_request_ttft:
+        raise ValueError("label arms are built from a per-request (slowdown / idle_multiple) primary label")
+    fixed = replace(primary, ttft_slo_mode=TTFT_SLO_MODE_FIXED, ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None,
+                    tpot_k=None, tpot_idle_ms=None)
+    if primary.idle_multiple:
+        return {ARM_PRIMARY: primary,
+                ARM_FIXED: replace(fixed, ttft_p95_ms=DEFAULT_TTFT_P95_MS, tpot_p95_ms=DEFAULT_TPOT_P95_MS)}
     return {
         ARM_PRIMARY: primary,
-        ARM_FIXED: replace(primary, ttft_slo_mode=TTFT_SLO_MODE_FIXED,
-                           ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None),
+        ARM_FIXED: fixed,
         ARM_K3: replace(primary, ttft_slowdown_k=ABLATION_TTFT_SLOWDOWN_K,
                         ttft_floor_ms=ABLATION_TTFT_FLOOR_MS),
     }
@@ -683,7 +741,7 @@ def resolve_arms(spec: Union[LabelSpec, LabelArms]) -> dict[str, LabelSpec]:
     * a mapping of arm name -> spec -> taken as given (must name ``primary``).
     """
     if isinstance(spec, LabelDefinition):
-        if spec.slowdown:
+        if spec.per_request_ttft:
             return dict(label_arms(spec))
         return {ARM_PRIMARY: spec, ARM_FIXED: spec}
     if spec and all(isinstance(v, (LabelDefinition, Mapping)) for v in spec.values()):
@@ -813,12 +871,19 @@ def add_label_arguments(
         parser.add_argument("--tpot-p95-ms", type=float, required=require_fixed)
     parser.add_argument("--ttft-slo-mode", choices=TTFT_SLO_MODES, default=None,
                         help="fixed: one TTFT p95 threshold (comparison column); slowdown: "
-                             "max(floor, k*(c_m+b_m*L)) per request (primary, plan 6.11 D6-prime). "
-                             "Default: the registry slo.ttft_slo_mode of the model, else slowdown")
+                             "max(floor, k*(c_m+b_m*L)) per request (plan 6.11 D6-prime); idle_multiple: "
+                             "the 2026-11-04 SLO (registry slo.idle_multiple). Default: the registry's "
+                             "top-level slo_mode (tre_common.slo)")
     parser.add_argument("--ttft-slowdown-k", type=float, default=None,
-                        help=f"default: registry slo.ttft_slowdown_k, else {DEFAULT_TTFT_SLOWDOWN_K}")
+                        help="TTFT multiple k of a per-request mode. Default: registry slo.ttft_slowdown_k "
+                             f"(slowdown, else {DEFAULT_TTFT_SLOWDOWN_K}) / slo.idle_multiple.ttft_k")
     parser.add_argument("--ttft-floor-ms", type=float, default=None,
-                        help=f"default: registry slo.ttft_floor_ms, else {DEFAULT_TTFT_FLOOR_MS}")
+                        help="TTFT floor of a per-request mode. Default: registry slo.ttft_floor_ms "
+                             f"(slowdown, else {DEFAULT_TTFT_FLOOR_MS}) / slo.idle_multiple.ttft_floor_ms")
+    parser.add_argument("--tpot-k", type=float, default=None,
+                        help="idle_multiple: TPOT multiple (default: registry slo.idle_multiple.tpot_k)")
+    parser.add_argument("--tpot-idle-ms", type=float, default=None,
+                        help="idle_multiple: idle TPOT ms (default: registry slo.idle_multiple.tpot_idle_ms)")
     parser.add_argument("--ttft-idle-c-ms", type=float, default=None,
                         help="override the registry slo.ttft_idle_c_ms of the model")
     parser.add_argument("--ttft-idle-b-ms-per-token", type=float, default=None,
@@ -843,16 +908,27 @@ def label_def_for_model(
     floor: Optional[float] = None,
     c: Optional[float] = None,
     b: Optional[float] = None,
+    tpot_k: Optional[float] = None,
+    tpot_idle_ms: Optional[float] = None,
     min_completed_requests: int = DEFAULT_MIN_COMPLETED_REQUESTS,
     registry: Any = None,
     attribution: Optional[str] = None,
 ) -> LabelDefinition:
-    """Build the label for one model. Precedence per field: explicit value > the model's
-    registry ``slo`` block > the module default (the D6' primary label: slowdown, k = 5,
-    floor 500 ms, TPOT 75 ms). ``registry`` is a loaded registry or a path (None: the
+    """Build the label for one model. ``mode`` defaults to the registry's top-level
+    ``slo_mode`` (the one switch, ``tre_common.slo``). Precedence per parameter: explicit
+    value > the model's registry ``slo`` block (read through ``tre_common.slo``) > the module
+    default (slowdown k = 5, floor 500 ms, TPOT 75 ms; ``idle_multiple`` has none).
+    ``idle_multiple`` ignores ``tpot_p95_ms`` (the fixed-mode TPOT): its TPOT threshold is
+    ``tpot_k * tpot_idle_ms``. ``registry`` is a loaded registry or a path (None: the
     shared one)."""
     slo = None
-    if mode != TTFT_SLO_MODE_FIXED and model and None in (mode, k, floor, c, b):
+    registry_mode = None
+    needs_registry = bool(model) and (
+        mode is None
+        or (mode != TTFT_SLO_MODE_FIXED and None in (k, floor, c, b))
+        or (mode == TTFT_SLO_MODE_IDLE_MULTIPLE and None in (tpot_k, tpot_idle_ms))
+    )
+    if needs_registry:
         if registry is None or isinstance(registry, str):
             from tre_common.registry import load_registry
 
@@ -861,16 +937,35 @@ def label_def_for_model(
             slo = registry.model(model).slo
         except KeyError:
             slo = None
+        mode_of = getattr(registry, "slo_mode", None)
+        registry_mode = mode_of() if callable(mode_of) else None
     if mode is None:
-        mode = (slo.ttft_slo_mode if slo is not None else None) or DEFAULT_TTFT_SLO_MODE
-    if k is None:
-        k = slo.ttft_slowdown_k if slo is not None and slo.ttft_slowdown_k is not None else DEFAULT_TTFT_SLOWDOWN_K
-    if floor is None:
-        floor = slo.ttft_floor_ms if slo is not None and slo.ttft_floor_ms is not None else DEFAULT_TTFT_FLOOR_MS
-    if mode == TTFT_SLO_MODE_SLOWDOWN and (c is None or b is None):
+        mode = registry_mode or DEFAULT_TTFT_SLO_MODE
+    if mode not in TTFT_SLO_MODES:
+        raise ValueError(f"ttft_slo_mode must be one of {TTFT_SLO_MODES}, got {mode!r}")
+    base = None
+    if slo is not None:
+        try:
+            base = _slo.slo_thresholds(slo, mode)
+        except _slo.SloConfigError:
+            base = None
+
+    def pick(explicit: Optional[float], registry_value: Optional[float], default: Optional[float]) -> Optional[float]:
+        if explicit is not None:
+            return float(explicit)
+        if registry_value is not None:
+            return float(registry_value)
+        return None if default is None else float(default)
+
+    idle = mode == TTFT_SLO_MODE_IDLE_MULTIPLE
+    per_request = mode in _slo.PER_REQUEST_TTFT_MODES
+    ttft_fixed = pick(ttft_p95_ms, base.ttft_fixed_ms if base is not None else None, DEFAULT_TTFT_P95_MS)
+    k = pick(k, base.ttft_k if base is not None else None, None if idle else DEFAULT_TTFT_SLOWDOWN_K)
+    floor = pick(floor, base.ttft_floor_ms if base is not None else None, None if idle else DEFAULT_TTFT_FLOOR_MS)
+    if per_request and (c is None or b is None):
         if not model:
             raise SystemExit(
-                "--ttft-slo-mode slowdown (the default) needs a model name or --ttft-idle-c-ms/"
+                f"--ttft-slo-mode {mode} needs a model name or --ttft-idle-c-ms/"
                 "--ttft-idle-b-ms-per-token; pass --ttft-slo-mode fixed for the 500 ms label"
             )
         if slo is None:
@@ -879,16 +974,30 @@ def label_def_for_model(
         b = slo.ttft_idle_b_ms_per_token if b is None else b
         if c is None or b is None:
             raise SystemExit(f"registry model {model} has no slo.ttft_idle_c_ms / ttft_idle_b_ms_per_token")
+    if idle:
+        tpot_k = pick(tpot_k, base.tpot_k if base is not None else None, None)
+        tpot_idle_ms = pick(tpot_idle_ms, base.tpot_idle_ms if base is not None else None, None)
+        if None in (k, floor, tpot_k, tpot_idle_ms):
+            raise SystemExit(
+                f"model {model}: idle_multiple needs slo.idle_multiple (ttft_k, ttft_floor_ms, tpot_k, "
+                "tpot_idle_ms) in the registry or --ttft-slowdown-k / --ttft-floor-ms / --tpot-k / --tpot-idle-ms"
+            )
+        tpot = _slo.tpot_idle_multiple_ms(tpot_k=tpot_k, tpot_idle_ms=tpot_idle_ms)  # type: ignore[arg-type]
+    else:
+        tpot = pick(tpot_p95_ms, base.tpot_ms if base is not None else None, DEFAULT_TPOT_P95_MS)
+        tpot_k = tpot_idle_ms = None
     return LabelDefinition(
-        ttft_p95_ms=DEFAULT_TTFT_P95_MS if ttft_p95_ms is None else float(ttft_p95_ms),
-        tpot_p95_ms=DEFAULT_TPOT_P95_MS if tpot_p95_ms is None else float(tpot_p95_ms),
+        ttft_p95_ms=float(ttft_fixed),  # type: ignore[arg-type]
+        tpot_p95_ms=float(tpot),  # type: ignore[arg-type]
         ttft_slo_mode=mode,
-        ttft_slowdown_k=float(k),
-        ttft_floor_ms=float(floor),
-        ttft_idle_c_ms=c if mode == TTFT_SLO_MODE_SLOWDOWN else None,
-        ttft_idle_b_ms_per_token=b if mode == TTFT_SLO_MODE_SLOWDOWN else None,
+        ttft_slowdown_k=float(k),  # type: ignore[arg-type]
+        ttft_floor_ms=float(floor),  # type: ignore[arg-type]
+        ttft_idle_c_ms=c if per_request else None,
+        ttft_idle_b_ms_per_token=b if per_request else None,
         min_completed_requests=int(min_completed_requests),
         attribution=attribution or ATTRIBUTION_COMPLETION,
+        tpot_k=tpot_k,
+        tpot_idle_ms=tpot_idle_ms,
     )
 
 
@@ -912,6 +1021,8 @@ def label_def_from_args(args: argparse.Namespace, model: Optional[str]) -> Label
         floor=getattr(args, "ttft_floor_ms", None),
         c=getattr(args, "ttft_idle_c_ms", None),
         b=getattr(args, "ttft_idle_b_ms_per_token", None),
+        tpot_k=getattr(args, "tpot_k", None),
+        tpot_idle_ms=getattr(args, "tpot_idle_ms", None),
         min_completed_requests=first("min_completed_requests")
         if first("min_completed_requests") is not None else DEFAULT_MIN_COMPLETED_REQUESTS,
         registry=first("label_registry", "registry"),
@@ -926,13 +1037,15 @@ def label_cli_args(label: LabelDefinition) -> list[str]:
         "--ttft-slo-mode", label.ttft_slo_mode,
         "--min-completed-requests", str(int(label.min_completed_requests)),
     ]
-    if label.slowdown:
+    if label.per_request_ttft:
         out += [
             "--ttft-slowdown-k", str(label.ttft_slowdown_k),
             "--ttft-floor-ms", str(label.ttft_floor_ms),
             "--ttft-idle-c-ms", str(label.ttft_idle_c_ms),
             "--ttft-idle-b-ms-per-token", str(label.ttft_idle_b_ms_per_token),
         ]
+    if label.idle_multiple:
+        out += ["--tpot-k", repr(float(label.tpot_k)), "--tpot-idle-ms", repr(float(label.tpot_idle_ms))]  # type: ignore[arg-type]
     if label.hybrid:
         # only when not the default, so a v1 label's command line is unchanged
         out += ["--label-attribution", label.attribution]

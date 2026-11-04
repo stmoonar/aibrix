@@ -1,8 +1,9 @@
 # Input of `python3 -m tre_baselines.tools.preserve_nl_slo --config <this file> --data-root <root> --registry
 # <tre>/deploy/registry.yaml --out <dir>`: PreServe's NL SLO per model (the --nl-slo file of preserve_mu alg1).
-# SLO = multiples of the idle latencies (user 2026-11-04; local workspace docs/slo-idle-multiples-20261104.md):
-#   TTFT_slo(L) = max(ttft_floor_ms, k_ttft * (c + b L)), c / b = registry models[].slo.ttft_idle_c_ms / _b_ms_per_token
-#   TPOT_slo    = k_tpot * TPOT_idle, TPOT_idle = median tpot_ms of the ok idle records (idle_raw)
+# SLO = multiples of the idle latencies (user 2026-11-04; local workspace docs/slo-idle-multiples-20261104.md), the
+# registry's slo_mode idle_multiple (tre_common.slo):
+#   TTFT_slo(L) = max(ttft_floor_ms, ttft_k * (c + b L)), c / b = registry models[].slo.ttft_idle_c_ms / _b_ms_per_token
+#   TPOT_slo    = tpot_k * tpot_idle_ms, tpot_idle_ms = median tpot_ms of the ok idle records (idle_raw)
 #   NL_SLO      = (TTFT_slo(L_mix) + (out_mix - 1) TPOT_slo) / out_mix at the model's mix shape (isolated run)
 # Expected (2026-11-04): TPOT_idle 12.188 / 12.675 / 13.982 ms, NL_SLO 62.38 / 64.97 / 43.34 ms (7b / 8b / 14b).
 round_decimals: 2
@@ -17,7 +18,7 @@ inputs:
   isolated_dir: bl-calib-20261026/isolated
   mix_shape: mix
 
-models:
-  dsqwen-7b:  {k_ttft: 3, k_tpot: 5, ttft_floor_ms: 450}
-  dsllama-8b: {k_ttft: 3, k_tpot: 5, ttft_floor_ms: 450}
-  dsqwen-14b: {k_ttft: 5, k_tpot: 3, ttft_floor_ms: 450}
+# The SLO parameters (k_ttft, k_tpot, TTFT floor, TPOT_idle) are the registry's models[].slo.idle_multiple
+# (ttft_k 3 / 3 / 5, tpot_k 5 / 5 / 3, ttft_floor_ms 450, tpot_idle_ms = the median below; tre_common.slo), not
+# this file's: the tool recomputes TPOT_idle from idle_raw and refuses a registry whose tpot_idle_ms differs.
+models: [dsqwen-7b, dsllama-8b, dsqwen-14b]
