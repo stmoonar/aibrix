@@ -1,0 +1,125 @@
+# 2026-11-04 TokenScale with the new lambda' output rule (user 2026-11-04 20:2x: "上线现行代码，然后开始跑 tokenscale 看结果"):
+# TokenScale only, the 7 ICSE-suite traces, seed 1, 7 arms, NO TRE / APA / PreServe arm.
+# THE ONLY METHOD DIFFERENCE against the TokenScale arms of campaign-bl-w10-apa-ts-20261103 (same traces, seed, window 10 s, ConfigMap):
+#   lambda'_b, output part (aibrix 0142c09e, tre/baselines/tre_baselines/policies/tokenscale.py): a request the simulated
+#   length-prediction error leaves in its bucket counts its OWN max_tokens; a misbucketed request (misbucket_rate 0.15, same hash
+#   draw) counts the landing bucket's represented output (bucket_centers); a request without a valid max_tokens counts its bucket's
+#   represented output (missing_out_window). Before (v1 D47 / D66) every request counted its landing bucket's represented output.
+#   The bucket after misbucketing still picks V_b and counts the input. New decision inputs: term_own_out, term_misbucketed,
+#   missing_out_window.
+# IMAGE: baseline-scaler tre-v2-baseline-scaler:20261104-0142c09e (image sha256:79d0d279b835…, both nodes) instead of 20261029-8b60253f
+#   (the image of the 11-03 TokenScale arms). Between those two images tokenscale.py changed only in (a) window_s became a required
+#   key (2aca3403; the ConfigMap sets 10 in both runs, so no behaviour change) and (b) the lambda' rule above; the other changes of
+#   tre/baselines are PreServe-only (policies/preserve*, tools/) and two read-only additions in tre/common (tpot_mean alt signal).
+#   The TokenScale ConfigMap block of this checkout = the one of the 11-03 runner 1ecf378a (checked key by key).
+# Runner / client: main (the driver's MAIN_SHA); between 1ecf378a (11-03) and this main the runner changed only for PreServe
+#   (history_variant, per-model predictors; baseline_sanity.sh preserve branch) and eval/tre_eval/metrics.py moved the TTFT
+#   threshold into tre_common.slo_labels.request_ttft_slo_ms (same formula). SM 20261029-d9fa1571, gateway 20261029-8b60253f-nozmq2;
+#   the controller (20261102-420c69ef) stays in observe mode and is not a method of any arm here.
+# Registry: pinned to the live one, f75155148eba1e61 = the same id as campaign-bl-w10-apa-ts-20261103 (no difference; the baselines
+#   read no TRE parameter anyway).
+# Arm position: in 11-03 TokenScale ran after APA on traces 1, 3, 5, 7 (williams) and first on 2, 4, 6; here every arm follows the
+#   previous TokenScale arm (or the runner's first pre-check / reset), so the arm-to-arm carry-over differs (the runner resets the
+#   awake layout before every arm).
+# Same trace files as 11-03 (sha256 below and in tre/eval/runner/drivers/bl-ts-maxtok-20261104/campaign-bl-ts-maxtok-20261104.traces.sha256,
+# paths relative to ${CAMPAIGN_DATA_ROOT}):
+#   Alternating_hot_model_periodic_A   r3c k1.65   traces-icse-r3c-20261101   sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+#   Simultaneous_spike_ramp_twice_tps1o2 r3c k1.325 traces-icse-r3c-20261101   sha256 6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93
+#   Prefill_mixed_corner_decode_mix    r3c k1.7    traces-icse-r3c-20261101   sha256 91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e
+#   Decode_heavy_burst                 ktrace x1.2 traces-icse-ktrace-20261031 sha256 f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929
+#   Sinusoidal_demand                  ktrace x1.3 traces-icse-ktrace-20261031 sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+#   Real_conv_2023_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5
+#   Real_code_2024_slice_a_tok70       r3e         traces-icse-r3e-20261101   sha256 457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c
+#
+# RUN ORDER: traces in file order (= 11-03), one arm each. The FIRST run is TokenScale x Alternating: check it at once with
+# first_run_check.py and compare with <data root>/campaign-bl-w10-apa-ts-20261103-run/Alternating_hot_model_periodic_A_s1/tokenscale.
+# ETA: ~15 min per arm (11-03 TokenScale arms: wall 14:58-15:17) -> 7 arms ~1 h 50 min (+ first pre-check / reset 2-10 min;
+# + about 17 min per retried arm).
+#
+# Parameters (environment): CAMPAIGN_DATA_ROOT = the directory with the results roots, the trace sets and the exclusive-window marker
+# (required); TRE_REPO = the tre/ tree of the checkout (default: this checkout). Site-specific and NOT parameterised (YAML keys are
+# not expanded): the node name under precheck.disk_min_free_gb.nodes.
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-bl-ts-maxtok-20261104.yaml --dry-run
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/drivers/bl-ts-maxtok-20261104/run_campaign-bl-ts-maxtok-20261104.sh --check   (read-only guards)
+#   python3 tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/tokenscale      # after run 1, then every 50 min
+name: campaign-bl-ts-maxtok-20261104
+round: campaign-bl-ts-maxtok-20261104
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-ts-maxtok-20261104-run
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [tokenscale]
+order: fixed
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 190, report_s: 150}
+
+registry_expect:
+  registry_id: f75155148eba1e61     # live registry since 2026-11-03 13:49; = campaign-bl-w10-apa-ts-20261103 (see the header)
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+report:
+  enabled: false                    # project rule 2026-11-02: no reports while a campaign runs (viz.sh afterwards)
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: tokenscale
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; per-trace dir = <trace set>/<trace>/seed1 (traces_tre.effective.json, manifest.json)
+traces:
+  - trace: Alternating_hot_model_periodic_A
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+    # Alternating r3c k1.65
+  - trace: Simultaneous_spike_ramp_twice_tps1o2
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+    # Simultaneous r3c k1.325
+  - trace: Prefill_mixed_corner_decode_mix
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+    # Prefill_mixed r3c k1.7
+  - trace: Decode_heavy_burst
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+    # Decode_heavy ktrace x1.2
+  - trace: Sinusoidal_demand
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+    # Sinusoidal ktrace x1.3
+  - trace: Real_conv_2023_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+    # Real_conv r3e
+  - trace: Real_code_2024_slice_a_tok70
+    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+    # Real_code r3e
