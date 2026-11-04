@@ -1,0 +1,117 @@
+# 2026-11-04 ablation "PreServe V1 with the OLD mu": 2 traces x 1 arm, seed 1, 2 arms.
+# WHY: attribution of the PreServe degradation between campaign-bl-w10-preserve-20261103 and campaign-bl-preserve-paper-20261104.
+#   The paper campaign changed mu (Alg. 1 on dataset A) together with Tier-1, the predictors and the history. This batch puts the
+#   OLD mu back and keeps everything else of the paper campaign's arm preserve-v1, so the difference to that arm is mu alone.
+# WHAT CHANGED against campaign-bl-preserve-paper-20261104 (arm preserve-v1):
+#   - mu only (set per arm, the same way as that campaign's arm preserve-v1-mutt): the ladder mu used live before 2026-11-04,
+#     bl-calib-20261026/mu.yaml, block mu_B (tools/velocity_ladder mu, variant B; sha256
+#     04b0b23b6847487447395dd2b5be7d816527ce45ffd99807b4f78aee181d3ba5), values below (the driver checks them against the file):
+#     7b 6775.7 / 5137.7 / 9547.0, 8b 3196.9 / 4458.1 / 7655.0, 14b 6164.9 / 4013.3 / 7533.4 tok/s p / d / t;
+#   - 2 traces only (user 2026-11-04): Alternating_hot_model_periodic_A, then Sinusoidal_demand; one arm each.
+# UNCHANGED (= arm preserve-v1 of campaign-bl-preserve-paper-20261104): the ConfigMap of that campaign (tier1_horizon
+#   paper_two_step, tier1_d_source done_tokens, load_error_mode paper_tab2_relative, underload_pending_gate false, weights
+#   preserve-mlstm-20261104-trace-w10, history_variant train-tail-20261104), predictor_rules V1 (every trace -> v1-<trace>),
+#   the same trace files (sha256), seed 1, the same registry pin, reports off. The ConfigMap default mu stays the Alg. 1 mu.
+# Scoring: the TTFT + TPOT standard (as the paper campaign).
+# Traces (the files of campaign-bl-preserve-paper-20261104, same sha256):
+#   Alternating_hot_model_periodic_A   r3c k1.65   traces-icse-r3c-20261101   sha256 574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf
+#   Sinusoidal_demand                  ktrace x1.3 traces-icse-ktrace-20261031 sha256 5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab
+# The baselines read no TRE parameter: the registry is pinned to the live one (registry_expect), the same id as the paper campaign.
+#
+# RUN ORDER: Alternating, then Sinusoidal. order: fixed. The FIRST run is PreServe-V1-muold x Alternating: check it at once with
+# first_run_check.py. ETA: ~920 s per arm (720 s trace + ~200 s overhead) -> 2 arms ~31 min.
+#
+# Parameters (environment): CAMPAIGN_DATA_ROOT = the directory with the results roots, the trace sets, the baseline trace volume
+# (baseline-traces), datasets/ and the exclusive-window marker (required); TRE_REPO = the tre/ tree of the checkout (default: this
+# checkout). Site-specific and NOT parameterised: the node name under precheck.disk_min_free_gb.nodes.
+#   CAMPAIGN_DATA_ROOT=... bash tre/eval/runner/run_campaign.sh tre/eval/runner/campaigns/campaign-bl-preserve-muold-20261104.yaml --dry-run
+#   CAMPAIGN_DATA_ROOT=... EXPECT_BL=tre-v2-baseline-scaler:<tag> bash tre/eval/runner/drivers/bl-preserve-muold-20261104/run_campaign-bl-preserve-muold-20261104.sh --check
+#   python3 tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/preserve-v1-muold   # after run 1
+name: campaign-bl-preserve-muold-20261104
+round: campaign-bl-preserve-muold-20261104
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-preserve-muold-20261104-run
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [preserve-v1-muold]   # every trace entry lists its own arm
+order: fixed
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 200, report_s: 150}
+
+arm_defs:
+  preserve-v1-muold:
+    base: preserve
+    label: PreServe-V1-muold
+    policy:
+      tier1: mlstm
+      # every trace -> its own v1 set (= tre_baselines.tools.freeze_params.predictor_rules("v1"); guard test)
+      predictor_rules:
+        - [Alternating_hot_model_periodic_A, v1-Alternating_hot_model_periodic_A]
+        - [Simultaneous_spike_ramp_twice_tps1o2, v1-Simultaneous_spike_ramp_twice_tps1o2]
+        - [Prefill_mixed_corner_decode_mix, v1-Prefill_mixed_corner_decode_mix]
+        - [Decode_heavy_burst, v1-Decode_heavy_burst]
+        - [Sinusoidal_demand, v1-Sinusoidal_demand]
+        - [Real_conv_2023_slice_a_tok70, v1-Real_conv_2023_slice_a_tok70]
+        - [Real_code_2024_slice_a_tok70, v1-Real_code_2024_slice_a_tok70]
+      mu:                 # bl-calib-20261026/mu.yaml mu_B (the ladder mu used live before 2026-11-04)
+        dsqwen-7b: {p: 6775.7, d: 5137.7, t: 9547.0}
+        dsllama-8b: {p: 3196.9, d: 4458.1, t: 7655.0}
+        dsqwen-14b: {p: 6164.9, d: 4013.3, t: 7533.4}
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces    # = the hostPath of the baseline-scaler's trace volume
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+  history_root: ${CAMPAIGN_DATA_ROOT}/datasets/preserve-train-trace-20261104/history   # <set>/<trace>/seed1/<variant file>
+
+registry_expect:
+  registry_id: f75155148eba1e61     # live registry since 2026-11-03 13:49; the same pin as campaign-bl-preserve-paper-20261104
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+report:
+  enabled: false                    # project rule 2026-11-02: no reports while a campaign runs (viz.sh afterwards)
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: preserve-v1-muold
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; per-trace dir = <trace set>/<trace>/seed1
+traces:
+  - {trace: Alternating_hot_model_periodic_A, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1", arms: [preserve-v1-muold]}
+  - {trace: Sinusoidal_demand, dir: "${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1", arms: [preserve-v1-muold]}
