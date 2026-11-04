@@ -76,7 +76,8 @@ class SafeScaleConfig:
     # Optional OVERRIDES of the probe's latency thresholds (env SAFE_SCALE_TTFT_P95_SLO_MS /
     # SAFE_SCALE_TPOT_P95_SLO_MS, unset by default). None = the registry decides
     # (its top-level slo_mode, thresholds from tre_common.slo); without a registry
-    # resolver (direct constructions) None means 500 / 75 ms.
+    # resolver (direct constructions only) the planner's no-registry values apply
+    # (planning.safescale_evidence.NO_REGISTRY_*).
     ttft_p95_slo_ms: float | None = None
     tpot_p95_slo_ms: float | None = None
     # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).

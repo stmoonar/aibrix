@@ -51,11 +51,15 @@ LOG = logging.getLogger("tre_controller.safescale")
 #: (``fixed`` / ``slowdown`` / ``idle_multiple``; before 2026-11-04 the audit wrote
 #: ``labels`` for what is now ``slowdown``), or ``config`` below.
 THRESHOLD_MODE_FIXED = slo_def.SLO_MODE_FIXED
-#: Direct constructions without a registry (tests / offline): config values or the fixed
-#: mode's defaults (500 / 75 ms).
+#: Direct constructions without a registry resolver (tests / offline replays): the config
+#: values (SafeScaleConfig.ttft_p95_slo_ms / tpot_p95_slo_ms), else the two values below.
+#: The controller itself always judges with the registry resolver (app.py), whose values
+#: are the registry's (tre_common.slo has no built-in SLO value since 2026-11-04). These two
+#: are NOT an SLO definition: the last resort of a construction that has no registry
+#: (allow-listed in deploy/tests/test_slo_single_definition.py).
 THRESHOLD_MODE_CONFIG = "config"
-DEFAULT_TTFT_SLO_MS = slo_def.FIXED_TTFT_MS
-DEFAULT_TPOT_SLO_MS = slo_def.FIXED_TPOT_MS
+NO_REGISTRY_TTFT_MS = 500.0
+NO_REGISTRY_TPOT_MS = 75.0
 
 
 @dataclass(frozen=True)
@@ -369,6 +373,13 @@ class RegistryThresholds:
                 record["tpot_ms"] = float(self._tpot_override)
         return record
 
+    def fixed_record(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
+        """The registry's fixed-mode thresholds of ``model`` (the fallback when :meth:`resolve`
+        fails; the env overrides do not apply)."""
+        thresholds = slo_def.slo_thresholds(self._registry.model(model).slo, THRESHOLD_MODE_FIXED)
+        return {"mode": thresholds.mode, "ttft_ms": float(thresholds.ttft_ms(None)), "tpot_ms": float(thresholds.tpot_ms),
+                "mean_prompt_tokens": _finite_nonneg(mean_prompt_tokens), "source": "registry_fixed_fallback"}
+
     def _of(self, model: str) -> tuple[Any, str | None]:
         if model not in self._thresholds:
             fallback = None
@@ -377,22 +388,22 @@ class RegistryThresholds:
             except (slo_def.SloConfigError, KeyError, AttributeError) as exc:
                 LOG.warning("safescale thresholds: %s has no %s SLO (%s); using fixed", model, self._mode, exc)
                 fallback = f"slo_unavailable: {exc}"
-                try:
-                    thresholds = slo_def.slo_thresholds(self._registry.model(model).slo, THRESHOLD_MODE_FIXED)
-                except (slo_def.SloConfigError, KeyError, AttributeError):
-                    thresholds = slo_def.slo_thresholds({}, THRESHOLD_MODE_FIXED)
+                # The registry's fixed values (a loaded registry has them for every model;
+                # an unknown model raises: there is no built-in threshold).
+                thresholds = slo_def.slo_thresholds(self._registry.model(model).slo, THRESHOLD_MODE_FIXED)
             self._thresholds[model] = (thresholds, fallback)
         return self._thresholds[model]
 
 
 def config_thresholds(config: Any, mean_prompt_tokens: float | None = None) -> dict[str, Any]:
-    """Thresholds without a registry resolver: the config values, else 500 / 75 ms."""
+    """Thresholds without a registry resolver: the config values, else the no-registry
+    values (direct constructions only, see NO_REGISTRY_TTFT_MS)."""
     ttft = getattr(config, "ttft_p95_slo_ms", None)
     tpot = getattr(config, "tpot_p95_slo_ms", None)
     return {
         "mode": THRESHOLD_MODE_CONFIG,
-        "ttft_ms": float(ttft) if ttft is not None else DEFAULT_TTFT_SLO_MS,
-        "tpot_ms": float(tpot) if tpot is not None else DEFAULT_TPOT_SLO_MS,
+        "ttft_ms": float(ttft) if ttft is not None else NO_REGISTRY_TTFT_MS,
+        "tpot_ms": float(tpot) if tpot is not None else NO_REGISTRY_TPOT_MS,
         "mean_prompt_tokens": _finite_nonneg(mean_prompt_tokens),
         "source": "config",
     }

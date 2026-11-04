@@ -18,9 +18,10 @@ from tre_controller.planning.safescale_direct import (
     evaluate_poll,
     take_baseline,
 )
-from tre_common import slo as slo_def
 from tre_common.persistence import span_reaches
 from tre_controller.planning.safescale_evidence import (
+    NO_REGISTRY_TPOT_MS,
+    NO_REGISTRY_TTFT_MS,
     EvidenceSource,
     EvidenceWindow,
     HideAnchor,
@@ -1861,8 +1862,15 @@ class SafeScaleStateMachine:
         if self._thresholds is not None:
             try:
                 return self._thresholds.resolve(model, mean_prompt_tokens)
-            except Exception:  # noqa: BLE001 - config values are the documented fallback
-                LOG.warning("safescale thresholds of %s failed; using the config values", model, exc_info=True)
+            except Exception:  # noqa: BLE001 - the registry's fixed values are the documented fallback
+                LOG.warning("safescale thresholds of %s failed; using the registry's fixed values", model,
+                            exc_info=True)
+                fixed = getattr(self._thresholds, "fixed_record", None)
+                if fixed is not None:
+                    try:
+                        return fixed(model, mean_prompt_tokens)
+                    except Exception:  # noqa: BLE001 - last resort: the config values
+                        LOG.warning("safescale fixed thresholds of %s failed", model, exc_info=True)
         return config_thresholds(self._config, mean_prompt_tokens)
 
     def _wall_ms(self) -> int | None:
@@ -2406,9 +2414,9 @@ def _summarize_tail(
             limits = thresholds(newest)
             ttft_limit, tpot_limit = limits["ttft_ms"], limits["tpot_ms"]
         else:
-            # No resolver (direct constructions): the fixed mode's defaults (tre_common.slo).
-            ttft_limit = slo_def.FIXED_TTFT_MS if ttft_p95_slo_ms is None else ttft_p95_slo_ms
-            tpot_limit = slo_def.FIXED_TPOT_MS if tpot_p95_slo_ms is None else tpot_p95_slo_ms
+            # No resolver (direct constructions only): the explicit values, else the no-registry ones.
+            ttft_limit = NO_REGISTRY_TTFT_MS if ttft_p95_slo_ms is None else ttft_p95_slo_ms
+            tpot_limit = NO_REGISTRY_TPOT_MS if tpot_p95_slo_ms is None else tpot_p95_slo_ms
         if ttft is not None and ttft > ttft_limit:
             latency_ok = False
         if tpot is not None and tpot > tpot_limit:
