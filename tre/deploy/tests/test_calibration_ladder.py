@@ -57,6 +57,8 @@ PRIORS_DOC = {
 }
 GROUPS_DOC = {"groups": {"decode": ["S4", "S5"], "prefill": ["S3", "T8"],
                          "middle": ["S1", "S2", "T9"]}}
+#: the fixed-threshold pair these verdicts are judged on (no default threshold since 2026-11-04)
+FIXED_500_75 = {"ttft_slo_ms": 500.0, "tpot_slo_ms": 75.0}
 
 
 def _write(path: Path, doc) -> Path:
@@ -374,15 +376,15 @@ def test_a_hold_cell_is_labelled_after_its_warm_up_and_a_backlog_stop_is_violate
     start = 1_790_000_000_000
     healthy_then_bad = _windows(start, 60) + _windows(start + 60_000, 90, tpot=200.0)
     guard = {"start_ms": start, "void_reasons": []}
-    verdict = design.hold_cell_verdict(healthy_then_bad, guard, warmup_s=60.0)
+    verdict = design.hold_cell_verdict(healthy_then_bad, guard, warmup_s=60.0, **FIXED_500_75)
     assert verdict["verdict"] == boundary.VERDICT_VIOLATED  # the healthy warm-up is ignored
     assert verdict["independent_windows"] == 3
     short = design.hold_cell_verdict(_windows(start, 70), {
         "start_ms": start, "void_reasons": [], "truncated": True,
-        "truncation_cause": openloop.TRUNCATION_BACKLOG}, warmup_s=60.0)
+        "truncation_cause": openloop.TRUNCATION_BACKLOG}, warmup_s=60.0, **FIXED_500_75)
     assert short["verdict"] == boundary.VERDICT_VIOLATED and short["backlog_stopped"]
     void = design.hold_cell_verdict([], {"void_reasons": ["envoy pending overflow"]},
-                                    warmup_s=60.0)
+                                    warmup_s=60.0, **FIXED_500_75)
     assert void["verdict"] == boundary.VERDICT_VOID
 
 
@@ -407,13 +409,13 @@ def test_supplementary_cells_follow_measured_labels_not_rho() -> None:
 def test_sentinel_drift_is_judged_against_the_first_sentinel() -> None:
     start = 1_790_000_000_000
     guard = {"start_ms": start, "void_reasons": []}
-    same = design.sentinel_summary(_windows(start, 240), guard, warmup_s=60.0)
-    slower = design.sentinel_summary(_windows(start, 240, tpot=13.0), guard, warmup_s=60.0)
+    same = design.sentinel_summary(_windows(start, 240), guard, warmup_s=60.0, **FIXED_500_75)
+    slower = design.sentinel_summary(_windows(start, 240, tpot=13.0), guard, warmup_s=60.0, **FIXED_500_75)
     assert same["measured"] and same["median_p95_tpot_client_ms"] == 10.0
     assert design.sentinel_drift([same, same, same])["flagged"] is False
     drift = design.sentinel_drift([same, same, slower])
     assert drift["flagged"] is True and drift["checks"][1]["median_p95_tpot_relative"] == 0.3
-    unmeasured = design.sentinel_summary([], {"void_reasons": ["x"]}, warmup_s=60.0)
+    unmeasured = design.sentinel_summary([], {"void_reasons": ["x"]}, warmup_s=60.0, **FIXED_500_75)
     assert design.sentinel_drift([same, unmeasured, same])["flagged"] is None
     assert same["median_running"] == 6.0
 
@@ -425,13 +427,13 @@ def test_sentinel_drift_flags_on_tpot_and_running_not_on_ttft_or_violations() ->
         "median_p95_tpot_relative", "median_running_relative"}
     start = 1_790_000_000_000
     guard = {"start_ms": start, "void_reasons": []}
-    ref = design.sentinel_summary(_windows(start, 240), guard, warmup_s=60.0)
-    fuller = design.sentinel_summary(_windows(start, 240, running=8.0), guard, warmup_s=60.0)
+    ref = design.sentinel_summary(_windows(start, 240), guard, warmup_s=60.0, **FIXED_500_75)
+    fuller = design.sentinel_summary(_windows(start, 240, running=8.0), guard, warmup_s=60.0, **FIXED_500_75)
     drift = design.sentinel_drift([ref, fuller])
     assert drift["flagged"] is True
     assert drift["checks"][0]["median_running_relative"] == pytest.approx(1 / 3, abs=1e-3)
     # every window over the TTFT SLO: violating fraction 0 -> 1, TTFT x 20 - not flagged
-    late = design.sentinel_summary(_windows(start, 240, ttft=2000.0), guard, warmup_s=60.0)
+    late = design.sentinel_summary(_windows(start, 240, ttft=2000.0), guard, warmup_s=60.0, **FIXED_500_75)
     assert late["violating_fraction"] == 1.0
     quiet = design.sentinel_drift([ref, late])
     assert quiet["flagged"] is False
@@ -440,7 +442,7 @@ def test_sentinel_drift_flags_on_tpot_and_running_not_on_ttft_or_violations() ->
     assert set(quiet["informational"]) == set(design.SENTINEL_INFORMATIONAL)
     # a sentinel without the running column cannot be judged on it: undetermined
     blind = [{k: v for k, v in r.items() if k != "avg_running"} for r in _windows(start, 240)]
-    no_running = design.sentinel_summary(blind, guard, warmup_s=60.0)
+    no_running = design.sentinel_summary(blind, guard, warmup_s=60.0, **FIXED_500_75)
     assert design.sentinel_drift([ref, no_running])["flagged"] is None
 
 

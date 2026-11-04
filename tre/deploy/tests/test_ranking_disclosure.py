@@ -270,12 +270,12 @@ def test_alpha_fit_threads_window_and_episode_margin(monkeypatch) -> None:
     monkeypatch.setattr(af, "alpha_rule", fake_rule)
     monkeypatch.setattr(tv, "critical_dwell_flags", fake_flags)
     monkeypatch.setattr(slo_labels, "label_def_from_args", lambda a, m: dl.label_for(m, "fixed", str(base.REGISTRY)))
-    ns = af._parse(["--model", MODEL, "--fitting-csv", "x.csv", "--w-p", "0", "--lambda-wait", "1", "--output", "o",
+    ns = af._parse(["--model", MODEL, "--ttft-slo-mode", "fixed", "--fitting-csv", "x.csv", "--w-p", "0", "--lambda-wait", "1", "--output", "o",
                     "--window-ms", "20000", "--episode-margin-ms", "15000", "--dwell-windows", "3"])
     rep = af.run(ns)
     assert got["flags"]["window_ms"] == 20_000.0 and got["flags"]["dwell_windows"] == 3
     assert got["rule"]["margin_ms"] == 15_000.0 and rep["window_ms"] == 20_000.0
-    ns = af._parse(["--model", MODEL, "--fitting-csv", "x.csv", "--w-p", "0", "--lambda-wait", "1", "--output", "o"])
+    ns = af._parse(["--model", MODEL, "--ttft-slo-mode", "fixed", "--fitting-csv", "x.csv", "--w-p", "0", "--lambda-wait", "1", "--output", "o"])
     af.run(ns)
     assert got["flags"]["window_ms"] == af.DEFAULT_WINDOW_MS and got["rule"]["margin_ms"] == af.EPISODE_MARGIN_MS
 

@@ -821,7 +821,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
 
     ttft_slo_ms = args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms
     tpot_slo_ms = args.tpot_slo_ms if args.tpot_slo_ms is not None else spec.slo.tpot_p95_ms
-    # The primary window label (D6' slowdown TTFT from the registry's idle fit, TPOT at
+    # The primary window label (the registry's slo_mode unless --ttft-slo-mode, TPOT at
     # tpot_slo_ms) - what the boundary search judges this cell on, and what the fit
     # trains on. Built before anything is driven so a missing idle fit fails fast.
     label = primary_label(args, spec)
@@ -1271,9 +1271,10 @@ def closed_loop_rows(
 
 
 def primary_label(args, spec):
-    """The primary window label of this run: ``--ttft-slo-mode`` & co. (D6' slowdown by
-    default, idle TTFT fit from the model's registry ``slo`` block), fixed thresholds from
-    ``--ttft-slo-ms`` / ``--tpot-slo-ms`` or the registry."""
+    """The primary window label of this run: ``--ttft-slo-mode`` & co. (default: the loaded
+    registry's ``slo_mode``, ``args.registry_slo_mode`` set by :func:`main`; parameters from
+    the model's registry ``slo`` block), fixed thresholds from ``--ttft-slo-ms`` /
+    ``--tpot-slo-ms`` or the registry."""
     return slo_labels.label_def_for_model(
         spec.name,
         ttft_p95_ms=args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms,
@@ -1285,15 +1286,31 @@ def primary_label(args, spec):
         b=getattr(args, "ttft_idle_b_ms_per_token", None),
         min_completed_requests=getattr(
             args, "min_completed_requests", slo_labels.DEFAULT_MIN_COMPLETED_REQUESTS),
-        registry=_SpecRegistry(spec),
+        registry=_SpecRegistry(spec, _registry_slo_mode(args)),
     )
 
 
-class _SpecRegistry:
-    """A one-model registry view, so the label reads the same spec the driver loaded."""
+def _registry_slo_mode(args):
+    """The slo_mode of the registry the driver loads (``--registry``, default the shared one):
+    :func:`main` records it in ``args.registry_slo_mode``; a caller that skipped main reads it."""
+    mode = getattr(args, "registry_slo_mode", None)
+    if mode is None:
+        from tre_common.registry import load_registry
 
-    def __init__(self, spec) -> None:
+        mode = load_registry(getattr(args, "registry", None)).slo_mode()
+    return mode
+
+
+class _SpecRegistry:
+    """A one-model registry view, so the label reads the same spec (and the same
+    ``slo_mode``) as the registry the driver loaded."""
+
+    def __init__(self, spec, slo_mode=None) -> None:
         self._spec = spec
+        self._slo_mode = slo_mode
+
+    def slo_mode(self):
+        return self._slo_mode
 
     def model(self, name: str):
         if name != self._spec.name:
@@ -1543,7 +1560,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                     help="p95 TTFT SLO for the window evidence count (default: registry)")
     ap.add_argument("--tpot-slo-ms", type=float, default=None,
                     help="p95 TPOT SLO for the window evidence count (default: registry)")
-    # The primary window label's TTFT term (D6' slowdown by default, from the registry).
+    # The primary window label's TTFT term (default: the registry's slo_mode).
     slo_labels.add_label_arguments(ap, include_fixed=False)
     ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
                     help="fail: a cell that did not deliver its load aborts the run")
@@ -1615,6 +1632,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     registry = load_registry(args.registry)
     spec = registry.model(args.model)
+    args.registry_slo_mode = registry.slo_mode()   # the label's default mode (the one switch)
     redis_client = redis.Redis.from_url(args.redis_url)
     store = MetricsStore(
         redis_client, registry,

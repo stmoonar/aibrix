@@ -411,7 +411,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=FIT_EMA_TAU_MS,
         help="EMA time constant candidates are smoothed with (default 0 = raw, as the deployed registry names it; > 0 = time-constant EMA)",
     )
-    add_label_arguments(parser)
+    add_label_arguments(parser, require_mode=True)
     parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument(
         "--inherited-w-p", type=float, help="Inherited w_p (default: registry value for the model)"

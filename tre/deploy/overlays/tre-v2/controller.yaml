@@ -138,10 +138,10 @@ spec:
             # theta_window_ms makes this controller refuse to start.
             - name: TRE_METRICS_WINDOW_MS
               value: "10000"
-            # SafeScale latency thresholds come from the registry (safescale.slo_mode,
-            # 2026-09-29): SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS are
-            # optional overrides and deliberately NOT set here. (Older images default
-            # to the same 500 / 75 ms without them.)
+            # SafeScale latency thresholds come from the registry only (top-level slo_mode +
+            # models[].slo, tre_common.slo; 2026-11-04). The env overrides
+            # SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS were removed: this
+            # controller refuses to start when either is set.
             # A6: probe window W = min(max(E2E_MULTIPLIER * p95_e2e, WINDOW_FLOOR_MS), W_max),
             # W_max = registry safescale.window_ceiling_s (60 s). Missing p95_e2e
             # -> W = WINDOW_FLOOR_MS. The latency gate reads the post-hide evidence

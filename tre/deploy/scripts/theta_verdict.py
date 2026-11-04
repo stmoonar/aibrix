@@ -718,7 +718,7 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     v.add_argument("--qmin", type=float, default=1.0)
     v.add_argument("--ema-tau-ms", type=nonneg_tau_ms_arg, default=FIT_EMA_TAU_MS)
-    add_label_arguments(v)
+    add_label_arguments(v, require_mode=True)
     v.add_argument("--trim-ramp-windows", type=int, default=1)
     v.add_argument("--n-resamples", type=int, default=1000)
     v.add_argument("--family-resamples", type=int, default=200)

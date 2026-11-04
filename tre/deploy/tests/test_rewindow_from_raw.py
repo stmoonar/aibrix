@@ -550,7 +550,7 @@ def test_main_writes_meta_json_beside_csv(tmp_path: Path, monkeypatch: pytest.Mo
     _write_campaign_raw(raw_dir)
     out = tmp_path / "out" / "rewindow_20s.csv"
     rc = _run_main(monkeypatch, [
-        "--model", MODEL, "--raw-dir", str(raw_dir), "--output", str(out),
+        "--model", MODEL, "--ttft-slo-mode", "fixed", "--raw-dir", str(raw_dir), "--output", str(out),
         "--window-ms", "20000", "--instant-sample-ms", "1000", "--instant-grid", "raw",
         "--min-latency-samples", "0", "--registry", str(REGISTRY_PATH),
     ])
@@ -580,7 +580,7 @@ def test_main_refuses_mismatched_cadence(tmp_path: Path, monkeypatch: pytest.Mon
     _write_campaign_raw(raw_dir)
     with pytest.raises(rewindow_from_raw.CadenceMismatchError):
         _run_main(monkeypatch, [
-            "--model", MODEL, "--raw-dir", str(raw_dir),
+            "--model", MODEL, "--ttft-slo-mode", "fixed", "--raw-dir", str(raw_dir),
             "--output", str(tmp_path / "out" / "bad.csv"),
             "--window-ms", "20000", "--instant-grid", "live", "--instant-sample-ms", "1000",
             "--registry", str(REGISTRY_PATH),
@@ -592,7 +592,7 @@ def test_main_live_grid_records_gap_threshold(tmp_path: Path, monkeypatch: pytes
     _write_campaign_raw(raw_dir)
     out = tmp_path / "out" / "rewindow_live.csv"
     rc = _run_main(monkeypatch, [
-        "--model", MODEL, "--raw-dir", str(raw_dir), "--output", str(out),
+        "--model", MODEL, "--ttft-slo-mode", "fixed", "--raw-dir", str(raw_dir), "--output", str(out),
         "--window-ms", "20000", "--instant-grid", "live",
         "--instant-sample-ms", str(SCRAPE_INTERVAL_MS),
         "--gap-threshold", "5.0", "--min-latency-samples", "0",

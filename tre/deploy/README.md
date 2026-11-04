@@ -121,6 +121,47 @@ Order: registry ConfigMap (`merge_live_registry.py`, then `kubectl replace`)
 -> gateway-plugins -> service-manager -> controller. Rollback restores the
 images and the ConfigMap as a pair.
 
+### SLO switch release and rollback (2026-11-04)
+
+The SLO is one registry key, `slo_mode` (`tre_common.slo`). Images before 2026-11-04
+read the two retired keys instead (`safescale.slo_mode` for the SafeScale probe,
+`models[].slo.ttft_slo_mode` for the scorer / labels / baseline scaler); the current
+images refuse a registry whose retired keys disagree with each other (no `slo_mode`)
+or mean another mode than `slo_mode` to an old image.
+
+- Release: `params_set.py --set slo_mode=<mode> --apply --backup-dir <dir>` (it drops
+  the retired keys; `--apply` saves the live ConfigMap under `--backup-dir`), then the
+  images (SM -> controller; baseline scaler last). Without `--restart` the running pods
+  keep the registry they read at start until their own rollout.
+- Transition registry (optional, `fixed` / `slowdown` only): `slo_mode` plus retired keys
+  that mean the same mode to an old image (`ttft_slo_mode: <mode>` on every model and
+  `safescale.slo_mode: fixed` (mode fixed) or `labels`). Old and new images then read the
+  same SLO. `idle_multiple` has no old spelling.
+- Rollback: **restore the registry backup together with the images** (the old images
+  ignore `slo_mode`: without their retired keys the old probe falls back to `labels` and
+  the old scorer to `slowdown`). Exception: a transition registry, which both read alike.
+
+### SLO consumers that do not follow the switch (2026-11-04)
+
+Every verdict goes through `tre_common.slo` under the registry's `slo_mode`, except:
+
+- the `latency_p95` alternative signal (`controller/tre_controller/signals/sources.py`
+  `_latency_signal`): it normalises the window p95s by the block's fixed `ttft_p95_ms` /
+  `tpot_p95_ms` / `e2e_p95_ms` (v1 signal, a signal not a verdict);
+- the replayer's V_sys (`replayer/tre_replayer/scoring.py`, `run_trace.py`,
+  `deploy/scripts/analysis/score_request_trace.py`): v1 parity, fixed thresholds + e2e, a
+  diagnostic next to the scorer (`tre_eval.metrics`);
+- D6' reproductions: `dline_refit.py` and `calibration_dataset.py` take the D6' mode
+  explicitly but read c / b / k / floor from the registry they are given (default: the
+  current one) - reproduce the 10-03 freeze with that time's registry;
+  `calibration_campaign.py --fit-ttft-slo-mode` defaults to the 10-03 design's D6'
+  slowdown, not the switch;
+- the fit tools compared with frozen records (`rewindow_from_raw.py`, `refit_trs_params.py`,
+  `theta_verdict.py`, `alpha_fit.py`) require `--ttft-slo-mode` (no default);
+- `velocity_ladder.py --slo-rule unified` judges under the registry's `slo_mode` (default)
+  or `--slo-mode`; before 2026-11-04 it followed the blocks' `ttft_slo_mode` (slowdown), so
+  its results from the repo registry (`fixed`) are on another basis than older ones.
+
 ### Run mode: controller mode and SM actuation
 
 `tre:v2:controller:mode` and `tre:v2:sm:actuation` (`active` | `observe`) are
@@ -274,7 +315,9 @@ Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
 - thresholds: the registry's top-level `slo_mode` (2026-11-04: the one SLO switch of every
   consumer, `tre_common.slo`; `fixed` / `slowdown` / `idle_multiple`, replaces
   `safescale.slo_mode`); a per-request mode is judged at the window's mean prompt length;
-  env `SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` are optional overrides (unset);
+  no env override (`SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` were removed
+  2026-11-04: the controller refuses to start when either is set); no fallback - a model
+  whose `slo` block lacks its mode's parameters is refused when the registry loads;
 - clock / continuity check (fail-closed, `evidence_clock_skew`): each remaining pod's
   first evidence doc within `[S, N + safescale.evidence_clock_tolerance_s]`, and the
   newest-doc read at the hide must have worked; offsets of Redis `TIME`, the gateway

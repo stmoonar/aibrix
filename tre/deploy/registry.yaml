@@ -749,12 +749,14 @@ service_manager:
 #                   (the 10-03 theta label; scorer of the runs before 2026-11-04);
 #   idle_multiple - models[].slo.idle_multiple (user 2026-11-04).
 # The probe judges its window p95s against the per-request TTFT threshold at the window's
-# mean prompt length (L unknown -> the floor). The controller env
-# SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS (unset) override the probe's.
+# mean prompt length (L unknown -> the floor); there is no env override (the controller
+# refuses SAFE_SCALE_TTFT_P95_SLO_MS / _TPOT_, removed 2026-11-04).
 # Changing it changes every consumer: restart-to-apply with params_set.py
 # (--set slo_mode=...). idle_multiple goes live only together with the theta / lambda /
 # tau / w_p refit on that SLO (one --apply). Replaces safescale.slo_mode and
-# models[].slo.ttft_slo_mode (a registry with both is refused).
+# models[].slo.ttft_slo_mode: a registry may keep them only where they mean this same mode
+# to an image before 2026-11-04 (a transition registry both read alike); otherwise it is
+# refused. An image rollback restores the registry backup with it (deploy/README.md).
 slo_mode: fixed
 # SafeScale probe (controller only; read at start, restart-to-apply; every key
 # optional, the values below are the built-in defaults). Controller images before

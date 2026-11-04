@@ -9,12 +9,15 @@ every consumer (user rules 2026-10-29 / 2026-11-04).
 2. Data contract: every ``models[].slo`` field has a reader, every repo-registry model has
    the ``idle_multiple`` parameters, and the switch is written in both repo registry files.
 3. One switch: changing ``slo_mode`` changes the thresholds of every consumer at once.
-4. No SLO value in code (2026-11-04): outside an allow-list, no file under tre/ holds a numeric
-   literal in an SLO context - compared with, or dividing / multiplying, a value named after
-   TTFT / TPOT (``max(ttft / 500.0, tpot / 75.0)``), as the default of a TTFT / TPOT option or
-   parameter, as a ``*ttft*`` / ``*tpot*`` keyword argument, or as a TTFT / TPOT module
-   constant - and no file compares a TTFT / TPOT value with an SLO threshold itself (instead
-   of ``tre_common.slo.judge_request`` / ``violated_array`` or the window label).
+4. No SLO value in code (2026-11-04): outside an exact allow-list of (file, hit), no file under
+   tre/ holds a numeric literal in an SLO context - compared with, or dividing / multiplying, a
+   value named after a latency (TTFT / TPOT / first token / ITL / latency; ``max(ttft / 500.0,
+   tpot / 75.0)``, seconds included: ``r["ttft"] > 0.5``), as the default of such an option or
+   parameter, as such a keyword or positional argument (matched to the callee's parameter
+   names), as a dict value under such a key, as the constant of ``max`` / ``min`` with an
+   idle / floor / SLO term (a TTFT floor), or as such a module constant; no ``.sh`` / ``.yaml``
+   passes ``--ttft-*-ms <number>``; and no file compares a latency with an SLO threshold itself
+   (instead of ``tre_common.slo.judge_request`` / ``violated_array`` or the window label).
 """
 from __future__ import annotations
 
@@ -67,40 +70,78 @@ ALLOWED = {
 }
 
 
-#: Rule 4. Numbers that are units or neutral values, never an SLO (ms <-> s, ratios).
+#: Rule 4. Numbers that are units or neutral values, never an SLO (ms <-> s, ratios). Next to a
+#: latency, 0.5 is not neutral: it is 500 ms in seconds (``r["ttft"] > 0.5``).
 UNIT_NUMBERS = {0, 1, 2, 10, 100, 1000, 1e6, 1e-3, 1e-6, 0.5, 60}
-TTFT_TPOT = re.compile(r"ttft|tpot", re.IGNORECASE)
+LATENCY_UNIT_NUMBERS = UNIT_NUMBERS - {0.5}
+#: What a latency is called (TTFT / TPOT and their other names: first token, ITL, latency).
+LATENCY = re.compile(r"ttft|tpot|first_token|(?<![a-z])itl(?![a-z])|latency", re.IGNORECASE)
 LIMIT = re.compile(r"slo|thr|limit", re.IGNORECASE)
+#: ``max`` / ``min`` of a constant and a term named so: a TTFT floor (``max(450.0, k * idle)``).
+FLOOR_CONTEXT = re.compile(r"ttft|tpot|first_token|(?<![a-z])itl(?![a-z])|latency|idle|slo|floor", re.IGNORECASE)
+#: Shell scripts / YAML (campaign specs, drivers): an SLO value on a command line.
+SHELL_FLAG = re.compile(r"--(?:ttft|tpot)-[a-z0-9-]*-ms[ =]+[\"']?\d+(?:\.\d+)?")
 
-#: Rule 4 allow-lists (file -> why). LITERALS: an SLO-context number that is not an SLO
-#: definition. COMPARES: code that compares a TTFT / TPOT value with a threshold it got from
-#: tre_common.slo / the label (window-level or a diagnostic), not a request verdict of its own.
+#: Rule 4 allow-lists, exact: (file, hit) -> why; the scan must find exactly these. LITERALS: an
+#: SLO-context number that is not an SLO definition. COMPARES: code that compares a latency with a
+#: threshold it got from tre_common.slo / the label (window-level or a diagnostic), not a request
+#: verdict of its own. Not caught (documented limit): a number reaching a latency comparison
+#: through a variable whose name says nothing (``lim = 500; lat > lim`` is a COMPARES hit only
+#: when the variable is named like a limit).
 LITERALS = {
-    "controller/tre_controller/planning/safescale_evidence.py":
-        "NO_REGISTRY_TTFT_MS / _TPOT_MS: the last resort of a SafeScale construction without a registry "
-        "(tests / offline); the controller judges with the registry resolver",
-    "baselines/tre_baselines/tools/tokenscale_profile.py": "make_stub_measure: the dry run's stub latency model, not an SLO",
-    "common/tre_common/slo_labels.py":
-        "ABLATION_TTFT_*: the D6 ablation arm (k 3 / floor 150 ms, plan 2026-09-21 6.9h), a label column of the "
-        "10-03 design, not an SLO mode",
-    "deploy/scripts/calibration_design.py": "TTFT_SLO_MS / TPOT_SLO_MS: the 10-03 D6' design record (frozen calibration)",
+    ("baselines/tre_baselines/tools/tokenscale_profile.py", "def make_stub_measure(ttft_ms_per_c=30.0)"):
+        "the dry run's stub latency model, not an SLO",
+    ("calibration/tre_calibration/fit.py", "DEFAULT_SURPLUS_LATENCY_QUANTILE = 0.35"): "a quantile, not a latency",
+    ("common/tre_common/rediskeys.py", "SM_SLEEP_ACK_LATENCY_MAX = 5000"): "SM sleep-ack timeout (ms), not an SLO",
+    ("common/tre_common/slo_labels.py", "ABLATION_TTFT_FLOOR_MS = 150.0"):
+        "the D6 ablation arm (k 3 / floor 150 ms, plan 2026-09-21 6.9h): a label column of the 10-03 design",
+    ("common/tre_common/slo_labels.py", "ABLATION_TTFT_SLOWDOWN_K = 3.0"): "the D6 ablation arm (as above)",
+    ("deploy/scripts/calibration_design.py", "TTFT_SLO_MS = 500.0"):
+        "the frozen D-line design record (preregistered_parameters, calibration_ladder.check_label_args); "
+        "no verdict defaults to it (2026-11-04)",
+    ("deploy/scripts/calibration_design.py", "TPOT_SLO_MS = 75.0"): "the frozen D-line design record (as above)",
+    ("deploy/scripts/calibration_design.py", "{'median_p95_tpot_relative': 0.2}"): "sentinel drift tolerance (a ratio)",
+    ("eval/runner/selftest_bl_tools.py", "r['phases'][1]['release_latency_s'] == 4"): "offline self-test fixture",
+    ("eval/runner/selftest_bl_tools.py", "{'e2e_latency': 150.0}"): "offline self-test fixture",
+    ("eval/runner/selftest_bl_tools.py", "{'ttft': 0.1}"): "offline self-test fixture",
+    ("replayer/tre_replayer/run_trace.py", "StreamResult(first_token_ms=80.0)"): "dry-run synthetic response",
 }
 COMPARES = {
-    "common/tre_common/slo.py": "the implementation",
-    "controller/tre_controller/planning/safescale.py":
-        "SafeScale probe: window p95 against the resolver's thresholds (tre_common.slo; window-level, unchanged 2026-11-04)",
-    "baselines/tre_baselines/tools/tokenscale_profile.py": "TokenScale profile: a step's p95 against the label's thresholds",
-    "deploy/scripts/calibration_campaign.py": "10-03 capacity prior: a window p95 against the run's fixed thresholds",
-    "deploy/scripts/dline_refit.py": "D6' validation diagnostic: per-bucket TTFT attainment against LabelDefinition.ttft_slo_ms",
-    "deploy/scripts/openloop.py": "10-03 open-loop ladder goodput (fixed thresholds passed in by the caller; kept to reproduce)",
-    "replayer/tre_replayer/scoring.py": "v1-parity V_sys diagnostic (fixed + e2e)",
+    ("common/tre_common/slo.py", "float(ttft_ms) > ttft_thr"): "the implementation",
+    ("common/tre_common/slo.py", "np.nan_to_num(tpot, nan=0.0) > float(thresholds.tpot_ms)"): "the implementation",
+    ("common/tre_common/slo.py", "np.nan_to_num(ttft, nan=0.0) > thr"): "the implementation",
+    ("common/tre_common/slo.py", "tpot > thresholds.tpot_ms"): "the implementation",
+    ("controller/tre_controller/planning/safescale.py", "tpot > tpot_limit"):
+        "SafeScale probe: window p95 against the resolver's thresholds (window-level, unchanged 2026-11-04)",
+    ("controller/tre_controller/planning/safescale.py", "ttft > ttft_limit"): "SafeScale probe (as above)",
+    ("controller/tre_controller/planning/safescale.py", "tpot_p95_ms > thresholds['tpot_ms']"): "SafeScale probe (as above)",
+    ("controller/tre_controller/planning/safescale.py", "ttft_p95_ms > thresholds['ttft_ms']"): "SafeScale probe (as above)",
+    ("baselines/tre_baselines/tools/tokenscale_profile.py", "s.tpot_p95_ms <= tpot_slo_ms"):
+        "TokenScale profile: a step's p95 against the label's thresholds",
+    ("baselines/tre_baselines/tools/tokenscale_profile.py", "s.ttft_p95_ms <= ttft_slo_ms"): "TokenScale profile (as above)",
+    ("deploy/scripts/calibration_campaign.py", "p95_tpot <= tpot_slo_ms"):
+        "10-03 capacity prior: a window p95 against the run's fixed thresholds",
+    ("deploy/scripts/calibration_campaign.py", "p95_ttft <= ttft_slo_ms"): "10-03 capacity prior (as above)",
+    ("deploy/scripts/dline_refit.py", "ttft <= label.ttft_slo_ms(length)"):
+        "D6' validation diagnostic: per-bucket TTFT attainment against LabelDefinition.ttft_slo_ms",
+    ("deploy/scripts/openloop.py", "float(tpot) <= tpot_slo_ms"):
+        "10-03 open-loop ladder goodput (fixed thresholds passed in by the caller; kept to reproduce)",
+    ("deploy/scripts/openloop.py", "float(ttft) <= ttft_slo_ms"): "10-03 open-loop ladder goodput (as above)",
+    ("replayer/tre_replayer/scoring.py", "m['tpot_ms'] > tpot_slo_ms"): "v1-parity V_sys diagnostic (fixed + e2e)",
+    ("replayer/tre_replayer/scoring.py", "m['ttft_ms'] > ttft_slo_ms"): "v1-parity V_sys diagnostic (as above)",
 }
+#: Shell / YAML hits (file, hit) -> why: none.
+SHELL_FLAGS: dict[tuple[str, str], str] = {}
 
 
-def _number(node: ast.AST) -> bool:
+def _number(node: ast.AST, units: set = UNIT_NUMBERS) -> bool:
     return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
-            and not isinstance(node.value, bool) and abs(node.value) not in UNIT_NUMBERS
+            and not isinstance(node.value, bool) and abs(node.value) not in units
             and abs(node.value) >= 0.01)   # tolerances (1e-9) are not SLO values
+
+
+def _lat_number(node: ast.AST) -> bool:
+    return _number(node, LATENCY_UNIT_NUMBERS)
 
 
 def _named(node: ast.AST, rx: re.Pattern) -> bool:
@@ -109,69 +150,121 @@ def _named(node: ast.AST, rx: re.Pattern) -> bool:
     return bool(rx.search(ast.unparse(node)))
 
 
-def _literal_and_compare_hits(tree: ast.AST) -> tuple[set[str], set[str]]:
+def _signatures(trees) -> dict[str, list[list[str]]]:
+    """Callee simple name -> positional parameter names (functions, ``__init__`` without self,
+    dataclass-style fields), so ``f(m, 500.0, 75.0)`` is matched to ``f``'s parameter names."""
+    sig: dict[str, list[list[str]]] = {}
+    for tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                sig.setdefault(node.name, []).append([x.arg for x in node.args.posonlyargs + node.args.args])
+            elif isinstance(node, ast.ClassDef):
+                init = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
+                if init:
+                    sig.setdefault(node.name, []).append(
+                        [x.arg for x in init[0].args.posonlyargs + init[0].args.args][1:])
+                else:
+                    fields = [n.target.id for n in node.body
+                              if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)]
+                    if fields:
+                        sig.setdefault(node.name, []).append(fields)
+    return sig
+
+
+_MEMBERSHIP = (ast.In, ast.NotIn, ast.Is, ast.IsNot)
+
+
+def _literal_and_compare_hits(tree: ast.AST, sig: dict | None = None) -> tuple[set[str], set[str]]:
+    sig = sig if sig is not None else _signatures([tree])
     literals: set[str] = set()
     compares: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and _number(node.value):
+        if isinstance(node, ast.Assign) and _lat_number(node.value):
             for name in (n.id for t in node.targets for n in ast.walk(t) if isinstance(n, ast.Name)):
-                if TTFT_TPOT.search(name):
+                if LATENCY.search(name):
                     literals.add(f"{name} = {node.value.value}")
-        elif isinstance(node, ast.Compare):
+        elif isinstance(node, ast.Compare) and not any(isinstance(op, _MEMBERSHIP) for op in node.ops):
             ops = [node.left, *node.comparators]
-            if any(_named(o, TTFT_TPOT) for o in ops) and any(_number(o) for o in ops):
+            if any(_named(o, LATENCY) for o in ops) and any(_lat_number(o) for o in ops):
                 literals.add(ast.unparse(node)[:80])
-            elif (any(_named(o, TTFT_TPOT) and not _named(o, LIMIT) for o in ops)
+            elif (any(_named(o, LATENCY) and not _named(o, LIMIT) for o in ops)
                   and any(_named(o, LIMIT) for o in ops)):
                 compares.add(ast.unparse(node)[:80])
         elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Mult)):
-            if ((_named(node.left, TTFT_TPOT) and _number(node.right))
-                    or (_named(node.right, TTFT_TPOT) and _number(node.left))):
+            if ((_named(node.left, LATENCY) and _lat_number(node.right))
+                    or (_named(node.right, LATENCY) and _lat_number(node.left))):
                 literals.add(ast.unparse(node)[:80])
+        elif isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and isinstance(k.value, str) and LATENCY.search(k.value)
+                        and _lat_number(v)):
+                    literals.add(f"{{{k.value!r}: {v.value}}}")
         elif isinstance(node, ast.Call):
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
             if name == "add_argument":
                 flags = " ".join(a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str))
                 for kw in node.keywords:
-                    if kw.arg == "default" and _number(kw.value) and TTFT_TPOT.search(flags):
+                    if kw.arg == "default" and _lat_number(kw.value) and LATENCY.search(flags):
                         literals.add(f"add_argument({flags}, default={kw.value.value})")
             for kw in node.keywords:
-                if kw.arg and TTFT_TPOT.search(kw.arg) and _number(kw.value):
+                if kw.arg and LATENCY.search(kw.arg) and _lat_number(kw.value):
                     literals.add(f"{name}({kw.arg}={kw.value.value})")
+            if name in ("max", "min") and not node.keywords:
+                others = [a for a in node.args if not isinstance(a, ast.Constant)]
+                if any(_lat_number(a) for a in node.args) and any(_named(a, FLOOR_CONTEXT) for a in others):
+                    literals.add(ast.unparse(node)[:80])
+            for params in sig.get(name, ()):
+                for i, arg in enumerate(node.args):
+                    if i < len(params) and LATENCY.search(params[i]) and _lat_number(arg):
+                        literals.add(f"{name}(<{params[i]}>={arg.value})")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             a = node.args
             pos = a.posonlyargs + a.args
             pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults))
             pairs += [(x, d) for x, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
             for arg, default in pairs:
-                if TTFT_TPOT.search(arg.arg) and _number(default):
+                if LATENCY.search(arg.arg) and _lat_number(default):
                     literals.add(f"def {node.name}({arg.arg}={default.value})")
     return literals, compares
 
 
-def _scan_rule4() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    lit, cmp_ = {}, {}
-    for path in sorted(TRE.rglob("*.py")):
+def _shell_hits(text: str) -> set[str]:
+    return {m.group(0) for line in text.splitlines() if not line.lstrip().startswith("#")
+            for m in SHELL_FLAG.finditer(line)}
+
+
+def _scanned(pattern: str):
+    for path in sorted(TRE.rglob(pattern)):
         rel = path.relative_to(TRE).as_posix()
         if "/tests/" in rel or rel.startswith("docs/") or "/." in rel:
             continue
-        a, b = _literal_and_compare_hits(ast.parse(path.read_text(encoding="utf-8")))
-        if a:
-            lit[rel] = a
-        if b:
-            cmp_[rel] = b
-    return lit, cmp_
+        yield rel, path
+
+
+def _scan_rule4() -> tuple[set[tuple[str, str]], set[tuple[str, str]], set[tuple[str, str]]]:
+    trees = {rel: ast.parse(path.read_text(encoding="utf-8")) for rel, path in _scanned("*.py")}
+    sig = _signatures(trees.values())
+    lit: set[tuple[str, str]] = set()
+    cmp_: set[tuple[str, str]] = set()
+    for rel, tree in trees.items():
+        a, b = _literal_and_compare_hits(tree, sig)
+        lit |= {(rel, h) for h in a}
+        cmp_ |= {(rel, h) for h in b}
+    shell = {(rel, h) for pattern in ("*.sh", "*.yaml", "*.yml") for rel, path in _scanned(pattern)
+             for h in _shell_hits(path.read_text(encoding="utf-8", errors="replace"))}
+    return lit, cmp_, shell
 
 
 def test_no_slo_value_in_code_and_no_verdict_of_its_own() -> None:
-    lit, cmp_ = _scan_rule4()
-    new_lit = {f: sorted(h) for f, h in lit.items() if f not in LITERALS}
-    assert not new_lit, f"SLO values in code (read them from the registry through tre_common.slo): {new_lit}"
-    new_cmp = {f: sorted(h) for f, h in cmp_.items() if f not in COMPARES}
-    assert not new_cmp, (f"TTFT / TPOT compared with a threshold outside tre_common.slo (use judge_request / "
-                         f"violated_array, or justify in COMPARES): {new_cmp}")
-    stale = sorted((set(LITERALS) - set(lit)) | (set(COMPARES) - set(cmp_)))
+    lit, cmp_, shell = _scan_rule4()
+    assert not lit - set(LITERALS), (f"SLO values in code (read them from the registry through tre_common.slo, "
+                                     f"or justify the exact hit in LITERALS): {sorted(lit - set(LITERALS))}")
+    assert not cmp_ - set(COMPARES), (f"a latency compared with a threshold outside tre_common.slo (use "
+                                      f"judge_request / violated_array, or justify in COMPARES): "
+                                      f"{sorted(cmp_ - set(COMPARES))}")
+    assert not shell - set(SHELL_FLAGS), f"SLO values on a command line (read the registry): {sorted(shell - set(SHELL_FLAGS))}"
+    stale = sorted((set(LITERALS) - lit) | (set(COMPARES) - cmp_) | (set(SHELL_FLAGS) - shell))
     assert not stale, f"rule-4 allow-list entries that no longer match (remove them): {stale}"
 
 
@@ -183,12 +276,35 @@ def test_no_slo_value_in_code_and_no_verdict_of_its_own() -> None:
     ("f(model, ttft_p95_ms=500.0, tpot_p95_ms=75.0)", "literal"),  # dline_refit before 2026-11-04
     ("def g(rows, ttft_slo_ms=500.0):\n    pass", "literal"),
     ("NO_REGISTRY_TTFT_MS = 500.0", "literal"),
+    # review 2026-11-04: forms the first rule-4 scan missed
+    ("late = r['ttft'] > 0.5", "literal"),                        # seconds: 0.5 is 500 ms next to a latency
+    ("cfg = {'ttft_p95_ms': 500}", "literal"),                    # a dict literal
+    ("def f(model, ttft_slo_ms, tpot_slo_ms):\n    pass\nf(m, 500.0, 75.0)", "literal"),   # positional
+    ("late = first_token_ms > 450.0", "literal"),                 # other names of a latency
+    ("bad = itl_ms > 61.0", "literal"),
+    ("slow = latency_ms > 3000", "literal"),
+    ("thr = max(450.0, k * idle)", "literal"),                    # a TTFT floor
+    # not hits
     ("ms = ttft_s * 1000.0", None),                               # a unit
     ("ok = ttft_ms is not None", None),
+    ("half = width * 0.5", None),                                 # 0.5 away from a latency
+    ("ok = slo_key not in LATENCY_COLUMNS", None),                # membership
+    ("n = max(5, len(rows))", None),                              # max of a count
+    ("wide = title_len > 40", None),                              # "itl" inside a word
 ])
 def test_rule4_catches_the_inline_forms(source, kind) -> None:
     lit, cmp_ = _literal_and_compare_hits(ast.parse(source))
     assert (("literal" if lit else None) or ("compare" if cmp_ else None)) == kind, (lit, cmp_)
+
+
+@pytest.mark.parametrize("line, hit", [
+    ("python3 fit.py --ttft-p95-ms 500 --model m", True),         # run_alphafit_w10.sh before 2026-11-04
+    ("  --tpot-slo-ms=75.0 \\", True),
+    ("# --ttft-p95-ms 500 (comment)", False),
+    ("--ttft-slo-mode fixed", False),
+])
+def test_rule4_catches_slo_values_on_a_command_line(line, hit) -> None:
+    assert bool(_shell_hits(line)) is hit
 
 
 def _key(node: ast.AST):
@@ -268,14 +384,17 @@ def test_every_slo_field_has_a_reader_and_the_registry_writes_them() -> None:
             slo.slo_thresholds(block, "idle_multiple")
     # written: both repo registry files carry the switch (the live value) and complete blocks
     params = yaml.safe_load(yaml.safe_load(PARAMS.read_text(encoding="utf-8"))["data"]["registry.yaml"])
-    for raw in (yaml.safe_load(REGISTRY.read_text(encoding="utf-8")), params):
-        assert raw["slo_mode"] == "fixed"
+    repo = yaml.safe_load(REGISTRY.read_text(encoding="utf-8"))
+    assert repo["slo_mode"] == params["slo_mode"] and repo["slo_mode"] in slo.SLO_MODES   # one value, both files
+    for raw in (repo, params):
         assert slo.resolve_slo_mode(raw).source == "slo_mode"
         for model in raw["models"]:
             assert set(model["slo"]["idle_multiple"]) == set(slo.IDLE_MULTIPLE_FIELDS), model["name"]
     # read: every consumer of "the definition in force" asks the registry's switch
     readers = {
         "controller/tre_controller/config.py": "slo_mode_resolution()",
+        "controller/tre_controller/app.py": "registry.slo_mode()",
+        "deploy/scripts/r3_grid.py": "registry.slo_mode()",
         "eval/tre_eval/load.py": "resolve_slo_mode(",
         "eval/runner/score_pilot.py": "resolve_slo_mode(",
         "common/tre_common/slo_labels.py": '"slo_mode"',
@@ -351,3 +470,19 @@ def test_params_set_publishes_the_switch_and_the_idle_multiple_parameters() -> N
     assert ("registry", "slo_mode", None, "idle_multiple") in changes
     with pytest.raises(rp.ParamValidationError):
         rp.apply_and_validate(text, rp.parse_sets(["slo_mode=median"], names))
+
+
+def test_offline_label_tools_follow_the_switch_or_name_the_mode(tmp_path) -> None:
+    """S2 (review 2026-11-04): r3_grid labels under the loaded registry's slo_mode; the fit tools whose
+    output is compared with a frozen record (D6' reproductions) require --ttft-slo-mode."""
+    from types import SimpleNamespace
+
+    from scripts import r3_grid
+
+    for mode in ("fixed", "slowdown"):
+        reg = load_registry(str(_registry_file(tmp_path, mode)))
+        args = SimpleNamespace(ttft_slo_ms=None, tpot_slo_ms=None, registry_slo_mode=reg.slo_mode())
+        assert r3_grid.primary_label(args, reg.model("dsqwen-7b")).ttft_slo_mode == mode
+    for rel in ("deploy/scripts/rewindow_from_raw.py", "deploy/scripts/refit_trs_params.py",
+                "deploy/scripts/theta_verdict.py", "deploy/scripts/alpha_fit.py"):
+        assert "require_mode=True" in (TRE / rel).read_text(encoding="utf-8"), rel
