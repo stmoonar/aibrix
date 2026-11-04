@@ -98,18 +98,40 @@ def test_ceil_rounds_up():
     assert d.inputs["term_buckets"] > 6.3 and d.desired == 7  # 14/6 + 2 + 2 = 6.33
 
 
-def test_lambda_counts_the_represented_output_of_the_landing_bucket():
-    """lambda' = true input + the output of the calibration point of the bucket the request
-    lands in after misbucketing (v1 D47 / D66), never its true output."""
+def test_a_request_left_in_its_bucket_counts_its_own_max_tokens():
+    """lambda' = true input + the request's own max_tokens when the simulated error leaves it
+    in its bucket (user 2026-11-04), not the bucket's calibration output."""
     d = _policy().decide(_snap(100_000, [_ev(99_000, 60, 30), _ev(99_000, 60, 45)]))[M]
-    assert d.inputs["lambda_b"]["00"] == 2 * (60 + 20) / 10  # centre out 20, true 30 / 45
-    assert d.inputs["term_true_out"] == round((90 + 105) / 10 / 7, 4)
+    assert d.inputs["lambda_b"]["00"] == (60 + 30 + 60 + 45) / 10  # centre out 20 is not used
+    assert d.inputs["term_buckets"] == d.inputs["term_own_out"] == d.inputs["term_true_out"] == round(195 / 10 / 7, 4)
+    assert d.inputs["term_misbucketed"] == 0.0 and d.inputs["missing_out_window"] == 0
+
+
+def test_a_misbucketed_request_counts_the_represented_output_of_its_landing_bucket():
+    """The predictor's wrong answer: the output of the landing bucket's calibration point, and
+    that bucket's V_b (v1 D47 / D66)."""
     moved = _policy(misbucket_rate=1.0).decide(_snap(100_000, [_ev(99_000, 60, 30) for _ in range(50)]))[M]
     lam = moved.inputs["lambda_b"]
     assert moved.inputs["misbucketed"] == 50 and lam["00"] == 0.0
     n01, n02 = moved.inputs["events_b"]["01"], moved.inputs["events_b"]["02"]
     assert n01 + n02 == 50 and n01 > 0 and n02 > 0
     assert lam["01"] == n01 * (60 + 70) / 10 and lam["02"] == n02 * (60 + 200) / 10
+    assert moved.inputs["term_own_out"] == 0.0
+    want = (n01 * 130 + n02 * 260) / 10 / BIG
+    assert moved.inputs["term_misbucketed"] == pytest.approx(want, abs=1e-4)
+    assert moved.inputs["term_buckets"] == pytest.approx(want, abs=1e-4)
+
+
+def test_own_and_misbucketed_parts_add_up_at_the_paper_rate():
+    """15 % of a large sample is misbucketed (the same hash draw); the logged parts sum to the term."""
+    evs = [_ev(99_000, 60, 30 + i % 15) for i in range(2000)]
+    d = _policy(misbucket_rate=0.15, seed=7).decide(_snap(100_000, evs))[M]
+    assert 0.13 < d.inputs["misbucketed"] / 2000 < 0.17
+    assert d.inputs["term_buckets"] == pytest.approx(d.inputs["term_own_out"] + d.inputs["term_misbucketed"], abs=2e-4)
+    # the requests left in bucket 00 count their own outputs (30..44), never the centre 20
+    n00 = d.inputs["events_b"]["00"]
+    assert n00 == 2000 - d.inputs["misbucketed"]
+    assert n00 * (60 + 30) / 10 < d.inputs["lambda_b"]["00"] < n00 * (60 + 44) / 10
 
 
 @pytest.mark.parametrize("tin,b_in", [(255, 0), (256, 1), (1023, 1), (1024, 2), (8192, 2), (16310, 2)])
@@ -170,10 +192,16 @@ def test_reissue_skipped_and_other_kinds_ignored():
     assert d2.inputs["events"] == 1
 
 
-def test_missing_max_tokens_uses_default():
-    d = _policy(default_out_tokens=80).decide(_snap(100_000, [_ev(99_000, 50, None)]))[M]
-    assert d.inputs["missing_out"] == 1
-    assert d.inputs["lambda_b"]["01"] == (50 + 70) / 10  # out 80 -> output bucket 1, counted at its centre 70
+def test_missing_or_invalid_max_tokens_falls_back_to_the_bucket_centre_and_is_counted():
+    p = _policy(default_out_tokens=80)
+    d = p.decide(_snap(100_000, [_ev(99_000, 50, None), _ev(99_000, 50, 0), _ev(99_000, 50, -5)]))[M]
+    assert d.inputs["missing_out"] == 3 and d.inputs["missing_out_window"] == 3
+    # out 80 -> output bucket 1, counted at its centre 70 (not 80, not the request's 0 / -5)
+    assert d.inputs["lambda_b"]["01"] == 3 * (50 + 70) / 10
+    assert d.inputs["term_own_out"] == d.inputs["term_misbucketed"] == 0.0 < d.inputs["term_buckets"]
+    # still in the window on the next tick, no new arrivals
+    d2 = p.decide(_snap(101_000))[M]
+    assert d2.inputs["missing_out"] == 0 and d2.inputs["missing_out_window"] == 3
 
 
 def test_rate_zero_never_misbuckets():

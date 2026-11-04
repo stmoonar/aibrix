@@ -166,8 +166,10 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
   <ladder profile> --write` and `... preserve --mu <mu.yaml> --write` render the whole policy block of
   `deploy/baselines/tre/policy-configmaps.yaml` from the calibration outputs (input sha256 in the header);
   until then the blocks say `calibration: pending` and the policies refuse to start (`--pending` renders that).
-- TokenScale: no V_P (v1 D51); lambda' per cell = true input + the cell's represented output after the
-  simulated 15 % misbucketing, drawn from `hash(seed, model, client request id)` (`x-tre-request-id`, carried by
+- TokenScale: no V_P (v1 D51); lambda' per cell = true input + output, where the output is the request's own
+  `max_tokens`, or, for the 15 % the simulated error misbuckets (and for a request without a valid
+  `max_tokens`), the landing cell's represented output (user 2026-11-04; v1 counted the represented output for
+  every request); the misbucketing is drawn from `hash(seed, model, client request id)` (`x-tre-request-id`, carried by
   the gateway's bl events as `client_id`; a sidecar reissue keeps it, so a reissue lands in the same cell).
 - PreServe: `window_s` 10 (2026-11-03; 30 before, v1 D18); mu = variant B of `velocity_ladder mu`: cells whose P share lies in the
   traces' pooled 30 s window share **[p5, p95]** (deviation from v1's [min, max], recorded in the output:

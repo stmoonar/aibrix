@@ -10,11 +10,18 @@ pools; TRE serves colocated replicas, so one velocity per bucket counts both pha
   ``< 256`` / ``< 1024`` / else (an input above 8192 is long too), output ``< 100`` / ``< 350``
   / ``>= 350`` (``bucket_edges`` as inclusive integer upper bounds ``in [255, 1023]``,
   ``out [99, 349]``; decision 2026-10-26);
-* ``lambda'_b``: (input + output) token arrival rate of bucket ``b`` over a sliding window,
-  where the output part is the **represented output** of the bucket the request lands in
-  after the simulated length-prediction error (the output of that bucket's calibration point
-  ``bucket_centers``), not the request's true length (v1 D47 / D66: the output is a
-  prediction at arrival in the paper); the input part is the true counted input;
+* ``lambda'_b``: (input + output) token arrival rate of bucket ``b`` over a sliding window.
+  The input part is the true counted input. The output part (user 2026-11-04; v1 D47 / D66
+  counted the bucket's output for every request) is:
+
+  - a request the simulated length-prediction error leaves in its bucket (1 -
+    ``misbucket_rate``): its own ``max_tokens``;
+  - a misbucketed request: the **represented output** of the bucket it lands in (the output
+    of that bucket's calibration point ``bucket_centers``), the predictor's wrong answer;
+  - a request without a valid ``max_tokens`` (missing or <= 0): the represented output of
+    its bucket (counted, ``missing_out`` / ``missing_out_window``).
+
+  The bucket still picks ``V_b`` (after misbucketing) and counts the input;
 * ``V_b``: the profiled (in+out) token velocity of bucket ``b`` at its calibration point,
   the peak of full steps (v1 D53, ``tools/velocity_ladder``). There is no prefill term:
   ``lambda_in / V_P`` won none of ~3100 v1 decisions and was dropped (v1 D51).
@@ -54,13 +61,15 @@ key                          default     meaning
                                          calibration point (mean (in, out) of the campaign's
                                          requests in it, ``tools/tokenscale_buckets``); must
                                          lie in its own bucket. Its output is what
-                                         ``lambda'`` counts. ours (v1 D49)
+                                         ``lambda'`` counts for a misbucketed request or
+                                         one without ``max_tokens``. ours (v1 D49)
 ``models``                   None        restrict the managed models (others: no Decision);
                                          default = every model in ``config.models``.
 ``out_len_source``           max_tokens  the true output that picks the bucket before the
                                          simulated error; only ``max_tokens``. ours
-``default_out_tokens``       256         out_len when an event lacks ``max_tokens`` (counted
-                                         as ``missing_out``). ours
+``default_out_tokens``       256         out_len that picks the bucket when an event lacks a
+                                         valid ``max_tokens`` (missing or <= 0; counted as
+                                         ``missing_out``). ours
 ``misbucket_rate``           0.15        P(output bucket replaced by a uniformly random
                                          different one); paper evaluates with an 85 %
                                          accurate length predictor.
@@ -79,9 +88,13 @@ are estimates (inaccurate for Chinese text). A stalled event stream needs no tim
 own: requests the engines run but the stream does not show are an ``event_gap``.
 
 Logged per decision (``inputs``): ``lambda_b`` (lambda'), ``term_buckets`` (the sum),
+``term_own_out`` / ``term_misbucketed`` (the parts of the sum from requests counted with their
+own ``max_tokens`` / from misbucketed requests; the rest comes from the
+``missing_out_window`` requests: in the window, no valid ``max_tokens``, not misbucketed),
 ``term_true_out`` (the same sum with each request's true output and true bucket, for
-disclosure of the predictor's effect), ``misbucketed`` (this tick), ``no_client_id`` (arrivals
-whose draw fell back to the gateway id).
+disclosure of the predictor's effect), ``misbucketed`` / ``missing_out`` (arrivals of this
+tick; ``missing_out`` includes misbucketed ones), ``no_client_id`` (arrivals whose draw fell
+back to the gateway id).
 """
 from __future__ import annotations
 
@@ -113,6 +126,15 @@ class _Ev:
     #: output bucket after the simulated error (the one lambda' counts in)
     b_out: int
     estimate: bool
+    #: output tokens lambda' counts and why: OWN (max_tokens), MISBUCKETED or MISSING_OUT
+    #: (both the represented output of ``(b_in, b_out)``)
+    out_counted: float
+    out_src: str
+
+
+OWN = "own"
+MISBUCKETED = "misbucketed"
+MISSING_OUT = "missing_out"
 
 
 def _bucket_index(x: float, edges: tuple[float, float]) -> int:
@@ -286,7 +308,8 @@ class TokenScalePolicy:
         return out
 
     def represented_out(self, model: str, b_in: int, b_out: int) -> float:
-        """Output tokens lambda' counts for a request in bucket (b_in, b_out)."""
+        """Output of the calibration point of bucket (b_in, b_out): what lambda' counts for a
+        misbucketed request or one without a valid ``max_tokens``."""
         return self._centers[model][b_in][b_out][1]
 
     def _ingest(self, model: str, ms: ModelSnapshot) -> tuple[int, int, int, int]:
@@ -306,11 +329,12 @@ class TokenScalePolicy:
                 self._skipped_missing_in[model] += 1
                 self._missing_in[model].append(int(ev.ts_ms))
                 continue
-            if ev.max_tokens is None:
+            has_out = _pos(ev.max_tokens)
+            if has_out:
+                out_len = int(ev.max_tokens)
+            else:
                 out_len = self.default_out_tokens
                 n_missing += 1
-            else:
-                out_len = int(ev.max_tokens)
             if not ev.client_id:
                 n_no_id += 1
                 self._counts[model]["no_client_id"] += 1
@@ -318,7 +342,14 @@ class TokenScalePolicy:
             b_true = _bucket_index(out_len, edges_out)
             b_out, moved = misbucket(b_true, self.misbucket_rate, self.seed, model, ev.draw_key)
             n_mis += moved
-            win.append(_Ev(ev.ts_ms, int(ev.in_tokens), out_len, b_true, b_in, b_out, ev.in_src not in ("header", "token_ids")))
+            if moved:
+                out_counted, out_src = self.represented_out(model, b_in, b_out), MISBUCKETED
+            elif has_out:
+                out_counted, out_src = float(out_len), OWN
+            else:
+                out_counted, out_src = self.represented_out(model, b_in, b_out), MISSING_OUT
+            win.append(_Ev(ev.ts_ms, int(ev.in_tokens), out_len, b_true, b_in, b_out,
+                           ev.in_src not in ("header", "token_ids"), out_counted, out_src))
             n_new += 1
         return n_new, n_missing, n_mis, n_no_id
 
@@ -344,14 +375,18 @@ class TokenScalePolicy:
         lam = [[0.0] * N_OUT for _ in range(N_IN)]
         lam_true = [[0.0] * N_OUT for _ in range(N_IN)]
         trusted_term = 0.0
-        n_est = n_mis_win = 0
+        term_src = {OWN: 0.0, MISBUCKETED: 0.0, MISSING_OUT: 0.0}
+        n_est = n_mis_win = n_missing_win = 0
         for e in win:
-            lam[e.b_in][e.b_out] += e.in_tokens + self.represented_out(model, e.b_in, e.b_out)
+            lam[e.b_in][e.b_out] += e.in_tokens + e.out_counted
             lam_true[e.b_in][e.b_out_true] += e.in_tokens + e.out_len
+            part = (e.in_tokens + e.out_counted) / grid[e.b_in][e.b_out] / self.window_s
+            term_src[e.out_src] += part
             if not e.estimate:
-                trusted_term += (e.in_tokens + self.represented_out(model, e.b_in, e.b_out)) / grid[e.b_in][e.b_out] / self.window_s
+                trusted_term += part
             n_est += e.estimate
             n_mis_win += e.b_out != e.b_out_true
+            n_missing_win += e.out_src == MISSING_OUT
         w = self.window_s
         lam = [[x / w for x in row] for row in lam]
         term_b = sum(lam[i][j] / grid[i][j] for i in range(N_IN) for j in range(N_OUT))
@@ -362,6 +397,8 @@ class TokenScalePolicy:
         inputs: dict[str, Any] = {
             "lambda_b": {f"{i}{j}": round(lam[i][j], 3) for i in range(N_IN) for j in range(N_OUT)},
             "term_buckets": round(term_b, 4),
+            "term_own_out": round(term_src[OWN], 4),
+            "term_misbucketed": round(term_src[MISBUCKETED], 4),
             "term_true_out": round(term_true, 4),
             "window_s": w,
             "events": len(win),
@@ -371,6 +408,7 @@ class TokenScalePolicy:
             "skipped_reissue": self._skipped_reissue[model],
             "skipped_missing_in": self._skipped_missing_in[model],
             "missing_out": n_missing,
+            "missing_out_window": n_missing_win,
             "misbucketed": n_mis,
             "misbucketed_window": n_mis_win,
             "no_client_id": n_no_id,
