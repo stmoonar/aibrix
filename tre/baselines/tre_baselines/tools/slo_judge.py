@@ -106,9 +106,7 @@ def unified_slo(model: str, registry: Any, mode: Optional[str] = None) -> LabelD
         from tre_common.registry import load_registry
 
         registry = load_registry(registry)
-    spec = registry.model(model).slo
-    return label_def_for_model(model, mode=mode or registry.slo_mode(), tpot_p95_ms=spec.tpot_p95_ms,
-                               ttft_p95_ms=spec.ttft_p95_ms, registry=registry)
+    return label_def_for_model(model, mode=mode or registry.slo_mode(), registry=registry)
 
 
 def slo_record(slo: LabelDefinition, registry_mode: Optional[str] = None) -> Dict[str, Any]:

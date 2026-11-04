@@ -877,7 +877,7 @@ def label_for(model: str, arm: str, registry: Optional[str] = None,
                              "(branch calib/next-20261005)")
         extra["attribution"] = attribution
     primary = slo_labels.label_def_for_model(
-        model, ttft_p95_ms=500.0, tpot_p95_ms=75.0, mode=slo_labels.D6_PRIME_MODE, registry=registry, **extra)
+        model, mode=slo_labels.D6_PRIME_MODE, registry=registry, **extra)   # fixed values: the registry's
     if arm == "primary":
         return primary
     arms = slo_labels.label_arms(primary)

@@ -634,6 +634,12 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
                 guard = _read_json(guard_path)
                 ttft = ttft or guard.get("ttft_slo_ms")
                 tpot = tpot or guard.get("tpot_slo_ms")
+    def fixed_slo() -> tuple[float, float]:
+        """Neither the overrides, the plan nor a guard recorded the fixed SLO: the label
+        registry's (no SLO value is written here)."""
+        return slo_labels.registry_fixed_slo_ms(
+            overrides.get("label_registry") or Path(__file__).resolve().parents[1] / "registry.yaml")
+
     # The dataset's windows are revision 2's whatever the run itself used online; what
     # the run used is kept for the parity check against its online CSVs.
     numerator = str(overrides.get("numerator") or l3.NUMERATOR_GATEWAY)
@@ -660,8 +666,8 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
         online_step_ms=None if step_ms is None else int(step_ms),
         online_window_align=str(online_align or rewindow_from_raw.WINDOW_ALIGN_NONE),
         online_label=online_label,
-        ttft_slo_ms=float(overrides.get("ttft_slo_ms") or ttft or 500.0),
-        tpot_slo_ms=float(overrides.get("tpot_slo_ms") or tpot or 75.0),
+        ttft_slo_ms=float(overrides.get("ttft_slo_ms") or ttft or fixed_slo()[0]),
+        tpot_slo_ms=float(overrides.get("tpot_slo_ms") or tpot or fixed_slo()[1]),
         min_latency_samples=int(overrides.get("min_latency_samples") or 10),
         percentile_mode=str(overrides.get("percentile_mode") or "bucket_upper"),
         registry_path=Path(

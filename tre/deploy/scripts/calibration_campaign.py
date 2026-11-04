@@ -2601,15 +2601,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--instant-sample-ms", type=int, default=1000)
     ap.add_argument("--cooldown-s", type=float, default=DEFAULT_COOLDOWN_S)
     ap.add_argument("--step-transient-s", type=float, default=DEFAULT_STEP_TRANSIENT_S)
-    ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
-    ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
+    ap.add_argument("--ttft-slo-ms", type=float, default=None, help="default: the registry's slo.ttft_p95_ms")
+    ap.add_argument("--tpot-slo-ms", type=float, default=None, help="default: the registry's slo.tpot_p95_ms")
     ap.add_argument("--fit-ttft-slo-mode", choices=["fixed", "slowdown"], default=DEFAULT_FIT_TTFT_SLO_MODE,
                     help="TTFT SLO of the fit label: slowdown = max(floor, k*(c_m+b_m*L)) with the "
                          "registry's idle TTFT fit (plan 6.9h); fixed = --ttft-slo-ms")
     ap.add_argument("--fit-ttft-slowdown-k", type=float, default=None,
-                    help="default: registry slo.ttft_slowdown_k (5, D6'); 3 = the D6 ablation arm")
+                    help="default: registry slo.ttft_slowdown_k (D6'); 3 = the D6 ablation arm")
     ap.add_argument("--fit-ttft-floor-ms", type=float, default=None,
-                    help="default: registry slo.ttft_floor_ms (500 ms, D6'); 150 = the D6 ablation arm")
+                    help="default: registry slo.ttft_floor_ms (D6'); 150 = the D6 ablation arm")
     ap.add_argument("--fit-min-completed-requests", type=int, default=20)
     ap.add_argument("--fit-label-attribution", choices=list(slo_labels.ATTRIBUTIONS), default=None,
                     help="request-to-window attribution of the fit / probe label: completion "
@@ -2848,6 +2848,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    slo_labels.fill_fixed_slo_args(args, [m for m in args.models.split(",") if m], registry=args.registry)
     if args.gateway_url:
         try:
             corpus_record.check_gateway_url(args.gateway_url, args.api)

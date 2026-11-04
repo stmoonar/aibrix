@@ -156,24 +156,13 @@ def _slo_definition(model: str, spec: Any, registry: Registry, *, strict: bool) 
     that actuates refuses to start (``strict``): it would judge requests by a different SLO
     than the other arms. A dry-run shell warns and falls back to the fixed arm."""
     try:
-        return label_def_for_model(
-            model,
-            ttft_p95_ms=spec.slo.ttft_p95_ms,
-            tpot_p95_ms=spec.slo.tpot_p95_ms,
-            registry=registry,
-        )
+        return label_def_for_model(model, registry=registry)   # every value the registry's
     except (SystemExit, ValueError) as exc:
         if strict:
             raise ValueError(f"model {model}: no {registry.slo_mode()} SLO ({exc}); the registry needs the "
                              "mode's models[].slo parameters (dry-run falls back)") from None
         LOG.warning("model %s: %s SLO unavailable (%s); dry-run: using the fixed arm", model, registry.slo_mode(), exc)
-        return label_def_for_model(
-            model,
-            ttft_p95_ms=spec.slo.ttft_p95_ms,
-            tpot_p95_ms=spec.slo.tpot_p95_ms,
-            mode=TTFT_SLO_MODE_FIXED,
-            registry=registry,
-        )
+        return label_def_for_model(model, mode=TTFT_SLO_MODE_FIXED, registry=registry)
 
 
 def model_limits(registry: Registry, only: Optional[set[str]] = None, *, strict: bool = True) -> dict[str, ModelLimits]:
