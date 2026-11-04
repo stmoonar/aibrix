@@ -20,14 +20,11 @@ from tre_controller.planning.safescale_direct import (
 )
 from tre_common.persistence import span_reaches
 from tre_controller.planning.safescale_evidence import (
-    NO_REGISTRY_TPOT_MS,
-    NO_REGISTRY_TTFT_MS,
     EvidenceSource,
     EvidenceWindow,
     HideAnchor,
     ThresholdResolver,
     anchor_reference_ms,
-    config_thresholds,
     log_clock_skew_alert,
 )
 from tre_controller.store.evidence_grid import EvidenceGrid
@@ -296,7 +293,7 @@ class SafeScaleStateMachine:
         config: SafeScaleConfig,
         store: ProbeStore | None = None,
         evidence: EvidenceSource | None = None,
-        thresholds: ThresholdResolver | None = None,
+        thresholds: ThresholdResolver,
         wall_clock_ms: Callable[[], int] | None = None,
         remaining_pods: Callable[[str, tuple[str, ...]], Collection[str] | None] | None = None,
         grid: EvidenceGrid | None = None,
@@ -306,8 +303,9 @@ class SafeScaleStateMachine:
         latency part of the commit gate to the post-hide evidence window (2026-09-29);
         without it (direct constructions / offline replays) the gate reads the tail of
         the snapshot observations as before. ``thresholds`` resolves the per-model
-        latency thresholds from the registry (``RegistryThresholds``); without it the
-        config values (or 500 / 75 ms) apply. ``remaining_pods(model, probe_pods)`` = the
+        latency thresholds (required, 2026-11-04: the controller passes ``RegistryThresholds``;
+        offline replays and tests ``StaticThresholds`` with their own values - there is no
+        built-in threshold). ``remaining_pods(model, probe_pods)`` = the
         model's awake, not hidden pods minus the probe pods of a FRESH cluster view (None
         without one): the pods a Redis-mode commit needs evidence of; not wired = no
         Redis-mode commit.
@@ -1859,19 +1857,8 @@ class SafeScaleStateMachine:
         return self._post_hide_start(probe)
 
     def _thresholds_for(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
-        if self._thresholds is not None:
-            try:
-                return self._thresholds.resolve(model, mean_prompt_tokens)
-            except Exception:  # noqa: BLE001 - the registry's fixed values are the documented fallback
-                LOG.warning("safescale thresholds of %s failed; using the registry's fixed values", model,
-                            exc_info=True)
-                fixed = getattr(self._thresholds, "fixed_record", None)
-                if fixed is not None:
-                    try:
-                        return fixed(model, mean_prompt_tokens)
-                    except Exception:  # noqa: BLE001 - last resort: the config values
-                        LOG.warning("safescale fixed thresholds of %s failed", model, exc_info=True)
-        return config_thresholds(self._config, mean_prompt_tokens)
+        # Fail closed (2026-11-04): a resolver error propagates - no fallback threshold.
+        return self._thresholds.resolve(model, mean_prompt_tokens)
 
     def _wall_ms(self) -> int | None:
         try:
@@ -2372,8 +2359,6 @@ def _summarize_tail(
     probe: SafeScaleProbe,
     *,
     hq: float,
-    ttft_p95_slo_ms: float | None = None,
-    tpot_p95_slo_ms: float | None = None,
     thresholds: Callable[[ProbeObservation], dict[str, Any]] | None = None,
     judge_latency: bool = True,
     hide_ts_ms: int | None = None,
@@ -2386,7 +2371,7 @@ def _summarize_tail(
     :attr:`ProbeObservation.tail_start_ms` to the window end, at most one window): its
     raw Z, traffic, the remaining pods' time-weighted KV-cache fill and - with
     ``judge_latency`` (no evidence source) - its latency p95s against
-    ``thresholds(observation)`` or the fixed ``*_slo_ms`` values. ``evidence_ok``: no
+    ``thresholds(observation)`` (required then: no built-in threshold). ``evidence_ok``: no
     traffic, at least ``min_requests`` requests completed in the tail, or a tail that is
     the whole window (one metrics window of post-hide evidence: the planner's unit). A snapshot
     without a tail asked (offline / direct constructions) is judged on its whole window
@@ -2410,13 +2395,10 @@ def _summarize_tail(
         ttft, tpot, start = newest.ttft_p95_ms, newest.tpot_p95_ms, newest.window_start_ms
     latency_ok = True
     if judge_latency:
-        if thresholds is not None:
-            limits = thresholds(newest)
-            ttft_limit, tpot_limit = limits["ttft_ms"], limits["tpot_ms"]
-        else:
-            # No resolver (direct constructions only): the explicit values, else the no-registry ones.
-            ttft_limit = NO_REGISTRY_TTFT_MS if ttft_p95_slo_ms is None else ttft_p95_slo_ms
-            tpot_limit = NO_REGISTRY_TPOT_MS if tpot_p95_slo_ms is None else tpot_p95_slo_ms
+        if thresholds is None:
+            raise ValueError("_summarize_tail(judge_latency=True) needs thresholds (no built-in threshold)")
+        limits = thresholds(newest)
+        ttft_limit, tpot_limit = limits["ttft_ms"], limits["tpot_ms"]
         if ttft is not None and ttft > ttft_limit:
             latency_ok = False
         if tpot is not None and tpot > tpot_limit:

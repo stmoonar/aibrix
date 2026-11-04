@@ -20,6 +20,7 @@ import yaml
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import SafeScaleRegistryConfig, load_registry, parse_safescale_config
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -181,7 +182,7 @@ class Harness:
         self.obs_kwargs: dict = {}
 
     def _machine(self, cfg):
-        return SafeScaleStateMachine(config=_cfg(**cfg), store=self.store, evidence=self.evidence,
+        return SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(**cfg), store=self.store, evidence=self.evidence,
                                      wall_clock_ms=self.clock)
 
     def _collector(self, machine):
@@ -482,7 +483,7 @@ def test_direct_mode_never_reads_the_redis_evidence_and_works_without_a_reader()
     assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:no_baseline"
     # No Redis evidence reader at all: the direct path decides the same way.
     bare = Harness()
-    bare.machine = SafeScaleStateMachine(config=_cfg(), evidence=None, wall_clock_ms=bare.clock)
+    bare.machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), evidence=None, wall_clock_ms=bare.clock)
     bare.collector = bare._collector(bare.machine)
     bare.start()
     at, decision = bare.run_until(HIDE + W, serve=5)[-1]
@@ -579,6 +580,7 @@ def test_a_restarted_controller_resumes_from_the_persisted_baseline() -> None:
     record = json.loads(json.dumps(store.records[probe.request_id]))  # through JSON, as Redis
     assert set(record["direct_evidence"]) >= {"baseline", "baseline_ts_ms", "scrapes"}
     restored = SafeScaleStateMachine(
+        thresholds=STATIC_500_75,
         config=_cfg(), store=FakeProbeStore(unresolved=[record], journal=store.journal),
         evidence=h.evidence, wall_clock_ms=h.clock,
     )

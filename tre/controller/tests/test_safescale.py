@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from safescale_thresholds import STATIC_1000_100, STATIC_500_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.safescale import (
     ProbeObservation,
@@ -38,8 +39,6 @@ class FakeProbeStore:
 
 def _cfg() -> SafeScaleConfig:
     return SafeScaleConfig(
-        ttft_p95_slo_ms=1000.0,
-        tpot_p95_slo_ms=100.0,
         min_window_ms=60_000.0,
         hq=0.5,
         tau_low=1.0,
@@ -60,7 +59,7 @@ def _healthy_observation(ts_ms: int = 61_000) -> ProbeObservation:
 
 def test_safescale_starts_probe_and_persists_hidden_pods() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
 
     decision = machine.start_probe(
         model="donor",
@@ -83,7 +82,7 @@ def test_safescale_starts_probe_and_persists_hidden_pods() -> None:
 
 def test_safescale_rolls_back_immediately_on_slo_violation() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=1_000)
 
     decision = machine.observe(
@@ -123,7 +122,7 @@ def test_safescale_rolls_back_immediately_on_slo_violation() -> None:
 
 def test_safescale_commits_after_deadline_when_tail_is_healthy() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=1_000, pending_upscales={"receiver": 1})
     assert machine.observe("donor", _healthy_observation(ts_ms=20_000), now_ms=20_000).status == "probing"
 
@@ -152,7 +151,7 @@ def test_safescale_commits_after_deadline_when_tail_is_healthy() -> None:
 
 
 def test_safescale_rolls_back_at_deadline_when_tail_health_fails() -> None:
-    machine = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore())
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=FakeProbeStore())
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=1_000)
 
     decision = machine.observe(
@@ -202,7 +201,7 @@ def test_safescale_restores_unresolved_probe_and_commits() -> None:
         ]
     }
     store = FakeProbeStore(unresolved=unresolved, journal=journal)
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
 
     assert machine.restore() == 1
     decision = machine.observe("donor", _healthy_observation(ts_ms=61_000), now_ms=61_000)
@@ -246,7 +245,7 @@ def test_safescale_restored_tail_blocks_commit_on_prior_latency_violation() -> N
         ]
     }
     store = FakeProbeStore(unresolved=unresolved, journal=journal)
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
     assert machine.restore() == 1
 
     decision = machine.observe("donor", _healthy_observation(ts_ms=61_000), now_ms=61_000)
@@ -312,7 +311,7 @@ def test_window_has_no_upper_cap() -> None:
 
 def test_start_probe_uses_the_adaptive_window_and_persists_its_terms() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=_V1_CFG, store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_V1_CFG, store=store)
 
     decision = machine.start_probe(
         model="donor", pods=("pod-a",), now_ms=1_000, window_inputs=_inputs(p95_e2e_ms=45_000.0)
@@ -331,6 +330,7 @@ def test_start_probe_uses_the_adaptive_window_and_persists_its_terms() -> None:
     )
 
     restored = SafeScaleStateMachine(
+        thresholds=STATIC_500_75,
         config=_V1_CFG, store=FakeProbeStore(unresolved=[record])
     )
     assert restored.restore() == 1
@@ -382,7 +382,7 @@ def _gw(ts_ms: int, requests: float, errors: float, **kw) -> ProbeObservation:
 
 def test_donor_health_rolls_back_on_gateway_error_ratio_since_probe_start() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
 
     # Baseline taken at the first observation: errors before the probe never count.
@@ -405,7 +405,7 @@ def test_donor_health_rolls_back_on_gateway_error_ratio_since_probe_start() -> N
 
 
 def test_donor_health_fails_open_without_counters_and_rebaselines_after_reset() -> None:
-    machine = SafeScaleStateMachine(config=_cfg())
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg())
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
     assert machine.observe("donor", _gw(2_000, None, None), now_ms=2_000).reason == "probe_pending"
     assert machine.active_probe("donor").gateway_baseline is None
@@ -416,7 +416,7 @@ def test_donor_health_fails_open_without_counters_and_rebaselines_after_reset() 
 
 
 def test_commit_gate_records_donor_health_alongside_gate_failures() -> None:
-    machine = SafeScaleStateMachine(config=_cfg())
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg())
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
     machine.observe("donor", _gw(2_000, 1_000, 0), now_ms=2_000)
     decision = machine.observe("donor", _gw(61_000, 1_500, 1), now_ms=61_000)
@@ -430,7 +430,7 @@ def test_commit_gate_records_donor_health_alongside_gate_failures() -> None:
 def test_rollback_hold_follows_evidence_not_time() -> None:
     # Timer cleanup (2026-10-02): no fixed backoff - a capacity rollback holds until the
     # signal beats the probe's start.
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0,
                         window_inputs=ProbeWindowInputs(z_m=1.5, routable_pods=3))
     machine.observe("donor", _gw(1_000, 0, 0, ttft_p95_ms=5_000.0), now_ms=1_000)
@@ -453,7 +453,7 @@ def test_rollback_hold_follows_evidence_not_time() -> None:
 
 def test_preemption_request_is_idempotent_and_survives_restore() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=store)
     assert machine.request_preemption("donor") == 0  # no probe
     machine.start_probe(model="donor", pods=("pod-a", "pod-b"), now_ms=0)
     assert machine.request_preemption("donor") == 2
@@ -461,7 +461,7 @@ def test_preemption_request_is_idempotent_and_survives_restore() -> None:
     record = store.records[machine.active_probe("donor").request_id]
     assert record["preempt_reason"] == "receiver_need_upscale"
 
-    restored = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore(unresolved=[record]))
+    restored = SafeScaleStateMachine(thresholds=STATIC_1000_100, config=_cfg(), store=FakeProbeStore(unresolved=[record]))
     restored.restore()
     decision = restored.observe("donor", _healthy_observation(ts_ms=1_000), now_ms=1_000)
     assert (decision.status, decision.reason) == ("rollback", "receiver_need_upscale")

@@ -16,6 +16,7 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import SafeScaleRegistryConfig, parse_safescale_config
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from section_ticks import run_rescue_tick
 from tre_controller.planning.planner import HideAction
@@ -31,7 +32,7 @@ from test_loop_ticks import FakeQueue, _metrics_with_pods, _registry_with_models
 
 
 def _machine(**config) -> SafeScaleStateMachine:
-    return SafeScaleStateMachine(config=SafeScaleConfig(**config))
+    return SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(**config))
 
 
 def _rolled_back(machine, *, reason="slo_violation", z=1.5, routable=3, now_ms=10_000, model="donor"):

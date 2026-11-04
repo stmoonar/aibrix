@@ -22,6 +22,7 @@ import math
 import pytest
 
 from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
+from safescale_thresholds import STATIC_500_75
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
     DirectEvidenceCollector,
@@ -116,7 +117,7 @@ def test_a_legacy_record_that_had_fallen_back_is_rolled_back() -> None:
     probe = h.start()
     record = json.loads(json.dumps(store.records[probe.request_id]))
     record["direct_evidence"]["fallback"] = {"reason": "pods_missing", "ts_ms": HIDE + 1_000}
-    restored = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore(unresolved=[record]),
+    restored = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), store=FakeProbeStore(unresolved=[record]),
                                      evidence=h.evidence, wall_clock_ms=h.clock)
     assert restored.restore() == 1
     h.machine, h.collector = restored, h._collector(restored)
@@ -127,7 +128,7 @@ def test_a_legacy_record_that_had_fallen_back_is_rolled_back() -> None:
 
 def test_a_direct_probe_whose_hide_is_never_confirmed_never_commits_without_a_reader() -> None:
     # 8d252108 judged it on the tail snapshots (no evidence reader): commit.
-    machine = SafeScaleStateMachine(config=_cfg(), evidence=None, wall_clock_ms=lambda: 0)
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), evidence=None, wall_clock_ms=lambda: 0)
     machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
     for ts in range(110_000, 180_000, 10_000):
         decision = machine.observe(MODEL, _obs(ts), now_ms=ts)
@@ -260,7 +261,7 @@ def test_redis_mode_without_a_fresh_view_or_remaining_pods_never_commits() -> No
         ts, decision = _redis_until_decided(machine)[-1]
         assert (ts, decision.status) == (170_000, "rollback"), gap
         assert decision.details["rollback_reason"]["code"] == f"evidence_incomplete:{gap}"
-    stale = SafeScaleStateMachine(config=redis_cfg(), evidence=FakeEvidence([redis_window(50)]), wall_clock_ms=lambda: 0,
+    stale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=redis_cfg(), evidence=FakeEvidence([redis_window(50)]), wall_clock_ms=lambda: 0,
                                   remaining_pods=lambda model, exclude: None)  # a stale view
     _started(stale)
     assert _redis_until_decided(stale)[-1][1].details["rollback_reason"]["code"] == \

@@ -11,6 +11,7 @@ observation), and both need ``min_commit_samples`` requests in it.
 """
 from __future__ import annotations
 
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleStateMachine
 
@@ -19,8 +20,8 @@ HIDE = 100_000  # no evidence source: the planned start is the post-hide start
 
 
 def _machine() -> SafeScaleStateMachine:
-    machine = SafeScaleStateMachine(config=SafeScaleConfig(
-        ttft_p95_slo_ms=500.0, tpot_p95_slo_ms=75.0, min_window_ms=20_000.0, window_ceiling_ms=60_000.0,
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(
+        min_window_ms=20_000.0, window_ceiling_ms=60_000.0,
         tau_low=1.0, min_commit_samples=20,
     ))
     machine.start_probe(model=MODEL, pods=("d-1",), now_ms=HIDE)

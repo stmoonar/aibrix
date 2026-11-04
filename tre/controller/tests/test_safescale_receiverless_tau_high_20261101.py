@@ -12,6 +12,7 @@ from test_b8_observe_probes import _probe_snapshot
 from test_loop_ticks import FakeQueue, _metrics_with_pods, _registry_with_models
 
 from tre_common.metrics_schema import MetricsSnapshot
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleStateMachine
 
@@ -37,7 +38,7 @@ def _tail(probe, z: float) -> ProbeObservation:
     ],
 )
 def test_a_receiverless_shrink_commits_only_if_the_model_stays_high(receiver, z, status, gates):
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     if receiver:
         model, snapshot = "donor", _probe_snapshot()
         registry = _registry_with_models("critical", "donor")
@@ -72,7 +73,7 @@ def test_the_tau_high_floor_is_waived_while_a_model_the_freed_gpus_serve_is_crit
 ):
     # Live run 11-01: a 14b (TP2) receiver-less probe held its 2 GPUs ~21 s and rolled
     # back on the floor while 7b was CRITICAL and capacity-blocked.
-    machine = SafeScaleStateMachine(config=SafeScaleConfig(), tp_sizes=tp_sizes)
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(), tp_sizes=tp_sizes)
     snapshot = MetricsSnapshot(ts_ms=1, stale=False, models={
         "high": _metrics_with_pods("high", generation=400.0, waiting=0.0, running=1.0, pods=("h-a", "h-b")),
     })

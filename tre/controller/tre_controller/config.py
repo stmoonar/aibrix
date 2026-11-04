@@ -40,6 +40,11 @@ LOG = logging.getLogger(__name__)
 #: still sets the variable gets one warning and the value is ignored.
 REMOVED_ENV_VARS = ("ENABLE_TRE_SCALING",)
 
+#: Removed 2026-11-04: the SafeScale probe's threshold overrides. The thresholds are the
+#: registry's (top-level slo_mode + models[].slo, tre_common.slo) like every other
+#: consumer's; a Deployment that still sets one (any non-empty value) is refused.
+REMOVED_SLO_OVERRIDE_ENV = ("SAFE_SCALE_TTFT_P95_SLO_MS", "SAFE_SCALE_TPOT_P95_SLO_MS")
+
 
 def _warn_removed_env(values: Mapping[str, str]) -> None:
     for name in REMOVED_ENV_VARS:
@@ -73,13 +78,9 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
 @dataclass(frozen=True)
 class SafeScaleConfig:
-    # Optional OVERRIDES of the probe's latency thresholds (env SAFE_SCALE_TTFT_P95_SLO_MS /
-    # SAFE_SCALE_TPOT_P95_SLO_MS, unset by default). None = the registry decides
-    # (its top-level slo_mode, thresholds from tre_common.slo); without a registry
-    # resolver (direct constructions only) the planner's no-registry values apply
-    # (planning.safescale_evidence.NO_REGISTRY_*).
-    ttft_p95_slo_ms: float | None = None
-    tpot_p95_slo_ms: float | None = None
+    # The probe's latency thresholds are not configuration here (2026-11-04): the registry's
+    # top-level slo_mode and models[].slo blocks (tre_common.slo, planning.safescale_evidence.
+    # RegistryThresholds); the env overrides SAFE_SCALE_TTFT_P95_SLO_MS / _TPOT_ were removed.
     # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).
     # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The latency part of
     # the commit gate reads an evidence window that starts at the first gateway boundary
@@ -94,12 +95,10 @@ class SafeScaleConfig:
     # Never below min_window_ms (calc_probe_window_details raises it to the floor).
     # None = no ceiling and no deadline extension (direct constructions only).
     window_ceiling_ms: float | None = 60_000.0
-    # The registry's top-level slo_mode (tre_common.slo: fixed | slowdown | idle_multiple;
-    # the one SLO switch, 2026-11-04 - replaces safescale.slo_mode labels | fixed), and
-    # safescale.min_commit_samples / evidence_clock_tolerance_s (ms here). Round 4: no
+    # Registry safescale.min_commit_samples / evidence_clock_tolerance_s (ms here). The SLO
+    # mode is not kept here: Registry.slo_mode() is its one copy (2026-11-04). Round 4: no
     # evidence period here - the Redis evidence path's doc grid is the store's
     # (store.evidence_grid.EvidenceGrid).
-    slo_mode: str = "slowdown"
     min_commit_samples: int = 20
     evidence_clock_tolerance_ms: float = 20_000.0
     # Registry safescale.evidence_source / evidence_poll_s / scrape_timeout_s /
@@ -297,6 +296,15 @@ class ControllerConfig:
                 "TRE_DISABLE_ETA_GATE was removed (2026-11-02): donors are ordered IDLE first, then Z "
                 "descending on every arm, alt-signal arms included; remove it from the Deployment"
             )
+        # 2026-11-04: the probe's thresholds come from the registry only (tre_common.slo, one
+        # definition for every consumer); the two env overrides were removed. Any value fails
+        # closed - it asked for thresholds the scorer does not use.
+        for removed in REMOVED_SLO_OVERRIDE_ENV:
+            if str(values.get(removed, "")).strip():
+                raise ValueError(
+                    f"{removed} was removed (2026-11-04): the SafeScale thresholds are the registry's "
+                    f"(slo_mode + models[].slo, tre_common.slo); remove it from the Deployment"
+                )
         if "TRE_DISABLE_ETA_GATE" in values:
             LOG.warning(
                 "TRE_DISABLE_ETA_GATE=%r is ignored (removed 2026-11-02): donors are ordered IDLE first, "
@@ -358,15 +366,13 @@ class ControllerConfig:
         if metrics_phase_offset_ms >= evidence_period_ms:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below TRE_EVIDENCE_PERIOD_MS")
 
+        _check_registry_slo_mode(registry_path)
         safescale_registry = _safescale_registry(registry_path)
         scaling_registry = _scaling_registry(registry_path)
         safescale = SafeScaleConfig(
-            ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
-            tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
             min_window_ms=_safescale_window_floor_ms(values),
             e2e_multiplier=_get_positive_float(values, "SAFE_SCALE_E2E_MULTIPLIER", 2.0),
             window_ceiling_ms=float(safescale_registry.window_ceiling_s) * 1000.0,
-            slo_mode=_registry_slo_mode(registry_path),
             min_commit_samples=int(safescale_registry.min_commit_samples),
             evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
             evidence_source=safescale_registry.evidence_source,
@@ -573,22 +579,22 @@ def _get_span_ms(
     return value
 
 
-def _registry_slo_mode(registry_path: str) -> str:
-    """The registry's ``slo_mode`` (the SLO definition of every consumer). A legacy
-    registry (no ``slo_mode``) whose two retired keys disagree - the probe obeyed
-    ``safescale.slo_mode``, the scorer and the labels ``models[].slo.ttft_slo_mode`` - is
-    refused: set ``slo_mode`` (release step, params_set.py --set slo_mode=...). An
-    unreadable registry only warns here (the controller's own load fails right after)."""
+def _check_registry_slo_mode(registry_path: str) -> None:
+    """Refuse a registry whose SLO definition is ambiguous: a legacy registry (no
+    ``slo_mode``) whose two retired keys disagree - the probe obeyed ``safescale.slo_mode``,
+    the scorer and the labels ``models[].slo.ttft_slo_mode`` - (set ``slo_mode``: release
+    step, params_set.py --set slo_mode=...). The mode itself is read from the registry
+    (Registry.slo_mode()), not kept in the config. An unreadable registry only warns here
+    (the controller's own load fails right after)."""
     try:
         resolution = load_registry(registry_path).slo_mode_resolution()
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - load_registry fails loudly later on
-        LOG.warning("registry %s unreadable (%r): SLO mode default", registry_path, exc)
-        return SafeScaleConfig().slo_mode
+        LOG.warning("registry %s unreadable (%r)", registry_path, exc)
+        return
     if resolution.legacy_conflict:
         raise ValueError(f"registry {registry_path}: {resolution.legacy_conflict}")
-    return resolution.mode
 
 
 def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
@@ -715,13 +721,6 @@ def _get_positive_float(env: Mapping[str, str], key: str, default: float) -> flo
     if value <= 0.0:
         raise ValueError(f"{key} must be positive")
     return value
-
-
-def _get_optional_positive_float(env: Mapping[str, str], key: str) -> float | None:
-    """A positive float when ``key`` is set (non-empty), else None."""
-    if env.get(key) in (None, ""):
-        return None
-    return _get_positive_float(env, key, 1.0)
 
 
 def _get_nonneg_float(env: Mapping[str, str], key: str, default: float) -> float:

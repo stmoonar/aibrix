@@ -263,8 +263,6 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
         {
             "TRE_RUNTIME_STATE_DIR": "/var/lib/aibrix/tre",
             "PROACTIVE_RELEASE_MIN_TRS": "3000",
-            "SAFE_SCALE_TTFT_P95_SLO_MS": "1300",
-            "SAFE_SCALE_TPOT_P95_SLO_MS": "120",
             "SAFE_SCALE_WINDOW_FLOOR_MS": "90000",
             "SAFE_SCALE_E2E_MULTIPLIER": "3.5",
             "SAFE_SCALE_HQ": "0.5",
@@ -275,8 +273,6 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
 
     assert config.runtime_state_dir == "/var/lib/aibrix/tre"
     assert config.proactive_release_min_trs == 3000.0
-    assert config.safescale.ttft_p95_slo_ms == 1300.0
-    assert config.safescale.tpot_p95_slo_ms == 120.0
     assert config.safescale.min_window_ms == 90_000.0
     assert config.safescale.e2e_multiplier == 3.5
     assert config.safescale.hq == 0.5
@@ -293,6 +289,13 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
     assert ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "tumbling"}).metrics_window_mode == "tumbling"
     with pytest.raises(ValueError):
         ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
+
+
+@pytest.mark.parametrize("key", ["SAFE_SCALE_TTFT_P95_SLO_MS", "SAFE_SCALE_TPOT_P95_SLO_MS"])
+def test_removed_safescale_threshold_overrides_are_refused(key: str) -> None:
+    assert ControllerConfig.from_env({key: ""}).safescale is not None  # empty = unset
+    with pytest.raises(ValueError, match="was removed"):
+        ControllerConfig.from_env({key: "700"})
 
 
 def test_safescale_window_defaults_and_env_parsing() -> None:

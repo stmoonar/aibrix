@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from tre_common.metrics_schema import MetricsSnapshot
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
@@ -66,7 +67,7 @@ def _decide(world: World):
     snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=False)
     actions, _ = _apply_safescale(
         snapshot, tuple(plan.actions), plan.probe_upscale_plans,
-        safescale=SafeScaleStateMachine(config=SafeScaleConfig()), cluster_view=view, safescale_scope="all",
+        safescale=SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig()), cluster_view=view, safescale_scope="all",
     )
     actions, _ = _name_shrink_pods(snapshot, actions, view)
     return actions, plan.events

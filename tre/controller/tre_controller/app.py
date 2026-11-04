@@ -363,12 +363,7 @@ def create_controller_dependencies(
             redis_client=metrics_redis_client,
             sleeping_pods=lambda model: _sleeping_pods(cluster_view_box.get(), model),
         ),
-        thresholds=RegistryThresholds(
-            registry,
-            mode=cfg.safescale.slo_mode,
-            ttft_override_ms=cfg.safescale.ttft_p95_slo_ms,
-            tpot_override_ms=cfg.safescale.tpot_p95_slo_ms,
-        ),
+        thresholds=RegistryThresholds(registry),
         # Redis mode: the remaining pods a commit needs evidence of (fresh view only).
         remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
         # 2026-11-01: which CRITICAL models a receiver-less probe's freed GPUs can serve.
@@ -409,7 +404,7 @@ def create_controller_dependencies(
         "metrics_port": cfg.safescale.metrics_port,
         "min_commit_samples": cfg.safescale.min_commit_samples,
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
-        "slo_mode": cfg.safescale.slo_mode,
+        "slo_mode": registry.slo_mode(),
         "slo_mode_source": registry.slo_mode_resolution().source,
         "early_commit": cfg.safescale.early_commit,
         "early_commit_min_evidence_ms": cfg.safescale.early_commit_min_evidence_ms,

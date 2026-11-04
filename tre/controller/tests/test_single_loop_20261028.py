@@ -29,6 +29,7 @@ import pytest
 from tre_common.gpu_placement import GpuBlock
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue, PlanBatch
 from tre_controller.loops.decision_task import DecisionLoop, decision_task
@@ -143,7 +144,7 @@ def _tp2(*donors: Binding, classes=None, scope="all", receivers=None):
     plan = _plan(bindings, classes, topology=TOPOLOGY8, model_tp_sizes=tp_sizes,
                  min_replicas_by_model={"x": 2, **{model: 0 for model in models}},
                  release_without_safescale=scope != "all")
-    machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = None if scope == "off" else SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     out, _ = _apply_safescale(
         MetricsSnapshot(ts_ms=1, models={}, stale=False), tuple(plan.actions), plan.probe_upscale_plans,
         safescale=machine, cluster_view=ClusterView(TOPOLOGY8, tuple(bindings)), safescale_scope=scope,
@@ -179,7 +180,7 @@ VIEW = ClusterView(TOPOLOGY, (
     ("all", replace(BLOCK, reason="critical_block_idle")),  # IDLE donor: no probe
 ])
 def test_a_tp_block_is_one_plan_of_the_donor_sleep_and_the_receiver_wake(scope, block):
-    machine = None if scope == "off" else SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = None if scope == "off" else SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
 
     out, _ = _apply_safescale(MetricsSnapshot(ts_ms=1, models={}, stale=False), (block,), {},
                               safescale=machine, cluster_view=VIEW, safescale_scope=scope)
@@ -215,7 +216,7 @@ def test_a_decision_with_a_tp_block_is_one_sm_plan():
 
 
 def test_with_safescale_the_block_is_a_probe_and_its_commit_is_that_one_plan():
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=False)
     out, _ = _apply_safescale(snapshot, (PROBE_BLOCK,), {}, safescale=machine, cluster_view=VIEW,
                               safescale_scope="all")
@@ -389,7 +390,7 @@ def test_a_receiver_gets_one_step_per_plan_and_none_before_the_window_reflects_i
 def test_a_step_promised_by_a_running_probe_is_not_planned_again():
     """Review P2-3: a donor probe for the CRITICAL receiver is its step (the commit wakes
     the replica); while the probe runs, the next calls hold the receiver."""
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     registry = _registry_with_models("critical", "donor")
     queue = FakeQueue()
 

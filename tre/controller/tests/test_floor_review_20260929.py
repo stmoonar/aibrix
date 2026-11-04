@@ -28,6 +28,7 @@ import yaml
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec
+from safescale_thresholds import STATIC_1000_100, STATIC_500_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from section_ticks import run_rescue_tick
 from tre_controller.loops.safescale_task import _observation_from_metrics, run_safescale_observation_tick
@@ -71,7 +72,8 @@ def _obs(ts_ms: int, window_ms: int = 30_000) -> ProbeObservation:
 def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
     store = FakeProbeStore()
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(ttft_p95_slo_ms=500.0, tpot_p95_slo_ms=75.0, min_window_ms=25_000.0, hq=0.5),
+        thresholds=STATIC_500_75,
+        config=SafeScaleConfig(min_window_ms=25_000.0, hq=0.5),
         store=store,
     )
     machine.start_probe(model="donor", pods=("donor-0",), now_ms=100_000)  # hide at 100 s
@@ -113,9 +115,10 @@ def test_observations_carry_the_metrics_window_they_read() -> None:
 
     queue = ObservationQueue()
     machine = SafeScaleStateMachine(
+        thresholds=STATIC_1000_100,
         # Round 5: no post-hide suffix in this window, so only the W ceiling (= the floor
         # here) judges it - on the whole window, flagged tail_low_evidence.
-        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5,
+        config=SafeScaleConfig(min_window_ms=1000.0, hq=0.5,
                                window_ceiling_ms=1000.0)
     )
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=45_000)  # hide 45 s into the window
@@ -245,7 +248,7 @@ def test_window_ceiling_comes_from_the_registry_safescale_section(tmp_path, capl
 
 def test_probe_record_keeps_w_max_and_clamped() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(config=SafeScaleConfig(window_ceiling_ms=300_000.0), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(window_ceiling_ms=300_000.0), store=store)
     machine.start_probe(
         model="m", pods=("m-0",), now_ms=0, window_inputs=ProbeWindowInputs(p95_e2e_ms=400_000.0)
     )
