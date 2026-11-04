@@ -40,7 +40,7 @@ def _flag(argv: list[str], name: str) -> str:
 
 
 @pytest.mark.parametrize("env,numerator,window", [
-    ({}, "vllm_counter", "20000"),  # the 2026-10-28 default: step counters on 20 s windows
+    ({}, "vllm_counter", "10000"),  # the default: step counters on the controller's 10 s window (20 s from 2026-10-28 to 11-03)
     ({"NUMERATOR": "gateway", "WINDOW_MS": "30000"}, "gateway", "30000"),  # reproduces the 2026-10-25 freeze
 ])
 def test_every_stage_gets_the_numerator_and_the_window(tmp_path, env, numerator, window) -> None:

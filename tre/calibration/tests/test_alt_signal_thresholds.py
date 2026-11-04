@@ -431,10 +431,10 @@ def test_v1_signals_go_through_the_same_fit_in_their_own_direction(signal: str, 
     # The fit stamps what theta was fitted on (the controller checks it at start).
     from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
 
-    from tre_common.tss import DEFAULT_EMA_TAU_MS
+    from tre_common.tss import FIT_EMA_TAU_MS
 
     assert threshold["basis"] == {"definition": ALT_SIGNAL_DEFINITIONS[signal], "window_ms": 1000,
-                                  "ema_tau_ms": float(DEFAULT_EMA_TAU_MS)}
+                                  "ema_tau_ms": float(FIT_EMA_TAU_MS)}
     # The boundary at 300 on the fixture axis: 300 ms, or headroom 1 - 0.3.
     boundary = BOUNDARY if signal == "ttft_mean" else 1.0 - BOUNDARY / 1000.0
     assert threshold["theta"] == pytest.approx(boundary, rel=0.03)
@@ -477,3 +477,9 @@ def test_alt_band_grids_span_what_the_classifier_can_use() -> None:
 
     assert ALT_DELTA_CRIT_GRID[0] == 0.0 and ALT_DELTA_CRIT_GRID[-1] == pytest.approx(0.99)
     assert ALT_DELTA_HIGH_GRID[0] == 0.0 and ALT_DELTA_HIGH_GRID[-1] == pytest.approx(Z_MAX - 1.0)
+
+
+def test_the_driver_refuses_a_negative_ema_tau(capsys) -> None:
+    with pytest.raises(SystemExit) as stop:
+        _load_driver().main(["--ema-tau-ms=-1"])
+    assert stop.value.code == 2 and "must be >= 0" in capsys.readouterr().err

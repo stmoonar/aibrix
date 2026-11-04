@@ -1,0 +1,93 @@
+# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
+# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
+# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
+# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
+# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+# 2026-11-01 TRE-only FULL 720 s runs under tune F (registry f3ac339a6e5de9be: lambda_wait 20, w_p 0.01, theta/tau by
+# the D rule; campaign-icse-tune-20261031/registry-F). User 11-01: "run F on all traces". Baselines: full 720 s arms
+# already exist (r3c traces: campaign-icse-r3c-full-D-20261101-run; ICSE traces: campaign-icse-bl-20261030).
+# Runner / client / controller: main 4ab51261 (controller 20261101-c8279678).
+# Traces: r3c (redesigned) Prefill_mixed, Alternating, Simultaneous.
+name: campaign-icse-r3c-full-F-20261101
+round: campaign-icse-r3c-full-F-20261101
+results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-r3c-full-F-20261101-run
+trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101
+loadgen_config_root: ${TRE_REPO}/loadgen_v1/configs/traces_v14
+seed: 1
+arms: [tre]
+order: williams
+max_attempts: 2
+gap_s: 0
+eta: {overhead_s: 280, report_s: 150}
+
+registry_expect:
+  registry_id: f3ac339a6e5de9be     # tune F (lambda 20, w_p 0.01); = ID_EXPECT in the driver
+  present:
+    - "*.trs.numerator"
+    - "*.trs.theta_window_ms"
+    - "*.trs.ema_tau_ms"
+
+env:
+  RELEASE_TRE: ${TRE_REPO}
+  TRE_DIR: ${RELEASE_TRE}
+  BL_CM_FILE: ${RELEASE_TRE}/deploy/baselines/tre/policy-configmaps.yaml
+  BL_CM_APPLY: "1"
+  LOADGEN_TRE_DIR: ${TRE_REPO}
+  GW_PARITY: "1"
+  GW_EVENTS_KEEP: "1"
+  BL_SEED: "0"
+  IGNORE_EOS: "1"
+  PROBE_WAIT_S: "300"
+  RUN_CHECK_CONTROLLER_TICK_S: "5"
+  RUN_CHECK_BASELINE_TICK_S: "5"
+  RUN_CHECK_COVERAGE_MIN: "0.9"
+  RUN_CHECK_FROZEN_MAX: "0.05"
+
+arm_defs:
+  tre:
+    base: tre
+    label: TRE
+    controller_env: {TRE_SAFESCALE_SCOPE: healthy_and_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false}
+  preserve:
+    base: preserve
+    label: PreServe                 # faithful (mLSTM, load errors), drain on
+    policy: {tier1: mlstm}          # history: preserve_history.json next to the trace (real Azure segments, causal)
+
+preserve:
+  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+  trace_pod_root: /etc/tre-baselines-traces
+  match_parts: 3
+
+report:
+  enabled: true
+  per_arm: true
+  capacity: ${TRE_REPO}/eval/configs/capacity-v030-vslo-20261007.yaml
+  ref: tre
+  reps: 1000
+  timeout_s: 1200
+  nice: 10
+
+precheck:
+  gpu_truth_max_age_s: 30
+  breakpoint_lookback_s: 60
+  wait_s: 300
+  poll_s: 30
+  disk_min_free_gb:
+    nfs: 50
+    nodes: {nscc-ds-4a100-node9: 8}
+
+validity:
+  fail_frac_suspect: 0.01
+  fail_frac_invalid: 0.20
+  sent_frac_min: 0.98
+  emfile: invalid
+  max_tokens_hit_min: 0.99
+  clock_drift_max_s: 1.0
+
+marker: {extend: true, margin_s: 1800}
+
+# first in the file = first to run; the Real_* entries carry the PreServe arm
+traces:
+  - trace: Prefill_mixed_corner_decode_mix
+  - trace: Alternating_hot_model_periodic_A
+  - trace: Simultaneous_spike_ramp_twice_tps1o2

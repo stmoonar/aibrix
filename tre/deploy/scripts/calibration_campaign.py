@@ -2303,24 +2303,31 @@ def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optio
         ) + "\n",
         encoding="utf-8",
     )
+    cut: dict = {}
     try:
         from scripts import calibration_dataset
 
-        built = calibration_dataset.build_dataset(out_dir)
+        # The windows are named here, not left to the module default (which changes: 30 s, 20 s, 10 s), and they are
+        # the ones a rebuild passes again (the hint below; the datasets record them in manifest.json -> windowing).
+        cut = {"window_ms": calibration_dataset.DEFAULT_WINDOW_MS, "step_ms": calibration_dataset.DEFAULT_STEP_MS}
+        built = calibration_dataset.build_dataset(out_dir, overrides=cut)
         print(f"standard dataset: {built}")
         attribution = planned_attribution(out_dir)
         if attribution != slo_labels.ATTRIBUTION_COMPLETION:
             # the run was judged on a label v2: its own dataset too, next to the v1 one
-            hybrid = calibration_dataset.build_dataset(out_dir, overrides={"attribution": attribution})
+            hybrid = calibration_dataset.build_dataset(out_dir, overrides={**cut, "attribution": attribution})
             print(f"standard dataset ({attribution} attribution): {hybrid}")
         parent = out_dir.parent
         siblings = calibration_dataset.campaign_dirs(parent)
         if len(siblings) > 1 and all((d / CAMPAIGN_STATUS_FILE).exists() for d in siblings):
-            merged = calibration_dataset.build_dataset(parent)
+            # the merge cuts what its campaigns were cut with (an earlier campaign of a resumed run may have another window)
+            window, step = calibration_dataset.recorded_windowing(parent)
+            merged = calibration_dataset.build_dataset(parent, overrides={"window_ms": window, "step_ms": step})
             print(f"every campaign under {parent} has finished; merged dataset: {merged}")
     except Exception as exc:  # noqa: BLE001 - see docstring
         print(f"WARNING: building the standard dataset failed ({exc!r}); rebuild it with "
-              f"python -m scripts.calibration_dataset {out_dir}")
+              f"python -m scripts.calibration_dataset {out_dir}"
+              + (f" --window-ms {cut['window_ms']} --step-ms {cut['step_ms']}" if cut else ""))
 
 
 def run_campaign(args) -> int:

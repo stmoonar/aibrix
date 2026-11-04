@@ -15,8 +15,8 @@ Plan 2026-09-21 §6.4 (unified definition)::
   ``request_*_tokens`` histogram sums, i.e. the tokens of the requests that COMPLETED in
   the window (:data:`NUMERATOR_COMPLETION_HISTOGRAMS`; offline only, to reproduce old
   freezes);
-* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (20 s since 2026-10-28, 30 s
-  before), so the numerator is a **window token total**, the convention main and v1
+* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (10 s since 2026-10-31 live and 2026-11-03 in the overlay;
+  20 s from 2026-10-28, 30 s before), so the numerator is a **window token total**, the convention main and v1
   always used - theta is therefore tied to the window length and to the numerator
   source: the registry stamps both per model (``trs.numerator``, ``trs.theta_window_ms``)
   and the controller refuses to start on a mismatch (:func:`theta_basis_errors`);
@@ -46,8 +46,9 @@ The EMA is a wall-clock time-constant EMA, ``alpha_k = 1 - exp(-dt_k / tau)``
 (``tre_controller.signals.trs.TRSComputer``) and offline
 (``tre_calibration.dataset`` recompute, ``tre_calibration.signals``).
 
-**Idle-gap reset** (:class:`TssEma`; its threshold follows the window: 20 s since
-2026-10-28; tau itself is a separate registry value, ``trs.ema_tau_ms``, 10 s, unchanged):
+**Idle-gap reset** (:class:`TssEma`; its threshold follows the window; tau itself is a
+separate registry value, ``trs.ema_tau_ms``: 0 = EMA off since the 10 s window, live
+2026-10-30 and in the repo registry 2026-11-03; 10 s before):
 when a sample arrives more than one metrics window
 after the last sample that advanced the EMA (``window_end_ms - last_ms > window_ms``), the
 EMA is cleared first, so a traffic period never inherits the previous period's value
@@ -69,8 +70,28 @@ LOG = logging.getLogger(__name__)
 #: Units the published theta is expressed in.
 TSS_UNITS = "decode-equivalent tokens per metrics window (TRE_METRICS_WINDOW_MS) per in-flight request"
 
-#: EMA time constant the plan fixes (§6.5: tau is designed, not fitted).
+#: The tau an alternative signal is smoothed with when its model's registry entry names no ``trs.ema_tau_ms`` (a registry from
+#: before the time-constant EMA; every deployed entry names one). Not the default of the fit tools: see :data:`FIT_EMA_TAU_MS`.
 DEFAULT_EMA_TAU_MS = 20_000.0
+
+#: Default EMA time constant of the fit tools (``--ema-tau-ms``): what the deployed registry names in ``trs.ema_tau_ms``,
+#: 0 = no smoothing (live since the 10 s window, 2026-10-30; the repo registry since 2026-11-03). A fit with this default
+#: smooths like the controller does, and an alt-signal basis it stamps (``basis.ema_tau_ms``) is the one the controller accepts.
+FIT_EMA_TAU_MS = 0.0
+
+
+def nonneg_tau_ms_arg(text: str) -> float:
+    """argparse ``type`` of a ``--ema-tau-ms``: 0 = no smoothing, > 0 = the time constant. A negative value would be read as "no
+    smoothing" too (tau <= 0 means raw), so it is refused instead of silently accepted."""
+    import argparse  # noqa: PLC0415
+
+    try:
+        tau = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not tau >= 0.0:  # also NaN
+        raise argparse.ArgumentTypeError(f"must be >= 0 (0 = no smoothing), got {text}")
+    return tau
 
 #: Numerator sources a theta can be fitted on (registry ``trs.numerator``).
 NUMERATOR_STEP_COUNTERS = "step_counters"
@@ -344,6 +365,8 @@ def convert_window_total_theta(theta_total: float, window_ms: float) -> float:
 
 __all__: Iterable[str] = (
     "DEFAULT_EMA_TAU_MS",
+    "FIT_EMA_TAU_MS",
+    "nonneg_tau_ms_arg",
     "NUMERATOR_COMPLETION_HISTOGRAMS",
     "NUMERATOR_STEP_COUNTERS",
     "TSS_NUMERATOR",

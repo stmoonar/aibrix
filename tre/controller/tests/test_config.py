@@ -23,7 +23,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.metrics_refresh_interval_s == 5.0
     assert config.rescue_interval_s == 5.0
     assert config.fairness_interval_s == 10.0
-    assert config.metrics_window_ms == 20_000  # 2026-10-28: 20 s with the step-counter numerator
+    assert config.metrics_window_ms == 10_000  # 2026-11-03: 10 s (20 s from 2026-10-28)
     assert config.metrics_window_mode == "sliding"
     # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 2 s); the read
     # offset defaults to min(2 s, evidence / 2).
@@ -139,8 +139,8 @@ def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
     registry = yaml.safe_load(repo.read_text(encoding="utf-8"))
     entry = {"theta": 2.0, "direction": EXPECTED_SIGNAL_DIRECTIONS[source],
              "delta_crit": 0.1, "delta_high": 0.3,
-             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000,
-                       "ema_tau_ms": 10_000.0}, **fields}
+             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000,
+                       "ema_tau_ms": 0.0}, **fields}
     for model in registry["models"]:
         model.setdefault("alt_thresholds", {})[source] = {k: v for k, v in entry.items() if v is not None}
     path = tmp_path / "registry.yaml"
@@ -196,11 +196,11 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
     from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
 
     if basis == "window":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000, "ema_tau_ms": 10_000.0}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000, "ema_tau_ms": 0.0}
     elif basis == "tau":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000, "ema_tau_ms": 0.0}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000, "ema_tau_ms": 10_000.0}
     elif basis == "no_tau":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000}
     path = _registry_with_alt(tmp_path, source, basis=basis)
     with pytest.raises(ValueError, match="basis does not match.*dsqwen-7b"):
         ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
@@ -211,11 +211,16 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
         assert cfg.signal_source == source
 
 
-@pytest.mark.parametrize("source", ["ttft_mean", "tpot_mean", "kv_usage"])
-def test_v1_alt_source_refuses_to_start_on_the_repo_registry(source: str) -> None:
-    """The repo registry carries no fitted theta for the v1 signals."""
-    with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires fitted"):
-        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source})
+@pytest.mark.parametrize("source", ["queue_len", "ttft_mean", "tpot_mean", "kv_usage"])
+def test_alt_thresholds_of_the_repo_registry_are_fitted_on_the_default_window(source: str) -> None:
+    """Since 2026-11-03 the repo registry carries the live fitted alt thresholds (basis: 10 s window, EMA off): they fit the
+    default window of the controller and no other."""
+    env = {"TRE_SIGNAL_SOURCE": source, "TRE_DISABLE_ETA_GATE": "true",   # a non-zm source requires the gate off (from_env)
+           "TRE_REGISTRY_PATH": str(Path(__file__).parents[2] / "deploy" / "registry.yaml")}
+    assert ControllerConfig.from_env({}).metrics_window_ms == 10_000
+    assert ControllerConfig.from_env(env).signal_source == source              # accepted at the default window
+    with pytest.raises(ValueError, match="basis does not match"):
+        ControllerConfig.from_env({**env, "TRE_METRICS_WINDOW_MS": "20000"})
 
 
 def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:

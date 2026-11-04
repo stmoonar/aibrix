@@ -205,7 +205,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     # P0-4A: per-model params load from a mounted ConfigMap so params_set.py can edit +
     # restart-to-apply. W stays frozen as an explicit env value (not in the CM).
     assert _env(controller)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
-    assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "20000"  # W (2026-10-28: 20 s, step counters)
+    assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "10000"  # W (2026-11-03: 10 s, step counters; 20 s from 2026-10-28)
     assert controller["spec"]["strategy"] == {"type": "Recreate"}  # no dual-controller actuation
     # 2026-11-02: PID 1 ignores SIGTERM (no handler): the grace period is only how long the old pod keeps running
     assert controller["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 5
@@ -227,6 +227,18 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert params["metadata"]["namespace"] == "tre-v2"
     assert "registry.yaml" in params["data"]
     assert yaml.safe_load(params["data"]["registry.yaml"]) == _load_yaml(DEPLOY_ROOT / "registry.yaml")
+
+
+def test_a_fresh_install_starts_the_controller_on_the_bootstrap_registry() -> None:
+    """The controller refuses to start unless every model's thetas are stamped for the window and numerator it computes
+    (tre_common.tss.theta_basis_errors; Recreate: no controller is left). The bootstrap registry (registry.yaml and its
+    params.yaml copy) must stamp the overlay's TRE_METRICS_WINDOW_MS (10 s since 2026-11-03)."""
+    from tre_common.tss import theta_basis_errors
+
+    window = int(_env(_load_yaml(DEPLOY_ROOT / "overlays" / "tre-v2" / "controller.yaml"))["TRE_METRICS_WINDOW_MS"])
+    registry = load_registry(str(DEPLOY_ROOT / "registry.yaml"))
+    assert theta_basis_errors(registry.models(), window_ms=window) == []
+    assert theta_basis_errors(registry.models(), window_ms=window * 2) != []
 
 
 def test_ablation_overlays_patch_only_controller_env() -> None:

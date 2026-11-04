@@ -256,6 +256,8 @@ def test_a_refused_model_is_reported_and_does_not_stop_the_others(tmp_path: Path
         return driver.main([
             "--model-input", f"a={fit}", "--model-input", f"b={fit}", "--family", f"b:prefill_heavy={fam}",
             "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
+            # the degenerate band of this fixture is a fact of the smoothed signal (the default tau is 0 = raw)
+            "--ema-tau-ms", "20000",
             "--theta-source", "family", "--n-resamples", "20", "--family-resamples", "10",
             "--verdict-dir", str(out), "--output", str(out / "alt.yaml"), *extra,
         ])

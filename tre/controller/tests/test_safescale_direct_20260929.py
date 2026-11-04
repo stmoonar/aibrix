@@ -703,7 +703,10 @@ def test_registry_direct_keys_defaults_and_validation() -> None:
     params = yaml.safe_load((TRE_DIR / "deploy" / "overlays" / "tre-v2" / "params.yaml").read_text(encoding="utf-8"))
     params_registry = yaml.safe_load(next(iter(params["data"].values())))
     assert params_registry["safescale"] == registry["safescale"]
-    assert parse_safescale_config(registry["safescale"]) == defaults
+    # the repo registry = the built-in defaults, except slo_mode (fixed, live since 2026-10-31)
+    from dataclasses import replace
+
+    assert parse_safescale_config(registry["safescale"]) == replace(defaults, slo_mode="fixed")
 
 
 def test_config_maps_the_registry_keys(tmp_path) -> None:

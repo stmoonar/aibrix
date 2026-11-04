@@ -1,0 +1,62 @@
+--- live
++++ edited
+@@ -90,16 +90,16 @@
+     lambda_wait: 2.125
+     qmin: 1.0
+     ema_alpha: 0.632121
+-    theta_m: 605.6869086920817
++    theta_m: 302.843454
+     tau_crit: 0.52
+     tau_low: 1.0
+     tau_high: 1.645
+     qsat: 4.0
+     epsat: 0.05
+     hsat: 3
+-    ema_tau_ms: 10000
++    ema_tau_ms: 0.0
+     numerator: step_counters
+-    theta_window_ms: 20000
++    theta_window_ms: 10000
+   vllm_extra_args:
+   - --no-enable-prefix-caching
+   - --max-num-seqs
+@@ -170,16 +170,16 @@
+     lambda_wait: 2.0
+     qmin: 1.0
+     ema_alpha: 0.632121
+-    theta_m: 460.61925201720703
++    theta_m: 230.309626
+     tau_crit: 0.66
+     tau_low: 1.0
+     tau_high: 1.825
+     qsat: 4.0
+     epsat: 0.05
+     hsat: 3
+-    ema_tau_ms: 10000
++    ema_tau_ms: 0.0
+     numerator: step_counters
+-    theta_window_ms: 20000
++    theta_window_ms: 10000
+   vllm_extra_args:
+   - --no-enable-prefix-caching
+   - --max-num-seqs
+@@ -250,16 +250,16 @@
+     lambda_wait: 2.0
+     qmin: 1.0
+     ema_alpha: 0.632121
+-    theta_m: 467.12896116050626
++    theta_m: 233.564481
+     tau_crit: 0.6
+     tau_low: 1.0
+     tau_high: 2.0
+     qsat: 4.0
+     epsat: 0.05
+     hsat: 3
+-    ema_tau_ms: 10000
++    ema_tau_ms: 0.0
+     numerator: step_counters
+-    theta_window_ms: 20000
++    theta_window_ms: 10000
+   vllm_extra_args:
+   - --no-enable-prefix-caching
+   - --max-num-seqs
