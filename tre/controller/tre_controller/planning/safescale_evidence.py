@@ -124,6 +124,9 @@ class EvidenceWindow:
     judged_count: float | None = None
     #: pod -> stamp (ms) of the last histogram doc its TTFT delta ends at.
     last_doc_ts_ms: dict[str, int] = field(default_factory=dict)
+    #: Pods whose TPOT series is missing from a histogram doc of the read: no TPOT
+    #: evidence (a required one makes the evidence incomplete, ``no_tpot_histogram``).
+    tpot_missing_pods: tuple[str, ...] = ()
     #: TPOT p95 of the remaining pods' histograms pooled first (per-pod minimum not
     #: applied per pod, but to the pooled count); already folded into tpot_p95_ms (max).
     pooled_tpot_p95_ms: float | None = None
@@ -201,9 +204,18 @@ class MetricsEvidenceReader:
             for key, pod in pods.items()
             if getattr(pod, "hist_first_ts_ms", None) is not None
         }
+        # Fail closed (review of 9ad3ec32, B1): TPOT is the judged latency. A pod whose
+        # TPOT series is missing from a doc of the read gives no TPOT evidence: it is
+        # reported (``tpot_missing_pods``: a required one blocks the commit) and its
+        # requests are never counted as judged.
+        tpot_missing = tuple(sorted(
+            str(getattr(pod, "pod", key)) for key, pod in pods.items()
+            if not getattr(pod, "tpot_count_complete", True)
+        ))
+        with_tpot = [pod for key, pod in pods.items() if str(getattr(pod, "pod", key)) not in tpot_missing]
         judged = sum(
             float(getattr(pod, "ttft_count", None) or 0.0)
-            for pod in pods.values()
+            for pod in with_tpot
             if pod.tpot_p95_ms is not None
         )
         last_docs = {
@@ -219,7 +231,9 @@ class MetricsEvidenceReader:
         )
         total = float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values()))
         if pooled_tpot is not None:
-            judged = total  # every request is in the pooled p95
+            # The requests in the pooled p95: those of the pods with TPOT samples.
+            judged = sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in with_tpot
+                         if float(getattr(pod, "tpot_hist_count", None) or 0.0) > 0)
         # The same max(per pod, pooled) without any minimum-samples rule (low-sample
         # evaluation at the ceiling).
         rule0 = (rule[0], 0)
@@ -239,6 +253,7 @@ class MetricsEvidenceReader:
             last_doc_ts_ms=last_docs,
             pooled_tpot_p95_ms=pooled_tpot,
             low_tpot_p95_ms=low("tpot_hist", "tpot_hist_count"),
+            tpot_missing_pods=tpot_missing,
         )
 
     def _now(self) -> tuple[int, str]:

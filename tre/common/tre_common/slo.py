@@ -7,7 +7,7 @@ the calibration window label (``tre_common.slo_labels``), the scorer
 ``SloThresholds.tpot_ms`` - and judges no TTFT, user 2026-11-04), the baseline tools
 (``tre_baselines.tools.slo_judge`` / ``preserve_nl_slo`` / ``tokenscale_profile`` through
 the label) and the baseline-scaler limits (``tre_baselines.config``). A second
-implementation is a bug (guard: ``common/tests/test_slo_single_definition.py``).
+implementation is a bug (guard: ``deploy/tests/test_slo_single_definition.py``).
 
 One switch, one parameter set per mode
 --------------------------------------

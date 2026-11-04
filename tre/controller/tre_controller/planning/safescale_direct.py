@@ -586,7 +586,7 @@ def take_baseline(
     late_after_ms: float | None = None,
 ) -> DirectState:
     """The probe's direct state from a baseline scrape: pods that answered (awake, with
-    a TTFT histogram) form the baseline, pods reporting their engine asleep are dropped,
+    TTFT and TPOT histograms) form the baseline, pods reporting their engine asleep are dropped,
     the others (timeout, error, no IP) are pending - their baseline is their first later
     successful scrape, and they are ``late`` then. No pod answered: ``baseline`` stays
     None and ``failed_polls`` counts the attempt.
@@ -632,6 +632,11 @@ def _unusable(result: "PodScrape | str") -> str | None:
         if result.other_models:
             return "model_mismatch:" + ",".join(result.other_models)
         return "no_ttft_histogram"
+    if result.tpot is None:
+        # Fail closed (review of 9ad3ec32, B1): TPOT is the judged latency, so a pod
+        # without the TPOT family gives no evidence (its requests must never count as
+        # judged): pending / unanswered like a failed scrape, no commit without it.
+        return "no_tpot_histogram"
     return None
 
 
@@ -660,7 +665,9 @@ def _pod_delta(
     elif base.tpot is not None:
         return "family_vanished"
     else:
-        tpot = (0.0, ())
+        # A baseline without the TPOT family (a record of an older controller): nothing
+        # to difference the judged latency against - reset like a restart (late, no commit).
+        return "no_tpot_baseline"
     return PodDelta(
         ts_ms=result.coverage_end_ms,
         n=ttft[0],
@@ -809,7 +816,9 @@ def evaluate_poll(
     total_n = float(sum(d.n for d in deltas.values()))
     judged_n = float(sum(d.n for d in deltas.values() if d.tpot_p95_ms is not None))
     if pooled_tpot is not None:
-        judged_n = total_n  # every request is in the pooled p95
+        # The requests in the pooled p95: those of the pods with TPOT samples (a pod
+        # whose requests produced no TPOT sample is not judged by it).
+        judged_n = float(sum(d.n for d in deltas.values() if d.tpot_n > 0))
     # The ceiling's low-sample evaluation: the same max(per pod, pooled) without any
     # minimum-samples rule (every request counts, however few).
     rule0 = (percentile_mode, 0)

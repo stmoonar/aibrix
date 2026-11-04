@@ -397,19 +397,20 @@ def test_a_pending_pod_that_falls_asleep_is_late_not_silently_dropped() -> None:
 
 # ============================================================ review 2, F1: pooled p95
 def test_an_overloaded_pod_below_the_per_pod_minimum_still_weighs_in() -> None:
-    # m-0 serves 50 fast; overloaded m-2 completes only 9 requests: the pooled TPOT p95
-    # is formed next to the per-pod maximum and both see the slow pod. (TRE_MIN_LATENCY_SAMPLES
-    # counts histogram samples; the TPOT histogram is per token, 10 per simulated request.)
+    # m-0 serves 50 fast; overloaded m-2 has only 9 TPOT samples (< TRE_MIN_LATENCY_SAMPLES
+    # 10; one per request here): its own p95 is undefined, the per-pod maximum sees m-0
+    # only, the pooled p95 (59 samples) sees m-2.
     h = Harness()
     h.start()
-    h.sims["m-0"].serve(50, itl_s=0.05)
-    h.sims["m-2"].serve(9, itl_s=10.0)
+    h.sims["m-0"].serve(50, itl_s=0.05, tokens=1)
+    h.sims["m-2"].serve(9, itl_s=10.0, tokens=1)
     decision = h.tick(HIDE + 2_000)
     assert decision.status == "rollback"
     assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
     assert decision.details["rollback_reason"]["tpot_p95_ms"] == pytest.approx(10_000.0)
     assert decision.details["evidence_pooled_tpot_p95_ms"] == pytest.approx(10_000.0)
     assert decision.details["latency_samples_judged"] == 59
+    assert decision.details["direct_pods"]["m-2"]["tpot_p95_ms"] is None  # the pooled p95 caught it
 
 
 def test_the_redis_reader_pools_the_pods_too() -> None:

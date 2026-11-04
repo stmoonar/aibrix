@@ -525,7 +525,7 @@ class MetricsStore:
         carries ``metric``. Review L3 (2026-10-28): the alt ttft_mean signal must not read an
         absent TTFT histogram as "no first token" (nor tpot_mean an absent TPOT histogram as
         "no decoded token"); the offline columns void such a window (``alt_signal_columns``
-        ``missing_series``). Only the alt signals read this."""
+        ``missing_series``). Read by the alt signals and, for TPOT, the SafeScale Redis evidence."""
         hist = [doc for doc in docs if isinstance(doc.get("model_histogram_metrics"), dict)]
         if not _has_window_hist_doc(hist, window_start_ms):
             return False

@@ -69,10 +69,12 @@ class PodSim:
         self.kv = kv
         self.awake = True
 
-    def serve(self, n: int, *, ttft_s: float = 0.05, itl_s: float = 0.02, prompt: float = 500.0) -> None:
+    def serve(self, n: int, *, ttft_s: float = 0.05, itl_s: float = 0.02, prompt: float = 500.0,
+              tokens: int = 10) -> None:
+        """``n`` requests; each adds one TTFT sample and ``tokens`` ITL (TPOT) samples."""
         for _ in range(n):
             self.ttft.append(ttft_s)
-            self.itl.extend([itl_s] * 10)
+            self.itl.extend([itl_s] * tokens)
             self.prompt.append(prompt)
 
     def restart(self) -> None:
@@ -180,6 +182,8 @@ class Harness:
         self.scraper = SimScraper(self)
         self.collector = self._collector(self.machine)
         self.obs_kwargs: dict = {}
+        #: TPOT (ITL) samples per request served by tick / run_until (0 = one-token outputs).
+        self.tokens = 10
 
     def _machine(self, cfg):
         return SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(**cfg), store=self.store, evidence=self.evidence,
@@ -206,7 +210,7 @@ class Harness:
              obs: ProbeObservation | None = None):
         self.clock.now = at_ms
         for sim in self.sims.values():
-            sim.serve(serve, ttft_s=ttft_s, itl_s=itl_s)
+            sim.serve(serve, ttft_s=ttft_s, itl_s=itl_s, tokens=self.tokens)
         polls = asyncio.run(self.collector.poll())
         boundary = at_ms // 10_000 * 10_000
         observation = obs or _obs(boundary, **self.obs_kwargs)
@@ -412,7 +416,9 @@ def test_a_counter_reset_keeps_the_pod_from_zero_and_the_probe_never_commits() -
     assert decision.details["evidence_source_used"] == "direct" and h.evidence.reads == []
 
 
-def test_a_vanished_family_is_a_restart_too() -> None:
+def test_a_vanished_tpot_family_gives_no_evidence_and_no_commit() -> None:
+    # The judged latency's family gone after the baseline (2026-11-04 review B1): the pod
+    # is unusable in every later poll (never judged on its stale delta) - no commit.
     h = Harness()
     h.start(pre_hide=10, pre_hide_itl=0.02)
     h.tick(HIDE + 2_000, serve=5)
@@ -421,8 +427,10 @@ def test_a_vanished_family_is_a_restart_too() -> None:
         line for line in original(**kw).splitlines() if "inter_token_latency" not in line) + "\n"
     h.tick(HIDE + 4_000, serve=5)
     state = h.machine.active_probe(MODEL).direct
-    assert state.late["m-2"]["cause"] == "family_vanished" and state.baseline["m-2"].tpot is None
-    assert "m-2" in state.last.pods and state.last.missing == {"m-2": "late_baseline"}
+    assert state.last.unanswered == {"m-2": "no_tpot_histogram"}
+    decisions = h.run_until(HIDE + 60_000, serve=5, first=HIDE + 6_000)
+    assert all(d.status != "commit" for _, d in decisions)
+    assert decisions[-1][1].details["rollback_reason"]["code"].startswith("evidence_incomplete:")
 
 
 def test_every_pod_failing_defers_and_never_switches_to_the_redis_evidence() -> None:

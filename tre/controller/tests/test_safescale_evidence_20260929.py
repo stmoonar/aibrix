@@ -425,9 +425,11 @@ class DocRedis:
         return [(m, s) for s, m in rows] if withscores else [m for _, m in rows]
 
     def add(self, pod: str, ts: int, *, fast: int, slow: int, prompt: float, model: str = MODEL,
-            ttft_s: float = 0.05) -> None:
+            ttft_s: float = 0.05, tpot: str = "samples") -> None:
         """Cumulative counts: ``fast`` / ``slow`` requests with a 10 ms / 500 ms TPOT (the
-        judged latency); every request's TTFT is ``ttft_s`` (not judged by SafeScale)."""
+        judged latency); every request's TTFT is ``ttft_s`` (not judged by SafeScale).
+        ``tpot``: ``samples`` (one per request), ``empty`` (the family with no sample: one-
+        token outputs) or ``absent`` (no TPOT family in the doc)."""
         self.sets.setdefault(pods_key(model), set()).add(pod)
         count = fast + slow
         ttft_le = next(le for le in (0.1, 5.0, 60.0) if ttft_s <= le)
@@ -442,12 +444,14 @@ class DocRedis:
                     "buckets": {**{str(le): (count if le >= ttft_le else 0) for le in (0.1, 5.0, 60.0)},
                                 "+Inf": count},
                 },
-                f"{model}/time_per_output_token_seconds": {
-                    "sum": fast * 0.01 + slow * 0.5, "count": count,
-                    "buckets": {"0.02": fast, "1.0": count, "+Inf": count},
-                },
             },
         }
+        if tpot != "absent":
+            n_fast, n_all = (fast, count) if tpot == "samples" else (0, 0)
+            doc["model_histogram_metrics"][f"{model}/time_per_output_token_seconds"] = {
+                "sum": (fast * 0.01 + slow * 0.5) if tpot == "samples" else 0.0, "count": n_all,
+                "buckets": {"0.02": n_fast, "1.0": n_all, "+Inf": n_all},
+            }
         self.zsets.setdefault(hist_key(pod), []).append((float(ts), json.dumps(doc)))
 
 

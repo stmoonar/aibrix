@@ -587,6 +587,8 @@ def build_probes(raw: str | None, clock: _Clock, nodes: list[str], window: tuple
         model = p.get("model")
         detail = {k: p.get(k) for k in ("request_id", "status", "resolution", "terminal_reason", "start_z_m",
                                         "start_routable", "hidden_count", "preempt_reason", "pods") if p.get(k) is not None}
+        # ttft_threshold_ms / evidence_ttft_p95_ms: only in probe records before 2026-11-04 (SafeScale
+        # judges TPOT only since; newer records lack them and they are skipped below).
         for k in ("threshold_mode", "ttft_threshold_ms", "tpot_threshold_ms", "latency_gate", "latency_skip_reason",
                   "latency_samples", "latency_violations", "evidence_source_used", "evidence_ttft_p95_ms",
                   "evidence_tpot_p95_ms", "kv_direct", "extensions", "clamped", "idle_commit", "low_sample_reason",
@@ -919,6 +921,8 @@ def _models_meta(reg: dict, models: list[str]) -> list[dict]:
         slo, trs = r.get("slo") or {}, r.get("trs") or {}
         tau = {k: trs.get(f"tau_{k}") for k in ("crit", "low", "high") if trs.get(f"tau_{k}") is not None}
         out.append({"name": name, "tp": int(r["tp_size"]) if r.get("tp_size") else None,
+                    # The registry's fixed-mode SLO values (the scorer's); not the SafeScale verdict, which
+                    # is TPOT only since 2026-11-04.
                     "slo": {k: slo.get(k) for k in ("ttft_p95_ms", "tpot_p95_ms") if slo.get(k) is not None},
                     "tau": tau or None, "max_awake": r.get("max_awake_replicas"),
                     "color": {"light": c, "dark": S.DARK_STEPS.get(c, c)}})

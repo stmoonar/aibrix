@@ -276,6 +276,10 @@ class ProbeTailSummary:
     evidence_ok: bool = True
     tail_requests: float | None = None
     tail_observed_ms: int | None = None
+    #: Tail-snapshot latency (no evidence source): traffic but no TPOT p95 in the tail -
+    #: the latency cannot be judged (review of 9ad3ec32, S1: never a commit on it; the
+    #: gate extends, then rolls back ``insufficient_evidence:p95_unavailable``).
+    latency_unjudged: bool = False
 
 
 class SafeScaleStateMachine:
@@ -1147,6 +1151,17 @@ class SafeScaleStateMachine:
                 "extensions": probe.extensions,
                 "clamped": bool(probe.window_terms.get("clamped")),
             }
+            if summary.latency_unjudged:
+                # Traffic but no TPOT p95 in the tail: no latency verdict, so no commit
+                # (fail closed): extend while possible, then roll back.
+                latency_audit["latency_gate"] = "insufficient_evidence"
+                if probe.deadline_ms < _deadline_cap(probe, self._config):
+                    return self._extend(probe, {**tail_audit, **latency_audit, "extend_reason": "p95_unavailable"})
+                code = "insufficient_evidence:p95_unavailable"
+                return self._rollback_now(
+                    probe, reason=code, details={"evidence": latency_audit},
+                    rollback_reason={"code": code}, audit={**tail_audit, **latency_audit},
+                )
         tail_low_evidence = False
         if not idle and summary.latency_ok and not summary.evidence_ok:
             # Round 5 (H1): a tail shorter than one metrics window with too few post-hide
@@ -2063,7 +2078,8 @@ def _direct_fresh_ms(config: SafeScaleConfig) -> float:
 
 def _evidence_incomplete(required, evidence: EvidenceWindow, *, end_ms: int) -> dict[str, str]:
     """Redis evidence: every required remaining pod (a fresh cluster view's) must have
-    a TTFT delta in the window that ends at its end (a doc stamped >= ``end_ms``).
+    a TTFT delta (the request count) and its TPOT series (the judged latency) in the
+    window that ends at its end (a doc stamped >= ``end_ms``).
     pod -> why not; {} = complete."""
     missing: dict[str, str] = {}
     present = set(evidence.pods)
@@ -2072,6 +2088,8 @@ def _evidence_incomplete(required, evidence: EvidenceWindow, *, end_ms: int) -> 
             missing[pod] = "no_docs"
         elif pod not in evidence.first_doc_ts_ms:
             missing[pod] = "no_ttft_histogram"
+        elif pod in evidence.tpot_missing_pods:
+            missing[pod] = "no_tpot_histogram"  # the judged latency (B1, fail closed)
         else:
             last = evidence.last_doc_ts_ms.get(pod)
             if last is None or int(last) < int(end_ms):
@@ -2357,10 +2375,12 @@ def _summarize_tail(
         z, has_traffic, kv = newest.z_m, newest.has_traffic, newest.avg_gpu_cache_norm
         tpot, start = newest.tpot_p95_ms, newest.window_start_ms
     latency_ok = True
+    latency_unjudged = False
     if judge_latency:
         if thresholds is None:
             raise ValueError("_summarize_tail(judge_latency=True) needs thresholds (no built-in threshold)")
         latency_ok = not _latency_violations(tpot, thresholds())
+        latency_unjudged = bool(has_traffic) and tpot is None
     z_min = float(z) if z is not None else None
     if z_min is None and not has_traffic:
         z_min = float("inf")
@@ -2389,6 +2409,7 @@ def _summarize_tail(
         evidence_ok=evidence_ok,
         tail_requests=newest.tail_requests if has_tail else None,
         tail_observed_ms=newest.tail_observed_ms if has_tail else None,
+        latency_unjudged=latency_unjudged,
     )
 
 
