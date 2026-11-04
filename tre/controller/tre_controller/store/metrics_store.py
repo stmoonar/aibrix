@@ -19,8 +19,8 @@ LOG = logging.getLogger("tre_controller.store.metrics_store")
 # tre_common.vllm_metrics.GATEWAY_DOC_KEYS, so the vLLM 0.30 identifiers
 # (inter_token_latency_seconds, kv_cache_usage_perc) are accepted as well, newest first.
 HISTOGRAM_METRICS = {
-    # Completed requests: the count is the window's request evidence, the sum the
-    # numerator of its mean prompt length (SafeScale). Not the TSS numerator.
+    # Completed requests: the count is the window's request evidence. Not the TSS
+    # numerator.
     "completed_prompt_tokens": "request_prompt_tokens",
     "ttft": "time_to_first_token_seconds",
     "tpot": "time_per_output_token_seconds",
@@ -465,7 +465,6 @@ class MetricsStore:
             e2e_p95_ms=_seconds_to_ms(self._p95(e2e)),
             request_count=request_count,
             request_count_observed=request_count,
-            completed_prompt_tokens=completed.sum_delta(has_hist),
             token_counter_reset=_counter_reset_index(model, hist_docs) > 0,
             instant_ticks_ms=_doc_ticks(inst_docs),
             gpu_cache_usage=self._instant_avg_optional(model, INSTANT_METRICS["gpu_cache"], inst_docs),
@@ -971,16 +970,6 @@ class _MetricWindow:
         if not has_hist_doc:
             return None
         return 0.0 if self.first is None else self.count()
-
-    def sum_delta(self, has_hist_doc: bool) -> float | None:
-        """None without a histogram doc in the window or when the sum went down, 0
-        without the series."""
-        if not has_hist_doc:
-            return None
-        if self.first is None:
-            return 0.0
-        delta = self._diff("sum")
-        return delta if delta >= 0.0 else None
 
     def mean(self) -> float | None:
         """sum / count over the window; None without the series in the window or without

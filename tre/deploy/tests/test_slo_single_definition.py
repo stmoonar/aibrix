@@ -111,11 +111,8 @@ COMPARES = {
     ("common/tre_common/slo.py", "np.nan_to_num(tpot, nan=0.0) > float(thresholds.tpot_ms)"): "the implementation",
     ("common/tre_common/slo.py", "np.nan_to_num(ttft, nan=0.0) > thr"): "the implementation",
     ("common/tre_common/slo.py", "tpot > thresholds.tpot_ms"): "the implementation",
-    ("controller/tre_controller/planning/safescale.py", "tpot > tpot_limit"):
-        "SafeScale probe: window p95 against the resolver's thresholds (window-level, unchanged 2026-11-04)",
-    ("controller/tre_controller/planning/safescale.py", "ttft > ttft_limit"): "SafeScale probe (as above)",
-    ("controller/tre_controller/planning/safescale.py", "tpot_p95_ms > thresholds['tpot_ms']"): "SafeScale probe (as above)",
-    ("controller/tre_controller/planning/safescale.py", "ttft_p95_ms > thresholds['ttft_ms']"): "SafeScale probe (as above)",
+    ("controller/tre_controller/planning/safescale.py", "tpot_p95_ms > thresholds['tpot_ms']"):
+        "SafeScale probe: window TPOT p95 against the resolver's TPOT_slo (window-level; TPOT only, user 2026-11-04)",
     ("baselines/tre_baselines/tools/tokenscale_profile.py", "s.tpot_p95_ms <= tpot_slo_ms"):
         "TokenScale profile: a step's p95 against the label's thresholds",
     ("baselines/tre_baselines/tools/tokenscale_profile.py", "s.ttft_p95_ms <= ttft_slo_ms"): "TokenScale profile (as above)",
@@ -436,7 +433,6 @@ def test_the_switch_changes_every_consumer_at_once(tmp_path, mode) -> None:
         for L in (256, 2048, 6000):
             ttft = want.ttft_ms(L)
             assert label.ttft_slo_ms(L) == judge.ttft_slo_ms(L) == limits[model].slo.ttft_slo_ms(L) == ttft
-            assert probe.resolve(model, float(L))["ttft_ms"] == ttft
             under = (ttft - 1.0, ttft - 1.0 + 9 * (want.tpot_ms - 0.1))   # 1 ms / 0.1 ms under the limits
             row = {"input_tokens": L, "ttft": under[0] / 1000.0, "e2e_latency": under[1] / 1000.0,
                    "output_tokens": 10, "success_strict": True}
@@ -448,7 +444,8 @@ def test_the_switch_changes_every_consumer_at_once(tmp_path, mode) -> None:
                                          blocks[model], eval_mode)
             assert slow["v_tpot"] and not slow["v_ttft"]
         assert label.tpot_p95_ms == judge.tpot_p95_ms == limits[model].tpot_slo_ms == want.tpot_ms
-        assert probe.resolve(model, None)["tpot_ms"] == want.tpot_ms
+        # SafeScale consumes the TPOT component only (user 2026-11-04): no TTFT threshold.
+        assert probe.resolve(model) == {"mode": mode, "tpot_ms": want.tpot_ms, "source": "registry"}
 
 
 def test_params_set_publishes_the_switch_and_the_idle_multiple_parameters() -> None:

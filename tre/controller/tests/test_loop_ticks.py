@@ -7,7 +7,7 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_common.registry import PlacementConfig
 from section_ticks import run_fairness_tick
 from section_ticks import run_rescue_tick
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.loops.tick import PaperStateCache
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction
@@ -299,7 +299,7 @@ def test_rescue_tick_can_use_legacy_drop_all_for_incomplete_paper_state() -> Non
 
 def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> None:
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     registry = _registry_with_models("critical", "donor")
     snapshot = MetricsSnapshot(
         ts_ms=10_000,
@@ -609,7 +609,7 @@ def test_rescue_tick_converts_a_tp_block_with_a_high_donor_to_a_safescale_probe_
     from tre_sm.allocator.slots import Binding, Slot
 
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     registry = _registry_for_tp_block()
     snapshot = MetricsSnapshot(
         ts_ms=20_000,
@@ -654,7 +654,7 @@ def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
         stale=False,
         models={"hot": _metrics_with_pods("hot", generation=1000.0, waiting=0.0, running=1.0, pods=("hot-a", "hot-b"))},
     )
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
 
     probed = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
     assert any(isinstance(a, HideAction) for a in probed.actions)
@@ -717,7 +717,7 @@ def test_scale_up_of_a_probing_model_preempts_its_probe_like_v1() -> None:
     from tre_controller.planning.planner import UnhideAction
 
     registry = _registry()
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     safescale.start_probe(model="critical", pods=("critical-1",), now_ms=0)
     snapshot = MetricsSnapshot(
         ts_ms=1_000,
@@ -763,5 +763,4 @@ def test_probe_window_inputs_carry_the_count_weighted_mean_latencies() -> None:
     inputs = probe_window_inputs(snapshot, "donor", {"donor": {"Q_ctl": 1.0, "routable_pods": 2}})
 
     assert inputs.p95_e2e_ms is None
-    assert inputs.avg_ttft_ms == 200.0  # (100*3 + 500*1) / 4, v1's overall mean
     assert inputs.avg_tpot_ms == 20.0

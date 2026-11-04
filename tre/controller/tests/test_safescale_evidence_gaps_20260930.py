@@ -22,7 +22,7 @@ import math
 import pytest
 
 from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
     DirectEvidenceCollector,
@@ -60,24 +60,24 @@ CAP = HIDE + 60_000
 def _healthy_redis() -> FullEvidence:
     """Gateway docs of every remaining pod, fast and plentiful: the evidence 8d252108
     committed on after a fallback."""
-    return FullEvidence([_window(50, ttft=100.0)], anchor=_anchor())
+    return FullEvidence([_window(50)], anchor=_anchor())
 
 
 # ============================================================ the review's reproductions
 def test_repro_1_fifteen_ten_second_samples_at_the_ceiling_roll_back_direct() -> None:
     h = Harness(pods=("m-0",))
     h.start()
-    h.tick(HIDE + 2_000, serve=15, ttft_s=10.0)  # 15 < min_commit_samples: no immediate rollback
+    h.tick(HIDE + 2_000, serve=15, itl_s=10.0)  # 15 < min_commit_samples: no immediate rollback
     at, decision = h.run_until(CAP, first=HIDE + 4_000)[-1]
     assert at == CAP and decision.status == "rollback"
     assert decision.details["rollback_reason"]["gates"] == ["latency"]
     assert decision.details["latency_gate"] == "evaluated_low_samples"
-    assert decision.details["low_sample_ttft_p95_ms"] == pytest.approx(10_000.0)
+    assert decision.details["low_sample_tpot_p95_ms"] == pytest.approx(10_000.0)
     assert decision.details["latency_samples"] == 15
 
 
 def test_repro_1_fifteen_ten_second_samples_at_the_ceiling_roll_back_redis() -> None:
-    machine = redis_machine(FakeEvidence([redis_window(15, ttft=10_000.0)]))
+    machine = redis_machine(FakeEvidence([redis_window(15, tpot=10_000.0)]))
     _started(machine)
     for ts in range(110_000, 170_000, 10_000):
         decision = machine.observe(MODEL, redis_obs(ts), now_ms=ts)
@@ -117,7 +117,7 @@ def test_a_legacy_record_that_had_fallen_back_is_rolled_back() -> None:
     probe = h.start()
     record = json.loads(json.dumps(store.records[probe.request_id]))
     record["direct_evidence"]["fallback"] = {"reason": "pods_missing", "ts_ms": HIDE + 1_000}
-    restored = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), store=FakeProbeStore(unresolved=[record]),
+    restored = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(), store=FakeProbeStore(unresolved=[record]),
                                      evidence=h.evidence, wall_clock_ms=h.clock)
     assert restored.restore() == 1
     h.machine, h.collector = restored, h._collector(restored)
@@ -128,7 +128,7 @@ def test_a_legacy_record_that_had_fallen_back_is_rolled_back() -> None:
 
 def test_a_direct_probe_whose_hide_is_never_confirmed_never_commits_without_a_reader() -> None:
     # 8d252108 judged it on the tail snapshots (no evidence reader): commit.
-    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), evidence=None, wall_clock_ms=lambda: 0)
+    machine = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(), evidence=None, wall_clock_ms=lambda: 0)
     machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
     for ts in range(110_000, 180_000, 10_000):
         decision = machine.observe(MODEL, _obs(ts), now_ms=ts)
@@ -160,7 +160,7 @@ def test_a_joined_pod_still_drives_the_immediate_rollback() -> None:
     h.sims["m-3"] = PodSim()
     h.tick(HIDE + 2_000, serve=5)  # m-3 joins
     h.tick(HIDE + 4_000, serve=5)  # its baseline
-    h.sims["m-3"].serve(30, ttft_s=5.0)
+    h.sims["m-3"].serve(30, itl_s=5.0)
     decision = h.tick(HIDE + 6_000, serve=5)
     assert decision.status == "rollback" and decision.details["rollback_reason"]["code"] == "slo_violation_direct"
 
@@ -203,12 +203,12 @@ def test_a_low_sample_commit_is_evaluated_and_counted_apart() -> None:
 
     h = Harness(pods=("m-0",))
     h.start()
-    h.tick(HIDE + 2_000, serve=15, ttft_s=0.05)
+    h.tick(HIDE + 2_000, serve=15, itl_s=0.05)
     at, decision = h.run_until(CAP, first=HIDE + 4_000)[-1]
     assert (at, decision.status) == (CAP, "commit")
     assert decision.details["latency_gate"] == "evaluated_low_samples"
     assert decision.details["low_sample_commit"] is True and decision.details["latency_samples"] == 15
-    assert decision.details["low_sample_ttft_p95_ms"] == pytest.approx(60.0)
+    assert decision.details["low_sample_tpot_p95_ms"] == pytest.approx(50.0)
     probe = h.machine.active_probe(MODEL)
     record = {"status": "resolved", "resolution": "commit", "window_terms": dict(probe.window_terms)}
     assert summarize([record])["low_sample_commits"] == 1
@@ -261,7 +261,7 @@ def test_redis_mode_without_a_fresh_view_or_remaining_pods_never_commits() -> No
         ts, decision = _redis_until_decided(machine)[-1]
         assert (ts, decision.status) == (170_000, "rollback"), gap
         assert decision.details["rollback_reason"]["code"] == f"evidence_incomplete:{gap}"
-    stale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=redis_cfg(), evidence=FakeEvidence([redis_window(50)]), wall_clock_ms=lambda: 0,
+    stale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=redis_cfg(), evidence=FakeEvidence([redis_window(50)]), wall_clock_ms=lambda: 0,
                                   remaining_pods=lambda model, exclude: None)  # a stale view
     _started(stale)
     assert _redis_until_decided(stale)[-1][1].details["rollback_reason"]["code"] == \
@@ -330,7 +330,7 @@ def test_a_direct_commit_records_its_coverage_and_pooled_p95() -> None:
     assert decision.status == "commit"
     assert (decision.details["evidence_coverage_start_ms"], decision.details["evidence_coverage_end_ms"]) == (
         HIDE, HIDE + W)
-    assert decision.details["evidence_pooled_ttft_p95_ms"] == pytest.approx(60.0)
+    assert decision.details["evidence_pooled_tpot_p95_ms"] == pytest.approx(25.0)
     assert "evidence_pooled_tpot_p95_ms" in decision.details
 
 
@@ -364,30 +364,30 @@ def test_the_immediate_rollback_judges_the_pooled_p95_too() -> None:
     from test_safescale_evidence_20260929 import _slo_registry
     from tre_controller.loops.safescale_task import _observation_from_metrics
 
-    fast = ((0.1, 50.0), (5.0, 50.0), (math.inf, 50.0))
-    slow = ((0.1, 0.0), (5.0, 9.0), (math.inf, 9.0))
+    fast = ((0.02, 50.0), (5.0, 50.0), (math.inf, 50.0))
+    slow = ((0.02, 0.0), (5.0, 9.0), (math.inf, 9.0))
 
     def pod(name, hist, count):
         return PodWindowMetrics(pod=name, prompt_tokens=0.0, generation_tokens=0.0, avg_waiting=0.0,
                                 avg_running=1.0, avg_swapping=0.0, kv_cache_hit_rate=0.0,
-                                ttft_p95_ms=100.0 if count >= 10 else None, tpot_p95_ms=None, e2e_p95_ms=None,
-                                ttft_hist=hist, ttft_hist_count=count)
+                                ttft_p95_ms=None, tpot_p95_ms=20.0 if count >= 10 else None, e2e_p95_ms=None,
+                                tpot_hist=hist, tpot_hist_count=count)
 
     metrics = ModelWindowMetrics(
         model=MODEL, window_start_ms=110_000, window_end_ms=140_000, prompt_tokens=0.0, generation_tokens=0.0,
-        avg_waiting=0.0, avg_running=2.0, avg_swapping=0.0, kv_cache_hit_rate=0.0, ttft_p95_ms=100.0,
-        tpot_p95_ms=None, e2e_p95_ms=None, routable_pods=2, assigned_replicas=2,
+        avg_waiting=0.0, avg_running=2.0, avg_swapping=0.0, kv_cache_hit_rate=0.0, ttft_p95_ms=None,
+        tpot_p95_ms=20.0, e2e_p95_ms=None, routable_pods=2, assigned_replicas=2,
         per_pod={"m-0": pod("m-0", fast, 50.0), "m-3": pod("m-3", slow, 9.0), "m-1": pod("m-1", slow, 9.0)},
         p95_rule=("bucket_upper", 10),
     )
     registry = _slo_registry()
     observation = _observation_from_metrics(140_000, metrics, registry.model(MODEL), "zm", hidden_pods=("m-1",))
-    assert observation.ttft_p95_ms == 100.0 and observation.pooled_ttft_p95_ms == 5_000.0
+    assert observation.tpot_p95_ms == 20.0 and observation.pooled_tpot_p95_ms == 5_000.0
     machine = redis_machine(FakeEvidence([redis_window(50)]))
     _started(machine, p95_e2e=30_000.0)
     decision = machine.observe(MODEL, observation, now_ms=140_000)
     assert (decision.status, decision.reason) == ("rollback", "slo_violation")
-    assert decision.details["rollback_reason"]["ttft_p95_ms"] == 5_000.0
+    assert decision.details["rollback_reason"]["tpot_p95_ms"] == 5_000.0
 
 
 # ============================================================ review of 84936742
@@ -402,7 +402,7 @@ def test_min_commit_samples_zero_never_makes_the_latency_gate_vacuous() -> None:
     at, decision = h.run_until(CAP)[-1]
     assert (at, decision.status) == (CAP, "rollback")
     assert decision.details["rollback_reason"]["code"] == "insufficient_evidence:stalled"
-    machine = redis_machine(FakeEvidence([redis_window(0, ttft=None, tpot=None)]), min_commit_samples=0)
+    machine = redis_machine(FakeEvidence([redis_window(0, tpot=None)]), min_commit_samples=0)
     _started(machine)
     for ts in range(110_000, 170_000, 10_000):
         decision = machine.observe(MODEL, redis_obs(ts, traffic=True), now_ms=ts)

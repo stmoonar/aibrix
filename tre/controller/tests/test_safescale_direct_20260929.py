@@ -20,7 +20,7 @@ import yaml
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import SafeScaleRegistryConfig, load_registry, parse_safescale_config
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.cluster_view_task import cluster_view_from_state
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -159,7 +159,7 @@ def _cfg(**overrides) -> SafeScaleConfig:
 
 
 def _obs(boundary: int, *, z: float = 2.0, traffic: bool = True, kv: float | None = 0.1) -> ProbeObservation:
-    return ProbeObservation(ts_ms=boundary, ttft_p95_ms=100.0, tpot_p95_ms=10.0, z_m=z, has_traffic=traffic,
+    return ProbeObservation(ts_ms=boundary, tpot_p95_ms=10.0, z_m=z, has_traffic=traffic,
                             avg_gpu_cache_norm=kv, window_start_ms=boundary - 30_000, window_end_ms=boundary)
 
 
@@ -182,7 +182,7 @@ class Harness:
         self.obs_kwargs: dict = {}
 
     def _machine(self, cfg):
-        return SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(**cfg), store=self.store, evidence=self.evidence,
+        return SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(**cfg), store=self.store, evidence=self.evidence,
                                      wall_clock_ms=self.clock)
 
     def _collector(self, machine):
@@ -192,29 +192,31 @@ class Harness:
             poll_ms=2_000.0, clock_ms=self.clock,
         )
 
-    def start(self, *, pre_hide: int = 0, pre_hide_ttft: float = 2.0):
+    def start(self, *, pre_hide: int = 0, pre_hide_itl: float = 0.5):
         self.machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
         for sim in self.sims.values():
-            sim.serve(pre_hide, ttft_s=pre_hide_ttft)
+            sim.serve(pre_hide, itl_s=pre_hide_itl)
         self.clock.now = HIDE
         # No running loop here: the baseline is taken by the collector (as the tick would).
         assert self.collector.on_hide_done(MODEL, ("m-1",))
         asyncio.run(self.collector.take_baselines())
         return self.machine.active_probe(MODEL)
 
-    def tick(self, at_ms: int, *, serve: int = 0, ttft_s: float = 0.05, obs: ProbeObservation | None = None):
+    def tick(self, at_ms: int, *, serve: int = 0, itl_s: float = 0.02, ttft_s: float = 0.05,
+             obs: ProbeObservation | None = None):
         self.clock.now = at_ms
         for sim in self.sims.values():
-            sim.serve(serve, ttft_s=ttft_s)
+            sim.serve(serve, ttft_s=ttft_s, itl_s=itl_s)
         polls = asyncio.run(self.collector.poll())
         boundary = at_ms // 10_000 * 10_000
         observation = obs or _obs(boundary, **self.obs_kwargs)
         return self.machine.observe(MODEL, observation, now_ms=boundary, direct_poll=polls.get(MODEL))
 
-    def run_until(self, end_ms: int, *, serve: int = 0, ttft_s: float = 0.05, first: int = HIDE + 2_000):
+    def run_until(self, end_ms: int, *, serve: int = 0, itl_s: float = 0.02, ttft_s: float = 0.05,
+                  first: int = HIDE + 2_000):
         decisions = []
         for at in range(first, end_ms + 1, 2_000):
-            decision = self.tick(at, serve=serve, ttft_s=ttft_s)
+            decision = self.tick(at, serve=serve, itl_s=itl_s, ttft_s=ttft_s)
             decisions.append((at, decision))
             if decision.status in ("commit", "rollback"):
                 break
@@ -231,7 +233,6 @@ def test_the_live_030_fixture_parses_to_the_evidence_families() -> None:
     # request_time_per_output_token_seconds (6 requests).
     assert scrape.tpot_name == "vllm:inter_token_latency_seconds"
     assert scrape.tpot.count == 218.0
-    assert scrape.prompt == (72.0, 6.0)
     assert scrape.kv_cache == 0.0 and scrape.awake is True
 
 
@@ -261,12 +262,12 @@ def test_the_compact_baseline_is_small_json_and_differences_exactly_like_the_ful
 # ============================================================ baseline / difference
 def test_pre_hide_requests_never_enter_the_evidence() -> None:
     h = Harness()
-    probe = h.start(pre_hide=100, pre_hide_ttft=2.0)  # slow before the hide
+    probe = h.start(pre_hide=100, pre_hide_itl=2.0)  # slow before the hide
     assert probe.direct.baseline_ts_ms == HIDE and sorted(probe.direct.baseline) == ["m-0", "m-2"]
-    decisions = h.run_until(HIDE + W, serve=3, ttft_s=0.05)
+    decisions = h.run_until(HIDE + W, serve=3, itl_s=0.02)
     at, decision = decisions[-1]
     assert (at, decision.status, decision.reason) == (HIDE + W, "commit", "formal_commit_gate_passed")
-    assert decision.details["evidence_ttft_p95_ms"] == pytest.approx(60.0)  # bucket_upper 0.06 s
+    assert decision.details["evidence_tpot_p95_ms"] == pytest.approx(25.0)  # bucket_upper 0.025 s
     assert decision.details["latency_samples"] == 2 * 3 * 10
     assert decision.details["evidence_source_used"] == "direct"
     assert decision.details["tail_pre_hide_fraction"] == 0.0
@@ -315,24 +316,24 @@ def test_at_the_ceiling_a_stalled_model_rolls_back_and_an_idle_one_commits() -> 
 # the pooled p95 (24 requests) already judges it (review F1).
 @pytest.mark.parametrize("per_pod_per_tick, rollback_after_ms", [(8, 2_000), (20, 2_000)])
 def test_a_violation_rolls_back_within_2_to_4_s_at_7b_load(per_pod_per_tick, rollback_after_ms) -> None:
-    # 3 remaining pods at 4 / 10 req/s each (the 7b load range); TTFT 2 s > 500 ms.
-    # Per-pod p95 needs TRE_MIN_LATENCY_SAMPLES (10) requests of that pod.
+    # 3 remaining pods at 4 / 10 req/s each (the 7b load range); TPOT 2 s > 75 ms.
+    # Per-pod p95 needs TRE_MIN_LATENCY_SAMPLES (10) samples (tokens) of that pod.
     h = Harness(pods=("m-0", "m-2", "m-3"))
     h.start()
-    decisions = h.run_until(HIDE + W, serve=per_pod_per_tick, ttft_s=2.0)
+    decisions = h.run_until(HIDE + W, serve=per_pod_per_tick, itl_s=2.0)
     at, decision = decisions[-1]
     assert decision.status == "rollback" and at - HIDE == rollback_after_ms
     reason = decision.details["rollback_reason"]
-    assert reason["code"] == "slo_violation_direct" and reason["metrics"] == ["ttft"]
-    assert reason["ttft_p95_ms"] == pytest.approx(2500.0) and reason["ttft_threshold_ms"] == 500.0
+    assert reason["code"] == "slo_violation_direct" and reason["metrics"] == ["tpot"]
+    assert reason["tpot_p95_ms"] == pytest.approx(2500.0) and reason["tpot_threshold_ms"] == 75.0
     assert decision.details["evidence_source_used"] == "direct"
 
 
 def test_below_min_commit_samples_a_violation_is_not_judged_yet() -> None:
     h = Harness(pods=("m-0",))
     h.start()
-    assert h.tick(HIDE + 2_000, serve=12, ttft_s=2.0).status == "probing"  # n = 12 < 20
-    assert h.tick(HIDE + 4_000, serve=12, ttft_s=2.0).status == "rollback"
+    assert h.tick(HIDE + 2_000, serve=12, itl_s=2.0).status == "probing"  # n = 12 < 20
+    assert h.tick(HIDE + 4_000, serve=12, itl_s=2.0).status == "rollback"
 
 
 # ============================================================ failures
@@ -351,7 +352,7 @@ def test_one_failed_scrape_of_a_pod_is_tolerated_and_recorded() -> None:
 
 
 def test_a_pod_failing_only_at_the_baseline_gets_its_own_baseline_and_is_judged() -> None:
-    # Review P0 case A: the loaded pod misses the baseline scrape, then serves 5 s TTFT.
+    # Review P0 case A: the loaded pod misses the baseline scrape, then serves 5 s TPOT.
     h = Harness()
     h.failing["m-2"] = "timeout"
     probe = h.start()
@@ -363,7 +364,7 @@ def test_a_pod_failing_only_at_the_baseline_gets_its_own_baseline_and_is_judged(
     # Its own (late) baseline: it can roll back, never commit on the direct path.
     assert state.last.missing == {"m-2": "late_baseline"}
     assert state.late["m-2"] == {"cause": "pending_baseline", "lag_ms": 2_000, "ts_ms": HIDE + 2_000}
-    decisions = h.run_until(HIDE + W, serve=5, ttft_s=5.0, first=HIDE + 4_000)
+    decisions = h.run_until(HIDE + W, serve=5, itl_s=5.0, first=HIDE + 4_000)
     at, decision = decisions[-1]
     assert decision.status == "rollback" and decision.details["rollback_reason"]["code"] == "slo_violation_direct"
 
@@ -392,7 +393,7 @@ def test_a_counter_reset_keeps_the_pod_from_zero_and_the_probe_never_commits() -
     # hide) and it stays polled and judged; its pre-restart requests are lost, so it is
     # late for good and the probe rolls back at its deadline.
     h = Harness()
-    h.start(pre_hide=10, pre_hide_ttft=0.05)
+    h.start(pre_hide=10, pre_hide_itl=0.02)
     h.tick(HIDE + 2_000, serve=5)
     h.sims["m-2"].restart()
     h.tick(HIDE + 4_000, serve=5)
@@ -413,14 +414,14 @@ def test_a_counter_reset_keeps_the_pod_from_zero_and_the_probe_never_commits() -
 
 def test_a_vanished_family_is_a_restart_too() -> None:
     h = Harness()
-    h.start(pre_hide=10, pre_hide_ttft=0.05)
+    h.start(pre_hide=10, pre_hide_itl=0.02)
     h.tick(HIDE + 2_000, serve=5)
     original = h.sims["m-2"].text
     h.sims["m-2"].text = lambda **kw: "\n".join(
-        line for line in original(**kw).splitlines() if "request_prompt_tokens" not in line) + "\n"
+        line for line in original(**kw).splitlines() if "inter_token_latency" not in line) + "\n"
     h.tick(HIDE + 4_000, serve=5)
     state = h.machine.active_probe(MODEL).direct
-    assert state.late["m-2"]["cause"] == "family_vanished" and state.baseline["m-2"].prompt is None
+    assert state.late["m-2"]["cause"] == "family_vanished" and state.baseline["m-2"].tpot is None
     assert "m-2" in state.last.pods and state.last.missing == {"m-2": "late_baseline"}
 
 
@@ -483,7 +484,7 @@ def test_direct_mode_never_reads_the_redis_evidence_and_works_without_a_reader()
     assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:no_baseline"
     # No Redis evidence reader at all: the direct path decides the same way.
     bare = Harness()
-    bare.machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), evidence=None, wall_clock_ms=bare.clock)
+    bare.machine = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(), evidence=None, wall_clock_ms=bare.clock)
     bare.collector = bare._collector(bare.machine)
     bare.start()
     at, decision = bare.run_until(HIDE + W, serve=5)[-1]
@@ -530,9 +531,9 @@ def test_a_p95_in_the_inf_bucket_is_clamped_and_records_stay_strict_json() -> No
     store = FakeProbeStore()
     h = Harness(store=store)
     probe = h.start()
-    decision = h.tick(HIDE + 2_000, serve=20, ttft_s=5000.0)  # beyond the last finite TTFT bucket
+    decision = h.tick(HIDE + 2_000, serve=20, itl_s=5000.0)  # beyond the last finite ITL bucket
     assert decision.status == "rollback"
-    assert decision.details["rollback_reason"]["ttft_p95_ms"] == 2_560_000.0
+    assert decision.details["rollback_reason"]["tpot_p95_ms"] == 80_000.0
     json.dumps(decision.details, allow_nan=False)
     json.dumps(store.records[probe.request_id], allow_nan=False)
 
@@ -575,12 +576,12 @@ def test_the_z_gate_still_reads_the_snapshot_tail() -> None:
 def test_a_restarted_controller_resumes_from_the_persisted_baseline() -> None:
     store = FakeProbeStore()
     h = Harness(store=store)
-    probe = h.start(pre_hide=50, pre_hide_ttft=2.0)
+    probe = h.start(pre_hide=50, pre_hide_itl=2.0)
     h.tick(HIDE + 2_000, serve=4)
     record = json.loads(json.dumps(store.records[probe.request_id]))  # through JSON, as Redis
     assert set(record["direct_evidence"]) >= {"baseline", "baseline_ts_ms", "scrapes"}
     restored = SafeScaleStateMachine(
-        thresholds=STATIC_500_75,
+        thresholds=STATIC_TPOT_75,
         config=_cfg(), store=FakeProbeStore(unresolved=[record], journal=store.journal),
         evidence=h.evidence, wall_clock_ms=h.clock,
     )
@@ -591,7 +592,7 @@ def test_a_restarted_controller_resumes_from_the_persisted_baseline() -> None:
     h.machine, h.collector = restored, h._collector(restored)
     at, decision = h.run_until(HIDE + W, serve=4, first=HIDE + 4_000)[-1]
     assert decision.status == "commit" and decision.details["latency_samples"] == 2 * 4 * 10
-    assert decision.details["evidence_ttft_p95_ms"] == pytest.approx(60.0)
+    assert decision.details["evidence_tpot_p95_ms"] == pytest.approx(25.0)
 
 
 # ============================================================ non-blocking scrapes
@@ -658,12 +659,12 @@ def test_the_observation_tick_hands_the_polls_to_the_machine_and_logs_the_direct
     )})
     h.clock.now = HIDE + 2_000
     for sim in h.sims.values():
-        sim.serve(20, ttft_s=2.0)
+        sim.serve(20, itl_s=2.0)
     polls = asyncio.run(h.collector.poll())
     queue = FakeQueue()
     result = run_safescale_observation_tick(snapshot, queue=queue, registry=registry, safescale=h.machine,
                                             direct_polls=polls)
-    assert any(e.startswith("safescale_rollback_reason:m:slo_violation_direct:ttft") for e in result.events)
+    assert any(e.startswith("safescale_rollback_reason:m:slo_violation_direct:tpot") for e in result.events)
     assert any(e.startswith("safescale_evidence:m:") for e in result.events)
     assert queue.submitted and queue.submitted[0][0].pods == ("m-1",)
 

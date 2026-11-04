@@ -78,8 +78,8 @@ class EarlyHarness(Harness):
         return probe
 
 
-def _first_terminal(h: EarlyHarness, end_ms: int, *, serve: int = 5, ttft_s: float = 0.05):
-    return h.run_until(end_ms, serve=serve, ttft_s=ttft_s)[-1]
+def _first_terminal(h: EarlyHarness, end_ms: int, *, serve: int = 5, itl_s: float = 0.02):
+    return h.run_until(end_ms, serve=serve, itl_s=itl_s)[-1]
 
 
 def test_commits_at_the_first_poll_that_meets_every_condition():
@@ -186,7 +186,7 @@ def test_a_failing_gate_is_not_acted_on_early_and_rolls_back_at_the_deadline():
 def test_a_violation_still_rolls_back_at_once():
     h = EarlyHarness(pods=("m-0", "m-2", "m-3"))
     h.start()
-    at, decision = _first_terminal(h, HIDE + LONG_W, serve=8, ttft_s=2.0)
+    at, decision = _first_terminal(h, HIDE + LONG_W, serve=8, itl_s=2.0)
     assert decision.status == "rollback" and at == HIDE + 2_000
     assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
 

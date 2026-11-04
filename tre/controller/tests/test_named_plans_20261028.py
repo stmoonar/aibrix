@@ -12,7 +12,7 @@ import pytest
 
 from tre_common.gpu_placement import GpuBlock
 from tre_common.metrics_schema import MetricsSnapshot
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.loops.action_queue import ActionQueue, PlanBatch, transfer_plan
 from tre_controller.loops.plan_items import plan_item
 from tre_controller.loops.tick import _apply_safescale, _name_shrink_pods
@@ -140,7 +140,7 @@ def _h_gives(receivers, scope):
     bindings += [_binding(f"{model}-{gpu}", model, (gpu,), False) for model in receivers for gpu in range(3)]
     plan = _plan(bindings, {**receivers, "h": (*HIGH, 1.4), "x": (*HEALTHY, 1.1)},
                  min_replicas_by_model={"x": 1, "h": 0}, release_without_safescale=scope != "all")
-    machine = None if scope == "off" else SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
+    machine = None if scope == "off" else SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig())
     snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=False)
     out, _ = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=machine,
                               cluster_view=ClusterView(TOPOLOGY, tuple(bindings)), safescale_scope=scope)

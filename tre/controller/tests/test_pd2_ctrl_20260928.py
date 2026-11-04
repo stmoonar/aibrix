@@ -261,7 +261,7 @@ def test_abort_only_marks_the_probe_owning_the_pods_and_is_persisted():
 def _observation():
     from tre_controller.planning.safescale import ProbeObservation
 
-    return ProbeObservation(ts_ms=10_500, ttft_p95_ms=100.0, tpot_p95_ms=10.0, z_m=2.0, has_traffic=True)
+    return ProbeObservation(ts_ms=10_500, tpot_p95_ms=10.0, z_m=2.0, has_traffic=True)
 
 
 # ================================================================ planner

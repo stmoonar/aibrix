@@ -208,7 +208,7 @@ class Sim:
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
         self.offset = int(scenario.gateway_offset_ms)
         self.signal_state = SignalState()
-        thresholds = StaticThresholds(1000.0, float(scenario.tpot_slo_ms))
+        thresholds = StaticThresholds(float(scenario.tpot_slo_ms))
         self.collector = None
         if scenario.direct:
             self.safescale = SafeScaleStateMachine(
@@ -437,7 +437,7 @@ class Sim:
         running, waiting, kv = pod.gauges
         return PodScrape(
             ts_ms=self.now, started_ms=self.now, ttft=_cumulative(pod.count, TTFT_BOUNDS, pod.ttft),
-            tpot=_cumulative(pod.gen, TPOT_BOUNDS, pod.tpot), prompt=(pod.count * PROMPT_TOKENS, pod.count),
+            tpot=_cumulative(pod.gen, TPOT_BOUNDS, pod.tpot),
             kv_cache=kv, awake=pod.awake, in_flight=running + waiting,
         )
 

@@ -11,7 +11,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from tre_common.metrics_schema import MetricsSnapshot
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from section_ticks import run_rescue_tick
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -64,7 +64,7 @@ def _probe_snapshot():
 # ------------------------------------------------------------ 1. no probe in observe
 def test_observe_mode_starts_no_probe_and_submits_no_hide():
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     registry = _registry_with_models("critical", "donor")
 
     result = run_rescue_tick(
@@ -83,7 +83,7 @@ def test_observe_mode_starts_no_probe_and_submits_no_hide():
 
 def test_observe_mode_does_not_preempt_a_running_probe():
     registry = _tick_registry()
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     safescale.start_probe(model="critical", pods=("critical-1",), now_ms=0)
     snapshot = MetricsSnapshot(
         ts_ms=1_000,
@@ -108,7 +108,7 @@ def test_the_decision_loop_reads_the_mode_gate_every_tick():
     from tre_controller.loops.decision_task import DecisionLoop
 
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     reads = []
 
     def is_observe():

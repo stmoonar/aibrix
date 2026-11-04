@@ -16,10 +16,12 @@ part of the gate now reads ONE evidence window instead:
   boundary (the same doc-stamp grid the snapshots read);
 * pods: the model's pods minus the probe's hidden pods and minus the pods the fleet
   state reports asleep (a pod the fleet state does not list is kept);
-* TTFT / TPOT p95 = max over those pods (the snapshot rule, per-pod minimum samples
-  ``TRE_MIN_LATENCY_SAMPLES``), ``n`` = their TTFT count, ``n_judged`` = the TTFT count
-  of the pods that have a p95, mean prompt length ``L`` = their
-  ``request_prompt_tokens`` sum / count delta.
+* TPOT p95 = max over those pods and their pooled histogram (the snapshot rule, per-pod
+  minimum samples ``TRE_MIN_LATENCY_SAMPLES``), ``n`` = their TTFT count (the TTFT
+  histogram count is the request counter: requests that got their first token),
+  ``n_judged`` = the TTFT count of the pods that have a TPOT p95. SafeScale judges TPOT
+  only (2026-11-04): TTFT is not a latency verdict of the probe, so no TTFT p95 and no
+  prompt length are formed here.
 
 ``hide_ts`` is Redis ``TIME`` read right after the SM confirmed the hide (the reference
 the service-manager's clock-skew check uses too), else the controller clock. It is
@@ -36,7 +38,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Mapping, Protocol
@@ -113,33 +114,22 @@ class EvidenceWindow:
     end_ms: int
     pods: tuple[str, ...]
     excluded_pods: tuple[str, ...]
-    ttft_p95_ms: float | None
     tpot_p95_ms: float | None
     #: n: completed requests (TTFT count delta) of the remaining pods.
     ttft_count: float
-    prompt_tokens: float | None = None
-    prompt_count: float | None = None
     #: pod -> stamp (ms) of the first histogram doc its TTFT delta starts from.
     first_doc_ts_ms: dict[str, int] = field(default_factory=dict)
-    #: TTFT count of the pods whose p95 is defined (the requests the p95 judges).
+    #: TTFT count of the pods whose TPOT p95 is defined (the requests the p95 judges).
     #: None = same as ttft_count.
     judged_count: float | None = None
     #: pod -> stamp (ms) of the last histogram doc its TTFT delta ends at.
     last_doc_ts_ms: dict[str, int] = field(default_factory=dict)
-    #: p95 of the remaining pods' histograms pooled first (per-pod minimum not applied
-    #: per pod, but to the pooled count); already folded into ttft/tpot_p95_ms (max).
-    pooled_ttft_p95_ms: float | None = None
+    #: TPOT p95 of the remaining pods' histograms pooled first (per-pod minimum not
+    #: applied per pod, but to the pooled count); already folded into tpot_p95_ms (max).
     pooled_tpot_p95_ms: float | None = None
-    #: max(per pod, pooled) p95 WITHOUT any minimum-samples rule: the ceiling's
-    #: low-sample evaluation. None = not computed (then the p95s above stand in).
-    low_ttft_p95_ms: float | None = None
+    #: max(per pod, pooled) TPOT p95 WITHOUT any minimum-samples rule: the ceiling's
+    #: low-sample evaluation. None = not computed (then tpot_p95_ms stands in).
     low_tpot_p95_ms: float | None = None
-
-    @property
-    def mean_prompt_tokens(self) -> float | None:
-        if self.prompt_tokens is None or not self.prompt_count or self.prompt_count <= 0:
-            return None
-        return float(self.prompt_tokens) / float(self.prompt_count)
 
     @property
     def judged(self) -> float:
@@ -153,7 +143,7 @@ class EvidenceSource(Protocol):
 
 
 class ThresholdResolver(Protocol):
-    def resolve(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]: ...
+    def resolve(self, model: str) -> dict[str, Any]: ...
 
 
 class MetricsEvidenceReader:
@@ -214,7 +204,7 @@ class MetricsEvidenceReader:
         judged = sum(
             float(getattr(pod, "ttft_count", None) or 0.0)
             for pod in pods.values()
-            if pod.ttft_p95_ms is not None or pod.tpot_p95_ms is not None
+            if pod.tpot_p95_ms is not None
         )
         last_docs = {
             str(getattr(pod, "pod", key)): int(pod.hist_last_ts_ms)
@@ -224,14 +214,11 @@ class MetricsEvidenceReader:
         # Pooled p95 next to the per-pod maximum: a pod below the per-pod minimum
         # samples (an overloaded pod completes few requests) still weighs in.
         rule = getattr(self._store, "p95_rule", None) or ("bucket_upper", 0)
-        pooled_ttft = pooled_p95_ms(
-            ((getattr(pod, "ttft_hist", None), getattr(pod, "ttft_hist_count", None)) for pod in pods.values()), rule
-        )
         pooled_tpot = pooled_p95_ms(
             ((getattr(pod, "tpot_hist", None), getattr(pod, "tpot_hist_count", None)) for pod in pods.values()), rule
         )
         total = float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values()))
-        if pooled_ttft is not None or pooled_tpot is not None:
+        if pooled_tpot is not None:
             judged = total  # every request is in the pooled p95
         # The same max(per pod, pooled) without any minimum-samples rule (low-sample
         # evaluation at the ceiling).
@@ -245,19 +232,12 @@ class MetricsEvidenceReader:
             end_ms=int(end_ms),
             pods=tuple(sorted(str(getattr(pod, "pod", key)) for key, pod in pods.items())),
             excluded_pods=dropped,
-            ttft_p95_ms=_max_present([*(pod.ttft_p95_ms for pod in pods.values()), pooled_ttft]),
             tpot_p95_ms=_max_present([*(pod.tpot_p95_ms for pod in pods.values()), pooled_tpot]),
             ttft_count=total,
-            # Mean prompt length of the completed requests (2026-10-28: the histogram
-            # sum, not the TSS step-counter total ``prompt_tokens``).
-            prompt_tokens=_sum_present(getattr(pod, "completed_prompt_tokens", None) for pod in pods.values()),
-            prompt_count=_sum_present(getattr(pod, "request_count_observed", None) for pod in pods.values()),
             first_doc_ts_ms=first_docs,
             judged_count=float(judged),
             last_doc_ts_ms=last_docs,
-            pooled_ttft_p95_ms=pooled_ttft,
             pooled_tpot_p95_ms=pooled_tpot,
-            low_ttft_p95_ms=low("ttft_hist", "ttft_hist_count"),
             low_tpot_p95_ms=low("tpot_hist", "tpot_hist_count"),
         )
 
@@ -309,15 +289,15 @@ def _optional_ms(value: Any) -> int | None:
 
 
 class RegistryThresholds:
-    """:class:`ThresholdResolver` from the registry: the thresholds of the registry's
+    """:class:`ThresholdResolver` from the registry: the TPOT threshold of the registry's
     ``slo_mode`` (the one switch of every consumer), built by ``tre_common.slo``.
 
-    What the probe judges: the evidence window's p95 TTFT and p95 TPOT (vLLM histograms of
-    the remaining pods, max of per pod and pooled) against ONE TTFT and ONE TPOT threshold.
-    In a per-request mode (``slowdown`` / ``idle_multiple``) the TTFT threshold is the
-    per-request one evaluated at the window's MEAN prompt length L (without L: the floor).
-    The evidence carries no per-request (TTFT, L) pairs - only histogram buckets and the
-    prompt-token sum / count - so a per-request verdict is not possible from it.
+    What the probe judges (user 2026-11-04, a design change): the evidence window's p95
+    TPOT (vLLM inter-token-latency histograms of the remaining pods, max of per pod and
+    pooled) against the mode's TPOT_slo - ``tpot_p95_ms`` in ``fixed`` / ``slowdown``,
+    ``tpot_k * tpot_idle_ms`` in ``idle_multiple``. TTFT is not judged by SafeScale (no
+    rollback, no blocked commit): the probe uses the TPOT component of the definition
+    only; the scorer and the labels still judge both components.
 
     ``mode`` (tests) replaces the registry's mode. Fail closed: a model whose ``slo``
     block cannot build the mode's thresholds raises (``load_registry`` validates every
@@ -337,16 +317,9 @@ class RegistryThresholds:
     def mode(self) -> str:
         return self._mode
 
-    def resolve(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
+    def resolve(self, model: str) -> dict[str, Any]:
         thresholds = self._of(model)
-        length = _finite_nonneg(mean_prompt_tokens)
-        return {
-            "mode": thresholds.mode,
-            "ttft_ms": float(thresholds.ttft_ms(length)),
-            "tpot_ms": float(thresholds.tpot_ms),
-            "mean_prompt_tokens": length,
-            "source": "registry",
-        }
+        return {"mode": thresholds.mode, "tpot_ms": float(thresholds.tpot_ms), "source": "registry"}
 
     def _of(self, model: str) -> Any:
         if model not in self._thresholds:
@@ -356,31 +329,16 @@ class RegistryThresholds:
 
 
 class StaticThresholds:
-    """:class:`ThresholdResolver` with one TTFT and one TPOT threshold for every model
-    (offline replays and tests; the caller names both values - there is no default)."""
+    """:class:`ThresholdResolver` with one TPOT threshold for every model (offline
+    replays and tests; the caller names the value - there is no default)."""
 
-    def __init__(self, ttft_ms: float, tpot_ms: float) -> None:
-        self._ttft_ms = float(ttft_ms)
+    def __init__(self, tpot_ms: float) -> None:
         self._tpot_ms = float(tpot_ms)
 
-    def resolve(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
-        return {"mode": THRESHOLD_MODE_STATIC, "ttft_ms": self._ttft_ms, "tpot_ms": self._tpot_ms,
-                "mean_prompt_tokens": _finite_nonneg(mean_prompt_tokens), "source": "static"}
-
-
-def _finite_nonneg(value: Any) -> float | None:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+    def resolve(self, model: str) -> dict[str, Any]:
+        return {"mode": THRESHOLD_MODE_STATIC, "tpot_ms": self._tpot_ms, "source": "static"}
 
 
 def _max_present(values) -> float | None:
     present = [float(value) for value in values if value is not None]
     return max(present) if present else None
-
-
-def _sum_present(values) -> float | None:
-    present = [float(value) for value in values if value is not None]
-    return sum(present) if present else None

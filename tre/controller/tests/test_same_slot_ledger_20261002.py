@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from test_floor_plan_20260929 import _cls, _topology
 from tre_common.registry import NodeSpec
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.planning.classify import ModelRole, ModelState
 from tre_controller.planning.planner import (
     ClusterView,
@@ -119,7 +119,7 @@ def test_tick_commits_a_block_probe_with_only_the_receiver_upscale():
     from tre_controller.loops.tick import _apply_safescale
     from tre_controller.planning.safescale import SafeScaleConfig, SafeScaleStateMachine
 
-    safescale = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(min_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(min_window_ms=60_000.0))
     snapshot = MetricsSnapshot(
         ts_ms=20_000, stale=False,
         models={"high": _metrics_with_pods("high", generation=200.0, waiting=0.0, running=1.0, pods=("high-0",))},

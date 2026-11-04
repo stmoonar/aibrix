@@ -6,14 +6,13 @@
   (ActionQueue ``on_hide_done`` -> :meth:`DirectEvidenceCollector.on_hide_done`; the
   delay lets the gateway's pod watch apply the hide first), every remaining pod (the
   model's awake pods minus the probe pods) is scraped once, concurrently; the cumulative TTFT /
-  inter-token-latency histograms and the prompt-token sum / count are kept in the probe
-  record (compact: only the bucket steps, see :func:`compact_hist`), so a restarted
-  controller continues from it;
+  inter-token-latency histograms are kept in the probe record (compact: only the bucket
+  steps, see :func:`compact_hist`), so a restarted controller continues from it;
 * **poll** - every ``evidence_poll_s`` (one SafeScale tick) the same pods are scraped
-  again; the difference to the baseline is the evidence of ``[baseline, now]``: TTFT /
-  TPOT p95 per pod (percentile mode and per-pod minimum samples of the metrics store),
-  model p95 = max over the pods, ``n`` = TTFT count, mean prompt length ``L``, and the
-  KV-cache fill = mean ``kv_cache_usage_perc`` of the pods of the latest scrape (the
+  again; the difference to the baseline is the evidence of ``[baseline, now]``: TPOT p95
+  per pod (percentile mode and per-pod minimum samples of the metrics store), model p95 =
+  max over the pods and their pooled histogram, ``n`` = TTFT count (the TTFT histogram is
+  the request counter; SafeScale judges TPOT only, 2026-11-04), and the KV-cache fill = mean ``kv_cache_usage_perc`` of the pods of the latest scrape (the
   KV gate's aggregation, ``remaining_pods_kv_cache``);
 * **failures** - a pod whose scrape fails is left out of that tick (recorded);
 * **evidence gaps never commit** (2026-09-29 reviews) - a pod whose baseline is late
@@ -43,7 +42,7 @@ another model's pod yields ``model_mismatch``).
 
 Metric names (vLLM 0.30, verified on a live pod): ``vllm:time_to_first_token_seconds``,
 ``vllm:inter_token_latency_seconds`` (old name ``vllm:time_per_output_token_seconds``;
-the gateway's TPOT is the same per-token histogram), ``vllm:request_prompt_tokens``,
+the gateway's TPOT is the same per-token histogram),
 ``vllm:kv_cache_usage_perc`` (old ``vllm:gpu_cache_usage_perc``), all with an
 ``engine`` label (summed / averaged over engines), and ``vllm:engine_sleep_state``.
 """
@@ -73,7 +72,6 @@ SOURCE_REDIS = "redis"
 
 _TTFT = "time_to_first_token_seconds"
 _TPOT = "inter_token_latency_seconds"
-_PROMPT = "request_prompt_tokens"
 _KV = "kv_cache_usage_perc"
 _SLEEP_STATE = "vllm:engine_sleep_state"
 #: Process start time (restart detection next to the counter reset); vLLM 0.30 exposes
@@ -104,8 +102,6 @@ class PodScrape:
     ts_ms: int
     ttft: Hist | None = None
     tpot: Hist | None = None
-    #: request_prompt_tokens (sum, count).
-    prompt: tuple[float, float] | None = None
     kv_cache: float | None = None
     #: False when vllm:engine_sleep_state reports the engine not awake; None = unknown.
     awake: bool | None = None
@@ -137,10 +133,10 @@ def parse_vllm_metrics(
     read was sent (``ts_ms`` = when it was answered)."""
     wanted: dict[str, tuple[str, str]] = {}
     families: dict[str, tuple[str, ...]] = {}
-    for canonical in (_TTFT, _TPOT, _PROMPT):
+    for canonical in (_TTFT, _TPOT):
         families[canonical] = vllm_candidates(canonical)
         for raw in families[canonical]:
-            for suffix in ("_bucket", "_count", "_sum"):
+            for suffix in ("_bucket", "_count"):
                 wanted[raw + suffix] = (raw, suffix)
     kv_names = vllm_candidates(_KV)
     for raw in (*kv_names, *_PROCESS_START, *_IN_FLIGHT):
@@ -149,7 +145,6 @@ def parse_vllm_metrics(
 
     buckets: dict[str, dict[float, float]] = {}
     counts: dict[str, float] = {}
-    sums: dict[str, float] = {}
     gauges: dict[str, list[float]] = {}
     awake_values: list[float] = []
     other_models: set[str] = set()
@@ -200,8 +195,6 @@ def parse_vllm_metrics(
             per[le] = per.get(le, 0.0) + value
         elif suffix == "_count":
             counts[family] = counts.get(family, 0.0) + value
-        elif suffix == "_sum":
-            sums[family] = sums.get(family, 0.0) + value
         else:
             gauges.setdefault(family, []).append(value)
 
@@ -213,11 +206,6 @@ def parse_vllm_metrics(
 
     ttft, _ = hist(_TTFT)
     tpot, tpot_name = hist(_TPOT)
-    prompt = None
-    for raw in families[_PROMPT]:
-        if raw in counts and raw in sums:
-            prompt = (sums[raw], counts[raw])
-            break
     kv = None
     for raw in kv_names:
         values = gauges.get(raw)
@@ -231,7 +219,7 @@ def parse_vllm_metrics(
             process_start = max(gauges[raw])
             break
     flight = [value for raw in _IN_FLIGHT for value in gauges.get(raw, ())]
-    return PodScrape(ts_ms=int(ts_ms), ttft=ttft, tpot=tpot, prompt=prompt, kv_cache=kv, awake=awake,
+    return PodScrape(ts_ms=int(ts_ms), ttft=ttft, tpot=tpot, kv_cache=kv, awake=awake,
                      tpot_name=tpot_name, other_models=tuple(sorted(other_models)),
                      started_ms=int(started_ms) if started_ms is not None else None,
                      process_start_s=process_start, in_flight=sum(flight) if flight else None)
@@ -297,7 +285,6 @@ class PodBaseline:
     ts_ms: int
     ttft: Hist | None
     tpot: Hist | None
-    prompt: tuple[float, float] | None
     #: process_start_time_seconds at the baseline (None = not exposed).
     process_start_s: float | None = None
 
@@ -307,8 +294,6 @@ class PodBaseline:
             record["ttft"] = compact_hist(self.ttft)
         if self.tpot is not None:
             record["tpot"] = compact_hist(self.tpot)
-        if self.prompt is not None:
-            record["prompt"] = [self.prompt[0], self.prompt[1]]
         if self.process_start_s is not None:
             record["process_start_s"] = self.process_start_s
         return record
@@ -321,12 +306,6 @@ class PodBaseline:
             ts_ms = int(float(raw["ts_ms"]))
         except (KeyError, TypeError, ValueError):
             return None
-        prompt = None
-        if isinstance(raw.get("prompt"), (list, tuple)) and len(raw["prompt"]) == 2:
-            try:
-                prompt = (float(raw["prompt"][0]), float(raw["prompt"][1]))
-            except (TypeError, ValueError):
-                prompt = None
         process_start = None
         if raw.get("process_start_s") is not None:
             try:
@@ -337,13 +316,12 @@ class PodBaseline:
             ts_ms=ts_ms,
             ttft=expand_hist(raw["ttft"]) if raw.get("ttft") is not None else None,
             tpot=expand_hist(raw["tpot"]) if raw.get("tpot") is not None else None,
-            prompt=prompt,
             process_start_s=process_start,
         )
 
     @classmethod
     def from_scrape(cls, scrape: PodScrape) -> "PodBaseline":
-        return cls(ts_ms=scrape.ts_ms, ttft=scrape.ttft, tpot=scrape.tpot, prompt=scrape.prompt,
+        return cls(ts_ms=scrape.ts_ms, ttft=scrape.ttft, tpot=scrape.tpot,
                    process_start_s=scrape.process_start_s)
 
     @classmethod
@@ -356,7 +334,6 @@ class PodBaseline:
             ts_ms=int(ts_ms),
             ttft=empty if scrape.ttft is not None else None,
             tpot=empty if scrape.tpot is not None else None,
-            prompt=(0.0, 0.0) if scrape.prompt is not None else None,
             process_start_s=scrape.process_start_s,
         )
 
@@ -368,17 +345,15 @@ class PodDelta:
 
     #: Coverage end: when the read was sent (its counters include everything before).
     ts_ms: int
+    #: Requests (TTFT count delta).
     n: float
-    ttft_p95_ms: float | None
     tpot_p95_ms: float | None
-    prompt: tuple[float, float] | None
-    #: The delta histograms (cumulative buckets) and counts, for the pooled p95.
-    ttft_hist: tuple[tuple[float, float], ...] = ()
+    #: The TPOT delta histogram (cumulative buckets) and count, for the pooled p95.
     tpot_hist: tuple[tuple[float, float], ...] = ()
     tpot_n: float = 0.0
 
     def audit(self) -> dict[str, Any]:
-        return {"n": self.n, "ttft_p95_ms": self.ttft_p95_ms, "tpot_p95_ms": self.tpot_p95_ms, "ts_ms": self.ts_ms}
+        return {"n": self.n, "tpot_p95_ms": self.tpot_p95_ms, "ts_ms": self.ts_ms}
 
 
 @dataclass(frozen=True)
@@ -395,17 +370,16 @@ class DirectWindow:
     #: (``late_baseline``, for good: no commit), no successful scrape yet, or the latest
     #: older than the freshness bound.
     missing: dict[str, str]
-    ttft_p95_ms: float | None
     tpot_p95_ms: float | None
+    #: Requests (TTFT count delta) of the live pods; ``judged_count`` = those of the pods
+    #: with a TPOT p95 (all of them once the pooled p95 exists).
     ttft_count: float
     judged_count: float
-    prompt_tokens: float | None
-    prompt_count: float | None
     #: Mean kv_cache_usage_perc over the pods scraped in this poll; ``kv_tail_max`` =
     #: max of the per-poll means over the hq tail of the polls (the KV gate's value).
     kv_cache: float | None
     kv_tail_max: float | None = None
-    #: pod -> {"n", "ttft_p95_ms", "tpot_p95_ms", "ts_ms"} (audit).
+    #: pod -> {"n", "tpot_p95_ms", "ts_ms"} (audit).
     per_pod: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: Live pods NOT scraped successfully in this very poll (pod -> reason): a deadline
     #: commit needs every live pod answered in the deciding poll.
@@ -413,8 +387,7 @@ class DirectWindow:
     #: pod -> {"cause", "lag_ms", "ts_ms"}: pods with a late baseline (see DirectState.late),
     #: live or not (a pending pod that went to sleep stays here).
     late: dict[str, dict[str, Any]] = field(default_factory=dict)
-    #: p95 of the pods' delta histograms pooled first (folded into the p95s above).
-    pooled_ttft_p95_ms: float | None = None
+    #: TPOT p95 of the pods' delta histograms pooled first (folded into tpot_p95_ms).
     pooled_tpot_p95_ms: float | None = None
     #: The remaining pods of a FRESH cluster view at this poll (awake, not hidden, not
     #: the probe's); None = no fresh view (a commit then waits for one).
@@ -423,22 +396,15 @@ class DirectWindow:
     #: (answered) to the earliest latest read (sent). None = a live pod without either.
     coverage_start_ms: int | None = None
     coverage_end_ms: int | None = None
-    #: p95 without any minimum-samples rule (max of per pod and pooled): the ceiling's
-    #: low-sample evaluation.
-    low_ttft_p95_ms: float | None = None
+    #: TPOT p95 without any minimum-samples rule (max of per pod and pooled): the
+    #: ceiling's low-sample evaluation.
     low_tpot_p95_ms: float | None = None
     #: num_requests_running + waiting over the pods of this poll (None = not exposed).
     in_flight: float | None = None
 
     @property
-    def mean_prompt_tokens(self) -> float | None:
-        if self.prompt_tokens is None or not self.prompt_count or self.prompt_count <= 0:
-            return None
-        return float(self.prompt_tokens) / float(self.prompt_count)
-
-    @property
     def p95_available(self) -> bool:
-        return self.ttft_p95_ms is not None or self.tpot_p95_ms is not None
+        return self.tpot_p95_ms is not None
 
     def audit(self) -> dict[str, Any]:
         return {
@@ -460,10 +426,7 @@ class DirectWindow:
             "evidence_coverage_end_ms": self.coverage_end_ms,
             "latency_samples": self.ttft_count,
             "latency_samples_judged": self.judged_count,
-            "mean_prompt_tokens": self.mean_prompt_tokens,
-            "evidence_ttft_p95_ms": self.ttft_p95_ms,
             "evidence_tpot_p95_ms": self.tpot_p95_ms,
-            "evidence_pooled_ttft_p95_ms": self.pooled_ttft_p95_ms,
             "evidence_pooled_tpot_p95_ms": self.pooled_tpot_p95_ms,
         }
 
@@ -698,20 +661,10 @@ def _pod_delta(
         return "family_vanished"
     else:
         tpot = (0.0, ())
-    prompt = None
-    if base.prompt is not None and result.prompt is not None:
-        prompt = (result.prompt[0] - base.prompt[0], result.prompt[1] - base.prompt[1])
-        if min(prompt) < 0:
-            return "counter_reset"
-    elif base.prompt is not None:
-        return "family_vanished"
     return PodDelta(
         ts_ms=result.coverage_end_ms,
         n=ttft[0],
-        ttft_p95_ms=_p95_ms(ttft[1], ttft[0], percentile_mode, min_latency_samples),
         tpot_p95_ms=_p95_ms(tpot[1], tpot[0], percentile_mode, min_latency_samples),
-        prompt=prompt,
-        ttft_hist=tuple(ttft[1]),
         tpot_hist=tuple(tpot[1]),
         tpot_n=float(tpot[0]),
     )
@@ -732,8 +685,8 @@ def evaluate_poll(
     pod whose counters went backwards (restarted after its baseline, so after the hide)
     gets a zero baseline - everything it counted since is evidence - and is ``late`` (the
     requests before its restart are lost); failures keep the pod's previous delta and are
-    recorded. The window aggregates every live pod's latest delta (p95 = max over pods,
-    n = sum, judged = n of the pods with a p95); ``missing`` lists the live pods whose
+    recorded. The window aggregates every live pod's latest delta (TPOT p95 = max over
+    pods and pooled, n = sum, judged = n of the pods with a TPOT p95); ``missing`` lists the live pods whose
     evidence is incomplete (pending, late for good, no delta, or none newer than
     ``fresh_ms``), ``unanswered`` the live pods without a usable scrape in THIS poll.
     Returns the updated state and the window (None while no live pod has any delta)."""
@@ -846,28 +799,20 @@ def evaluate_poll(
             missing[pod] = f"stale:{excluded.get(pod, 'not_polled')}"
     if not deltas:
         return replace(updated, last=None), None
-    ttft_p95 = [d.ttft_p95_ms for d in deltas.values() if d.ttft_p95_ms is not None]
     tpot_p95 = [d.tpot_p95_ms for d in deltas.values() if d.tpot_p95_ms is not None]
-    prompts = [d.prompt for d in deltas.values() if d.prompt is not None]
     # Pooled p95 next to the per-pod maximum (2026-09-29 review F1): a pod below the
     # per-pod minimum samples - an overloaded pod completes few requests - still
     # weighs in; the minimum is applied to the pooled count.
     rule = (percentile_mode, int(min_latency_samples))
-    pooled_ttft = pooled_p95_ms(((d.ttft_hist, d.n) for d in deltas.values()), rule)
     pooled_tpot = pooled_p95_ms(((d.tpot_hist, d.tpot_n) for d in deltas.values()), rule)
-    ttft_p95 += [pooled_ttft] if pooled_ttft is not None else []
     tpot_p95 += [pooled_tpot] if pooled_tpot is not None else []
     total_n = float(sum(d.n for d in deltas.values()))
-    judged_n = float(sum(d.n for d in deltas.values() if d.ttft_p95_ms is not None or d.tpot_p95_ms is not None))
-    if pooled_ttft is not None or pooled_tpot is not None:
+    judged_n = float(sum(d.n for d in deltas.values() if d.tpot_p95_ms is not None))
+    if pooled_tpot is not None:
         judged_n = total_n  # every request is in the pooled p95
     # The ceiling's low-sample evaluation: the same max(per pod, pooled) without any
     # minimum-samples rule (every request counts, however few).
     rule0 = (percentile_mode, 0)
-    low_ttft = _max_present(
-        [_p95_ms(d.ttft_hist, d.n, percentile_mode, 0) for d in deltas.values()]
-        + [pooled_p95_ms(((d.ttft_hist, d.n) for d in deltas.values()), rule0)]
-    )
     low_tpot = _max_present(
         [_p95_ms(d.tpot_hist, d.tpot_n, percentile_mode, 0) for d in deltas.values()]
         + [pooled_p95_ms(((d.tpot_hist, d.tpot_n) for d in deltas.values()), rule0)]
@@ -881,23 +826,18 @@ def evaluate_poll(
         pods=tuple(sorted(deltas)),
         excluded={**{pod: str(value.get("reason")) for pod, value in dropped.items()}, **excluded},
         missing=missing,
-        ttft_p95_ms=max(ttft_p95) if ttft_p95 else None,
         tpot_p95_ms=max(tpot_p95) if tpot_p95 else None,
         ttft_count=total_n,
         judged_count=judged_n,
-        prompt_tokens=sum(p[0] for p in prompts) if prompts else None,
-        prompt_count=sum(p[1] for p in prompts) if prompts else None,
         kv_cache=(sum(kv_values) / len(kv_values)) if kv_values else None,
         kv_tail_max=_kv_tail_max(kv_history, hq),
         per_pod={pod: delta.audit() for pod, delta in deltas.items()},
         unanswered={pod: reason for pod, reason in unanswered.items() if pod in live},
         late={pod: dict(value) for pod, value in late.items()},  # dropped ones included
-        pooled_ttft_p95_ms=pooled_ttft,
         pooled_tpot_p95_ms=pooled_tpot,
         view_pods=tuple(sorted(poll.view_pods)) if poll.view_pods is not None else None,
         coverage_start_ms=int(coverage_start) if coverage_start is not None else None,
         coverage_end_ms=int(coverage_end) if coverage_end is not None else None,
-        low_ttft_p95_ms=low_ttft,
         low_tpot_p95_ms=low_tpot,
         in_flight=sum(flight) if flight else None,
     )

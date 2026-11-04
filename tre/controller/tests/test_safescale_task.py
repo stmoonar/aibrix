@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
-from safescale_thresholds import STATIC_1000_100, STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_100, STATIC_TPOT_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import SubmitResult
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -81,7 +81,7 @@ def _metrics(*, ts_ms: int, generation: float = 120.0, ttft: float = 500.0, tpot
 
 def _machine() -> SafeScaleStateMachine:
     return SafeScaleStateMachine(
-        thresholds=STATIC_1000_100,
+        thresholds=STATIC_TPOT_100,
         config=SafeScaleConfig(
             min_window_ms=1000.0,
             hq=0.5,
@@ -95,7 +95,7 @@ def test_a_probe_whose_snapshots_stay_stale_past_its_ceiling_is_unhidden() -> No
     # ceiling (start 0 + 60 s) its pods are unhidden instead of staying hidden.
     clock = {"now": 30_000}
     machine = SafeScaleStateMachine(
-        thresholds=STATIC_500_75,
+        thresholds=STATIC_TPOT_75,
         config=SafeScaleConfig(min_window_ms=1000.0, window_ceiling_ms=60_000.0),
         wall_clock_ms=lambda: clock["now"],
     )
@@ -150,7 +150,7 @@ def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -
     queue = FakeQueue()
     machine = _machine()
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
-    snapshot = _metrics(ts_ms=500, ttft=1500.0)
+    snapshot = _metrics(ts_ms=500, tpot=1500.0)
     # Review round 6 (L2): judged once the window's request count is known and >= 20.
     snapshot = replace(snapshot, models={"donor": replace(snapshot.models["donor"], request_count=25.0)})
 
@@ -165,7 +165,7 @@ def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -
     assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "slo_violation", "safescale"),)]
     assert result.events == (
         "safescale_slo_violation:donor",
-        "safescale_rollback_reason:donor:slo_violation:ttft",
+        "safescale_rollback_reason:donor:slo_violation:tpot",
     )
 
 
@@ -261,7 +261,7 @@ def test_safescale_resolution_record_carries_the_gate_failures() -> None:
 
     store = Store()
     machine = SafeScaleStateMachine(
-        thresholds=STATIC_1000_100,
+        thresholds=STATIC_TPOT_100,
         config=SafeScaleConfig(min_window_ms=1000.0, hq=0.5
         ),
         store=store,
@@ -288,7 +288,7 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
 
     queue = FakeQueue()
     machine = SafeScaleStateMachine(
-        thresholds=STATIC_1000_100,
+        thresholds=STATIC_TPOT_100,
         config=SafeScaleConfig(min_window_ms=60_000.0)
     )
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)

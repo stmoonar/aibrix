@@ -433,7 +433,7 @@ def test_a_committing_partner_without_a_live_leader_rolls_back():
     machine._probes.pop(leader.model)  # the leader resolved, then the process stopped
     from tre_controller.planning.safescale import ProbeObservation
 
-    observation = ProbeObservation(ts_ms=6_000, ttft_p95_ms=None, tpot_p95_ms=None, z_m=None, q_ctl=0.0,
+    observation = ProbeObservation(ts_ms=6_000, tpot_p95_ms=None, z_m=None, q_ctl=0.0,
                                    has_traffic=False)
     decision = machine.observe(member.model, observation, now_ms=6_000)
     assert decision.status == "rollback" and [c.kind for c in decision.commands] == ["unhide"]

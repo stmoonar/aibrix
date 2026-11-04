@@ -41,7 +41,8 @@ Per pod and window `(start, end]` (`MetricsStore`):
 - Requests stay a completion measure: `request_count(_observed)` = the
   `request_prompt_tokens` count delta (O1 `min_evidence_requests`, SafeScale). The mean
   prompt length (SafeScale's length-dependent TTFT threshold) = `completed_prompt_tokens`
-  (the histogram sum) / that count. It never uses the counter total.
+  (the histogram sum) / that count. It never uses the counter total. (2026-11-04: SafeScale
+  judges TPOT only, so `completed_prompt_tokens` and the mean prompt length were removed.)
 - vLLM adds generated tokens every engine step and prompt tokens once at the first token
   (`vllm/v1/metrics/stats.py` `update_from_output`): chunked prefill and preemption recompute
   are not counted twice (10-27 check: counter / client = decode 0.9996-1.015, prompt

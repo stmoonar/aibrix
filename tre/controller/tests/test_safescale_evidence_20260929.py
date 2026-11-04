@@ -32,7 +32,7 @@ from tre_common.registry import (
 )
 from tre_common.slo import SloConfigError
 from tre_common.slo_labels import label_def_for_model
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.safescale_task import (
@@ -72,18 +72,16 @@ def _cfg(**overrides) -> SafeScaleConfig:
     return SafeScaleConfig(**values)
 
 
-def _obs(ts_ms: int, *, ttft: float = 100.0, tpot: float = 10.0, z: float | None = 2.0, traffic: bool = True,
-         window_ms: int = 30_000, prompt: float | None = None, gateway: tuple[float, float] | None = None
+def _obs(ts_ms: int, *, tpot: float = 10.0, z: float | None = 2.0, traffic: bool = True,
+         window_ms: int = 30_000, gateway: tuple[float, float] | None = None
          ) -> ProbeObservation:
     return ProbeObservation(
         ts_ms=ts_ms,
-        ttft_p95_ms=ttft,
         tpot_p95_ms=tpot,
         z_m=z,
         has_traffic=traffic,
         window_start_ms=ts_ms - window_ms,
         window_end_ms=ts_ms,
-        mean_prompt_tokens=prompt,
         gateway_requests=gateway[0] if gateway else None,
         gateway_errors=gateway[1] if gateway else None,
     )
@@ -109,11 +107,9 @@ class FakeEvidence:
         return EvidenceWindow(**{**window, "start_ms": start_ms, "end_ms": end_ms, "last_doc_ts_ms": last})
 
 
-def _window(n: float, *, ttft: float | None = 100.0, tpot: float | None = 10.0, first_doc: int = 110_000,
-            prompt_tokens: float | None = None, prompt_count: float | None = None) -> dict:
+def _window(n: float, *, tpot: float | None = 10.0, first_doc: int = 110_000) -> dict:
     return dict(
-        start_ms=0, end_ms=0, pods=("m-0",), excluded_pods=("m-1",), ttft_p95_ms=ttft, tpot_p95_ms=tpot,
-        ttft_count=n, prompt_tokens=prompt_tokens, prompt_count=prompt_count,
+        start_ms=0, end_ms=0, pods=("m-0",), excluded_pods=("m-1",), tpot_p95_ms=tpot, ttft_count=n,
         first_doc_ts_ms={"m-0": first_doc} if first_doc is not None else {},
     )
 
@@ -127,7 +123,7 @@ def _machine(evidence, *, store=None, thresholds=None, remaining=("m-0",), **cfg
     clock = iter(range(1_000_000, 10_000_000, 7_000))
     return SafeScaleStateMachine(
         config=_cfg(**cfg), store=store, evidence=evidence,
-        thresholds=thresholds if thresholds is not None else STATIC_500_75,
+        thresholds=thresholds if thresholds is not None else STATIC_TPOT_75,
         wall_clock_ms=lambda: next(clock),
         remaining_pods=_remaining(*remaining) if remaining is not None else None,
     )
@@ -173,21 +169,21 @@ def test_a_pre_hide_snapshot_never_triggers_the_immediate_rollback() -> None:
     _started(machine, p95_e2e=30_000.0)  # W = 60 s -> deadline 160 s
     # Windows (80, 110], (90, 120], (100, 130] overlap the hide (103 s): recorded, not judged.
     for ts in (110_000, 120_000, 130_000):
-        decision = machine.observe(MODEL, _obs(ts, ttft=5_000.0, tpot=500.0), now_ms=ts)
+        decision = machine.observe(MODEL, _obs(ts, tpot=500.0), now_ms=ts)
         assert decision.reason == "probe_pending", ts
     # (110, 140] follows the hide completely: judged.
-    decision = machine.observe(MODEL, _obs(140_000, ttft=5_000.0), now_ms=140_000)
+    decision = machine.observe(MODEL, _obs(140_000, tpot=500.0), now_ms=140_000)
     assert (decision.status, decision.reason) == ("rollback", "slo_violation")
     reason = decision.details["rollback_reason"]
     assert (reason["code"], reason["metrics"], reason["window_start_ms"], reason["evidence_start_ms"]) == (
-        "slo_violation", ["ttft"], 110_000, 110_000,
+        "slo_violation", ["tpot"], 110_000, 110_000,
     )
 
 
 def test_no_immediate_rollback_before_the_hide_is_confirmed() -> None:
     machine = _machine(FakeEvidence([_window(50)]))
     _started(machine, p95_e2e=30_000.0, hide=False)
-    assert machine.observe(MODEL, _obs(140_000, ttft=5_000.0), now_ms=140_000).reason == "probe_pending"
+    assert machine.observe(MODEL, _obs(140_000, tpot=500.0), now_ms=140_000).reason == "probe_pending"
 
 
 # ============================================================ 2. evidence window + extensions
@@ -204,23 +200,23 @@ def test_the_evidence_window_starts_at_the_first_boundary_after_the_hide_and_end
 
 
 def test_evidence_latency_violation_rolls_back_even_though_the_tail_snapshots_look_fine() -> None:
-    machine = _machine(FakeEvidence([_window(50, ttft=900.0)]))
+    machine = _machine(FakeEvidence([_window(50, tpot=900.0)]))
     _started(machine)
     machine.observe(MODEL, _obs(110_000), now_ms=110_000)
-    decision = machine.observe(MODEL, _obs(120_000, ttft=100.0), now_ms=120_000)
+    decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
     assert (decision.status, decision.reason) == ("rollback", "formal_commit_gate_failed")
     reason = decision.details["rollback_reason"]
     assert reason["code"] == "formal_commit_gate_failed" and reason["gates"] == ["latency"]
-    assert reason["latency"]["evidence_ttft_p95_ms"] == 900.0
+    assert reason["latency"]["evidence_tpot_p95_ms"] == 900.0
 
 
 def test_pre_hide_slowness_in_the_tail_no_longer_blocks_the_commit() -> None:
     # Old gate: the tail snapshots (windows reaching 30 s back) carried the pre-hide
     # slowness and rolled back; now only the post-hide evidence is judged for latency.
-    machine = _machine(FakeEvidence([_window(50, ttft=120.0)]))
+    machine = _machine(FakeEvidence([_window(50)]))
     _started(machine)
-    machine.observe(MODEL, _obs(110_000, ttft=3_000.0), now_ms=110_000)
-    decision = machine.observe(MODEL, _obs(120_000, ttft=3_000.0), now_ms=120_000)
+    machine.observe(MODEL, _obs(110_000, tpot=3_000.0), now_ms=110_000)
+    decision = machine.observe(MODEL, _obs(120_000, tpot=3_000.0), now_ms=120_000)
     assert decision.status == "commit"
 
 
@@ -248,7 +244,7 @@ def test_short_evidence_extends_the_deadline_one_gateway_period_until_enough_sam
 
 
 def test_at_the_ceiling_an_idle_model_commits() -> None:
-    machine = _machine(FakeEvidence([_window(0, ttft=None, tpot=None)]))
+    machine = _machine(FakeEvidence([_window(0, tpot=None)]))
     _started(machine)
     for ts in range(110_000, 170_000, 10_000):
         decision = machine.observe(MODEL, _obs(ts, z=None, traffic=False), now_ms=ts)
@@ -262,20 +258,20 @@ def test_at_the_ceiling_an_idle_model_commits() -> None:
 def test_at_the_ceiling_with_traffic_the_few_samples_are_judged_and_z_decides() -> None:
     # 2026-09-29 review: the latency gate is no longer skipped at the ceiling - the few
     # samples there are are judged (max of per pod and pooled, no minimum).
-    ok = _machine(FakeEvidence([_window(5, ttft=120.0)]))
+    ok = _machine(FakeEvidence([_window(5, tpot=60.0)]))
     _started(ok)
     for ts in range(110_000, 170_000, 10_000):
         decision = ok.observe(MODEL, _obs(ts, z=1.5), now_ms=ts)
     assert decision.status == "commit"
     assert decision.details["latency_gate"] == "evaluated_low_samples"
     assert (decision.details["low_sample_commit"], decision.details["latency_samples"]) == (True, 5)
-    slow = _machine(FakeEvidence([_window(5, ttft=5_000.0)]))
+    slow = _machine(FakeEvidence([_window(5, tpot=500.0)]))
     _started(slow)
     for ts in range(110_000, 170_000, 10_000):
         decision = slow.observe(MODEL, _obs(ts, z=1.5), now_ms=ts)
     assert (decision.status, decision.reason) == ("rollback", "formal_commit_gate_failed")
     assert decision.details["rollback_reason"]["gates"] == ["latency"]
-    low = _machine(FakeEvidence([_window(5, ttft=120.0)]))
+    low = _machine(FakeEvidence([_window(5, tpot=60.0)]))
     _started(low)
     for ts in range(110_000, 170_000, 10_000):
         decision = low.observe(MODEL, _obs(ts, z=0.6), now_ms=ts)
@@ -382,67 +378,29 @@ def _slo_registry(**slo) -> Registry:
                     slo_mode="slowdown")
 
 
-def test_labels_mode_uses_the_calibration_label_rule_with_the_evidence_prompt_length() -> None:
-    labels = RegistryThresholds(_slo_registry())
-    long = labels.resolve(MODEL, 4_000.0)  # 5 * (40 + 0.05 * 4000) = 1200; TPOT = slo.tpot_p95_ms
-    assert (long["mode"], long["ttft_ms"], long["tpot_ms"]) == ("slowdown", pytest.approx(1_200.0), 90.0)
-    assert labels.resolve(MODEL, 100.0)["ttft_ms"] == 500.0  # 5 * 45 = 225 -> floor 500
-    assert labels.resolve(MODEL, None)["ttft_ms"] == 500.0  # L unknown -> the floor
-    # The same function the theta labels use, on the shipped registry.
+def test_the_probe_threshold_is_the_modes_tpot_slo_and_nothing_else() -> None:
+    # SafeScale judges TPOT only (user 2026-11-04): the resolver gives TPOT_slo, no TTFT.
+    assert RegistryThresholds(_slo_registry()).resolve(MODEL) == {"mode": "slowdown", "tpot_ms": 90.0,
+                                                                   "source": "registry"}
     shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))
     model = shipped.models()[0].name
     for mode in ("fixed", "slowdown", "idle_multiple"):
-        assert RegistryThresholds(shipped, mode=mode).resolve(model, 3_000.0)["ttft_ms"] == pytest.approx(
-            label_def_for_model(model, mode=mode, registry=shipped).ttft_slo_ms(3_000.0)
-        )
+        got = RegistryThresholds(shipped, mode=mode).resolve(model)
+        assert got["tpot_ms"] == pytest.approx(label_def_for_model(model, mode=mode, registry=shipped).tpot_p95_ms)
+        assert "ttft_ms" not in got
 
 
 def test_fixed_mode_uses_models_slo_and_an_unbuildable_slo_raises() -> None:
-    fixed = RegistryThresholds(_slo_registry(), mode="fixed").resolve(MODEL, 4_000.0)
-    assert (fixed["mode"], fixed["ttft_ms"], fixed["tpot_ms"]) == ("fixed", 800.0, 90.0)
-    # No idle fit -> the label cannot be built: no fallback to fixed values, the error propagates.
+    fixed = RegistryThresholds(_slo_registry(), mode="fixed").resolve(MODEL)
+    assert (fixed["mode"], fixed["tpot_ms"]) == ("fixed", 90.0)
+    # No idle fit -> the mode's block cannot be built: no fallback, the error propagates.
     with pytest.raises(SloConfigError):
-        RegistryThresholds(_slo_registry(ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None)).resolve(MODEL, 1.0)
+        RegistryThresholds(_slo_registry(ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None)).resolve(MODEL)
 
 
 def test_static_thresholds_resolve_the_same_values_for_every_model() -> None:
-    record = StaticThresholds(700.0, 80.0).resolve(MODEL, 4_000.0)
-    assert (record["mode"], record["ttft_ms"], record["tpot_ms"], record["source"]) == ("static", 700.0, 80.0, "static")
-
-
-def test_the_gate_judges_evidence_against_the_labels_threshold_of_its_prompt_length() -> None:
-    # 4000-token prompts: TTFT threshold 1200 ms, so a 1000 ms p95 passes (fixed 800 would fail).
-    labels = _machine(FakeEvidence([_window(50, ttft=1_000.0, prompt_tokens=200_000.0, prompt_count=50.0)]),
-                      thresholds=RegistryThresholds(_slo_registry()))
-    _started(labels)
-    labels.observe(MODEL, _obs(110_000), now_ms=110_000)
-    decision = labels.observe(MODEL, _obs(120_000), now_ms=120_000)
-    assert decision.status == "commit"
-    assert (decision.details["threshold_mode"], decision.details["mean_prompt_tokens"]) == ("slowdown", 4_000.0)
-    assert decision.details["ttft_threshold_ms"] == pytest.approx(1_200.0)
-    fixed = _machine(FakeEvidence([_window(50, ttft=1_000.0, prompt_tokens=200_000.0, prompt_count=50.0)]),
-                     thresholds=RegistryThresholds(_slo_registry(), mode="fixed"))
-    _started(fixed)
-    fixed.observe(MODEL, _obs(110_000), now_ms=110_000)
-    assert fixed.observe(MODEL, _obs(120_000), now_ms=120_000).status == "rollback"
-
-
-def test_snapshot_observations_carry_their_mean_prompt_length() -> None:
-    from test_safescale_task import _registry
-
-    window = ModelWindowMetrics(
-        model="donor", window_start_ms=0, window_end_ms=30_000, prompt_tokens=6_000.0, generation_tokens=10.0,
-        avg_waiting=0.0, avg_running=1.0, avg_swapping=0.0, kv_cache_hit_rate=0.0, ttft_p95_ms=1.0,
-        tpot_p95_ms=1.0, e2e_p95_ms=1.0, routable_pods=1, assigned_replicas=1, per_pod={}, request_count=4.0,
-        completed_prompt_tokens=6_000.0,
-    )
-    observation = _observation_from_metrics(30_000, window, _registry().model("donor"), "zm")
-    assert observation.mean_prompt_tokens == 1_500.0
-    # 2026-10-28: the mean length comes from the completed requests, never from the TSS
-    # step-counter total (prompt_tokens): without the histogram sum it is unknown.
-    from dataclasses import replace as _replace
-    unknown = _observation_from_metrics(30_000, _replace(window, completed_prompt_tokens=None), _registry().model("donor"), "zm")
-    assert unknown.mean_prompt_tokens is None
+    record = StaticThresholds(80.0).resolve(MODEL)
+    assert record == {"mode": "static", "tpot_ms": 80.0, "source": "static"}
 
 
 # ============================================================ 2+5. the real reader (fake redis)
@@ -466,9 +424,13 @@ class DocRedis:
         rows = rows[:num] if num is not None else rows
         return [(m, s) for s, m in rows] if withscores else [m for _, m in rows]
 
-    def add(self, pod: str, ts: int, *, fast: int, slow: int, prompt: float, model: str = MODEL) -> None:
+    def add(self, pod: str, ts: int, *, fast: int, slow: int, prompt: float, model: str = MODEL,
+            ttft_s: float = 0.05) -> None:
+        """Cumulative counts: ``fast`` / ``slow`` requests with a 10 ms / 500 ms TPOT (the
+        judged latency); every request's TTFT is ``ttft_s`` (not judged by SafeScale)."""
         self.sets.setdefault(pods_key(model), set()).add(pod)
         count = fast + slow
+        ttft_le = next(le for le in (0.1, 5.0, 60.0) if ttft_s <= le)
         doc = {
             "pod_name": pod,
             "timestamp": ts,
@@ -476,11 +438,13 @@ class DocRedis:
             "model_histogram_metrics": {
                 f"{model}/request_prompt_tokens": {"sum": prompt, "count": count, "buckets": {"+Inf": count}},
                 f"{model}/time_to_first_token_seconds": {
-                    "sum": fast * 0.05 + slow * 4.0, "count": count,
-                    "buckets": {"0.1": fast, "5.0": count, "+Inf": count},
+                    "sum": count * ttft_s, "count": count,
+                    "buckets": {**{str(le): (count if le >= ttft_le else 0) for le in (0.1, 5.0, 60.0)},
+                                "+Inf": count},
                 },
                 f"{model}/time_per_output_token_seconds": {
-                    "sum": count * 0.01, "count": count, "buckets": {"0.02": count, "+Inf": count},
+                    "sum": fast * 0.01 + slow * 0.5, "count": count,
+                    "buckets": {"0.02": fast, "1.0": count, "+Inf": count},
                 },
             },
         }
@@ -519,14 +483,13 @@ def test_reader_differences_the_remaining_pods_from_the_first_boundary_after_the
     window = _reader(redis).read(MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=("m-1",))
     assert window.pods == ("m-0",) and window.excluded_pods == ("m-1", "m-2")
     assert window.ttft_count == 30  # 15 + 15 after the 110 s boundary doc, none before it
-    assert window.ttft_p95_ms == 100.0  # only fast requests (the slow pods are excluded)
+    assert window.tpot_p95_ms == 20.0  # only fast requests (the slow pods are excluded)
     assert window.first_doc_ts_ms == {"m-0": 110_000}  # the boundary doc is the baseline
-    assert window.mean_prompt_tokens == 1_000.0
     # Without the exclusions the probe / sleeping pods' slow requests would dominate.
     everything = MetricsEvidenceReader(_reader(redis)._store, redis_client=redis).read(
         MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=()
     )
-    assert everything.ttft_p95_ms == 5_000.0 and everything.ttft_count == 70
+    assert everything.tpot_p95_ms == 1_000.0 and everything.ttft_count == 70
 
 
 def test_hide_anchor_is_redis_time_with_the_newest_gateway_doc() -> None:
@@ -585,12 +548,12 @@ def test_real_reader_commits_on_post_hide_evidence() -> None:
     redis = DocRedis()
     _history(redis)
     machine = _real_machine(redis)
-    # Snapshots still show the pre-hide slowness (5 s TTFT): not judged, not in the gate.
-    machine.observe(MODEL, _obs(110_000, ttft=5_000.0), now_ms=110_000)
-    assert machine.observe(MODEL, _obs(120_000, ttft=5_000.0), now_ms=120_000).reason == "evidence_extended"
-    decision = machine.observe(MODEL, _obs(130_000, ttft=5_000.0), now_ms=130_000)
+    # Snapshots still show the pre-hide slowness (500 ms TPOT): not judged, not in the gate.
+    machine.observe(MODEL, _obs(110_000, tpot=500.0), now_ms=110_000)
+    assert machine.observe(MODEL, _obs(120_000, tpot=500.0), now_ms=120_000).reason == "evidence_extended"
+    decision = machine.observe(MODEL, _obs(130_000, tpot=500.0), now_ms=130_000)
     assert decision.status == "commit"
-    assert (decision.details["latency_samples"], decision.details["evidence_ttft_p95_ms"]) == (30, 100.0)
+    assert (decision.details["latency_samples"], decision.details["evidence_tpot_p95_ms"]) == (30, 20.0)
     assert decision.details["tail_pre_hide_fraction"] == 0.0
 
 
@@ -654,7 +617,7 @@ def test_clock_only_anchors_fail_closed_with_an_evidence_source() -> None:
 
 
 def test_no_doc_of_any_remaining_pod_by_the_ceiling_rolls_back_instead_of_committing() -> None:
-    empty = {**_window(0, ttft=None, tpot=None, first_doc=None), "pods": (), "judged_count": 0.0}
+    empty = {**_window(0, tpot=None, first_doc=None), "pods": (), "judged_count": 0.0}
     for traffic in (True, False):
         machine = _machine(FakeEvidence([empty]))
         _started(machine)
@@ -670,7 +633,7 @@ def test_a_restored_probe_keeps_its_late_window_base() -> None:
     store = FakeProbeStore()
     machine = _machine(FakeEvidence([_window(50)], anchor=late), store=store)
     probe = _started(machine)
-    restored = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]]),
+    restored = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]]),
                                      evidence=FakeEvidence([_window(50)]))
     assert restored.restore() == 1
     again = restored.active_probe(MODEL)
@@ -682,7 +645,7 @@ def test_a_restored_probe_keeps_its_late_window_base() -> None:
 # ============================================================ review follow-ups
 def test_idle_needs_no_requests_in_flight_either() -> None:
     # n = 0 but the tail shows traffic (queue): not idle - stalled, rolled back.
-    machine = _machine(FakeEvidence([_window(0, ttft=None, tpot=None)]))
+    machine = _machine(FakeEvidence([_window(0, tpot=None)]))
     _started(machine)
     for ts in range(110_000, 170_000, 10_000):
         decision = machine.observe(MODEL, _obs(ts, z=None, traffic=True), now_ms=ts)
@@ -705,13 +668,13 @@ def test_a_snapshot_clock_jump_does_not_burn_extensions_on_the_same_evidence() -
 
 def test_n_counts_only_the_pods_whose_p95_is_judged() -> None:
     # 24 requests spread over pods below the per-pod p95 minimum: no p95 is judged.
-    machine = _machine(FakeEvidence([{**_window(24, ttft=None, tpot=None), "judged_count": 0.0}]))
+    machine = _machine(FakeEvidence([{**_window(24, tpot=None), "judged_count": 0.0}]))
     _started(machine)
     machine.observe(MODEL, _obs(110_000), now_ms=110_000)
     decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
     assert (decision.reason, decision.details["extend_reason"]) == ("evidence_extended", "p95_unavailable")
     # A slow pod below the per-pod minimum does not let a fast pod fill the quota alone.
-    partial = _machine(FakeEvidence([{**_window(20, ttft=100.0), "judged_count": 11.0}]))
+    partial = _machine(FakeEvidence([{**_window(20), "judged_count": 11.0}]))
     _started(partial)
     partial.observe(MODEL, _obs(110_000), now_ms=110_000)
     assert partial.observe(MODEL, _obs(120_000), now_ms=120_000).reason == "evidence_extended"
@@ -726,13 +689,13 @@ def test_reader_judged_count_excludes_pods_below_the_per_pod_minimum_unless_pool
         redis.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
     window = _reader(redis).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
     assert (window.ttft_count, window.judged_count) == (18.0, 18.0)
-    assert window.pooled_ttft_p95_ms == 100.0
+    assert window.pooled_tpot_p95_ms == 20.0
     few = DocRedis()
     for pod, fast in (("m-0", 3), ("m-3", 4)):  # 7 in all: below the minimum even pooled
         few.add(pod, 110_000, fast=0, slow=0, prompt=0.0)
         few.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
     window = _reader(few).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
-    assert (window.ttft_count, window.judged_count, window.pooled_ttft_p95_ms) == (7.0, 0.0, None)
+    assert (window.ttft_count, window.judged_count, window.pooled_tpot_p95_ms) == (7.0, 0.0, None)
 
 
 def test_a_late_hide_moves_the_window_with_it() -> None:
@@ -760,13 +723,13 @@ def test_registry_safescale_section_ignores_unknown_keys_with_a_warning(caplog) 
 # ============================================================ 6. audit fields
 AUDIT_KEYS = (
     "evidence_start_ms", "evidence_end_ms", "latency_samples", "latency_gate", "extensions", "clamped",
-    "threshold_mode", "ttft_threshold_ms", "tpot_threshold_ms", "probe_wall_clock_ms", "tail_pre_hide_fraction",
+    "threshold_mode", "tpot_threshold_ms", "probe_wall_clock_ms", "tail_pre_hide_fraction",
 )
 
 
 def test_audit_fields_reach_the_decision_the_record_and_window_terms() -> None:
     store = FakeProbeStore()
-    machine = _machine(FakeEvidence([_window(8), _window(50, ttft=900.0)]), store=store)
+    machine = _machine(FakeEvidence([_window(8), _window(50, tpot=900.0)]), store=store)
     probe = _started(machine)
     machine.observe(MODEL, _obs(110_000), now_ms=110_000)
     machine.observe(MODEL, _obs(120_000), now_ms=120_000)
@@ -798,7 +761,7 @@ def test_a_restored_probe_keeps_its_anchor_extensions_and_deduplicated_observati
     # An older controller journalled one entry per 2 s tick: duplicate it.
     store.journal[probe.request_id].append(dict(store.journal[probe.request_id][-1]))
     restored = SafeScaleStateMachine(
-        thresholds=STATIC_500_75,
+        thresholds=STATIC_TPOT_75,
         config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]],
                                             journal=store.journal), evidence=FakeEvidence([_window(50)])
     )
@@ -850,7 +813,7 @@ def test_the_app_wires_the_evidence_reader_thresholds_and_hide_callback() -> Non
 def test_the_observation_tick_emits_the_evidence_and_rollback_reason_events() -> None:
     from test_safescale_task import FakeQueue
 
-    machine = _machine(FakeEvidence([_window(50, ttft=900.0)]))
+    machine = _machine(FakeEvidence([_window(50, tpot=900.0)]))
     _started(machine)
     snapshot = lambda ts: MetricsSnapshot(ts_ms=ts, stale=False, models={MODEL: ModelWindowMetrics(
         model=MODEL, window_start_ms=ts - 30_000, window_end_ms=ts, prompt_tokens=0.0, generation_tokens=100.0,
@@ -882,17 +845,15 @@ def test_the_app_probe_thresholds_come_from_the_registry(tmp_path, mode) -> None
                                           redis_client=EmptyRedis())
     for model in ("dsqwen-7b", "dsqwen-14b"):
         want = reg.slo_thresholds(model)
-        for length in (256.0, 4096.0):
-            got = deps.safescale._thresholds_for(model, length)
-            assert (got["mode"], got["source"]) == (mode, "registry")
-            assert (got["ttft_ms"], got["tpot_ms"]) == (want.ttft_ms(length), want.tpot_ms)
+        got = deps.safescale._thresholds_for(model)
+        assert got == {"mode": mode, "tpot_ms": want.tpot_ms, "source": "registry"}
 
 
 def test_a_threshold_error_never_commits_the_probe() -> None:
     """re-review 2026-11-04: _thresholds_for has no fallback; a resolver error propagates out of the judge,
     so the commit gate is never passed on it (the same evidence commits with a working resolver, above)."""
     class Broken:
-        def resolve(self, model, mean_prompt_tokens):
+        def resolve(self, model):
             raise SloConfigError(f"{model}: no thresholds")
 
     machine = _machine(FakeEvidence([_window(50)]), thresholds=Broken())

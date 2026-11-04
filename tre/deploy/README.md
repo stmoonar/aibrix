@@ -313,10 +313,14 @@ Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
   deadline moves one gateway period past the newest evidence, up to `W_max` (W counts
   from the confirmed hide); still short there: no traffic -> commit, traffic -> latency
   skipped (Z / KV judged);
-- thresholds: the registry's top-level `slo_mode` (2026-11-04: the one SLO switch of every
-  consumer, `tre_common.slo`; `fixed` / `slowdown` / `idle_multiple`, replaces
-  `safescale.slo_mode`); a per-request mode is judged at the window's mean prompt length;
-  no env override (`SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` were removed
+- the latency verdict is TPOT only (2026-11-04): the window's TPOT p95 (max of per pod
+  and pooled) against the model's TPOT_slo is the one latency violation, on both evidence
+  paths and in the immediate rollback, the deadline gate and the low-sample check at the
+  ceiling; TTFT neither rolls a probe back nor blocks a commit (the TTFT histogram count
+  stays the request count `n`);
+- thresholds: TPOT_slo of the registry's top-level `slo_mode` (2026-11-04: the one SLO
+  switch of every consumer, `tre_common.slo`; `fixed` / `slowdown`: `tpot_p95_ms`,
+  `idle_multiple`: `tpot_k * tpot_idle_ms`; replaces `safescale.slo_mode`); no env override (`SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` were removed
   2026-11-04: the controller refuses to start when either is set); no fallback - a model
   whose `slo` block lacks its mode's parameters is refused when the registry loads;
 - clock / continuity check (fail-closed, `evidence_clock_skew`): each remaining pod's

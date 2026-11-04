@@ -304,10 +304,10 @@ class _CriticalHarness(EarlyHarness):
         asyncio.run(self.collector.take_baselines())
         return self.machine.active_probe(MODEL)
 
-    def tick(self, at_ms, *, serve=0, ttft_s=0.05, obs=None):
+    def tick(self, at_ms, *, serve=0, itl_s=0.02, ttft_s=0.05, obs=None):
         self.clock.now = at_ms
         for sim in self.sims.values():
-            sim.serve(serve, ttft_s=ttft_s)
+            sim.serve(serve, ttft_s=ttft_s, itl_s=itl_s)
         polls = asyncio.run(self.collector.poll())
         boundary = at_ms // 10_000 * 10_000
         return self.machine.observe(MODEL, obs or _obs(boundary, **self.obs_kwargs), now_ms=boundary,

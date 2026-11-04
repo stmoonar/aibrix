@@ -22,7 +22,7 @@ import yaml
 from dataclasses import replace
 
 from tre_common.registry import SafeScaleRegistryConfig, parse_safescale_config
-from safescale_thresholds import STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_75
 from tre_controller.config import ControllerConfig
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
@@ -53,7 +53,7 @@ from test_safescale_direct_20260929 import (
 
 def _violating_redis() -> FakeEvidence:
     """Redis evidence (every remaining pod) that sees the violation the direct window lost."""
-    return FullEvidence([_window(50, ttft=2_000.0)], anchor=_anchor())
+    return FullEvidence([_window(50, tpot=2_000.0)], anchor=_anchor())
 
 
 # ============================================================ reproductions
@@ -64,7 +64,7 @@ def test_repro_p0_pending_pod_violating_before_its_late_baseline_never_commits_o
     h.failing["m-2"] = "timeout"
     h.start()
     del h.failing["m-2"]
-    h.sims["m-2"].serve(30, ttft_s=5.0)
+    h.sims["m-2"].serve(30, itl_s=5.0)
     decisions = h.run_until(HIDE + W, serve=5)
     at, decision = decisions[-1]
     assert at == HIDE + W and decision.status == "rollback"
@@ -80,14 +80,14 @@ def test_repro_p1a_violation_after_a_restart_rolls_back() -> None:
     # m-2 restarts after its baseline and then serves 2 s TTFTs: the pod must stay in
     # the evidence (zero baseline), not be dropped so m-0 alone commits.
     h = Harness()
-    h.start(pre_hide=10, pre_hide_ttft=0.05)
+    h.start(pre_hide=10, pre_hide_itl=0.05)
     h.tick(HIDE + 2_000, serve=5)
     h.sims["m-2"].restart()
-    h.sims["m-2"].serve(20, ttft_s=2.0)
+    h.sims["m-2"].serve(20, itl_s=2.0)
     decision = h.tick(HIDE + 4_000, serve=5)
     assert decision.status == "rollback"
     assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
-    assert decision.details["rollback_reason"]["ttft_p95_ms"] == pytest.approx(2_500.0)
+    assert decision.details["rollback_reason"]["tpot_p95_ms"] == pytest.approx(2_500.0)
 
 
 def test_repro_p1b_a_pod_failing_the_deadline_poll_defers_the_commit() -> None:
@@ -97,7 +97,7 @@ def test_repro_p1b_a_pod_failing_the_deadline_poll_defers_the_commit() -> None:
     h.start()
     h.run_until(HIDE + W - 2_000, serve=5)
     h.failing["m-2"] = "timeout"
-    h.sims["m-2"].serve(40, ttft_s=2.0)
+    h.sims["m-2"].serve(40, itl_s=2.0)
     decision = h.tick(HIDE + W, serve=5)
     assert decision.status == "probing" and decision.reason == "evidence_extended"
     assert decision.details["extend_reason"] == "pods_unanswered"
@@ -119,8 +119,8 @@ def test_a_controller_restart_between_hide_and_baseline_makes_the_whole_probe_la
     record = json.loads(json.dumps(store.records[probe.request_id]))
     # The controller restarts; meanwhile the remaining pods serve slow requests.
     for sim in h.sims.values():
-        sim.serve(30, ttft_s=5.0)
-    restored = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), store=FakeProbeStore(unresolved=[record]),
+        sim.serve(30, itl_s=5.0)
+    restored = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(), store=FakeProbeStore(unresolved=[record]),
                                      evidence=h.evidence, wall_clock_ms=h.clock)
     assert restored.restore() == 1
     h.machine, h.collector = restored, h._collector(restored)
@@ -156,7 +156,7 @@ def test_a_late_pod_still_drives_the_immediate_rollback() -> None:
     h.start()
     del h.failing["m-2"]
     h.tick(HIDE + 2_000, serve=5)  # m-2's (late) baseline
-    decision = h.tick(HIDE + 4_000, serve=25, ttft_s=2.0)
+    decision = h.tick(HIDE + 4_000, serve=25, itl_s=2.0)
     assert decision.status == "rollback"
     assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
 
@@ -205,7 +205,7 @@ def test_the_baseline_waits_for_the_delay_and_the_deadline_stays_confirmation_pl
     assert h.machine.direct_baseline_due(now_ms=HIDE + 999) == ()
     assert h.machine.direct_baseline_planned_ms(MODEL) == HIDE + 1_000
     for sim in h.sims.values():
-        sim.serve(30, ttft_s=5.0)  # still routed while the gateway applies the hide
+        sim.serve(30, itl_s=5.0)  # still routed while the gateway applies the hide
     h.clock.now = HIDE + 1_000
     assert asyncio.run(h.collector.take_baselines()) == 1
     probe = h.machine.active_probe(MODEL)
@@ -232,7 +232,7 @@ def test_the_hide_callback_schedules_the_baseline_after_the_delay() -> None:
 
     h = Harness(baseline_delay_ms=80.0)
     h.clock = real_clock  # type: ignore[assignment]
-    h.machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(baseline_delay_ms=80.0), evidence=h.evidence,
+    h.machine = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=_cfg(baseline_delay_ms=80.0), evidence=h.evidence,
                                       wall_clock_ms=real_clock)
     h.collector = h._collector(h.machine)
     h.machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
@@ -382,7 +382,7 @@ def test_a_pending_pod_that_falls_asleep_is_late_not_silently_dropped() -> None:
     h.failing["m-2"] = "timeout"
     h.start()
     del h.failing["m-2"]
-    h.sims["m-2"].serve(30, ttft_s=5.0)
+    h.sims["m-2"].serve(30, itl_s=5.0)
     h.sims["m-2"].awake = False
     h.tick(HIDE + 2_000, serve=5)
     state = h.machine.active_probe(MODEL).direct
@@ -397,17 +397,18 @@ def test_a_pending_pod_that_falls_asleep_is_late_not_silently_dropped() -> None:
 
 # ============================================================ review 2, F1: pooled p95
 def test_an_overloaded_pod_below_the_per_pod_minimum_still_weighs_in() -> None:
-    # m-0 serves 50 fast; overloaded m-2 completes only 9 (< TRE_MIN_LATENCY_SAMPLES 10)
-    # at 10 s: its own p95 is undefined, the per-pod maximum sees m-0 only.
+    # m-0 serves 50 fast; overloaded m-2 completes only 9 requests: the pooled TPOT p95
+    # is formed next to the per-pod maximum and both see the slow pod. (TRE_MIN_LATENCY_SAMPLES
+    # counts histogram samples; the TPOT histogram is per token, 10 per simulated request.)
     h = Harness()
     h.start()
-    h.sims["m-0"].serve(50, ttft_s=0.05)
-    h.sims["m-2"].serve(9, ttft_s=10.0)
+    h.sims["m-0"].serve(50, itl_s=0.05)
+    h.sims["m-2"].serve(9, itl_s=10.0)
     decision = h.tick(HIDE + 2_000)
     assert decision.status == "rollback"
     assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
-    assert decision.details["rollback_reason"]["ttft_p95_ms"] == pytest.approx(10_000.0)
-    assert decision.details["evidence_pooled_ttft_p95_ms"] == pytest.approx(10_000.0)
+    assert decision.details["rollback_reason"]["tpot_p95_ms"] == pytest.approx(10_000.0)
+    assert decision.details["evidence_pooled_tpot_p95_ms"] == pytest.approx(10_000.0)
     assert decision.details["latency_samples_judged"] == 59
 
 
@@ -421,7 +422,7 @@ def test_the_redis_reader_pools_the_pods_too() -> None:
         redis.add("m-3", ts, fast=0, slow=slow, prompt=float(slow))
     window = evidence_reader(redis).read(MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=("m-1",))
     assert window.pods == ("m-0", "m-3") and window.ttft_count == 89
-    assert window.pooled_ttft_p95_ms == 5_000.0 and window.ttft_p95_ms == 5_000.0  # m-3 alone has none
+    assert window.pooled_tpot_p95_ms == 1_000.0 and window.tpot_p95_ms == 1_000.0  # m-3 alone has none
     assert window.judged == 89
     assert window.last_doc_ts_ms == {"m-0": 130_000, "m-3": 130_000}
 

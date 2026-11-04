@@ -50,7 +50,6 @@ class ProbeStore(Protocol):
 @dataclass(frozen=True)
 class ProbeObservation:
     ts_ms: int
-    ttft_p95_ms: float | None = None
     tpot_p95_ms: float | None = None
     z_m: float | None = None
     q_ctl: float | None = None
@@ -65,12 +64,8 @@ class ProbeObservation:
     #: observation journalled by an older controller).
     window_start_ms: int | None = None
     window_end_ms: int | None = None
-    #: Mean prompt length (tokens) of the window: ``request_prompt_tokens`` sum / count
-    #: delta (the L of the labels-mode TTFT threshold). None = no requests / unknown.
-    mean_prompt_tokens: float | None = None
-    #: p95 of the remaining pods' window histograms pooled first (minimum samples on the
-    #: pooled count): the immediate rollback judges max(per pod, pooled), like the gate.
-    pooled_ttft_p95_ms: float | None = None
+    #: TPOT p95 of the remaining pods' window histograms pooled first (minimum samples on
+    #: the pooled count): the immediate rollback judges max(per pod, pooled), like the gate.
     pooled_tpot_p95_ms: float | None = None
     #: Round 4: the window's newest observation (gateway ``scraped_ms``; the evidence
     #: spans after the hide / a rollback are measured to it). None = unknown.
@@ -79,8 +74,8 @@ class ProbeObservation:
     #: part of the snapshot's window - from ``tail_start_ms`` (the first gateway doc
     #: boundary at or after the probe's post-hide start; the window start once the hide
     #: precedes the window) to its end: its raw Z (no EMA, numerator scaled to a whole
-    #: window), traffic, the remaining pods' time-weighted KV-cache fill and its latency
-    #: p95s; and its evidence - ``tail_observed_ms`` (observed span, gateway
+    #: window), traffic, the remaining pods' time-weighted KV-cache fill and its TPOT
+    #: p95; and its evidence - ``tail_observed_ms`` (observed span, gateway
     #: ``scraped_ms``) and ``tail_requests`` (requests the remaining pods completed in
     #: it; None = unknown: a synthetic window without counts). ``tail_start_ms`` None =
     #: no probe tail asked (offline / direct constructions: the gate reads the whole
@@ -91,7 +86,6 @@ class ProbeObservation:
     tail_z_m: float | None = None
     tail_has_traffic: bool = False
     tail_gpu_cache: float | None = None
-    tail_ttft_p95_ms: float | None = None
     tail_tpot_p95_ms: float | None = None
 
 
@@ -111,9 +105,7 @@ class ProbeWindowInputs:
 
     p95_e2e_ms: float | None = None
     p95_tpot_ms: float | None = None
-    #: v1 fallbacks when a p95 is missing: overall window mean TTFT for the e2e term
-    #: (sic - v1 uses avg TTFT, not avg e2e) and mean TPOT for the decode term.
-    avg_ttft_ms: float | None = None
+    #: v1 fallback when a p95 is missing: mean TPOT for the decode term.
     avg_tpot_ms: float | None = None
     q: float | None = None
     y_total: float | None = None
@@ -305,7 +297,9 @@ class SafeScaleStateMachine:
         the snapshot observations as before. ``thresholds`` resolves the per-model
         latency thresholds (required, 2026-11-04: the controller passes ``RegistryThresholds``;
         offline replays and tests ``StaticThresholds`` with their own values - there is no
-        built-in threshold). ``remaining_pods(model, probe_pods)`` = the
+        built-in threshold). SafeScale judges TPOT only (user 2026-11-04): a window's
+        TPOT p95 above the model's TPOT_slo is the one latency violation; TTFT neither
+        rolls a probe back nor blocks a commit. ``remaining_pods(model, probe_pods)`` = the
         model's awake, not hidden pods minus the probe pods of a FRESH cluster view (None
         without one): the pods a Redis-mode commit needs evidence of; not wired = no
         Redis-mode commit.
@@ -796,12 +790,11 @@ class SafeScaleStateMachine:
             return probe, wall_now, self._rollback_now(
                 probe,
                 reason="slo_violation_direct",
-                details={"slo": {"ttft_p95_ms": window.ttft_p95_ms, "tpot_p95_ms": window.tpot_p95_ms}},
+                details={"slo": {"tpot_p95_ms": window.tpot_p95_ms}},
                 rollback_reason=violation,
                 audit={
                     **self._direct_audit(probe), **window.latency_audit(), "latency_gate": "evaluated",
                     "latency_violations": violation["metrics"], "threshold_mode": violation["threshold_mode"],
-                    "ttft_threshold_ms": violation["ttft_threshold_ms"],
                     "tpot_threshold_ms": violation["tpot_threshold_ms"],
                 },
             )
@@ -809,27 +802,23 @@ class SafeScaleStateMachine:
 
     def _direct_violation(self, probe: SafeScaleProbe, window: DirectWindow) -> dict[str, Any] | None:
         """Immediate rollback on the direct window once ``min_commit_samples`` requests
-        of pods with a p95 are in it (the commit gate's own sample rule)."""
+        of pods with a TPOT p95 are in it (the commit gate's own sample rule)."""
         min_samples = int(getattr(self._config, "min_commit_samples", 20))
         if not window.p95_available or (min_samples > 0 and window.judged_count < min_samples):
             return None
-        thresholds = self._thresholds_for(probe.model, window.mean_prompt_tokens)
-        metrics = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds)
+        thresholds = self._thresholds_for(probe.model)
+        metrics = _latency_violations(window.tpot_p95_ms, thresholds)
         if not metrics:
             return None
         return {
             "code": "slo_violation_direct",
             "metrics": metrics,
-            "ttft_p95_ms": window.ttft_p95_ms,
             "tpot_p95_ms": window.tpot_p95_ms,
-            "pooled_ttft_p95_ms": window.pooled_ttft_p95_ms,
             "pooled_tpot_p95_ms": window.pooled_tpot_p95_ms,
-            "ttft_threshold_ms": thresholds["ttft_ms"],
             "tpot_threshold_ms": thresholds["tpot_ms"],
             "threshold_mode": thresholds["mode"],
             "latency_samples": window.ttft_count,
             "latency_samples_judged": window.judged_count,
-            "mean_prompt_tokens": window.mean_prompt_tokens,
             "evidence_start_ms": window.start_ms,
             "evidence_end_ms": window.end_ms,
         }
@@ -970,7 +959,7 @@ class SafeScaleStateMachine:
             return self._rollback_now(
                 updated,
                 reason="slo_violation",
-                details={"slo": {"ttft_p95_ms": violation["ttft_p95_ms"], "tpot_p95_ms": violation["tpot_p95_ms"]}},
+                details={"slo": {"tpot_p95_ms": violation["tpot_p95_ms"]}},
                 rollback_reason=violation,
             )
 
@@ -1066,7 +1055,7 @@ class SafeScaleStateMachine:
         summary = _summarize_tail(
             probe,
             hq=self._config.hq,
-            thresholds=lambda observation: self._thresholds_for(model, observation.mean_prompt_tokens),
+            thresholds=lambda: self._thresholds_for(model),
             judge_latency=not (evidence_mode or direct_live),
             hide_ts_ms=self._hide_reference_ms(probe),
             min_requests=float(getattr(self._config, "min_commit_samples", 20) or 0),
@@ -1147,12 +1136,11 @@ class SafeScaleStateMachine:
             idle = outcome.idle
             low_samples = outcome.low_samples
         else:
-            thresholds = self._thresholds_for(model, _last_mean_prompt(probe))
+            thresholds = self._thresholds_for(model)
             latency_audit = {
                 "latency_source": "tail_snapshots",
                 "latency_gate": "evaluated",
                 "threshold_mode": thresholds["mode"],
-                "ttft_threshold_ms": thresholds["ttft_ms"],
                 "tpot_threshold_ms": thresholds["tpot_ms"],
                 # The tail snapshots WERE the latency evidence.
                 "tail_pre_hide_fraction": summary.pre_hide_fraction_max,
@@ -1222,8 +1210,7 @@ class SafeScaleStateMachine:
                 "latency": {
                     key: audit.get(key)
                     for key in (
-                        "latency_gate", "latency_samples", "evidence_ttft_p95_ms", "evidence_tpot_p95_ms",
-                        "ttft_threshold_ms", "tpot_threshold_ms",
+                        "latency_gate", "latency_samples", "evidence_tpot_p95_ms", "tpot_threshold_ms",
                     )
                     if key in audit
                 },
@@ -1237,7 +1224,6 @@ class SafeScaleStateMachine:
             LOG.warning(json.dumps({
                 "event": "safescale_low_sample_commit", "model": model, "request_id": probe.request_id,
                 "latency_samples": audit.get("latency_samples"),
-                "low_sample_ttft_p95_ms": audit.get("low_sample_ttft_p95_ms"),
                 "low_sample_tpot_p95_ms": audit.get("low_sample_tpot_p95_ms"),
             }, sort_keys=True))
         audit["probe_wall_clock_ms"] = details["probe_wall_clock_ms"] = self._probe_wall_clock_ms(probe)
@@ -1360,7 +1346,6 @@ class SafeScaleStateMachine:
             )
         samples = float(evidence.ttft_count)
         judged = float(evidence.judged)
-        mean_prompt = evidence.mean_prompt_tokens
         # 2026-09-29 review: the pods a commit needs evidence of come from a FRESH
         # cluster view (awake, not hidden, not the probe's), not from whatever docs the
         # window holds; each must have docs up to E, and E must reach the deadline.
@@ -1384,31 +1369,25 @@ class SafeScaleStateMachine:
             evidence_coverage_start_ms=max(evidence.first_doc_ts_ms.values()) if evidence.first_doc_ts_ms else None,
             evidence_coverage_end_ms=min(last_docs) if required and len(last_docs) == len(required) else None,
         )
-        thresholds = self._thresholds_for(model, mean_prompt)
+        thresholds = self._thresholds_for(model)
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
         audit.update(
             latency_samples=samples,
             latency_samples_judged=judged,
             min_commit_samples=min_samples,
-            mean_prompt_tokens=mean_prompt,
-            evidence_ttft_p95_ms=evidence.ttft_p95_ms,
             evidence_tpot_p95_ms=evidence.tpot_p95_ms,
+            evidence_pooled_tpot_p95_ms=evidence.pooled_tpot_p95_ms,
             threshold_mode=thresholds["mode"],
             threshold_source=thresholds.get("source"),
-            ttft_threshold_ms=thresholds["ttft_ms"],
             tpot_threshold_ms=thresholds["tpot_ms"],
         )
-        if "fallback" in thresholds:
-            audit["threshold_fallback"] = thresholds["fallback"]
-        audit.update(evidence_pooled_ttft_p95_ms=evidence.pooled_ttft_p95_ms,
-                     evidence_pooled_tpot_p95_ms=evidence.pooled_tpot_p95_ms)
-        p95_available = evidence.ttft_p95_ms is not None or evidence.tpot_p95_ms is not None
-        # n counts the requests the p95 judges: the pods whose own p95 is defined
+        p95_available = evidence.tpot_p95_ms is not None
+        # n counts the requests the p95 judges: the pods whose own TPOT p95 is defined
         # (per-pod minimum samples), or all of them once the pooled p95 exists.
         # At least one judged request whatever min_commit_samples says (0 must not make
         # the gate vacuous: no sample is not evidence of health).
         enough = judged >= max(1, min_samples) and p95_available
-        violations = _latency_violations(evidence.ttft_p95_ms, evidence.tpot_p95_ms, thresholds) if enough else []
+        violations = _latency_violations(evidence.tpot_p95_ms, thresholds) if enough else []
         if violations:
             # A violation is one whatever pods are missing.
             audit.update(latency_gate="evaluated", latency_violations=violations)
@@ -1470,7 +1449,6 @@ class SafeScaleStateMachine:
         # At the W ceiling with too little evidence: judged on what there is.
         return _ceiling_outcome(
             audit, samples=samples, has_traffic=summary.has_traffic, short=short, thresholds=thresholds,
-            ttft_ms=_max_present(evidence.low_ttft_p95_ms, evidence.ttft_p95_ms),
             tpot_ms=_max_present(evidence.low_tpot_p95_ms, evidence.tpot_p95_ms),
         )
 
@@ -1528,7 +1506,7 @@ class SafeScaleStateMachine:
             return gap(why, {"window_end_ms": window.end_ms if window is not None else None})
         confirm = probe.window_base_ms if probe.window_base_ms is not None else probe.start_ms
         samples, judged = float(window.ttft_count), float(window.judged_count)
-        thresholds = self._thresholds_for(probe.model, window.mean_prompt_tokens)
+        thresholds = self._thresholds_for(probe.model)
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
         audit.update(
             **window.latency_audit(),
@@ -1538,16 +1516,13 @@ class SafeScaleStateMachine:
             min_commit_samples=min_samples,
             threshold_mode=thresholds["mode"],
             threshold_source=thresholds.get("source"),
-            ttft_threshold_ms=thresholds["ttft_ms"],
             tpot_threshold_ms=thresholds["tpot_ms"],
             deadline_ms=deadline,
         )
-        if "fallback" in thresholds:
-            audit["threshold_fallback"] = thresholds["fallback"]
         # At least one judged request whatever min_commit_samples says (0 must not make
         # the gate vacuous: no sample is not evidence of health).
         enough = judged >= max(1, min_samples) and window.p95_available
-        violations = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds) if enough else []
+        violations = _latency_violations(window.tpot_p95_ms, thresholds) if enough else []
         if violations:
             # A violation is one whatever pods are missing.
             audit.update(latency_gate="evaluated", latency_violations=violations)
@@ -1595,7 +1570,7 @@ class SafeScaleStateMachine:
         in_flight = window.in_flight is not None and window.in_flight > 0
         return _ceiling_outcome(
             audit, samples=samples, has_traffic=summary.has_traffic or in_flight, short=short,
-            thresholds=thresholds, ttft_ms=window.low_ttft_p95_ms, tpot_ms=window.low_tpot_p95_ms,
+            thresholds=thresholds, tpot_ms=window.low_tpot_p95_ms,
         )
 
     def _try_early_commit(
@@ -1799,26 +1774,22 @@ class SafeScaleStateMachine:
             requests = observation.tail_requests
             if min_samples > 0 and (requests is None or float(requests) < min_samples):
                 return None
-            ttft, tpot = observation.tail_ttft_p95_ms, observation.tail_tpot_p95_ms
+            tpot = observation.tail_tpot_p95_ms
         else:
             start = observation.window_start_ms
             if start is None or int(start) < int(hide_ts):
                 return None
             # max(per pod, pooled), as the deadline gate judges (2026-09-29 review P3).
-            ttft = _max_present(observation.ttft_p95_ms, observation.pooled_ttft_p95_ms)
             tpot = _max_present(observation.tpot_p95_ms, observation.pooled_tpot_p95_ms)
-        thresholds = self._thresholds_for(probe.model, observation.mean_prompt_tokens)
-        metrics = _latency_violations(ttft, tpot, thresholds)
+        thresholds = self._thresholds_for(probe.model)
+        metrics = _latency_violations(tpot, thresholds)
         if not metrics:
             return None
         return {
             "code": "slo_violation",
             "metrics": metrics,
-            "ttft_p95_ms": ttft,
             "tpot_p95_ms": tpot,
-            "pooled_ttft_p95_ms": observation.pooled_ttft_p95_ms,
             "pooled_tpot_p95_ms": observation.pooled_tpot_p95_ms,
-            "ttft_threshold_ms": thresholds["ttft_ms"],
             "tpot_threshold_ms": thresholds["tpot_ms"],
             "threshold_mode": thresholds["mode"],
             "window_start_ms": int(start),
@@ -1856,9 +1827,10 @@ class SafeScaleStateMachine:
             return None
         return self._post_hide_start(probe)
 
-    def _thresholds_for(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
+    def _thresholds_for(self, model: str) -> dict[str, Any]:
         # Fail closed (2026-11-04): a resolver error propagates - no fallback threshold.
-        return self._thresholds.resolve(model, mean_prompt_tokens)
+        # TPOT only (user 2026-11-04): the resolver gives TPOT_slo, nothing else is judged.
+        return self._thresholds.resolve(model)
 
     def _wall_ms(self) -> int | None:
         try:
@@ -2119,7 +2091,6 @@ def _ceiling_outcome(
     has_traffic: bool,
     short: str,
     thresholds: dict[str, Any],
-    ttft_ms: float | None,
     tpot_ms: float | None,
 ) -> "_EvidenceOutcome":
     """At the W ceiling with fewer than ``min_commit_samples`` judged requests (both
@@ -2127,11 +2098,11 @@ def _ceiling_outcome(
 
     * no request completed and nothing in flight (idle) -> commit (v1 idle rule);
     * no request completed but traffic -> rollback ``insufficient_evidence:stalled``;
-    * otherwise every sample there is is judged: ``ttft_ms`` / ``tpot_ms`` = max(per-pod,
-      pooled) p95 without any minimum-samples rule; above a threshold -> the latency
-      gate fails (rollback), else it passes (``latency_gate = evaluated_low_samples``;
-      a commit is counted apart as ``low_sample_commit``). No p95 at all despite
-      completed requests -> rollback ``insufficient_evidence:p95_unavailable``."""
+    * otherwise every sample there is is judged: ``tpot_ms`` = max(per-pod, pooled) TPOT
+      p95 without any minimum-samples rule; above TPOT_slo -> the latency gate fails
+      (rollback), else it passes (``latency_gate = evaluated_low_samples``; a commit is
+      counted apart as ``low_sample_commit``). No TPOT p95 despite completed requests ->
+      rollback ``insufficient_evidence:p95_unavailable``."""
     audit = {**audit, "clamped": True, "low_sample_reason": short}
     if samples <= 0:
         if not has_traffic:
@@ -2140,12 +2111,12 @@ def _ceiling_outcome(
         audit.update(latency_gate="insufficient_evidence")
         return _EvidenceOutcome("rollback", audit=audit, rollback_reason={
             "code": "insufficient_evidence:stalled", "latency_samples": samples, "has_traffic": True})
-    audit.update(low_sample_ttft_p95_ms=ttft_ms, low_sample_tpot_p95_ms=tpot_ms)
-    if ttft_ms is None and tpot_ms is None:
+    audit.update(low_sample_tpot_p95_ms=tpot_ms)
+    if tpot_ms is None:
         audit.update(latency_gate="insufficient_evidence")
         return _EvidenceOutcome("rollback", audit=audit, rollback_reason={
             "code": "insufficient_evidence:p95_unavailable", "latency_samples": samples})
-    violations = _latency_violations(ttft_ms, tpot_ms, thresholds)
+    violations = _latency_violations(tpot_ms, thresholds)
     audit.update(latency_gate="evaluated_low_samples", latency_violations=violations)
     return _EvidenceOutcome("judge", audit=audit, latency_ok=not violations, low_samples=True)
 
@@ -2161,13 +2132,12 @@ def _hide_confirm_ms(probe: SafeScaleProbe) -> int | None:
     return int(anchor.controller_ts_ms if anchor.controller_ts_ms is not None else anchor.ts_ms)
 
 
-def _latency_violations(ttft_p95_ms: float | None, tpot_p95_ms: float | None, thresholds: dict[str, Any]) -> list[str]:
-    violations = []
-    if ttft_p95_ms is not None and ttft_p95_ms > thresholds["ttft_ms"]:
-        violations.append("ttft")
+def _latency_violations(tpot_p95_ms: float | None, thresholds: dict[str, Any]) -> list[str]:
+    """The probe's one latency verdict (user 2026-11-04): the window's TPOT p95 above the
+    model's TPOT_slo. TTFT is not judged by SafeScale."""
     if tpot_p95_ms is not None and tpot_p95_ms > thresholds["tpot_ms"]:
-        violations.append("tpot")
-    return violations
+        return ["tpot"]
+    return []
 
 
 def _hidden_drained(probe: SafeScaleProbe, poll: DirectPoll) -> dict[str, Any] | None:
@@ -2209,13 +2179,6 @@ def _deadline_cap(probe: SafeScaleProbe, config: SafeScaleConfig) -> int:
 def _latest_window_end(probe: SafeScaleProbe) -> int | None:
     ends = [int(obs.window_end_ms) for obs in probe.observations if obs.window_end_ms is not None]
     return max(ends) if ends else None
-
-
-def _last_mean_prompt(probe: SafeScaleProbe) -> float | None:
-    for observation in reversed(probe.observations):
-        if observation.mean_prompt_tokens is not None:
-            return observation.mean_prompt_tokens
-    return None
 
 
 def _pre_hide_fraction(hide_ts_ms: int, start_ms: int, end_ms: int) -> float:
@@ -2359,7 +2322,7 @@ def _summarize_tail(
     probe: SafeScaleProbe,
     *,
     hq: float,
-    thresholds: Callable[[ProbeObservation], dict[str, Any]] | None = None,
+    thresholds: Callable[[], dict[str, Any]] | None = None,
     judge_latency: bool = True,
     hide_ts_ms: int | None = None,
     min_requests: float = 0.0,
@@ -2370,8 +2333,8 @@ def _summarize_tail(
     The span is the newest snapshot's post-hide tail (round 5,
     :attr:`ProbeObservation.tail_start_ms` to the window end, at most one window): its
     raw Z, traffic, the remaining pods' time-weighted KV-cache fill and - with
-    ``judge_latency`` (no evidence source) - its latency p95s against
-    ``thresholds(observation)`` (required then: no built-in threshold). ``evidence_ok``: no
+    ``judge_latency`` (no evidence source) - its TPOT p95 against ``thresholds()``'s
+    TPOT_slo (required then: no built-in threshold; TTFT is not judged). ``evidence_ok``: no
     traffic, at least ``min_requests`` requests completed in the tail, or a tail that is
     the whole window (one metrics window of post-hide evidence: the planner's unit). A snapshot
     without a tail asked (offline / direct constructions) is judged on its whole window
@@ -2389,20 +2352,15 @@ def _summarize_tail(
     has_tail = newest.tail_start_ms is not None and newest.tail_observed_ms is not None
     if has_tail:
         z, has_traffic, kv = newest.tail_z_m, newest.tail_has_traffic, newest.tail_gpu_cache
-        ttft, tpot, start = newest.tail_ttft_p95_ms, newest.tail_tpot_p95_ms, newest.tail_start_ms
+        tpot, start = newest.tail_tpot_p95_ms, newest.tail_start_ms
     else:
         z, has_traffic, kv = newest.z_m, newest.has_traffic, newest.avg_gpu_cache_norm
-        ttft, tpot, start = newest.ttft_p95_ms, newest.tpot_p95_ms, newest.window_start_ms
+        tpot, start = newest.tpot_p95_ms, newest.window_start_ms
     latency_ok = True
     if judge_latency:
         if thresholds is None:
             raise ValueError("_summarize_tail(judge_latency=True) needs thresholds (no built-in threshold)")
-        limits = thresholds(newest)
-        ttft_limit, tpot_limit = limits["ttft_ms"], limits["tpot_ms"]
-        if ttft is not None and ttft > ttft_limit:
-            latency_ok = False
-        if tpot is not None and tpot > tpot_limit:
-            latency_ok = False
+        latency_ok = not _latency_violations(tpot, thresholds())
     z_min = float(z) if z is not None else None
     if z_min is None and not has_traffic:
         z_min = float("inf")
@@ -2574,7 +2532,6 @@ def _probe_record(
 def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
     return {
         "ts_ms": observation.ts_ms,
-        "ttft_p95_ms": observation.ttft_p95_ms,
         "tpot_p95_ms": observation.tpot_p95_ms,
         "z_m": observation.z_m,
         "q_ctl": observation.q_ctl,
@@ -2584,8 +2541,6 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "gateway_errors": observation.gateway_errors,
         "window_start_ms": observation.window_start_ms,
         "window_end_ms": observation.window_end_ms,
-        "mean_prompt_tokens": observation.mean_prompt_tokens,
-        "pooled_ttft_p95_ms": observation.pooled_ttft_p95_ms,
         "pooled_tpot_p95_ms": observation.pooled_tpot_p95_ms,
         "observed_ms": observation.observed_ms,
         "tail_start_ms": observation.tail_start_ms,
@@ -2594,7 +2549,6 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "tail_z_m": observation.tail_z_m,
         "tail_has_traffic": observation.tail_has_traffic,
         "tail_gpu_cache": observation.tail_gpu_cache,
-        "tail_ttft_p95_ms": observation.tail_ttft_p95_ms,
         "tail_tpot_p95_ms": observation.tail_tpot_p95_ms,
     }
 
@@ -2720,7 +2674,6 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         return None
     return ProbeObservation(
         ts_ms=ts_ms,
-        ttft_p95_ms=_optional_float(raw.get("ttft_p95_ms")),
         tpot_p95_ms=_optional_float(raw.get("tpot_p95_ms")),
         z_m=_optional_float(raw.get("z_m")),
         q_ctl=_optional_float(raw.get("q_ctl", raw.get("Q_ctl"))),
@@ -2730,8 +2683,6 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         gateway_errors=_optional_float(raw.get("gateway_errors")),
         window_start_ms=_optional_int(raw.get("window_start_ms")),
         window_end_ms=_optional_int(raw.get("window_end_ms")),
-        mean_prompt_tokens=_optional_float(raw.get("mean_prompt_tokens")),
-        pooled_ttft_p95_ms=_optional_float(raw.get("pooled_ttft_p95_ms")),
         pooled_tpot_p95_ms=_optional_float(raw.get("pooled_tpot_p95_ms")),
         observed_ms=_optional_int(raw.get("observed_ms")),
         tail_start_ms=_optional_int(raw.get("tail_start_ms")),
@@ -2740,7 +2691,6 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         tail_z_m=_optional_float(raw.get("tail_z_m")),
         tail_has_traffic=bool(raw.get("tail_has_traffic", False)),
         tail_gpu_cache=_optional_float(raw.get("tail_gpu_cache")),
-        tail_ttft_p95_ms=_optional_float(raw.get("tail_ttft_p95_ms")),
         tail_tpot_p95_ms=_optional_float(raw.get("tail_tpot_p95_ms")),
     )
 

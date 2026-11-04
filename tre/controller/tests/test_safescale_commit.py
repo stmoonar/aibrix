@@ -8,7 +8,7 @@ import pytest
 from tre_common import rediskeys
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
-from safescale_thresholds import STATIC_1000_100
+from safescale_thresholds import STATIC_TPOT_100
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue, SubmitResult
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -136,7 +136,7 @@ def _metrics(ts_ms: int) -> MetricsSnapshot:
 
 def _machine(store):
     return SafeScaleStateMachine(
-        thresholds=STATIC_1000_100,
+        thresholds=STATIC_TPOT_100,
         config=SafeScaleConfig(
             min_window_ms=1000.0,
             hq=0.5,

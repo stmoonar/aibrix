@@ -6,7 +6,7 @@ import asyncio
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
-from safescale_thresholds import STATIC_1000_100, STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_100, STATIC_TPOT_75
 from tre_controller.app import _active_probe_models
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue
@@ -194,7 +194,7 @@ def test_probe_hides_serving_pod_and_commit_sleeps_exactly_that_pod() -> None:
     sm = InProcessServiceManager(service)
     queue = ActionQueue(PlanShim(sm, state=service.get_state))
     machine = SafeScaleStateMachine(
-        thresholds=STATIC_1000_100,
+        thresholds=STATIC_TPOT_100,
         config=SafeScaleConfig(min_window_ms=1000.0, hq=0.5
         )
     )
@@ -306,7 +306,7 @@ def _run_rescue_once(*, probed: bool) -> list:
             Binding("donor-3", "donor", Slot("node-a", (3,)), awake=True),
         ),
     )
-    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig())
     if probed:
         machine.start_probe(model="donor", pods=("donor-3",), now_ms=0)
     queue = _Queue()

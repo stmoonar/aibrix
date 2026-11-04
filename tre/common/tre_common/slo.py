@@ -2,8 +2,9 @@
 
 Every consumer of "what is this request's SLO" and "did it meet it" calls this module:
 the calibration window label (``tre_common.slo_labels``), the scorer
-(``tre_eval.metrics``), the SafeScale probe thresholds
-(``tre_controller.planning.safescale_evidence``), the baseline tools
+(``tre_eval.metrics``), the SafeScale probe threshold
+(``tre_controller.planning.safescale_evidence``; the probe uses the TPOT component only -
+``SloThresholds.tpot_ms`` - and judges no TTFT, user 2026-11-04), the baseline tools
 (``tre_baselines.tools.slo_judge`` / ``preserve_nl_slo`` / ``tokenscale_profile`` through
 the label) and the baseline-scaler limits (``tre_baselines.config``). A second
 implementation is a bug (guard: ``common/tests/test_slo_single_definition.py``).

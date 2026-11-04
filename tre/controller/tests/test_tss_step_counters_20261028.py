@@ -60,7 +60,7 @@ def test_the_numerator_is_processed_tokens_not_completed_ones():
     w = _read(redis)
     assert w.generation_tokens == pytest.approx(100.0 * WINDOW / 1000)
     assert w.prompt_tokens == pytest.approx(50.0 * WINDOW / 1000)
-    assert w.completed_prompt_tokens == 0.0 and w.request_count_observed == 0.0
+    assert w.request_count_observed == 0.0
     assert not w.token_counter_reset and w.sample_incomplete_pods == ()
 
 

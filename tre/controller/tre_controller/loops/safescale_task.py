@@ -10,7 +10,6 @@ from typing import Awaitable, Callable, Collection, Mapping, Protocol
 from tre_common.metrics_schema import (
     MetricsSnapshot,
     ModelWindowMetrics,
-    mean_completed_prompt_tokens,
     observed_of,
     observed_requests,
 )
@@ -643,7 +642,7 @@ def format_evidence_event(model: str, details: Mapping) -> str:
         f":n={fmt(details.get('latency_samples'))}:gate={gate}"
         f":ext={fmt(details.get('extensions'))}:clamped={fmt(bool(details.get('clamped')))}"
         f":mode={fmt(details.get('threshold_mode'))}"
-        f":ttft_thr={fmt(details.get('ttft_threshold_ms'))}:tpot_thr={fmt(details.get('tpot_threshold_ms'))}"
+        f":tpot_thr={fmt(details.get('tpot_threshold_ms'))}"
         f":pre_hide={fmt(details.get('tail_pre_hide_fraction'))}"
     )
 
@@ -718,7 +717,6 @@ def _observation_from_metrics(
     result, signal = computed.result, computed.signal
     return ProbeObservation(
         ts_ms=ts_ms,
-        ttft_p95_ms=metrics.ttft_p95_ms,
         tpot_p95_ms=metrics.tpot_p95_ms,
         z_m=signal.z_m,
         q_ctl=result.Q_ctl,
@@ -732,10 +730,7 @@ def _observation_from_metrics(
         # P1-2 audit: the metrics window this observation read (from the snapshot).
         window_start_ms=getattr(metrics, "window_start_ms", None),
         window_end_ms=getattr(metrics, "window_end_ms", None),
-        # L of the labels-mode TTFT threshold: prompt-token sum / count delta.
-        mean_prompt_tokens=_mean_prompt_tokens(metrics),
         # The immediate rollback judges max(per pod, pooled) like the deadline gate.
-        pooled_ttft_p95_ms=_pooled_p95(metrics, hidden_pods, "ttft_hist", "ttft_hist_count"),
         pooled_tpot_p95_ms=_pooled_p95(metrics, hidden_pods, "tpot_hist", "tpot_hist_count"),
         observed_ms=observed_of(metrics).t_last_ms,
         **_tail_terms(metrics, spec, signal_source, hidden_pods, tail_start_ms, routable_pod_ids),
@@ -761,7 +756,7 @@ def _tail_terms(
     30 s, of post-hide evidence). One value per quantity over that span: raw Z (no
     EMA, the TSS numerator scaled to a whole window), traffic, the remaining
     pods' KV-cache fill (each pod's mean over its instant docs: time-weighted) and the
-    latency p95s; plus its evidence - the observed span (``Observed``, gateway clock)
+    TPOT p95 (SafeScale judges TPOT only); plus its evidence - the observed span (``Observed``, gateway clock)
     and the requests the remaining pods completed in it (unscaled; None = unknown, a
     synthetic window without counts). {} without a probe; only ``tail_start_ms`` when
     the snapshot has no such span yet (no evidence)."""
@@ -811,9 +806,6 @@ def _tail_terms(
         "tail_has_traffic": bool(result.Q > 0.0 or (result.Y_m > 0.0 and result.defined)),
         "tail_gpu_cache": remaining_pods_kv_cache(window, hidden_pods),
         # max(per pod, pooled remaining pods), as the deadline gate judges.
-        "tail_ttft_p95_ms": _max_known(
-            window.ttft_p95_ms, _pooled_p95(window, hidden_pods, "ttft_hist", "ttft_hist_count")
-        ),
         "tail_tpot_p95_ms": _max_known(
             window.tpot_p95_ms, _pooled_p95(window, hidden_pods, "tpot_hist", "tpot_hist_count")
         ),
@@ -835,12 +827,6 @@ def _pooled_p95(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...], hist:
     pods = [pod for key, pod in (getattr(metrics, "per_pod", None) or {}).items()
             if key not in hidden and getattr(pod, "pod", key) not in hidden]
     return pooled_p95_ms(((getattr(pod, hist, None), getattr(pod, count, None)) for pod in pods), rule)
-
-
-def _mean_prompt_tokens(metrics: ModelWindowMetrics) -> float | None:
-    """Mean prompt length of the requests completed in the window (the histogram
-    sum / count; 2026-10-28: never the TSS step-counter total)."""
-    return mean_completed_prompt_tokens(metrics)
 
 
 def _probe_request_id(safescale: SafeScaleObserver, model: str) -> str | None:

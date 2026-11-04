@@ -81,6 +81,8 @@ class SafeScaleConfig:
     # The probe's latency thresholds are not configuration here (2026-11-04): the registry's
     # top-level slo_mode and models[].slo blocks (tre_common.slo, planning.safescale_evidence.
     # RegistryThresholds); the env overrides SAFE_SCALE_TTFT_P95_SLO_MS / _TPOT_ were removed.
+    # The probe judges TPOT only (user 2026-11-04): window TPOT p95 > TPOT_slo is its one
+    # latency violation; TTFT never rolls a probe back or blocks a commit.
     # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).
     # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The latency part of
     # the commit gate reads an evidence window that starts at the first gateway boundary

@@ -28,7 +28,7 @@ import yaml
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import ClusterTopology, NodeSpec
-from safescale_thresholds import STATIC_1000_100, STATIC_500_75
+from safescale_thresholds import STATIC_TPOT_100, STATIC_TPOT_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from section_ticks import run_rescue_tick
 from tre_controller.loops.safescale_task import _observation_from_metrics, run_safescale_observation_tick
@@ -60,7 +60,6 @@ TRE_DIR = Path(__file__).resolve().parents[2]
 def _obs(ts_ms: int, window_ms: int = 30_000) -> ProbeObservation:
     return ProbeObservation(
         ts_ms=ts_ms,
-        ttft_p95_ms=100.0,
         tpot_p95_ms=10.0,
         z_m=2.0,
         has_traffic=True,
@@ -72,7 +71,7 @@ def _obs(ts_ms: int, window_ms: int = 30_000) -> ProbeObservation:
 def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
     store = FakeProbeStore()
     machine = SafeScaleStateMachine(
-        thresholds=STATIC_500_75,
+        thresholds=STATIC_TPOT_75,
         config=SafeScaleConfig(min_window_ms=25_000.0, hq=0.5),
         store=store,
     )
@@ -83,7 +82,7 @@ def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
     # at the post-hide start; a synthetic one starting 5 s before the hide here, to see
     # the audit), with enough requests in it (round 5 H1 floor).
     newest = replace(_obs(130_000), tail_start_ms=95_000, tail_z_m=2.0, tail_has_traffic=True,
-                     tail_ttft_p95_ms=100.0, tail_tpot_p95_ms=10.0, tail_requests=25.0,
+                     tail_tpot_p95_ms=10.0, tail_requests=25.0,
                      tail_observed_ms=35_000)
     decision = machine.observe("donor", newest, now_ms=130_000)
 
@@ -115,7 +114,7 @@ def test_observations_carry_the_metrics_window_they_read() -> None:
 
     queue = ObservationQueue()
     machine = SafeScaleStateMachine(
-        thresholds=STATIC_1000_100,
+        thresholds=STATIC_TPOT_100,
         # Round 5: no post-hide suffix in this window, so only the W ceiling (= the floor
         # here) judges it - on the whole window, flagged tail_low_evidence.
         config=SafeScaleConfig(min_window_ms=1000.0, hq=0.5,
@@ -248,7 +247,7 @@ def test_window_ceiling_comes_from_the_registry_safescale_section(tmp_path, capl
 
 def test_probe_record_keeps_w_max_and_clamped() -> None:
     store = FakeProbeStore()
-    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(window_ceiling_ms=300_000.0), store=store)
+    machine = SafeScaleStateMachine(thresholds=STATIC_TPOT_75, config=SafeScaleConfig(window_ceiling_ms=300_000.0), store=store)
     machine.start_probe(
         model="m", pods=("m-0",), now_ms=0, window_inputs=ProbeWindowInputs(p95_e2e_ms=400_000.0)
     )

@@ -72,15 +72,6 @@ class _ReferenceStore(MetricsStore):
             return 0.0
         return max(0.0, ms._number(last.get("count"), 0.0) - ms._number(first.get("count"), 0.0))
 
-    def _sum(self, model, metric, docs, start):
-        if not ms._has_window_hist_doc(docs, start):
-            return None
-        first, last = _ref_first_last(model, metric, docs)
-        if first is None:
-            return 0.0
-        delta = ms._number(last.get("sum"), 0.0) - ms._number(first.get("sum"), 0.0)
-        return delta if delta >= 0.0 else None
-
     def _avg(self, model, metric, docs, start):
         if not _ref_has_window_metric(model, metric, docs, start):
             return None
@@ -132,7 +123,6 @@ class _ReferenceStore(MetricsStore):
             e2e_p95_ms=ms._seconds_to_ms(self._pct(model, H["e2e"], hist_docs, start)),
             request_count=self._count(model, H["completed_prompt_tokens"], hist_docs, start),
             request_count_observed=self._count(model, H["completed_prompt_tokens"], hist_docs, start),
-            completed_prompt_tokens=self._sum(model, H["completed_prompt_tokens"], hist_docs, start),
             token_counter_reset=ms._counter_reset_index(model, hist_docs) > 0,
             instant_ticks_ms=ms._doc_ticks(inst_docs),
             gpu_cache_usage=self._instant_avg_optional(model, ms.INSTANT_METRICS["gpu_cache"], inst_docs),
