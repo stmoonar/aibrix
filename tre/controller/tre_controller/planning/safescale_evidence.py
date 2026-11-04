@@ -329,8 +329,9 @@ class RegistryThresholds:
     ``mode`` (tests) replaces the registry's mode. ``ttft_override_ms`` /
     ``tpot_override_ms`` (env SAFE_SCALE_*_P95_SLO_MS, unset by default) replace the
     respective threshold. A model whose ``slo`` block cannot build the mode's thresholds
-    falls back to ``fixed`` (recorded; a registry in ``idle_multiple`` is refused at load,
-    so only a legacy ``slowdown`` registry without c / b gets here)."""
+    falls back to the registry's ``fixed`` record (recorded). ``load_registry`` validates the
+    mode's parameters of every model (2026-11-04), so only a registry object built without
+    that load (tests) gets here."""
 
     def __init__(
         self,
