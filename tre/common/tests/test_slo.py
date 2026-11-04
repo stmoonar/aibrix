@@ -75,3 +75,47 @@ def test_idle_multiple_is_refused_at_load_without_its_parameters() -> None:
     raw["models"][0]["slo"]["idle_multiple"]["ttft_k"] = -1
     with pytest.raises(ValueError, match="ttft_k"):
         _parse_registry(raw)
+
+
+def test_no_built_in_parameter_values() -> None:
+    # 2026-11-04: every threshold is the registry's - a block without the mode's parameter is refused
+    with pytest.raises(slo.SloConfigError, match="tpot_p95_ms"):
+        slo.slo_thresholds({"ttft_p95_ms": 500}, "fixed")
+    block = {"ttft_p95_ms": 500, "tpot_p95_ms": 75, "ttft_idle_c_ms": 40.0, "ttft_idle_b_ms_per_token": 0.05,
+             "ttft_floor_ms": 500}
+    with pytest.raises(slo.SloConfigError, match="ttft_slowdown_k"):
+        slo.slo_thresholds(block, "slowdown")
+    raw = _raw("slowdown")
+    del raw["models"][1]["slo"]["ttft_floor_ms"]
+    with pytest.raises(ValueError, match="ttft_floor_ms"):           # refused at load in every mode
+        _parse_registry(raw)
+
+
+@pytest.mark.parametrize("mode", slo.SLO_MODES)
+def test_the_vectorised_verdict_is_judge_request(mode) -> None:
+    np = pytest.importorskip("numpy")
+    t = _parse_registry(_raw(mode)).slo_thresholds("dsqwen-14b")
+    rows = [(done, L, ttft, tpot) for done in (True, False) for L in (None, 128, 1024, 6000)
+            for ttft in (None, 300.0, 460.0, 700.0, 2100.0) for tpot in (None, 30.0, 45.0, 80.0)]
+    want = [slo.judge_request(t, completed=d, prompt_tokens=L, ttft_ms=tt, tpot_ms=tp).violated for d, L, tt, tp in rows]
+    nan = float("nan")
+    got = slo.violated_array(
+        t, completed=[r[0] for r in rows], prompt_tokens=[nan if r[1] is None else r[1] for r in rows],
+        ttft_ms=[nan if r[2] is None else r[2] for r in rows], tpot_ms=[nan if r[3] is None else r[3] for r in rows])
+    assert got.tolist() == want
+
+
+def test_load_registry_slo(tmp_path) -> None:
+    rs = slo.load_registry_slo(str(REGISTRY))
+    assert (rs.mode, rs.source) == ("fixed", "slo_mode") and rs.of("dsqwen-7b").tpot_ms == 75.0
+    assert slo.load_registry_slo(str(REGISTRY), mode="idle_multiple").of("dsqwen-14b").ttft_ms(None) == 450.0
+    legacy = _raw()
+    legacy.pop("slo_mode")
+    legacy["safescale"]["slo_mode"] = "fixed"
+    for model in legacy["models"]:
+        model["slo"]["ttft_slo_mode"] = "slowdown"
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(legacy), encoding="utf-8")
+    with pytest.raises(slo.SloConfigError, match="name the mode"):  # the two retired keys disagree
+        slo.load_registry_slo(str(path))
+    assert slo.load_registry_slo(str(path), mode="fixed").source == "explicit"

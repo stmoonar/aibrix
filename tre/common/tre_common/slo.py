@@ -15,17 +15,25 @@ The registry's top-level ``slo_mode`` names the definition in force for EVERY co
 parameters in ``models[].slo``):
 
 ``fixed`` (user 2026-10-29; live since 2026-10-31)
-    TTFT_slo = ``ttft_p95_ms`` (500 ms), TPOT_slo = ``tpot_p95_ms`` (75 ms), any L.
+    TTFT_slo = ``ttft_p95_ms``, TPOT_slo = ``tpot_p95_ms``, any L.
 ``slowdown`` (plan 2026-09-21 6.11 D6'; the theta label of the 10-03 calibration and the
     scorer of every run before 2026-11-04 - kept to reproduce that data)
-    TTFT_slo(L) = ``max(ttft_floor_ms, ttft_slowdown_k * (c + b * L))`` (k 5, floor 500 ms),
-    TPOT_slo = ``tpot_p95_ms`` (75 ms).
+    TTFT_slo(L) = ``max(ttft_floor_ms, ttft_slowdown_k * (c + b * L))``,
+    TPOT_slo = ``tpot_p95_ms``.
 ``idle_multiple`` (user 2026-11-04, docs slo-idle-multiples-20261104)
     TTFT_slo(L) = ``max(idle_multiple.ttft_floor_ms, idle_multiple.ttft_k * (c + b * L))``,
     TPOT_slo = ``idle_multiple.tpot_k * idle_multiple.tpot_idle_ms``.
 
 ``c`` / ``b`` = ``ttft_idle_c_ms`` / ``ttft_idle_b_ms_per_token`` (the idle TTFT fit),
 shared by both per-request modes. ``L`` = the request's prompt tokens.
+
+Every parameter comes from the ``models[].slo`` block (the registry, or a run's registry
+snapshot); this module has no default value of any of them (2026-11-04): a block that lacks
+a parameter its mode needs is refused (:class:`SloConfigError`). The values: ``deploy/registry.yaml``
+(and ``docs/slo-idle-multiples-20261104.md`` of the local workspace for idle_multiple).
+
+Offline tools that judge many requests at once use :func:`violated_array` (the vectorised
+:func:`judge_request`, same rule) and read the registry with :func:`load_registry_slo`.
 
 The request verdict (:func:`judge_request`): a request that did not complete is a
 violation (``failed``); else TTFT > TTFT_slo(L) (``ttft``); else TPOT =
@@ -52,14 +60,6 @@ PER_REQUEST_TTFT_MODES = (SLO_MODE_SLOWDOWN, SLO_MODE_IDLE_MULTIPLE)
 #: A registry with no switch at all (neither ``slo_mode`` nor a legacy key): the built-in
 #: default both legacy consumers had (labels / slowdown).
 DEFAULT_SLO_MODE = SLO_MODE_SLOWDOWN
-
-#: Parameter defaults of the legacy modes when a ``models[].slo`` block leaves them out
-#: (the values every registry since 2026-09-21 carries). ``idle_multiple`` has no defaults:
-#: its block must be complete.
-FIXED_TTFT_MS = 500.0
-FIXED_TPOT_MS = 75.0
-SLOWDOWN_K = 5.0
-SLOWDOWN_FLOOR_MS = 500.0
 
 #: ``models[].slo.idle_multiple`` keys (all required in that block).
 IDLE_MULTIPLE_KEY = "idle_multiple"
@@ -181,27 +181,23 @@ def _idle_fit(block: Any) -> tuple[float, float]:
 def slo_thresholds(block: Any, mode: str) -> SloThresholds:
     """The thresholds of a ``models[].slo`` block (mapping or ``SloSpec``) under ``mode``.
 
-    Raises :class:`SloConfigError` when the block lacks a parameter the mode needs."""
+    Raises :class:`SloConfigError` when the block lacks a parameter the mode needs (there
+    are no defaults: every value is the registry's)."""
     if mode not in SLO_MODES:
         raise SloConfigError(f"slo_mode must be one of {SLO_MODES}, got {mode!r}")
     if mode == SLO_MODE_FIXED:
-        ttft = _field(block, "ttft_p95_ms")
-        tpot = _field(block, "tpot_p95_ms")
         return SloThresholds(
             mode=mode,
-            ttft_fixed_ms=_positive(FIXED_TTFT_MS if ttft is None else ttft, "slo.ttft_p95_ms"),
-            tpot_ms=_positive(FIXED_TPOT_MS if tpot is None else tpot, "slo.tpot_p95_ms"),
+            ttft_fixed_ms=_positive(_field(block, "ttft_p95_ms"), "slo.ttft_p95_ms"),
+            tpot_ms=_positive(_field(block, "tpot_p95_ms"), "slo.tpot_p95_ms"),
         )
     c, b = _idle_fit(block)
     if mode == SLO_MODE_SLOWDOWN:
-        k = _field(block, "ttft_slowdown_k")
-        floor = _field(block, "ttft_floor_ms")
-        tpot = _field(block, "tpot_p95_ms")
         return SloThresholds(
             mode=mode, c_ms=c, b_ms_per_token=b,
-            ttft_k=_positive(SLOWDOWN_K if k is None else k, "slo.ttft_slowdown_k"),
-            ttft_floor_ms=_positive(SLOWDOWN_FLOOR_MS if floor is None else floor, "slo.ttft_floor_ms"),
-            tpot_ms=_positive(FIXED_TPOT_MS if tpot is None else tpot, "slo.tpot_p95_ms"),
+            ttft_k=_positive(_field(block, "ttft_slowdown_k"), "slo.ttft_slowdown_k"),
+            ttft_floor_ms=_positive(_field(block, "ttft_floor_ms"), "slo.ttft_floor_ms"),
+            tpot_ms=_positive(_field(block, "tpot_p95_ms"), "slo.tpot_p95_ms"),
         )
     sub = _field(block, IDLE_MULTIPLE_KEY)
     if sub is None:
@@ -271,6 +267,41 @@ def judge_request(
         ttft_ms=None if ttft_ms is None else float(ttft_ms), tpot_ms=tpot,
         ttft_slo_ms=ttft_thr, tpot_slo_ms=thresholds.tpot_ms,
     )
+
+
+def violated_array(
+    thresholds: SloThresholds,
+    *,
+    completed: Any,
+    prompt_tokens: Any = None,
+    ttft_ms: Any,
+    tpot_ms: Any,
+) -> Any:
+    """:func:`judge_request`'s ``violated`` for many requests of one model at once (numpy
+    arrays or pandas columns of equal length; numpy is imported here, not by the module).
+
+    Same rule: not ``completed`` -> violated; else TTFT > TTFT_slo(L); else TPOT > TPOT_slo.
+    A missing (NaN) TTFT or TPOT is not judged (one output token: TPOT is NaN); a missing
+    prompt length in a per-request mode gives the floor. ``prompt_tokens`` may be None in
+    ``fixed`` (no length needed). ``tpot_ms`` = ``(e2e - ttft) / (output_tokens - 1)`` as the
+    caller's log has it (:func:`request_tpot_ms`). Returns a bool array."""
+    import numpy as np
+
+    done = np.asarray(completed, dtype=bool)
+    ttft = np.asarray(ttft_ms, dtype=float)
+    tpot = np.asarray(tpot_ms, dtype=float)
+    if thresholds.per_request_ttft:
+        if prompt_tokens is None:
+            raise ValueError(f"{thresholds.mode} TTFT threshold needs prompt_tokens")
+        length = np.asarray(prompt_tokens, dtype=float)
+        idle = float(thresholds.c_ms) + float(thresholds.b_ms_per_token) * length  # type: ignore[arg-type]
+        thr = np.maximum(float(thresholds.ttft_floor_ms), float(thresholds.ttft_k) * idle)  # type: ignore[arg-type]
+        thr = np.where(np.isfinite(length), thr, float(thresholds.ttft_floor_ms))  # type: ignore[arg-type]
+    else:
+        thr = float(thresholds.ttft_fixed_ms)  # type: ignore[arg-type]
+    v_ttft = np.nan_to_num(ttft, nan=0.0) > thr
+    v_tpot = done & (np.nan_to_num(tpot, nan=0.0) > float(thresholds.tpot_ms))
+    return (~done) | v_ttft | v_tpot
 
 
 # ------------------------------------------------------------------ the switch
@@ -346,3 +377,58 @@ def registry_slo_thresholds(raw: Mapping[str, Any], *, mode: Optional[str] = Non
     registry's own mode unless ``mode`` is given."""
     use = mode or resolve_slo_mode(raw).mode
     return {str(m["name"]): slo_thresholds(m.get("slo") or {}, use) for m in raw.get("models") or [] if m.get("slo")}
+
+
+@dataclass(frozen=True)
+class RegistrySlo:
+    """The SLO of every model of one registry file (:func:`load_registry_slo`)."""
+
+    path: str
+    sha256: str
+    mode: str
+    #: ``slo_mode`` / ``legacy:...`` / ``default`` (the registry's), or ``explicit``.
+    source: str
+    thresholds: Mapping[str, SloThresholds]
+
+    def of(self, model: str) -> SloThresholds:
+        if model not in self.thresholds:
+            raise SloConfigError(f"{self.path}: no models[{model}].slo")
+        return self.thresholds[model]
+
+    def as_record(self) -> dict[str, Any]:
+        """What a result file records: the file, its sha256, the mode and each model's thresholds."""
+        return {"registry": self.path, "registry_sha256": self.sha256, "mode": self.mode, "mode_source": self.source,
+                "models": {m: t.as_record() for m, t in sorted(self.thresholds.items())}}
+
+
+def load_registry_slo(path: str, *, mode: Optional[str] = None) -> RegistrySlo:
+    """Every model's thresholds of a registry YAML (the deployed registry, a run's snapshot or
+    the repo bootstrap; plain YAML read, so a snapshot without the cluster sections works too).
+
+    ``mode`` None: the registry's own (:func:`resolve_slo_mode`); a legacy registry whose two
+    retired keys disagree is refused then (name the mode). Raises :class:`SloConfigError`."""
+    import hashlib
+
+    import yaml
+
+    with open(path, "rb") as fh:
+        data = fh.read()
+    raw = yaml.safe_load(data) or {}
+    if mode is None:
+        try:
+            res = resolve_slo_mode(raw)
+        except ValueError as exc:
+            raise SloConfigError(f"{path}: {exc}") from None
+        if res.legacy_conflict:
+            raise SloConfigError(f"{path}: {res.legacy_conflict} (or name the mode explicitly)")
+        use, source = res.mode, res.source
+    else:
+        use, source = str(mode).strip().lower(), "explicit"
+    try:
+        thresholds = registry_slo_thresholds(raw, mode=use)
+    except SloConfigError as exc:
+        raise SloConfigError(f"{path}: slo_mode {use}: {exc}") from None
+    if not thresholds:
+        raise SloConfigError(f"{path}: no models[].slo block")
+    return RegistrySlo(path=str(path), sha256=hashlib.sha256(data).hexdigest(), mode=use, source=source,
+                       thresholds=thresholds)

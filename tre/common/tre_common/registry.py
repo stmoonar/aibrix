@@ -11,7 +11,6 @@ import yaml
 from tre_common.slo import (
     IDLE_MULTIPLE_FIELDS,
     IDLE_MULTIPLE_KEY,
-    SLO_MODE_IDLE_MULTIPLE,
     SloConfigError,
     SloModeResolution,
     SloThresholds,
@@ -50,7 +49,7 @@ class SloSpec:
     #: scale (plan 2026-09-21 6.9h, D6; 2026-10-03 capture).
     ttft_idle_c_ms: float | None = None
     ttft_idle_b_ms_per_token: float | None = None
-    #: ``slowdown`` (plan 2026-09-21 6.11 D6'): k and floor (defaults 5 / 500 ms).
+    #: ``slowdown`` (plan 2026-09-21 6.11 D6'): k and floor (required in that mode).
     ttft_slowdown_k: float | None = None
     ttft_floor_ms: float | None = None
     #: ``idle_multiple`` (2026-11-04).
@@ -1392,18 +1391,17 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     if tp_errors:
         raise ValueError("invalid registry: " + "; ".join(tp_errors))
     # One SLO switch for every consumer (tre_common.slo). The mode in force must be
-    # buildable for every model: refused at load, so no consumer falls back to another
-    # definition. The legacy modes keep their fallback (an old registry still loads).
+    # buildable for every model (tre_common.slo has no default parameter values): refused
+    # at load, so no consumer falls back to another definition.
     slo_mode = resolve_slo_mode(raw)
-    if slo_mode.mode == SLO_MODE_IDLE_MULTIPLE:
-        slo_errors = []
-        for model in models:
-            try:
-                slo_thresholds(model.slo, slo_mode.mode)
-            except SloConfigError as exc:
-                slo_errors.append(f"model {model.name}: {exc}")
-        if slo_errors:
-            raise ValueError(f"invalid registry: slo_mode {slo_mode.mode}: " + "; ".join(slo_errors))
+    slo_errors = []
+    for model in models:
+        try:
+            slo_thresholds(model.slo, slo_mode.mode)
+        except SloConfigError as exc:
+            slo_errors.append(f"model {model.name}: {exc}")
+    if slo_errors:
+        raise ValueError(f"invalid registry: slo_mode {slo_mode.mode}: " + "; ".join(slo_errors))
     max_bound = cluster.get("max_bound_per_gpu")
     return Registry(
         ClusterTopology(

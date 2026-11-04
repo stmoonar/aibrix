@@ -73,7 +73,8 @@ def test_the_label_definition_names_its_source() -> None:
 # ---------------------------------------------------------- the merged label (2026-09-23)
 
 PRIMARY = slo_labels.LabelDefinition(
-    500.0, 75.0, ttft_slo_mode="slowdown", ttft_idle_c_ms=36.4, ttft_idle_b_ms_per_token=0.0527,
+    500.0, 75.0, ttft_slo_mode="slowdown", ttft_slowdown_k=5.0, ttft_floor_ms=500.0,
+    ttft_idle_c_ms=36.4, ttft_idle_b_ms_per_token=0.0527,
 )
 
 
