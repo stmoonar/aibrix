@@ -47,8 +47,12 @@ VLLM_METRICS: Mapping[str, tuple[str, ...]] = {
 }
 
 #: Read but optional: the V0-only swap gauge is absent on the V1 engine (genuinely zero).
+#: The per-request TPOT histogram (one sample per finished request: its mean time per
+#: output token) is SafeScale's TPOT evidence (user 2026-11-05); the 0.10.1 sample lacks
+#: it, and the probe fails closed (no commit) on a pod that does not export it.
 OPTIONAL_VLLM_METRICS: Mapping[str, tuple[str, ...]] = {
     "num_requests_swapped": ("vllm:num_requests_swapped",),
+    "request_time_per_output_token_seconds": ("vllm:request_time_per_output_token_seconds",),
 }
 
 #: Gateway Redis doc metric keys: identifier the gateway writes -> keys a reader accepts,

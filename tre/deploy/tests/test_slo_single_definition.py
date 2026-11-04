@@ -111,8 +111,10 @@ COMPARES = {
     ("common/tre_common/slo.py", "np.nan_to_num(tpot, nan=0.0) > float(thresholds.tpot_ms)"): "the implementation",
     ("common/tre_common/slo.py", "np.nan_to_num(ttft, nan=0.0) > thr"): "the implementation",
     ("common/tre_common/slo.py", "tpot > thresholds.tpot_ms"): "the implementation",
-    ("controller/tre_controller/planning/safescale.py", "tpot_p95_ms > thresholds['tpot_ms']"):
-        "SafeScale probe: window TPOT p95 against the resolver's TPOT_slo (window-level; TPOT only, user 2026-11-04)",
+    ("controller/tre_controller/planning/safescale.py", "tpot_p95_ms > limit_ms"):
+        "SafeScale probe: window TPOT p95 (bucket_upper) against E = tre_common.slo.tpot_bucket_threshold_ms("
+        "TPOT_slo, the histogram's edges) - a derived quantization of the one TPOT_slo, not a second "
+        "definition (TPOT only, user 2026-11-04; per-request TPOT and E, user 2026-11-05)",
     ("baselines/tre_baselines/tools/tokenscale_profile.py", "s.tpot_p95_ms <= tpot_slo_ms"):
         "TokenScale profile: a step's p95 against the label's thresholds",
     ("baselines/tre_baselines/tools/tokenscale_profile.py", "s.ttft_p95_ms <= ttft_slo_ms"): "TokenScale profile (as above)",
@@ -415,6 +417,7 @@ def test_the_switch_changes_every_consumer_at_once(tmp_path, mode) -> None:
     from tre_baselines.config import model_limits
     from tre_baselines.tools import slo_judge
     from tre_common.slo_labels import label_def_for_model
+    from tre_controller.planning.safescale import tpot_limit_ms
     from tre_controller.planning.safescale_evidence import RegistryThresholds
     from tre_eval import metrics
 
@@ -446,6 +449,32 @@ def test_the_switch_changes_every_consumer_at_once(tmp_path, mode) -> None:
         assert label.tpot_p95_ms == judge.tpot_p95_ms == limits[model].tpot_slo_ms == want.tpot_ms
         # SafeScale consumes the TPOT component only (user 2026-11-04): no TTFT threshold.
         assert probe.resolve(model) == {"mode": mode, "tpot_ms": want.tpot_ms, "source": "registry"}
+        # Its threshold is E (user 2026-11-05): the smallest edge of the per-request TPOT
+        # histogram the pods export (vLLM 0.30's) >= that same TPOT_slo - derived, one place.
+        limit = tpot_limit_ms(probe.resolve(model), VLLM_030_TPOT_EDGES)
+        assert limit == slo.tpot_bucket_threshold_ms(want.tpot_ms, VLLM_030_TPOT_EDGES) >= want.tpot_ms
+        assert limit / 1000.0 in VLLM_030_TPOT_EDGES
+        assert limit == SAFESCALE_E_MS[mode][model]
+
+
+#: What the probe compares with, per mode, on the 0.30 edges (25 / 50 / 75 / 100 ms ...):
+#: idle_multiple TPOT_slo 60.9 / 63.4 / 42.0 ms -> 75 / 75 / 50; fixed / slowdown 75 -> 75.
+SAFESCALE_E_MS = {
+    slo.SLO_MODE_FIXED: dict.fromkeys(MODELS, 75.0),
+    slo.SLO_MODE_SLOWDOWN: dict.fromkeys(MODELS, 75.0),
+    slo.SLO_MODE_IDLE_MULTIPLE: {"dsqwen-7b": 75.0, "dsllama-8b": 75.0, "dsqwen-14b": 50.0},
+}
+
+
+def _vllm_030_tpot_edges() -> tuple[float, ...]:
+    from tre_controller.planning.safescale_direct import parse_vllm_metrics
+
+    text = (TRE / "deploy" / "tests" / "fixtures" / "vllm_metrics" / "vllm-0.30.0.prom").read_text(encoding="utf-8")
+    hist = parse_vllm_metrics(text, ts_ms=0).tpot
+    return tuple(le for le, _ in hist.buckets if le != float("inf"))
+
+
+VLLM_030_TPOT_EDGES = _vllm_030_tpot_edges()
 
 
 def test_params_set_publishes_the_switch_and_the_idle_multiple_parameters() -> None:

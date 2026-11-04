@@ -275,12 +275,12 @@ def test_samples_of_another_model_name_are_skipped() -> None:
     mine.serve(3)
     other.serve(7)
     text = mine.text() + other.text().replace('model_name="m"', 'model_name="other"')
-    assert parse_vllm_metrics(text, ts_ms=1).ttft.count == 10  # no filter: summed
+    assert parse_vllm_metrics(text, ts_ms=1).tpot.count == 10  # no filter: summed
     scrape = parse_vllm_metrics(text, ts_ms=1, model_name="m")
-    assert scrape.ttft.count == 3 and scrape.other_models == ("other",)
+    assert scrape.tpot.count == 3 and scrape.other_models == ("other",)
     foreign = parse_vllm_metrics(other.text().replace('model_name="m"', 'model_name="other"'), ts_ms=1,
                                  model_name="m")
-    assert foreign.ttft is None and _unusable(foreign) == "model_mismatch:other"
+    assert foreign.tpot is None and _unusable(foreign) == "model_mismatch:other"
 
 
 def test_a_pod_ip_reused_by_another_model_is_no_evidence() -> None:
@@ -330,7 +330,7 @@ def test_a_read_without_a_thread_is_pool_saturated_and_a_busy_pool_is_logged(cap
 def test_occupancy_returns_to_zero_and_close_stops_the_pool() -> None:
     scraper = PodMetricsScraper(timeout_s=0.5, fetch=lambda url, t: LIVE_030.read_text(encoding="utf-8"))
     results = asyncio.run(scraper.scrape({"a": "http://a", "b": None}, model_name="dsqwen-7b"))
-    assert results["a"].ttft.count == 6.0 and results["b"] == "no_endpoint"
+    assert results["a"].tpot.count == 6.0 and results["b"] == "no_endpoint"
     assert scraper.occupancy() == 0
     h = Harness()
     h.collector = DirectEvidenceCollector(h.machine, scraper, lambda model, exclude: {}, poll_ms=2_000.0)
@@ -397,13 +397,13 @@ def test_a_pending_pod_that_falls_asleep_is_late_not_silently_dropped() -> None:
 
 # ============================================================ review 2, F1: pooled p95
 def test_an_overloaded_pod_below_the_per_pod_minimum_still_weighs_in() -> None:
-    # m-0 serves 50 fast; overloaded m-2 has only 9 TPOT samples (< TRE_MIN_LATENCY_SAMPLES
-    # 10; one per request here): its own p95 is undefined, the per-pod maximum sees m-0
-    # only, the pooled p95 (59 samples) sees m-2.
+    # m-0 serves 50 fast; overloaded m-2 finishes only 9 requests (< TRE_MIN_LATENCY_SAMPLES
+    # 10; one per-request TPOT sample each): its own p95 is undefined, the per-pod maximum
+    # sees m-0 only, the pooled p95 (59 samples) sees m-2.
     h = Harness()
     h.start()
-    h.sims["m-0"].serve(50, itl_s=0.05, tokens=1)
-    h.sims["m-2"].serve(9, itl_s=10.0, tokens=1)
+    h.sims["m-0"].serve(50, itl_s=0.05)
+    h.sims["m-2"].serve(9, itl_s=10.0)
     decision = h.tick(HIDE + 2_000)
     assert decision.status == "rollback"
     assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
@@ -411,21 +411,6 @@ def test_an_overloaded_pod_below_the_per_pod_minimum_still_weighs_in() -> None:
     assert decision.details["evidence_pooled_tpot_p95_ms"] == pytest.approx(10_000.0)
     assert decision.details["latency_samples_judged"] == 59
     assert decision.details["direct_pods"]["m-2"]["tpot_p95_ms"] is None  # the pooled p95 caught it
-
-
-def test_the_redis_reader_pools_the_pods_too() -> None:
-    from test_safescale_evidence_20260929 import DocRedis
-    from test_safescale_evidence_20260929 import _reader as evidence_reader
-
-    redis = DocRedis()
-    for ts, fast, slow in ((110_000, 0, 0), (120_000, 40, 5), (130_000, 80, 9)):
-        redis.add("m-0", ts, fast=fast, slow=0, prompt=float(fast))
-        redis.add("m-3", ts, fast=0, slow=slow, prompt=float(slow))
-    window = evidence_reader(redis).read(MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=("m-1",))
-    assert window.pods == ("m-0", "m-3") and window.ttft_count == 89
-    assert window.pooled_tpot_p95_ms == 1_000.0 and window.tpot_p95_ms == 1_000.0  # m-3 alone has none
-    assert window.judged == 89
-    assert window.last_doc_ts_ms == {"m-0": 130_000, "m-3": 130_000}
 
 
 def test_pooled_p95_rule() -> None:

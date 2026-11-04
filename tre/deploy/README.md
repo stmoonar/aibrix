@@ -314,10 +314,22 @@ Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
   from the confirmed hide); still short there: no traffic -> commit, traffic -> latency
   skipped (Z / KV judged);
 - the latency verdict is TPOT only (2026-11-04): the window's TPOT p95 (max of per pod
-  and pooled) against the model's TPOT_slo is the one latency violation, on both evidence
-  paths and in the immediate rollback, the deadline gate and the low-sample check at the
-  ceiling; TTFT neither rolls a probe back nor blocks a commit (the TTFT histogram count
-  stays the request count `n`);
+  and pooled) above the threshold is the one latency violation, in the immediate rollback,
+  the deadline gate and the low-sample check at the ceiling; TTFT neither rolls a probe
+  back nor blocks a commit;
+- the TPOT evidence (2026-11-05) is the per-request histogram
+  `vllm:request_time_per_output_token_seconds` (one sample per finished request; its
+  count is `n`), p95 always `bucket_upper` (whatever `TRE_PERCENTILE_MODE`), against
+  E = the smallest bucket edge the pods export >= TPOT_slo (`tre_common.slo.tpot_bucket_threshold_ms`;
+  0.30 edges 25 / 50 / 75 ms: TPOT_slo 42 -> 50, 61 / 63 / 75 -> 75). Since both are
+  edges, `p95 > E` iff the true p95 is above E; a true p95 in (TPOT_slo, E] passes (the
+  histogram cannot resolve it). No E (edges unknown, the pods' edges differ, or none >=
+  TPOT_slo) -> rollback `insufficient_evidence:tpot_threshold_unresolved`; a pod without
+  the family gives no evidence (no commit). Only the direct path has this series: the
+  gateway's Redis docs carry the per-token TPOT only, so `evidence_source: redis` never
+  commits (`evidence_incomplete:pods_incomplete`, `no_tpot_histogram`); its immediate
+  rollback and the offline tail-snapshot gate still compare the snapshots' per-token TPOT
+  with TPOT_slo;
 - thresholds: TPOT_slo of the registry's top-level `slo_mode` (2026-11-04: the one SLO
   switch of every consumer, `tre_common.slo`; `fixed` / `slowdown`: `tpot_p95_ms`,
   `idle_multiple`: `tpot_k * tpot_idle_ms`; replaces `safescale.slo_mode`); no env override (`SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` were removed

@@ -33,6 +33,7 @@ from tre_controller.planning.safescale_direct import (
     cluster_view_targets,
     compact_hist,
     expand_hist,
+    _unusable,
     hist_delta,
     parse_vllm_metrics,
 )
@@ -65,29 +66,36 @@ class PodSim:
     def __init__(self, *, kv: float = 0.2) -> None:
         self.ttft: list[float] = []
         self.itl: list[float] = []
+        self.req_tpot: list[float] = []
         self.prompt: list[float] = []
         self.kv = kv
         self.awake = True
+        #: False: the pod does not export the per-request TPOT family.
+        self.request_tpot = True
 
     def serve(self, n: int, *, ttft_s: float = 0.05, itl_s: float = 0.02, prompt: float = 500.0,
               tokens: int = 10) -> None:
-        """``n`` requests; each adds one TTFT sample and ``tokens`` ITL (TPOT) samples."""
+        """``n`` finished requests; each adds one TTFT sample, ``tokens`` per-token ITL
+        samples and one per-request TPOT sample (its mean ITL; vLLM: 0 for a one-token
+        request)."""
         for _ in range(n):
             self.ttft.append(ttft_s)
             self.itl.extend([itl_s] * tokens)
+            self.req_tpot.append(itl_s if tokens > 1 else 0.0)
             self.prompt.append(prompt)
 
     def restart(self) -> None:
-        self.ttft, self.itl, self.prompt = [], [], []
+        self.ttft, self.itl, self.req_tpot, self.prompt = [], [], [], []
 
-    def text(self, *, tpot_family: str = "vllm:inter_token_latency_seconds") -> str:
+    def text(self) -> str:
         lines = [f'vllm:engine_sleep_state{{engine="0",model_name="m",sleep_state="awake"}} '
                  f'{1.0 if self.awake else 0.0}',
                  f'vllm:kv_cache_usage_perc{{engine="0",model_name="m"}} {self.kv}']
         lines += _hist_lines("vllm:time_to_first_token_seconds", TTFT_LES, self.ttft)
-        lines += _hist_lines(tpot_family, ITL_LES, self.itl)
-        # Per-request TPOT (0.30): a different family that must not be mistaken for it.
-        lines += _hist_lines("vllm:request_time_per_output_token_seconds", ITL_LES, [9.0] * len(self.ttft))
+        # The per-token ITL (0.30): a different family that must not be mistaken for it.
+        lines += _hist_lines("vllm:inter_token_latency_seconds", ITL_LES, self.itl)
+        if self.request_tpot:
+            lines += _hist_lines("vllm:request_time_per_output_token_seconds", ITL_LES, self.req_tpot)
         lines.append(f'vllm:request_prompt_tokens_count{{engine="0",model_name="m"}} {float(len(self.prompt))}')
         lines.append(f'vllm:request_prompt_tokens_sum{{engine="0",model_name="m"}} {float(sum(self.prompt))}')
         return "\n".join(lines) + "\n"
@@ -230,37 +238,32 @@ class Harness:
 # ============================================================ /metrics format
 def test_the_live_030_fixture_parses_to_the_evidence_families() -> None:
     scrape = parse_vllm_metrics(LIVE_030.read_text(encoding="utf-8"), ts_ms=1)
-    assert scrape.ttft.count == 6.0
-    assert dict(scrape.ttft.buckets)[0.04] == 5.0 and dict(scrape.ttft.buckets)[0.08] == 6.0
-    assert dict(scrape.ttft.buckets)[math.inf] == 6.0
-    # TPOT = the per-token inter_token_latency family (218 tokens), not the per-request
-    # request_time_per_output_token_seconds (6 requests).
-    assert scrape.tpot_name == "vllm:inter_token_latency_seconds"
-    assert scrape.tpot.count == 218.0
+    # TPOT = the per-request request_time_per_output_token_seconds (6 requests, user
+    # 2026-11-05), not the per-token inter_token_latency family (218 tokens).
+    assert scrape.tpot.count == 6.0
+    assert dict(scrape.tpot.buckets)[math.inf] == 6.0
     assert scrape.kv_cache == 0.0 and scrape.awake is True
 
 
-def test_old_vllm_names_are_accepted() -> None:
+def test_a_vllm_without_the_per_request_tpot_gives_no_evidence() -> None:
+    # 0.10.1 sample: only the per-token TPOT family; the probe must not fall back to it.
     scrape = parse_vllm_metrics(OLD_0101.read_text(encoding="utf-8"), ts_ms=1)
-    assert scrape.tpot_name == "vllm:time_per_output_token_seconds"
-    assert scrape.ttft is not None and scrape.kv_cache is not None
-    sim = PodSim()
-    sim.serve(3)
-    assert parse_vllm_metrics(sim.text(tpot_family="vllm:time_per_output_token_seconds"), ts_ms=1).tpot.count == 30
+    assert scrape.tpot is None and scrape.kv_cache is not None
+    assert _unusable(scrape) == "no_tpot_histogram"
 
 
 def test_the_compact_baseline_is_small_json_and_differences_exactly_like_the_full_one() -> None:
     before = PodSim()
-    before.serve(40, ttft_s=0.03)
-    before.serve(5, ttft_s=0.9)
+    before.serve(40, itl_s=0.02)
+    before.serve(5, itl_s=0.4)
     base = parse_vllm_metrics(before.text(), ts_ms=1)
-    record = compact_hist(base.ttft)
+    record = compact_hist(base.tpot)
     assert len(record[1]) == 2 and json.loads(json.dumps(record)) == record  # 2 steps, no Infinity
-    before.serve(30, ttft_s=3.0)
+    before.serve(30, itl_s=3.0)
     now = parse_vllm_metrics(before.text(), ts_ms=2)
-    assert hist_delta(expand_hist(record), now.ttft) == hist_delta(base.ttft, now.ttft)
-    assert hist_delta(base.ttft, now.ttft)[0] == 30.0
-    assert hist_delta(now.ttft, base.ttft) is None  # counters backwards = restart
+    assert hist_delta(expand_hist(record), now.tpot) == hist_delta(base.tpot, now.tpot)
+    assert hist_delta(base.tpot, now.tpot)[0] == 30.0
+    assert hist_delta(now.tpot, base.tpot) is None  # counters backwards = restart
 
 
 # ============================================================ baseline / difference
@@ -405,7 +408,7 @@ def test_a_counter_reset_keeps_the_pod_from_zero_and_the_probe_never_commits() -
     assert probe.direct.dropped == {}
     assert probe.direct.live_pods() == ("m-0", "m-2")
     assert probe.direct.late["m-2"] == {"cause": "counter_reset", "lag_ms": 4_000, "ts_ms": HIDE + 4_000}
-    assert probe.direct.baseline["m-2"].ttft.count == 0.0
+    assert probe.direct.baseline["m-2"].tpot.count == 0.0
     assert probe.direct.last.per_pod["m-2"]["n"] == 5  # everything since the restart
     assert probe.direct.last.missing == {"m-2": "late_baseline"}
     at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 6_000)[-1]
@@ -424,7 +427,7 @@ def test_a_vanished_tpot_family_gives_no_evidence_and_no_commit() -> None:
     h.tick(HIDE + 2_000, serve=5)
     original = h.sims["m-2"].text
     h.sims["m-2"].text = lambda **kw: "\n".join(
-        line for line in original(**kw).splitlines() if "inter_token_latency" not in line) + "\n"
+        line for line in original(**kw).splitlines() if "request_time_per_output_token" not in line) + "\n"
     h.tick(HIDE + 4_000, serve=5)
     state = h.machine.active_probe(MODEL).direct
     assert state.last.unanswered == {"m-2": "no_tpot_histogram"}
@@ -596,7 +599,7 @@ def test_a_restarted_controller_resumes_from_the_persisted_baseline() -> None:
     assert restored.restore() == 1
     again = restored.active_probe(MODEL)
     assert again.deadline_ms == HIDE + W and again.direct.baseline_ts_ms == HIDE
-    assert again.direct.baseline["m-0"].ttft.count == 50  # the pre-hide requests stay out
+    assert again.direct.baseline["m-0"].tpot.count == 50  # the pre-hide requests stay out
     h.machine, h.collector = restored, h._collector(restored)
     at, decision = h.run_until(HIDE + W, serve=4, first=HIDE + 4_000)[-1]
     assert decision.status == "commit" and decision.details["latency_samples"] == 2 * 4 * 10
@@ -633,7 +636,7 @@ def test_scrapes_are_concurrent_bounded_and_never_block_the_event_loop() -> None
     results, elapsed, beats = asyncio.run(scenario())
     scraper.close()
     assert results["d"] == "timeout" and results["n"] == "no_endpoint"
-    assert all(results[f"p{i}"].ttft.count == 6.0 for i in range(6))
+    assert all(results[f"p{i}"].tpot.count == 6.0 for i in range(6))
     assert elapsed < 0.6  # 6 x 0.15 s in parallel, the dead pod cut at 0.3 s
     assert beats >= 10  # the loop kept running meanwhile
 
@@ -726,7 +729,7 @@ def test_config_maps_the_registry_keys(tmp_path) -> None:
     cfg = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path), "TRE_MIN_LATENCY_SAMPLES": "7"}).safescale
     assert (cfg.evidence_source, cfg.evidence_poll_ms, cfg.scrape_timeout_s, cfg.metrics_port) == (
         "direct", 3000.0, 0.5, 9000)
-    assert (cfg.min_latency_samples, cfg.percentile_mode) == (7, "bucket_upper")
+    assert cfg.min_latency_samples == 7
 
 
 def test_the_app_wires_the_collector_and_redis_mode_leaves_it_out(tmp_path) -> None:
@@ -754,5 +757,5 @@ def test_direct_state_record_roundtrip() -> None:
 
     state = take_baseline({"a": parse_vllm_metrics(sim.text(), ts_ms=5), "b": "timeout"}, ts_ms=6)
     again = DirectState.from_record(json.loads(json.dumps(state.as_record())))
-    assert again.baseline["a"].ttft.count == 12 and again.pending == ("b",) and again.dropped == {}
-    assert again.baseline_ts_ms == 5 and isinstance(again.baseline["a"].ttft, Hist)
+    assert again.baseline["a"].tpot.count == 12 and again.pending == ("b",) and again.dropped == {}
+    assert again.baseline_ts_ms == 5 and isinstance(again.baseline["a"].tpot, Hist)

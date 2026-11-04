@@ -107,9 +107,10 @@ class SafeScaleConfig:
     # metrics_port (2026-09-29 B+D). The registry default is "direct"; the dataclass
     # default "redis" keeps direct constructions (tests, offline replays without pod
     # access) on the gateway-doc path. Direct: the controller scrapes the remaining
-    # pods' vLLM /metrics (planning.safescale_direct); per-pod p95 rule = the metrics
-    # store's (percentile_mode, min_latency_samples = TRE_PERCENTILE_MODE /
-    # TRE_MIN_LATENCY_SAMPLES).
+    # pods' vLLM /metrics (planning.safescale_direct); per-pod minimum samples = the
+    # metrics store's (TRE_MIN_LATENCY_SAMPLES). The TPOT p95 is always bucket_upper
+    # (2026-11-05: the threshold E is exact only for an edge), so TRE_PERCENTILE_MODE
+    # does not reach SafeScale (no percentile_mode here).
     evidence_source: str = "redis"
     evidence_poll_ms: float = 2_000.0
     scrape_timeout_s: float = 1.0
@@ -117,7 +118,6 @@ class SafeScaleConfig:
     # Registry safescale.baseline_delay_ms: baseline scrape this long after the hide
     # confirmation (the deadline still counts from the confirmation).
     baseline_delay_ms: float = 1_000.0
-    percentile_mode: str = "bucket_upper"
     min_latency_samples: int = 0
     hq: float = 0.25
     tau_low: float = 1.0
@@ -382,7 +382,6 @@ class ControllerConfig:
             scrape_timeout_s=float(safescale_registry.scrape_timeout_s),
             metrics_port=int(safescale_registry.metrics_port),
             baseline_delay_ms=float(safescale_registry.baseline_delay_ms),
-            percentile_mode=percentile_mode,
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),

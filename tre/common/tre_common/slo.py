@@ -4,7 +4,9 @@ Every consumer of "what is this request's SLO" and "did it meet it" calls this m
 the calibration window label (``tre_common.slo_labels``), the scorer
 (``tre_eval.metrics``), the SafeScale probe threshold
 (``tre_controller.planning.safescale_evidence``; the probe uses the TPOT component only -
-``SloThresholds.tpot_ms`` - and judges no TTFT, user 2026-11-04), the baseline tools
+``SloThresholds.tpot_ms`` - and judges no TTFT, user 2026-11-04; it compares the p95 with
+the bucket edge :func:`tpot_bucket_threshold_ms` derives from TPOT_slo, user 2026-11-05),
+the baseline tools
 (``tre_baselines.tools.slo_judge`` / ``preserve_nl_slo`` / ``tokenscale_profile`` through
 the label) and the baseline-scaler limits (``tre_baselines.config``). A second
 implementation is a bug (guard: ``deploy/tests/test_slo_single_definition.py``).
@@ -50,7 +52,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 SLO_MODE_FIXED = "fixed"
 SLO_MODE_SLOWDOWN = "slowdown"
@@ -94,6 +96,30 @@ def request_ttft_slo_ms(
 def tpot_idle_multiple_ms(*, tpot_k: float, tpot_idle_ms: float) -> float:
     """The ``idle_multiple`` TPOT threshold: ``tpot_k * tpot_idle_ms``."""
     return float(tpot_k) * float(tpot_idle_ms)
+
+
+def tpot_bucket_threshold_ms(tpot_slo_ms: float, edges_s: Optional[Iterable[float]]) -> Optional[float]:
+    """SafeScale's TPOT threshold E (user 2026-11-05): the smallest finite bucket edge of
+    the per-request TPOT histogram (``vllm:request_time_per_output_token_seconds``, edges
+    in seconds as scraped) that is >= TPOT_slo, in ms. It is a derived quantity of the one
+    definition - TPOT_slo stays ``SloThresholds.tpot_ms`` - not a second threshold.
+
+    Why: the probe's p95 is read with ``bucket_upper`` (the upper edge of the bucket that
+    holds the p95), so it is always an edge. With E an edge too, "reported p95 > E" holds
+    exactly when the true p95 is above E: no false violation for a true p95 <= TPOT_slo
+    (<= E), and a true p95 in (TPOT_slo, E] is not a violation - the histogram cannot
+    tell it apart (the documented quantization; e.g. edges 25 / 50 / 75 ms: TPOT_slo 42
+    -> E 50, 61 / 63 / 75 -> E 75).
+
+    None (the caller fails closed: no commit) when no edge is known or none is >= TPOT_slo."""
+    if edges_s is None:
+        return None
+    slo = float(tpot_slo_ms)
+    edges = sorted(float(edge) * 1000.0 for edge in edges_s if math.isfinite(float(edge)))
+    for edge_ms in edges:
+        if edge_ms >= slo - 1e-9:
+            return edge_ms
+    return None
 
 
 # ------------------------------------------------------------------ the thresholds

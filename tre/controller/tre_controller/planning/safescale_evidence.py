@@ -16,12 +16,16 @@ part of the gate now reads ONE evidence window instead:
   boundary (the same doc-stamp grid the snapshots read);
 * pods: the model's pods minus the probe's hidden pods and minus the pods the fleet
   state reports asleep (a pod the fleet state does not list is kept);
-* TPOT p95 = max over those pods and their pooled histogram (the snapshot rule, per-pod
-  minimum samples ``TRE_MIN_LATENCY_SAMPLES``), ``n`` = their TTFT count (the TTFT
-  histogram count is the request counter: requests that got their first token),
-  ``n_judged`` = the TTFT count of the pods that have a TPOT p95. SafeScale judges TPOT
-  only (2026-11-04): TTFT is not a latency verdict of the probe, so no TTFT p95 and no
-  prompt length are formed here.
+* the latency SafeScale judges is the per-request TPOT (user 2026-11-05,
+  ``vllm:request_time_per_output_token_seconds``: p95 ``bucket_upper`` against the
+  bucket edge E >= TPOT_slo, :func:`tre_controller.planning.safescale.tpot_limit_ms`).
+  **The gateway docs do not carry that series** (``pkg/cache/cache_tre_redis.go``
+  ``treHistogramMetricNames`` writes TTFT / the per-token TPOT / e2e / token counts), so
+  :class:`MetricsEvidenceReader` reports every pod's TPOT as missing and no bucket
+  edges: this path never commits (fail closed, ``evidence_incomplete:pods_incomplete``
+  with ``no_tpot_histogram``) until the gateway writes the per-request series and the
+  reader reads it. ``n`` = the remaining pods' TTFT count (requests that got their first
+  token), kept for the audit and the idle / stalled checks.
 
 ``hide_ts`` is Redis ``TIME`` read right after the SM confirmed the hide (the reference
 the service-manager's clock-skew check uses too), else the controller clock. It is
@@ -44,7 +48,6 @@ from typing import Any, Callable, Collection, Mapping, Protocol
 
 from tre_common import slo as slo_def
 from tre_common.rediskeys import hist_key, pods_key
-from tre_common.window_pods import pooled_p95_ms
 
 LOG = logging.getLogger("tre_controller.safescale")
 
@@ -115,12 +118,13 @@ class EvidenceWindow:
     pods: tuple[str, ...]
     excluded_pods: tuple[str, ...]
     tpot_p95_ms: float | None
-    #: n: completed requests (TTFT count delta) of the remaining pods.
-    ttft_count: float
+    #: n: requests of the remaining pods (the per-request TPOT count of an
+    #: :class:`EvidenceSource` that has it; :class:`MetricsEvidenceReader`: TTFT count).
+    request_count: float
     #: pod -> stamp (ms) of the first histogram doc its TTFT delta starts from.
     first_doc_ts_ms: dict[str, int] = field(default_factory=dict)
-    #: TTFT count of the pods whose TPOT p95 is defined (the requests the p95 judges).
-    #: None = same as ttft_count.
+    #: Requests of the pods whose TPOT p95 is defined (the requests the p95 judges).
+    #: None = same as request_count.
     judged_count: float | None = None
     #: pod -> stamp (ms) of the last histogram doc its TTFT delta ends at.
     last_doc_ts_ms: dict[str, int] = field(default_factory=dict)
@@ -133,10 +137,13 @@ class EvidenceWindow:
     #: max(per pod, pooled) TPOT p95 WITHOUT any minimum-samples rule: the ceiling's
     #: low-sample evaluation. None = not computed (then tpot_p95_ms stands in).
     low_tpot_p95_ms: float | None = None
+    #: Finite bucket edges (s) of the per-request TPOT histogram (the threshold E);
+    #: None = unknown (no threshold: no commit).
+    tpot_edges_s: tuple[float, ...] | None = None
 
     @property
     def judged(self) -> float:
-        return float(self.ttft_count if self.judged_count is None else self.judged_count)
+        return float(self.request_count if self.judged_count is None else self.judged_count)
 
 
 class EvidenceSource(Protocol):
@@ -204,56 +211,28 @@ class MetricsEvidenceReader:
             for key, pod in pods.items()
             if getattr(pod, "hist_first_ts_ms", None) is not None
         }
-        # Fail closed (review of 9ad3ec32, B1): TPOT is the judged latency. A pod whose
-        # TPOT series is missing from a doc of the read gives no TPOT evidence: it is
-        # reported (``tpot_missing_pods``: a required one blocks the commit) and its
-        # requests are never counted as judged.
-        tpot_missing = tuple(sorted(
-            str(getattr(pod, "pod", key)) for key, pod in pods.items()
-            if not getattr(pod, "tpot_count_complete", True)
-        ))
-        with_tpot = [pod for key, pod in pods.items() if str(getattr(pod, "pod", key)) not in tpot_missing]
-        judged = sum(
-            float(getattr(pod, "ttft_count", None) or 0.0)
-            for pod in with_tpot
-            if pod.tpot_p95_ms is not None
-        )
         last_docs = {
             str(getattr(pod, "pod", key)): int(pod.hist_last_ts_ms)
             for key, pod in pods.items()
             if getattr(pod, "hist_last_ts_ms", None) is not None
         }
-        # Pooled p95 next to the per-pod maximum: a pod below the per-pod minimum
-        # samples (an overloaded pod completes few requests) still weighs in.
-        rule = getattr(self._store, "p95_rule", None) or ("bucket_upper", 0)
-        pooled_tpot = pooled_p95_ms(
-            ((getattr(pod, "tpot_hist", None), getattr(pod, "tpot_hist_count", None)) for pod in pods.values()), rule
-        )
-        total = float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values()))
-        if pooled_tpot is not None:
-            # The requests in the pooled p95: those of the pods with TPOT samples.
-            judged = sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in with_tpot
-                         if float(getattr(pod, "tpot_hist_count", None) or 0.0) > 0)
-        # The same max(per pod, pooled) without any minimum-samples rule (low-sample
-        # evaluation at the ceiling).
-        rule0 = (rule[0], 0)
-
-        def low(hist_attr: str, count_attr: str) -> float | None:
-            pairs = [(getattr(pod, hist_attr, None), getattr(pod, count_attr, None)) for pod in pods.values()]
-            return _max_present([*(pooled_p95_ms([pair], rule0) for pair in pairs), pooled_p95_ms(pairs, rule0)])
+        names = tuple(sorted(str(getattr(pod, "pod", key)) for key, pod in pods.items()))
+        # Fail closed (user 2026-11-05): SafeScale judges the per-request TPOT, which the
+        # gateway docs do not carry (the doc's TPOT is the per-token histogram). Every pod's
+        # TPOT is missing (a required one makes the evidence incomplete) and there are no
+        # bucket edges (no threshold E): this source never lets a probe commit.
         return EvidenceWindow(
             start_ms=int(start_ms),
             end_ms=int(end_ms),
-            pods=tuple(sorted(str(getattr(pod, "pod", key)) for key, pod in pods.items())),
+            pods=names,
             excluded_pods=dropped,
-            tpot_p95_ms=_max_present([*(pod.tpot_p95_ms for pod in pods.values()), pooled_tpot]),
-            ttft_count=total,
+            tpot_p95_ms=None,
+            request_count=float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values())),
             first_doc_ts_ms=first_docs,
-            judged_count=float(judged),
+            judged_count=0.0,
             last_doc_ts_ms=last_docs,
-            pooled_tpot_p95_ms=pooled_tpot,
-            low_tpot_p95_ms=low("tpot_hist", "tpot_hist_count"),
-            tpot_missing_pods=tpot_missing,
+            tpot_missing_pods=names,
+            tpot_edges_s=None,
         )
 
     def _now(self) -> tuple[int, str]:
@@ -307,10 +286,13 @@ class RegistryThresholds:
     """:class:`ThresholdResolver` from the registry: the TPOT threshold of the registry's
     ``slo_mode`` (the one switch of every consumer), built by ``tre_common.slo``.
 
-    What the probe judges (user 2026-11-04, a design change): the evidence window's p95
-    TPOT (vLLM inter-token-latency histograms of the remaining pods, max of per pod and
-    pooled) against the mode's TPOT_slo - ``tpot_p95_ms`` in ``fixed`` / ``slowdown``,
-    ``tpot_k * tpot_idle_ms`` in ``idle_multiple``. TTFT is not judged by SafeScale (no
+    What the probe judges (user 2026-11-04, a design change; metric and threshold user
+    2026-11-05): the evidence window's p95 TPOT (vLLM per-request TPOT histograms
+    ``request_time_per_output_token_seconds`` of the remaining pods, max of per pod and
+    pooled, ``bucket_upper``) against E, the smallest bucket edge >= the mode's TPOT_slo
+    (``tpot_p95_ms`` in ``fixed`` / ``slowdown``, ``tpot_k * tpot_idle_ms`` in
+    ``idle_multiple``). This resolver gives TPOT_slo; E is derived from it and the
+    scraped edges (``tre_common.slo.tpot_bucket_threshold_ms``). TTFT is not judged by SafeScale (no
     rollback, no blocked commit): the probe uses the TPOT component of the definition
     only; the scorer and the labels still judge both components.
 
@@ -352,8 +334,3 @@ class StaticThresholds:
 
     def resolve(self, model: str) -> dict[str, Any]:
         return {"mode": THRESHOLD_MODE_STATIC, "tpot_ms": self._tpot_ms, "source": "static"}
-
-
-def _max_present(values) -> float | None:
-    present = [float(value) for value in values if value is not None]
-    return max(present) if present else None

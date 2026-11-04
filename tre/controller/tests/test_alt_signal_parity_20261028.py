@@ -166,5 +166,5 @@ def test_missing_ttft_histogram_leaves_safescale_ttft_count_as_before():
     reader = MetricsEvidenceReader(ev_store, redis_client=store.redis_client)
     evidence = reader.read(MODEL, start_ms=start, end_ms=end, exclude_pods=())
     w0 = ev_store.read_model_window(MODEL, start - 1, end, start_exclusive=True)
-    assert evidence.ttft_count > 0.0
-    assert evidence.ttft_count == pytest.approx(sum(p.ttft_count or 0.0 for p in w0.per_pod.values()))
+    assert evidence.request_count > 0.0
+    assert evidence.request_count == pytest.approx(sum(p.ttft_count or 0.0 for p in w0.per_pod.values()))

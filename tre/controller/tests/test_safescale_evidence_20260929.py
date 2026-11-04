@@ -63,6 +63,9 @@ TRE_DIR = Path(__file__).resolve().parents[2]
 MODEL = "m"
 START = 100_000  # probe planned on the snapshot of boundary 100 s
 HIDE = 103_000  # the SM confirmed the hide 3 s later (Redis TIME)
+#: vLLM 0.30's per-request TPOT bucket edges (s).
+VLLM_TPOT_EDGES_S = (0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+                     20.0, 40.0, 80.0)
 
 
 # ----------------------------------------------------------------------- helpers
@@ -104,12 +107,16 @@ class FakeEvidence:
         # The gateway writes a doc of every remaining pod every period: by default each
         # pod's docs reach the window end (a fresh view's remaining pods must, to commit).
         last = window.get("last_doc_ts_ms", {pod: end_ms for pod in window.get("pods", ())})
-        return EvidenceWindow(**{**window, "start_ms": start_ms, "end_ms": end_ms, "last_doc_ts_ms": last})
+        # A source with the per-request TPOT series has its bucket edges (vLLM 0.30's);
+        # the real Redis reader has none (fail closed).
+        edges = window.get("tpot_edges_s", VLLM_TPOT_EDGES_S)
+        return EvidenceWindow(**{**window, "start_ms": start_ms, "end_ms": end_ms, "last_doc_ts_ms": last,
+                                 "tpot_edges_s": edges})
 
 
 def _window(n: float, *, tpot: float | None = 10.0, first_doc: int = 110_000) -> dict:
     return dict(
-        start_ms=0, end_ms=0, pods=("m-0",), excluded_pods=("m-1",), tpot_p95_ms=tpot, ttft_count=n,
+        start_ms=0, end_ms=0, pods=("m-0",), excluded_pods=("m-1",), tpot_p95_ms=tpot, request_count=n,
         first_doc_ts_ms={"m-0": first_doc} if first_doc is not None else {},
     )
 
@@ -486,14 +493,12 @@ def test_reader_differences_the_remaining_pods_from_the_first_boundary_after_the
     _history(redis)
     window = _reader(redis).read(MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=("m-1",))
     assert window.pods == ("m-0",) and window.excluded_pods == ("m-1", "m-2")
-    assert window.ttft_count == 30  # 15 + 15 after the 110 s boundary doc, none before it
-    assert window.tpot_p95_ms == 20.0  # only fast requests (the slow pods are excluded)
+    assert window.request_count == 30  # 15 + 15 after the 110 s boundary doc, none before it
     assert window.first_doc_ts_ms == {"m-0": 110_000}  # the boundary doc is the baseline
-    # Without the exclusions the probe / sleeping pods' slow requests would dominate.
     everything = MetricsEvidenceReader(_reader(redis)._store, redis_client=redis).read(
         MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=()
     )
-    assert everything.tpot_p95_ms == 1_000.0 and everything.ttft_count == 70
+    assert everything.request_count == 70
 
 
 def test_hide_anchor_is_redis_time_with_the_newest_gateway_doc() -> None:
@@ -523,7 +528,7 @@ def test_one_missed_boundary_tick_is_tolerated_the_delta_starts_at_the_next_doc(
     assert machine.observe(MODEL, _obs(120_000), now_ms=120_000).reason == "evidence_extended"  # 1 doc: n = 0
     assert machine.observe(MODEL, _obs(130_000), now_ms=130_000).reason == "evidence_extended"  # n = 15
     decision = machine.observe(MODEL, _obs(140_000), now_ms=140_000)
-    assert decision.status == "commit"
+    assert decision.status != "commit"  # no per-request TPOT in the gateway docs
     # Never the pre-hide 100 s doc as the baseline (no lookback).
     assert (decision.details["evidence_first_doc_ts_ms"], decision.details["latency_samples"]) == (120_000, 30)
 
@@ -548,17 +553,17 @@ def test_the_evidence_reader_refuses_a_store_with_histogram_lookback() -> None:
         MetricsEvidenceReader(store)
 
 
-def test_real_reader_commits_on_post_hide_evidence() -> None:
+def test_real_reader_never_commits_the_gateway_docs_lack_the_per_request_tpot() -> None:
+    # User 2026-11-05: SafeScale judges the per-request TPOT; the gateway docs carry only
+    # the per-token TPOT. Healthy post-hide traffic still never commits on this path.
     redis = DocRedis()
     _history(redis)
     machine = _real_machine(redis)
-    # Snapshots still show the pre-hide slowness (500 ms TPOT): not judged, not in the gate.
-    machine.observe(MODEL, _obs(110_000, tpot=500.0), now_ms=110_000)
-    assert machine.observe(MODEL, _obs(120_000, tpot=500.0), now_ms=120_000).reason == "evidence_extended"
-    decision = machine.observe(MODEL, _obs(130_000, tpot=500.0), now_ms=130_000)
-    assert decision.status == "commit"
-    assert (decision.details["latency_samples"], decision.details["evidence_tpot_p95_ms"]) == (30, 20.0)
-    assert decision.details["tail_pre_hide_fraction"] == 0.0
+    decisions = [machine.observe(MODEL, _obs(ts), now_ms=ts) for ts in range(110_000, 200_001, 10_000)]
+    assert all(d.status != "commit" for d in decisions)
+    final = next(d for d in decisions if d.status == "rollback")
+    assert final.details["rollback_reason"]["code"] == "evidence_incomplete:pods_incomplete"
+    assert final.details["rollback_reason"]["detail"] == {"m-0": "no_tpot_histogram"}
 
 
 # ============================================================ 5. clock check
@@ -682,24 +687,6 @@ def test_n_counts_only_the_pods_whose_p95_is_judged() -> None:
     _started(partial)
     partial.observe(MODEL, _obs(110_000), now_ms=110_000)
     assert partial.observe(MODEL, _obs(120_000), now_ms=120_000).reason == "evidence_extended"
-
-
-def test_reader_judged_count_excludes_pods_below_the_per_pod_minimum_unless_pooled() -> None:
-    # 2026-09-29 review F1: the pooled p95 (per-pod minimum applied to the pooled count)
-    # judges every request, the pod below the per-pod minimum included.
-    redis = DocRedis()
-    for pod, fast in (("m-0", 6), ("m-3", 12)):
-        redis.add(pod, 110_000, fast=0, slow=0, prompt=0.0)
-        redis.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
-    window = _reader(redis).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
-    assert (window.ttft_count, window.judged_count) == (18.0, 18.0)
-    assert window.pooled_tpot_p95_ms == 20.0
-    few = DocRedis()
-    for pod, fast in (("m-0", 3), ("m-3", 4)):  # 7 in all: below the minimum even pooled
-        few.add(pod, 110_000, fast=0, slow=0, prompt=0.0)
-        few.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
-    window = _reader(few).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
-    assert (window.ttft_count, window.judged_count, window.pooled_tpot_p95_ms) == (7.0, 0.0, None)
 
 
 def test_a_late_hide_moves_the_window_with_it() -> None:

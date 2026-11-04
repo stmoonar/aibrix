@@ -120,6 +120,8 @@ class _Pod:
     e2e_sum: float = 0.0
     ttft: list = field(default_factory=lambda: [0.0] * (len(TTFT_BOUNDS) + 1))
     tpot: list = field(default_factory=lambda: [0.0] * (len(TPOT_BOUNDS) + 1))
+    #: Per-request TPOT (one sample per finished request): the direct path's evidence.
+    req_tpot: list = field(default_factory=lambda: [0.0] * (len(TPOT_BOUNDS) + 1))
     e2e: list = field(default_factory=lambda: [0.0] * (len(E2E_BOUNDS) + 1))
     gauges: tuple = (0.0, 0.0, 0.0)
 
@@ -296,6 +298,7 @@ class Sim:
                 pod.ttft_sum += ttft * done
                 pod.e2e_sum += (ttft + out / speed) * done
                 _bucket_add(pod.tpot, TPOT_BOUNDS, 1.0 / speed, done * out)
+                _bucket_add(pod.req_tpot, TPOT_BOUNDS, 1.0 / speed, done)
                 _bucket_add(pod.e2e, E2E_BOUNDS, ttft + out / speed, done)
                 pod.gauges = (running, waiting, min(1.0, (running + 4.0 * waiting) / 18.0))
         if self._stalled(ts):
@@ -436,8 +439,7 @@ class Sim:
         pod = self._pod(name)
         running, waiting, kv = pod.gauges
         return PodScrape(
-            ts_ms=self.now, started_ms=self.now, ttft=_cumulative(pod.count, TTFT_BOUNDS, pod.ttft),
-            tpot=_cumulative(pod.gen, TPOT_BOUNDS, pod.tpot),
+            ts_ms=self.now, started_ms=self.now, tpot=_cumulative(pod.count, TPOT_BOUNDS, pod.req_tpot),
             kv_cache=kv, awake=pod.awake, in_flight=running + waiting,
         )
 

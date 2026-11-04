@@ -53,6 +53,9 @@ def test_030_resolves_to_the_new_names() -> None:
     names = sample_names(_text("0.30.0"))
     assert resolve_vllm_name("kv_cache_usage_perc", names) == "vllm:kv_cache_usage_perc"
     assert resolve_vllm_name("inter_token_latency_seconds", names) == "vllm:inter_token_latency_seconds"
+    # SafeScale's TPOT evidence (user 2026-11-05): the per-request histogram, on 0.30.
+    assert resolve_vllm_name("request_time_per_output_token_seconds", names) == (
+        "vllm:request_time_per_output_token_seconds")
     assert resolve_vllm_name("prefix_cache_queries", names) == "vllm:prefix_cache_queries_total"
     assert resolve_vllm_name("prefix_cache_hits", names) == "vllm:prefix_cache_hits_total"
     # The e2e histogram is exported under its unchanged name (SafeScale / latency_p95 e2e).
