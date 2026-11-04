@@ -193,7 +193,6 @@ TTFT_SLO_MODES = _slo.SLO_MODES
 #: floor from the registry (DynamoLLM / SLOs-Serve loose 5x; the floor keeps short prompts
 #: on the fixed rule - a purely length-normalised SLO turns head-of-line blocking of short
 #: prompts into violations TSS cannot see).
-DEFAULT_TTFT_SLO_MODE = _slo.DEFAULT_SLO_MODE
 #: The mode of the D6' primary label (plan 2026-09-21 6.11): the label the 10-03 calibration
 #: chain (calibration_campaign / _supplement / _dataset, dline_refit, their freezes and
 #: sealed label hashes) is defined on. Those tools name it explicitly (a frozen record's
@@ -917,22 +916,27 @@ def fill_fixed_slo_args(args: argparse.Namespace, models: Optional[Iterable[str]
 
 def add_label_arguments(
     parser: argparse.ArgumentParser, *, require_fixed: bool = False, include_fixed: bool = True,
+    require_mode: bool = False,
 ) -> None:
     """The label flags every fit entry point shares. ``include_fixed=False`` leaves out
     ``--ttft-p95-ms`` / ``--tpot-p95-ms`` for a tool that already has its own
     ``--ttft-slo-ms`` / ``--tpot-slo-ms`` (``label_def_from_args`` reads either). The fixed
-    thresholds default to the registry's (``slo.ttft_p95_ms`` / ``tpot_p95_ms``)."""
+    thresholds default to the registry's (``slo.ttft_p95_ms`` / ``tpot_p95_ms``).
+    ``require_mode`` (tools whose output is compared with a frozen record, e.g. a D6'
+    reproduction): ``--ttft-slo-mode`` is required - the registry's switch may have moved
+    since the record was made (2026-11-04)."""
     if include_fixed:
         parser.add_argument("--ttft-p95-ms", type=float, required=require_fixed,
                             help="fixed-mode TTFT p95 SLO (ms; default: the registry's slo.ttft_p95_ms); "
                                  "recorded but unused in a per-request mode")
         parser.add_argument("--tpot-p95-ms", type=float, required=require_fixed,
                             help="fixed-mode TPOT p95 SLO (ms; default: the registry's slo.tpot_p95_ms)")
-    parser.add_argument("--ttft-slo-mode", choices=TTFT_SLO_MODES, default=None,
+    parser.add_argument("--ttft-slo-mode", choices=TTFT_SLO_MODES, default=None, required=require_mode,
                         help="fixed: one TTFT p95 threshold (comparison column); slowdown: "
                              "max(floor, k*(c_m+b_m*L)) per request (plan 6.11 D6-prime); idle_multiple: "
-                             "the 2026-11-04 SLO (registry slo.idle_multiple). Default: the registry's "
-                             "top-level slo_mode (tre_common.slo)")
+                             "the 2026-11-04 SLO (registry slo.idle_multiple). "
+                             + ("Required (the output is compared with a frozen record)" if require_mode else
+                                "Default: the registry's top-level slo_mode (tre_common.slo)"))
     parser.add_argument("--ttft-slowdown-k", type=float, default=None,
                         help="TTFT multiple k of a per-request mode. Default: registry slo.ttft_slowdown_k "
                              "(slowdown) / slo.idle_multiple.ttft_k")
@@ -1000,7 +1004,10 @@ def label_def_for_model(
         mode_of = getattr(registry, "slo_mode", None)
         registry_mode = mode_of() if callable(mode_of) else None
     if mode is None:
-        mode = registry_mode or DEFAULT_TTFT_SLO_MODE
+        # the one switch (2026-11-04): no built-in default mode
+        if registry_mode is None:
+            raise SystemExit(f"model {model}: no SLO mode - pass mode (--ttft-slo-mode) or a registry with slo_mode")
+        mode = registry_mode
     if mode not in TTFT_SLO_MODES:
         raise ValueError(f"ttft_slo_mode must be one of {TTFT_SLO_MODES}, got {mode!r}")
     base = fixed_base = None

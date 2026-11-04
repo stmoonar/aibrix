@@ -171,3 +171,24 @@ def test_the_cli_builds_the_registry_primary_and_its_arms(tmp_path) -> None:
     again = ap.parse_args(["--label-registry", str(registry), *slo_labels.label_mode_cli_args(primary)])
     assert slo_labels.label_def_from_args(again, "dsqwen-7b") == primary
     assert set(slo_labels.resolve_arms(primary)) == set(slo_labels.ARM_COLUMNS)
+
+
+def test_no_mode_and_no_registry_switch_is_refused_not_slowdown() -> None:
+    """S2 (review 2026-11-04): the label's default mode is the registry's slo_mode; a registry view
+    without one (and no explicit mode) is refused - no silent slowdown."""
+    class NoSwitch:
+        def model(self, name):
+            raise KeyError(name)
+
+    with pytest.raises(SystemExit, match="no SLO mode"):
+        slo_labels.label_def_for_model("m", registry=NoSwitch(), ttft_p95_ms=500.0, tpot_p95_ms=75.0)
+
+
+def test_tools_compared_with_a_frozen_record_require_the_mode() -> None:
+    import argparse
+
+    p = argparse.ArgumentParser()
+    slo_labels.add_label_arguments(p, require_mode=True)
+    with pytest.raises(SystemExit):
+        p.parse_args([])
+    assert p.parse_args(["--ttft-slo-mode", "slowdown"]).ttft_slo_mode == "slowdown"

@@ -318,52 +318,83 @@ class SloModeResolution:
     legacy_conflict: Optional[str] = None
 
 
-def resolve_slo_mode(raw: Mapping[str, Any]) -> SloModeResolution:
-    """The mode a registry (raw YAML mapping) puts in force. Raises ValueError for an
-    unknown mode, or for a registry that has the switch AND a legacy key (two switches)."""
-    raw = raw or {}
-    model_modes: dict[str, str] = {}
-    for model in raw.get("models") or []:
-        value = ((model or {}).get("slo") or {}).get(LEGACY_MODEL_KEY)
-        if value is not None:
-            model_modes[str((model or {}).get("name"))] = str(value).strip().lower()
+def _legacy_meaning(raw: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """What the two retired keys meant to the consumers of an image from before 2026-11-04,
+    per model: (old scorer / labels mode, old SafeScale probe mode, the retired keys present).
+
+    * scorer / labels: ``models[].slo.ttft_slo_mode`` (fixed | slowdown), absent = slowdown;
+    * probe: ``safescale.slo_mode: fixed`` = fixed; ``labels`` (and absent, its old default) =
+      the model's label rule, i.e. that model's scorer mode."""
+    models = [m or {} for m in raw.get("models") or []]
     safescale = raw.get("safescale") or {}
     legacy_safescale = safescale.get(LEGACY_SAFESCALE_KEY) if isinstance(safescale, Mapping) else None
+    present: list[str] = []
+    probe_fixed = False
+    if legacy_safescale is not None:
+        name = str(legacy_safescale).strip().lower()
+        if name not in LEGACY_SAFESCALE_MODES:
+            raise ValueError(f"safescale.slo_mode must be one of {tuple(LEGACY_SAFESCALE_MODES)}, got {legacy_safescale!r}")
+        probe_fixed = name == "fixed"
+        present.append(f"safescale.{LEGACY_SAFESCALE_KEY}")
+    scorer: dict[str, str] = {}
+    probe: dict[str, str] = {}
+    for model in models:
+        name = str(model.get("name"))
+        value = (model.get("slo") or {}).get(LEGACY_MODEL_KEY)
+        if value is not None:
+            value = str(value).strip().lower()
+            if value not in (SLO_MODE_FIXED, SLO_MODE_SLOWDOWN):
+                raise ValueError(f"models[].slo.{LEGACY_MODEL_KEY} must be fixed or slowdown, got {value!r}")
+            present.append(f"models[{name}].slo.{LEGACY_MODEL_KEY}")
+        scorer[name] = value or SLO_MODE_SLOWDOWN
+        probe[name] = SLO_MODE_FIXED if probe_fixed else scorer[name]
+    return scorer, probe, present
+
+
+def resolve_slo_mode(raw: Mapping[str, Any]) -> SloModeResolution:
+    """The mode a registry (raw YAML mapping) puts in force. Raises ValueError for an
+    unknown mode, or for a registry whose switch and retired keys disagree.
+
+    A registry may carry the switch AND the retired keys when they mean the same mode to
+    an image from before 2026-11-04 (:func:`_legacy_meaning`: its scorer / labels and its
+    probe) - a transition registry that the old and the new images read alike, so a
+    rollback of the images alone keeps the SLO. ``idle_multiple`` has no legacy
+    spelling: next to a retired key it is refused."""
+    raw = raw or {}
+    scorer, probe, present = _legacy_meaning(raw)
     switch = raw.get(SLO_MODE_KEY)
     if switch is not None:
         mode = str(switch).strip().lower()
         if mode not in SLO_MODES:
             raise ValueError(f"{SLO_MODE_KEY} must be one of {SLO_MODES}, got {switch!r}")
-        legacy = [f"models[{m}].slo.{LEGACY_MODEL_KEY}" for m in sorted(model_modes)]
-        if legacy_safescale is not None:
-            legacy.append(f"safescale.{LEGACY_SAFESCALE_KEY}")
-        if legacy:
-            raise ValueError(
-                f"registry has {SLO_MODE_KEY} and the retired key(s) {legacy}: one switch only "
-                f"(remove them; {SLO_MODE_KEY} acts on every consumer)"
-            )
+        if present:
+            differ = sorted({f"{m} scorer {scorer[m]} / probe {probe[m]}" for m in scorer
+                             if scorer[m] != mode or probe[m] != mode})
+            if differ:
+                raise ValueError(
+                    f"registry has {SLO_MODE_KEY} {mode} and the retired key(s) {present} meaning otherwise to an "
+                    f"image before 2026-11-04 ({'; '.join(differ)}): one switch (remove them, or make them mean "
+                    f"{mode}; {SLO_MODE_KEY} acts on every consumer)"
+                )
         return SloModeResolution(mode=mode, source=SLO_MODE_KEY)
-    safescale_mode: Optional[str] = None
-    if legacy_safescale is not None:
-        name = str(legacy_safescale).strip().lower()
-        if name not in LEGACY_SAFESCALE_MODES:
-            raise ValueError(f"safescale.slo_mode must be one of {tuple(LEGACY_SAFESCALE_MODES)}, got {legacy_safescale!r}")
-        safescale_mode = LEGACY_SAFESCALE_MODES[name]
-    if model_modes:
-        distinct = sorted(set(model_modes.values()))
-        bad = [m for m in distinct if m not in (SLO_MODE_FIXED, SLO_MODE_SLOWDOWN)]
-        if bad:
-            raise ValueError(f"models[].slo.{LEGACY_MODEL_KEY} must be fixed or slowdown, got {bad}")
-        if len(distinct) > 1:
-            raise ValueError(f"models[].slo.{LEGACY_MODEL_KEY} differs between models {model_modes}; set {SLO_MODE_KEY}")
-        mode = distinct[0]
+    if present:
+        safescale = raw.get("safescale") or {}
+        legacy_safescale = safescale.get(LEGACY_SAFESCALE_KEY) if isinstance(safescale, Mapping) else None
+        keyed = {str((m or {}).get("name")): str(((m or {}).get("slo") or {})[LEGACY_MODEL_KEY]).strip().lower()
+                 for m in raw.get("models") or [] if ((m or {}).get("slo") or {}).get(LEGACY_MODEL_KEY) is not None}
+        if not keyed:   # only the probe key (as before 2026-11-04: its mode)
+            name = str(legacy_safescale).strip().lower()
+            return SloModeResolution(mode=LEGACY_SAFESCALE_MODES[name], source=f"legacy:safescale.{LEGACY_SAFESCALE_KEY}")
+        modes = sorted(set(keyed.values()))
+        if len(modes) > 1:
+            raise ValueError(f"models[].slo.{LEGACY_MODEL_KEY} differs between models {keyed}; set {SLO_MODE_KEY}")
+        mode = modes[0]
         conflict = None
-        if safescale_mode is not None and safescale_mode != mode:
+        # the probe: ``fixed`` = fixed; ``labels`` = the label rule, i.e. this same mode
+        if legacy_safescale is not None and str(legacy_safescale).strip().lower() == "fixed" and mode != SLO_MODE_FIXED:
             conflict = (f"legacy registry: the scorer / labels used models[].slo.{LEGACY_MODEL_KEY} {mode}, "
                         f"the SafeScale probe safescale.slo_mode {legacy_safescale}; set {SLO_MODE_KEY}")
         return SloModeResolution(mode=mode, source=f"legacy:models.slo.{LEGACY_MODEL_KEY}", legacy_conflict=conflict)
-    if safescale_mode is not None:
-        return SloModeResolution(mode=safescale_mode, source=f"legacy:safescale.{LEGACY_SAFESCALE_KEY}")
     # No switch at all: slowdown (the built-in default of both legacy consumers) when every
     # model has the idle fit it needs, else fixed (what the probe fell back to without it).
     blocks = [(m or {}).get("slo") or {} for m in raw.get("models") or []]

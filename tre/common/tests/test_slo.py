@@ -52,7 +52,7 @@ def test_the_verdict() -> None:
 
 def test_one_switch() -> None:
     raw = _raw()
-    raw["safescale"]["slo_mode"] = "fixed"               # a retired key next to the switch
+    raw["safescale"]["slo_mode"] = "fixed"               # a retired key next to the switch, meaning otherwise
     with pytest.raises(ValueError, match="one switch"):
         slo.resolve_slo_mode(raw)
     legacy = _raw()
@@ -64,6 +64,40 @@ def test_one_switch() -> None:
     assert res.mode == "slowdown" and res.legacy_conflict and res.source.startswith("legacy")
     with pytest.raises(ValueError, match="slo_mode must be one of"):
         slo.resolve_slo_mode({**_raw(), "slo_mode": "median"})
+
+
+@pytest.mark.parametrize("probe, scorer, switch, ok", [
+    ("fixed", "fixed", "fixed", True),          # a transition registry: old and new images read fixed
+    ("labels", "fixed", "fixed", True),         # labels = the label rule = the model's ttft_slo_mode
+    ("labels", "slowdown", "slowdown", True),
+    (None, "slowdown", "slowdown", True),       # no probe key: the old probe's default was labels
+    ("fixed", "slowdown", "fixed", False),      # the pre-11-04 live registry: the old scorer used slowdown
+    ("fixed", None, "fixed", False),            # no model key: the old scorer's default was slowdown
+    ("fixed", "fixed", "idle_multiple", False),  # idle_multiple has no old spelling
+])
+def test_retired_keys_next_to_the_switch_must_mean_the_same_mode(probe, scorer, switch, ok) -> None:
+    """S8 (review 2026-11-04): a registry the old and the new images read alike may keep the retired keys."""
+    raw = _raw(switch)
+    if probe is not None:
+        raw["safescale"]["slo_mode"] = probe
+    for model in raw["models"]:
+        if scorer is not None:
+            model["slo"]["ttft_slo_mode"] = scorer
+    if ok:
+        assert slo.resolve_slo_mode(raw) == slo.SloModeResolution(mode=switch, source="slo_mode")
+    else:
+        with pytest.raises(ValueError, match="meaning otherwise"):
+            slo.resolve_slo_mode(raw)
+
+
+def test_a_legacy_labels_registry_is_not_a_conflict() -> None:
+    legacy = _raw()
+    legacy.pop("slo_mode")
+    legacy["safescale"]["slo_mode"] = "labels"
+    for model in legacy["models"]:
+        model["slo"]["ttft_slo_mode"] = "fixed"
+    res = slo.resolve_slo_mode(legacy)
+    assert (res.mode, res.legacy_conflict) == ("fixed", None)
 
 
 def test_idle_multiple_is_refused_at_load_without_its_parameters() -> None:
