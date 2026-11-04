@@ -6,8 +6,10 @@ datasets; writes only under --out.  Sealed held-out sets (M, E) are refused befo
 Rules (primary, prereg §2):
   attribution  first_token: a request belongs to the window whose (end - 10 s, end] holds send_ts + ttft
                (failures without a first token: done / abort time); S4 = completion time
-  label        TTFT > 500 ms or TPOT > 75 ms or not served (outcome != ok / http != 200: failed, timed out, truncated)
-  lambda, w_p  formula on the training set: lambda = 0.15 L_out, w_p = 6.667 / L_in (request-weighted means of the
+  label        TTFT > TTFT_slo(L) or TPOT > TPOT_slo or not served (outcome != ok / http != 200: failed, timed out,
+               truncated); the thresholds are the registry's (supp_lib "SLO"; the prereg's: fixed 500 / 75 ms)
+  lambda, w_p  formula on the training set: lambda = TPOT_slo / TTFT_slo L_out, w_p = TTFT_slo / TPOT_slo / L_in (fixed
+               500 / 75 ms: 0.15 L_out, 6.667 / L_in; request-weighted means of the
                SERVED requests attributed to the kept training windows); fitted with lambda rounded to 0.01 and w_p to
                1e-6 (= the published values).  S2 = fixed 20 / 0.01
   estimator    local logistic on log TSS (h 0.15, refit_fixedslo.local_root), cluster bootstrap over cells (--nboot 200)
@@ -55,8 +57,11 @@ def fit_one(md, cfg, nboot, rng, ladder_src, prims=L.LADDER_PRIMITIVES, rounding
     K0, shapes_used = L.shape_subset(K0, cfg["shapes"])
     C = L.attr_counts(K0, md.Q, tcol, ["v", "served", "lin", "lout", "fail"])
     # 2. lambda / w_p
-    L_in, L_out, n_served, lam_x, wp_x = L.lam_wp_from(C)
+    L_in, L_out, n_served, lam_x, wp_x = L.lam_wp_from(C, model)
     if cfg["lamwp"] == "formula":
+        if lam_x is None:
+            raise SystemExit(f"{model}: --lam-wp formula is defined for the fixed SLO only (slo_mode {L.r.SLO.mode}: "
+                             "TTFT_slo depends on L); define it first, or --lam-wp fixed --lam --wp")
         lam, wp = round(lam_x, 2), round(wp_x, 6)
     else:
         lam, wp = float(cfg["lam"]), float(cfg["wp"])
@@ -346,7 +351,8 @@ def main(argv=None):
                 "ladder_primitives": prims, "data": data, "host": os.uname().nodename,
                 "time": pd.Timestamp.now().isoformat(timespec="seconds"),
                 "prereg": "tre_local_workspace/docs/prereg-calib-supplement-20261103.md",
-                "constants": {"TTFT_SLO_MS": L.TTFT_SLO_MS, "TPOT_SLO_MS": L.TPOT_SLO_MS, "H_LOCAL": L.H_LOCAL,
+                "slo": L.slo_record(),
+                "constants": {"H_LOCAL": L.H_LOCAL,
                               "R_CRIT": L.R_CRIT, "CAP": L.CAP, "MIN_W": L.MIN_W, "CM_D_10S": L.CM_D_10S,
                               "LAM_D": L.LAM_D, "TRAIN_SPLITS": L.TRAIN_SPLITS, "STEP_MS": L.STEP_MS, "TRIM": L.TRIM}}
         fit = L.clean({"meta": meta, "data": data_prov, "models": results[tag]})

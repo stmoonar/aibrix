@@ -5,7 +5,7 @@ Spec  : tre_local_workspace/docs/prereg-calib-supplement-20261103.md (prereg: pr
 Design: tre_local_workspace/docs/calib-supplement-design-20261103.md; background train-set-slo-review-20261102.md §8, §10.
 
 Imported unchanged (never copied): refit_fixedslo.py (this directory; from <data root>/refit-fixedslo-w10-20261031/,
-    only its paths made configurable)
+    only its paths made configurable; 2026-11-04: its SLO is the registry's, see "SLO" below)
     glm, local_root (local logistic on log TSS, Gaussian kernel h 0.15), local_curve, auroc, boot_ci, antitonic.
     Its tss_all / kept_windows / count are used only by selfcheck.py, to assert that the generalised code below gives
     identical windows, TSS and counts on the old roots.
@@ -23,12 +23,21 @@ Generalised here (old roots give the same numbers; asserted by selfcheck.py):
     recompute_tss_rows (this repo's; the freeze tree's until the 11-03 move) on every source for every basis used;
   * guard: sealed held-out data (M under calib_20261003/M, the coming E set) is refused BEFORE any file is opened.
 
+SLO (2026-11-04): the per-request verdict is tre_common.slo.violated_array with the thresholds of the registry
+refit_fixedslo.configure loads (TRE_FIT_SLO_REGISTRY, default this repo's deploy/registry.yaml; TRE_FIT_SLO_MODE,
+default its slo_mode); no SLO value is written here.  fit.json records it (meta.slo).  The 11-03 fits (tune F,
+Frecf_*) used fixed 500 / 75 ms: TRE_FIT_SLO_MODE=fixed with any registry of that time (the snapshots under
+tre/eval/registries/, the repo registry) reproduces their labels bit for bit.  The lambda / w_p formula
+(lambda = TPOT_slo / TTFT_slo * L_out, w_p = TTFT_slo / TPOT_slo / L_in) is defined for the fixed mode only: a
+per-request mode (TTFT_slo depends on L) needs its own definition first (--lam-wp fixed still works).
+
 Site configuration (2026-11-03, moved into the repo; nothing site-specific is written here):
   TRE_FIT_DATA_ROOT   the directory that holds the calibration data roots (calib_20261003/, calib_supp_20261103/,
                       analysis-tss-params-20261030/, refit-fixedslo-w10-20261031/, freeze-ctr20-20261028/); the
                       'old' training roots, the freeze parameters and the sealed-root prefixes are named relative to it.
                       Unset: '--data old' is refused and the freeze lambda cross-check is skipped (logged).  The
                       sealed guard does not depend on it (it matches the sealed roots' names anywhere in a path).
+  TRE_FIT_SLO_REGISTRY, TRE_FIT_SLO_MODE  the SLO's registry (or run snapshot) and mode (above)
   TRE_EXCLUSIVE_WINDOW_FILE  the exclusive-window marker (default <data root>/TRE_EXCLUSIVE_WINDOW)
   TRE_EXCLUSIVE_WINDOW_DENY_HOSTS, TRE_FIT_CPUS  while the marker exists the tools run only when both are set, the
                       host is not denied (a comma list of hostname substrings; at our site the control-plane node) and
@@ -75,9 +84,6 @@ GSHAPE = re.compile(r"^G(\d+)x(\d+)$")
 HELD_OUT_SHAPES = frozenset({"M", "MP", "MD", "G800x240", "U512x512", "G512x256", "G1200x240", "G640x400",
                              "G1800x160", "G3072x96", "G4096x64", "G256x768", "G512x1024", "ES", "EL"})
 TRAIN_SPLITS = ("train", "auxiliary")
-TTFT_SLO_MS, TPOT_SLO_MS = 500.0, 75.0
-K_LAM = TPOT_SLO_MS / TTFT_SLO_MS  # lambda = 0.15 L_out
-K_WP = TTFT_SLO_MS / TPOT_SLO_MS   # w_p = 6.667 / L_in
 STEP_MS = 10000.0
 TRIM = 1
 H_LOCAL = 0.15
@@ -135,7 +141,8 @@ def configure(window_ms):
                  "--out", os.devnull])
     r.TRAIN_SPLITS = TRAIN_SPLITS
     assert r.EMA_TAU_MS is None and r.STEP_MS == STEP_MS and r.TRIM == TRIM and r.H_LOCAL == H_LOCAL
-    assert (r.TTFT_SLO, r.TPOT_SLO) == (TTFT_SLO_MS, TPOT_SLO_MS)
+    assert r.SLO is not None
+    log(f"SLO: {r.SLO.mode} ({r.SLO.source}) from {r.SLO.path} (sha256 {r.SLO.sha256[:12]})")
     if FREEZE_PARAMS is None:
         log("note: TRE_FIT_DATA_ROOT unset - the freeze lambda (LAM_D) cross-check is skipped")
         return
@@ -316,21 +323,24 @@ REQ_NEED = ("model", "cell_id", "attempt", "send_ts_ms", "done_ts_ms", "ttft_ms"
             "output_tokens", "http_status", "outcome", "request_timeout_s")
 
 
-def per_request_frame(q, name):
-    """refit_fixedslo.per_request (label: not ok | TTFT > 500 | TPOT > 75; done time) + first-token time + served
-    lengths (outcome ok, http 200, both token counts present) for the lambda / w_p formula."""
-    ok = (q.outcome == "ok") & (q.http_status == 200)
+def slo_record():
+    """The SLO the requests are judged with (fit.json meta.slo)."""
+    return r.SLO.as_record()
+
+
+def per_request_frame(q, name, model):
+    """refit_fixedslo.request_violated (label: not ok | TTFT > TTFT_slo(L) | TPOT > TPOT_slo, the registry's
+    thresholds; done time) + first-token time + served lengths (outcome ok, http 200, both token counts present)
+    for the lambda / w_p formula."""
+    ok, v = r.request_violated(q, model)
     tt = q.ttft_ms
-    out = q.output_tokens
-    tpot = np.where(out > 1, (q.e2e_ms - tt) / (out - 1), np.nan)
-    v = (~ok) | (tt.fillna(0.0) > TTFT_SLO_MS) | (np.nan_to_num(tpot, nan=0.0) > TPOT_SLO_MS)
     done = q.done_ts_ms.fillna(q.send_ts_ms + q.e2e_ms.fillna(q.request_timeout_s * 1000))
     ttv = tt.values.astype(float)
     tft = np.where(np.isfinite(ttv), q.send_ts_ms.values.astype(float) + ttv, done.values.astype(float))
     served = ok & q.input_tokens.notna() & q.output_tokens.notna()
     return pd.DataFrame({
         "key": (name + "|" + q.cell_id.astype(str) + "|" + q.attempt.astype(str)).values,
-        "v": v.values.astype(float), "done": done.values.astype(float), "tft": tft,
+        "v": v.astype(float), "done": done.values.astype(float), "tft": tft,
         "served": served.values.astype(float), "fail": (~ok).values.astype(float),
         "lin": np.where(served.values, q.input_tokens.values.astype(float), 0.0),
         "lout": np.where(served.values, q.output_tokens.values.astype(float), 0.0),
@@ -398,7 +408,7 @@ class ModelData:
                 raise SystemExit(f"{qpath}: missing columns {miss}")
             q = pd.read_csv(qpath, usecols=list(REQ_NEED), low_memory=False)
             q = q[q.model == model]
-            q = per_request_frame(q, s["name"])
+            q = per_request_frame(q, s["name"], model)
             q = q[q.key.isin(set(w.key.unique()))]  # requests of other splits / models never enter
             self.prov[-1].update(n_window_rows_model=int(n_rows), n_window_rows_used=int(len(w)),
                                  n_requests_used=int(len(q)))
@@ -677,10 +687,18 @@ def ladder_info(cell, lad):
     return info
 
 
-def lam_wp_from(C, served_col=2, lin_col=3, lout_col=4):
+def lam_wp_from(C, model, served_col=2, lin_col=3, lout_col=4):
+    """(L_in, L_out, n served, lambda, w_p) of the SLO-budget formula lambda = TPOT_slo / TTFT_slo * L_out,
+    w_p = TTFT_slo / TPOT_slo / L_in (training means; the model's registry thresholds).  Defined for the fixed SLO
+    only: lambda and w_p are None in a per-request mode (fit_one refuses --lam-wp formula then)."""
     ns = C[:, served_col].sum()
     L_in, L_out = C[:, lin_col].sum() / ns, C[:, lout_col].sum() / ns
-    return float(L_in), float(L_out), int(ns), float(K_LAM * L_out), float(K_WP / L_in)
+    th = r.SLO.of(model)
+    if th.per_request_ttft:
+        return float(L_in), float(L_out), int(ns), None, None
+    k_lam = th.tpot_ms / th.ttft_fixed_ms   # 0.15 at 500 / 75 ms
+    k_wp = th.ttft_fixed_ms / th.tpot_ms    # 6.667 at 500 / 75 ms
+    return float(L_in), float(L_out), int(ns), float(k_lam * L_out), float(k_wp / L_in)
 
 
 def json_default(o):

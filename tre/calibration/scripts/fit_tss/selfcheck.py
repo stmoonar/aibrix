@@ -139,14 +139,14 @@ def main():
                                                          "theta17", "tau_crit", "tau_high", "tau_high_detail",
                                                          "auroc_local", "auroc_global")}
         # ---- c. lambda / w_p formula (completion = analysis C; first token = primary)
-        L_in, L_out, ns, lam, wp = L.lam_wp_from(Cc)
+        L_in, L_out, ns, lam, wp = L.lam_wp_from(Cc, model)
         rc = REF_C[model]
         chk(rows, model, "c n served (completion)", ns, rc["n_served"], 0)
         chk(rows, model, "c L_in (completion)", L_in, rc["L_in"], 1e-12, rel=True)
         chk(rows, model, "c L_out (completion)", L_out, rc["L_out"], 1e-12, rel=True)
         chk(rows, model, "c lambda = 0.15 L_out", lam, rc["lam"], 1e-12, rel=True)
         chk(rows, model, "c w_p = 6.667 / L_in", wp, rc["w_p"], 1e-12, rel=True)
-        fL_in, fL_out, fns, flam, fwp = L.lam_wp_from(Cf)
+        fL_in, fL_out, fns, flam, fwp = L.lam_wp_from(Cf, model)
         extra[f"c_{model}_first_token"] = dict(n_served=fns, L_in=fL_in, L_out=fL_out, lam=flam, w_p=fwp)
         L.log(f"{model}: done")
         del md, srcs, Wref

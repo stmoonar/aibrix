@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PRIMARY tau fit at W = 10 s: the repo's D4' alpha_fit (main 9f2856a1, read-only) on the freeze
 # calibration runs (calib_20261003, same stages / overrides as freeze-ctr20-20261028), re-windowed
-# from raw at WINDOW_MS (default 10000) / STEP_MS, label = fixed SLO p95 TTFT 500 / TPOT 75 + unserved.
+# from raw at WINDOW_MS (default 10000) / STEP_MS, label = fixed SLO (the LABEL_REGISTRY values, p95 TTFT / TPOT) + unserved.
 # CPU only, nice; outputs under OUT (no cluster access, inputs not modified).
 # Step 1 (datasets) is what the fit tools read as the 'old' 10 s root (supp_lib.OLD_ROOTS[10000] =
 # <data root>/analysis-tss-params-20261030/win10/alphafit-w10000-s10000/datasets): the 10-30 run had
@@ -51,7 +51,7 @@ fit_one() {  # each step's exit code is reported; the first failing step ends th
   for st in run1 run2 supp p1; do s=$(stage_for $m $st); [ -f "$CALIB_ROOT/$s/$m/cells.jsonl" ] && lg+=(--ledger "$CALIB_ROOT/$s/$m/cells.jsonl"); done
   case $m in dsqwen-7b) W=0.025 L=2.125;; dsllama-8b) W=0.0125 L=2.0;; dsqwen-14b) W=0.01 L=2.0;; esac   # freeze = live
   "${PY[@]}" -m scripts.alpha_fit --model "$m" --fitting-csv "$F/${m}_fitting.csv" --w-p "$W" --lambda-wait "$L" \
-      --ttft-slo-mode fixed --ttft-p95-ms 500 --tpot-p95-ms 75 --label-registry "$LABEL_REGISTRY" \
+      --ttft-slo-mode fixed --label-registry "$LABEL_REGISTRY" \
       --tau-grid-s $TAUS --dt-ref-s "$DT_REF_S" --dwell-windows "$DWELL" --window-ms "$WINDOW_MS" --step-ms "$STEP_MS" \
       --bootstrap 300 "${lg[@]}" --output "$OUT/alpha.$m.json" > "$OUT/logs/alpha.$m.log" 2>&1 || rc=$?
   echo "alpha $m exit $rc"
