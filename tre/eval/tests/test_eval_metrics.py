@@ -34,7 +34,8 @@ def test_ttft_threshold_is_the_one_shared_definition():
     slo7 = {**SLO, "ttft_idle_c_ms": 41.1, "ttft_idle_b_ms_per_token": 0.0694}
     assert M.ttft_threshold_ms(slo7, 256) == 500.0                       # 5 * 58.9 = 294.3 < floor
     assert M.ttft_threshold_ms(slo7, 2048) == pytest.approx(916.156)     # 5 * (41.1 + 142.13)
-    label = label_def_for_model("m", mode="slowdown", c=41.1, b=0.0694, k=5.0, floor=500.0)
+    label = label_def_for_model("m", mode="slowdown", c=41.1, b=0.0694, k=5.0, floor=500.0,
+                                ttft_p95_ms=500.0, tpot_p95_ms=75.0)
     for L in (0, 256, 1000, 2048, 8000):
         assert M.ttft_threshold_ms(slo7, L) == label.ttft_slo_ms(L) == request_ttft_slo_ms(
             L, c_ms=41.1, b_ms_per_token=0.0694, k=5.0, floor_ms=500.0)
@@ -48,7 +49,8 @@ def test_metrics_import_with_only_tre_eval_on_the_path():
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     p = subprocess.run([sys.executable, "-c", "from tre_eval import metrics as M; "
                         "print(M.ttft_threshold_ms({'ttft_slo_mode': 'slowdown', 'ttft_idle_c_ms': 41.1, "
-                        "'ttft_idle_b_ms_per_token': 0.0694}, 2048))"],
+                        "'ttft_idle_b_ms_per_token': 0.0694, 'ttft_slowdown_k': 5.0, 'ttft_floor_ms': 500.0, "
+                        "'tpot_p95_ms': 75.0}, 2048))"],
                        cwd=eval_dir, env=env, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr
     assert float(p.stdout) == pytest.approx(916.156)

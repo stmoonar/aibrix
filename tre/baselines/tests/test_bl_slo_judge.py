@@ -67,7 +67,8 @@ def test_campaign_client_rows_judge_in_10s_windows_per_model():
                 "e2e_latency": e2e, "input_tokens": 300, "output_tokens": out, "success_strict": ok}
     rows = [row(0, "a", 1.0, 0.1), row(1, "b", 2.0, 0.1), row(2, "a", 12.0, 0.6), row(3, "b", 21.0, 0.6),
             row(4, "a", 25.0, 0.1)]
-    slos = {"a": SLO, "b": label_def_for_model("b", mode="slowdown", c=150.0, b=0.0, k=5.0, floor=500.0)}
+    slos = {"a": SLO, "b": label_def_for_model("b", mode="slowdown", c=150.0, b=0.0, k=5.0, floor=500.0,
+                                               ttft_p95_ms=500.0, tpot_p95_ms=75.0)}
     ws = sj.judge_windows([sj.from_client_row(r) for r in rows], slos, start=1000.0, end=1030.0)
     assert [(w["n"], w["meets_slo"]) for w in ws] == [(2, True), (1, False), (2, True)]  # b: 600 ms <= 5 x 150
     assert ws[1]["v_ttft"] == 1

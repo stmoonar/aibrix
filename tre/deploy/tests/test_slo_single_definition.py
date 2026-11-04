@@ -9,6 +9,12 @@ every consumer (user rules 2026-10-29 / 2026-11-04).
 2. Data contract: every ``models[].slo`` field has a reader, every repo-registry model has
    the ``idle_multiple`` parameters, and the switch is written in both repo registry files.
 3. One switch: changing ``slo_mode`` changes the thresholds of every consumer at once.
+4. No SLO value in code (2026-11-04): outside an allow-list, no file under tre/ holds a numeric
+   literal in an SLO context - compared with, or dividing / multiplying, a value named after
+   TTFT / TPOT (``max(ttft / 500.0, tpot / 75.0)``), as the default of a TTFT / TPOT option or
+   parameter, as a ``*ttft*`` / ``*tpot*`` keyword argument, or as a TTFT / TPOT module
+   constant - and no file compares a TTFT / TPOT value with an SLO threshold itself (instead
+   of ``tre_common.slo.judge_request`` / ``violated_array`` or the window label).
 """
 from __future__ import annotations
 
@@ -42,7 +48,6 @@ ALLOWED = {
     "common/tre_common/slo.py": "the implementation",
     "common/tre_common/slo_labels.py": "the window label: LabelDefinition.thresholds() builds through tre_common.slo",
     "common/tre_common/registry.py": "parses models[].slo",
-    "baselines/tre_baselines/config.py": "passes the block's fixed-mode values into label_def_for_model",
     "baselines/tre_baselines/tools/preserve_nl_slo.py": "records the SloThresholds parameters in its output",
     "baselines/tre_baselines/tools/tokenscale_profile.py": "reads the label's TPOT threshold (LabelDefinition)",
     "baselines/tre_baselines/tools/velocity_ladder.py": "the TokenScale paper's own SLO (D52 disclosure column)",
@@ -60,6 +65,130 @@ ALLOWED = {
     "replayer/tre_replayer/run_trace.py": "v1-parity V_sys diagnostic (fixed + e2e)",
     "deploy/scripts/analysis/score_request_trace.py": "v1-parity V_sys diagnostic (fixed + e2e)",
 }
+
+
+#: Rule 4. Numbers that are units or neutral values, never an SLO (ms <-> s, ratios).
+UNIT_NUMBERS = {0, 1, 2, 10, 100, 1000, 1e6, 1e-3, 1e-6, 0.5, 60}
+TTFT_TPOT = re.compile(r"ttft|tpot", re.IGNORECASE)
+LIMIT = re.compile(r"slo|thr|limit", re.IGNORECASE)
+
+#: Rule 4 allow-lists (file -> why). LITERALS: an SLO-context number that is not an SLO
+#: definition. COMPARES: code that compares a TTFT / TPOT value with a threshold it got from
+#: tre_common.slo / the label (window-level or a diagnostic), not a request verdict of its own.
+LITERALS = {
+    "controller/tre_controller/planning/safescale_evidence.py":
+        "NO_REGISTRY_TTFT_MS / _TPOT_MS: the last resort of a SafeScale construction without a registry "
+        "(tests / offline); the controller judges with the registry resolver",
+    "baselines/tre_baselines/tools/tokenscale_profile.py": "make_stub_measure: the dry run's stub latency model, not an SLO",
+    "common/tre_common/slo_labels.py":
+        "ABLATION_TTFT_*: the D6 ablation arm (k 3 / floor 150 ms, plan 2026-09-21 6.9h), a label column of the "
+        "10-03 design, not an SLO mode",
+    "deploy/scripts/calibration_design.py": "TTFT_SLO_MS / TPOT_SLO_MS: the 10-03 D6' design record (frozen calibration)",
+}
+COMPARES = {
+    "common/tre_common/slo.py": "the implementation",
+    "controller/tre_controller/planning/safescale.py":
+        "SafeScale probe: window p95 against the resolver's thresholds (tre_common.slo; window-level, unchanged 2026-11-04)",
+    "baselines/tre_baselines/tools/tokenscale_profile.py": "TokenScale profile: a step's p95 against the label's thresholds",
+    "deploy/scripts/calibration_campaign.py": "10-03 capacity prior: a window p95 against the run's fixed thresholds",
+    "deploy/scripts/dline_refit.py": "D6' validation diagnostic: per-bucket TTFT attainment against LabelDefinition.ttft_slo_ms",
+    "deploy/scripts/openloop.py": "10-03 open-loop ladder goodput (fixed thresholds passed in by the caller; kept to reproduce)",
+    "replayer/tre_replayer/scoring.py": "v1-parity V_sys diagnostic (fixed + e2e)",
+}
+
+
+def _number(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+            and not isinstance(node.value, bool) and abs(node.value) not in UNIT_NUMBERS
+            and abs(node.value) >= 0.01)   # tolerances (1e-9) are not SLO values
+
+
+def _named(node: ast.AST, rx: re.Pattern) -> bool:
+    if isinstance(node, (ast.Constant, ast.Set, ast.List, ast.Tuple, ast.Dict)):
+        return False
+    return bool(rx.search(ast.unparse(node)))
+
+
+def _literal_and_compare_hits(tree: ast.AST) -> tuple[set[str], set[str]]:
+    literals: set[str] = set()
+    compares: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _number(node.value):
+            for name in (n.id for t in node.targets for n in ast.walk(t) if isinstance(n, ast.Name)):
+                if TTFT_TPOT.search(name):
+                    literals.add(f"{name} = {node.value.value}")
+        elif isinstance(node, ast.Compare):
+            ops = [node.left, *node.comparators]
+            if any(_named(o, TTFT_TPOT) for o in ops) and any(_number(o) for o in ops):
+                literals.add(ast.unparse(node)[:80])
+            elif (any(_named(o, TTFT_TPOT) and not _named(o, LIMIT) for o in ops)
+                  and any(_named(o, LIMIT) for o in ops)):
+                compares.add(ast.unparse(node)[:80])
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Mult)):
+            if ((_named(node.left, TTFT_TPOT) and _number(node.right))
+                    or (_named(node.right, TTFT_TPOT) and _number(node.left))):
+                literals.add(ast.unparse(node)[:80])
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name == "add_argument":
+                flags = " ".join(a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str))
+                for kw in node.keywords:
+                    if kw.arg == "default" and _number(kw.value) and TTFT_TPOT.search(flags):
+                        literals.add(f"add_argument({flags}, default={kw.value.value})")
+            for kw in node.keywords:
+                if kw.arg and TTFT_TPOT.search(kw.arg) and _number(kw.value):
+                    literals.add(f"{name}({kw.arg}={kw.value.value})")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            pos = a.posonlyargs + a.args
+            pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults))
+            pairs += [(x, d) for x, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
+            for arg, default in pairs:
+                if TTFT_TPOT.search(arg.arg) and _number(default):
+                    literals.add(f"def {node.name}({arg.arg}={default.value})")
+    return literals, compares
+
+
+def _scan_rule4() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    lit, cmp_ = {}, {}
+    for path in sorted(TRE.rglob("*.py")):
+        rel = path.relative_to(TRE).as_posix()
+        if "/tests/" in rel or rel.startswith("docs/") or "/." in rel:
+            continue
+        a, b = _literal_and_compare_hits(ast.parse(path.read_text(encoding="utf-8")))
+        if a:
+            lit[rel] = a
+        if b:
+            cmp_[rel] = b
+    return lit, cmp_
+
+
+def test_no_slo_value_in_code_and_no_verdict_of_its_own() -> None:
+    lit, cmp_ = _scan_rule4()
+    new_lit = {f: sorted(h) for f, h in lit.items() if f not in LITERALS}
+    assert not new_lit, f"SLO values in code (read them from the registry through tre_common.slo): {new_lit}"
+    new_cmp = {f: sorted(h) for f, h in cmp_.items() if f not in COMPARES}
+    assert not new_cmp, (f"TTFT / TPOT compared with a threshold outside tre_common.slo (use judge_request / "
+                         f"violated_array, or justify in COMPARES): {new_cmp}")
+    stale = sorted((set(LITERALS) - set(lit)) | (set(COMPARES) - set(cmp_)))
+    assert not stale, f"rule-4 allow-list entries that no longer match (remove them): {stale}"
+
+
+@pytest.mark.parametrize("source, kind", [
+    ("x = max(ttft / 500.0, tpot / 75.0)", "literal"),           # calibration_priors before 2026-11-04
+    ("v = tt.fillna(0.0) > TTFT_SLO_MS", None),                   # a constant: rule 1 (SLO_CONSTANT)
+    ("v = np.nan_to_num(tpot) > TPOT_SLO_MS", "compare"),         # supp_lib before 2026-11-04
+    ("ap.add_argument('--ttft-slo-ms', type=float, default=500.0)", "literal"),
+    ("f(model, ttft_p95_ms=500.0, tpot_p95_ms=75.0)", "literal"),  # dline_refit before 2026-11-04
+    ("def g(rows, ttft_slo_ms=500.0):\n    pass", "literal"),
+    ("NO_REGISTRY_TTFT_MS = 500.0", "literal"),
+    ("ms = ttft_s * 1000.0", None),                               # a unit
+    ("ok = ttft_ms is not None", None),
+])
+def test_rule4_catches_the_inline_forms(source, kind) -> None:
+    lit, cmp_ = _literal_and_compare_hits(ast.parse(source))
+    assert (("literal" if lit else None) or ("compare" if cmp_ else None)) == kind, (lit, cmp_)
 
 
 def _key(node: ast.AST):

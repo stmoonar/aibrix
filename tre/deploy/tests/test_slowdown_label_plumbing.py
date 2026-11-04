@@ -104,7 +104,7 @@ def test_violation_class_breakdown_reports_critical_recall_per_class() -> None:
 
 
 def test_holdout_rebuilds_the_label_from_the_verdict() -> None:
-    label = LabelDefinition(500.0, 75.0, ttft_slo_mode="slowdown", ttft_idle_c_ms=36.4,
+    label = LabelDefinition(500.0, 75.0, ttft_slo_mode="slowdown", ttft_floor_ms=500.0, ttft_idle_c_ms=36.4,
                             ttft_idle_b_ms_per_token=0.0527, ttft_slowdown_k=2.0)
     assert LabelDefinition.from_dict(label.as_dict()) == label
 

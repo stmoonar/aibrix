@@ -121,8 +121,9 @@ def test_controller_mode_key_matches_tre_common() -> None:
 
 
 def test_missing_idle_ttft_fit_refuses_an_actuating_shell(tmp_path) -> None:
-    """c/b are live values in a per-request SLO mode (the TRE arm's TTFT SLO): no silent 500/75
-    fallback when acting."""
+    """c/b are live values in a per-request SLO mode (the TRE arm's TTFT SLO): no silent fixed-mode
+    fallback. Since 2026-11-04 the registry itself is refused at load (every mode's parameters are
+    required, tre_common.slo has no defaults), so a dry run is refused too."""
     text = Path(REGISTRY).read_text(encoding="utf-8").replace("\nslo_mode: fixed\n", "\nslo_mode: slowdown\n")
     assert "slo_mode: slowdown" in text
     stripped = "\n".join(ln for ln in text.splitlines()
@@ -132,7 +133,8 @@ def test_missing_idle_ttft_fit_refuses_an_actuating_shell(tmp_path) -> None:
     env = {**ENV, "TRE_REGISTRY_PATH": str(reg)}
     with pytest.raises(ValueError, match="ttft_idle_c_ms"):
         load_config({**env, "TRE_BL_DRY_RUN": "false"})
-    assert load_config(env).dry_run is True  # dry-run: warns, falls back to the fixed arm
+    with pytest.raises(ValueError, match="ttft_idle_c_ms"):
+        load_config(env)
 
 
 def test_arms_are_named_as_adaptations(tmp_path) -> None:
