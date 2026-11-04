@@ -266,8 +266,10 @@ def load_arm(path: str, clock_offsets: dict[str, float] | None = None,
             raise ValueError(f"{reg_path}: SLO mode unresolvable ({e}); score it with an explicit mode") from e
         arm.slo_mode, arm.slo_mode_source = res.mode, res.source
         if res.source == "default":
-            arm.warn(f"live-registry.yaml names no SLO mode (no slo_mode, no retired key): scored as {res.mode}, "
-                     f"the rule of the images before 2026-11-04 (tre_common.slo.resolve_slo_mode)")
+            arm.warn(f"live-registry.yaml names no SLO mode (no slo_mode, no retired key): scored as {res.mode} "
+                     f"(tre_common.slo.resolve_slo_mode: slowdown when every model has its idle TTFT fit, else "
+                     f"fixed). The scorer before 2026-11-04 judged each model by its own ttft_slo_mode and read a "
+                     f"missing key as fixed, so this score can differ from the one made then")
     for m in arm.registry.get("models") or []:
         arm.models.append(m["name"])
         arm.tp[m["name"]] = int(m.get("tp_size") or 1)

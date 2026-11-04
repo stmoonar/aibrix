@@ -72,7 +72,8 @@ def test_one_switch() -> None:
     ("labels", "slowdown", "slowdown", True),
     (None, "slowdown", "slowdown", True),       # no probe key: the old probe's default was labels
     ("fixed", "slowdown", "fixed", False),      # the pre-11-04 live registry: the old scorer used slowdown
-    ("fixed", None, "fixed", False),            # no model key: the old scorer's default was slowdown
+    ("fixed", None, "fixed", False),            # no model key: refused (every model must name its mode)
+    ("labels", None, "slowdown", False),        # re-review 2026-11-04: the old scorer read a missing key as fixed
     ("fixed", "fixed", "idle_multiple", False),  # idle_multiple has no old spelling
 ])
 def test_retired_keys_next_to_the_switch_must_mean_the_same_mode(probe, scorer, switch, ok) -> None:
@@ -88,6 +89,18 @@ def test_retired_keys_next_to_the_switch_must_mean_the_same_mode(probe, scorer, 
     else:
         with pytest.raises(ValueError, match="meaning otherwise"):
             slo.resolve_slo_mode(raw)
+
+
+def test_a_transition_registry_where_one_model_lacks_its_key_is_refused() -> None:
+    """re-review 2026-11-04: the old scorer judged each model by its own ttft_slo_mode (missing = fixed), so
+    one model without the key next to slo_mode slowdown would be scored otherwise by an old image."""
+    raw = _raw("slowdown")
+    raw["safescale"]["slo_mode"] = "labels"
+    for model in raw["models"][1:]:
+        model["slo"]["ttft_slo_mode"] = "slowdown"
+    raw["models"][0]["slo"].pop("ttft_slo_mode", None)
+    with pytest.raises(ValueError, match="lack models"):
+        slo.resolve_slo_mode(raw)
 
 
 def test_a_legacy_labels_registry_is_not_a_conflict() -> None:

@@ -864,3 +864,45 @@ def test_the_observation_tick_emits_the_evidence_and_rollback_reason_events() ->
                for event in result.events)
     assert any(event.startswith("safescale_rollback_reason:m:formal_commit_gate_failed:latency")
                for event in result.events)
+
+
+@pytest.mark.parametrize("mode", ["fixed", "idle_multiple"])
+def test_the_app_probe_thresholds_come_from_the_registry(tmp_path, mode) -> None:
+    """re-review 2026-11-04: the controller built from a registry judges probes with that registry's
+    slo_mode and models[].slo (no built-in threshold, no env override)."""
+    from test_controller_app import EmptyRedis
+    from tre_controller.app import create_controller_dependencies
+
+    raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
+    raw["slo_mode"] = mode
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    reg = load_registry(str(path))
+    deps = create_controller_dependencies(ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)}),
+                                          redis_client=EmptyRedis())
+    for model in ("dsqwen-7b", "dsqwen-14b"):
+        want = reg.slo_thresholds(model)
+        for length in (256.0, 4096.0):
+            got = deps.safescale._thresholds_for(model, length)
+            assert (got["mode"], got["source"]) == (mode, "registry")
+            assert (got["ttft_ms"], got["tpot_ms"]) == (want.ttft_ms(length), want.tpot_ms)
+
+
+def test_a_threshold_error_never_commits_the_probe() -> None:
+    """re-review 2026-11-04: _thresholds_for has no fallback; a resolver error propagates out of the judge,
+    so the commit gate is never passed on it (the same evidence commits with a working resolver, above)."""
+    class Broken:
+        def resolve(self, model, mean_prompt_tokens):
+            raise SloConfigError(f"{model}: no thresholds")
+
+    machine = _machine(FakeEvidence([_window(50)]), thresholds=Broken())
+    _started(machine)
+    raised = 0
+    for ts in (110_000, 120_000):   # the commit deadline is 120 s
+        try:
+            decision = machine.observe(MODEL, _obs(ts), now_ms=ts)
+        except SloConfigError:
+            raised += 1
+            continue
+        assert decision.status != "commit", decision
+    assert raised and machine.active_probe(MODEL).status == "probing"     # not committed, not resolved

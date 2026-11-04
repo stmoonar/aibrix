@@ -134,12 +134,13 @@ or mean another mode than `slo_mode` to an old image.
   images (SM -> controller; baseline scaler last). Without `--restart` the running pods
   keep the registry they read at start until their own rollout.
 - Transition registry (optional, `fixed` / `slowdown` only): `slo_mode` plus retired keys
-  that mean the same mode to an old image (`ttft_slo_mode: <mode>` on every model and
+  that mean the same mode to an old image (`ttft_slo_mode: <mode>` on every model - a model
+  without it is refused - and
   `safescale.slo_mode: fixed` (mode fixed) or `labels`). Old and new images then read the
   same SLO. `idle_multiple` has no old spelling.
 - Rollback: **restore the registry backup together with the images** (the old images
   ignore `slo_mode`: without their retired keys the old probe falls back to `labels` and
-  the old scorer to `slowdown`). Exception: a transition registry, which both read alike.
+  the old scorer to `fixed`). Exception: a transition registry, which both read alike.
 
 ### SLO consumers that do not follow the switch (2026-11-04)
 

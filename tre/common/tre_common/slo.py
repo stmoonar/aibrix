@@ -318,13 +318,15 @@ class SloModeResolution:
     legacy_conflict: Optional[str] = None
 
 
-def _legacy_meaning(raw: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str], list[str]]:
+def _legacy_meaning(raw: Mapping[str, Any]) -> tuple[dict[str, Optional[str]], dict[str, Optional[str]], list[str]]:
     """What the two retired keys meant to the consumers of an image from before 2026-11-04,
     per model: (old scorer / labels mode, old SafeScale probe mode, the retired keys present).
 
-    * scorer / labels: ``models[].slo.ttft_slo_mode`` (fixed | slowdown), absent = slowdown;
+    * scorer / labels: ``models[].slo.ttft_slo_mode`` (fixed | slowdown); None when the model
+      lacks it (the old scorer judged each model by its own key, and its default for a
+      missing key - fixed - is not the labels' one, so a missing key means no known mode);
     * probe: ``safescale.slo_mode: fixed`` = fixed; ``labels`` (and absent, its old default) =
-      the model's label rule, i.e. that model's scorer mode."""
+      the model's label rule, i.e. that model's key (None when missing)."""
     models = [m or {} for m in raw.get("models") or []]
     safescale = raw.get("safescale") or {}
     legacy_safescale = safescale.get(LEGACY_SAFESCALE_KEY) if isinstance(safescale, Mapping) else None
@@ -346,8 +348,8 @@ def _legacy_meaning(raw: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, s
             if value not in (SLO_MODE_FIXED, SLO_MODE_SLOWDOWN):
                 raise ValueError(f"models[].slo.{LEGACY_MODEL_KEY} must be fixed or slowdown, got {value!r}")
             present.append(f"models[{name}].slo.{LEGACY_MODEL_KEY}")
-        scorer[name] = value or SLO_MODE_SLOWDOWN
-        probe[name] = SLO_MODE_FIXED if probe_fixed else scorer[name]
+        scorer[name] = value   # None: the key is missing (the old scorer's per-model default is not ours to guess)
+        probe[name] = SLO_MODE_FIXED if probe_fixed else value
     return scorer, probe, present
 
 
@@ -368,6 +370,14 @@ def resolve_slo_mode(raw: Mapping[str, Any]) -> SloModeResolution:
         if mode not in SLO_MODES:
             raise ValueError(f"{SLO_MODE_KEY} must be one of {SLO_MODES}, got {switch!r}")
         if present:
+            missing = sorted(m for m in scorer if scorer[m] is None)
+            if missing:
+                raise ValueError(
+                    f"registry has {SLO_MODE_KEY} {mode} and the retired key(s) {present} meaning otherwise to an "
+                    f"image before 2026-11-04: models {missing} lack models[].slo.{LEGACY_MODEL_KEY} (the old "
+                    f"scorer judged each model by its own key): one switch (a transition registry names it on every "
+                    f"model, or drops every retired key)"
+                )
             differ = sorted({f"{m} scorer {scorer[m]} / probe {probe[m]}" for m in scorer
                              if scorer[m] != mode or probe[m] != mode})
             if differ:
