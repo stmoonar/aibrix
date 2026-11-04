@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Offline refit of theta / tau_crit / tau_high (and a lambda x w_p grid) under the FIXED SLO
-of 2026-10-29: a request violates if not served ok (error / unserved / client timeout) OR
-client TTFT > 500 ms OR TPOT = (e2e - ttft) / (out - 1) > 75 ms.  theta_m = the TSS at which
-the per-request violation probability reaches r* = 1 %.
+"""Offline refit of theta / tau_crit / tau_high (and a lambda x w_p grid) under the registry's SLO
+(tre_common.slo; written for the FIXED SLO of 2026-10-29): a request violates if not served ok (error /
+unserved / client timeout) OR client TTFT > TTFT_slo(L) OR TPOT = (e2e - ttft) / (out - 1) > TPOT_slo.
+theta_m = the TSS at which the per-request violation probability reaches r* = 1 %.
+
+SLO (2026-11-04): every threshold is the registry's, judged by tre_common.slo.violated_array (the one
+definition). --slo-registry (default $TRE_FIT_SLO_REGISTRY, else this repo's deploy/registry.yaml) names the
+registry or run snapshot, --slo-mode (default $TRE_FIT_SLO_MODE, else the registry's slo_mode) the mode; a
+legacy registry whose two retired keys disagree needs --slo-mode. fit_summary.json records both (config.slo).
+The 10-29 .. 11-03 fits used fixed 500 / 75 ms: --slo-mode fixed with any registry of that time (all carry
+ttft_p95_ms 500 / tpot_p95_ms 75) gives the same labels, bit for bit.
 
 Read-only on freeze-ctr20-20261028 datasets; TSS recomputed with the freeze build tree
 (rel-e891d29b, the code the freeze ran); writes only to OUT.  CPU only.
@@ -40,6 +47,7 @@ WINDOW_MS = 20000.0
 EMA_TAU_MS = None  # raw TSS only (the 10-31 default 10000 needs the freeze tree's EMA, see the header)
 sys.path[:0] = [TRE + "/common", TRE + "/calibration"]
 from tre_calibration.dataset import TssRecompute, recompute_tss_rows  # noqa: E402
+from tre_common import slo as slo_def  # noqa: E402
 
 SOURCES = {
     "dsqwen-7b": ["run1", "run2", "supp", "p1r2"],
@@ -47,7 +55,7 @@ SOURCES = {
     "dsqwen-14b": ["run1", "run2b", "supp", "p1"],
 }
 TRAIN_SPLITS = ("train", "auxiliary")  # = the freeze fitting CSV (holdout = sealed H2/M)
-TTFT_SLO, TPOT_SLO = 500.0, 75.0
+SLO = None  # tre_common.slo.RegistrySlo of --slo-registry / --slo-mode (configure())
 R_STAR, R_CRIT = 0.01, 0.10
 STEP_MS = 10000.0
 TRIM = 1  # dline_refit.TRIM_RAMP_WINDOWS: earliest kept window per scenario_id dropped
@@ -61,14 +69,22 @@ LOGIT = lambda p: np.log(p / (1 - p))  # noqa: E731
 
 
 # ---------------------------------------------------------------- data
-def per_request(q):
+def request_violated(q, model):
+    """Per-request SLO verdict of a requests.csv frame of one model (tre_common.slo, the registry's thresholds):
+    not served ok (outcome ok and http 200) | TTFT > TTFT_slo(L) | TPOT = (e2e - ttft) / (out - 1) > TPOT_slo."""
+    th = SLO.of(model)
     ok = (q.outcome == "ok") & (q.http_status == 200)
     tt = q.ttft_ms
     out = q.output_tokens
     tpot = np.where(out > 1, (q.e2e_ms - tt) / (out - 1), np.nan)
-    v = (~ok) | (tt.fillna(0.0) > TTFT_SLO) | (np.nan_to_num(tpot, nan=0.0) > TPOT_SLO)
+    return ok, slo_def.violated_array(th, completed=ok, prompt_tokens=q.input_tokens if th.per_request_ttft else None,
+                                      ttft_ms=tt, tpot_ms=tpot)
+
+
+def per_request(q, model):
+    _, v = request_violated(q, model)
     done = q.done_ts_ms.fillna(q.send_ts_ms + q.e2e_ms.fillna(q.request_timeout_s * 1000))
-    return pd.DataFrame({"key": q.key.values, "v": v.values.astype(float), "done": done.values,
+    return pd.DataFrame({"key": q.key.values, "v": v.astype(float), "done": done.values,
                          "send": q.send_ts_ms.values.astype(float)})
 
 
@@ -99,11 +115,12 @@ def load_model(model):
         w = pd.read_csv(p + "/windows.csv")
         q = pd.read_csv(p + "/requests.csv", usecols=[
             "cell_id", "attempt", "send_ts_ms", "first_token_ts_ms", "done_ts_ms", "ttft_ms", "e2e_ms",
-            "output_tokens", "http_status", "outcome", "request_timeout_s"])
+            "output_tokens", "http_status", "outcome", "request_timeout_s"]
+            + (["input_tokens"] if SLO.of(model).per_request_ttft else []))
         w["src"] = src
         w["key"] = src + "|" + w.cell_id + "|" + w.attempt.astype(str)
         q["key"] = src + "|" + q.cell_id + "|" + q.attempt.astype(str)
-        srcs.append((src, w, w.to_dict("records"), per_request(q)))
+        srcs.append((src, w, w.to_dict("records"), per_request(q, model)))
     return srcs
 
 
@@ -559,7 +576,7 @@ def plot(curves, fits, shapes, locs, betas, path):
                      f"\ntau_crit {f['tau_crit_Z10']:.2f}  (lambda {f['lambda']}, w_p {f['w_p']})", fontsize=10)
         ax.set_xlabel("Z = TSS / theta_new"); ax.grid(alpha=0.3, which="both")
         ax.legend(fontsize=7, loc="lower left")
-    axes[0].set_ylabel("per-request violation probability (fixed SLO: TTFT 500 ms, TPOT 75 ms, fail)")
+    axes[0].set_ylabel(f"per-request violation probability (SLO {SLO.mode}, fail)")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
 
@@ -576,22 +593,37 @@ def repro_check(model, W, fz):
             "recomputed_healthy_quantile_at_entry": float((h.tss < e["theta"]).mean()), "n_healthy": int(len(h))}
 
 
+def load_slo(path, mode):
+    """The registry's SLO (tre_common.slo.load_registry_slo); refuses (SystemExit) a registry it cannot build."""
+    try:
+        return slo_def.load_registry_slo(path, mode=mode or None)
+    except (OSError, slo_def.SloConfigError) as exc:
+        raise SystemExit(f"--slo-registry {path} / --slo-mode {mode}: {exc}") from None
+
+
 def configure(argv=None):
-    global DS, OUT, WINDOW_MS, EMA_TAU_MS
+    global DS, OUT, WINDOW_MS, EMA_TAU_MS, SLO
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-stage2", action="store_true")
     ap.add_argument("--ds-root", default=DS)
     ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
     ap.add_argument("--ema-tau-ms", type=float, default=0.0, help="0 only (raw TSS); > 0 is refused")
     ap.add_argument("--out", default=OUT)
+    ap.add_argument("--slo-registry", default=os.environ.get("TRE_FIT_SLO_REGISTRY") or TRE + "/deploy/registry.yaml",
+                    help="registry / run snapshot whose models[].slo judges the requests (default $TRE_FIT_SLO_REGISTRY, "
+                         "else this repo's deploy/registry.yaml)")
+    ap.add_argument("--slo-mode", default=os.environ.get("TRE_FIT_SLO_MODE") or None, choices=slo_def.SLO_MODES,
+                    help="default $TRE_FIT_SLO_MODE, else the registry's slo_mode")
     args = ap.parse_args(argv)
     DS, OUT, WINDOW_MS = args.ds_root, args.out, args.window_ms
+    SLO = load_slo(args.slo_registry, args.slo_mode)
     if args.ema_tau_ms and args.ema_tau_ms > 0:
         raise SystemExit(f"--ema-tau-ms {args.ema_tau_ms:g}: this repo copy computes raw TSS only - the EMA of the "
                          "repo's recompute_tss_rows changed after the freeze tree e891d29b (b8bd62d1), so an EMA refit "
                          "would not be the 10-29 one; use the original refit_fixedslo.py with the freeze tree")
     EMA_TAU_MS = None
-    print(f"config: ds={DS} window_ms={WINDOW_MS} ema_tau_ms={EMA_TAU_MS} out={OUT}", file=sys.stderr, flush=True)
+    print(f"config: ds={DS} window_ms={WINDOW_MS} ema_tau_ms={EMA_TAU_MS} out={OUT} slo={SLO.mode} "
+          f"({SLO.source}, {SLO.path} sha256 {SLO.sha256[:12]})", file=sys.stderr, flush=True)
     return args
 
 
@@ -651,7 +683,8 @@ def main():
     if s2rows:
         pd.concat(s2rows).to_csv(OUT + "/stage2_grid.csv", index=False)
         json.dump(s2sum, open(OUT + "/stage2_summary.json", "w"), indent=1)
-    json.dump({"config": {"ds_root": DS, "window_ms": WINDOW_MS, "ema_tau_ms": EMA_TAU_MS, "tre": TRE},
+    json.dump({"config": {"ds_root": DS, "window_ms": WINDOW_MS, "ema_tau_ms": EMA_TAU_MS, "tre": TRE,
+                          "slo": SLO.as_record()},
                "tss_repro_check": repro, "fits": fits}, open(OUT + "/fit_summary.json", "w"), indent=1, default=float)
     plot(curves, fits, shapes, locs, betas, OUT + "/p_vs_Z.png")
 

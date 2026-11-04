@@ -74,8 +74,7 @@ def _plan(bindings, *, receiver_state=ModelState.CRITICAL, donor_state=ModelStat
         },
         classifications=[
             _cls(R, receiver_state, ModelRole.RECEIVER, 0.4 if receiver_state == ModelState.CRITICAL else 0.9),
-            _cls(D, donor_state, role, 10.0 if donor_state == ModelState.IDLE else 2.0,
-                 "idle" if donor_state == ModelState.IDLE else "surplus"),
+            _cls(D, donor_state, role, 10.0 if donor_state == ModelState.IDLE else 2.0),
         ],
         model_replicas={D: 8, R: 8},
         idle_gpus=0,
@@ -141,7 +140,7 @@ def test_idle_proactive_shrink_is_a_model_level_target_call_bounded_by_headroom(
     def plan(ctx):
         return build_plan(
             model_contexts={"idle": {"routable_pods": 4, "assigned_replicas": 4, **ctx}},
-            classifications=[_cls("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")],
+            classifications=[_cls("idle", ModelState.IDLE, ModelRole.DONOR, 10.0)],
             model_replicas={"idle": 4},
             idle_gpus=0,
             cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),

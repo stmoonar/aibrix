@@ -12,8 +12,8 @@ import yaml
 ap = argparse.ArgumentParser()
 ap.add_argument("src")
 ap.add_argument("--registry", default=os.environ.get("SCORE_REGISTRY"),
-                help="registry whose slo block (c/b, k, floor, tpot, e2e) is used (the runner passes the live "
-                     "registry recorded at arm start; default: env SCORE_REGISTRY)")
+                help="registry whose slo_mode and models[].slo blocks are used (tre_common.slo; the runner passes "
+                     "the live registry recorded at arm start; default: env SCORE_REGISTRY)")
 ap.add_argument("--trim-s", type=float, default=30.0)
 ap.add_argument("--out")
 ap.add_argument("--traces", help="traces.json with per-request max_output_tokens (default: next to the metrics file)")
@@ -33,10 +33,11 @@ rows = [json.loads(l) for l in open(src) if l.strip()]
 # Share the exact completion and SLO semantics with the full evaluator.
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tre_eval.metrics import score_requests
+from tre_eval.metrics import score_requests, slo_def
 
-_, summary = score_requests(rows, slo, trim_s=a.trim_s, max_tok=max_tok)
-res = {"source": os.path.abspath(src), "registry": a.registry, "trim_s": a.trim_s,
+slo_mode = slo_def.resolve_slo_mode(reg).mode
+_, summary = score_requests(rows, slo, trim_s=a.trim_s, max_tok=max_tok, mode=slo_mode)
+res = {"source": os.path.abspath(src), "registry": a.registry, "slo_mode": slo_mode, "trim_s": a.trim_s,
        "traces": traces_path if max_tok else None, "scoring_basis": "strict-completion-v1", "models": summary}
 if a.validity:
     rv = json.load(open(a.validity)) if os.path.exists(a.validity) else None

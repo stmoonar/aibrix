@@ -40,7 +40,7 @@ from tre_controller.loops.tick import run_planner_tick
 from tre_controller.planning.planner import ClusterView, HideAction, ScaleAction, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import DirectEvidenceCollector, Hist, PodScrape
-from tre_controller.planning.safescale_evidence import HideAnchor
+from tre_controller.planning.safescale_evidence import HideAnchor, StaticThresholds
 from tre_controller.signals.trs import SignalState
 from tre_controller.store.evidence_grid import EvidenceGrid
 from tre_controller.store.metrics_store import MetricsStore
@@ -208,13 +208,13 @@ class Sim:
         self.poll_ms = int(cfg.safescale.probe_poll_seconds * 1000)
         self.offset = int(scenario.gateway_offset_ms)
         self.signal_state = SignalState()
-        slo = dict(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=float(scenario.tpot_slo_ms))
+        thresholds = StaticThresholds(1000.0, float(scenario.tpot_slo_ms))
         self.collector = None
         if scenario.direct:
             self.safescale = SafeScaleStateMachine(
-                config=SafeScaleConfig(**slo, evidence_source="direct", early_commit=True, baseline_delay_ms=0.0,
+                config=SafeScaleConfig(evidence_source="direct", early_commit=True, baseline_delay_ms=0.0,
                                        min_window_ms=60_000.0, window_ceiling_ms=90_000.0),
-                grid=EvidenceGrid(self.period), evidence=_SimEvidence(self), wall_clock_ms=lambda: self.now,
+                grid=EvidenceGrid(self.period), evidence=_SimEvidence(self), thresholds=thresholds, wall_clock_ms=lambda: self.now,
             )
             self.collector = DirectEvidenceCollector(
                 self.safescale, _SimScraper(self),
@@ -225,7 +225,9 @@ class Sim:
                 gateway_inflight=lambda pods: 0.0,  # the mock SM drains a hidden pod at once
             )
         else:
-            self.safescale = SafeScaleStateMachine(config=SafeScaleConfig(**slo), grid=EvidenceGrid(self.period))
+            self.safescale = SafeScaleStateMachine(
+                config=SafeScaleConfig(), grid=EvidenceGrid(self.period), thresholds=thresholds
+            )
         self.store = MetricsStore(
             self.redis, self.registry, instant_sample_interval_ms=INSTANT, evidence_period_ms=self.period,
             expected_cadence=(INSTANT, self.period), cadence_enforce=True,

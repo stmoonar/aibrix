@@ -259,8 +259,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--gap-s", type=float, default=DEFAULT_GAP_S)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--expect-replicas", type=int, default=1)
-    ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
-    ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
+    ap.add_argument("--ttft-slo-ms", type=float, default=None, help="default: the registry's slo.ttft_p95_ms")
+    ap.add_argument("--tpot-slo-ms", type=float, default=None, help="default: the registry's slo.tpot_p95_ms")
     ap.add_argument("--window-ms", type=int, default=30000)
     ap.add_argument("--instant-sample-ms", type=int, default=1000)
     ap.add_argument("--corpus-lang", default=r3_grid.CORPUS_LANG_DEFAULT, choices=list(r3_grid.CORPUS_LANGS))
@@ -281,6 +281,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the estimate; send nothing")
     args = ap.parse_args(argv)
     args.models = [m for m in args.models.split(",") if m]
+    slo_labels.fill_fixed_slo_args(args, args.models, registry=args.registry)
     if args.gap_s < MIN_GAP_S:
         ap.error(f"--gap-s must be >= {MIN_GAP_S}")
     if args.per_length < 1 or args.max_tokens < 1 or args.warmup < 0:

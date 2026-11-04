@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+from safescale_thresholds import STATIC_1000_100, STATIC_500_75
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import SubmitResult
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
@@ -80,9 +81,8 @@ def _metrics(*, ts_ms: int, generation: float = 120.0, ttft: float = 500.0, tpot
 
 def _machine() -> SafeScaleStateMachine:
     return SafeScaleStateMachine(
+        thresholds=STATIC_1000_100,
         config=SafeScaleConfig(
-            ttft_p95_slo_ms=1000.0,
-            tpot_p95_slo_ms=100.0,
             min_window_ms=1000.0,
             hq=0.5,
             tau_low=1.0,
@@ -95,6 +95,7 @@ def test_a_probe_whose_snapshots_stay_stale_past_its_ceiling_is_unhidden() -> No
     # ceiling (start 0 + 60 s) its pods are unhidden instead of staying hidden.
     clock = {"now": 30_000}
     machine = SafeScaleStateMachine(
+        thresholds=STATIC_500_75,
         config=SafeScaleConfig(min_window_ms=1000.0, window_ceiling_ms=60_000.0),
         wall_clock_ms=lambda: clock["now"],
     )
@@ -260,8 +261,8 @@ def test_safescale_resolution_record_carries_the_gate_failures() -> None:
 
     store = Store()
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(
-            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5
+        thresholds=STATIC_1000_100,
+        config=SafeScaleConfig(min_window_ms=1000.0, hq=0.5
         ),
         store=store,
     )
@@ -287,7 +288,8 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
 
     queue = FakeQueue()
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=60_000.0)
+        thresholds=STATIC_1000_100,
+        config=SafeScaleConfig(min_window_ms=60_000.0)
     )
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
 

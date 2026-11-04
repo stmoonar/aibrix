@@ -4,7 +4,7 @@
 
 Per model, on the kept windows (same filter as the fit: valid, not warm-up, not contaminated, TSS > 0, first window per
 cell dropped), TSS at the candidate's lambda / w_p, Z = TSS / theta, requests attributed by the candidate's attribution
-(first token by default), label = TTFT > 500 or TPOT > 75 or not served:
+(first token by default), label = TTFT > TTFT_slo or TPOT > TPOT_slo (the registry's, supp_lib "SLO") or not served:
   1. Z in [0.9, 1.1): per-request violation rate, cell-bootstrap CI90 (--nboot 2000); PASS if the CI90 meets
      [0.5, 2] x r*  (prereg §4.1)
   2. per-request violation rate over the Z bands  < tau_crit | tau_crit-0.9 | 0.9-1.1 | 1.1-tau_high | >= tau_high

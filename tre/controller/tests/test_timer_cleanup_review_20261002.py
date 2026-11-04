@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import ControllerConfig
 from tre_controller.loops import cluster_view_task as cluster_view_module
 from tre_controller.loops.cluster_view_task import (
@@ -165,7 +166,7 @@ def test_an_action_done_while_the_request_was_in_flight_is_pending():
 
 def test_a_stalled_probe_is_a_capacity_rollback():
     assert "insufficient_evidence:stalled" in CAPACITY_ROLLBACK_CODES
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     machine.start_probe(model="d", pods=("d-1",), now_ms=0, window_inputs=ProbeWindowInputs(z_m=1.5, routable_pods=3))
     machine.resolve("d", status="rollback", reason="insufficient_evidence:stalled", now_ms=10_000)
     assert machine.rollback_evidence()["d"].capacity is True

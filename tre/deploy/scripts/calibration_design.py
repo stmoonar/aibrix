@@ -92,6 +92,9 @@ DECISION_RULE = {
     "shared_w_p_max_loss_ba_points": 1.0,
     "otherwise": "baseline wins ('no difference detected at this resolution')",
 }
+#: The frozen D-line design record (preregistered_parameters; calibration_ladder.check_label_args
+#: refuses a run with other values). Not a default of any verdict: hold_cell_verdict /
+#: sentinel_summary take the run's label (or explicit values) - 2026-11-04.
 TTFT_SLO_MS = 500.0
 TPOT_SLO_MS = 75.0
 WINDOW_MS = 30_000
@@ -1191,19 +1194,22 @@ def hold_cell_verdict(
     *,
     warmup_s: float,
     label: Optional["slo_labels.LabelSpec"] = None,
-    ttft_slo_ms: float = TTFT_SLO_MS,
-    tpot_slo_ms: float = TPOT_SLO_MS,
+    ttft_slo_ms: Optional[float] = None,
+    tpot_slo_ms: Optional[float] = None,
 ) -> dict:
     """The verdict of one hold cell (probe, ladder, supplement or sentinel).
 
     ``label`` is the run's primary window label (``calibration_campaign.primary_label``,
-    D6'); without it the fixed ``ttft_slo_ms`` / ``tpot_slo_ms`` pair is used.
+    D6'); without it the explicit fixed ``ttft_slo_ms`` / ``tpot_slo_ms`` pair (both
+    required then: no default threshold, ValueError).
 
     Void when the guard voided it; violated when the backlog valve stopped it (it ran far
     past any healthy operating point, and is short of windows only because it was
     stopped); otherwise :func:`scripts.adaptive_boundary.probe_verdict` on the windows
     after the warm-up.
     """
+    if label is None and (ttft_slo_ms is None or tpot_slo_ms is None):
+        raise ValueError("hold_cell_verdict needs label (or ttft_slo_ms and tpot_slo_ms)")
     void_reasons = [str(r) for r in (guard.get("void_reasons") or [])]
     if void_reasons:
         return {"verdict": boundary.VERDICT_VOID, "void_reasons": void_reasons,
@@ -1317,13 +1323,16 @@ def sentinel_summary(
     *,
     warmup_s: float,
     label: Optional["slo_labels.LabelSpec"] = None,
-    ttft_slo_ms: float = TTFT_SLO_MS,
-    tpot_slo_ms: float = TPOT_SLO_MS,
+    ttft_slo_ms: Optional[float] = None,
+    tpot_slo_ms: Optional[float] = None,
 ) -> dict:
     """One sentinel after its warm-up: the median window TPOT p95 and the median of the
     windows' mean ``running`` (the drift criteria), plus the median TTFT p95 and the
     violating fraction by ``label`` (the run's primary label; the fixed pair without it),
-    which are reported but not judged on (see :data:`SENTINEL_DRIFT_THRESHOLDS`)."""
+    which are reported but not judged on (see :data:`SENTINEL_DRIFT_THRESHOLDS`). Without
+    ``label`` both fixed values are required (no default threshold, ValueError)."""
+    if label is None and (ttft_slo_ms is None or tpot_slo_ms is None):
+        raise ValueError("sentinel_summary needs label (or ttft_slo_ms and tpot_slo_ms)")
     if guard.get("void_reasons"):
         return {"measured": False, "why": "void"}
     targets = label if label is not None else slo_labels.slo_targets(

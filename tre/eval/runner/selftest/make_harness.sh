@@ -14,17 +14,28 @@ case "$a" in
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SAFESCALE*) cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_ABLATION_DISABLE_SLOW_LOOP*) cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || true ;;
   *"get deploy tre-v2-controller"*TRE_SAFESCALE_SCOPE*) cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null || true ;;
+  *"get deploy tre-v2-controller"*TRE_SIGNAL_SOURCE*) cat $S/ctl_TRE_SIGNAL_SOURCE 2>/dev/null || true ;;
+  # 2026-11-02: TRE_DISABLE_ETA_GATE (removed from the controller) still on the Deployment: its name, then its value
+  *"get deploy tre-v2-controller"*'TRE_DISABLE_ETA_GATE")].name}'*) [ ! -e $S/ctl_TRE_DISABLE_ETA_GATE ] || echo TRE_DISABLE_ETA_GATE ;;
+  *"get deploy tre-v2-controller"*TRE_DISABLE_ETA_GATE*) cat $S/ctl_TRE_DISABLE_ETA_GATE 2>/dev/null || true ;;
   # 2026-11-02: TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE - on the Deployment and (record_ablation_switches) the running pod
   *"get deploy tre-v2-controller"*TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE*|*"get pods"*TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE*)
       cat $S/ctl_TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE 2>/dev/null || true ;;
-  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*|TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; esac; done
+  *"set env deploy/tre-v2-controller"*) for kv in "$@"; do case "$kv" in TRE_ABLATION_*=*|TRE_SAFESCALE_SCOPE=*|TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=*|TRE_SIGNAL_SOURCE=*|TRE_DISABLE_ETA_GATE=*) echo -n "${kv#*=}" > $S/ctl_${kv%%=*} ;; TRE_SAFESCALE_SCOPE-) rm -f $S/ctl_TRE_SAFESCALE_SCOPE ;; TRE_SIGNAL_SOURCE-) rm -f $S/ctl_TRE_SIGNAL_SOURCE ;; TRE_DISABLE_ETA_GATE-) rm -f $S/ctl_TRE_DISABLE_ETA_GATE ;; esac; done
+      # an image before the eta removal (old_image_line) refuses an alt signal without TRE_DISABLE_ETA_GATE=true;
+      # the current image refuses TRE_DISABLE_ETA_GATE=true (tre_controller.config)
+      g=$(cat $S/ctl_TRE_DISABLE_ETA_GATE 2>/dev/null); sg=$(cat $S/ctl_TRE_SIGNAL_SOURCE 2>/dev/null)
+      if [ -e $S/old_image_line ]; then { [ -n "$sg" ] && [ "$sg" != zm ] && [ "$g" != true ]; } && echo "$a" >> $S/refused
+      else [ "$g" != true ] || echo "$a" >> $S/refused; fi
       # the controller refuses to start when the switch and the scope disagree (tre_controller.config._safescale_scope)
       d=$(cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null); c=$(cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null)
       if [ -n "$d" ] && [ -n "$c" ] && { [ "$d" = true ] && [ "$c" != off ] || [ "$d" != true ] && [ "$c" = off ]; }; then echo "$a" >> $S/inconsistent; fi ;;
   *"logs deploy/tre-v2-controller"*) ds="$(cat $S/switch_line_safescale 2>/dev/null || cat $S/ctl_TRE_ABLATION_DISABLE_SAFESCALE 2>/dev/null || echo false)"
       sc="$(cat $S/ctl_TRE_SAFESCALE_SCOPE 2>/dev/null)"; [ -n "$sc" ] || { [ "$ds" = true ] && sc=off || sc=all; }   # as tre_controller.config
-      [ -e $S/no_switch_line ] || printf '{"level": "INFO", "logger": "tre_controller", "message": "{\\"disable_safescale\\": %s, \\"disable_slow_loop\\": %s, \\"event\\": \\"ablation_switches\\", \\"safescale_scope\\": \\"%s\\"}", "time": "2026-10-08 11:01:00,916"}\n' \
-      "$ds" "$(cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || echo false)" "$sc" ;;
+      old=""; [ ! -e $S/old_image_line ] || old="\\\"disable_eta_gate\\\": $(cat $S/ctl_TRE_DISABLE_ETA_GATE 2>/dev/null || echo false), "   # image before the eta removal
+      [ ! -e $S/ctl_TRE_SIGNAL_SOURCE ] || old="$old\\\"signal_source\\\": \\\"$(cat $S/ctl_TRE_SIGNAL_SOURCE)\\\", "
+      [ -e $S/no_switch_line ] || printf '{"level": "INFO", "logger": "tre_controller", "message": "{%s\\"disable_safescale\\": %s, \\"disable_slow_loop\\": %s, \\"event\\": \\"ablation_switches\\", \\"safescale_scope\\": \\"%s\\"}", "time": "2026-10-08 11:01:00,916"}\n' \
+      "$old" "$ds" "$(cat $S/ctl_TRE_ABLATION_DISABLE_SLOW_LOOP 2>/dev/null || echo false)" "$sc" ;;
   *"get deploy tre-v2-baseline-scaler"*replicas*) cat $S/scaler_replicas 2>/dev/null || echo 0 ;;
   *"get deploy tre-gateway-plugins"*TRE_BL_REQ_EVENTS*) cat $S/events 2>/dev/null || true ;;
   *"set env deploy/tre-gateway-plugins TRE_BL_REQ_EVENTS-"*) rm -f $S/events ;;

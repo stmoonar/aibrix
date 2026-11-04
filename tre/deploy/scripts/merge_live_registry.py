@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from tre_common import slo as slo_def
 from tre_common.tss import NUMERATOR_COMPLETION_HISTOGRAMS
 
 #: Per-model keys params_set.py may edit (deploy/scripts/registry_params.py).
@@ -95,6 +96,8 @@ def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any]
             continue
         for section in TUNABLE_SECTIONS:
             for key, value in (src.get(section) or {}).items():
+                if section == "slo" and key == slo_def.LEGACY_MODEL_KEY:
+                    continue  # the retired per-model switch: see _merge_slo_mode
                 target = model.setdefault(section, {})
                 if target.get(key) != value:
                     report.append(f"{name}: {section}.{key} live {value!r} kept (release {target.get(key)!r})")
@@ -125,7 +128,38 @@ def merge(live: dict[str, Any], release: dict[str, Any]) -> tuple[dict[str, Any]
             )
     for name in sorted(set(live_models) - {m.get("name") for m in merged.get("models") or []}):
         report.append(f"WARN {name}: in the live registry only (dropped by the release)")
+    _merge_slo_mode(live, merged, report)
     return merged, report
+
+
+def _merge_slo_mode(live: dict[str, Any], merged: dict[str, Any], report: list[str]) -> None:
+    """The SLO switch is a tunable (params_set.py --set slo_mode=...): a live ``slo_mode``
+    is kept. A live registry from before it (2026-11-04) has the two retired keys instead;
+    they are dropped (one switch, tre_common.slo) and the release's ``slo_mode`` applies,
+    reported with what the live keys meant."""
+    key = slo_def.SLO_MODE_KEY
+    if key in live:
+        if merged.get(key) != live[key]:
+            report.append(f"registry: {key} live {live[key]!r} kept (release {merged.get(key)!r})")
+        merged[key] = live[key]
+    else:
+        try:
+            legacy = slo_def.resolve_slo_mode(live)
+        except ValueError as exc:
+            legacy = None
+            report.append(f"WARN registry: live SLO keys unresolvable ({exc})")
+        if legacy is not None and legacy.source != "default":
+            safescale = (live.get("safescale") or {}).get(slo_def.LEGACY_SAFESCALE_KEY)
+            report.append(
+                f"WARN registry: live has no {key} (legacy {legacy.source} -> {legacy.mode}; safescale.slo_mode "
+                f"{safescale!r}); the release {key} {merged.get(key)!r} applies to every consumer and the retired "
+                "keys are dropped"
+            )
+    safescale = merged.get("safescale")
+    if isinstance(safescale, dict):
+        safescale.pop(slo_def.LEGACY_SAFESCALE_KEY, None)
+    for model in merged.get("models") or []:
+        (model.get("slo") or {}).pop(slo_def.LEGACY_MODEL_KEY, None)
 
 
 def _validate(merged: dict[str, Any]) -> list[str]:

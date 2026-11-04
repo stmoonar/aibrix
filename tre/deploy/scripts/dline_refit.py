@@ -197,8 +197,8 @@ TRIM_RAMP_WINDOWS = 1
 #: ``--dt-ref-s`` / ``--horizon-ms`` / ``--dwell-windows``, thread the values explicitly
 #: (no module state changes), record them as ``windowing`` in their outputs, and the
 #: freeze carries them to ``accept``: a different window only needs an offline re-run.
-#: WINDOW_MS = the controller's TRE_METRICS_WINDOW_MS (20 s since 2026-10-28).
-WINDOW_MS = 20_000.0
+#: WINDOW_MS = the controller's TRE_METRICS_WINDOW_MS (10 s since 2026-11-03; 20 s from 2026-10-28).
+WINDOW_MS = 10_000.0
 #: The window of every stage output / freeze written before the windowing record
 #: (2026-09-30) and the default until 2026-10-28: :func:`windowing_of` reads a record
 #: without ``window_ms`` as this, never as the current default.
@@ -877,7 +877,7 @@ def label_for(model: str, arm: str, registry: Optional[str] = None,
                              "(branch calib/next-20261005)")
         extra["attribution"] = attribution
     primary = slo_labels.label_def_for_model(
-        model, ttft_p95_ms=500.0, tpot_p95_ms=75.0, mode=None, registry=registry, **extra)
+        model, mode=slo_labels.D6_PRIME_MODE, registry=registry, **extra)   # fixed values: the registry's
     if arm == "primary":
         return primary
     arms = slo_labels.label_arms(primary)

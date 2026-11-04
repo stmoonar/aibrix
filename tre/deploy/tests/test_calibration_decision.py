@@ -270,7 +270,8 @@ def _window_rows(shape, primitive, stage, cell_id, load, start_ms, n, rng, flip=
 
 
 def _primary_label() -> slo_labels.LabelDefinition:
-    return slo_labels.label_def_for_model(MODEL, ttft_p95_ms=500, tpot_p95_ms=75, registry=str(REGISTRY))
+    return slo_labels.label_def_for_model(MODEL, ttft_p95_ms=500, tpot_p95_ms=75, mode=slo_labels.D6_PRIME_MODE,
+                                          registry=str(REGISTRY))
 
 
 def _as_revision_2(windows: list[dict]) -> dict:

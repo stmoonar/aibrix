@@ -588,7 +588,7 @@ def _parse(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     p.add_argument("--w-p", type=float, required=True)
     p.add_argument("--lambda-wait", type=float, required=True)
     p.add_argument("--qmin", type=float, default=1.0)
-    add_label_arguments(p, require_fixed=False)
+    add_label_arguments(p, require_fixed=False, require_mode=True)
     p.add_argument("--trim-ramp-windows", type=int, default=1)
     p.add_argument("--tau-grid-s", type=float, nargs="*", default=None)
     p.add_argument("--dt-ref-s", type=float, default=DT_REF_S)

@@ -283,7 +283,7 @@ def test_alpha_fit_reads_the_ledger_it_is_given(tmp_path) -> None:
         {"cell_id": "i256_o128_c1000056", "attempt": 1, "role": "ladder", "primitive": "hold"},
         {"cell_id": "i256_o128_c1000090", "attempt": 1, "role": "ramp", "primitive": "ramp"},
     )) + "\n")
-    args = af._parse(["--model", MODEL, "--fitting-csv", "x.csv", "--w-p", "0.01",
+    args = af._parse(["--model", MODEL, "--ttft-slo-mode", "fixed", "--fitting-csv", "x.csv", "--w-p", "0.01",
                       "--lambda-wait", "1", "--ledger", str(ledger), "--output", "o.json"])
     assert args.ledger == [str(ledger)]
     from scripts.rewindow_from_raw import load_ledgers

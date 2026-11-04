@@ -57,6 +57,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from tre_common import slo_labels
+
 #: The seven shapes the fit trains on, and the held-out mixed shape (not grouped).
 TRAINING_SHAPES = ("S1", "S2", "S3", "S4", "S5", "T8", "T9")
 HELD_OUT_SHAPE = "M"
@@ -442,8 +444,22 @@ def stationary_points(
     *,
     primitives: Sequence[str] = STATIONARY_PRIMITIVES,
     hold_warmup_s: float = DEFAULT_HOLD_WARMUP_S,
+    registry: Any = None,
 ) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    """Per (model, shape): labelled windows of ``primitives`` with their offered rho."""
+    """Per (model, shape): labelled windows of ``primitives`` with their offered rho.
+    ``latency_ratio`` = the larger of p95 TTFT / p95 TPOT over the model's fixed-mode SLO
+    (``tre_common.slo_labels``, the registry's ``slo.ttft_p95_ms`` / ``tpot_p95_ms``;
+    ``registry``: path or loaded, None = the shared one)."""
+    fixed: dict[str, Any] = {}
+
+    def ratio(row: Mapping[str, Any]) -> float | None:
+        model = str(row["model"])
+        if model not in fixed:
+            fixed[model] = slo_labels.label_def_for_model(
+                model, mode=slo_labels.TTFT_SLO_MODE_FIXED, registry=registry).latency_slo_ms()
+        ratios = slo_labels.latency_ratios(row, fixed[model])
+        return None if ratios is None else max(ratios)
+
     sends: dict[tuple, list[float]] = defaultdict(list)
     for r in requests:
         if r.get("cell_status") == "void" or r.get("primitive") not in primitives:
@@ -473,7 +489,7 @@ def stationary_points(
             "rps": rps,
             "violated": 1 if w["slo_label"] == "violated" else 0,
             "primitive": w["primitive"],
-            "latency_ratio": None if ttft is None or tpot is None else max(ttft / 500.0, tpot / 75.0),
+            "latency_ratio": None if ttft is None or tpot is None else ratio(w),
             "running": _f(w.get("avg_running")),
         })
     return out
@@ -603,10 +619,12 @@ def rho_priors(
     min_violating_windows: int = DEFAULT_MIN_VIOLATING_WINDOWS,
     max_num_seqs: int = DEFAULT_MAX_NUM_SEQS,
     search_cap_rho: float = DEFAULT_SEARCH_CAP_RHO,
+    registry: Any = None,
 ) -> dict[str, Any]:
     caps = capacities(run_dir, cells)
-    points = stationary_points(windows, requests, cells, caps, hold_warmup_s=hold_warmup_s)
-    ramp = stationary_points(windows, requests, cells, caps, primitives=("ramp",), hold_warmup_s=hold_warmup_s)
+    points = stationary_points(windows, requests, cells, caps, hold_warmup_s=hold_warmup_s, registry=registry)
+    ramp = stationary_points(windows, requests, cells, caps, primitives=("ramp",), hold_warmup_s=hold_warmup_s,
+                             registry=registry)
     models: dict[str, dict[str, Any]] = defaultdict(dict)
     for (model, shape), cap in sorted(caps.items()):
         models[model][shape] = rho_prior(
@@ -654,6 +672,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--min-violating-windows", type=int, default=DEFAULT_MIN_VIOLATING_WINDOWS)
     ap.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS)
     ap.add_argument("--search-cap-rho", type=float, default=DEFAULT_SEARCH_CAP_RHO)
+    ap.add_argument("--registry", default=None,
+                    help="registry whose fixed-mode SLO the latency_ratio column uses (default: the shared one)")
     args = ap.parse_args(argv)
     run_dir = args.run_dir.resolve()
     out_dir = args.out_dir.resolve()
@@ -672,6 +692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "min_violating_windows": args.min_violating_windows,
             "max_num_seqs": args.max_num_seqs,
             "search_cap_rho": args.search_cap_rho,
+            "slo_registry": args.registry,
         },
         "run_dir": str(run_dir),
         "inputs_sha256": {n: _sha256(ds / n) for n in ("requests.csv", "windows.csv", "cells.csv")},
@@ -681,7 +702,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     priors = rho_priors(
         run_dir, windows, requests, cells,
         hold_warmup_s=args.hold_warmup_s, min_violating_windows=args.min_violating_windows,
-        max_num_seqs=args.max_num_seqs, search_cap_rho=args.search_cap_rho,
+        max_num_seqs=args.max_num_seqs, search_cap_rho=args.search_cap_rho, registry=args.registry,
     )
     for name, doc in (("regime_groups.json", groups), ("rho_priors.json", priors)):
         (out_dir / name).write_text(json.dumps({"provenance": provenance, **doc}, indent=1) + "\n")

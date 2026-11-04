@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from tre_common import slo_labels
 from tre_common.slo_labels import LabelDefinition, LabelSpec, label_window
 from tre_common.tss import (
-    DEFAULT_EMA_TAU_MS,
+    FIT_EMA_TAU_MS,
     TssEma,
     replica_factor,
     signal_ema,
@@ -64,7 +64,7 @@ class TssRecompute:
     w_p: float
     lambda_wait: float
     qmin: float = 1.0
-    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS
+    ema_tau_ms: float | None = FIT_EMA_TAU_MS
 
     def as_dict(self) -> dict[str, float | None]:
         return {
@@ -169,8 +169,8 @@ def recompute_tss_rows(
             ),
         )
         raws.append(terms.raw)
-    if params.ema_tau_ms is None:
-        return raws
+    if params.ema_tau_ms is None or params.ema_tau_ms <= 0:
+        return raws  # no smoothing (tau 0 = raw, what the deployed registry names)
     tau = params.ema_tau_ms
     return smooth_rows_by_cell(rows, raws, make_ema=lambda: TssEma(tau))
 
@@ -223,7 +223,7 @@ def load_windows_from_csv(
     # rows the filter below drops, because the online EMA saw them too.
     if tss is not None:
         recomputed: list[float | None] | None = recompute_tss_rows(all_rows, tss)
-    elif ema_tau_ms is not None:
+    elif ema_tau_ms is not None and float(ema_tau_ms) > 0:
         raws = [
             _as_float(signal_transform(row) if signal_transform is not None else row.get(signal_column))
             for row in all_rows

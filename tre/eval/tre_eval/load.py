@@ -75,6 +75,10 @@ class Arm:
     models: list[str] = field(default_factory=list)
     tp: dict[str, int] = field(default_factory=dict)
     slo: dict[str, dict] = field(default_factory=dict)
+    #: The registry's SLO mode (``tre_common.slo.resolve_slo_mode``; None = no registry) and
+    #: where it came from (``slo_mode`` / ``legacy:...`` / ``default``).
+    slo_mode: str | None = None
+    slo_mode_source: str | None = None
     trs: dict[str, dict] = field(default_factory=dict)
     layout: list[tuple[float, dict]] = field(default_factory=list)
     gauges: list[tuple[float, dict]] = field(default_factory=list)
@@ -252,6 +256,20 @@ def load_arm(path: str, clock_offsets: dict[str, float] | None = None,
             arm.warn(f"live-registry.yaml unreadable: {e}")
     else:
         arm.warn("live-registry.yaml missing: SLO thresholds unavailable (V_req not computed)")
+    if arm.registry:
+        from .metrics import slo_def  # tre_common.slo (metrics puts tre/common on the path)
+
+        # fail closed (2026-11-04): an unresolvable SLO mode stops the load - no scoring under a guessed mode
+        try:
+            res = slo_def.resolve_slo_mode(arm.registry)
+        except ValueError as e:
+            raise ValueError(f"{reg_path}: SLO mode unresolvable ({e}); score it with an explicit mode") from e
+        arm.slo_mode, arm.slo_mode_source = res.mode, res.source
+        if res.source == "default":
+            arm.warn(f"live-registry.yaml names no SLO mode (no slo_mode, no retired key): scored as {res.mode} "
+                     f"(tre_common.slo.resolve_slo_mode: slowdown when every model has its idle TTFT fit, else "
+                     f"fixed). The scorer before 2026-11-04 judged each model by its own ttft_slo_mode and read a "
+                     f"missing key as fixed, so this score can differ from the one made then")
     for m in arm.registry.get("models") or []:
         arm.models.append(m["name"])
         arm.tp[m["name"]] = int(m.get("tp_size") or 1)
@@ -316,7 +334,7 @@ def load_arm(path: str, clock_offsets: dict[str, float] | None = None,
             arm.signal.append({"ts": ts, "model": r.get("model"),
                                **{k: _num(r.get(k)) for k in ("z_m", "z", "tss", "theta_m", "queue_len",
                                                              "decode_tps", "prefill_tps", "replicas_awake",
-                                                             "replicas_target", "raw_signal", "eta_m")},
+                                                             "replicas_target", "raw_signal")},
                                "tier": r.get("tier"), "action": r.get("action"),
                                "signal_source": r.get("signal_source")})
     else:

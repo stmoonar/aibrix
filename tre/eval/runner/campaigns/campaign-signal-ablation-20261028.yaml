@@ -4,12 +4,15 @@
 # v1 signal - queue_len (running + waiting per routable pod, floor 1 request / pod), ttft_mean (mean TTFT, v1 D38),
 # kv_usage (KV-cache occupancy, not the prefix hit rate). Everything else unchanged.
 #   * SafeScale scope receiverless_shrink on every arm (user 10-28, §8.1).
-#   * eta gate (and waste ordering) off only on the alternative-signal arms (v1 D31, §8.3).
+#   * eta gate (and waste ordering) off only on the alternative-signal arms (v1 D31, §8.3). 2026-11-02: eta and
+#     TRE_DISABLE_ETA_GATE were removed from the controller; every arm orders donors IDLE first, then Z descending,
+#     so the switch is gone from the arms below (runs before that recorded it in their campaign_spec.yaml copy).
 #   * Tight_pool replaces v1's Alternating (§8.5). Disclose: Tight_pool is an integer overload, unlike Alternating.
 #   * Disclose: the O1 breakpoint-aware window and hold apply on every arm (alt signals included; the alt EMA
 #     restarts at the breakpoint like the TSS). Only the onset saturation rescue is zm-only (eligibility_reason returns
 #     None for other signals), so the alternative-signal arms run without it (§3, §8.4).
-#   * The controller refuses an alt-signal arm unless TRE_DISABLE_ETA_GATE=true (feat/alt-signals-20261028 1f05e51c).
+#   * (until 2026-11-02) The controller refused an alt-signal arm unless TRE_DISABLE_ETA_GATE=true
+#     (feat/alt-signals-20261028 1f05e51c); since then it refuses TRE_DISABLE_ETA_GATE=true.
 #
 # PREREQUISITES - the campaign refuses to start until all hold:
 #   1. The RECALIBRATED registry is live: TSS numerator = vLLM per-step token counter, signal window 20 s, EMA kept
@@ -90,19 +93,19 @@ arm_defs:
   sig-tss:
     base: tre
     label: TSS
-    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: zm, TRE_DISABLE_ETA_GATE: false}
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: zm}
   sig-queue:
     base: tre
     label: QUEUE
-    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: queue_len, TRE_DISABLE_ETA_GATE: true}
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: queue_len}
   sig-ttft:
     base: tre
     label: LATENCY-ttft-mean
-    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: ttft_mean, TRE_DISABLE_ETA_GATE: true}
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: ttft_mean}
   sig-kv:
     base: tre
     label: KV-usage
-    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: kv_usage, TRE_DISABLE_ETA_GATE: true}
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: kv_usage}
 
 preserve:                           # unused (TRE arms only); kept so the file validates like the other campaigns
   trace_host_root: /data/nfs_shared_data/xxy/baseline-traces

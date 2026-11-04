@@ -79,6 +79,7 @@ def _setting(arm_dir: str) -> str:
     sig = env.get("TRE_SIGNAL_SOURCE")
     if sig:
         parts.insert(0, f"signal={sig}")
+    # arms run before 2026-11-02 (eta removed; campaign.py now refuses the switch): their manifests keep it
     if str(env.get("TRE_DISABLE_ETA_GATE", "false")).lower() == "true":
         parts.append("eta gate off")
     return "; ".join(parts)
@@ -87,7 +88,8 @@ def _setting(arm_dir: str) -> str:
 def arm_row(path: str, trim_s: float = 30.0) -> dict[str, Any]:
     arm = L.load_arm(path)
     max_tok = {t["request_id"]: t.get("max_output_tokens") for t in arm.traces}
-    recs, summ = M.score_requests(arm.requests, arm.slo, trim_s=trim_s, max_tok=max_tok, t_ref=arm.t_load)
+    recs, summ = M.score_requests(arm.requests, arm.slo, trim_s=trim_s, max_tok=max_tok, t_ref=arm.t_load,
+                                  mode=arm.slo_mode)
     gpu = M.gpu_accounting(arm, summ)
     inter = M.interruption(arm, recs)
     a = summ.get(M.ALL) or {}

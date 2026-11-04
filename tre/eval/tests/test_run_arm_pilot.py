@@ -9,7 +9,10 @@ kubectl, curl, redis-py, loadgen; no cluster). Invariants (2026-11-02, docs runn
 * a switch compares as the controller reads it (_get_bool): the overlay's "0" is false - no rollout, no
   deviation; a value the controller does not know is reported;
 * every collector file is still written, and an arm that dies in its collection puts its switches back
-  (CTL_ENV_KEEP=1 too).
+  (CTL_ENV_KEEP=1 too);
+* (eta removed 2026-11-02) TRE_DISABLE_ETA_GATE left on the Deployment is unset in the arm's one rollout and by
+  the final reset; (2026-11-04) on a controller image that still logs disable_eta_gate (told by its startup line)
+  the runner writes it true on an alt-signal arm only, and that image's startup line matches.
 """
 from __future__ import annotations
 
@@ -160,3 +163,66 @@ def test_a_switch_compares_as_the_controller_reads_it(harness):
     # a value the controller does not know is still reported
     (h / "state" / f"ctl_{sup}").write_text("maybe")
     assert f"{sup}=maybe" in reset_check(h)
+
+
+def test_a_removed_switch_left_on_the_deployment_is_unset_in_the_arms_one_rollout_and_by_the_final_reset(harness):
+    """A stale TRE_DISABLE_ETA_GATE would crash-loop the current controller ("true") or linger ("false")."""
+    h = harness
+    stale = h / "state" / "ctl_TRE_DISABLE_ETA_GATE"
+    stale.write_text("true")
+    assert SWITCH_DEVIATION not in reset_check(h, CTL_ENV_KEEP="1")      # between arms: the next arm unsets it
+    assert "TRE_DISABLE_ETA_GATE=true(removed)" in reset_check(h)
+    rc, d, ro = run_arm(h, "tre", 1, CTL_ENV_KEEP="1")
+    assert rc == 0 and len(ro) == 1 and "TRE_DISABLE_ETA_GATE-" in ro[0].split(), ro
+    assert not stale.exists() and startup_line_matched(d)
+    stale.write_text("false")
+    subprocess.run(["bash", str(h / "tools" / "reset_canonical.sh")], cwd=h, capture_output=True, env=env_of(h))
+    assert not stale.exists()
+
+
+def _eta_rollouts(ro: list[str]) -> list[str]:
+    return [kv for c in ro for kv in c.split() if kv.startswith("TRE_DISABLE_ETA_GATE")]
+
+
+@pytest.mark.parametrize("old_image", [True, False], ids=["image-before-eta-removal", "current-image"])
+def test_the_runner_works_on_the_controller_image_before_and_after_the_eta_removal(harness, old_image):
+    """B1 (review 2026-11-04): the image is told by its startup line (disable_eta_gate logged or not), not by its tag.
+    Old image: the logged disable_eta_gate is a known retired key (no mismatch); an alt-signal arm gets
+    TRE_DISABLE_ETA_GATE=true (that image refuses an alt signal without it) and a TSS arm has it unset (= false).
+    Current image: the runner never writes it (that image refuses true)."""
+    import json
+    h = harness
+    if old_image:
+        (h / "state" / "old_image_line").write_text("")
+    # a TSS arm with a switch (campaign mode)
+    rc, d, ro = run_arm(h, "tre", 1, CTL_ENV_KEEP="1", ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SLOW_LOOP=true")
+    sw = json.loads((d / "ablation_switches.json").read_text())
+    assert rc == 0 and sw["match"] is True and sw["problem"] is None, (d / "runner.log").read_text()[-1500:]
+    assert not _eta_rollouts(ro) and sw["eta_gate"] == ({"image_has_eta_gate": True, "logged": False, "wanted": False}
+                                                        if old_image else None)
+    # an alt-signal arm
+    rc, d, ro = run_arm(h, "tre", 2, CTL_ENV_KEEP="1", ARM_CONTROLLER_ENV="TRE_SIGNAL_SOURCE=queue_len")
+    sw = json.loads((d / "ablation_switches.json").read_text())
+    assert rc == 0 and sw["match"] is True, (d / "runner.log").read_text()[-1500:]
+    assert _eta_rollouts(ro) == (["TRE_DISABLE_ETA_GATE=true"] if old_image else [])
+    assert switch(h, "TRE_DISABLE_ETA_GATE") == ("true" if old_image else "")
+    # back to a TSS arm: the gate is unset again in the arm's one rollout
+    rc, d, ro = run_arm(h, "tre", 3, CTL_ENV_KEEP="1")
+    sw = json.loads((d / "ablation_switches.json").read_text())
+    assert rc == 0 and sw["match"] is True and switch(h, "TRE_DISABLE_ETA_GATE") == ""
+    assert _eta_rollouts(ro) == (["TRE_DISABLE_ETA_GATE-"] if old_image else [])
+    assert not (h / "state" / "refused").exists()      # neither image was asked for a setting it refuses
+
+
+def test_an_old_image_whose_eta_gate_disagrees_with_the_arm_does_not_match(harness):
+    """The retired key is accepted only with the value the arm needs (true exactly on an alt-signal arm)."""
+    import json
+    h = harness
+    (h / "state" / "old_image_line").write_text("")
+    # the arm wants TSS, but the image logs the gate true (e.g. set by hand after the runner's rollout)
+    line = h / "bin" / "kubectl"
+    txt = line.read_text().replace('$(cat $S/ctl_TRE_DISABLE_ETA_GATE 2>/dev/null || echo false)', 'true')
+    line.write_text(txt)
+    rc, d, _ = run_arm(h, "tre", 1, ARM_CONTROLLER_ENV="TRE_ABLATION_DISABLE_SLOW_LOOP=true")
+    sw = json.loads((d / "ablation_switches.json").read_text())
+    assert rc == 4 and sw["match"] is False and "disable_eta_gate=True" in (sw["problem"] or ""), sw

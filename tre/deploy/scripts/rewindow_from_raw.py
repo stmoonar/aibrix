@@ -1163,8 +1163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="fixed TTFT p95 SLO (the slo_label_fixed arm; default: registry)")
     ap.add_argument("--tpot-slo-ms", type=float, default=None,
                     help="p95 TPOT SLO of every arm (default: registry)")
-    # The primary label's TTFT mode (D6' slowdown by default, from the registry slo block).
-    slo_labels.add_label_arguments(ap, include_fixed=False)
+    # The primary label's TTFT mode: --ttft-slo-mode is required (the output is compared with frozen D6' records).
+    slo_labels.add_label_arguments(ap, include_fixed=False, require_mode=True)
     ap.add_argument("--registry", default=None)
     ap.add_argument("--routable-pods", type=int, default=1)
     ap.add_argument("--assigned-replicas", type=int, default=1)

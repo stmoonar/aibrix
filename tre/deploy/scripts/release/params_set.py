@@ -21,11 +21,15 @@ the basis with --apply alone, then roll out the matching controller image (relea
 docs/design/20261028-tss-step-counters.md).
 
 Editable (deploy/scripts/registry_params.py): <model>.trs.<f> (not ema_tau_ms),
-<model>.slo.{ttft_p95_ms,tpot_p95_ms,e2e_p95_ms,ttft_idle_c_ms,ttft_idle_b_ms_per_token},
+<model>.slo.{ttft_p95_ms,tpot_p95_ms,e2e_p95_ms,ttft_idle_c_ms,ttft_idle_b_ms_per_token,
+ttft_slowdown_k,ttft_floor_ms}, <model>.slo.idle_multiple.{ttft_k,tpot_k,ttft_floor_ms,tpot_idle_ms},
+slo_mode=<fixed|slowdown|idle_multiple> (no model prefix: the one SLO switch of every consumer,
+tre_common.slo; setting it drops the retired safescale.slo_mode / models[].slo.ttft_slo_mode),
 <model>.alt_thresholds.<signal>.{theta,direction,delta_crit,delta_high,basis.definition,
 basis.window_ms,basis.ema_tau_ms} (an alt arm starts only on a matching basis stamp),
 <model>.{min_replicas,max_awake_replicas}. Several --set go out in ONE ConfigMap write, so a
-recalibration (theta, lambda, tau, w_p and c/b) is published atomically. max_replicas (the
+recalibration (theta, lambda, tau, w_p, c/b and the SLO mode it was fitted on) is published
+atomically. max_replicas (the
 GPU layout) is structural. VALUE is parsed as YAML. The edit
 is checked against the bounds and cross-field rules, re-parsed with tre_common.registry,
 and rejected if Registry.validate() reports an error the live registry does not have.

@@ -26,7 +26,7 @@ SIGNAL_LOG_FIELDS = (
     "replicas_awake",
     "replicas_target",
     "tier",
-    "eta_m",
+    # 2026-11-02: eta_m dropped (eta removed); older streams still carry the column.
     "action",
 )
 
@@ -104,7 +104,6 @@ class SignalLogWriter:
                 "replicas_awake": str(replicas_awake),
                 "replicas_target": str(replicas_target),
                 "tier": _tier(classification),
-                "eta_m": _format(context.get("eta_m")),
                 "action": action_by_model.get(model, "none"),
             }
             with self._lock:

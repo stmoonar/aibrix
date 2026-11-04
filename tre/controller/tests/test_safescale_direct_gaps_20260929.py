@@ -22,6 +22,7 @@ import yaml
 from dataclasses import replace
 
 from tre_common.registry import SafeScaleRegistryConfig, parse_safescale_config
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import ControllerConfig
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
@@ -119,7 +120,7 @@ def test_a_controller_restart_between_hide_and_baseline_makes_the_whole_probe_la
     # The controller restarts; meanwhile the remaining pods serve slow requests.
     for sim in h.sims.values():
         sim.serve(30, ttft_s=5.0)
-    restored = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore(unresolved=[record]),
+    restored = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), store=FakeProbeStore(unresolved=[record]),
                                      evidence=h.evidence, wall_clock_ms=h.clock)
     assert restored.restore() == 1
     h.machine, h.collector = restored, h._collector(restored)
@@ -231,7 +232,7 @@ def test_the_hide_callback_schedules_the_baseline_after_the_delay() -> None:
 
     h = Harness(baseline_delay_ms=80.0)
     h.clock = real_clock  # type: ignore[assignment]
-    h.machine = SafeScaleStateMachine(config=_cfg(baseline_delay_ms=80.0), evidence=h.evidence,
+    h.machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(baseline_delay_ms=80.0), evidence=h.evidence,
                                       wall_clock_ms=real_clock)
     h.collector = h._collector(h.machine)
     h.machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)

@@ -4,8 +4,9 @@
 #   tre-ss-receiverless  TRE as in campaign-v2-20261028 (TSS step counters, 20 s window)
 #   apa                  APA (controller-manager posts absolute targets to POST /v2/plans)
 #   tokenscale           baseline-scaler, one POST /v2/plans per tick
-#   sig-queue            alt signal queue_len, eta gate off (the controller refuses unless TRE_DISABLE_ETA_GATE=true and
-#                        the fitted alt thresholds + basis {definition, window_ms, ema_tau_ms} are live)
+#   sig-queue            alt signal queue_len (the controller refuses unless the fitted alt thresholds + basis
+#                        {definition, window_ms, ema_tau_ms} are live; 2026-11-02: TRE_DISABLE_ETA_GATE removed with eta,
+#                        it was required =true here before)
 #   sens-theta-m20       theta_m x0.8 on every model: exercises params_set apply / restore and the
 #                        tre.dev/arm-registry-restore annotation (check it is cleared and the registry id is back)
 # registry_expect needs the published registry id (same value as campaign-v2-20261028). The smoke may run from the
@@ -70,7 +71,7 @@ arm_defs:
   sig-queue:
     base: tre
     label: QUEUE
-    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: queue_len, TRE_DISABLE_ETA_GATE: true}
+    controller_env: {TRE_SAFESCALE_SCOPE: receiverless_shrink, TRE_ABLATION_DISABLE_SAFESCALE: false, TRE_SIGNAL_SOURCE: queue_len}
   sens-theta-m20:
     base: tre
     label: THETA-x0.8

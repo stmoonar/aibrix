@@ -798,7 +798,7 @@ def test_the_published_family_theta_is_the_one_that_classifies_more_windows_crit
 
     def state(theta: float) -> ModelState:
         return classify_model(
-            model_name="m", trs=tss, Z_m=tss / theta, eta_m=None, theta_m=theta, tau=tau
+            model_name="m", trs=tss, Z_m=tss / theta, theta_m=theta, tau=tau
         ).state
 
     assert state(verdict["theta"]) == ModelState.CRITICAL

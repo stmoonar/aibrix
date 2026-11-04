@@ -41,18 +41,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Mapping, Protocol
 
+from tre_common import slo as slo_def
 from tre_common.rediskeys import hist_key, pods_key
 from tre_common.window_pods import pooled_p95_ms
 
 LOG = logging.getLogger("tre_controller.safescale")
 
-#: Threshold modes recorded in the probe audit.
-THRESHOLD_MODE_LABELS = "labels"
-THRESHOLD_MODE_FIXED = "fixed"
-#: Direct constructions without a registry (tests / offline): config values or 500 / 75.
-THRESHOLD_MODE_CONFIG = "config"
-DEFAULT_TTFT_SLO_MS = 500.0
-DEFAULT_TPOT_SLO_MS = 75.0
+#: Threshold modes recorded in the probe audit: the ``tre_common.slo`` mode
+#: (``fixed`` / ``slowdown`` / ``idle_multiple``; before 2026-11-04 the audit wrote
+#: ``labels`` for what is now ``slowdown``), or ``static`` (:class:`StaticThresholds`).
+#: There is no built-in threshold (2026-11-04): the controller judges with
+#: :class:`RegistryThresholds`; every other construction names its thresholds.
+THRESHOLD_MODE_STATIC = "static"
 
 
 @dataclass(frozen=True)
@@ -309,99 +309,63 @@ def _optional_ms(value: Any) -> int | None:
 
 
 class RegistryThresholds:
-    """:class:`ThresholdResolver` from the registry (``safescale.slo_mode``).
+    """:class:`ThresholdResolver` from the registry: the thresholds of the registry's
+    ``slo_mode`` (the one switch of every consumer), built by ``tre_common.slo``.
 
-    * ``labels`` (default): the calibration label's rule, via the same function the
-      theta labels use (``tre_common.slo_labels.label_def_for_model``): TPOT fixed,
-      TTFT = max(floor, k * (c + b * L)) for the slowdown label (L = the evidence
-      window's mean prompt length; without L the TTFT threshold is the floor).
-    * ``fixed``: ``models[].slo.ttft_p95_ms`` / ``tpot_p95_ms`` (v1's 500 / 75).
+    What the probe judges: the evidence window's p95 TTFT and p95 TPOT (vLLM histograms of
+    the remaining pods, max of per pod and pooled) against ONE TTFT and ONE TPOT threshold.
+    In a per-request mode (``slowdown`` / ``idle_multiple``) the TTFT threshold is the
+    per-request one evaluated at the window's MEAN prompt length L (without L: the floor).
+    The evidence carries no per-request (TTFT, L) pairs - only histogram buckets and the
+    prompt-token sum / count - so a per-request verdict is not possible from it.
 
-    ``ttft_override_ms`` / ``tpot_override_ms`` (env SAFE_SCALE_*_P95_SLO_MS, unset by
-    default) replace the respective threshold in either mode. A model whose registry
-    ``slo`` block cannot build a label falls back to ``fixed`` (recorded)."""
+    ``mode`` (tests) replaces the registry's mode. Fail closed: a model whose ``slo``
+    block cannot build the mode's thresholds raises (``load_registry`` validates every
+    model's block for its mode, so a loaded registry never gets here); there is no
+    fallback to another mode and no env override (SAFE_SCALE_*_P95_SLO_MS removed
+    2026-11-04)."""
 
-    def __init__(
-        self,
-        registry: Any,
-        *,
-        mode: str = THRESHOLD_MODE_LABELS,
-        ttft_override_ms: float | None = None,
-        tpot_override_ms: float | None = None,
-    ) -> None:
-        if mode not in (THRESHOLD_MODE_LABELS, THRESHOLD_MODE_FIXED):
+    def __init__(self, registry: Any, *, mode: str | None = None) -> None:
+        mode = mode or registry.slo_mode()
+        if mode not in slo_def.SLO_MODES:
             raise ValueError(f"unknown SafeScale threshold mode {mode!r}")
         self._registry = registry
         self._mode = mode
-        self._ttft_override = ttft_override_ms
-        self._tpot_override = tpot_override_ms
-        self._labels: dict[str, Any] = {}
+        self._thresholds: dict[str, Any] = {}
+
+    @property
+    def mode(self) -> str:
+        return self._mode
 
     def resolve(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
-        mode = self._mode
-        fallback: str | None = None
-        ttft: float
-        tpot: float
-        if mode == THRESHOLD_MODE_LABELS:
-            label = self._label(model)
-            if isinstance(label, str):
-                fallback, mode = label, THRESHOLD_MODE_FIXED
-            else:
-                tpot = float(label.tpot_p95_ms)
-                if label.slowdown:
-                    length = _finite_nonneg(mean_prompt_tokens)
-                    ttft = float(label.ttft_slo_ms(length)) if length is not None else float(label.ttft_floor_ms)
-                else:
-                    ttft = float(label.ttft_p95_ms)
-        if mode == THRESHOLD_MODE_FIXED:
-            ttft, tpot = self._fixed(model)
-        record: dict[str, Any] = {
-            "mode": mode,
-            "ttft_ms": ttft,
-            "tpot_ms": tpot,
-            "mean_prompt_tokens": _finite_nonneg(mean_prompt_tokens),
+        thresholds = self._of(model)
+        length = _finite_nonneg(mean_prompt_tokens)
+        return {
+            "mode": thresholds.mode,
+            "ttft_ms": float(thresholds.ttft_ms(length)),
+            "tpot_ms": float(thresholds.tpot_ms),
+            "mean_prompt_tokens": length,
             "source": "registry",
         }
-        if fallback is not None:
-            record["fallback"] = fallback
-        if self._ttft_override is not None or self._tpot_override is not None:
-            record["source"] = "env_override"
-            if self._ttft_override is not None:
-                record["ttft_ms"] = float(self._ttft_override)
-            if self._tpot_override is not None:
-                record["tpot_ms"] = float(self._tpot_override)
-        return record
 
-    def _label(self, model: str) -> Any:
-        if model not in self._labels:
-            from tre_common.slo_labels import label_def_for_model
-
-            try:
-                self._labels[model] = label_def_for_model(model, registry=self._registry)
-            except (SystemExit, ValueError, KeyError) as exc:
-                LOG.warning("safescale thresholds: no label for %s (%s); using models[].slo", model, exc)
-                self._labels[model] = f"label_unavailable: {exc}"
-        return self._labels[model]
-
-    def _fixed(self, model: str) -> tuple[float, float]:
-        try:
-            slo = self._registry.model(model).slo
-            return float(slo.ttft_p95_ms), float(slo.tpot_p95_ms)
-        except (KeyError, AttributeError, TypeError, ValueError):
-            return DEFAULT_TTFT_SLO_MS, DEFAULT_TPOT_SLO_MS
+    def _of(self, model: str) -> Any:
+        if model not in self._thresholds:
+            # raises (SloConfigError / KeyError): no threshold without the registry's
+            self._thresholds[model] = slo_def.slo_thresholds(self._registry.model(model).slo, self._mode)
+        return self._thresholds[model]
 
 
-def config_thresholds(config: Any, mean_prompt_tokens: float | None = None) -> dict[str, Any]:
-    """Thresholds without a registry resolver: the config values, else 500 / 75 ms."""
-    ttft = getattr(config, "ttft_p95_slo_ms", None)
-    tpot = getattr(config, "tpot_p95_slo_ms", None)
-    return {
-        "mode": THRESHOLD_MODE_CONFIG,
-        "ttft_ms": float(ttft) if ttft is not None else DEFAULT_TTFT_SLO_MS,
-        "tpot_ms": float(tpot) if tpot is not None else DEFAULT_TPOT_SLO_MS,
-        "mean_prompt_tokens": _finite_nonneg(mean_prompt_tokens),
-        "source": "config",
-    }
+class StaticThresholds:
+    """:class:`ThresholdResolver` with one TTFT and one TPOT threshold for every model
+    (offline replays and tests; the caller names both values - there is no default)."""
+
+    def __init__(self, ttft_ms: float, tpot_ms: float) -> None:
+        self._ttft_ms = float(ttft_ms)
+        self._tpot_ms = float(tpot_ms)
+
+    def resolve(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
+        return {"mode": THRESHOLD_MODE_STATIC, "ttft_ms": self._ttft_ms, "tpot_ms": self._tpot_ms,
+                "mean_prompt_tokens": _finite_nonneg(mean_prompt_tokens), "source": "static"}
 
 
 def _finite_nonneg(value: Any) -> float | None:

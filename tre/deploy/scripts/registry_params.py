@@ -21,6 +21,7 @@ import yaml
 
 from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS, Z_MAX, alt_tau_high_unreachable
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
+from tre_common import slo as slo_def
 from tre_common.tss import NUMERATOR_COMPLETION_HISTOGRAMS, NUMERATOR_STEP_COUNTERS
 
 # field -> (min, max, kind, min_exclusive, max_exclusive)
@@ -61,11 +62,31 @@ _SLO_BOUNDS: dict[str, tuple] = {
     "ttft_p95_ms": (50, 5000, "float", False, False),
     "tpot_p95_ms": (10, 500, "float", False, False),
     "e2e_p95_ms": (1000, 120000, "float", False, False),
-    # Idle-TTFT intercept / slope (c, b): live with safescale.slo_mode labels (TTFT threshold
-    # max(500, k*(c + b*L))), so they are published together with theta in one --apply.
+    # Idle-TTFT intercept / slope (c, b): live in the per-request SLO modes (slowdown,
+    # idle_multiple: TTFT threshold max(floor, k*(c + b*L))), so they are published together
+    # with theta in one --apply.
     "ttft_idle_c_ms": (0, 2000, "float", True, False),
     "ttft_idle_b_ms_per_token": (0, 1, "float", False, False),
+    # slo_mode slowdown: TTFT multiple and floor.
+    "ttft_slowdown_k": (0, 50, "float", True, False),
+    "ttft_floor_ms": (0, 5000, "float", True, False),
 }
+#: models[].slo.idle_multiple (slo_mode idle_multiple, 2026-11-04; tre_common.slo).
+_SLO_IDLE_MULTIPLE_BOUNDS: dict[str, tuple] = {
+    "ttft_k": (0, 50, "float", True, False),
+    "tpot_k": (0, 50, "float", True, False),
+    "ttft_floor_ms": (0, 5000, "float", True, False),
+    "tpot_idle_ms": (0, 500, "float", True, False),
+}
+#: Registry-level tunables (``--set slo_mode=<mode>``, no model prefix). slo_mode is the one SLO
+#: switch of every consumer; it goes in the same --apply as the theta / lambda / tau / w_p refit
+#: on that SLO. Setting it removes the retired keys safescale.slo_mode and
+#: models[].slo.ttft_slo_mode (tre_common.slo refuses a registry with both).
+_GLOBAL_BOUNDS: dict[str, tuple] = {
+    slo_def.SLO_MODE_KEY: (slo_def.SLO_MODES, None, "enum", False, False),
+}
+#: The edits key of the registry-level tunables (never a model name: names are DNS labels).
+GLOBAL_EDITS = "*"
 _TOP_BOUNDS: dict[str, tuple] = {
     "min_replicas": (0, 4, "int", False, False),
     # Scaling cap (v1/paper alignment A1); max_replicas is the GPU layout size (locked).
@@ -129,6 +150,9 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
             )
         for field, spec in _SLO_BOUNDS.items():
             editable[f"slo.{field}"] = _field_view(slo.get(field), spec)
+        for field, spec in _SLO_IDLE_MULTIPLE_BOUNDS.items():
+            editable[f"slo.{slo_def.IDLE_MULTIPLE_KEY}.{field}"] = _field_view(
+                (slo.get(slo_def.IDLE_MULTIPLE_KEY) or {}).get(field), spec)
         for field, spec in _TOP_BOUNDS.items():
             editable[field] = _field_view(model.get(field), spec)
         locked = {
@@ -163,12 +187,15 @@ def apply_and_validate(
 ) -> str:
     """Return a new registry.yaml with `edits` applied, or raise ParamValidationError.
 
-    edits: {model_name: {"trs": {f: v}, "slo": {f: v}, "alt_thresholds": {signal: {f: v}},
-            "min_replicas": v, "max_awake_replicas": v}}
+    edits: {model_name: {"trs": {f: v}, "slo": {f: v, "idle_multiple": {f: v}},
+            "alt_thresholds": {signal: {f: v}}, "min_replicas": v, "max_awake_replicas": v},
+            GLOBAL_EDITS: {"slo_mode": v}}
     """
     data = yaml.safe_load(registry_yaml) or {}
     models = {m.get("name"): m for m in (data.get("models") or [])}
     errors: list[dict] = []
+    edits = dict(edits)
+    _apply_global(data, edits.pop(GLOBAL_EDITS, {}) or {}, errors)
 
     for model_name, changes in edits.items():
         model = models.get(model_name)
@@ -182,7 +209,18 @@ def apply_and_validate(
             model_name,
             errors,
         )
-        _apply_section(model.setdefault("slo", {}), changes.get("slo", {}), _SLO_BOUNDS, model_name, "slo.", errors)
+        slo_changes = dict(changes.get("slo", {}))
+        idle_changes = slo_changes.pop(slo_def.IDLE_MULTIPLE_KEY, None)
+        _apply_section(model.setdefault("slo", {}), slo_changes, _SLO_BOUNDS, model_name, "slo.", errors)
+        if idle_changes is not None:
+            if not isinstance(idle_changes, dict):
+                errors.append({"model": model_name, "field": f"slo.{slo_def.IDLE_MULTIPLE_KEY}", "error": "not_an_object"})
+            else:
+                target = model["slo"].get(slo_def.IDLE_MULTIPLE_KEY)
+                if not isinstance(target, dict):
+                    target = model["slo"][slo_def.IDLE_MULTIPLE_KEY] = {}
+                _apply_section(target, idle_changes, _SLO_IDLE_MULTIPLE_BOUNDS, model_name,
+                               f"slo.{slo_def.IDLE_MULTIPLE_KEY}.", errors)
         top = {k: v for k, v in changes.items() if k in _TOP_BOUNDS}
         _apply_section(model, top, _TOP_BOUNDS, model_name, "", errors)
         _reject_locked(changes, model_name, errors)
@@ -225,6 +263,28 @@ def _apply_section(target: dict, changes: dict, bounds: dict, model: str, prefix
         coerced = _coerce(raw, spec, model, key, errors)
         if coerced is not None:
             target[field] = coerced
+
+
+def _apply_global(data: dict, changes: dict, errors: list) -> None:
+    """Registry-level tunables. ``slo_mode``: set it and drop the retired SLO switches
+    (``safescale.slo_mode``, ``models[].slo.ttft_slo_mode``) so one switch is left."""
+    for field, raw in changes.items():
+        spec = _GLOBAL_BOUNDS.get(field)
+        if spec is None:
+            errors.append({"model": "", "field": field, "error": "unknown_field"})
+            continue
+        value = _coerce(raw, spec, "", field, errors)
+        if value is None:
+            continue
+        data[field] = value
+        if field == slo_def.SLO_MODE_KEY:
+            safescale = data.get("safescale")
+            if isinstance(safescale, dict):
+                safescale.pop(slo_def.LEGACY_SAFESCALE_KEY, None)
+            for model in data.get("models") or []:
+                slo = (model or {}).get("slo")
+                if isinstance(slo, dict):
+                    slo.pop(slo_def.LEGACY_MODEL_KEY, None)
 
 
 def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list) -> None:
@@ -384,7 +444,8 @@ _SECTIONS = ("trs", "slo")
 def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
     """``["<model>.<path>=<value>", ...]`` -> the ``edits`` mapping of apply_and_validate.
 
-    <path> is ``trs.<f>``, ``slo.<f>``, ``alt_thresholds.<signal>.<f>``,
+    ``slo_mode=<mode>`` (no model prefix) is the registry-level SLO switch.
+    <path> is ``trs.<f>``, ``slo.<f>``, ``slo.idle_multiple.<f>``, ``alt_thresholds.<signal>.<f>``,
     ``alt_thresholds.<signal>.basis.{definition,window_ms,ema_tau_ms}`` or a top-level
     replica bound. The model is matched by the longest registry name that prefixes the
     key (names may contain dots). VALUE is parsed as YAML. Raises ParamValidationError
@@ -397,6 +458,9 @@ def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
         if not sep:
             errors.append({"model": "", "field": item, "error": "expected_MODEL.PATH=VALUE"})
             continue
+        if key in _GLOBAL_BOUNDS:
+            edits.setdefault(GLOBAL_EDITS, {})[key] = yaml.safe_load(raw)
+            continue
         model = max((m for m in model_names if key.startswith(f"{m}.")), key=len, default=None)
         if model is None:
             errors.append({"model": key.split(".", 1)[0], "field": key, "error": "unknown_model"})
@@ -406,6 +470,8 @@ def parse_sets(sets: list[str], model_names: list[str]) -> dict[str, Any]:
         changes = edits.setdefault(model, {})
         if len(path) == 2 and path[0] in _SECTIONS:
             changes.setdefault(path[0], {})[path[1]] = value
+        elif len(path) == 3 and path[0] == "slo" and path[1] == slo_def.IDLE_MULTIPLE_KEY:
+            changes.setdefault("slo", {}).setdefault(path[1], {})[path[2]] = value
         elif len(path) == 3 and path[0] == "alt_thresholds":
             changes.setdefault("alt_thresholds", {}).setdefault(path[1], {})[path[2]] = value
         elif len(path) == 4 and path[0] == "alt_thresholds" and path[2] == "basis":
@@ -426,9 +492,16 @@ def params_hash(registry_yaml: str) -> str:
 
 
 def changed_fields(old_yaml: str, new_yaml: str) -> list[tuple[str, str, Any, Any]]:
-    """(model, dotted field, old, new) for every per-model leaf that differs."""
+    """(model, dotted field, old, new) for every per-model leaf that differs, and the
+    registry-level SLO switch (model ``registry``: ``slo_mode``, ``safescale.slo_mode``)."""
     old = {m.get("name"): m for m in load_models(old_yaml)}
     out: list[tuple[str, str, Any, Any]] = []
+    raw_old, raw_new = yaml.safe_load(old_yaml) or {}, yaml.safe_load(new_yaml) or {}
+    for field, get in ((slo_def.SLO_MODE_KEY, lambda r: r.get(slo_def.SLO_MODE_KEY)),
+                       (f"safescale.{slo_def.LEGACY_SAFESCALE_KEY}",
+                        lambda r: (r.get("safescale") or {}).get(slo_def.LEGACY_SAFESCALE_KEY))):
+        if get(raw_old) != get(raw_new):
+            out.append(("registry", field, get(raw_old), get(raw_new)))
     for model in load_models(new_yaml):
         name = model.get("name")
         before, after = _leaves(old.get(name) or {}), _leaves(model)

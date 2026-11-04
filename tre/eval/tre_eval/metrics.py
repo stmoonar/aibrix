@@ -19,10 +19,10 @@ import numpy as np
 from .load import Arm, parse_binding
 
 try:
-    from tre_common.slo_labels import request_ttft_slo_ms
+    from tre_common import slo as slo_def
 except ImportError:  # the entry points (report.py, runner/score_pilot.py) put only tre/eval on the path
     sys.path.append(str(Path(__file__).resolve().parents[2] / "common"))
-    from tre_common.slo_labels import request_ttft_slo_ms
+    from tre_common import slo as slo_def
 
 E2E_CENSOR_MS = 149000.0  # diagnostic threshold only; strict completion determines truncation
 ALL = "ALL"
@@ -50,14 +50,30 @@ def pct(xs: Iterable[float | None], p: float) -> float | None:
 
 
 # ---------------------------------------------------------------- SLO thresholds
-def ttft_threshold_ms(slo: dict, input_tokens: float) -> float:
-    """TTFT SLO of one request: ``max(floor, k * (c + b * L))`` in slowdown mode (the one
-    definition, ``tre_common.slo_labels.request_ttft_slo_ms``), else ttft_p95_ms."""
-    if slo.get("ttft_slo_mode") == "slowdown":
-        return request_ttft_slo_ms(input_tokens, c_ms=slo["ttft_idle_c_ms"],
-                                   b_ms_per_token=slo["ttft_idle_b_ms_per_token"],
-                                   k=slo.get("ttft_slowdown_k", 5.0), floor_ms=slo.get("ttft_floor_ms", 500.0))
-    return slo["ttft_p95_ms"]
+def slo_mode_of(blocks: Iterable[dict]) -> str:
+    """The SLO mode of a set of ``models[].slo`` blocks without their registry (legacy
+    callers): the blocks' retired ``ttft_slo_mode`` (``tre_common.slo.resolve_slo_mode``).
+    No block names one -> ValueError: the caller passes the registry's ``slo_mode``
+    (2026-11-04: no silent default mode)."""
+    blocks = list(blocks)
+    if not any(isinstance(b, dict) and b.get(slo_def.LEGACY_MODEL_KEY) is not None for b in blocks):
+        raise ValueError(f"no SLO mode: none of the models[].slo blocks has {slo_def.LEGACY_MODEL_KEY}; "
+                         f"pass mode= (the registry's slo_mode, tre_common.slo.resolve_slo_mode)")
+    return slo_def.resolve_slo_mode({"models": [{"name": str(i), "slo": b} for i, b in enumerate(blocks)]}).mode
+
+
+def thresholds_of(slo: Any, mode: str | None = None) -> "slo_def.SloThresholds":
+    """``slo`` = ``tre_common.slo.SloThresholds`` (returned as is) or a ``models[].slo``
+    block judged under ``mode`` (default: :func:`slo_mode_of` the block, which refuses a
+    block without the retired ``ttft_slo_mode``)."""
+    if isinstance(slo, slo_def.SloThresholds):
+        return slo
+    return slo_def.slo_thresholds(slo, mode or slo_mode_of([slo]))
+
+
+def ttft_threshold_ms(slo: Any, input_tokens: float, mode: str | None = None) -> float:
+    """TTFT SLO of one request (``tre_common.slo``, the one definition)."""
+    return thresholds_of(slo, mode).ttft_ms(input_tokens)
 
 
 def completion_status(r: dict) -> str:
@@ -76,23 +92,27 @@ def completion_status(r: dict) -> str:
     return "failed"
 
 
-def score_request(r: dict, slo: dict) -> dict:
-    """Per-request scored record (times in ms). V_req = not strictly complete or TTFT>thr or TPOT>tpot_p95."""
+def score_request(r: dict, slo: Any, mode: str | None = None, e2e_slo_ms: float | None = None) -> dict:
+    """Per-request scored record (times in ms). V_req = not strictly complete or TTFT > TTFT_slo(L)
+    or TPOT > TPOT_slo (``tre_common.slo.judge_request``). ``slo`` = a ``models[].slo`` block
+    (judged under ``mode``) or ``tre_common.slo.SloThresholds``; ``v_e2e`` (diagnostic) uses the
+    block's ``e2e_p95_ms`` (or ``e2e_slo_ms``)."""
     L = r.get("input_tokens") or 0
     completion = completion_status(r)
     ok = completion == "complete"
     ttft = r["ttft"] * 1000 if r.get("ttft") is not None else None
     e2e = r["e2e_latency"] * 1000 if r.get("e2e_latency") is not None else None
     out = r.get("output_tokens") or 0
-    tpot = (e2e - ttft) / (out - 1) if (ok and ttft is not None and e2e is not None and out > 1) else None
-    thr = ttft_threshold_ms(slo, L)
-    v_tt = ttft is not None and ttft > thr
-    v_tp = tpot is not None and tpot > slo["tpot_p95_ms"]
-    v_e2e = e2e is not None and e2e > slo["e2e_p95_ms"]
+    verdict = slo_def.judge_request(thresholds_of(slo, mode), completed=ok, prompt_tokens=L, ttft_ms=ttft,
+                                    e2e_ms=e2e, output_tokens=out)
+    tpot, thr, v_tt, v_tp = verdict.tpot_ms, verdict.ttft_slo_ms, verdict.v_ttft, verdict.v_tpot
+    if e2e_slo_ms is None and isinstance(slo, dict):
+        e2e_slo_ms = slo.get("e2e_p95_ms")
+    v_e2e = e2e is not None and e2e_slo_ms is not None and e2e > float(e2e_slo_ms)
     # Duration alone cannot prove truncation. A normal long completion remains complete.
     censored = completion == "truncated"
     long_e2e = e2e is not None and e2e >= E2E_CENSOR_MS
-    viol = (not ok) or v_tt or v_tp
+    viol = verdict.violated
     return {"ok": ok, "completion": completion, "long_e2e": long_e2e, "ttft_ms": ttft, "tpot_ms": tpot, "e2e_ms": e2e, "out": out, "in": L,
             "ttft_thr_ms": thr, "v_ttft": v_tt, "v_tpot": v_tp, "v_e2e": v_e2e, "censored": censored,
             "viol": viol, "viol_with_e2e": viol or v_e2e,
@@ -100,14 +120,20 @@ def score_request(r: dict, slo: dict) -> dict:
             "http_502": (r.get("http_status") == 502 or "502" in str(r.get("error_message") or ""))}
 
 
-def score_requests(rows: list[dict], slo_by_model: dict[str, dict], trim_s: float = 30.0,
-                   max_tok: dict[str, Any] | None = None, t_ref: float | None = None) -> tuple[list[dict], dict]:
+def score_requests(rows: list[dict], slo_by_model: dict[str, Any], trim_s: float = 30.0,
+                   max_tok: dict[str, Any] | None = None, t_ref: float | None = None,
+                   mode: str | None = None) -> tuple[list[dict], dict]:
     """Score every client row. Returns (records, summary_by_model) with summary keys == score_pilot's
     plus extras (``*_mean_ms``, ``*_p90_ms``, ``*_p999_ms``, ``*_max_ms``, v1-basis TPOT, goodput).
 
-    ``t_ref`` (epoch s) is t = 0 for the records' ``t_send`` / ``t_end`` (default: first send).
+    ``slo_by_model``: model -> ``models[].slo`` block of the run's registry, judged under ``mode``
+    (the registry's ``slo_mode``, ``tre_common.slo.resolve_slo_mode``; None = :func:`slo_mode_of`
+    the blocks, the legacy rule - a ValueError when no block names a mode). ``t_ref`` (epoch s) is t = 0 for the records' ``t_send`` /
+    ``t_end`` (default: first send).
     """
     max_tok = max_tok or {}
+    blocks = [b for b in slo_by_model.values() if isinstance(b, dict)]
+    mode = mode or (slo_mode_of(blocks) if blocks else None)
     starts = [r["start_time"] for r in rows if r.get("start_time")]
     t_first = min(starts) if starts else 0.0
     t_ref = t_first if t_ref is None else t_ref
@@ -134,7 +160,7 @@ def score_requests(rows: list[dict], slo_by_model: dict[str, dict], trim_s: floa
         if model not in slo_by_model:
             recs.append({**base, "trimmed": False, "unscored": True})
             continue
-        s = score_request(r, slo_by_model[model])
+        s = score_request(r, slo_by_model[model], mode)
         mt = max_tok.get(r.get("request_id"))
         rec = {**base, "trimmed": False, **s, "max_tokens": mt}
         recs.append(rec)

@@ -221,7 +221,6 @@ class DecisionLoop:
                 incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
                 signal_state=self._signal_state,
                 suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", False),
-                disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                 prof=self._prof,
                 loop=loop_name,
                 # B8: controller mode, read per decision (ObserveModeGate, cached).

@@ -73,7 +73,8 @@ def test_the_label_definition_names_its_source() -> None:
 # ---------------------------------------------------------- the merged label (2026-09-23)
 
 PRIMARY = slo_labels.LabelDefinition(
-    500.0, 75.0, ttft_slo_mode="slowdown", ttft_idle_c_ms=36.4, ttft_idle_b_ms_per_token=0.0527,
+    500.0, 75.0, ttft_slo_mode="slowdown", ttft_slowdown_k=5.0, ttft_floor_ms=500.0,
+    ttft_idle_c_ms=36.4, ttft_idle_b_ms_per_token=0.0527,
 )
 
 
@@ -161,10 +162,33 @@ def test_the_cli_builds_the_registry_primary_and_its_arms(tmp_path) -> None:
     ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
     ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
     slo_labels.add_label_arguments(ap, include_fixed=False)
-    args = ap.parse_args(["--label-registry", str(registry)])
+    default = slo_labels.label_def_from_args(ap.parse_args(["--label-registry", str(registry)]), "dsqwen-7b")
+    assert default.ttft_slo_mode == "fixed"  # no flag: the registry's slo_mode
+    args = ap.parse_args(["--label-registry", str(registry), "--ttft-slo-mode", "slowdown"])
     primary = slo_labels.label_def_from_args(args, "dsqwen-7b")
     assert primary.slowdown and primary.min_completed_requests == 20
     assert (primary.ttft_slowdown_k, primary.ttft_floor_ms) == (5.0, 500.0)
     again = ap.parse_args(["--label-registry", str(registry), *slo_labels.label_mode_cli_args(primary)])
     assert slo_labels.label_def_from_args(again, "dsqwen-7b") == primary
     assert set(slo_labels.resolve_arms(primary)) == set(slo_labels.ARM_COLUMNS)
+
+
+def test_no_mode_and_no_registry_switch_is_refused_not_slowdown() -> None:
+    """S2 (review 2026-11-04): the label's default mode is the registry's slo_mode; a registry view
+    without one (and no explicit mode) is refused - no silent slowdown."""
+    class NoSwitch:
+        def model(self, name):
+            raise KeyError(name)
+
+    with pytest.raises(SystemExit, match="no SLO mode"):
+        slo_labels.label_def_for_model("m", registry=NoSwitch(), ttft_p95_ms=500.0, tpot_p95_ms=75.0)
+
+
+def test_tools_compared_with_a_frozen_record_require_the_mode() -> None:
+    import argparse
+
+    p = argparse.ArgumentParser()
+    slo_labels.add_label_arguments(p, require_mode=True)
+    with pytest.raises(SystemExit):
+        p.parse_args([])
+    assert p.parse_args(["--ttft-slo-mode", "slowdown"]).ttft_slo_mode == "slowdown"

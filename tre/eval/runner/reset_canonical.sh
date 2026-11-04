@@ -4,7 +4,7 @@
 #   run mode observe/active; decision source NONE (0 APA CRs, baseline scaler at 0 replicas, no
 #   baseline owner lock); no hidden binding; awake set == $BASELINE (runner.env); engines idle;
 #   (2026-10-08) controller ablation switches false (unset counts as false); (2026-10-28) TRE_SIGNAL_SOURCE
-#   unset (= zm), TRE_DISABLE_ETA_GATE false; (2026-10-28) no sensitivity-arm registry perturbation in effect
+#   unset (= zm) (2026-11-02: TRE_DISABLE_ETA_GATE removed); (2026-10-28) no sensitivity-arm registry perturbation in effect
 #   (arm_registry.py: annotation tre.dev/arm-registry-restore on the registry ConfigMap; restored through
 #   params_set.py --apply --restart, SM then controller, backups in $ARM_REGISTRY_BACKUP_DIR, which campaign.py
 #   sets to <results_root>/_registry/backups; else $TRE_BACKUP_ROOT/arm-registry).
@@ -44,22 +44,30 @@ mode_set() { bash "$TRE/deploy/scripts/set_run_mode.sh" "$1" "$2" >/dev/null; lo
 n_apa() { kubectl -n "$APA_NS" get podautoscalers.autoscaling.aibrix.ai -o name 2>/dev/null | grep -c . || true; }
 bl_replicas() { kubectl -n "$BL_NS" get deploy "$BL_DEPLOY" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0; }
 bl_owner() { kubectl -n "$TRE_NS" exec "deploy/$REDIS_DEPLOY" -- redis-cli --raw GET "$BL_OWNER_KEY" 2>/dev/null | tr -d '\r' || true; }
-CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_DISABLE_ETA_GATE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"   # = run_arm_pilot.sh note 14
+CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"   # = run_arm_pilot.sh note 14
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_env_get() { kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
 CTL_ENV_KEEP="${CTL_ENV_KEEP:-0}"
+# (2026-11-02) keys removed from the controller (= run_arm_pilot.sh CTL_REMOVED_KEYS): any value on the Deployment
+# is a deviation and is unset (a stale "true" would crash-loop the controller, a stale "false" would linger)
+CTL_REMOVED_KEYS="TRE_DISABLE_ETA_GATE"
+ctl_env_has() { [ -n "$(kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].name}")" ]; }
 # settings off their default (unset = default; a switch read as the controller reads it, lib_env.sh ctl_bool:
-# the overlay's "0" is false): "K=v" lines; none with CTL_ENV_KEEP=1 (not checked, not reset)
+# the overlay's "0" is false): "K=v" lines; a removed key still set: "K=v(removed)"; none with CTL_ENV_KEEP=1
+# (not checked, not reset - the next arm's run_arm_pilot.sh ctl_env_set unsets a removed key too)
 ctl_off_default() {
   local k v d
   for k in $CTL_ENV_KEYS; do
     d=$(ctl_default "$k"); v=$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]')
     if [ "$d" = false ]; then [ "$(ctl_bool "$v")" = false ] || echo "$k=$v"; else [ "${v:-$d}" = "$d" ] || echo "$k=$v"; fi
   done
+  for k in $CTL_REMOVED_KEYS; do if ctl_env_has "$k"; then echo "$k=$(ctl_env_get "$k")(removed)"; fi; done
 }
 ctl_not_false() { [ "$CTL_ENV_KEEP" = 1 ] || ctl_off_default; }
-# their reset arguments: a switch -> K=false, the scope -> K- (unset)
-ctl_reset_args() { local kv k; for kv in $(ctl_not_false); do k=${kv%%=*}; if [ "$(ctl_default "$k")" = false ]; then echo "$k=false"; else echo "$k-"; fi; done; }
+# their reset arguments: a switch -> K=false, the scope and a removed key -> K- (unset)
+ctl_reset_args() { local kv k; for kv in $(ctl_not_false); do k=${kv%%=*}
+  case " $CTL_REMOVED_KEYS " in *" $k "*) echo "$k-"; continue ;; esac
+  if [ "$(ctl_default "$k")" = false ]; then echo "$k=false"; else echo "$k-"; fi; done; }
 AREG() { TRE_DIR="$TRE" TRE_NS="$TRE_NS" CONTROLLER_DEPLOY="$CONTROLLER_DEPLOY" SM_DEPLOY="${SM_DEPLOY:-tre-v2-service-manager}" \
            python3 "$RUNNER_DIR/arm_registry.py" "$@"; }
 ARM_TOOL() { env PYTHONPATH="$TRE/common:$TRE/deploy:$TRE/baselines" python3 -m tre_baselines.tools.arm "$@" \

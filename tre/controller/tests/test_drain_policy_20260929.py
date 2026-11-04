@@ -33,7 +33,7 @@ def _plan():
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0),
     ]
     contexts = {
         "critical": {"assigned_replicas": 2, "routable_pods": 2},
@@ -85,7 +85,7 @@ def test_add_scale_action_passes_sleep_path_and_budget_only_for_a_shrink():
 
 
 def test_idle_proactive_immediate_donor_dispatches_on_the_urgent_path():
-    classifications = [_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
+    classifications = [_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0)]
     plan = build_plan(
         model_contexts={"idle": {"assigned_replicas": 4, "routable_pods": 4, "Y_m": 0.0, "Q": 0.0}},
         classifications=classifications,

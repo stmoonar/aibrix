@@ -1,0 +1,193 @@
+{
+ "base": "/data/nfs_shared_data/xxy/analysis-tss-params-20261030/win10/registry/registry-win10.yaml",
+ "candidate": "/data/nfs_shared_data/xxy/refit-fixedslo-w10-20261031/registry-candidate/registry-win10-refit.yaml",
+ "standard": "/data/nfs_shared_data/xxy/analysis-tss-params-20261030/win10/registry/live-registry.yaml",
+ "sets": [
+  "dsqwen-7b.trs.theta_m=652.7",
+  "dsqwen-7b.trs.tau_crit=0.56",
+  "dsqwen-7b.trs.tau_high=1.27",
+  "dsllama-8b.trs.theta_m=650.9",
+  "dsllama-8b.trs.tau_crit=0.39",
+  "dsllama-8b.trs.tau_high=1.59",
+  "dsqwen-14b.trs.theta_m=591.6",
+  "dsqwen-14b.trs.tau_crit=0.6",
+  "dsqwen-14b.trs.tau_high=1.67"
+ ],
+ "structural": [
+  "safescale.slo_mode: labels -> fixed"
+ ],
+ "changes_vs_win10": [
+  [
+   "dsqwen-7b",
+   "trs.tau_crit",
+   "0.52",
+   "0.56"
+  ],
+  [
+   "dsqwen-7b",
+   "trs.tau_high",
+   "1.645",
+   "1.27"
+  ],
+  [
+   "dsqwen-7b",
+   "trs.theta_m",
+   "302.843454",
+   "652.7"
+  ],
+  [
+   "dsllama-8b",
+   "trs.tau_crit",
+   "0.66",
+   "0.39"
+  ],
+  [
+   "dsllama-8b",
+   "trs.tau_high",
+   "1.825",
+   "1.59"
+  ],
+  [
+   "dsllama-8b",
+   "trs.theta_m",
+   "230.309626",
+   "650.9"
+  ],
+  [
+   "dsqwen-14b",
+   "trs.tau_high",
+   "2.0",
+   "1.67"
+  ],
+  [
+   "dsqwen-14b",
+   "trs.theta_m",
+   "233.564481",
+   "591.6"
+  ]
+ ],
+ "changes_vs_standard": [
+  [
+   "dsqwen-7b",
+   "trs.ema_tau_ms",
+   "10000",
+   "0.0"
+  ],
+  [
+   "dsqwen-7b",
+   "trs.tau_crit",
+   "0.52",
+   "0.56"
+  ],
+  [
+   "dsqwen-7b",
+   "trs.tau_high",
+   "1.645",
+   "1.27"
+  ],
+  [
+   "dsqwen-7b",
+   "trs.theta_m",
+   "605.6869086920817",
+   "652.7"
+  ],
+  [
+   "dsqwen-7b",
+   "trs.theta_window_ms",
+   "20000",
+   "10000"
+  ],
+  [
+   "dsllama-8b",
+   "trs.ema_tau_ms",
+   "10000",
+   "0.0"
+  ],
+  [
+   "dsllama-8b",
+   "trs.tau_crit",
+   "0.66",
+   "0.39"
+  ],
+  [
+   "dsllama-8b",
+   "trs.tau_high",
+   "1.825",
+   "1.59"
+  ],
+  [
+   "dsllama-8b",
+   "trs.theta_m",
+   "460.61925201720703",
+   "650.9"
+  ],
+  [
+   "dsllama-8b",
+   "trs.theta_window_ms",
+   "20000",
+   "10000"
+  ],
+  [
+   "dsqwen-14b",
+   "trs.ema_tau_ms",
+   "10000",
+   "0.0"
+  ],
+  [
+   "dsqwen-14b",
+   "trs.tau_high",
+   "2.0",
+   "1.67"
+  ],
+  [
+   "dsqwen-14b",
+   "trs.theta_m",
+   "467.12896116050626",
+   "591.6"
+  ],
+  [
+   "dsqwen-14b",
+   "trs.theta_window_ms",
+   "20000",
+   "10000"
+  ]
+ ],
+ "registry_id_base": "5028a1209a5fe38d",
+ "registry_id_candidate": "f9544af50501cb85",
+ "registry_id_standard": "af9aef4701804743",
+ "registry_id_new": "b1eb8f0c7593a86c",
+ "params_hash_base": "5c5c36277c346651",
+ "params_hash_standard": "4c40a90cb2abc1d5",
+ "params_hash_new": "c58ede0c9375b119",
+ "controller_check": {
+  "metrics_window_ms": 10000,
+  "slo_mode": "fixed",
+  "safescale_scope": "healthy_and_shrink",
+  "basis_errors_at_20000": 3,
+  "thresholds": {
+   "dsqwen-7b": {
+    "mode": "fixed",
+    "ttft_ms": 500.0,
+    "tpot_ms": 75.0,
+    "mean_prompt_tokens": 3000.0,
+    "source": "registry"
+   },
+   "dsllama-8b": {
+    "mode": "fixed",
+    "ttft_ms": 500.0,
+    "tpot_ms": 75.0,
+    "mean_prompt_tokens": 3000.0,
+    "source": "registry"
+   },
+   "dsqwen-14b": {
+    "mode": "fixed",
+    "ttft_ms": 500.0,
+    "tpot_ms": 75.0,
+    "mean_prompt_tokens": 3000.0,
+    "source": "registry"
+   }
+  }
+ },
+ "tre_commit": "9f2856a1",
+ "applied": false
+}

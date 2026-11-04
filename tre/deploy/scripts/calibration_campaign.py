@@ -192,7 +192,7 @@ SECONDARY_FIT_TOLERANCE = 0.05
 #: 2026-09-21 6.11 D6', max(500 ms, 5 * idle TTFT(L)), TPOT 75 ms. ``--fit-ttft-slo-mode
 #: fixed`` gives the 500/75 ms comparison column, ``--fit-ttft-slowdown-k 3
 #: --fit-ttft-floor-ms 150`` the D6 ablation arm; k/floor default to the registry profile.
-DEFAULT_FIT_TTFT_SLO_MODE = "slowdown"
+DEFAULT_FIT_TTFT_SLO_MODE = slo_labels.D6_PRIME_MODE
 
 
 def utc_iso() -> str:
@@ -599,7 +599,7 @@ def primary_label(args, model: str) -> slo_labels.LabelDefinition:
         model,
         ttft_p95_ms=args.ttft_slo_ms,
         tpot_p95_ms=args.tpot_slo_ms,
-        mode=getattr(args, "fit_ttft_slo_mode", None),
+        mode=getattr(args, "fit_ttft_slo_mode", None) or DEFAULT_FIT_TTFT_SLO_MODE,
         k=getattr(args, "fit_ttft_slowdown_k", None),
         floor=getattr(args, "fit_ttft_floor_ms", None),
         min_completed_requests=getattr(
@@ -2303,24 +2303,31 @@ def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optio
         ) + "\n",
         encoding="utf-8",
     )
+    cut: dict = {}
     try:
         from scripts import calibration_dataset
 
-        built = calibration_dataset.build_dataset(out_dir)
+        # The windows are named here, not left to the module default (which changes: 30 s, 20 s, 10 s), and they are
+        # the ones a rebuild passes again (the hint below; the datasets record them in manifest.json -> windowing).
+        cut = {"window_ms": calibration_dataset.DEFAULT_WINDOW_MS, "step_ms": calibration_dataset.DEFAULT_STEP_MS}
+        built = calibration_dataset.build_dataset(out_dir, overrides=cut)
         print(f"standard dataset: {built}")
         attribution = planned_attribution(out_dir)
         if attribution != slo_labels.ATTRIBUTION_COMPLETION:
             # the run was judged on a label v2: its own dataset too, next to the v1 one
-            hybrid = calibration_dataset.build_dataset(out_dir, overrides={"attribution": attribution})
+            hybrid = calibration_dataset.build_dataset(out_dir, overrides={**cut, "attribution": attribution})
             print(f"standard dataset ({attribution} attribution): {hybrid}")
         parent = out_dir.parent
         siblings = calibration_dataset.campaign_dirs(parent)
         if len(siblings) > 1 and all((d / CAMPAIGN_STATUS_FILE).exists() for d in siblings):
-            merged = calibration_dataset.build_dataset(parent)
+            # the merge cuts what its campaigns were cut with (an earlier campaign of a resumed run may have another window)
+            window, step = calibration_dataset.recorded_windowing(parent)
+            merged = calibration_dataset.build_dataset(parent, overrides={"window_ms": window, "step_ms": step})
             print(f"every campaign under {parent} has finished; merged dataset: {merged}")
     except Exception as exc:  # noqa: BLE001 - see docstring
         print(f"WARNING: building the standard dataset failed ({exc!r}); rebuild it with "
-              f"python -m scripts.calibration_dataset {out_dir}")
+              f"python -m scripts.calibration_dataset {out_dir}"
+              + (f" --window-ms {cut['window_ms']} --step-ms {cut['step_ms']}" if cut else ""))
 
 
 def run_campaign(args) -> int:
@@ -2594,15 +2601,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--instant-sample-ms", type=int, default=1000)
     ap.add_argument("--cooldown-s", type=float, default=DEFAULT_COOLDOWN_S)
     ap.add_argument("--step-transient-s", type=float, default=DEFAULT_STEP_TRANSIENT_S)
-    ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
-    ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
+    ap.add_argument("--ttft-slo-ms", type=float, default=None, help="default: the registry's slo.ttft_p95_ms")
+    ap.add_argument("--tpot-slo-ms", type=float, default=None, help="default: the registry's slo.tpot_p95_ms")
     ap.add_argument("--fit-ttft-slo-mode", choices=["fixed", "slowdown"], default=DEFAULT_FIT_TTFT_SLO_MODE,
                     help="TTFT SLO of the fit label: slowdown = max(floor, k*(c_m+b_m*L)) with the "
                          "registry's idle TTFT fit (plan 6.9h); fixed = --ttft-slo-ms")
     ap.add_argument("--fit-ttft-slowdown-k", type=float, default=None,
-                    help="default: registry slo.ttft_slowdown_k (5, D6'); 3 = the D6 ablation arm")
+                    help="default: registry slo.ttft_slowdown_k (D6'); 3 = the D6 ablation arm")
     ap.add_argument("--fit-ttft-floor-ms", type=float, default=None,
-                    help="default: registry slo.ttft_floor_ms (500 ms, D6'); 150 = the D6 ablation arm")
+                    help="default: registry slo.ttft_floor_ms (D6'); 150 = the D6 ablation arm")
     ap.add_argument("--fit-min-completed-requests", type=int, default=20)
     ap.add_argument("--fit-label-attribution", choices=list(slo_labels.ATTRIBUTIONS), default=None,
                     help="request-to-window attribution of the fit / probe label: completion "
@@ -2841,6 +2848,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    slo_labels.fill_fixed_slo_args(args, [m for m in args.models.split(",") if m], registry=args.registry)
     if args.gateway_url:
         try:
             corpus_record.check_gateway_url(args.gateway_url, args.api)

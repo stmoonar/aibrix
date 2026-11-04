@@ -23,7 +23,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.metrics_refresh_interval_s == 5.0
     assert config.rescue_interval_s == 5.0
     assert config.fairness_interval_s == 10.0
-    assert config.metrics_window_ms == 20_000  # 2026-10-28: 20 s with the step-counter numerator
+    assert config.metrics_window_ms == 10_000  # 2026-11-03: 10 s (20 s from 2026-10-28)
     assert config.metrics_window_mode == "sliding"
     # 2026-10-25: the gateway's two doc periods (instant 0.5 s, evidence 2 s); the read
     # offset defaults to min(2 s, evidence / 2).
@@ -41,7 +41,6 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.incomplete_policy == "drop_model"
     assert config.ablation_disable_slow_loop is False
     assert config.ablation_disable_safescale is False
-    assert config.disable_eta_gate is False
     # v1/paper alignment A2: the receiver-less HIGH proactive SafeScale shrink is live.
     assert config.safescale_suppress_hot_proactive is False
     # Timer cleanup (2026-10-02): the band dwell, the fixed rollback backoff and the
@@ -102,7 +101,6 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_INCOMPLETE_POLICY": "drop_all",
             "TRE_ABLATION_DISABLE_SLOW_LOOP": "1",
             "TRE_ABLATION_DISABLE_SAFESCALE": "yes",
-            "TRE_DISABLE_ETA_GATE": "true",
         }
     )
 
@@ -123,7 +121,6 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.incomplete_policy == "drop_all"
     assert config.ablation_disable_slow_loop is True
     assert config.ablation_disable_safescale is True
-    assert config.disable_eta_gate is True
 
 
 FITTED_ALT_SOURCES = ["queue_len", "ttft_mean", "tpot_mean", "kv_usage", "decode_tps", "prefill_tps"]
@@ -139,8 +136,8 @@ def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
     registry = yaml.safe_load(repo.read_text(encoding="utf-8"))
     entry = {"theta": 2.0, "direction": EXPECTED_SIGNAL_DIRECTIONS[source],
              "delta_crit": 0.1, "delta_high": 0.3,
-             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000,
-                       "ema_tau_ms": 10_000.0}, **fields}
+             "basis": {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000,
+                       "ema_tau_ms": 0.0}, **fields}
     for model in registry["models"]:
         model.setdefault("alt_thresholds", {})[source] = {k: v for k, v in entry.items() if v is not None}
     path = tmp_path / "registry.yaml"
@@ -150,29 +147,34 @@ def _registry_with_alt(tmp_path, source: str, **fields) -> Path:
 
 @pytest.mark.parametrize("source", ["zm", "latency_p95"])
 def test_config_accepts_unfitted_signal_sources(source: str) -> None:
-    env = {"TRE_SIGNAL_SOURCE": source}
-    if source != "zm":
-        env["TRE_DISABLE_ETA_GATE"] = "true"
-    assert ControllerConfig.from_env(env).signal_source == source
+    assert ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source}).signal_source == source
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
 def test_config_accepts_fitted_alt_source(tmp_path, source: str) -> None:
     path = _registry_with_alt(tmp_path, source)
-    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
-                                     "TRE_DISABLE_ETA_GATE": "true"})
-    assert cfg.signal_source == source and cfg.disable_eta_gate is True
+    cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
+    assert cfg.signal_source == source
 
 
-@pytest.mark.parametrize("source", [*FITTED_ALT_SOURCES, "latency_p95"])
-def test_alt_source_refuses_to_start_with_the_eta_gate_on(tmp_path, source: str) -> None:
-    """Plan section 8: only the signal changes on an alt arm - the eta gate is off there."""
-    path = _registry_with_alt(tmp_path, source) if source in FITTED_ALT_SOURCES else None
-    env = {"TRE_SIGNAL_SOURCE": source, **({"TRE_REGISTRY_PATH": str(path)} if path else {})}
-    with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires TRE_DISABLE_ETA_GATE=true"):
-        ControllerConfig.from_env(env)
-    with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE"):
-        ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "false"})
+@pytest.mark.parametrize("source", ["zm", "queue_len"])
+def test_the_removed_eta_gate_switch_fails_closed_on_true_and_is_ignored_on_false(tmp_path, source: str, caplog) -> None:
+    """2026-11-02: eta and TRE_DISABLE_ETA_GATE were removed. "true" asked for the removed name
+    order and refuses to start; "false" (old TSS-arm specs, a runner reset) starts with one
+    warning; anything else is refused like any boolean switch. An alt signal starts without
+    the switch (above)."""
+    env = {"TRE_SIGNAL_SOURCE": source}
+    if source != "zm":
+        env["TRE_REGISTRY_PATH"] = str(_registry_with_alt(tmp_path, source))
+    for value in ("true", "1"):
+        with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE was removed"):
+            ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": value})
+    with pytest.raises(ValueError, match="TRE_DISABLE_ETA_GATE must be a boolean value"):
+        ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "maybe"})
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert ControllerConfig.from_env({**env, "TRE_DISABLE_ETA_GATE": "false"}).signal_source == source
+    assert [r for r in caplog.records if "TRE_DISABLE_ETA_GATE" in r.getMessage() and "ignored" in r.getMessage()]
 
 
 @pytest.mark.parametrize("source", FITTED_ALT_SOURCES)
@@ -196,26 +198,31 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
     from tre_common.alt_signals import ALT_SIGNAL_DEFINITIONS
 
     if basis == "window":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000, "ema_tau_ms": 10_000.0}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 30_000, "ema_tau_ms": 0.0}
     elif basis == "tau":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000, "ema_tau_ms": 0.0}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000, "ema_tau_ms": 10_000.0}
     elif basis == "no_tau":
-        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 20_000}
+        basis = {"definition": ALT_SIGNAL_DEFINITIONS[source], "window_ms": 10_000}
     path = _registry_with_alt(tmp_path, source, basis=basis)
     with pytest.raises(ValueError, match="basis does not match.*dsqwen-7b"):
         ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)})
     # the same stamp is accepted when the controller window matches it
     if basis is not None and basis["window_ms"] == 30_000:
         cfg = ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path),
-                                         "TRE_METRICS_WINDOW_MS": "30000", "TRE_DISABLE_ETA_GATE": "true"})
+                                         "TRE_METRICS_WINDOW_MS": "30000"})
         assert cfg.signal_source == source
 
 
-@pytest.mark.parametrize("source", ["ttft_mean", "tpot_mean", "kv_usage"])
-def test_v1_alt_source_refuses_to_start_on_the_repo_registry(source: str) -> None:
-    """The repo registry carries no fitted theta for the v1 signals."""
-    with pytest.raises(ValueError, match=f"TRE_SIGNAL_SOURCE={source} requires fitted"):
-        ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source})
+@pytest.mark.parametrize("source", ["queue_len", "ttft_mean", "tpot_mean", "kv_usage"])
+def test_alt_thresholds_of_the_repo_registry_are_fitted_on_the_default_window(source: str) -> None:
+    """Since 2026-11-03 the repo registry carries the live fitted alt thresholds (basis: 10 s window, EMA off): they fit the
+    default window of the controller and no other."""
+    env = {"TRE_SIGNAL_SOURCE": source,
+           "TRE_REGISTRY_PATH": str(Path(__file__).parents[2] / "deploy" / "registry.yaml")}
+    assert ControllerConfig.from_env({}).metrics_window_ms == 10_000
+    assert ControllerConfig.from_env(env).signal_source == source              # accepted at the default window
+    with pytest.raises(ValueError, match="basis does not match"):
+        ControllerConfig.from_env({**env, "TRE_METRICS_WINDOW_MS": "20000"})
 
 
 def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:
@@ -256,8 +263,6 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
         {
             "TRE_RUNTIME_STATE_DIR": "/var/lib/aibrix/tre",
             "PROACTIVE_RELEASE_MIN_TRS": "3000",
-            "SAFE_SCALE_TTFT_P95_SLO_MS": "1300",
-            "SAFE_SCALE_TPOT_P95_SLO_MS": "120",
             "SAFE_SCALE_WINDOW_FLOOR_MS": "90000",
             "SAFE_SCALE_E2E_MULTIPLIER": "3.5",
             "SAFE_SCALE_HQ": "0.5",
@@ -268,8 +273,6 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
 
     assert config.runtime_state_dir == "/var/lib/aibrix/tre"
     assert config.proactive_release_min_trs == 3000.0
-    assert config.safescale.ttft_p95_slo_ms == 1300.0
-    assert config.safescale.tpot_p95_slo_ms == 120.0
     assert config.safescale.min_window_ms == 90_000.0
     assert config.safescale.e2e_multiplier == 3.5
     assert config.safescale.hq == 0.5
@@ -286,6 +289,13 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
     assert ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "tumbling"}).metrics_window_mode == "tumbling"
     with pytest.raises(ValueError):
         ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
+
+
+@pytest.mark.parametrize("key", ["SAFE_SCALE_TTFT_P95_SLO_MS", "SAFE_SCALE_TPOT_P95_SLO_MS"])
+def test_removed_safescale_threshold_overrides_are_refused(key: str) -> None:
+    assert ControllerConfig.from_env({key: ""}).safescale is not None  # empty = unset
+    with pytest.raises(ValueError, match="was removed"):
+        ControllerConfig.from_env({key: "700"})
 
 
 def test_safescale_window_defaults_and_env_parsing() -> None:

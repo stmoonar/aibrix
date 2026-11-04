@@ -1,0 +1,588 @@
+# unified diffs original -> repo copy, generated when the copies were made (identical files are not listed)
+
+--- original/campaign-bl-rep2-20261103.yaml
++++ repo/tre/eval/runner/campaigns/campaign-bl-rep2-20261103.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -46 +51 @@
+-#   bash /data/nfs_shared_data/xxy/campaign-bl-rep2-20261103/run_campaign-bl-rep2-20261103.sh --check   (read-only guards)
++#   bash ${CAMPAIGN_DATA_ROOT}/campaign-bl-rep2-20261103/run_campaign-bl-rep2-20261103.sh --check   (read-only guards)
+@@ -50 +55 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-bl-rep2-20261103-run
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-rep2-20261103-run
+@@ -82 +87 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+@@ -118 +123 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+@@ -121 +126 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+@@ -124 +129 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+@@ -127 +132 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+@@ -130 +135 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+@@ -133 +138 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-20261030/Real_conv_2023_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-20261030/Real_conv_2023_slice_a_tok70/seed1
+@@ -136 +141 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Real_code_2024_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Real_code_2024_slice_a_tok70/seed1
+
+--- original/campaign-bl-rep2-r3e-20261103.yaml
++++ repo/tre/eval/runner/campaigns/campaign-bl-rep2-r3e-20261103.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -46 +51 @@
+-#   bash /data/nfs_shared_data/xxy/campaign-bl-rep2-20261103/run_campaign-bl-rep2-20261103.sh --check   (read-only guards)
++#   bash ${CAMPAIGN_DATA_ROOT}/campaign-bl-rep2-20261103/run_campaign-bl-rep2-20261103.sh --check   (read-only guards)
+@@ -50 +55 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-bl-rep2-r3e-20261103-run
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-bl-rep2-r3e-20261103-run
+@@ -82 +87 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+@@ -118 +123 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+@@ -121 +126 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+@@ -124 +129 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+@@ -127 +132 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+@@ -130 +135 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+@@ -133 +138 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+@@ -136 +141 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+
+--- original/campaign-tre-rerun-r3e-20261103.yaml
++++ repo/tre/eval/runner/campaigns/campaign-tre-rerun-r3e-20261103.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -76 +81 @@
+-#   bash /data/nfs_shared_data/xxy/campaign-tre-rerun-draft-20261103/run_campaign-tre-rerun-20261103.sh --check   (read-only guards)
++#   bash ${CAMPAIGN_DATA_ROOT}/campaign-tre-rerun-draft-20261103/run_campaign-tre-rerun-20261103.sh --check   (read-only guards)
+@@ -80 +85 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-tre-rerun-r3e-20261103-run
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-tre-rerun-r3e-20261103-run
+@@ -127 +132 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+@@ -162 +167 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+@@ -165 +170 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+@@ -168 +173 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+@@ -171 +176 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+@@ -174 +179 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+@@ -177 +182 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+@@ -180 +185 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+
+--- original/campaign-icse-r3c-full-D-20261101.yaml
++++ repo/tre/eval/runner/campaigns/campaign-icse-r3c-full-D-20261101.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -12,2 +17,2 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-icse-r3c-full-D-20261101-run
+-trace_root: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-r3c-full-D-20261101-run
++trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101
+@@ -56 +61 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+
+--- original/campaign-icse-r3c-full-F-20261101.yaml
++++ repo/tre/eval/runner/campaigns/campaign-icse-r3c-full-F-20261101.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -8,2 +13,2 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-icse-r3c-full-F-20261101-run
+-trace_root: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-r3c-full-F-20261101-run
++trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101
+@@ -52 +57 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+
+--- original/campaign-icse-ktrace-20261031.yaml
++++ repo/tre/eval/runner/campaigns/campaign-icse-ktrace-20261031.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -28 +33 @@
+-#   tre/eval/runner/run_campaign.sh /data/nfs_shared_data/xxy/campaign-icse-ktrace-20261031/campaign-icse-ktrace-20261031.yaml --dry-run
++#   tre/eval/runner/run_campaign.sh ${CAMPAIGN_DATA_ROOT}/campaign-icse-ktrace-20261031/campaign-icse-ktrace-20261031.yaml --dry-run
+@@ -32,2 +37,2 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-icse-ktrace-20261031-run
+-trace_root: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-ktrace-20261031-run
++trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031
+@@ -76 +81 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+
+--- original/campaign-icse-ktrace-full-F-20261101.yaml
++++ repo/tre/eval/runner/campaigns/campaign-icse-ktrace-full-F-20261101.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -5,2 +10,2 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-icse-ktrace-full-F-20261101-run
+-trace_root: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-ktrace-full-F-20261101-run
++trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031
+@@ -49 +54 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+
+--- original/campaign-icse-r3e-full-20261101.yaml
++++ repo/tre/eval/runner/campaigns/campaign-icse-r3e-full-20261101.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -11,2 +16,2 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-icse-r3e-full-20261101-run
+-trace_root: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-icse-r3e-full-20261101-run
++trace_root: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101
+@@ -57 +62 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+
+--- original/run_campaign-bl-rep2-20261103.sh
++++ repo/tre/eval/runner/drivers/bl-rep2-20261103/run_campaign-bl-rep2-20261103.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -12 +14 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-bl-rep2-20261103 && setsid nohup bash run_campaign-bl-rep2-20261103.sh >> run_campaign-bl-rep2-20261103.out 2>&1 < /dev/null &
++#   cd $CAMPAIGN_DATA_ROOT/campaign-bl-rep2-20261103 && setsid nohup bash run_campaign-bl-rep2-20261103.sh >> run_campaign-bl-rep2-20261103.out 2>&1 < /dev/null &
+@@ -17 +19 @@
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-bl-rep2-20261103-run/STOP  (the runner stops after the
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-bl-rep2-20261103-run/STOP  (the runner stops after the
+@@ -21 +23 @@
+-#   python3 /data/nfs_shared_data/xxy/aibrix/tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/preserve
++#   python3 $T/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/preserve
+@@ -25,2 +27,3 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-bl-rep2-20261103
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-bl-rep2-20261103}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
+@@ -28 +31 @@
+-T=$X/aibrix/tre
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
+@@ -30 +33 @@
+-SPEC=$C/$NAME.yaml
++SPEC=$T/eval/runner/campaigns/$NAME.yaml
+@@ -33 +36 @@
+-REF=$C/registry-live-0ab5352747bdd70e.yaml   # registry of the first look (copy of the ConfigMap, 11-03 02:20)
++REF=$T/eval/registries/0ab5352747bdd70e.yaml   # registry of the first look (copy of the ConfigMap, 11-03 02:20)
+@@ -38,0 +42 @@
++[ "$CHECK" = 1 ] || mkdir -p "$C"            # [repo] --check writes nothing
+@@ -58 +62 @@
+-  log "driver exit rc=$rc; live registry $(python3 $C/registry_guard.py $REF --id 2>&1 | tail -1)"
++  log "driver exit rc=$rc; live registry $(python3 $HERE/registry_guard.py $REF --id 2>&1 | tail -1)"
+@@ -95,2 +99,2 @@
+-SHAOUT=$(cd / && nice -n 19 sha256sum -c --quiet "$C/$NAME.traces.sha256" 2>&1); SHARC=$?
+-if [ $SHARC = 0 ]; then log "ok   $(wc -l < $C/$NAME.traces.sha256) trace files match the sha256 of the first sample"
++SHAOUT=$(cd "$X" && nice -n 19 sha256sum -c --quiet "$HERE/$NAME.traces.sha256" 2>&1); SHARC=$?
++if [ $SHARC = 0 ]; then log "ok   $(wc -l < $HERE/$NAME.traces.sha256) trace files match the sha256 of the first sample"
+@@ -98 +102 @@
+-for d in $(awk '{print $2}' "$C/$NAME.traces.sha256" | xargs -n1 dirname); do
++for d in $(awk -v x="$X" '{print x "/" $2}' "$HERE/$NAME.traces.sha256" | xargs -n1 dirname); do
+@@ -107 +111 @@
+-RG=$(python3 $C/registry_guard.py "$REF" 2>&1); RGC=$?
++RG=$(python3 $HERE/registry_guard.py "$REF" 2>&1); RGC=$?
+@@ -111 +115 @@
+-CG=$(python3 $C/guard_cluster.py 2>&1); CGC=$?
++CG=$(python3 $HERE/guard_cluster.py 2>&1); CGC=$?
+@@ -139,2 +143,2 @@
+-    python3 $C/registry_guard.py "$REF" >/dev/null 2>&1; rc=$?
+-    [ $rc = 0 ] || log "WARNING: baseline-relevant registry part differs from the reference during the campaign (rc $rc): python3 $C/registry_guard.py $REF"
++    python3 $HERE/registry_guard.py "$REF" >/dev/null 2>&1; rc=$?
++    [ $rc = 0 ] || log "WARNING: baseline-relevant registry part differs from the reference during the campaign (rc $rc): python3 $HERE/registry_guard.py $REF"
+
+--- original/registry_guard.py
++++ repo/tre/eval/runner/drivers/bl-rep2-20261103/registry_guard.py
+@@ -1,0 +2 @@
++# [repo] Repo copy: only the fallback path to the tre/ tree changed (TRE_DIR still wins).
+@@ -43 +44 @@
+-        tre = os.environ.get("TRE_DIR") or os.path.join(here, "..", "aibrix", "tre")
++        tre = os.environ.get("TRE_DIR") or os.path.join(here, "..", "..", "..", "..")
+
+--- original/campaign-bl-rep2-20261103.traces.sha256
++++ repo/tre/eval/runner/drivers/bl-rep2-20261103/campaign-bl-rep2-20261103.traces.sha256
+@@ -1,7 +1,7 @@
+-574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1/traces_tre.effective.json
+-6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1/traces_tre.effective.json
+-91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1/traces_tre.effective.json
+-f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1/traces_tre.effective.json
+-5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1/traces_tre.effective.json
+-4f8ce83471ea39034b3b2d2aa677a56ea99e036854a734b936f30ecd20de8ca7  /data/nfs_shared_data/xxy/traces-icse-20261030/Real_conv_2023_slice_a_tok70/seed1/traces_tre.effective.json
+-b115e279de7c6eda4ac0c65fcd2bdfdac677a75b3ea24c0298202d23a35c4e72  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Real_code_2024_slice_a_tok70/seed1/traces_tre.effective.json
++574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf  traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1/traces_tre.effective.json
++6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93  traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1/traces_tre.effective.json
++91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e  traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1/traces_tre.effective.json
++f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929  traces-icse-ktrace-20261031/Decode_heavy_burst/seed1/traces_tre.effective.json
++5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab  traces-icse-ktrace-20261031/Sinusoidal_demand/seed1/traces_tre.effective.json
++4f8ce83471ea39034b3b2d2aa677a56ea99e036854a734b936f30ecd20de8ca7  traces-icse-20261030/Real_conv_2023_slice_a_tok70/seed1/traces_tre.effective.json
++b115e279de7c6eda4ac0c65fcd2bdfdac677a75b3ea24c0298202d23a35c4e72  traces-icse-ktrace-20261031/Real_code_2024_slice_a_tok70/seed1/traces_tre.effective.json
+
+--- original/campaign-bl-rep2-r3e-20261103.traces.sha256
++++ repo/tre/eval/runner/drivers/bl-rep2-20261103/campaign-bl-rep2-r3e-20261103.traces.sha256
+@@ -1,7 +1,7 @@
+-574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1/traces_tre.effective.json
+-6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1/traces_tre.effective.json
+-91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1/traces_tre.effective.json
+-f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1/traces_tre.effective.json
+-5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1/traces_tre.effective.json
+-431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5  /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1/traces_tre.effective.json
+-457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c  /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1/traces_tre.effective.json
++574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf  traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1/traces_tre.effective.json
++6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93  traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1/traces_tre.effective.json
++91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e  traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1/traces_tre.effective.json
++f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929  traces-icse-ktrace-20261031/Decode_heavy_burst/seed1/traces_tre.effective.json
++5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab  traces-icse-ktrace-20261031/Sinusoidal_demand/seed1/traces_tre.effective.json
++431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5  traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1/traces_tre.effective.json
++457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c  traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1/traces_tre.effective.json
+
+--- original/run_campaign-tre-rerun-20261103.sh
++++ repo/tre/eval/runner/drivers/tre-rerun-20261103/run_campaign-tre-rerun-20261103.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -12 +14 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-tre-rerun-draft-20261103 && setsid nohup bash run_campaign-tre-rerun-20261103.sh >> run_campaign-tre-rerun-20261103.out 2>&1 < /dev/null &
++#   cd $CAMPAIGN_DATA_ROOT/campaign-tre-rerun-draft-20261103 && setsid nohup bash run_campaign-tre-rerun-20261103.sh >> run_campaign-tre-rerun-20261103.out 2>&1 < /dev/null &
+@@ -19 +21 @@
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-tre-rerun-draft-20261103/STOP  (forwarded within 5 s; the
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-tre-rerun-draft-20261103/STOP  (forwarded within 5 s; the
+@@ -23 +25 @@
+-#   python3 /data/nfs_shared_data/xxy/aibrix/tre/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/tre
++#   python3 $T/eval/runner/first_run_check.py <results_root>/Alternating_hot_model_periodic_A_s1/tre
+@@ -27,2 +29,3 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-tre-rerun-draft-20261103
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-tre-rerun-draft-20261103}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
+@@ -31 +34 @@
+-T=$X/aibrix/tre
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
+@@ -33 +36 @@
+-SPEC=$C/$NAME.yaml
++SPEC=$T/eval/runner/campaigns/$NAME.yaml
+@@ -35 +38 @@
+-SHAFILE=$C/$REP1.traces.sha256               # the 7 trace files (= campaign-bl-rep2-r3e-20261103), both reps
++SHAFILE=$HERE/$REP1.traces.sha256               # the 7 trace files (= campaign-bl-rep2-r3e-20261103), both reps
+@@ -39 +42 @@
+-REF=$C/registry-live-0ab5352747bdd70e.yaml   # registry of the baselines rep 2 (tune F + 11-02 alt_thresholds)
++REF=$T/eval/registries/0ab5352747bdd70e.yaml   # registry of the baselines rep 2 (tune F + 11-02 alt_thresholds)
+@@ -46,0 +50 @@
++[ "$CHECK" = 1 ] || mkdir -p "$C"            # [repo] --check writes nothing
+@@ -115,2 +119,2 @@
+-  DR=$(diff <(grep -vE '^(name|round|results_root):|^# REP:' "$C/$REP1.yaml") <(grep -vE '^(name|round|results_root):|^# REP:' "$SPEC") | head -c 400)
+-  [ -z "$DR" ] && log "ok   $NAME = $REP1 except name / round / results_root" || bad "$NAME drifted from $REP1 (bash $C/make_rep2.sh): $DR"
++  DR=$(diff <(grep -vE '^(name|round|results_root):|^# REP:' "$T/eval/runner/campaigns/$REP1.yaml") <(grep -vE '^(name|round|results_root):|^# REP:' "$SPEC") | head -c 400)
++  [ -z "$DR" ] && log "ok   $NAME = $REP1 except name / round / results_root" || bad "$NAME drifted from $REP1 (bash $HERE/make_rep2.sh): $DR"
+@@ -119 +123 @@
+-SHAOUT=$(cd / && nice -n 19 sha256sum -c --quiet "$SHAFILE" 2>&1); SHARC=$?
++SHAOUT=$(cd "$X" && nice -n 19 sha256sum -c --quiet "$SHAFILE" 2>&1); SHARC=$?
+@@ -127 +131 @@
+-RG=$(python3 $C/tss_only_guard.py "$REF" 2>&1); RGC=$?
++RG=$(python3 $HERE/tss_only_guard.py "$REF" 2>&1); RGC=$?
+@@ -134 +138 @@
+-CG=$(EXPECT_CTL=$CTL_IMAGE EXPECT_WINDOW=$WINDOW_EXPECT python3 $C/guard_cluster_tre.py 2>&1); CGC=$?
++CG=$(EXPECT_CTL=$CTL_IMAGE EXPECT_WINDOW=$WINDOW_EXPECT python3 $HERE/guard_cluster_tre.py 2>&1); CGC=$?
+
+--- original/make_rep2.sh
++++ repo/tre/eval/runner/drivers/tre-rerun-20261103/make_rep2.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -6 +8 @@
+-C="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++C="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../campaigns" && pwd)"   # [repo] the specs live in tre/eval/runner/campaigns
+@@ -11 +13 @@
+-    -e "s|^results_root: /data/nfs_shared_data/xxy/$R1-run\$|results_root: /data/nfs_shared_data/xxy/$R2-run|" \
++    -e "s|^results_root: \${CAMPAIGN_DATA_ROOT}/$R1-run\$|results_root: \${CAMPAIGN_DATA_ROOT}/$R2-run|" \
+
+--- original/CHECKLIST.md
++++ repo/tre/eval/runner/drivers/tre-rerun-20261103/CHECKLIST.md
+@@ -0,0 +1,5 @@
++> [repo] Repo copy of the checklist as written on 2026-11-03. Only the data root is replaced by `$CAMPAIGN_DATA_ROOT`.
++> In this checkout `$T` is `<repo>/tre`; the specs are in `$T/eval/runner/campaigns/`, the driver, guards and make_rep2.sh in
++> `$T/eval/runner/drivers/tre-rerun-20261103/`, the reference registry `0ab5...` in `$T/eval/registries/`; `$C` (logs, STOP file) is
++> `$CAMPAIGN_WORK_DIR` (default `$CAMPAIGN_DATA_ROOT/campaign-tre-rerun-draft-20261103`). The text below keeps the original names.
++
+@@ -3 +8 @@
+-目录：`C=/data/nfs_shared_data/xxy/campaign-tre-rerun-draft-20261103`，`T=/data/nfs_shared_data/xxy/aibrix/tre`。全部命令在 76 上跑。
++目录：`C=$CAMPAIGN_DATA_ROOT/campaign-tre-rerun-draft-20261103`，`T=$CAMPAIGN_DATA_ROOT/aibrix/tre`。全部命令在 76 上跑。
+@@ -12 +17 @@
+-   `cat /data/nfs_shared_data/xxy/TRE_EXCLUSIVE_WINDOW`（应不存在）；`python3 -c "import json;print(json.load(open('/data/nfs_shared_data/xxy/campaign-bl-rep2-r3e-20261103-run/status.json'))['state'])"`（应为 `done`）；`pgrep -af '^python3 .*campaign\.py run'`（应为空）。
++   `cat $CAMPAIGN_DATA_ROOT/TRE_EXCLUSIVE_WINDOW`（应不存在）；`python3 -c "import json;print(json.load(open('$CAMPAIGN_DATA_ROOT/campaign-bl-rep2-r3e-20261103-run/status.json'))['state'])"`（应为 `done`）；`pgrep -af '^python3 .*campaign\.py run'`（应为空）。
+@@ -18 +23 @@
+-   `cd $T && PYTHONPATH=common:deploy python3 deploy/scripts/release/params_set.py <第 3 步的全部 --set> --apply --restart --reason tss-rerun-20261103 --backup-dir /data/nfs_shared_data/xxy/backups/tss-rerun-20261103`
++   `cd $T && PYTHONPATH=common:deploy python3 deploy/scripts/release/params_set.py <第 3 步的全部 --set> --apply --restart --reason tss-rerun-20261103 --backup-dir $CAMPAIGN_DATA_ROOT/backups/tss-rerun-20261103`
+@@ -49 +54 @@
+-14. 第 1 臂（TRE × Alternating，约 15 min）一结束就查：`python3 $T/eval/runner/first_run_check.py /data/nfs_shared_data/xxy/campaign-tre-rerun-r3e-20261103-run/Alternating_hot_model_periodic_A_s1/tre`；再看 `status.json` 的 `last_validity`（完整性、信号丢失计数、V_req、TTFT p95 是否合理）。没问题后每 50 min 查一次。
++14. 第 1 臂（TRE × Alternating，约 15 min）一结束就查：`python3 $T/eval/runner/first_run_check.py $CAMPAIGN_DATA_ROOT/campaign-tre-rerun-r3e-20261103-run/Alternating_hot_model_periodic_A_s1/tre`；再看 `status.json` 的 `last_validity`（完整性、信号丢失计数、V_req、TTFT p95 是否合理）。没问题后每 50 min 查一次。
+
+--- original/campaign-tre-rerun-r3e-20261103.traces.sha256
++++ repo/tre/eval/runner/drivers/tre-rerun-20261103/campaign-tre-rerun-r3e-20261103.traces.sha256
+@@ -1,7 +1,7 @@
+-574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1/traces_tre.effective.json
+-6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1/traces_tre.effective.json
+-91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e  /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1/traces_tre.effective.json
+-f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1/traces_tre.effective.json
+-5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab  /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1/traces_tre.effective.json
+-431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5  /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1/traces_tre.effective.json
+-457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c  /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1/traces_tre.effective.json
++574ab1b5eb03fdb76c991fe3efb99b2476d0df32a8b7c1a6dade2c798cd1bbbf  traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1/traces_tre.effective.json
++6a2ce8f782b82a6a0daa938aa8aa3e245525c3a8caf3c3f9d9755d31be8c4d93  traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1/traces_tre.effective.json
++91821e6f5d92660566e252cf7086a6ed4712d542fbefa8fbcec844bf2ff8c42e  traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1/traces_tre.effective.json
++f4ed951263fc94f14aef18355c6699671c7a261cfebf9b89e9f13b5f0ae05929  traces-icse-ktrace-20261031/Decode_heavy_burst/seed1/traces_tre.effective.json
++5e1e3233bd0abf319a6be545fd08edd64e39964342de3a5b16a0b44fbbbc10ab  traces-icse-ktrace-20261031/Sinusoidal_demand/seed1/traces_tre.effective.json
++431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5  traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1/traces_tre.effective.json
++457df889b8bd051b78f745ee7d9a7f86af729a9f8ce6f72415d320313990289c  traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1/traces_tre.effective.json
+
+--- original/campaign-tre-rerun-r3e-rep2-20261103.yaml
++++ repo/tre/eval/runner/campaigns/campaign-tre-rerun-r3e-rep2-20261103.yaml
+@@ -0,0 +1,5 @@
++# [repo] Repo copy of the campaign spec as it was run. The only change is the path parameter: the site data root
++# [repo] (results roots, trace sets, baseline-trace history) is ${CAMPAIGN_DATA_ROOT}; set it before running or dry-running.
++# [repo] Drop the '# [repo]' lines and put the site root back and you get the original byte for byte
++# [repo] (tre/eval/runner/drivers/originals.tsv; tre/eval/tests/test_repro_assets_20261103.py checks it).
++# [repo] Site-specific and NOT parameterised (YAML keys are not expanded): the node name under precheck.disk_min_free_gb.nodes.
+@@ -3,0 +9,8 @@
++# PARAMETERS (user 11-03 13:35): candidate Frecf_all = tune F recipe (completion attribution, r* 5 %, 10 s window) on old
++# + A + B training cells, but lambda / w_p from the SLO-budget formula (lambda = 0.15 L_out, w_p = 6.67 / L_in, request-weighted
++# training means; docs/train-set-slo-review-20261102.md sec 10) instead of tune F 20 / 0.01. EXPLORATORY: not the
++# pre-registered primary (which failed its one-time E / M validation) and not validated on a sealed set. Fit:
++# calib_supp_20261103/fit/adhoc/frecipe-20261103/f_all/Frecf_all/{fit.json sha256 a58ba1fc8c3e49fc..., candidate.json}.
++#   7b theta 382.4 tau_crit .65 tau_high 1.47 lambda 32.91 w_p .009472 | 8b 291.0 .64 1.60 31.44 .009446 |
++#   14b 409.7 .49 1.27 32.93 .009425. Published with params_set.py from fix/lambda-bound-20261103 @31139fec (bound 20 -> 100).
++# REP 1 only for now (user: run TRE on the representative traces first).
+@@ -68 +81 @@
+-#   bash /data/nfs_shared_data/xxy/campaign-tre-rerun-draft-20261103/run_campaign-tre-rerun-20261103.sh --check   (read-only guards)
++#   bash ${CAMPAIGN_DATA_ROOT}/campaign-tre-rerun-draft-20261103/run_campaign-tre-rerun-20261103.sh --check   (read-only guards)
+@@ -72 +85 @@
+-results_root: /data/nfs_shared_data/xxy/campaign-tre-rerun-r3e-rep2-20261103-run
++results_root: ${CAMPAIGN_DATA_ROOT}/campaign-tre-rerun-r3e-rep2-20261103-run
+@@ -84 +97 @@
+-  registry_id: "FILL_REGISTRY_ID"
++  registry_id: "f75155148eba1e61"
+@@ -119 +132 @@
+-  trace_host_root: /data/nfs_shared_data/xxy/baseline-traces
++  trace_host_root: ${CAMPAIGN_DATA_ROOT}/baseline-traces
+@@ -154 +167 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Alternating_hot_model_periodic_A/seed1
+@@ -157 +170 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Simultaneous_spike_ramp_twice_tps1o2/seed1
+@@ -160 +173 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3c-20261101/Prefill_mixed_corner_decode_mix/seed1
+@@ -163 +176 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Decode_heavy_burst/seed1
+@@ -166 +179 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-ktrace-20261031/Sinusoidal_demand/seed1
+@@ -169 +182 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_conv_2023_slice_a_tok70/seed1
+@@ -172 +185 @@
+-    dir: /data/nfs_shared_data/xxy/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
++    dir: ${CAMPAIGN_DATA_ROOT}/traces-icse-r3e-20261101/Real_code_2024_slice_a_tok70/seed1
+
+--- original/run_r3c_full_D.sh
++++ repo/tre/eval/runner/drivers/icse-r3c-20261101/run_r3c_full_D.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -9,2 +11,2 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101 && setsid nohup bash run_r3c_full_D.sh >> run_r3c_full_D.out 2>&1 < /dev/null &
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101/STOP
++#   cd $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101 && setsid nohup bash run_r3c_full_D.sh >> run_r3c_full_D.out 2>&1 < /dev/null &
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101/STOP
+@@ -18,3 +20,5 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-icse-r3c-20261101
+-T=$X/aibrix/tre
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-icse-r3c-20261101}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
++mkdir -p "$C"
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
+@@ -24 +28 @@
+-SPEC=$C/campaign-icse-r3c-full-D-20261101.yaml; ROOT=$X/campaign-icse-r3c-full-D-20261101-run
++SPEC=$T/eval/runner/campaigns/campaign-icse-r3c-full-D-20261101.yaml; ROOT=$X/campaign-icse-r3c-full-D-20261101-run
+
+--- original/run_campaign-icse-r3c-full-F-20261101.sh
++++ repo/tre/eval/runner/drivers/icse-r3c-20261101/run_campaign-icse-r3c-full-F-20261101.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -9,2 +11,2 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101 && setsid nohup bash run_campaign-icse-r3c-full-F-20261101.sh >> run_campaign-icse-r3c-full-F-20261101.out 2>&1 < /dev/null &
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101/STOP
++#   cd $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101 && setsid nohup bash run_campaign-icse-r3c-full-F-20261101.sh >> run_campaign-icse-r3c-full-F-20261101.out 2>&1 < /dev/null &
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101/STOP
+@@ -18,5 +20,7 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-icse-r3c-20261101
+-T=$X/aibrix/tre
+-TRACE_ROOT=/data/nfs_shared_data/xxy/traces-icse-r3c-20261101
+-FULL_ROOT=/data/nfs_shared_data/xxy/traces-icse-r3c-20261101
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-icse-r3c-20261101}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
++mkdir -p "$C"
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
++TRACE_ROOT=$X/traces-icse-r3c-20261101
++FULL_ROOT=$X/traces-icse-r3c-20261101
+@@ -24 +28 @@
+-SPEC=$C/campaign-icse-r3c-full-F-20261101.yaml; ROOT=$X/campaign-icse-r3c-full-F-20261101-run
++SPEC=$T/eval/runner/campaigns/campaign-icse-r3c-full-F-20261101.yaml; ROOT=$X/campaign-icse-r3c-full-F-20261101-run
+
+--- original/run_campaign-icse-ktrace-full-F-20261101.sh
++++ repo/tre/eval/runner/drivers/icse-r3c-20261101/run_campaign-icse-ktrace-full-F-20261101.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -9,2 +11,2 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101 && setsid nohup bash run_campaign-icse-ktrace-full-F-20261101.sh >> run_campaign-icse-ktrace-full-F-20261101.out 2>&1 < /dev/null &
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101/STOP
++#   cd $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101 && setsid nohup bash run_campaign-icse-ktrace-full-F-20261101.sh >> run_campaign-icse-ktrace-full-F-20261101.out 2>&1 < /dev/null &
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101/STOP
+@@ -18,5 +20,7 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-icse-r3c-20261101
+-T=$X/aibrix/tre
+-TRACE_ROOT=/data/nfs_shared_data/xxy/traces-icse-ktrace-20261031
+-FULL_ROOT=/data/nfs_shared_data/xxy/traces-icse-ktrace-20261031
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-icse-r3c-20261101}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
++mkdir -p "$C"
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
++TRACE_ROOT=$X/traces-icse-ktrace-20261031
++FULL_ROOT=$X/traces-icse-ktrace-20261031
+@@ -24 +28 @@
+-SPEC=$C/campaign-icse-ktrace-full-F-20261101.yaml; ROOT=$X/campaign-icse-ktrace-full-F-20261101-run
++SPEC=$T/eval/runner/campaigns/campaign-icse-ktrace-full-F-20261101.yaml; ROOT=$X/campaign-icse-ktrace-full-F-20261101-run
+
+--- original/run_campaign-icse-r3e-full-20261101.sh
++++ repo/tre/eval/runner/drivers/icse-r3e-20261101/run_campaign-icse-r3e-full-20261101.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -9,2 +11,2 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-icse-r3e-20261101 && setsid nohup bash run_campaign-icse-r3e-full-20261101.sh >> run_campaign-icse-r3e-full-20261101.out 2>&1 < /dev/null &
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-icse-r3c-20261101/STOP
++#   cd $CAMPAIGN_DATA_ROOT/campaign-icse-r3e-20261101 && setsid nohup bash run_campaign-icse-r3e-full-20261101.sh >> run_campaign-icse-r3e-full-20261101.out 2>&1 < /dev/null &
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-icse-r3c-20261101/STOP
+@@ -18,5 +20,7 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-icse-r3e-20261101
+-T=$X/aibrix/tre
+-TRACE_ROOT=/data/nfs_shared_data/xxy/traces-icse-r3e-20261101
+-FULL_ROOT=/data/nfs_shared_data/xxy/traces-icse-r3e-20261101
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-icse-r3e-20261101}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
++mkdir -p "$C"
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
++TRACE_ROOT=$X/traces-icse-r3e-20261101
++FULL_ROOT=$X/traces-icse-r3e-20261101
+@@ -24 +28 @@
+-SPEC=$C/campaign-icse-r3e-full-20261101.yaml; ROOT=$X/campaign-icse-r3e-full-20261101-run
++SPEC=$T/eval/runner/campaigns/campaign-icse-r3e-full-20261101.yaml; ROOT=$X/campaign-icse-r3e-full-20261101-run
+
+--- original/run_all3.sh
++++ repo/tre/eval/runner/drivers/icse-ktrace-20261031/run_all3.sh
+@@ -1,0 +2,2 @@
++# [repo] Repo copy of the driver as it was run: only paths changed (CAMPAIGN_DATA_ROOT = data root, CAMPAIGN_WORK_DIR = log / STOP / runner-stdout dir,
++# [repo] TRE_REPO = the tre/ tree; spec, guards, registry snapshot and trace sha256 list come from the repo). See tre/eval/runner/drivers/README.md.
+@@ -7 +9 @@
+-#   bash /data/nfs_shared_data/xxy/backups/tss-win10-20261030/rollback_win10.sh   by hand.
++#   bash $CAMPAIGN_DATA_ROOT/backups/tss-win10-20261030/rollback_win10.sh   by hand.
+@@ -10,2 +12,2 @@
+-#   cd /data/nfs_shared_data/xxy/campaign-icse-ktrace-20261031 && setsid nohup bash run_all3.sh >> run_all3.out 2>&1 < /dev/null &
+-# Clean stop (no race): touch /data/nfs_shared_data/xxy/campaign-icse-ktrace-20261031-run/STOP
++#   cd $CAMPAIGN_DATA_ROOT/campaign-icse-ktrace-20261031 && setsid nohup bash run_all3.sh >> run_all3.out 2>&1 < /dev/null &
++# Clean stop (no race): touch $CAMPAIGN_DATA_ROOT/campaign-icse-ktrace-20261031-run/STOP
+@@ -18,6 +20,8 @@
+-X=/data/nfs_shared_data/xxy
+-C=$X/campaign-icse-ktrace-20261031
+-T=$X/aibrix/tre
+-W=$X/analysis-tss-params-20261030/win10
+-B=$X/backups/tss-win10-20261030
+-SPEC=$C/campaign-icse-ktrace-20261031.yaml
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # [repo] this driver directory (guards, trace sha256 lists)
++X="${CAMPAIGN_DATA_ROOT:?set CAMPAIGN_DATA_ROOT: the directory with the results roots, trace sets and the exclusive-window marker}"
++C="${CAMPAIGN_WORK_DIR:-$X/campaign-icse-ktrace-20261031}"                       # [repo] logs, STOP file, runner stdout (original: the campaign dir next to the spec)
++mkdir -p "$C"
++T="${TRE_REPO:-$(cd "$HERE/../../../.." && pwd)}"                      # [repo] the tre/ tree of this checkout
++W="${WIN10_DIR:-$X/analysis-tss-params-20261030/win10}"       # [repo] NOT in the repo: apply_win10.sh, registry/ (drivers/README.md)
++B="${WIN10_BACKUP_DIR:-$X/backups/tss-win10-20261030}"         # [repo] NOT in the repo: rollback_win10.sh, cm_replace.py, registry.before.yaml
++SPEC=$T/eval/runner/campaigns/campaign-icse-ktrace-20261031.yaml

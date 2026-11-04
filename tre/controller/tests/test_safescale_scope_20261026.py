@@ -13,6 +13,7 @@ import pytest
 from relay_view import fleet_view, transfer_members
 
 from tre_common.metrics_schema import MetricsSnapshot
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from section_ticks import run_rescue_tick
 from tre_controller.planning.safescale import SafeScaleStateMachine
@@ -25,7 +26,7 @@ SCOPE = "receiverless_shrink"
 
 def test_only_the_receiverless_high_shrink_runs_as_a_probe():
     # A HIGH model with no receiver: the proactive shrink starts a probe.
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     alone = MetricsSnapshot(ts_ms=1, stale=False, models={
         "high": _metrics_with_pods("high", generation=400.0, waiting=0.0, running=1.0, pods=("h-a", "h-b")),
     })
@@ -35,7 +36,7 @@ def test_only_the_receiverless_high_shrink_runs_as_a_probe():
     assert machine.active_probe("high") is not None
 
     # A HIGH donor for a CRITICAL receiver: an immediate relay, no probe.
-    machine = SafeScaleStateMachine(config=SafeScaleConfig())
+    machine = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig())
     snapshot = _probe_snapshot()
     donor = _metrics_with_pods("donor", generation=200.0, waiting=0.0, running=1.0, pods=("donor-a", "donor-b"))
     snapshot = replace(snapshot, models={**snapshot.models, "donor": donor})

@@ -17,8 +17,9 @@
 #
 # TSS numerator and window (user decision 2026-10-28): the defaults fit theta on the
 # vLLM step counters (NUMERATOR=vllm_counter, scripts.l3_numerator: the online rule, the
-# counter rate over the observed span as a window total) on 20 s windows (WINDOW_MS=20000);
-# the freeze stamps trs.numerator = step_counters and trs.theta_window_ms = 20000. The
+# counter rate over the observed span as a window total) on 10 s windows (WINDOW_MS=10000, the
+# controller's TRE_METRICS_WINDOW_MS since 2026-11-03; 20000 from 2026-10-28 to 2026-11-03);
+# the freeze stamps trs.numerator = step_counters and trs.theta_window_ms = 10000. The
 # 2026-10-25 freeze (live until the switch) is reproduced with NUMERATOR=gateway
 # WINDOW_MS=30000 (completion-counted histograms on 30 s windows; the queue / fit method
 # defaults above are that freeze's). WINDOW_MS / STEP_MS go to the dataset builder and to
@@ -58,7 +59,7 @@ TRE="$(cd "$HERE/../../.." && pwd)"
 : "${TRAIN_STAGES:=supp p1}"
 : "${STAGE_OVERRIDES:=dsqwen-14b:run2=run2b dsqwen-7b:p1=p1r2}"
 : "${NUMERATOR:=vllm_counter}"
-: "${WINDOW_MS:=20000}"
+: "${WINDOW_MS:=10000}"
 : "${STEP_MS:=10000}"
 : "${QUEUE_ESTIMATOR:=raw_mean}"
 : "${FIT_METHOD:=m2_unique_grid_plateau_midpoint}"

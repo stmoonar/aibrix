@@ -1,0 +1,170 @@
+{
+  "trace": "Real_conv_2023_slice_a_tok70",
+  "seed": 1,
+  "duration_s": 720.0,
+  "design": {
+    "requests": 52181,
+    "sha256": "431c96e7ff7b9961241c3915d3200fa3a6033bcc51ae1d215f7ce55eb51653d5",
+    "source": "generated (gen_r3e.py)"
+  },
+  "out_cap": {
+    "max_output_tokens": 510,
+    "null_max_output_tokens": 0,
+    "note": "null = the loadgen config's max_tokens"
+  },
+  "loadgen_config": "aibrix/tre/loadgen_v1/configs/traces_v14/Real_conv_2023_slice_a_tok70/config.yaml",
+  "preserve_history": {
+    "file": "preserve_history.json",
+    "sha256": "b5690a64770f22aea1819d2b81c4765c60f61ada07eb9e897715634db736aaaf",
+    "method": "azure-segment-v1-20261031"
+  },
+  "rate_scale": {
+    "k": 1.0,
+    "base_suite": "ICSE v1 Real_* config, r3e design lists (r3e.json in the design dir)",
+    "random_seed": 9804,
+    "icse_config_random_seed": 9804,
+    "method": "Real_*: r3e per-model independent time-compressed Azure intervals, plateau-clipped min-max target load (r3e_select.py), lists as designed",
+    "max_output_tokens": "generator / request value",
+    "r3e_marker_sha256": "c82107dd694a1a03667cb3c122afb102a3216aa1a41fa05900f64cc00338e5fe",
+    "gen_dir": "_gen/Real_conv_2023_slice_a_tok70/seed1",
+    "gen_config_sha256": "e7ed32145f2a0d3b348152a6b65101455d18d6603bdadd98afa05fd3fdc021ae",
+    "real": {
+      "dsllama-8b": {
+        "family": "conv",
+        "source_file": "2024/AzureLLMInferenceTrace_conv_1week.csv",
+        "source_sha256": "a0cc9b969a9bbf0fd811802cbf4323edd3a209ace791e3799ad4f9207f213941",
+        "compression_C": 8,
+        "interval_start_utc": "2024-05-16T22:13:00+00:00",
+        "interval_end_utc_exclusive": "2024-05-16T23:49:00+00:00",
+        "offset_in_file_s": 425580,
+        "raw_requests": 212109,
+        "raw_rps_mean": 36.824,
+        "hot_block_s": [
+          573,
+          700
+        ],
+        "head": 0.249,
+        "beta": 0.78,
+        "lo_hi_rho": [
+          0.6,
+          2.6
+        ],
+        "mu_design": 22.0972,
+        "rps_min_max": [
+          10.34,
+          44.81
+        ],
+        "requests": 16716,
+        "dropped": 195393,
+        "copies": 0,
+        "mean_in": 336.6,
+        "mean_out": 116.0,
+        "length_transform": "tok70 (v9 min-max of the interval's own lengths) to {'input': (250, 700), 'output': (80, 500)}",
+        "raw_in_range": [
+          6,
+          7998
+        ],
+        "raw_out_range": [
+          1,
+          1200
+        ],
+        "design_list_sha256": "ec50c9d0c838bfc5d79aba9b2097eda3e3b5181c2bbd057663ed8f2979dbdafe"
+      },
+      "dsqwen-7b": {
+        "family": "conv",
+        "source_file": "2024/AzureLLMInferenceTrace_conv_1week.csv",
+        "source_sha256": "a0cc9b969a9bbf0fd811802cbf4323edd3a209ace791e3799ad4f9207f213941",
+        "compression_C": 8,
+        "interval_start_utc": "2024-05-17T15:23:00+00:00",
+        "interval_end_utc_exclusive": "2024-05-17T16:59:00+00:00",
+        "offset_in_file_s": 487380,
+        "raw_requests": 304957,
+        "raw_rps_mean": 52.944,
+        "hot_block_s": [
+          78,
+          219
+        ],
+        "head": 0.407,
+        "beta": 0.78,
+        "lo_hi_rho": [
+          0.6,
+          2.6
+        ],
+        "mu_design": 26.4036,
+        "rps_min_max": [
+          12.36,
+          53.55
+        ],
+        "requests": 19592,
+        "dropped": 285365,
+        "copies": 0,
+        "mean_in": 344.8,
+        "mean_out": 112.5,
+        "length_transform": "tok70 (v9 min-max of the interval's own lengths) to {'input': (260, 710), 'output': (78, 495)}",
+        "raw_in_range": [
+          6,
+          7997
+        ],
+        "raw_out_range": [
+          1,
+          1200
+        ],
+        "design_list_sha256": "cd4c41e9604a2baec2f8d2e0a05d8d407d84dd298a34b970af67bb15415bf38e"
+      },
+      "dsqwen-14b": {
+        "family": "conv",
+        "source_file": "2024/AzureLLMInferenceTrace_conv_1week.csv",
+        "source_sha256": "a0cc9b969a9bbf0fd811802cbf4323edd3a209ace791e3799ad4f9207f213941",
+        "compression_C": 8,
+        "interval_start_utc": "2024-05-18T20:58:00+00:00",
+        "interval_end_utc_exclusive": "2024-05-18T22:34:00+00:00",
+        "offset_in_file_s": 593880,
+        "raw_requests": 158408,
+        "raw_rps_mean": 27.501,
+        "hot_block_s": [
+          271,
+          415
+        ],
+        "head": 0.39,
+        "beta": 0.78,
+        "lo_hi_rho": [
+          0.45,
+          2.45
+        ],
+        "mu_design": 20.4642,
+        "rps_min_max": [
+          7.18,
+          39.11
+        ],
+        "requests": 15873,
+        "dropped": 142535,
+        "copies": 0,
+        "mean_in": 333.0,
+        "mean_out": 121.7,
+        "length_transform": "tok70 (v9 min-max of the interval's own lengths) to {'input': (245, 695), 'output': (85, 510)}",
+        "raw_in_range": [
+          2,
+          7999
+        ],
+        "raw_out_range": [
+          1,
+          1200
+        ],
+        "design_list_sha256": "cf8e0a285a8403b4cdff7c911d44d6020d644703904851cf260e36eb35cfaef5"
+      }
+    }
+  },
+  "generator": {
+    "script": "docs/scripts/trace_suite_r3e_20261101/gen_r3e.py",
+    "sha256": "4d0aabd2473f8130de60e7b96b340c058b13ac7d72e31370968ecdc61345acd7",
+    "v1": {
+      "repo": "/data/nfs_shared_data/xxy/tools/r3d-genenv-20261101/v1gen",
+      "git_sha": "",
+      "dirty_src": "",
+      "trace_generator.py_sha256": "459a8977a92650f393ed07b7e303ad498cfba89f2cc07d304bad8b9a4495795d",
+      "data_generator.py_sha256": "be2d06a61ba58ae44fc13ca9b52788640d9afbeb8d1e4ae55347f7d723af95d2",
+      "real_trace_adapter.py_sha256": "6052126cd424a7779c45d81973f509513d6e7b6c9d294ee08bd0e9dd8b2d3bec",
+      "config_manager.py_sha256": "d9612f3864fd30d0335af1ea521e858cbaf6ed9b26f1584df9a9bb6fb78a8910"
+    }
+  }
+}

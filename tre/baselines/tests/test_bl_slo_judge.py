@@ -67,7 +67,8 @@ def test_campaign_client_rows_judge_in_10s_windows_per_model():
                 "e2e_latency": e2e, "input_tokens": 300, "output_tokens": out, "success_strict": ok}
     rows = [row(0, "a", 1.0, 0.1), row(1, "b", 2.0, 0.1), row(2, "a", 12.0, 0.6), row(3, "b", 21.0, 0.6),
             row(4, "a", 25.0, 0.1)]
-    slos = {"a": SLO, "b": label_def_for_model("b", mode="slowdown", c=150.0, b=0.0, k=5.0, floor=500.0)}
+    slos = {"a": SLO, "b": label_def_for_model("b", mode="slowdown", c=150.0, b=0.0, k=5.0, floor=500.0,
+                                               ttft_p95_ms=500.0, tpot_p95_ms=75.0)}
     ws = sj.judge_windows([sj.from_client_row(r) for r in rows], slos, start=1000.0, end=1030.0)
     assert [(w["n"], w["meets_slo"]) for w in ws] == [(2, True), (1, False), (2, True)]  # b: 600 ms <= 5 x 150
     assert ws[1]["v_ttft"] == 1
@@ -92,12 +93,13 @@ def _ladder(tmp_path, stream=True):
 def test_mu_unified_takes_the_registry_slo_and_refuses_unstreamed_steps(tmp_path):
     base = _ladder(tmp_path)
     assert vl.main(base + ["--slo-rule", "unified"]) == 2            # no --registry
-    assert vl.main(base + ["--slo-rule", "unified", "--registry", str(REGISTRY)]) == 0
+    assert vl.main(base + ["--slo-rule", "unified", "--registry", str(REGISTRY), "--slo-mode", "slowdown"]) == 0
     doc = yaml.safe_load((tmp_path / "mu.yaml").read_text())
     reg = yaml.safe_load(REGISTRY.read_text())
     want = next(m["slo"] for m in reg["models"] if m["name"] == "dsqwen-7b")
     got = doc["models"]["dsqwen-7b"]["slo"]
-    assert (got["c_ms"], got["b_ms_per_token"], got["tpot_ms"]) == (
+    assert (got["mode"], got["registry_slo_mode"]) == ("slowdown", reg["slo_mode"])
+    assert (got["c_ms"], got["b_ms_per_token"], got["tpot_slo_ms"]) == (
         want["ttft_idle_c_ms"], want["ttft_idle_b_ms_per_token"], want["tpot_p95_ms"])
     assert doc["sources"]["registry_sha256"] and doc["mu_B"]["dsqwen-7b"]["t"] == 3500.0
     assert doc["models"]["dsqwen-7b"]["cells_B"]["b11"]["bracketed_below"]

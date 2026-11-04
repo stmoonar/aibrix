@@ -84,9 +84,9 @@ README = "DATASET.md"
 #: 2: 30 s / 10 s grid-aligned windows (D8), three label arms (D6'), ttft_len_samples.
 FORMAT_REVISION = 2
 #: The fitting windows of revision 2 (plan 2026-09-21 §6.11 D8). The default window is
-#: the controller's (TRE_METRICS_WINDOW_MS, 20 s since 2026-10-28); 30 s reproduces the
-#: freezes before it (--window-ms 30000).
-DEFAULT_WINDOW_MS = 20_000
+#: the controller's (TRE_METRICS_WINDOW_MS, 10 s since 2026-11-03; 20 s from 2026-10-28); 30 s reproduces the
+#: freezes before 2026-10-28 (--window-ms 30000).
+DEFAULT_WINDOW_MS = 10_000
 DEFAULT_STEP_MS = 10_000
 DEFAULT_WINDOW_ALIGN = rewindow_from_raw.WINDOW_ALIGN_GRID
 
@@ -223,6 +223,23 @@ def _read_json(path: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return doc if isinstance(doc, dict) else {}
+
+
+def recorded_windowing(run_dir: Path) -> tuple[int, int]:
+    """(window_ms, step_ms) that the standard datasets already built for ``run_dir`` recorded (``windowing`` of the manifest of
+    every ``<campaign>/dataset`` and of ``<run_dir>/dataset``). A rebuild passes them explicitly instead of the module default, so
+    a change of DEFAULT_WINDOW_MS never silently re-cuts an old run. SystemExit when there is none or when they differ."""
+    run_dir = Path(run_dir)
+    found: dict[tuple[int, int], list[str]] = {}
+    for d in dict.fromkeys([run_dir, *campaign_dirs(run_dir)]):
+        w = _read_json(d / DATASET_DIR / MANIFEST).get("windowing") or {}
+        if w.get("window_ms") and w.get("step_ms"):
+            found.setdefault((int(w["window_ms"]), int(w["step_ms"])), []).append(d.name)
+    if not found:
+        raise SystemExit(f"{run_dir}: no standard dataset with a recorded windowing; pass --window-ms and --step-ms")
+    if len(found) > 1:
+        raise SystemExit(f"{run_dir}: its datasets were cut with different windowings {found}; pass --window-ms and --step-ms")
+    return next(iter(found))
 
 
 def _cell_capture(raw_dir: Path) -> tuple[Optional[Path], Optional[str]]:
@@ -522,7 +539,7 @@ class Settings:
         """The primary (D6') label of ``model``: its idle TTFT fit from ``registry`` (the
         label registry, :attr:`label_registry_path`)."""
         return slo_labels.label_def_for_model(
-            model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms,
+            model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms, mode=slo_labels.D6_PRIME_MODE,
             min_completed_requests=self.min_completed_requests, registry=registry,
             attribution=self.attribution,
         )
@@ -617,6 +634,12 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
                 guard = _read_json(guard_path)
                 ttft = ttft or guard.get("ttft_slo_ms")
                 tpot = tpot or guard.get("tpot_slo_ms")
+    def fixed_slo() -> tuple[float, float]:
+        """Neither the overrides, the plan nor a guard recorded the fixed SLO: the label
+        registry's (no SLO value is written here)."""
+        return slo_labels.registry_fixed_slo_ms(
+            overrides.get("label_registry") or Path(__file__).resolve().parents[1] / "registry.yaml")
+
     # The dataset's windows are revision 2's whatever the run itself used online; what
     # the run used is kept for the parity check against its online CSVs.
     numerator = str(overrides.get("numerator") or l3.NUMERATOR_GATEWAY)
@@ -643,8 +666,8 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
         online_step_ms=None if step_ms is None else int(step_ms),
         online_window_align=str(online_align or rewindow_from_raw.WINDOW_ALIGN_NONE),
         online_label=online_label,
-        ttft_slo_ms=float(overrides.get("ttft_slo_ms") or ttft or 500.0),
-        tpot_slo_ms=float(overrides.get("tpot_slo_ms") or tpot or 75.0),
+        ttft_slo_ms=float(overrides.get("ttft_slo_ms") or ttft or fixed_slo()[0]),
+        tpot_slo_ms=float(overrides.get("tpot_slo_ms") or tpot or fixed_slo()[1]),
         min_latency_samples=int(overrides.get("min_latency_samples") or 10),
         percentile_mode=str(overrides.get("percentile_mode") or "bucket_upper"),
         registry_path=Path(
@@ -1438,8 +1461,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--registry", default=None,
                     help="registry whose trs parameters fill the signal columns (default: "
                          "the one the run recorded, else the repository's)")
-    ap.add_argument("--window-ms", type=int, default=None)
-    ap.add_argument("--step-ms", type=int, default=None)
+    ap.add_argument("--window-ms", type=int, default=None, help=f"default {DEFAULT_WINDOW_MS}")
+    ap.add_argument("--step-ms", type=int, default=None, help=f"default {DEFAULT_STEP_MS}")
+    ap.add_argument("--recorded-windowing", action="store_true",
+                    help="print 'WINDOW_MS STEP_MS' as the datasets already under RUN_DIR recorded them and exit (for a rebuild "
+                         "that must cut the same windows: pass them back with --window-ms / --step-ms)")
     ap.add_argument("--ttft-slo-ms", type=float, default=None)
     ap.add_argument("--tpot-slo-ms", type=float, default=None)
     ap.add_argument("--min-latency-samples", type=int, default=None)
@@ -1468,6 +1494,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="build even when a cell's served requests were off their prompt length "
                          "(recorded; dline_refit trainset still refuses those cells)")
     args = ap.parse_args(argv)
+    if args.recorded_windowing:
+        print(*recorded_windowing(args.run_dir))
+        return 0
     out = build_dataset(args.run_dir, out_dir=args.out_dir,
                         allow_prompt_token_mismatch=args.allow_prompt_token_mismatch, overrides={
         "registry": args.registry, "label_registry": args.label_registry,

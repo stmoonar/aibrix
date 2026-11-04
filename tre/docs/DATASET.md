@@ -68,9 +68,16 @@
 生成 / 重建：
 
 ```bash
-cd /data/nfs_shared_data/xxy/aibrix/tre/deploy
+cd <仓库>/tre/deploy
 PYTHONPATH=../common:.:../controller:../service-manager:../calibration:../replayer:../ui \
-  python3 -m scripts.calibration_dataset <run_dir>
+  python3 -m scripts.calibration_dataset <run_dir> --window-ms 10000 --step-ms 10000
+```
+
+**重建时写明窗口，不要靠默认值**：默认值随控制器的 `TRE_METRICS_WINDOW_MS` 改过（2026-10-28 前 30 s，之后 20 s，2026-11-03 起 10 s），只靠默认值会静默改切窗。要和 run 里已有的数据集切得一样，先用 `--recorded-windowing` 取出它们记录的窗口（`manifest.json → windowing`），再传回 `--window-ms / --step-ms`（`run_chain_train.sh` 的 D2 就这样做）：
+
+```bash
+read -r W S <<< "$(python3 -m scripts.calibration_dataset <run_dir> --recorded-windowing)"
+python3 -m scripts.calibration_dataset <run_dir> --window-ms "$W" --step-ms "$S"
 ```
 
 读取：
@@ -114,11 +121,11 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 
 ## 4. 开窗
 
-- 窗口 = 相位对齐控制器实际读取的窗口（D8）：**30 s 宽、10 s 步长，窗尾落在网关 10 s 格上**，区间 `(start, end]`（`rewindow_from_raw --window-align grid`），参数记录在 `manifest.json → windowing`。
+- 窗口 = 相位对齐控制器实际读取的窗口（D8）：**宽度默认 10 s（= 控制器的 `TRE_METRICS_WINDOW_MS`，2026-11-03 起；2026-10-28 到 11-03 是 20 s，更早是 30 s）、步长 10 s，窗尾落在网关 10 s 格上**，区间 `(start, end]`（`rewindow_from_raw --window-align grid`）。实际用的宽度和步长记录在 `manifest.json → windowing`，重建要显式传（见上）。
 - 边界：每个 attempt 自己 guard 里的 `[start_ms, end_ms]`，第一个窗口从 `start_ms` 向下取整到 10 s 格起算（所以第一个窗可能含开始前 ≤10 s 的空闲，它总在 warm-up 内），每 10 s 一个窗口，直到窗口尾超过 `end_ms`。
 - 队列列（`avg_*`、`queue_control`）只用 sidecar 中 `on_live_grid = true` 的样本（网关 10 s 桶的那一点），除数为 10 s——即控制器看到的信号。
 - 在截断（admission overflow truncation）之后开始的窗口被删除。
-- 相邻滑动窗口重叠 5/6：**统计"有多少独立证据"时只能数互不重叠的窗口**（见 `cells.csv → independent_windows`）。
+- 相邻窗口的重叠 = 1 − 步长 ÷ 宽度（10 s 宽 / 10 s 步长不重叠；30 s 宽 / 10 s 步长重叠 2/3）：**统计"有多少独立证据"时只能数互不重叠的窗口**（见 `cells.csv → independent_windows`）。
 
 ## 5. `windows.csv`
 

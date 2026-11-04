@@ -135,7 +135,8 @@ class ModelSnapshot:
     max_replicas: int
     #: GPUs one replica occupies (registry ``tp_size``).
     gpus_per_replica: int
-    #: Fixed-arm SLOs (registry ``slo.ttft_p95_ms`` / ``slo.tpot_p95_ms``).
+    #: The model's SLO thresholds (``tre_common.slo``, registry ``slo_mode``): TTFT without a
+    #: prompt length (fixed value / per-request floor) and TPOT.
     ttft_slo_ms: float
     tpot_slo_ms: float
     #: vLLM ``--max-num-seqs`` from the registry; None = engine default.

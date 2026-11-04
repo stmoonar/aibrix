@@ -55,8 +55,7 @@ def _donor_plan(donor_state, receiver_state, *, backoff=None):
         },
         classifications=[
             _cls(R, receiver_state, ModelRole.RECEIVER, 0.4 if rescue else 0.9),
-            _cls(D, donor_state, ModelRole.DONOR, 10.0 if donor_state == ModelState.IDLE else 2.3,
-                 "idle" if donor_state == ModelState.IDLE else "surplus"),
+            _cls(D, donor_state, ModelRole.DONOR, 10.0 if donor_state == ModelState.IDLE else 2.3),
         ],
         model_replicas={D: 8, R: 8},
         idle_gpus=0,
@@ -105,7 +104,7 @@ TOPO_A = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((
 def _slot_plan(view: ClusterView, *, crit_tp2: bool, active=(), backoff=None, proactive=False):
     classifications = [
         _cls("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
     ]
     if crit_tp2:
         classifications.insert(0, _cls("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5))

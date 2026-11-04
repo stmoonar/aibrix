@@ -9,8 +9,10 @@ the existing readers in ``tre_common``:
   ``ModelSpec.scale_max_replicas`` (``max_awake_replicas`` else ``max_replicas``, the same
   cap the service manager enforces on every wake);
 * GPUs per replica: ``ModelSpec.tp_size``;
-* SLO: ``tre_common.slo_labels.label_def_for_model`` (the one SLO definition calibration
-  labels use) fed with the registry's fixed ``slo.ttft_p95_ms`` / ``slo.tpot_p95_ms``;
+* SLO: ``tre_common.slo_labels.label_def_for_model`` (thresholds from ``tre_common.slo``, the
+  one SLO definition) under the registry's ``slo_mode``; ``ModelLimits.ttft_slo_ms`` /
+  ``tpot_slo_ms`` are its TTFT threshold without a prompt length (the fixed value, or the floor
+  of a per-request mode) and its TPOT threshold;
 * ``--max-num-seqs``: ``scripts.admission_cap.max_num_seqs_from_args`` over the model's
   engine arguments (the reader the admission-cap tooling uses).
 
@@ -148,30 +150,19 @@ def _max_num_seqs(args: tuple[str, ...]) -> Optional[int]:
 
 
 def _slo_definition(model: str, spec: Any, registry: Registry, *, strict: bool) -> Any:
-    """The model's SLO definition via the shared label reader. Without the registry's
-    idle-TTFT fit (``slo.ttft_idle_c_ms`` / ``ttft_idle_b_ms_per_token``, the live c/b the
-    TRE arm uses) a shell that actuates refuses to start (``strict``): it would judge
-    requests by a different SLO than the other arms. A dry-run shell warns and falls back
-    to the fixed arm."""
+    """The model's SLO definition via the shared label reader, under the registry's
+    ``slo_mode``. When the model's block lacks the mode's parameters (a per-request mode
+    without the idle-TTFT fit ``slo.ttft_idle_c_ms`` / ``ttft_idle_b_ms_per_token``) a shell
+    that actuates refuses to start (``strict``): it would judge requests by a different SLO
+    than the other arms. A dry-run shell warns and falls back to the fixed arm."""
     try:
-        return label_def_for_model(
-            model,
-            ttft_p95_ms=spec.slo.ttft_p95_ms,
-            tpot_p95_ms=spec.slo.tpot_p95_ms,
-            registry=registry,
-        )
+        return label_def_for_model(model, registry=registry)   # every value the registry's
     except (SystemExit, ValueError) as exc:
         if strict:
-            raise ValueError(f"model {model}: no slowdown SLO ({exc}); the registry needs the live "
-                             "slo.ttft_idle_c_ms / ttft_idle_b_ms_per_token (dry-run falls back)") from None
-        LOG.warning("model %s: slowdown SLO unavailable (%s); dry-run: using the fixed arm", model, exc)
-        return label_def_for_model(
-            model,
-            ttft_p95_ms=spec.slo.ttft_p95_ms,
-            tpot_p95_ms=spec.slo.tpot_p95_ms,
-            mode=TTFT_SLO_MODE_FIXED,
-            registry=registry,
-        )
+            raise ValueError(f"model {model}: no {registry.slo_mode()} SLO ({exc}); the registry needs the "
+                             "mode's models[].slo parameters (dry-run falls back)") from None
+        LOG.warning("model %s: %s SLO unavailable (%s); dry-run: using the fixed arm", model, registry.slo_mode(), exc)
+        return label_def_for_model(model, mode=TTFT_SLO_MODE_FIXED, registry=registry)
 
 
 def model_limits(registry: Registry, only: Optional[set[str]] = None, *, strict: bool = True) -> dict[str, ModelLimits]:
@@ -185,8 +176,8 @@ def model_limits(registry: Registry, only: Optional[set[str]] = None, *, strict:
             min_replicas=int(spec.min_replicas),
             max_replicas=int(spec.scale_max_replicas),
             gpus_per_replica=int(spec.tp_size),
-            ttft_slo_ms=float(slo.ttft_p95_ms),
-            tpot_slo_ms=float(slo.tpot_p95_ms),
+            ttft_slo_ms=float(slo.thresholds().ttft_ms(None)),
+            tpot_slo_ms=float(slo.thresholds().tpot_ms),
             max_num_seqs=_max_num_seqs(tuple(spec.vllm_args)),
             slo=slo,
         )

@@ -14,6 +14,7 @@ import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
+from safescale_thresholds import STATIC_500_75
 import tre_controller.app as app
 from tre_common.metrics_schema import MetricsSnapshot
 import pytest
@@ -108,8 +109,8 @@ def _two_donor_plan(relay_holds=None):
         },
         classifications=[
             _cls("r", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-            _cls("h1", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
-            _cls("h2", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+            _cls("h1", ModelState.HIGH, ModelRole.DONOR, 1.4),
+            _cls("h2", ModelState.HIGH, ModelRole.DONOR, 1.4),
         ],
         model_replicas={"r": 0, "h1": 2, "h2": 2},
         idle_gpus=0,
@@ -154,10 +155,10 @@ async def _no_sleep(_seconds: float) -> None:
 
 def test_startup_rolls_back_a_probe_left_in_redis():
     store = ControllerStateStore(FakeRedis())
-    SafeScaleStateMachine(config=SafeScaleConfig(), store=store).start_probe(
+    SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(), store=store).start_probe(
         model="donor", pods=("donor-a",), now_ms=0
     )
-    restarted = SafeScaleStateMachine(config=SafeScaleConfig(), store=store)
+    restarted = SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(), store=store)
     assert restarted.restore() == 1
     queue = _AcceptingQueue()
 
@@ -167,7 +168,7 @@ def test_startup_rolls_back_a_probe_left_in_redis():
 
     assert queue.submitted == [(UnhideAction("donor", ("donor-a",), "safescale_disabled", "safescale"),)]
     assert restarted.all_probes() == ()
-    assert SafeScaleStateMachine(config=SafeScaleConfig(), store=store).restore() == 0
+    assert SafeScaleStateMachine(thresholds=STATIC_500_75, config=SafeScaleConfig(), store=store).restore() == 0
 
 
 # ------------------------------------------------------------- slow loop off

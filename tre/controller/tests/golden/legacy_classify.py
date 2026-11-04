@@ -180,71 +180,7 @@ def legacy_classify_all_models(
     return results
 
 
-def legacy_donor_mock_cost_key(classification: Any) -> tuple[int, float, float]:
-    donor_tier = getattr(classification, "donor_tier", None)
-    if donor_tier == "idle":
-        donor_prio = -1
-    elif donor_tier == "waste":
-        donor_prio = 0
-    else:
-        donor_prio = 1
-    z_m = legacy_float_or(getattr(classification, "Z_m", None), 0.0)
-    eta_m_raw = legacy_float_or(getattr(classification, "eta_m", None), None)
-    eta_m = eta_m_raw if eta_m_raw is not None else float("inf")
-    return (donor_prio, -z_m, eta_m)
-
-
-def legacy_filter_donors_by_eta(
-    donors: list[LegacyModelClassification],
-) -> tuple[list[LegacyModelClassification], list[LegacyModelClassification]]:
-    eligible: list[LegacyModelClassification] = []
-    filtered_out: list[LegacyModelClassification] = []
-    for donor in donors:
-        if donor.state == LegacyModelState.IDLE:
-            eligible.append(donor)
-            continue
-        if donor.eta_m is not None and donor.eta_crit is not None and donor.eta_m < donor.eta_crit:
-            filtered_out.append(donor)
-        else:
-            eligible.append(donor)
-    return eligible, filtered_out
-
-
-def legacy_split_receivers_donors(
-    classifications: list[LegacyModelClassification],
-    *,
-    apply_eta_gate: bool = True,
-) -> tuple[list[LegacyModelClassification], list[LegacyModelClassification]]:
-    receivers = [item for item in classifications if item.role == LegacyModelRole.RECEIVER]
-    donors = [item for item in classifications if item.role == LegacyModelRole.DONOR]
-    receivers.sort(key=lambda item: (1 if item.state == LegacyModelState.CRITICAL else 2, item.Z_m if item.Z_m is not None else float("inf")))
-    donors.sort(key=legacy_donor_mock_cost_key)
-    if apply_eta_gate:
-        donors, _filtered = legacy_filter_donors_by_eta(donors)
-    return receivers, donors
-
-
-def legacy_build_comparison_log(
-    *,
-    model_name: str,
-    legacy_type: str,
-    paper_cls: LegacyModelClassification,
-) -> dict[str, Any]:
-    eta_gate_pass: Optional[bool] = None
-    if paper_cls.role == LegacyModelRole.DONOR and paper_cls.eta_m is not None and paper_cls.eta_crit is not None:
-        eta_gate_pass = paper_cls.eta_m >= paper_cls.eta_crit
-    return {
-        "event": "state_comparison",
-        "model": model_name,
-        "legacy_type": legacy_type,
-        "legacy_role": "receiver" if legacy_type in ("THRASHING", "CONGESTED") else ("donor" if legacy_type in ("WASTE", "SURPLUS") else "neutral"),
-        "paper_state": paper_cls.state.value,
-        "paper_role": paper_cls.role.value,
-        "Z_m": paper_cls.Z_m,
-        "eta_m": paper_cls.eta_m,
-        "eta_crit": paper_cls.eta_crit,
-        "eta_gate_pass": eta_gate_pass,
-        "donor_tier": paper_cls.donor_tier,
-        "theta_m": paper_cls.theta_m,
-        "trs": paper_cls.trs,
-    }
+# 2026-11-02: the controller's eta gate, waste tier and eta donor ranking were removed
+# (donor order = classify.donor_sort_key); their parity tests went with them, and so did
+# the frozen references legacy_donor_mock_cost_key / legacy_filter_donors_by_eta /
+# legacy_split_receivers_donors / legacy_build_comparison_log that nothing imported any more.

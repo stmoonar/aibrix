@@ -30,7 +30,9 @@ from tre_common.registry import (
     load_registry,
     parse_safescale_config,
 )
+from tre_common.slo import SloConfigError
 from tre_common.slo_labels import label_def_for_model
+from safescale_thresholds import STATIC_500_75
 from tre_controller.config import ControllerConfig, SafeScaleConfig
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.safescale_task import (
@@ -50,6 +52,7 @@ from tre_controller.planning.safescale_evidence import (
     HideAnchor,
     MetricsEvidenceReader,
     RegistryThresholds,
+    StaticThresholds,
 )
 from tre_controller.store.metrics_store import MetricsStore
 
@@ -123,7 +126,8 @@ def _remaining(*pods: str):
 def _machine(evidence, *, store=None, thresholds=None, remaining=("m-0",), **cfg) -> SafeScaleStateMachine:
     clock = iter(range(1_000_000, 10_000_000, 7_000))
     return SafeScaleStateMachine(
-        config=_cfg(**cfg), store=store, evidence=evidence, thresholds=thresholds,
+        config=_cfg(**cfg), store=store, evidence=evidence,
+        thresholds=thresholds if thresholds is not None else STATIC_500_75,
         wall_clock_ms=lambda: next(clock),
         remaining_pods=_remaining(*remaining) if remaining is not None else None,
     )
@@ -319,24 +323,45 @@ def test_ceiling_multiplier_and_floor_come_from_config_and_registry(tmp_path) ->
     cfg = ControllerConfig.from_env({})
     assert cfg.safescale.window_ceiling_ms == 60_000.0
     assert (cfg.safescale.min_window_ms, cfg.safescale.e2e_multiplier) == (20_000.0, 2.0)
-    assert (cfg.safescale.slo_mode, cfg.safescale.min_commit_samples) == ("labels", 20)
+    # The probe's SLO mode is the registry's one switch (repo registry: fixed, the live one).
+    assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).slo_mode() == "fixed"
+    assert cfg.safescale.min_commit_samples == 20
     assert cfg.safescale.evidence_clock_tolerance_ms == 20_000.0
     raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
-    raw["safescale"] = {"slo_mode": "fixed", "window_ceiling_s": 90, "min_commit_samples": 30,
-                        "evidence_clock_tolerance_s": 15}
+    raw["slo_mode"] = "idle_multiple"
+    raw["safescale"] = {"window_ceiling_s": 90, "min_commit_samples": 30, "evidence_clock_tolerance_s": 15}
     path = tmp_path / "r.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     tuned = ControllerConfig.from_env({
         "TRE_REGISTRY_PATH": str(path), "SAFE_SCALE_E2E_MULTIPLIER": "3", "SAFE_SCALE_WINDOW_FLOOR_MS": "25000",
     }).safescale
-    assert (tuned.window_ceiling_ms, tuned.slo_mode, tuned.min_commit_samples) == (90_000.0, "fixed", 30)
+    assert load_registry(str(path)).slo_mode() == "idle_multiple"
+    assert (tuned.window_ceiling_ms, tuned.min_commit_samples) == (90_000.0, 30)
     assert (tuned.evidence_clock_tolerance_ms, tuned.e2e_multiplier, tuned.min_window_ms) == (15_000.0, 3.0, 25_000.0)
+
+
+def test_a_legacy_registry_whose_probe_and_scorer_modes_disagree_is_refused(tmp_path) -> None:
+    # The live registry before 2026-11-04: probe safescale.slo_mode fixed, scorer / labels
+    # models[].slo.ttft_slo_mode slowdown. Two switches -> the controller refuses it.
+    raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
+    raw.pop("slo_mode")
+    raw["safescale"] = {"slo_mode": "fixed"}
+    for model in raw["models"]:
+        model["slo"]["ttft_slo_mode"] = "slowdown"
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="slo_mode"):
+        ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)})
+    raw["safescale"] = {"slo_mode": "labels"}  # agreeing legacy keys: that mode
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)})  # accepted
+    assert load_registry(str(path)).slo_mode() == "slowdown"
 
 
 def test_registry_safescale_section_parsing() -> None:
     assert parse_safescale_config(None) == SafeScaleRegistryConfig()
     assert load_registry(str(TRE_DIR / "deploy" / "registry.yaml")).safescale() == SafeScaleRegistryConfig()
-    for bad in ({"slo_mode": "median"}, {"window_ceiling_s": 0}, {"min_commit_samples": 2.5},
+    for bad in ({"window_ceiling_s": 0}, {"min_commit_samples": 2.5},
                 {"min_commit_samples": -1}, {"evidence_clock_tolerance_s": -3}):
         with pytest.raises(ValueError):
             parse_safescale_config(bad)
@@ -345,8 +370,7 @@ def test_registry_safescale_section_parsing() -> None:
 # ============================================================ 4. thresholds
 def _slo_registry(**slo) -> Registry:
     values = dict(ttft_p95_ms=800.0, tpot_p95_ms=90.0, e2e_p95_ms=12_000.0, ttft_idle_c_ms=40.0,
-                  ttft_idle_b_ms_per_token=0.05, ttft_slo_mode="slowdown", ttft_slowdown_k=5.0,
-                  ttft_floor_ms=500.0)
+                  ttft_idle_b_ms_per_token=0.05, ttft_slowdown_k=5.0, ttft_floor_ms=500.0)
     values.update(slo)
     spec = ModelSpec(
         name=MODEL, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=2, vllm_image="img",
@@ -354,38 +378,36 @@ def _slo_registry(**slo) -> Registry:
         trs=TrsParams(w_p=0.04, w_d=1.0, lambda_wait=2.0, qmin=1.0, ema_alpha=0.0, theta_m=100.0, tau_crit=0.8,
                       tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=1),
     )
-    return Registry(ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)), [spec])
+    return Registry(ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)), [spec],
+                    slo_mode="slowdown")
 
 
 def test_labels_mode_uses_the_calibration_label_rule_with_the_evidence_prompt_length() -> None:
     labels = RegistryThresholds(_slo_registry())
-    long = labels.resolve(MODEL, 4_000.0)  # 5 * (40 + 0.05 * 4000) = 1200
-    assert (long["mode"], long["ttft_ms"], long["tpot_ms"]) == ("labels", pytest.approx(1_200.0), 75.0)
+    long = labels.resolve(MODEL, 4_000.0)  # 5 * (40 + 0.05 * 4000) = 1200; TPOT = slo.tpot_p95_ms
+    assert (long["mode"], long["ttft_ms"], long["tpot_ms"]) == ("slowdown", pytest.approx(1_200.0), 90.0)
     assert labels.resolve(MODEL, 100.0)["ttft_ms"] == 500.0  # 5 * 45 = 225 -> floor 500
     assert labels.resolve(MODEL, None)["ttft_ms"] == 500.0  # L unknown -> the floor
     # The same function the theta labels use, on the shipped registry.
     shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))
     model = shipped.models()[0].name
-    assert RegistryThresholds(shipped).resolve(model, 3_000.0)["ttft_ms"] == pytest.approx(
-        label_def_for_model(model, registry=shipped).ttft_slo_ms(3_000.0)
-    )
+    for mode in ("fixed", "slowdown", "idle_multiple"):
+        assert RegistryThresholds(shipped, mode=mode).resolve(model, 3_000.0)["ttft_ms"] == pytest.approx(
+            label_def_for_model(model, mode=mode, registry=shipped).ttft_slo_ms(3_000.0)
+        )
 
 
-def test_fixed_mode_uses_models_slo_and_env_overrides_either_mode() -> None:
+def test_fixed_mode_uses_models_slo_and_an_unbuildable_slo_raises() -> None:
     fixed = RegistryThresholds(_slo_registry(), mode="fixed").resolve(MODEL, 4_000.0)
     assert (fixed["mode"], fixed["ttft_ms"], fixed["tpot_ms"]) == ("fixed", 800.0, 90.0)
-    over = RegistryThresholds(_slo_registry(), ttft_override_ms=1_234.0).resolve(MODEL, 4_000.0)
-    assert (over["ttft_ms"], over["tpot_ms"], over["source"]) == (1_234.0, 75.0, "env_override")
-    # No idle fit -> the label cannot be built: fixed values, recorded.
-    fallback = RegistryThresholds(_slo_registry(ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None)).resolve(MODEL, 1.0)
-    assert (fallback["mode"], fallback["ttft_ms"]) == ("fixed", 800.0) and "fallback" in fallback
+    # No idle fit -> the label cannot be built: no fallback to fixed values, the error propagates.
+    with pytest.raises(SloConfigError):
+        RegistryThresholds(_slo_registry(ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None)).resolve(MODEL, 1.0)
 
 
-def test_env_thresholds_are_optional_overrides() -> None:
-    assert ControllerConfig.from_env({}).safescale.ttft_p95_slo_ms is None
-    assert ControllerConfig.from_env({}).safescale.tpot_p95_slo_ms is None
-    tuned = ControllerConfig.from_env({"SAFE_SCALE_TTFT_P95_SLO_MS": "700", "SAFE_SCALE_TPOT_P95_SLO_MS": "80"})
-    assert (tuned.safescale.ttft_p95_slo_ms, tuned.safescale.tpot_p95_slo_ms) == (700.0, 80.0)
+def test_static_thresholds_resolve_the_same_values_for_every_model() -> None:
+    record = StaticThresholds(700.0, 80.0).resolve(MODEL, 4_000.0)
+    assert (record["mode"], record["ttft_ms"], record["tpot_ms"], record["source"]) == ("static", 700.0, 80.0, "static")
 
 
 def test_the_gate_judges_evidence_against_the_labels_threshold_of_its_prompt_length() -> None:
@@ -396,7 +418,7 @@ def test_the_gate_judges_evidence_against_the_labels_threshold_of_its_prompt_len
     labels.observe(MODEL, _obs(110_000), now_ms=110_000)
     decision = labels.observe(MODEL, _obs(120_000), now_ms=120_000)
     assert decision.status == "commit"
-    assert (decision.details["threshold_mode"], decision.details["mean_prompt_tokens"]) == ("labels", 4_000.0)
+    assert (decision.details["threshold_mode"], decision.details["mean_prompt_tokens"]) == ("slowdown", 4_000.0)
     assert decision.details["ttft_threshold_ms"] == pytest.approx(1_200.0)
     fixed = _machine(FakeEvidence([_window(50, ttft=1_000.0, prompt_tokens=200_000.0, prompt_count=50.0)]),
                      thresholds=RegistryThresholds(_slo_registry(), mode="fixed"))
@@ -648,7 +670,7 @@ def test_a_restored_probe_keeps_its_late_window_base() -> None:
     store = FakeProbeStore()
     machine = _machine(FakeEvidence([_window(50)], anchor=late), store=store)
     probe = _started(machine)
-    restored = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]]),
+    restored = SafeScaleStateMachine(thresholds=STATIC_500_75, config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]]),
                                      evidence=FakeEvidence([_window(50)]))
     assert restored.restore() == 1
     again = restored.active_probe(MODEL)
@@ -776,6 +798,7 @@ def test_a_restored_probe_keeps_its_anchor_extensions_and_deduplicated_observati
     # An older controller journalled one entry per 2 s tick: duplicate it.
     store.journal[probe.request_id].append(dict(store.journal[probe.request_id][-1]))
     restored = SafeScaleStateMachine(
+        thresholds=STATIC_500_75,
         config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]],
                                             journal=store.journal), evidence=FakeEvidence([_window(50)])
     )
@@ -841,3 +864,45 @@ def test_the_observation_tick_emits_the_evidence_and_rollback_reason_events() ->
                for event in result.events)
     assert any(event.startswith("safescale_rollback_reason:m:formal_commit_gate_failed:latency")
                for event in result.events)
+
+
+@pytest.mark.parametrize("mode", ["fixed", "idle_multiple"])
+def test_the_app_probe_thresholds_come_from_the_registry(tmp_path, mode) -> None:
+    """re-review 2026-11-04: the controller built from a registry judges probes with that registry's
+    slo_mode and models[].slo (no built-in threshold, no env override)."""
+    from test_controller_app import EmptyRedis
+    from tre_controller.app import create_controller_dependencies
+
+    raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
+    raw["slo_mode"] = mode
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    reg = load_registry(str(path))
+    deps = create_controller_dependencies(ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(path)}),
+                                          redis_client=EmptyRedis())
+    for model in ("dsqwen-7b", "dsqwen-14b"):
+        want = reg.slo_thresholds(model)
+        for length in (256.0, 4096.0):
+            got = deps.safescale._thresholds_for(model, length)
+            assert (got["mode"], got["source"]) == (mode, "registry")
+            assert (got["ttft_ms"], got["tpot_ms"]) == (want.ttft_ms(length), want.tpot_ms)
+
+
+def test_a_threshold_error_never_commits_the_probe() -> None:
+    """re-review 2026-11-04: _thresholds_for has no fallback; a resolver error propagates out of the judge,
+    so the commit gate is never passed on it (the same evidence commits with a working resolver, above)."""
+    class Broken:
+        def resolve(self, model, mean_prompt_tokens):
+            raise SloConfigError(f"{model}: no thresholds")
+
+    machine = _machine(FakeEvidence([_window(50)]), thresholds=Broken())
+    _started(machine)
+    raised = 0
+    for ts in (110_000, 120_000):   # the commit deadline is 120 s
+        try:
+            decision = machine.observe(MODEL, _obs(ts), now_ms=ts)
+        except SloConfigError:
+            raised += 1
+            continue
+        assert decision.status != "commit", decision
+    assert raised and machine.active_probe(MODEL).status == "probing"     # not committed, not resolved

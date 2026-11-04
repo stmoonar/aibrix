@@ -1,0 +1,6 @@
+registry_id	file	file_sha256	source (live-registry.yaml of an arm)	runs (arm count)
+f75155148eba1e61	f75155148eba1e61.yaml	1aed1d95605b98b68f50e327b59ae84b2237e452917e1ed2fd12698201595e6b	campaign-tre-rerun-r3e-20261103-run/Alternating_hot_model_periodic_A_s1/tre/live-registry.yaml	campaign-tre-rerun-r3e-20261103(5)
+0ab5352747bdd70e	0ab5352747bdd70e.yaml	eae6e7e2a6655617d6e90a54efb528dbb25f9294bfa5f08e977bf26c326db3ff	campaign-bl-rep2-r3e-20261103-run/Alternating_hot_model_periodic_A_s1/apa/live-registry.yaml	campaign-bl-rep2-r3e-20261103(14)
+ee3712855753d0e8	ee3712855753d0e8.yaml	e15ba705f7a377d5da6bb759afabb41c06f52b864a199934e2822e1f33892dc2	campaign-icse-r3c-full-D-20261101-run/Alternating_hot_model_periodic_A_s1/tre/live-registry.yaml	campaign-icse-r3c-full-D-20261101(12)
+5028a1209a5fe38d	5028a1209a5fe38d.yaml	5c5c36277c3466514b6f651e846e9234be13ea1ee949f0a3d2ef186b1c6ad868	campaign-icse-ktrace-20261031-run/Alternating_hot_model_periodic_A_s1/tre/live-registry.yaml	campaign-icse-ktrace-20261031(29)
+f3ac339a6e5de9be	f3ac339a6e5de9be.yaml	d2d23949fcc22e0dafa5b96913b6974fc1003ae5c5521517d0d05738a10f0630	campaign-icse-r3e-full-20261101-run/Real_code_2024_slice_a_tok70_s1/tre/live-registry.yaml	campaign-icse-r3e-full-20261101(9),campaign-icse-r3c-full-F-20261101(3),campaign-icse-ktrace-full-F-20261101(4)

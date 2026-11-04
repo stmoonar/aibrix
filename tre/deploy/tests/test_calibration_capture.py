@@ -1039,7 +1039,7 @@ def test_finalize_run_backfills_pending_cells_with_the_given_or_default_redis(tm
     monkeypatch.setattr(cc, "pending_cells", lambda root, **kw: pending["cells"])
     monkeypatch.setattr(cc, "backfill_pending", lambda root, client, **kw: calls.append((root, kw)) or [])
     monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, url: urls.append(url) or object()))
-    monkeypatch.setattr("scripts.calibration_dataset.build_dataset", lambda d: d)
+    monkeypatch.setattr("scripts.calibration_dataset.build_dataset", lambda d, **kw: d)
     campaign.finalize_run(tmp_path, status="complete", exit_code=0)
     assert calls == []  # nothing pending: redis is not touched
     pending["cells"] = [tmp_path]

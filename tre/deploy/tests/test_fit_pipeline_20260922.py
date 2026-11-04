@@ -94,7 +94,8 @@ def test_rewindow_reads_the_failures_sidecar_and_marks_the_windows(tmp_path: Pat
 
     argv = ["rewindow_from_raw", "--model", MODEL, "--raw-dir", str(raw), "--output", str(out),
             "--window-ms", "30000", "--step-ms", "5000", "--instant-grid", "live",
-            "--instant-sample-ms", "10000", "--min-latency-samples", "0", "--registry", str(REGISTRY)]
+            "--instant-sample-ms", "10000", "--min-latency-samples", "0", "--registry", str(REGISTRY),
+            "--ttft-slo-mode", "slowdown"]
     with mock.patch.object(sys, "argv", argv):
         assert rw.main() == 0
     rows = list(csv.DictReader(out.open()))
@@ -173,7 +174,7 @@ def test_theta_verdict_and_holdout_run_end_to_end(tmp_path: Path) -> None:
     ]) == 0
     verdict = json.loads(out.read_text())
     assert verdict["label_def"]["e2e"] == "excluded"
-    assert verdict["tss"]["ema_tau_ms"] == 20000.0
+    assert verdict["tss"]["ema_tau_ms"] is None  # the default tau is 0 = raw, recorded as no EMA (as the deployed registry)
     assert verdict["merged"]["delta_crit"]["method"] == "ba_grid"
     assert verdict["family_verdict"]["publish"] in ("merged", "max_family")
     assert set(verdict["stop_rule"]) >= {"satisfied", "reasons"}

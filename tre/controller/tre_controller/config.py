@@ -40,6 +40,11 @@ LOG = logging.getLogger(__name__)
 #: still sets the variable gets one warning and the value is ignored.
 REMOVED_ENV_VARS = ("ENABLE_TRE_SCALING",)
 
+#: Removed 2026-11-04: the SafeScale probe's threshold overrides. The thresholds are the
+#: registry's (top-level slo_mode + models[].slo, tre_common.slo) like every other
+#: consumer's; a Deployment that still sets one (any non-empty value) is refused.
+REMOVED_SLO_OVERRIDE_ENV = ("SAFE_SCALE_TTFT_P95_SLO_MS", "SAFE_SCALE_TPOT_P95_SLO_MS")
+
 
 def _warn_removed_env(values: Mapping[str, str]) -> None:
     for name in REMOVED_ENV_VARS:
@@ -73,12 +78,9 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
 @dataclass(frozen=True)
 class SafeScaleConfig:
-    # Optional OVERRIDES of the probe's latency thresholds (env SAFE_SCALE_TTFT_P95_SLO_MS /
-    # SAFE_SCALE_TPOT_P95_SLO_MS, unset by default). None = the registry decides
-    # (safescale.slo_mode: labels -> tre_common.slo_labels rule, fixed -> models[].slo);
-    # without a registry resolver (direct constructions) None means 500 / 75 ms.
-    ttft_p95_slo_ms: float | None = None
-    tpot_p95_slo_ms: float | None = None
+    # The probe's latency thresholds are not configuration here (2026-11-04): the registry's
+    # top-level slo_mode and models[].slo blocks (tre_common.slo, planning.safescale_evidence.
+    # RegistryThresholds); the env overrides SAFE_SCALE_TTFT_P95_SLO_MS / _TPOT_ were removed.
     # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).
     # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The latency part of
     # the commit gate reads an evidence window that starts at the first gateway boundary
@@ -93,10 +95,10 @@ class SafeScaleConfig:
     # Never below min_window_ms (calc_probe_window_details raises it to the floor).
     # None = no ceiling and no deadline extension (direct constructions only).
     window_ceiling_ms: float | None = 60_000.0
-    # Registry safescale.slo_mode (labels | fixed), min_commit_samples and
-    # evidence_clock_tolerance_s (ms here). Round 4: no evidence period here - the Redis
-    # evidence path's doc grid is the store's (store.evidence_grid.EvidenceGrid).
-    slo_mode: str = "labels"
+    # Registry safescale.min_commit_samples / evidence_clock_tolerance_s (ms here). The SLO
+    # mode is not kept here: Registry.slo_mode() is its one copy (2026-11-04). Round 4: no
+    # evidence period here - the Redis evidence path's doc grid is the store's
+    # (store.evidence_grid.EvidenceGrid).
     min_commit_samples: int = 20
     evidence_clock_tolerance_ms: float = 20_000.0
     # Registry safescale.evidence_source / evidence_poll_s / scrape_timeout_s /
@@ -204,7 +206,6 @@ class ControllerConfig:
     #: shrink probe; a HIGH donor for a receiver is released at once) or ``off``.
     #: ``ablation_disable_safescale`` is ``safescale_scope == "off"``.
     safescale_scope: str
-    disable_eta_gate: bool
     orphan_scan_enabled: bool
     orphan_grace_s: float
     # t1: suppress the receiver-less proactive scale-down probe on hot (HIGH) donors
@@ -285,6 +286,30 @@ class ControllerConfig:
                 "TRE_ABLATION_DISABLE_FAST_LOOP was removed (2026-10-08); "
                 "TRE_ABLATION_DISABLE_SLOW_LOOP is the remaining loop ablation (no rebalance section)"
             )
+        # 2026-11-02 (user decision): eta and its gate were removed; every arm, alt-signal arms
+        # included, orders donors IDLE first, then Z descending. Parsed like any switch
+        # (_get_bool: an unknown value is an error). "true" asked for the removed name order,
+        # so it fails closed; "false" (old TSS-arm specs, a runner reset) is the only behaviour
+        # left: one warning, the value is ignored.
+        if _get_bool(values, "TRE_DISABLE_ETA_GATE", False):
+            raise ValueError(
+                "TRE_DISABLE_ETA_GATE was removed (2026-11-02): donors are ordered IDLE first, then Z "
+                "descending on every arm, alt-signal arms included; remove it from the Deployment"
+            )
+        # 2026-11-04: the probe's thresholds come from the registry only (tre_common.slo, one
+        # definition for every consumer); the two env overrides were removed. Any value fails
+        # closed - it asked for thresholds the scorer does not use.
+        for removed in REMOVED_SLO_OVERRIDE_ENV:
+            if str(values.get(removed, "")).strip():
+                raise ValueError(
+                    f"{removed} was removed (2026-11-04): the SafeScale thresholds are the registry's "
+                    f"(slo_mode + models[].slo, tre_common.slo); remove it from the Deployment"
+                )
+        if "TRE_DISABLE_ETA_GATE" in values:
+            LOG.warning(
+                "TRE_DISABLE_ETA_GATE=%r is ignored (removed 2026-11-02): donors are ordered IDLE first, "
+                "then Z descending on every arm; remove it from the Deployment", values.get("TRE_DISABLE_ETA_GATE")
+            )
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"
         default_state_dir = repo_tre_dir / ".runtime"
@@ -341,15 +366,13 @@ class ControllerConfig:
         if metrics_phase_offset_ms >= evidence_period_ms:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below TRE_EVIDENCE_PERIOD_MS")
 
+        _check_registry_slo_mode(registry_path)
         safescale_registry = _safescale_registry(registry_path)
         scaling_registry = _scaling_registry(registry_path)
         safescale = SafeScaleConfig(
-            ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
-            tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
             min_window_ms=_safescale_window_floor_ms(values),
             e2e_multiplier=_get_positive_float(values, "SAFE_SCALE_E2E_MULTIPLIER", 2.0),
             window_ceiling_ms=float(safescale_registry.window_ceiling_s) * 1000.0,
-            slo_mode=safescale_registry.slo_mode,
             min_commit_samples=int(safescale_registry.min_commit_samples),
             evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
             evidence_source=safescale_registry.evidence_source,
@@ -374,21 +397,12 @@ class ControllerConfig:
             ),
         )
 
-        # 2026-10-28 (user decision): 20 s (was 30 s). The registry's thetas are window
+        # 2026-11-03 (user decision): 10 s (20 s from 2026-10-28, 30 s before) = the window the
+        # live registry and the repo registry are stamped for. The registry's thetas are window
         # token totals fitted on one window: their trs.theta_window_ms must equal this
         # (checked at start, tre_common.tss.theta_basis_errors).
-        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 20_000)
+        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 10_000)
         _validate_signal_thresholds(registry_path, signal_source, window_ms=metrics_window_ms)
-        disable_eta_gate = _get_bool(values, "TRE_DISABLE_ETA_GATE", False)
-        if signal_source != "zm" and not disable_eta_gate:
-            # Signal ablation (plan docs/v2-ablation-sensitivity-gap-20261028.md section 8, v1
-            # D31): only the signal changes on an alt arm; the eta gate and the waste ranking
-            # are TSS machinery (token efficiency) and are off there. An alt arm with the gate
-            # on would compare signal + gate, so it is refused, not silently corrected.
-            raise ValueError(
-                f"TRE_SIGNAL_SOURCE={signal_source} requires TRE_DISABLE_ETA_GATE=true "
-                f"(got TRE_DISABLE_ETA_GATE=false): the eta gate is off on every alt-signal arm"
-            )
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
         # Round 5: the former N2 warning (a commit-gate tail of hq x W could read metrics
@@ -439,7 +453,6 @@ class ControllerConfig:
             ablation_disable_slow_loop=_get_bool(values, "TRE_ABLATION_DISABLE_SLOW_LOOP", False),
             ablation_disable_safescale=_safescale_scope(values) == SAFESCALE_SCOPE_OFF,
             safescale_scope=_safescale_scope(values),
-            disable_eta_gate=disable_eta_gate,
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),
             orphan_grace_s=_get_positive_float(values, "TRE_ORPHAN_GRACE_S", 600.0),
             safescale_suppress_hot_proactive=_get_bool(
@@ -566,10 +579,28 @@ def _get_span_ms(
     return value
 
 
+def _check_registry_slo_mode(registry_path: str) -> None:
+    """Refuse a registry whose SLO definition is ambiguous: a legacy registry (no
+    ``slo_mode``) whose two retired keys disagree - the probe obeyed ``safescale.slo_mode``,
+    the scorer and the labels ``models[].slo.ttft_slo_mode`` - (set ``slo_mode``: release
+    step, params_set.py --set slo_mode=...). The mode itself is read from the registry
+    (Registry.slo_mode()), not kept in the config. An unreadable registry only warns here
+    (the controller's own load fails right after)."""
+    try:
+        resolution = load_registry(registry_path).slo_mode_resolution()
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - load_registry fails loudly later on
+        LOG.warning("registry %s unreadable (%r)", registry_path, exc)
+        return
+    if resolution.legacy_conflict:
+        raise ValueError(f"registry {registry_path}: {resolution.legacy_conflict}")
+
+
 def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
-    """The registry ``safescale:`` section (window ceiling, threshold mode, minimum
+    """The registry ``safescale:`` section (window ceiling, minimum
     commit samples, evidence clock tolerance). A registry without the section gets the
-    built-in defaults (60 s, labels, 20, 20 s). A section with invalid values refuses
+    built-in defaults (60 s, 20, 20 s). A section with invalid values refuses
     the start (ValueError from the parser); an unreadable registry file only warns here
     (the controller's own registry load fails right after)."""
     try:
@@ -690,13 +721,6 @@ def _get_positive_float(env: Mapping[str, str], key: str, default: float) -> flo
     if value <= 0.0:
         raise ValueError(f"{key} must be positive")
     return value
-
-
-def _get_optional_positive_float(env: Mapping[str, str], key: str) -> float | None:
-    """A positive float when ``key`` is set (non-empty), else None."""
-    if env.get(key) in (None, ""):
-        return None
-    return _get_positive_float(env, key, 1.0)
 
 
 def _get_nonneg_float(env: Mapping[str, str], key: str, default: float) -> float:

@@ -78,7 +78,7 @@ spec:
             # evidence step. The metrics window must be a multiple of both.
             # 2026-10-28: 1 s (was 2 s; code default still 2 s): one snapshot per second,
             # so the 5 s rescue / 10 s rebalance sections land exactly on the grid, and
-            # the windows match the theta calibration (1 Hz counters, 20 s windows).
+            # the windows match the theta calibration (1 Hz counters; 10 s windows since 2026-11-03).
             # Changes together with the gateway's value (else every snapshot is stale).
             - name: TRE_INSTANT_SAMPLE_INTERVAL_MS
               value: "500"
@@ -130,12 +130,18 @@ spec:
             # noise, so a shorter window stays usable). Every model's registry
             # trs.theta_window_ms must equal this - the controller refuses to start
             # otherwise (thetas are window token totals).
+            # 2026-11-03 (user decision): 10 s. The live Deployment has run with 10 s since the
+            # 2026-10-31 w10refit publication (every TRE and baseline run of the 10-31 .. 11-03
+            # campaigns); the overlay now says so. The bootstrap registry (deploy/registry.yaml,
+            # overlays/tre-v2/params.yaml) stamps theta_window_ms 10000 with the live 10 s thetas
+            # (deploy/tests/test_kustomize_overlays.py keeps the two equal). A registry with another
+            # theta_window_ms makes this controller refuse to start.
             - name: TRE_METRICS_WINDOW_MS
-              value: "20000"
-            # SafeScale latency thresholds come from the registry (safescale.slo_mode,
-            # 2026-09-29): SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS are
-            # optional overrides and deliberately NOT set here. (Older images default
-            # to the same 500 / 75 ms without them.)
+              value: "10000"
+            # SafeScale latency thresholds come from the registry only (top-level slo_mode +
+            # models[].slo, tre_common.slo; 2026-11-04). The env overrides
+            # SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS were removed: this
+            # controller refuses to start when either is set.
             # A6: probe window W = min(max(E2E_MULTIPLIER * p95_e2e, WINDOW_FLOOR_MS), W_max),
             # W_max = registry safescale.window_ceiling_s (60 s). Missing p95_e2e
             # -> W = WINDOW_FLOOR_MS. The latency gate reads the post-hide evidence
