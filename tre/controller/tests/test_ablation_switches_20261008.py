@@ -108,8 +108,8 @@ def _two_donor_plan(relay_holds=None):
         },
         classifications=[
             _cls("r", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-            _cls("h1", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
-            _cls("h2", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+            _cls("h1", ModelState.HIGH, ModelRole.DONOR, 1.4),
+            _cls("h2", ModelState.HIGH, ModelRole.DONOR, 1.4),
         ],
         model_replicas={"r": 0, "h1": 2, "h2": 2},
         idle_gpus=0,

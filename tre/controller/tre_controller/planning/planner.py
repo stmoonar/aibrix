@@ -12,7 +12,7 @@ from tre_controller.planning.classify import (
     ModelClassification,
     ModelRole,
     ModelState,
-    donor_mock_cost_key,
+    donor_sort_key,
     receiver_sort_key,
 )
 from tre_common.gpu_placement import (
@@ -68,7 +68,6 @@ class PlanConfig:
     # hold (a rolled-back model is re-probed only on new evidence, timer cleanup 2026-10-02).
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
     suppress_hot_proactive_probe: bool = False
-    disable_eta_gate: bool = False
     # No SafeScale (TRE_ABLATION_DISABLE_SAFESCALE, 2026-10-08; set by the tick when it has
     # no SafeScale controller): a middle-zone / HIGH donor for a receiver is planned as
     # an immediate relay (reason suffix ``_nosafescale``) through the same gates as an
@@ -577,11 +576,8 @@ def build_plan(
     high_models = [item for item in classifications if item.state == ModelState.HIGH]
     idle_models = [item for item in classifications if item.state == ModelState.IDLE]
     paper_donors = [item for item in classifications if item.role == ModelRole.DONOR]
-    paper_donors.sort(
-        key=lambda item: donor_mock_cost_key(
-            item, disable_eta_gate=cfg.disable_eta_gate
-        )
-    )
+    # 2026-11-02: one donor order on every arm (IDLE, then Z descending, then name); no eta.
+    paper_donors.sort(key=donor_sort_key)
     middle_zone = [
         item
         for item in classifications

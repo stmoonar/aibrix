@@ -325,7 +325,7 @@ def load_arm(path: str, clock_offsets: dict[str, float] | None = None,
             arm.signal.append({"ts": ts, "model": r.get("model"),
                                **{k: _num(r.get(k)) for k in ("z_m", "z", "tss", "theta_m", "queue_len",
                                                              "decode_tps", "prefill_tps", "replicas_awake",
-                                                             "replicas_target", "raw_signal", "eta_m")},
+                                                             "replicas_target", "raw_signal")},
                                "tier": r.get("tier"), "action": r.get("action"),
                                "signal_source": r.get("signal_source")})
     else:

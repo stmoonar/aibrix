@@ -68,7 +68,6 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
             "trs_raw": None,
             "q_ctl": None,
             "y_m": None,
-            "eta_m": None,
             "theta_m": None,
             "routable_pods": None,
             "assigned_replicas": None,

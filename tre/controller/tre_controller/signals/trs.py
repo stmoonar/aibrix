@@ -88,7 +88,6 @@ class TRSResult:
     Q_ctl: float
     TRS_raw: float
     TRS: float
-    eta_m: float | None
     Z_m: float | None
     ema_alpha: float
     prev_Y: float | None = None
@@ -206,7 +205,6 @@ class TRSComputer:
         )
         trs_raw = terms.raw if terms.raw is not None else 0.0
         trs = smoothed if defined and smoothed is not None else 0.0
-        eta = compute_eta_m(trs, effective_pods)
         z_m = compute_z_m(trs, theta_m) if defined else None
         saved_prev_y = self._prev_Y
         saved_prev_q_ctl = self._prev_Q_ctl
@@ -219,7 +217,6 @@ class TRSComputer:
             Q_ctl=q_ctl,
             TRS_raw=trs_raw,
             TRS=trs,
-            eta_m=eta,
             Z_m=z_m,
             ema_alpha=self.ema_alpha,
             prev_Y=saved_prev_y,
@@ -285,16 +282,6 @@ def _is_finite_positive(value: float) -> bool:
     if value == 0:
         return False
     return True
-
-
-def compute_eta_m(trs: float, routable_pods: int | float) -> float | None:
-    if not _is_finite_positive(trs):
-        return None
-    try:
-        effective_pods = max(1.0, float(routable_pods))
-    except (TypeError, ValueError):
-        effective_pods = 1.0
-    return trs / effective_pods
 
 
 def compute_z_m(trs: float, theta_m: float | None) -> float | None:

@@ -22,7 +22,7 @@ SIGNAL_LOG_FIELDS = (
     "replicas_awake",
     "replicas_target",
     "tier",
-    "eta_m",
+    # 2026-11-02: eta_m dropped with eta (controller signal_log.SIGNAL_LOG_FIELDS).
     "action",
 )
 SIGNAL_LOG_KEY = "tre:v2:controller:signal_log"

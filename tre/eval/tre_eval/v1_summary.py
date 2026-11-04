@@ -79,6 +79,7 @@ def _setting(arm_dir: str) -> str:
     sig = env.get("TRE_SIGNAL_SOURCE")
     if sig:
         parts.insert(0, f"signal={sig}")
+    # arms run before 2026-11-02 (eta removed; campaign.py now refuses the switch): their manifests keep it
     if str(env.get("TRE_DISABLE_ETA_GATE", "false")).lower() == "true":
         parts.append("eta gate off")
     return "; ".join(parts)

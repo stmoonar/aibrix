@@ -35,7 +35,7 @@ from plan_shim import LegacyFakeQueue as ActionQueue  # pre-plan fakes behind PO
 TAU = TauThresholds.from_control()  # tau_crit 0.8, tau_low 1.0, tau_high 1.25
 
 
-def _cls(model, state, z, role=None, tier=None):
+def _cls(model, state, z, role=None):
     role = role or {
         ModelState.CRITICAL: ModelRole.RECEIVER,
         ModelState.LOW: ModelRole.RECEIVER,
@@ -43,8 +43,8 @@ def _cls(model, state, z, role=None, tier=None):
         ModelState.IDLE: ModelRole.DONOR,
     }.get(state, ModelRole.NEUTRAL)
     return ModelClassification(
-        model_name=model, state=state, role=role, Z_m=z, eta_m=None, trs=0.0,
-        theta_m=1.0, tau=TAU, donor_tier=tier,
+        model_name=model, state=state, role=role, Z_m=z, trs=0.0,
+        theta_m=1.0, tau=TAU,
     )
 
 
@@ -92,10 +92,10 @@ def test_idle_donor_gives_the_step_at_once_and_a_high_donor_only_a_probe():
     """F1-B (2026-10-07): an IDLE donor gives the receiver's step at once (Q3 2026-10-06:
     an idle window is evidence at any replica count); a HIGH donor gives it only through
     a SafeScale probe (the receiver's replica comes with the commit)."""
-    idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
+    idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0)]
     view = pool_view({"r": 3, "i": 4}, receivers=("r",))
     assert _deltas(_plan(idle, {"r": 3, "i": 4}, cluster_view=view)) == {"r": 1, "i": -1}  # one step per plan
-    high = [_cls("r", ModelState.CRITICAL, 0.4), _cls("d", ModelState.HIGH, 2.5, tier="surplus")]
+    high = [_cls("r", ModelState.CRITICAL, 0.4), _cls("d", ModelState.HIGH, 2.5)]
     plan = _plan(high, {"r": 2, "d": 4})
     assert _deltas(plan) == {"d": -1}
     assert [a.requires_safescale for a in plan.actions if a.model == "d"] == [True]

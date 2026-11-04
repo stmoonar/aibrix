@@ -29,7 +29,7 @@ def _same_slot_plan(high_replicas: int, *, low_replicas: int = 1):
     classifications = [
         _cls("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _cls("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _cls("high", ModelState.HIGH, ModelRole.DONOR, 1.4),
     ]
     contexts = {
         "tp2": {"assigned_replicas": 0, "routable_pods": 0},

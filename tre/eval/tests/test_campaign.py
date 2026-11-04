@@ -751,7 +751,7 @@ def test_ablation_arm_passes_its_controller_switch_and_other_arms_pass_none(tmp_
     ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SCOPE": "off", "TRE_ABLATION_DISABLE_SAFESCALE": False}},
      "contradicts"),
     ({"base": "tre", "controller_env": {"TRE_SIGNAL_SOURCE": "tss"}}, "must be one of"),
-    ({"base": "tre", "controller_env": {"TRE_DISABLE_ETA_GATE": "off"}}, "true or false"),
+    ({"base": "tre", "controller_env": {"TRE_DISABLE_ETA_GATE": True}}, "removed 2026-11-02"),
     ({"base": "tre", "controller_env": {"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "yes"}}, "true or false"),
 ])
 def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, bad, match):
@@ -762,13 +762,16 @@ def test_controller_env_is_refused_outside_tre_or_the_known_switches(tmp_path, b
 
 def test_controller_env_keys_are_one_list_in_campaign_and_both_shell_scripts():
     """run_arm_pilot.sh sets / checks and reset_canonical.sh restores exactly campaign.CONTROLLER_ENV_KEYS, with
-    the same defaults (TRE_SIGNAL_SOURCE back to zm = unset, TRE_DISABLE_ETA_GATE back to false); the runner
-    accepts every signal source the controller knows."""
+    the same defaults (TRE_SIGNAL_SOURCE back to zm = unset); the runner accepts every signal source the controller
+    knows."""
     import re
     for f in ("run_arm_pilot.sh", "reset_canonical.sh"):
         txt = (RUNNER / f).read_text()
         keys = re.search(r'(?m)^CTL_ENV_KEYS="([^"]+)"', txt).group(1).split()
         assert tuple(keys) == C.CONTROLLER_ENV_KEYS, f
+        # 2026-11-02: the removed keys are unset from the Deployment by both scripts
+        removed = re.search(r'(?m)^CTL_REMOVED_KEYS="([^"]+)"', txt).group(1).split()
+        assert tuple(removed) == C.REMOVED_CONTROLLER_ENV_KEYS, f
         assert "TRE_SIGNAL_SOURCE) echo zm ;;" in txt and "TRE_SAFESCALE_SCOPE) echo all ;;" in txt, f
     sh = re.search(r"TRE_SIGNAL_SOURCE\) case \"\$2\" in ([a-z0-9_|]+)\)", (RUNNER / "run_arm_pilot.sh").read_text())
     assert set(sh.group(1).split("|")) == set(C.SIGNAL_SOURCES)
@@ -788,12 +791,21 @@ def test_suppress_hot_proactive_switch_is_accepted_as_a_bool(tmp_path):
 
 def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):
     extra = {"arm_defs": {"sig-queue": {"base": "tre", "controller_env": {
-        "TRE_SIGNAL_SOURCE": "queue_len", "TRE_DISABLE_ETA_GATE": True, "TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}}}
+        "TRE_SIGNAL_SOURCE": "queue_len", "TRE_SAFESCALE_SCOPE": "receiverless_shrink"}}}}
     deps = EnvDeps()
     camp = campaign(tmp_path, deps, cfg={"traces": ["Alternating"], "arms": ("sig-queue",), "extra": extra})
     assert camp.run() == 0
-    assert deps.envs == {"Alternating_s1/sig-queue": "TRE_DISABLE_ETA_GATE=true TRE_SAFESCALE_SCOPE=receiverless_shrink "
-                                                     "TRE_SIGNAL_SOURCE=queue_len"}
+    assert deps.envs == {"Alternating_s1/sig-queue": "TRE_SAFESCALE_SCOPE=receiverless_shrink TRE_SIGNAL_SOURCE=queue_len"}
+
+
+def test_an_old_spec_with_the_removed_eta_gate_switch_false_still_plans(tmp_path):
+    """2026-11-02: TRE_DISABLE_ETA_GATE was removed from the controller. An old TSS-arm spec's false (the only
+    behaviour left) is dropped before the run; true fails the spec check (parametrized above)."""
+    extra = {"arm_defs": {"x": {"base": "tre", "controller_env": {"TRE_SIGNAL_SOURCE": "zm",
+                                                                  "TRE_DISABLE_ETA_GATE": False}}}}
+    c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra=extra))
+    plan = C.build_plan(c)
+    assert C.arm_def(c, plan[0].arm).controller_env == {"TRE_SIGNAL_SOURCE": "zm"}
 
 
 class RegDeps(FakeDeps):
@@ -947,7 +959,7 @@ def test_trace_set_is_one_setting_switchable_from_the_environment(tmp_path):
 
 def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
     """The shipped 10-28 specs: (A) Tight_pool / Simul_spike / Real_conv x {TSS, queue, ttft_mean, kv_usage}, SafeScale
-    receiverless_shrink everywhere, the eta gate off exactly on the alternative-signal arms; (B) Simul_spike /
+    receiverless_shrink everywhere, no eta switch (removed 2026-11-02); (B) Simul_spike /
     Real_conv x {base, theta / lambda / w_p / tau x0.8 x1.2, WP-ABS1}, one parameter per arm. Both pin
     registry_expect.registry_id to the published recalibrated registry (one id for both), and the A spec requires the
     refitted alt thresholds of its three signals."""
@@ -957,9 +969,9 @@ def test_signal_ablation_and_sensitivity_campaign_plans(tmp_path):
     assert [e.trace for e in C.resolve_traces(a)] == ["Tight_pool", "Simul_spike", "Real_conv"] and len(plan) == 12
     envs = {i.arm: C.arm_def(a, i.arm).controller_env for i in plan}
     assert all(e["TRE_SAFESCALE_SCOPE"] == "receiverless_shrink" for e in envs.values())
-    assert {k: (e["TRE_SIGNAL_SOURCE"], e["TRE_DISABLE_ETA_GATE"]) for k, e in envs.items()} == {
-        "sig-tss": ("zm", "false"), "sig-queue": ("queue_len", "true"), "sig-ttft": ("ttft_mean", "true"),
-        "sig-kv": ("kv_usage", "true")}
+    assert {k: e["TRE_SIGNAL_SOURCE"] for k, e in envs.items()} == {
+        "sig-tss": "zm", "sig-queue": "queue_len", "sig-ttft": "ttft_mean", "sig-kv": "kv_usage"}
+    assert not any("TRE_DISABLE_ETA_GATE" in e for e in envs.values())
     assert len({i.arm for i in plan if i.position == 1}) == 3 and a["report"]["ref"] == "sig-tss"
     assert {p.split(".")[2] for p in a["registry_expect"]["present"] if ".alt_thresholds." in p} == {
         "queue_len", "ttft_mean", "kv_usage"}
