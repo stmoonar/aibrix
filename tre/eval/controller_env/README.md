@@ -28,8 +28,8 @@ not tested (the fake models it).
 | `controller-env-20261103-live.env` | campaign-bl-rep2-r3e-20261103, campaign-tre-rerun-r3e-20261103 | 20261102-420c69ef |
 
 The two files differ in one value: `TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE` `0` vs `false` (same meaning). The runner-managed switches
-(`TRE_SAFESCALE_SCOPE`, `TRE_SIGNAL_SOURCE`, `TRE_ABLATION_*`, `TRE_DISABLE_ETA_GATE`, `TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE`;
-`campaign.py` CONTROLLER_ENV_KEYS) are written per arm from the spec's `arm_defs.<arm>.controller_env` and put back to the canonical value
+(`TRE_SAFESCALE_SCOPE`, `TRE_SIGNAL_SOURCE`, `TRE_ABLATION_*`, `TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE`;
+`campaign.py` CONTROLLER_ENV_KEYS; `TRE_DISABLE_ETA_GATE` was one of them until eta was removed, see below) are written per arm from the spec's `arm_defs.<arm>.controller_env` and put back to the canonical value
 afterwards; the files hold the canonical state between arms.
 
 ## Live env against `deploy/overlays/tre-v2/controller.yaml` (main + the 11-03 window change)
@@ -38,7 +38,7 @@ afterwards; the files hold the canonical state between arms.
 |---|---|---|---|---|
 | `TRE_METRICS_WINDOW_MS` | 10000 | 10000 (was 20000 until 11-03) | yes, default 10000 (20000 until 11-03) | real: the TSS window; must equal every model's `trs.theta_window_ms` |
 | `TRE_ACTION_COOLDOWN` | 1 | absent | no: in `REMOVED_TIMER_ENV`, logged once and ignored since 10-29 (TSS-only release) | none (leftover on the live Deployment) |
-| `TRE_DISABLE_ETA_GATE` | false | absent | yes (`_get_bool`, default false) | none for `TRE_SIGNAL_SOURCE=zm` (false is the default; it must be true for the alt-signal arms); written `false` by the runner's reset |
+| `TRE_DISABLE_ETA_GATE` | false | absent | yes (`_get_bool`, default false) | none for `TRE_SIGNAL_SOURCE=zm` (false is the default; it must be true for the alt-signal arms); written `false` by the runner's reset. Removed with eta (chore/remove-eta-20261102): a controller built after that removal logs a warning and ignores `false`, refuses to start on `true`; the runner unsets it (`REMOVED_CONTROLLER_ENV_KEYS` / `CTL_REMOVED_KEYS`). The files above are records of the earlier runs and keep it |
 | `TRE_SIGNAL_SOURCE` | unset | zm | yes, default `zm` | none (unset = zm; the runner's canonical state is unset) |
 | `TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE` | false (0 before 11-02) | "0" | yes (`_get_bool`) | none (0 and false are both false) |
 

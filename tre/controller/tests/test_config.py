@@ -217,7 +217,7 @@ def test_alt_source_refuses_to_start_on_a_missing_or_foreign_basis(tmp_path, sou
 def test_alt_thresholds_of_the_repo_registry_are_fitted_on_the_default_window(source: str) -> None:
     """Since 2026-11-03 the repo registry carries the live fitted alt thresholds (basis: 10 s window, EMA off): they fit the
     default window of the controller and no other."""
-    env = {"TRE_SIGNAL_SOURCE": source, "TRE_DISABLE_ETA_GATE": "true",   # a non-zm source requires the gate off (from_env)
+    env = {"TRE_SIGNAL_SOURCE": source,
            "TRE_REGISTRY_PATH": str(Path(__file__).parents[2] / "deploy" / "registry.yaml")}
     assert ControllerConfig.from_env({}).metrics_window_ms == 10_000
     assert ControllerConfig.from_env(env).signal_source == source              # accepted at the default window
