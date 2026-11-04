@@ -798,6 +798,17 @@ def test_signal_ablation_arm_env_reaches_run_arm_pilot(tmp_path):
     assert deps.envs == {"Alternating_s1/sig-queue": "TRE_SAFESCALE_SCOPE=receiverless_shrink TRE_SIGNAL_SOURCE=queue_len"}
 
 
+def test_an_old_alt_signal_spec_with_the_eta_gate_true_plans_without_it(tmp_path):
+    """2026-11-04 (review B1): an alt-signal arm of a spec written for the image before the eta removal carries
+    TRE_DISABLE_ETA_GATE: true (that image needed it). Accepted and dropped: run_arm_pilot.sh writes it by the
+    controller image's capability. On a TSS arm true is still refused (parametrized above)."""
+    extra = {"arm_defs": {"x": {"base": "tre", "controller_env": {"TRE_SIGNAL_SOURCE": "queue_len",
+                                                                  "TRE_DISABLE_ETA_GATE": True}}}}
+    c = C.load_campaign(write_campaign(tmp_path, traces=["Alternating"], arms=("x",), extra=extra))
+    plan = C.build_plan(c)
+    assert C.arm_def(c, plan[0].arm).controller_env == {"TRE_SIGNAL_SOURCE": "queue_len"}
+
+
 def test_an_old_spec_with_the_removed_eta_gate_switch_false_still_plans(tmp_path):
     """2026-11-02: TRE_DISABLE_ETA_GATE was removed from the controller. An old TSS-arm spec's false (the only
     behaviour left) is dropped before the run; true fails the spec check (parametrized above)."""

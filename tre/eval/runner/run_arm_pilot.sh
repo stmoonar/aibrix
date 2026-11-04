@@ -145,7 +145,10 @@ PROBE_WAIT_S="${PROBE_WAIT_S:-120}"              # baseline arms: max wait for o
 # record_ablation_switches checks it on the running controller pod's container env.
 CTL_ENV_KEYS="TRE_ABLATION_DISABLE_SAFESCALE TRE_ABLATION_DISABLE_SLOW_LOOP TRE_SAFESCALE_SCOPE TRE_SIGNAL_SOURCE TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"
 # (2026-11-02) keys removed from the controller (= campaign.py REMOVED_CONTROLLER_ENV_KEYS): ctl_env_set unsets them
-# when still on the Deployment (a stale "true" would crash-loop the controller, a stale "false" would linger)
+# when still on the Deployment (a stale "true" would crash-loop the controller, a stale "false" would linger).
+# (2026-11-04) Except on a controller image from before the eta removal (its startup line logs disable_eta_gate -
+# the image's capability, not its tag): that image refuses an alt signal (TRE_SIGNAL_SOURCE != zm) unless
+# TRE_DISABLE_ETA_GATE=true, so ctl_env_set writes true on such an arm (ctl_eta_gate_image) and unsets it otherwise.
 CTL_REMOVED_KEYS="TRE_DISABLE_ETA_GATE"
 ctl_default() { case "$1" in TRE_SAFESCALE_SCOPE) echo all ;; TRE_SIGNAL_SOURCE) echo zm ;; *) echo false ;; esac; }
 ctl_valid() {   # ctl_valid KEY VALUE
@@ -302,6 +305,12 @@ ctl_want() { local kv; for kv in $ARM_CONTROLLER_ENV; do [ "${kv%%=*}" = "$1" ] 
   # scope "off" alone implies the switch true (its alias): a live "false" left as is would disagree and crash-loop
   [ "$1" = TRE_ABLATION_DISABLE_SAFESCALE ] && [ "$(ctl_want TRE_SAFESCALE_SCOPE)" = off ] && { echo true; return 0; }
   ctl_default "$1"; }
+ctl_eta_gate_image() {   # yes | no | unknown: does the running controller's startup line log disable_eta_gate?
+  local line
+  line=$(kubectl -n "$TRE_NS" logs "deploy/$CONTROLLER_DEPLOY" 2>/dev/null | grep -m1 'ablation_switches' || true)
+  [ -n "$line" ] || { echo unknown; return 0; }
+  case "$line" in *disable_eta_gate*) echo yes ;; *) echo no ;; esac
+}
 ctl_env_has() { [ -n "$(kubectl -n "$TRE_NS" get deploy "$CONTROLLER_DEPLOY" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].name}")" ]; }
 ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the settings that differ; unset == default
   # (2026-11-02) CTL_ENV_ROLLED=1 when it rolled the controller out (the caller's restart, note 16a)
@@ -320,7 +329,23 @@ ctl_env_set() {   # ctl_env_set want|false : one `set env` (one rollout) for the
     # a switch goes back to an explicit "false" (as before); the scope back to unset (= all)
     if [ "$want" = "$def" ] && [ "$def" != false ]; then args+=("$k-"); else args+=("$k=$want"); fi
   done
-  for k in $CTL_REMOVED_KEYS; do if ctl_env_has "$k"; then args+=("$k-"); fi; done
+  # TRE_DISABLE_ETA_GATE by the image's capability (2026-11-04): true only for an alt-signal arm on an image whose
+  # startup line still logs disable_eta_gate; unknown (no startup line) on such an arm -> refuse (fail closed)
+  local eta_want="" img
+  if [ "$1" = want ] && [ "$(ctl_want TRE_SIGNAL_SOURCE)" != zm ]; then
+    img=$(ctl_eta_gate_image)
+    case "$img" in
+      yes) eta_want=true ;;
+      no) ;;
+      *) log "ERROR alt-signal arm: no controller startup line to tell whether the image still has the eta gate"
+         return 1 ;;
+    esac
+  fi
+  for k in $CTL_REMOVED_KEYS; do
+    if [ "$k" = TRE_DISABLE_ETA_GATE ] && [ -n "$eta_want" ]; then
+      [ "$(ctl_env_get "$k" | tr '[:upper:]' '[:lower:]')" = "$eta_want" ] || args+=("$k=$eta_want")
+    elif ctl_env_has "$k"; then args+=("$k-"); fi
+  done
   [ ${#args[@]} = 0 ] && return 0
   kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "${args[@]}" >> "$D/runner.log" 2>&1 || return 1
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=180s >> "$D/runner.log" 2>&1 || return 1
@@ -388,12 +413,18 @@ for key, wv, default in (("signal_source", want_sig, "zm"),):
     want[key] = wv
     got = None if rec is None else rec.get(key)
     ok = ok and (got == wv if got is not None else wv == default)
-# (2026-11-02) a line that still logs disable_eta_gate comes from a controller image built before the eta removal:
-# its donor order is the eta / waste tier (or the name order), not IDLE then Z -> mismatch whatever the values
+# (2026-11-04) a line that still logs disable_eta_gate comes from a controller image built before the eta removal
+# (2026-11-02): a known retired key, not a mismatch. That image's gate must be what ctl_env_set wrote: true on an
+# alt-signal arm (the image refuses an alt signal without it), false on a TSS arm (its production setting).
 old_image = rec is not None and "disable_eta_gate" in rec
-problem = ("the controller startup line logs disable_eta_gate: image built before the eta removal (2026-11-02), "
-           "donor order is not IDLE then Z; deploy the current controller image") if old_image else None
-ok = ok and not old_image
+eta_gate = None
+problem = None
+if old_image:
+    eta_gate = {"image_has_eta_gate": True, "logged": rec.get("disable_eta_gate"), "wanted": want_sig != "zm"}
+    if eta_gate["logged"] is not eta_gate["wanted"]:
+        problem = (f"controller image before the eta removal: disable_eta_gate={eta_gate['logged']}, wanted "
+                   f"{eta_gate['wanted']} (true exactly on an alt-signal arm)")
+        ok = False
 if problem:
     print(f"ablation switches: {problem}", file=sys.stderr)
 # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (2026-11-02): never in the startup line -> the pod env decides
@@ -413,7 +444,7 @@ effective = None if rec is None else {"disable_safescale": rec.get("disable_safe
                                       "disable_slow_loop": rec.get("disable_slow_loop"),
                                       "safescale_scope": scope_logged if scope_logged is not None else "all (not logged)",
                                       "signal_source": rec.get("signal_source", "zm (not logged)")}
-json.dump({"logged": rec, "wanted": want, "effective": effective, "match": ok, "problem": problem,
+json.dump({"logged": rec, "wanted": want, "effective": effective, "match": ok, "problem": problem, "eta_gate": eta_gate,
            "deployment_env": env_now.strip(),
            "suppress_hot_proactive": {"source": sup_src, "value": sup_got, "pod_env_raw": pod_sup},
            "raw": line[:500] or None}, open(out, "w"), indent=1)

@@ -52,14 +52,20 @@ def pct(xs: Iterable[float | None], p: float) -> float | None:
 # ---------------------------------------------------------------- SLO thresholds
 def slo_mode_of(blocks: Iterable[dict]) -> str:
     """The SLO mode of a set of ``models[].slo`` blocks without their registry (legacy
-    callers): the rule of ``tre_common.slo.resolve_slo_mode`` for a registry without
-    ``slo_mode`` (the blocks' ``ttft_slo_mode``, else the default)."""
+    callers): the blocks' retired ``ttft_slo_mode`` (``tre_common.slo.resolve_slo_mode``).
+    No block names one -> ValueError: the caller passes the registry's ``slo_mode``
+    (2026-11-04: no silent default mode)."""
+    blocks = list(blocks)
+    if not any(isinstance(b, dict) and b.get(slo_def.LEGACY_MODEL_KEY) is not None for b in blocks):
+        raise ValueError(f"no SLO mode: none of the models[].slo blocks has {slo_def.LEGACY_MODEL_KEY}; "
+                         f"pass mode= (the registry's slo_mode, tre_common.slo.resolve_slo_mode)")
     return slo_def.resolve_slo_mode({"models": [{"name": str(i), "slo": b} for i, b in enumerate(blocks)]}).mode
 
 
 def thresholds_of(slo: Any, mode: str | None = None) -> "slo_def.SloThresholds":
     """``slo`` = ``tre_common.slo.SloThresholds`` (returned as is) or a ``models[].slo``
-    block judged under ``mode`` (default: :func:`slo_mode_of` the block)."""
+    block judged under ``mode`` (default: :func:`slo_mode_of` the block, which refuses a
+    block without the retired ``ttft_slo_mode``)."""
     if isinstance(slo, slo_def.SloThresholds):
         return slo
     return slo_def.slo_thresholds(slo, mode or slo_mode_of([slo]))
@@ -122,7 +128,7 @@ def score_requests(rows: list[dict], slo_by_model: dict[str, Any], trim_s: float
 
     ``slo_by_model``: model -> ``models[].slo`` block of the run's registry, judged under ``mode``
     (the registry's ``slo_mode``, ``tre_common.slo.resolve_slo_mode``; None = :func:`slo_mode_of`
-    the blocks, the legacy rule). ``t_ref`` (epoch s) is t = 0 for the records' ``t_send`` /
+    the blocks, the legacy rule - a ValueError when no block names a mode). ``t_ref`` (epoch s) is t = 0 for the records' ``t_send`` /
     ``t_end`` (default: first send).
     """
     max_tok = max_tok or {}

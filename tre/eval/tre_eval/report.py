@@ -108,6 +108,7 @@ def manifest(arm: L.Arm) -> dict:
         "images": images or None, "image_ids_by_node": ids or None,
         "model_images": [{"image": a, "image_id": b, "pods": n} for (a, b), n in model_imgs.items()] or None,
         "registry_sha256": arm.registry_sha256, "traces_sha256": arm.traces_sha256,
+        "slo_mode": arm.slo_mode, "slo_mode_source": arm.slo_mode_source,
         "trace_segments_sha256": f.get("trace_segments_sha256"),
         "policy_file": f.get("policy_file"), "policy_sha256": f.get("policy_sha256"),
         "policy_cm_sha": (f.get("policy_cm_sha") or "").strip() or None,

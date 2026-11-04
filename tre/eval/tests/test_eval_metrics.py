@@ -41,6 +41,26 @@ def test_ttft_threshold_is_the_one_shared_definition():
             L, c_ms=41.1, b_ms_per_token=0.0694, k=5.0, floor_ms=500.0)
 
 
+def test_no_mode_anywhere_is_refused_not_slowdown():
+    """S3 (review 2026-11-04): blocks without ttft_slo_mode and no mode from the caller -> ValueError."""
+    block = {k: v for k, v in SLO.items() if k != "ttft_slo_mode"}
+    with pytest.raises(ValueError, match="no SLO mode"):
+        M.slo_mode_of([block])
+    with pytest.raises(ValueError, match="no SLO mode"):
+        M.score_requests([req(1, model="m-a")], {"m-a": block})
+    assert M.thresholds_of(block, "fixed").ttft_ms(4096) == 500.0          # an explicit mode is fine
+
+
+def test_an_unresolvable_registry_stops_the_load(tmp_path):
+    """S3: load_arm no longer warns and scores on - a registry whose SLO mode cannot be resolved raises."""
+    d = str(tmp_path / "arm")
+    write_arm(d, [(0.0, lay([A0], [B0]))], [req(1)])
+    with open(os.path.join(d, "live-registry.yaml"), "a") as fh:
+        fh.write("slo_mode: median\n")
+    with pytest.raises(ValueError, match="SLO mode unresolvable"):
+        L.load_arm(d)
+
+
 def test_metrics_import_with_only_tre_eval_on_the_path():
     # report.py / runner/score_pilot.py put only tre/eval on sys.path
     import subprocess

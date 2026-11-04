@@ -91,8 +91,10 @@ TIER1_D_SOURCES = ("done_tokens", "done_or_predicted", "arrival_max_tokens")
 CONTROLLER_ENV_KEYS = ("TRE_ABLATION_DISABLE_SAFESCALE", "TRE_ABLATION_DISABLE_SLOW_LOOP", "TRE_SAFESCALE_SCOPE",
                        "TRE_SIGNAL_SOURCE", "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE")
 # 2026-11-02: TRE_DISABLE_ETA_GATE was removed from the controller (eta gone; every arm orders donors IDLE first,
-# then Z descending). An old spec's "false" (the only behaviour left) is dropped; "true" (the removed name order)
-# fails the spec check - the controller would refuse to start.
+# then Z descending). It is dropped from a spec: run_arm_pilot.sh writes it by the controller image's capability
+# (2026-11-04: true on an alt-signal arm only when the image still has the gate, unset otherwise). An old spec's
+# "false", or "true" on an alt-signal arm (what an image before the removal needed), is accepted and dropped;
+# "true" on a TSS arm (the removed name order) fails the spec check.
 REMOVED_CONTROLLER_ENV_KEYS = ("TRE_DISABLE_ETA_GATE",)
 # 2026-10-26: TRE_SAFESCALE_SCOPE (fix/v2-sampling-20261025) is not a switch: a scope name, default "all" (= unset,
 # production), put back to unset at the end of the arm; the controller's startup line logs it as safescale_scope.
@@ -311,10 +313,13 @@ def _controller_env(arm_id: str, base: str, raw: Any) -> dict:
         raise CampaignError(f"arm_defs.{arm_id}.controller_env is only supported for base tre (the controller actuates)")
     if not isinstance(raw, dict):
         raise CampaignError(f"arm_defs.{arm_id}.controller_env must be a mapping")
+    alt_signal = str(raw.get("TRE_SIGNAL_SOURCE", "zm")).strip().lower() != "zm"
     for k in REMOVED_CONTROLLER_ENV_KEYS:
-        if k in raw and str(raw[k]).strip().lower() != "false":
+        if k in raw and str(raw[k]).strip().lower() != "false" and not (
+                k == "TRE_DISABLE_ETA_GATE" and alt_signal and str(raw[k]).strip().lower() == "true"):
             raise CampaignError(f"arm_defs.{arm_id}.controller_env.{k}={raw[k]}: removed 2026-11-02 (no eta; donors IDLE "
-                                f"first, then Z descending on every arm); only false is accepted, and dropped")
+                                f"first, then Z descending on every arm); only false (or true on an alt-signal arm) "
+                                f"is accepted, and dropped - the runner sets it by the controller image")
     raw = {k: v for k, v in raw.items() if k not in REMOVED_CONTROLLER_ENV_KEYS}
     bad = sorted(set(raw) - set(CONTROLLER_ENV_KEYS))
     if bad:
